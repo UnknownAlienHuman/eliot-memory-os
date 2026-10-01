@@ -87,6 +87,56 @@ where
     Ok(value)
 }
 
+/// Decoder for an effect-bearing field that is required on the wire and
+/// explicitly nullable.
+///
+/// `Option<T>` under derived `Deserialize` already decodes an *absent* key as
+/// `None`, so `#[serde(default)]` (or a bare `Option`) makes omission
+/// indistinguishable from an explicitly recorded "there is none". Carrying
+/// `#[serde(deserialize_with = "deserialize_required_nullable")]` and *no*
+/// `#[serde(default)]` makes the derived visitor reject the missing key with
+/// the typed missing-field error first, while this body keeps handling a
+/// present value or an explicit `null` exactly as before.
+///
+/// This is the same treatment `provider_invocation.rs` already gives its ten
+/// required-nullable outcome fields; there is no second pattern to invent.
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// Decoder: derived and closed. The three effect-bearing source bindings on
+/// `BackupManifest` (`surreal_source_endpoint`, `surreal_source_storage_ref`,
+/// `blob_payload_root`) carry `deserialize_with = "deserialize_required_nullable"`
+/// and no `#[serde(default)]`, so an absent key is a typed missing-field
+/// failure rather than a silent `None`.
+///
+/// Each of these is an isolation/effect fact, not telemetry. A silently
+/// defaulted `surreal_source_endpoint` decodes as "no endpoint", and
+/// `RestoreService::run_logical` (`crates/eliot-engine/src/safety.rs:556`)
+/// compares `manifest.surreal_source_endpoint` against the restore target's
+/// endpoint to decide endpoint isolation; a defaulted `blob_payload_root` is
+/// the root `verify_blob_payload_manifest`
+/// (`crates/eliot-engine/src/safety/backup.rs:386`) later resolves blob payload
+/// paths under. An omitted key must therefore not decode as a recorded absence
+/// (I5.16: absence stays explicit unknown, not a successful complete record;
+/// Appendix P: authority/effect/receipt fields are never silently defaulted).
+///
+/// Compatibility: `BackupManifest` already carries the enclosing version that
+/// selects the interpretation of its omissions —
+/// `schema_version`, decode-pinned to `crate::SCHEMA_VERSION` by
+/// `deserialize_manifest_schema_version` above. Only the adopted current
+/// version decodes, so no supported historical form selects a legacy reading of
+/// these three omissions and none is invented here; an older or unknown manifest
+/// already refuses on its version before these fields are considered. The sole
+/// writer, `BackupService::run`
+/// (`crates/eliot-engine/src/safety/backup.rs:129`), always emits all three keys
+/// including `null`, and `Serialize` is untouched, so accepted and emitted bytes
+/// are unchanged. An explicit `null` remains reachable and still means "this
+/// binding was not established"; only an *omitted* key refuses.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupManifest {
@@ -102,13 +152,13 @@ pub struct BackupManifest {
     pub config_snapshot_refs: Vec<String>,
     pub surreal_export_ref: Option<String>,
     pub surreal_export_status: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub surreal_source_endpoint: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub surreal_source_storage_ref: Option<PathRef>,
     pub control_wal_snapshot_ref: Option<String>,
     pub blob_manifest_ref: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub blob_payload_root: Option<PathRef>,
     pub blob_payloads: Vec<BackupBlobEntry>,
     pub report_manifest_ref: Option<String>,
@@ -188,6 +238,31 @@ pub struct BackupReport {
     pub generated_at: OffsetDateTime,
 }
 
+/// Decoder: derived and closed. The three effect-bearing target bindings on
+/// `RestorePlan` (`target_endpoint`, `target_storage_ref`, `exact_action_hash`)
+/// carry `deserialize_with = "deserialize_required_nullable"` and no
+/// `#[serde(default)]`, so an absent key is a typed missing-field failure
+/// rather than a silent `None`.
+///
+/// A restore plan names where a restore would write and which exact action was
+/// approved for it. A silently defaulted `target_endpoint`/`target_storage_ref`
+/// reads downstream as "no target endpoint" — the same value an isolated
+/// filesystem-only restore legitimately carries — and a defaulted
+/// `exact_action_hash` reads as "no action was bound". Those are effect
+/// decisions, not telemetry, so an omitted key must not be able to reach them
+/// (Appendix P; I5.16).
+///
+/// Compatibility: `RestorePlan` carries no enclosing `schema_version`, so there
+/// is no version that selects a documented legacy interpretation of these three
+/// omissions, and none is invented here (issue work item 4). Every current
+/// producer sets all three explicitly, including `None`:
+/// `RestoreService::plan_from_manifest` (`crates/eliot-engine/src/safety.rs:783`)
+/// constructs the full literal with all three `None`, and
+/// `RestoreService::plan_logical` / `run_logical` (`:705`, `:573`) overwrite all
+/// three with the bound values before any restore runs. `Serialize` is
+/// untouched, so emitted bytes are unchanged. A truncated or older plan that
+/// omitted these keys now fails loudly instead of decoding as a plan with no
+/// target binding and no approved action.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestorePlan {
@@ -196,11 +271,11 @@ pub struct RestorePlan {
     pub backup_manifest_ref: String,
     pub target_data_root: PathRef,
     pub restore_mode: RestoreMode,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub target_endpoint: Option<String>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub target_storage_ref: Option<PathRef>,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub exact_action_hash: Option<String>,
     pub checks: Vec<RestoreCheck>,
     pub created_at: OffsetDateTime,
@@ -222,6 +297,30 @@ pub struct RestoreCheck {
     pub message: String,
 }
 
+/// Decoder: derived and closed. `RestoreReceipt::exact_action_hash` carries
+/// `deserialize_with = "deserialize_required_nullable"` and no
+/// `#[serde(default)]`, so an absent key is a typed missing-field failure
+/// rather than a silent `None`.
+///
+/// This is the audit's third named field: a restore receipt retained as durable
+/// evidence is read back by the rollback effect path
+/// (`RestoreService::rollback_isolated`, `crates/eliot-engine/src/safety.rs:728`,
+/// decoding `restore-evidence/restore-receipt.json`). A silently defaulted
+/// `exact_action_hash` decodes as `None` inside a success-shaped
+/// `RestoredToNewRoot` receipt that an effect path then accepts, so a receipt
+/// that never recorded which exact action was executed would present itself as a
+/// complete one. Requiredness is the decoder's part of that contract; the
+/// consumer-side status/mode validation the audit also asks for (a dry-run
+/// receipt cannot stand for an executed restore, a deserialized receipt is not
+/// owner issuance) is a `RestoreService` repair outside `eliot-types` and is not
+/// claimed here.
+///
+/// Compatibility: no enclosing version selects a legacy reading of this
+/// omission and none is invented. Every current producer sets it explicitly,
+/// including `None`: `RestoreService::verify` (`:480`) and
+/// `RestoreService::run` (`:523`) construct `None`, `run_logical` (`:671`)
+/// constructs `Some(exact_action_hash)`, and `Serialize` is untouched, so
+/// emitted bytes are unchanged.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreReceipt {
@@ -233,7 +332,7 @@ pub struct RestoreReceipt {
     pub verified_checksums: bool,
     pub restored_objects: u64,
     pub restored_blobs: u64,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub exact_action_hash: Option<String>,
     pub dry_run: bool,
     pub started_at: OffsetDateTime,
