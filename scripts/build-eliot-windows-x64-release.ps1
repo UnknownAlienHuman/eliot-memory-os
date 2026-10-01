@@ -1591,10 +1591,28 @@ function Get-SelectedSurrealReleasePolicyReceipt([string]$Repo, [object]$Catalog
         throw 'selected-release dependency policy verifier is missing'
     }
     $python = Get-PinnedCommandFile 'python' 'selected-release dependency policy verifier'
+    # Issue #1923 W7: hand the verifier the release hashes THIS flow measured,
+    # so the receipt records a real binding instead of `not_bound`. These three
+    # digests were each computed by this flow's own Read-VerifiedResidentFile
+    # read of the bytes (catalogue, pinned candidate artifact, provisioning
+    # receipt) and each path is repository-relative, which is what the
+    # verifier's contained no-follow fence requires. The verifier recomputes
+    # every one of them from those bytes itself and refuses the run on any
+    # divergence, so the expected and observed sides stay independent: this
+    # file is an external claim to be checked, not a value to be restated.
+    # The file is written under the process temp root, never inside $Repo,
+    # because this flow requires an isolated clean source tree.
+    $releaseHashes = [ordered]@{}
+    $releaseHashes[[string]$Catalog.relative_path] = ([string]$Catalog.sha256).ToLowerInvariant()
+    $releaseHashes[[string]$SurrealArtifact.project_local_input_path] = ([string]$SurrealArtifact.sha256).ToLowerInvariant()
+    $releaseHashes[[string]$SurrealArtifact.provisioning_receipt_input_path] = ([string]$SurrealArtifact.provisioning_receipt_sha256).ToLowerInvariant()
+    $releaseHashesPath = Join-Path ([System.IO.Path]::GetTempPath()) ("eliot-release-hashes-" + [guid]::NewGuid().ToString('N') + '.json')
+    Set-Content -LiteralPath $releaseHashesPath -Value ($releaseHashes | ConvertTo-Json -Depth 4) -Encoding utf8
     $verifyArguments = @(
         $verifierPath,
         '--root', $Repo,
         '--selected-release-policy-receipt-out', $receiptPath,
+        '--release-hashes', $releaseHashesPath,
         '--selected-artifact-path', [string]$SurrealArtifact.project_local_input_path,
         '--selected-artifact-sha256', [string]$SurrealArtifact.sha256,
         '--selected-artifact-version', [string]$SurrealArtifact.version,
@@ -1639,6 +1657,24 @@ function Get-SelectedSurrealReleasePolicyReceipt([string]$Repo, [object]$Catalog
         @($receipt.advisory_snapshot.advisory_ids).Count -ne 0) {
         throw 'selected-release dependency policy receipt does not bind the consumed artifact, current advisory snapshot, catalogue, provisioner and source commit'
     }
+    # Issue #1923 W7: the receipt must carry the release binding this flow asked
+    # for, with the exact digests this flow measured. A receipt that came back
+    # `not_bound`, or bound to a different digest for any of the three paths,
+    # is refused here rather than staged into the bundle.
+    if ([string]$receipt.release_binding.status -cne 'bound') {
+        throw "selected-release dependency policy receipt records no release binding ($([string]$receipt.release_binding.status)); the release cannot be published on an unbound receipt"
+    }
+    foreach ($bound in $releaseHashes.Keys) {
+        # Release paths carry dots and slashes, so this must be an explicit
+        # member lookup rather than dynamic property syntax.
+        $boundProperty = @($receipt.release_binding.hashes.PSObject.Properties |
+            Where-Object { [string]$_.Name -ceq $bound })
+        $recordedBinding = if ($boundProperty.Count -eq 1) { [string]$boundProperty[0].Value } else { '' }
+        if ($recordedBinding -cne [string]$releaseHashes[$bound]) {
+            throw "selected-release dependency policy receipt binds '$bound' to '$recordedBinding' but this flow measured $($releaseHashes[$bound])"
+        }
+    }
+    Remove-Item -LiteralPath $releaseHashesPath -Force -ErrorAction SilentlyContinue
     [pscustomobject]@{
         path = $receiptPath
         relative_path = $relative
@@ -2006,7 +2042,12 @@ function Assert-IsolatedSourceTree([string]$Repo, [string]$SourceCommit, [string
     }
 }
 
-function Select-ReleaseIsolationFallback([string]$Boundary, [bool]$LocallyProven, [string]$Reason) {
+function Select-ReleaseIsolationFallback(
+    [string]$Boundary,
+    [object[]]$LocalProofs,
+    [string]$Reason,
+    [string]$RequiredMeasurement = ''
+) {
     # Issue #1923 W8: where the local environment cannot prove an isolation
     # boundary, the release selects and records a VM/lab fallback rather than
     # asserting local proof.  A locally proven boundary records the local
@@ -2019,11 +2060,69 @@ function Select-ReleaseIsolationFallback([string]$Boundary, [bool]$LocallyProven
     if ([string]::IsNullOrWhiteSpace($Reason)) {
         throw "release isolation fallback selection requires a recorded reason ($Boundary)"
     }
+    # Issue #1923 W8 (repair): `locally_proven` is DERIVED from the measured
+    # result records this flow already holds, never from a caller-supplied
+    # boolean.  A recorder that stamps local proof on any prose is the same
+    # defect as a check that cannot fail, so the boolean is a predicate over
+    # the measurement records themselves:
+    #   * every supplied record must be a measurement result dictionary;
+    #   * it must name the phase it measured and the 40-hex pinned HEAD it
+    #     observed;
+    #   * every assertion the measurement is responsible for must be recorded
+    #     as exactly $true.
+    # `Assert-IsolatedSourceTree` throws on any divergence, so a boundary whose
+    # proof comes from it can only reach this call at all once the measurement
+    # actually ran; and a boundary with no measured record can never be
+    # recorded as proven.
+    $proofRecords = @($LocalProofs | Where-Object { $null -ne $_ })
+    $defects = New-Object System.Collections.Generic.List[string]
+    $observed = New-Object System.Collections.Generic.List[string]
+    foreach ($proof in $proofRecords) {
+        if ($proof -isnot [System.Collections.IDictionary]) {
+            $defects.Add('a supplied local proof is not a measured result record')
+            continue
+        }
+        $phase = [string]$proof['phase']
+        $head = [string]$proof['head']
+        if ([string]::IsNullOrWhiteSpace($phase)) {
+            $defects.Add('a supplied local proof carries no measured phase')
+        }
+        if ($head -notmatch '^[0-9a-f]{40}$') {
+            $defects.Add("measured phase '$phase' carries no 40-hex pinned HEAD")
+        }
+        foreach ($assertion in @('tracked_clean', 'untracked_rejected', 'cargo_config_absent')) {
+            if (-not $proof.Contains($assertion) -or $proof[$assertion] -ne $true) {
+                $defects.Add("measured phase '$phase' did not record $assertion as true")
+            }
+        }
+        $observed.Add("$phase=$head")
+    }
+    $locallyProven = ($proofRecords.Count -gt 0) -and ($defects.Count -eq 0)
+    if ($locallyProven) {
+        # The reason keeps the operator prose and gains the measured evidence it
+        # was actually derived from, so the two cannot drift apart.
+        $recordedReason = "$Reason [derived: recorded locally_proven=true from the measured result(s) $($observed -join ', ')]"
+    }
+    else {
+        # A boundary with no usable measured result must name the measurement
+        # that is missing, so the record never reads as an unexplained refusal
+        # and never as local proof.
+        $missing = if ([string]::IsNullOrWhiteSpace($RequiredMeasurement)) {
+            "an executed local measurement proving $Boundary"
+        }
+        else {
+            $RequiredMeasurement
+        }
+        $recordedReason = "$Reason [derived: recorded locally_proven=false because no usable measured result was supplied for $Boundary; the missing measurement is $missing]"
+        if ($defects.Count -gt 0) {
+            $recordedReason += "; supplied result(s) were unusable: $($defects -join '; ')"
+        }
+    }
     [ordered]@{
         boundary = $Boundary
-        locally_proven = $LocallyProven
-        selected_runner = if ($LocallyProven) { 'local' } else { 'VM/lab isolated runner' }
-        reason = $Reason
+        locally_proven = $locallyProven
+        selected_runner = if ($locallyProven) { 'local' } else { 'VM/lab isolated runner' }
+        reason = $recordedReason
     }
 }
 
@@ -4991,17 +5090,19 @@ try {
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     # Issue #1923 W8: select and record the isolation disposition per boundary.
-    # Source-tree pinning is proven locally by Assert-IsolatedSourceTree
-    # (pre-build and post-build).  Descendant containment is claimed by the Job
-    # Object launch path but its removal measurement is executed by the release
-    # security suite, not by this flow.  Filesystem and network sandboxing have
-    # no local proof at all: per I18.44 a Job Object-only check cannot claim
-    # them, so both select the VM/lab isolated runner and are recorded as
-    # unproven rather than asserted.
+    # Source-tree pinning is proven locally by Assert-IsolatedSourceTree, so the
+    # measured result records it returned pre-build and post-build are what
+    # Select-ReleaseIsolationFallback derives its boolean from.  Descendant
+    # containment is claimed by the Job Object launch path but its removal
+    # measurement is executed by the release security suite, not by this flow.
+    # Filesystem and network sandboxing have no local proof at all: per I18.44 a
+    # Job Object-only check cannot claim them.  Both therefore pass NO measured
+    # result record, so the selector is forced to record locally_proven=false
+    # and to name the measurement that is missing; neither can be asserted here.
     $isolationFallback = @(
-        Select-ReleaseIsolationFallback 'source-tree-pinning' $true 'Assert-IsolatedSourceTree verified the pinned HEAD, a clean tree, and no local .cargo configuration pre-build and post-build'
-        Select-ReleaseIsolationFallback 'build-descendant-containment' $false 'every release cargo child is bound to a Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, created suspended then assigned before resume); the observed zero-survivor descendant measurement is executed by tests/release-security/build-sandbox-cache-tests.ps1 Measure-ReleaseLaunchDescendantRemoval, not by this release flow, so this flow records the claim as unmeasured here'
-        Select-ReleaseIsolationFallback 'build-filesystem-network-sandbox' $false 'per I18.44 a Job Object-only check cannot claim filesystem/network sandboxing; no local mechanism in this flow denies filesystem writes or network egress from the build'
+        Select-ReleaseIsolationFallback 'source-tree-pinning' @($preBuildIsolation, $postBuildIsolation) 'Assert-IsolatedSourceTree verified the pinned HEAD, a clean tree, and no local .cargo configuration pre-build and post-build' 'a pre-build and a post-build Assert-IsolatedSourceTree result for the pinned source commit'
+        Select-ReleaseIsolationFallback 'build-descendant-containment' @() 'every release cargo child is bound to a Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, created suspended then assigned before resume); the observed zero-survivor descendant measurement is executed by tests/release-security/build-sandbox-cache-tests.ps1 Measure-ReleaseLaunchDescendantRemoval, not by this release flow, so this flow records the claim as unmeasured here' 'an executed in-flow zero-survivor descendant removal measurement over a real release cargo child (tests/release-security/build-sandbox-cache-tests.ps1 Measure-ReleaseLaunchDescendantRemoval)'
+        Select-ReleaseIsolationFallback 'build-filesystem-network-sandbox' @() 'per I18.44 a Job Object-only check cannot claim filesystem/network sandboxing; no local mechanism in this flow denies filesystem writes or network egress from the build' 'an executed in-flow measurement denying filesystem writes and network egress from the build, which per I18.44 no Job Object-only check can establish'
     )
     # Issue #1858 AUD6/W6: stage the installed-entrypoint readback PLAN beside
     # the manifest. -WhatIf plans every retained entrypoint invocation without

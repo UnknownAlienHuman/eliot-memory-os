@@ -4237,8 +4237,15 @@ def build_selected_release_receipt(
     selected_artifact_version: str,
     selected_catalog_sha256: str,
     selected_provisioning_receipt_sha256: str,
+    release_binding: dict[str, str] | None = None,
 ) -> tuple[list[Finding], dict]:
-    """Build a non-runtime receipt for the exact project-local release selection."""
+    """Build a non-runtime receipt for the exact project-local release selection.
+
+    `release_binding` carries the release hashes this receipt is bound to when
+    the caller supplied them and every one of them reproduced from the
+    artifact bytes. It is recorded verbatim; an absent binding records
+    `not_bound` with its reason rather than implying one it never received.
+    """
 
     findings: list[Finding] = []
     manifest_findings, manifest_data = check_policy_manifest(root)
@@ -4386,6 +4393,7 @@ def build_selected_release_receipt(
             "records": provisioning_receipt.get("records"),
         },
         "advisory_snapshot": candidate_advisory,
+        "release_binding": _release_binding_block(release_binding),
         "installed_scope": {
             "version": surreal.get("version"),
             "status": "not_assessed_by_selected-release receipt; current-advisories retains its findings",
@@ -5288,6 +5296,24 @@ _NO_SUPPORT_CLAIM = (
 _SCANNER_POLICY_FINDING_CODES = ("DEP-004", "DEP-005", "DEP-006")
 
 
+def _release_binding_block(release_binding: dict | None) -> dict:
+    """Render the release binding an artifact actually holds.
+
+    `release_binding` holds only hashes `verify_release_hash_bindings` already
+    recomputed from the artifact bytes, so recording them verbatim is a record
+    of a measurement rather than a restatement of the caller's claim. A run
+    with no supplied hashes records `not_bound` with the reason; it never
+    asserts a binding it did not receive.
+    """
+
+    if isinstance(release_binding, dict) and release_binding:
+        return {"status": "bound", "hashes": dict(sorted(release_binding.items()))}
+    return {
+        "status": "not_bound",
+        "reason": "no release hashes were supplied for this run artifact",
+    }
+
+
 def _artifact_envelope(
     artifact: str,
     schema: str,
@@ -5312,14 +5338,7 @@ def _artifact_envelope(
         "source_sha": receipt.get("source_sha"),
         "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "receipt_digest": hashlib.sha256(canonical).hexdigest(),
-        "release_binding": (
-            {"status": "bound", "hashes": dict(sorted(release_binding.items()))}
-            if isinstance(release_binding, dict) and release_binding
-            else {
-                "status": "not_bound",
-                "reason": "no release hashes were supplied for this run artifact",
-            }
-        ),
+        "release_binding": _release_binding_block(release_binding),
         "support_claim": _NO_SUPPORT_CLAIM,
     }
 
@@ -6566,6 +6585,42 @@ def main() -> int:
         return run_self_tests()
 
     root = Path(args.root).resolve()
+
+    # Issue #1923 W7: bind the artifacts to the exact release hashes before
+    # anything is written. The recorded hashes arrive from the release owner;
+    # each is recomputed here over the artifact's own bytes through the
+    # contained no-follow fence and compared, so a recorded hash is never
+    # merely copied into an artifact. The two sides are independent: the
+    # expected digests come from the external --release-hashes file the release
+    # flow measured, the observed digests come from this process's own read.
+    # A divergence is a DEP-009 finding and the run fails closed BEFORE any
+    # artifact, receipt or policy output is written, so nothing can ever record
+    # a binding the code did not produce.
+    release_binding: dict[str, str] = {}
+    if args.release_hashes:
+        try:
+            recorded = json.loads(Path(args.release_hashes).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(f"DEPENDENCY_POLICY_RELEASE_HASHES_UNREADABLE: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(recorded, dict) or not recorded:
+            print(
+                "DEPENDENCY_POLICY_RELEASE_HASHES_MALFORMED: --release-hashes must be a "
+                "non-empty JSON object mapping artifact paths to recorded SHA-256 values",
+                file=sys.stderr,
+            )
+            return 1
+        release_binding, release_findings = verify_release_hash_bindings(root, recorded)
+        if release_findings:
+            print(
+                f"DEPENDENCY_POLICY_RELEASE_HASH_MISMATCH: {len(release_findings)} recorded "
+                "release hash(es) did not reproduce from the artifact bytes",
+                file=sys.stderr,
+            )
+            for finding in release_findings:
+                print(f"  [{finding.code}] {finding.path}:{finding.line}: {finding.detail}")
+            return 1
+
     if args.selected_release_policy_receipt_out:
         selected_args = (
             args.selected_artifact_path,
@@ -6583,6 +6638,7 @@ def main() -> int:
             args.selected_artifact_version,
             args.selected_catalog_sha256,
             args.selected_provisioning_receipt_sha256,
+            release_binding,
         )
         selected_receipt_path = Path(args.selected_release_policy_receipt_out)
         selected_receipt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6602,38 +6658,6 @@ def main() -> int:
         ) else 1
 
     findings, status, receipt, manifest_data, _ = verify_all(root, args.profile)
-
-    # Issue #1923 W7: bind the run artifacts to the exact release hashes before
-    # anything is written. The recorded hashes arrive from the release owner;
-    # each is recomputed here over the artifact's own bytes and compared, so a
-    # recorded hash is never merely copied into an artifact. A divergence is a
-    # finding and the run fails closed, so the artifacts can never record a
-    # binding the code did not produce.
-    release_binding: dict[str, str] = {}
-    if args.release_hashes:
-        try:
-            recorded = json.loads(Path(args.release_hashes).read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            print(f"DEPENDENCY_POLICY_RELEASE_HASHES_UNREADABLE: {exc}", file=sys.stderr)
-            return 1
-        if not isinstance(recorded, dict) or not recorded:
-            print(
-                "DEPENDENCY_POLICY_RELEASE_HASHES_MALFORMED: --release-hashes must be a "
-                "non-empty JSON object mapping artifact paths to recorded SHA-256 values",
-                file=sys.stderr,
-            )
-            return 1
-        release_binding, release_findings = verify_release_hash_bindings(root, recorded)
-        findings.extend(release_findings)
-        if release_findings:
-            print(
-                f"DEPENDENCY_POLICY_RELEASE_HASH_MISMATCH: {len(release_findings)} recorded "
-                "release hash(es) did not reproduce from the artifact bytes",
-                file=sys.stderr,
-            )
-            for finding in release_findings:
-                print(f"  [{finding.code}] {finding.path}:{finding.line}: {finding.detail}")
-            return 1
 
     if args.json_out:
         out_p = Path(args.json_out)
