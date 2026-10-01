@@ -28,6 +28,7 @@ use eliot_contracts::{EpochId, StateFence};
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::SupervisionJournalEpoch;
 use serde::Serialize;
+use std::time::Instant;
 
 /// Ordered I1.11 startup step (1-11). Step 0 means nothing completed.
 pub const STARTUP_FIRST_STEP: u8 = 1;
@@ -528,6 +529,12 @@ pub struct StartupCoordinator {
     /// revocable step, so a claim can never be asserted from process-only
     /// evidence or lease bookkeeping alone.
     current_supervision_observation: Option<WatchdogSupervisionObservation>,
+    /// Kernel-local expiry for the original admitted heartbeat window. This
+    /// process-local clock value is omitted from serialized status: a restored
+    /// coordinator has no matching monotonic clock origin and must not regain
+    /// supervision authority from a cached observation.
+    #[serde(skip)]
+    current_supervision_deadline: Option<Instant>,
     /// The observation the current one superseded or contradicted. It is kept
     /// as the immediately superseded fact and never gates anything.
     superseded_supervision_observation: Option<WatchdogSupervisionObservation>,
@@ -562,6 +569,7 @@ impl StartupCoordinator {
             epoch_recovered: false,
             supervision_evidence_complete: false,
             current_supervision_observation: None,
+            current_supervision_deadline: None,
             superseded_supervision_observation: None,
             supervision_owner_sequence_frontier: None,
             governor_authority: None,
@@ -977,7 +985,8 @@ impl StartupCoordinator {
     /// too, so a generation must be observed again before Material/Critical
     /// work is admitted as independently supervised. Currency of the retained
     /// observation is a separate fact, decided by
-    /// [`Self::admit_supervision_observation`].
+    /// [`Self::admit_supervision_observation`] using both its original wall
+    /// deadline and the Kernel-local monotonic deadline captured at admission.
     #[must_use]
     pub const fn supervision_evidence_is_complete(&self) -> bool {
         self.completed_step >= STARTUP_FINAL_STEP && self.supervision_evidence_complete
@@ -986,7 +995,9 @@ impl StartupCoordinator {
     /// Requires the recorded independent Watchdog observation to still describe
     /// exactly this candidate contour and exactly this consumer State Fence, and
     /// to still be inside the finite validity interval its own observation time
-    /// opens. Returns the Watchdog epoch the observation was taken under, so a
+    /// opens. Its local deadline is anchored to the remaining original window
+    /// at Kernel admission, so a later wall-clock rollback cannot extend it.
+    /// Returns the Watchdog epoch the observation was taken under, so a
     /// caller joins the lease it is verifying to the observation itself instead
     /// of to a retained string.
     ///
@@ -1026,8 +1037,12 @@ impl StartupCoordinator {
                 "the recorded Watchdog observation belongs to a different consumer State Fence",
             );
         }
+        let Some(local_deadline) = self.current_supervision_deadline else {
+            return Err("the Kernel-local Watchdog observation deadline is unavailable");
+        };
         if now_ms < current.observed_at_ms
             || now_ms >= current.heartbeat_proof.freshness_deadline_wall_ms
+            || Instant::now() >= local_deadline
         {
             return Err(
                 "the recorded Watchdog observation is outside its finite validity interval",
@@ -1048,9 +1063,10 @@ impl StartupCoordinator {
     ///
     /// Only a strictly newer original owner readiness sequence advances the
     /// claim. An exact replay is idempotent and retains the original receive
-    /// time and deadline. An older sequence or substituted proof contradicts
-    /// the standing claim: the prior record is retained, the claim is
-    /// withdrawn, and the caller is told. The contiguous I1.11 cursor is never
+    /// time, wall deadline and Kernel-local monotonic deadline. An older
+    /// sequence or substituted proof contradicts the standing claim: the
+    /// prior record is retained, the claim is withdrawn, and the caller is
+    /// told. The contiguous I1.11 cursor is never
     /// rolled back, so no earlier step is un-observed.
     ///
     /// # Errors
@@ -1062,6 +1078,7 @@ impl StartupCoordinator {
     pub(crate) fn record_live_supervision_evidence(
         &mut self,
         observation: WatchdogSupervisionObservation,
+        local_deadline: Instant,
     ) -> Result<bool, String> {
         let WatchdogSupervisionObservation {
             incarnation,
@@ -1076,6 +1093,12 @@ impl StartupCoordinator {
         if valid_for_ms == 0 {
             return Err(
                 "a Watchdog supervision observation needs a non-zero validity interval".to_owned(),
+            );
+        }
+        if Instant::now() >= local_deadline {
+            return Err(
+                "the original Watchdog heartbeat window expired before Kernel admission"
+                    .to_owned(),
             );
         }
         crate::verify_scm_watchdog_observation_shape(&incarnation).map_err(str::to_owned)?;
@@ -1109,6 +1132,17 @@ impl StartupCoordinator {
                 && current.observed_at_ms == observed_at_ms
                 && current.valid_for_ms == valid_for_ms
             {
+                let Some(current_deadline) = self.current_supervision_deadline else {
+                    return Err(
+                        "the retained Kernel-local Watchdog observation deadline is unavailable"
+                            .to_owned(),
+                    );
+                };
+                if Instant::now() >= current_deadline {
+                    return Err(
+                        "the retained original Watchdog heartbeat window has expired".to_owned(),
+                    );
+                }
                 return Ok(false);
             }
             if current.candidate_digest != candidate_digest
@@ -1126,6 +1160,7 @@ impl StartupCoordinator {
                 if let Some(previous) = self.current_supervision_observation.take() {
                     self.superseded_supervision_observation = Some(previous);
                 }
+                self.current_supervision_deadline = None;
                 self.supervision_evidence_complete = false;
                 self.record_governor_coverage_loss();
                 return Err(
@@ -1158,6 +1193,7 @@ impl StartupCoordinator {
             observed_at_ms,
             valid_for_ms,
         });
+        self.current_supervision_deadline = Some(local_deadline);
         Ok(true)
     }
 
@@ -1173,6 +1209,7 @@ impl StartupCoordinator {
     /// belonged to the previous activation.
     pub fn revoke_supervision_evidence(&mut self) {
         self.supervision_evidence_complete = false;
+        self.current_supervision_deadline = None;
         if let Some(previous) = self.current_supervision_observation.take() {
             self.superseded_supervision_observation = Some(previous);
         }

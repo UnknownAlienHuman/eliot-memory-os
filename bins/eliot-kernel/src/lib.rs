@@ -3174,6 +3174,10 @@ impl KernelComposition {
         }
         verify_scm_watchdog_observation_shape(&evidence.scm_watchdog_observation_digest)
             .map_err(|reason| KernelServiceError::Platform(reason.to_owned()))?;
+        // Anchor the original proof's remaining window to Kernel's own
+        // monotonic clock at authenticated admission. The Host monotonic value
+        // has a different process-local origin and is provenance only.
+        let admitted_monotonic = Instant::now();
         let now_ms = unix_ms();
         let valid_for_ms = heartbeat_proof
             .freshness_deadline_wall_ms
@@ -3193,6 +3197,22 @@ impl KernelComposition {
                     .to_owned(),
             ));
         }
+        let remaining_ms = heartbeat_proof
+            .freshness_deadline_wall_ms
+            .checked_sub(now_ms)
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "original Host heartbeat deadline is not in the future at Kernel admission"
+                        .to_owned(),
+                )
+            })?;
+        let local_deadline = admitted_monotonic
+            .checked_add(Duration::from_millis(remaining_ms))
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "Kernel-local Watchdog heartbeat deadline is not representable".to_owned(),
+                )
+            })?;
         let mut scm_parts = evidence.scm_watchdog_observation_digest.as_str().split(':');
         let scm_pid = scm_parts.nth(1).and_then(|value| value.parse::<u32>().ok());
         let scm_start = scm_parts.next().and_then(|value| value.parse::<u64>().ok());
@@ -3215,6 +3235,7 @@ impl KernelComposition {
             &evidence.state_fence,
             &incarnation.watchdog_epoch,
             heartbeat_proof,
+            local_deadline,
         )
     }
 
@@ -3417,6 +3438,7 @@ impl KernelComposition {
         state_fence: &StateFence,
         watchdog_epoch: &eliot_runtime_contracts::SupervisionJournalEpoch,
         heartbeat_proof: &eliot_kernel_service::AdmittedWatchdogHeartbeatProof,
+        local_deadline: Instant,
     ) -> Result<(), KernelServiceError> {
         let mut coordinator = self
             .startup_coordinator
@@ -3441,7 +3463,7 @@ impl KernelComposition {
             valid_for_ms,
         };
         coordinator
-            .record_live_supervision_evidence(observation)
+            .record_live_supervision_evidence(observation, local_deadline)
             .map(|_| ())
             .map_err(KernelServiceError::Platform)
     }
