@@ -238,7 +238,9 @@ use platform_security::{watchdog_task_readback_matches, watchdog_task_xml};
 /// unsafe stays inside this crate's identity owner; Host calls it under
 /// `#![forbid(unsafe_code)]`.
 pub use process_identity::directory_identity_for_path;
-pub use process_identity::{FileIdentity, ProcessIdentity, is_process_builtin_administrator};
+pub use process_identity::{
+    FileIdentity, ParentBoundProcessIdentity, ProcessIdentity, is_process_builtin_administrator,
+};
 pub(crate) use process_identity::{
     file_identity, file_identity_from_handle, inspect_process_handle, inspect_process_identity,
     process_token_identity, process_token_is_builtin_administrator, same_process_identity,
@@ -2952,6 +2954,16 @@ impl WindowsPlatform {
         process_identities_named(basename)
     }
 
+    /// Enumerates named processes together with their ToolHelp parent PID.
+    /// The child identity is re-opened and checked against the snapshot;
+    /// parent ownership remains a caller comparison against its live identity.
+    pub fn parent_bound_process_identities_named(
+        &self,
+        basename: &str,
+    ) -> Result<Vec<ParentBoundProcessIdentity>, WindowsAdapterError> {
+        parent_bound_process_identities_named(basename)
+    }
+
     /// Registers one validated ELIOT own-process service through SCM.
     ///
     /// This P-02-specific API deliberately does not reinterpret P-01's smaller
@@ -3241,6 +3253,94 @@ pub fn process_identities_named(
             Ok(identity)
         })
         .collect()
+}
+
+/// Captures ToolHelp's parent PID beside every exact live process identity
+/// whose executable basename matches `basename`.
+///
+/// A matching candidate that exits, changes image, or cannot be queried makes
+/// the complete census unavailable. Parent PID alone does not establish
+/// ownership; the consumer must compare it with a separately observed live
+/// parent identity.
+pub fn parent_bound_process_identities_named(
+    basename: &str,
+) -> Result<Vec<ParentBoundProcessIdentity>, WindowsAdapterError> {
+    if basename.is_empty()
+        || std::path::Path::new(basename)
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some(basename)
+    {
+        return Err(WindowsAdapterError::InvalidInput);
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+
+        // SAFETY: The ToolHelp snapshot is an owned process snapshot; it is
+        // closed exactly once below. PROCESSENTRY32W is initialized with its
+        // required size and remains writable for each enumeration call.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(last_windows_adapter_error());
+        }
+        let mut entry = PROCESSENTRY32W {
+            dwSize: u32::try_from(std::mem::size_of::<PROCESSENTRY32W>())
+                .map_err(|_| WindowsAdapterError::Failed)?,
+            ..Default::default()
+        };
+        let mut candidates = Vec::new();
+        let first = unsafe { Process32FirstW(snapshot, &raw mut entry) } != 0;
+        let mut terminal_error = 0_u32;
+        if first {
+            loop {
+                let length = entry
+                    .szExeFile
+                    .iter()
+                    .position(|unit| *unit == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
+                if process_basename_matches(&name, basename) {
+                    candidates.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                }
+                if unsafe { Process32NextW(snapshot, &raw mut entry) } == 0 {
+                    terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                    break;
+                }
+            }
+        } else {
+            terminal_error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        }
+        unsafe { CloseHandle(snapshot) };
+        if terminal_error != ERROR_NO_MORE_FILES {
+            return Err(WindowsAdapterError::Failed);
+        }
+        candidates
+            .into_iter()
+            .map(|(process_id, parent_process_id)| {
+                let process = inspect_process_identity(process_id)
+                    .map_err(|error| windows_adapter_from_io(&error))?;
+                if !process_basename_matches(&process.image_path, basename) {
+                    return Err(WindowsAdapterError::Failed);
+                }
+                Ok(ParentBoundProcessIdentity {
+                    process,
+                    parent_process_id,
+                })
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = basename;
+        Err(WindowsAdapterError::Unavailable)
+    }
 }
 
 fn process_ids_named(basename: &str) -> Result<Vec<u32>, WindowsAdapterError> {

@@ -51,6 +51,18 @@ pub struct ProcessIdentity {
     pub image_path: String,
 }
 
+/// ToolHelp parent edge captured beside an exact live process identity.
+///
+/// `parent_process_id` is only an observed OS relationship; callers must
+/// compare it with a still-live owner identity before treating it as launch
+/// lineage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParentBoundProcessIdentity {
+    pub process: ProcessIdentity,
+    pub parent_process_id: u32,
+}
+
 impl ProcessIdentity {
     pub(crate) fn is_usable(&self) -> bool {
         self.process_id != 0

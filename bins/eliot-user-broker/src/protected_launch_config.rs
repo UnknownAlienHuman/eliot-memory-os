@@ -97,27 +97,35 @@ pub(super) struct AdmittedInstallationProfile {
 /// admission still needs an OS-observed peer join at the listener.
 pub(super) fn observe_opencode_runtime(
     admitted: &AdmittedInstallationProfile,
+    broker_process_id: u32,
 ) -> Result<Vec<crate::OpenCodeRuntimeProcessObservation>, CompositionError> {
     let Some(adapter) = admitted.profile.opencode_adapter.as_ref() else {
         return Ok(Vec::new());
     };
-    let processes = eliot_platform_windows::process_identities_named("opencode.exe")
+    let processes = eliot_platform_windows::parent_bound_process_identities_named("opencode.exe")
         .map_err(|error| CompositionError::Launch(error.to_string()))?;
     processes
         .into_iter()
-        .map(|process| {
+        .map(|candidate| {
+            let process = candidate.process;
             let executable_sha256 = observe_process_image_sha256(&process)?;
             // The live process identity is re-read directly by the native
             // process owner after hashing the exact image file.
-            let live = eliot_platform_windows::process_identities_named("opencode.exe")
+            let live = eliot_platform_windows::parent_bound_process_identities_named("opencode.exe")
                 .map_err(|error| CompositionError::Launch(error.to_string()))?;
-            if !live.iter().any(|candidate| candidate == &process) {
+            if !live.iter().any(|observed| {
+                observed.process == process
+                    && observed.parent_process_id == candidate.parent_process_id
+            }) {
                 return Err(CompositionError::Launch(
-                    "OpenCode process identity changed during runtime observation".to_owned(),
+                    "OpenCode process or launch-parent identity changed during runtime observation"
+                        .to_owned(),
                 ));
             }
             Ok(crate::OpenCodeRuntimeProcessObservation {
                 process,
+                parent_process_id: candidate.parent_process_id,
+                launched_by_broker: candidate.parent_process_id == broker_process_id,
                 executable_sha256,
                 adapter_artifact_sha256: adapter.artifact_digest.as_str().to_owned(),
                 adapter_descriptor_sha256: adapter.descriptor_digest.as_str().to_owned(),

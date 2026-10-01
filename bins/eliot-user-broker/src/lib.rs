@@ -1259,6 +1259,12 @@ pub struct BrokerReadiness<'a> {
 pub struct OpenCodeRuntimeProcessObservation {
     /// Kernel-observed process id, start instant, and image path.
     pub process: ProcessIdentity,
+    /// ToolHelp parent PID captured alongside the process identity.
+    pub parent_process_id: u32,
+    /// Whether this process's observed parent PID is the still-live admitted
+    /// Broker PID. This records launch lineage only, not plugin loading or
+    /// callback authenticity.
+    pub launched_by_broker: bool,
     /// SHA-256 of the current executable file read through a no-follow handle.
     pub executable_sha256: String,
     /// Exact signed-installation-admitted plugin bytes digest.
@@ -1744,7 +1750,18 @@ impl BrokerComposition {
     fn refresh_opencode_runtime_observation(&mut self) {
         self.opencode_runtime_observation = match self.opencode_profile.as_ref() {
             None => OpenCodeRuntimeObservation::AdapterUnavailable,
-            Some(profile) => protected_launch_config::observe_opencode_runtime(profile)
+            Some(profile) => self
+                .process_binding
+                .as_ref()
+                .ok_or_else(|| {
+                    CompositionError::Launch("broker process binding is absent".to_owned())
+                })
+                .and_then(|binding| {
+                    protected_launch_config::observe_opencode_runtime(
+                        profile,
+                        binding.identity.process_id,
+                    )
+                })
                 .map(OpenCodeRuntimeObservation::Available)
                 .unwrap_or(OpenCodeRuntimeObservation::Unavailable),
         };
