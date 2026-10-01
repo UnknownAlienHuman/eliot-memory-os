@@ -26,13 +26,21 @@
 //!
 //! Role table (authenticated role travels as a separate fn argument):
 //!
+//! These rows MIRROR the owner; they do not define it. The single owner of the
+//! capability matrix is `BackupRole::capabilities`, and
+//! `tests/data/backup/role-capability-matrix.json` is its projection. A row
+//! here that contradicts either is a documentation defect, never authority to
+//! widen a role: a consumer that needs a contour its role does not carry
+//! narrows its own registered set instead.
+//!
 //! | Role | Permitted operations |
 //! |---|---|
 //! | REQUESTER | REQUEST_CAPTURE, READ_SNAPSHOT_PAGE, VERIFY_ARCHIVE, PREPARE_ISOLATED_RESTORE, RESTORE_STATUS, RECONCILE_RESTORE (no success receipts) |
-//! | CAPTURE_OWNER | own bounded snapshot only |
-//! | STORE_OWNER / ORS_OWNER / SPOOL_OWNER | own phase only (RESTORE_STEP, RESTORE_STATUS, RECONCILE_RESTORE) |
-//! | VERIFIER | VERIFY_ARCHIVE + COMPLETE_REHEARSAL only |
-//! | INSTALLATION_AUTHORITY | PREPARE_ISOLATED_RESTORE + ADMIT_CUTOVER alone |
+//! | CAPTURE_OWNER | own bounded snapshot only (READ_SNAPSHOT_PAGE, RESTORE_STATUS, RECONCILE_RESTORE) |
+//! | STORE_OWNER / ORS_OWNER | own phase only (RESTORE_STEP, RESTORE_STATUS, RECONCILE_RESTORE) |
+//! | SPOOL_OWNER | own spool only (READ_SNAPSHOT_PAGE, RECONCILE_RESTORE); deliberately narrower than STORE_OWNER / ORS_OWNER: no RESTORE_STEP, no RESTORE_STATUS |
+//! | VERIFIER | VERIFY_ARCHIVE + COMPLETE_REHEARSAL + RESTORE_STATUS only |
+//! | INSTALLATION_AUTHORITY | PREPARE_ISOLATED_RESTORE + ADMIT_CUTOVER + RESTORE_STATUS alone |
 //! | HOST_FORENSIC | observe-only; never active authority |
 //!
 //! Port table (owner -> attestation fn -> receipt type):
