@@ -289,7 +289,7 @@ pub use freshness_admission::{
 };
 pub use governor_authority_feed::{
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, GovernorAuthorityObservation,
-    maintain_governor_authority_feed, maintain_governor_authority_route_mismatch,
+    maintain_governor_authority_observation,
 };
 pub use governor_local_read::{
     answer_evidence_query, answer_projection_inputs, forward_admitted_local_read,
@@ -715,11 +715,11 @@ pub struct DaemonComposition {
     /// Constructed empty at [`DaemonComposition::start`] and owned here for
     /// the daemon's lifetime, so every projection published across the
     /// authenticated `publish_governor_authority` boundary derives from one
-    /// revision sequence: a degraded re-derivation publishes a new revision
-    /// that revokes everything issued under the old one. Fed only from
-    /// threaded live host/Watchdog/trace observation through
-    /// [`maintain_governor_authority_feed`](crate::maintain_governor_authority_feed);
-    /// nothing is derived here and no coverage is synthesized.
+    /// revision sequence: an unavailable or degraded original source page
+    /// publishes a narrower revision, while the Governor observation builder
+    /// alone classifies retained owner evidence. Fed through the authenticated
+    /// Kernel readback at
+    /// [`maintain_governor_authority_observation`](crate::maintain_governor_authority_observation).
     governor_authority: eliot_governor::LiveGovernorAuthority,
     /// Retained ingress record for an attach of an already-running
     /// external agent (issue #1782, I11.11 lines 27-42).
@@ -4002,8 +4002,8 @@ impl DaemonComposition {
     ///
     /// Mirrors [`Self::capability_admission_mut`]: readiness is checked
     /// first. Callers feed the held instance from threaded live
-    /// host/Watchdog/trace observation and publish the projection (see
-    /// [`maintain_governor_authority_feed`](crate::maintain_governor_authority_feed));
+    /// authenticated Kernel source observation and publish the projection
+    /// (see [`maintain_governor_authority_observation`](crate::maintain_governor_authority_observation));
     /// derivation semantics stay in the Governor owner.
     pub fn governor_authority_mut(
         &mut self,

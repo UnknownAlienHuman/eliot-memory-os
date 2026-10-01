@@ -4155,8 +4155,8 @@ enum GovernorAuthorityFlight {
 
 /// Starts one Governor authority drive pass (issue #1935 AUD1) on its own
 /// polled flight. The pass keeps its composition borrow inside the flight
-/// future (issue #2559): the bounded feed-plus-route-mismatch exchange the
-/// designated drivers perform runs there rather than awaited inside the
+/// future (issue #2559): the bounded source-readback and Governor publish
+/// exchange runs there rather than awaited inside the
 /// health tick, so health and shutdown stay pollable while it is outstanding.
 /// The pass runs at most once per heartbeat: an in-flight drive is never
 /// replaced. The stream's repeated-failure guard travels with the future
@@ -4236,31 +4236,21 @@ fn settle_governor_authority_completion(
 /// The composition borrow spans the bounded drive exchange inside this
 /// independently polled flight: the designated drivers borrow the single
 /// live Governor-owned derivation instance the composition root holds, and no
-/// second instance exists. Skipped passes perform no Kernel exchange at all.
+/// second instance exists. Every pass reads one bounded owner page; a pass
+/// skips publication only when neither an active profile nor prior baseline
+/// exists.
 async fn run_governor_authority_drive(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
     mut driver: GovernorAuthorityDriver,
     failure_guard: &mut RepeatedFailureGuard,
 ) -> GovernorAuthorityDriver {
-    // The live route observation is the validated Kernel-issued owner session
-    // binding (`DaemonKernelClient::owner_session_facts`): the literal bytes
-    // the handshake validated, never a locally minted session. Absent before
-    // any validated handshake, which fails this arm closed to "no live route"
-    // rather than inventing one.
-    let live_route = kernel
-        .owner_session_facts()
-        .map(|facts| facts.session_binding().to_owned());
-    // STITCH (issue #1935 produce side): no production owner on this base
-    // issues the verified active-fingerprint coverage, Watchdog supervision
-    // evidence, or trace freshness the feed derives from — the coverage
-    // crate's `candidate`/`verify` constructors are reached only by tests —
-    // so the feed arm honestly observes nothing and skips. The first publish
-    // stays pending and every Material/Critical gate keeps refusing closed
-    // until that observation owner lands and threads its bundle through this
-    // call site.
+    // The Kernel readback resolves the current original admitted adapter and
+    // pages its retained ORS source under authenticated Kernel owner facts.
+    // The daemon sends continuation cursors only; it never substitutes its
+    // session binding for the adapter fingerprint or chooses a stream owner.
     let mut guard = composition.lock().await;
-    match driver.drive_feed(&mut guard, kernel, None).await {
+    match driver.drive_kernel_observation(&mut guard, kernel).await {
         Ok(GovernorAuthorityDriveOutcome::FeedPublished { revision }) => {
             tracing::info!(
                 target: "eliotd::diagnostics",
@@ -4277,31 +4267,6 @@ async fn run_governor_authority_drive(
                 let _ = eliotd::diagnostics::ErrorRecord::of(
                     eliotd::diagnostics::OwningComponent::DaemonRuntime,
                     "governor-authority-feed",
-                    &error.to_string(),
-                )
-                .emit();
-            }
-        }
-    }
-    match driver
-        .drive_route_mismatch(&mut guard, kernel, live_route.as_deref())
-        .await
-    {
-        Ok(GovernorAuthorityDriveOutcome::RouteMismatchPublished { revision, revoked }) => {
-            tracing::info!(
-                target: "eliotd::diagnostics",
-                event = "eliotd.governor_authority_route_mismatch_published",
-                revision = revision,
-                revoked = revoked.len(),
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            // #740 A14: same guard-gated record as the feed arm above.
-            if failure_guard.should_emit() {
-                let _ = eliotd::diagnostics::ErrorRecord::of(
-                    eliotd::diagnostics::OwningComponent::DaemonRuntime,
-                    "governor-authority-route-mismatch",
                     &error.to_string(),
                 )
                 .emit();
