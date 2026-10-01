@@ -36,7 +36,7 @@
 use std::path::PathBuf;
 
 use eliot_ors::{
-    BackupCompleteness, BackupPartialReason, BACKUP_SNAPSHOT_SCHEMA_VERSION, EpochIdentity,
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, EpochIdentity,
     EpochLineage, KernelAuthoritySnapshot, KnownZeroVerdict, MAX_BACKUP_BYTES,
     MAX_BACKUP_PAGE_ENTRIES, OpaqueLabel, OperationalRecordContext, OperationalRecordInput,
     OperationalRecoveryStore, OrsBackupDestination, OrsBackupFence, OrsBackupImportRequest,
@@ -51,8 +51,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 /// A positive Unix millisecond stamp, well past 1970 and not a sentinel.
 const NOW_MS: i64 = 1_757_000_000_000;
 /// 64 lowercase hex characters, the shape `require_digest` enforces for a fence.
-const FENCE_DIGEST: &str =
-    "5f1d3c9a7b2e40618da4c9f70b3e5a2c8d1f4b6e09a3c7d5e1f8b2a4c6d8e0f1";
+const FENCE_DIGEST: &str = "5f1d3c9a7b2e40618da4c9f70b3e5a2c8d1f4b6e09a3c7d5e1f8b2a4c6d8e0f1";
 
 fn database_path(case: &str) -> PathBuf {
     let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -128,14 +127,13 @@ fn commit_authority(
     record_id: &str,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let lineage = epoch("953-w3k1-authority-lineage", 1)?;
-    let committed = store.commit_authority_snapshot(KernelAuthoritySnapshot::new(
-        operational_input(
+    let committed =
+        store.commit_authority_snapshot(KernelAuthoritySnapshot::new(operational_input(
             record_id,
             "953-w3k1-authority-subject",
             lineage,
             "opaque-authority-payload-953-w3k1",
-        )?,
-    )?)?;
+        )?)?)?;
     // The order the owner assigned is the store's observed ordering high-water,
     // which is exactly what an export request's fence must declare.
     Ok(committed.receipt().operation_order())
@@ -225,8 +223,7 @@ fn nonempty_member_set_refuses_known_zero_for_an_untriaged_member() -> TestResul
     let destination = RedbRecoveryStore::open(&destination_path)?;
     let high_water = commit_authority(&source_store, "953-w3k1-discriminator-authority")?;
 
-    let Exported { snapshot, import } =
-        export_snapshot(&source_store, &destination, high_water)?;
+    let Exported { snapshot, import } = export_snapshot(&source_store, &destination, high_water)?;
 
     // Precondition, measured rather than assumed: the archive really is
     // non-empty really does declare a member, and that member really is absent
@@ -254,10 +251,7 @@ fn nonempty_member_set_refuses_known_zero_for_an_untriaged_member() -> TestResul
     let receipt = destination.reconcile_backup_import(&import, &snapshot, &[], NOW_MS)?;
 
     assert!(
-        matches!(
-            receipt.known_zero_verdict,
-            KnownZeroVerdict::Refused { .. }
-        ),
+        matches!(receipt.known_zero_verdict, KnownZeroVerdict::Refused { .. }),
         "a nonempty snapshot reconciled against an EMPTY outcome accumulator must not report a known zero: {:?}",
         receipt.known_zero_verdict
     );
@@ -302,8 +296,7 @@ fn empty_member_set_still_produces_known_zero() -> TestResult {
     // denominator — this is a measured fact, not a missing one, which is exactly
     // what keeps a genuinely empty snapshot representable.
     let high_water = 0;
-    let Exported { snapshot, import } =
-        export_snapshot(&source_store, &destination, high_water)?;
+    let Exported { snapshot, import } = export_snapshot(&source_store, &destination, high_water)?;
 
     let expected = snapshot.expected_member_roster()?;
     assert!(
@@ -354,8 +347,7 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
     let destination = RedbRecoveryStore::open(&destination_path)?;
     let high_water = commit_authority(&source_store, "953-w3k1-duplicate-authority")?;
 
-    let Exported { snapshot, import } =
-        export_snapshot(&source_store, &destination, high_water)?;
+    let Exported { snapshot, import } = export_snapshot(&source_store, &destination, high_water)?;
     let expected = snapshot.expected_member_roster()?;
     assert!(
         !expected.is_empty(),
@@ -367,12 +359,18 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
     // audit says the old set comparison collapsed instead of rejecting.
     let outcomes = vec![
         (duplicated_id.clone(), PerEntryOutcome::Imported),
-        (duplicated_id.clone(), PerEntryOutcome::Rejected {
-            reason: "second, contradictory outcome for the same member".to_owned(),
-        }),
+        (
+            duplicated_id.clone(),
+            PerEntryOutcome::Rejected {
+                reason: "second, contradictory outcome for the same member".to_owned(),
+            },
+        ),
     ];
     assert_eq!(
-        outcomes.iter().filter(|(id, _)| *id == duplicated_id).count(),
+        outcomes
+            .iter()
+            .filter(|(id, _)| *id == duplicated_id)
+            .count(),
         2,
         "the fixture must actually present a duplicate outcome id"
     );
@@ -406,8 +404,7 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
     );
     assert_eq!(incomplete.per_entry, subset);
     assert!(matches!(
-        incomplete
-            .known_zero_unresolved(&incomplete.current_owner_validation),
+        incomplete.known_zero_unresolved(&incomplete.current_owner_validation),
         Err(OrsError::ReconciliationMismatch)
     ));
 

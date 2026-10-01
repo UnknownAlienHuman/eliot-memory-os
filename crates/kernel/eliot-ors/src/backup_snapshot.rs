@@ -3735,10 +3735,7 @@ impl OrsBackupImportReceipt {
     /// outcome vector survives for the caller to route.
     /// The REACHABILITY of [`KnownZeroVerdict::Satisfied`] is unchanged: a full
     /// checked roster with exact per-member outcomes still returns `Ok(())`.
-    fn owner_validation_is_complete(
-        &self,
-        owner: &CurrentOwnerValidation,
-    ) -> Result<(), OrsError> {
+    fn owner_validation_is_complete(&self, owner: &CurrentOwnerValidation) -> Result<(), OrsError> {
         // The expected/provided half of the coverage rule: repeats are refused by
         // `check_outcome_identities`, and this adds the set equality in both
         // directions, judged against the halves RECORDED on the receipt.
@@ -3799,8 +3796,7 @@ pub fn check_outcome_identities(
             return Err(OrsError::DuplicateConflict);
         }
     }
-    let expected_ids: BTreeSet<&str> =
-        expected.iter().map(|(_, record_id)| *record_id).collect();
+    let expected_ids: BTreeSet<&str> = expected.iter().map(|(_, record_id)| *record_id).collect();
     if expected_ids.len() != expected.len() {
         return Err(OrsError::ReconciliationMismatch);
     }
