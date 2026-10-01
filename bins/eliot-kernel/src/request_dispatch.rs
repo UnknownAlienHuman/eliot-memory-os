@@ -1655,7 +1655,7 @@ fn backup_verify_identity(
             &mut identity,
             &session.module_generation.state_fence,
             report,
-            &presented_bytes,
+            presented_bytes,
         )
         .map_err(|error| format!("{}: {}", error.field(), error.reason()))?;
     }
@@ -2407,8 +2407,6 @@ enum PriorVerification {
 /// "the owner did not authorise this reconciliation": the owner does re-prove
 /// that the reconciled operation IS the named operation, and it does so over the
 /// whole archive content, not over a correlation the caller chose.
-type AdmittedVerifyBundle = (Vec<u8>, Option<BackupVerifySuccessorPointer>);
-
 /// The EXACT key sets this route admits for one `backup.verify` payload.
 ///
 /// A CLOSED TWO-ARM UNION keyed on whether the protocol request is present, and
@@ -2432,68 +2430,95 @@ type AdmittedVerifyBundle = (Vec<u8>, Option<BackupVerifySuccessorPointer>);
 const VERIFY_INLINE_KEYS: &[&str] = &["bundle_hex"];
 const VERIFY_INLINE_SUCCESSOR_KEYS: &[&str] = &["bundle_hex", "successor_of"];
 const VERIFY_PROTOCOL_KEYS: &[&str] = &["bundle_hex", "verification"];
-const VERIFY_PROTOCOL_SUCCESSOR_KEYS: &[&str] =
-    &["bundle_hex", "successor_of", "verification"];
+const VERIFY_PROTOCOL_SUCCESSOR_KEYS: &[&str] = &["bundle_hex", "successor_of", "verification"];
 
-/// The one admitted `backup.verify` request (issue #2862, item I2).
+/// The INLINE arm's admitted `backup.verify` work (issue #2862, item I2).
 ///
-/// Two arms, and the ARM ITSELF decides whether the operation carries the
-/// EXISTING protocol request. That distinction is made here, at admission,
-/// rather than discovered later, because it is the difference between a
-/// structural candidate and a request that can be bound to owner provenance, and
-/// nothing downstream may blur it.
-enum AdmittedVerifyRequest {
-    /// The inline arm: bounded caller-presented archive bytes and no protocol
-    /// request. Unchanged behaviour, and it never carries owner provenance.
-    Inline(AdmittedVerifyBundle),
-    /// The protocol arm: the EXISTING protocol verification request, admitted
-    /// verbatim, beside the same bytes and the same succession pointer.
-    Protocol {
-        /// The admitted protocol request. Never a copy of its shape.
-        request: BackupVerifyAdmittedRequest,
-    },
-}
+/// One admitted `backup.verify` request: the inline archive bytes and the
+/// optional succession evidence, for the INLINE arm only.
+///
+/// The PROTOCOL arm does not appear here, and that is deliberate rather than
+/// incomplete. It is fully admitted — decoded through
+/// [`BackupVerifyAdmittedRequest`] and validated by the protocol's own
+/// `BackupArchiveVerification::validate` — inside
+/// [`admit_verify_bundle`], which then refuses it, because the arm's next step
+/// is to resolve an owner-issued handle into the exact bytes to verify and the
+/// retained-archive owner that would do that does not exist on this product.
+/// Returning an `AdmittedVerifyBundle` for an arm that cannot reach the capture
+/// owner would mean carrying bytes this route does not have, and returning the
+/// request itself would mean carrying a value no caller of the admission reads.
+/// So the arm is a typed refusal at the seam that owns it, and this alias is the
+/// inline arm's admitted work.
+type AdmittedVerifyBundle = (Vec<u8>, Option<BackupVerifySuccessorPointer>);
 
-/// Admits the bounded inline bundle bytes one verify frame presents, the
-/// optional succession evidence, and the EXISTING protocol verification request
-/// when the frame carries one.
+/// Field path the retained-archive refusal names on the PROTOCOL arm.
+///
+/// The missing thing is the resolution of an owner-issued handle, so this is the
+/// handle's own path and not the payload's. It is a typed refusal naming one
+/// absent owner, never a shape correction: the caller did nothing wrong and the
+/// reply says so by naming an owner rather than a field they can edit.
+const BACKUP_VERIFY_RETAINED_OWNER_FIELD: &str = "backup_verify.archive_handle";
+
+/// Bounded reason the retained-archive refusal names.
+///
+/// It states the one absent owner and nothing about the archive, so a caller
+/// learns that the arm is unavailable without learning anything about the bytes
+/// its request named, and without a hint that resubmitting the same request
+/// differently would help.
+const BACKUP_VERIFY_RETAINED_OWNER_REASON: &str = "the retained-archive owner that resolves a protocol archive handle into bytes does not exist yet";
+
+/// Admits the bounded inline bundle bytes one verify frame presents and the
+/// optional succession evidence, or admits and then refuses the EXISTING
+/// protocol verification request.
 ///
 /// Every refusal here is a shape failure decided before any owner is named: a
 /// non-object payload, an unexpected or missing key, a non-string or non-hex
 /// `bundle_hex`, empty bytes, a `verification` member that is not the protocol's
 /// own `BackupArchiveVerification`, and a `successor_of` that is not an object of
-/// exactly two 64-hex digests. The returned field and reason are the route's own
-/// shape vocabulary; the owner's refusal vocabulary is never used for a shape the
-/// owner never saw.
+/// exactly two 64-hex digests. The one refusal that is NOT a shape failure is the
+/// PROTOCOL arm's, and it says so by naming an absent owner rather than a field
+/// the caller can correct. Either way the returned field and reason are the
+/// route's own vocabulary; the owner's refusal vocabulary is never used for
+/// something the owner never saw.
 ///
 /// # THE PROTOCOL ARM (issue #2862, item I2)
 ///
 /// A payload carrying `verification` is decoded into
 /// [`BackupVerifyAdmittedRequest`], which embeds the EXISTING
-/// `BackupArchiveVerification` by value. Deserialising through that type rather
-/// than reading members out of the JSON object is what makes the admission
-/// CLOSED: the wrapper is `deny_unknown_fields`, and so is every type nested in
-/// it, so an unknown key at any depth is a refusal instead of a silently ignored
-/// field. The protocol's own `BackupArchiveVerification::validate` then runs at
-/// this seam, which is where the wire identity, the `VerifyArchive` operation
-/// binding, the request identity, the retained handle and both canonical digests
-/// are decided by the protocol owner rather than by a second set of shape rules
-/// written here.
+/// `BackupArchiveVerification` by value — no field redefined, none dropped.
+/// Deserialising through that type rather than reading members out of the JSON
+/// object is what makes the admission CLOSED: the wrapper is
+/// `deny_unknown_fields`, and so is every type nested in it, so an unknown key at
+/// any depth is a refusal instead of a silently ignored field. The protocol's own
+/// `BackupArchiveVerification::validate` then runs at this seam, which is where
+/// the wire identity, the `VerifyArchive` operation binding, the request identity,
+/// the retained handle and both canonical digests are decided by the protocol
+/// owner rather than by a second set of shape rules written here.
 ///
-/// Presenting the bytes beside the handle is what keeps the arm honest rather
-/// than decorative: the adapter requires the request's `handle.content_sha256`
-/// and `handle.byte_length` to be exactly the presented archive, so a handle for
-/// other content or other bytes refuses, and the gate then requires the OWNER to
-/// have issued that same handle together with the capture operation, receipt and
-/// roles. An inline frame that simply omits `verification` is the inline arm and
-/// is a structural candidate, which is exactly the level its evidence supports.
+/// The arm is then REFUSED, with the owner's own typed vocabulary. What it needs
+/// next is the exact bytes its owner-issued handle names, and only the
+/// retained-archive owner can supply them; none exists on this product, for the
+/// reasons enumerated in `super::backup_verify_provenance`'s module docs. Falling
+/// back to the caller's inline bytes instead would make the handle decorative and
+/// would let a caller present the very bytes the handle is meant to stand for, so
+/// there is no fallback: the arm refuses here, before the capture owner is
+/// called and before any request identity is built.
+///
+/// That refusal is a real, visible answer and not a stub: the protocol request is
+/// fully decoded and validated first, so a caller learns that its request is
+/// well-formed and that the ARM is what is unavailable. A future retained-archive
+/// owner replaces the `Err` with the owner's byte resolution and the rest of the
+/// route is already built for it — [`backup_verify_provenance::bind_protocol_request`]
+/// is the adapter that joins such a request to the archive, and
+/// [`check_provenance_binding`] is the gate that would then require the owner to
+/// stand behind it.
 ///
 /// `successor_of` is admitted only when present and is unchanged in meaning: it
 /// is a POINTER that only selects which durable row is read, and every check that
 /// decides whether the named operation may be observed still happens AFTER the
 /// real store read, in [`successor_may_observe`] and
 /// [`answer_successor_verification`].
-fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyRequest, (&'static str, String)> {
+fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, (&'static str, String)> {
     let Some(object) = payload.as_object() else {
         return Err(("backup.verify", "payload must be a JSON object".to_owned()));
     };
@@ -2503,10 +2528,10 @@ fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyRequest, (&'stat
         object.contains_key("verification"),
         object.contains_key("successor_of"),
     ) {
-        (false, false) => &VERIFY_INLINE_KEYS,
-        (false, true) => &VERIFY_INLINE_SUCCESSOR_KEYS,
-        (true, false) => &VERIFY_PROTOCOL_KEYS,
-        (true, true) => &VERIFY_PROTOCOL_SUCCESSOR_KEYS,
+        (false, false) => VERIFY_INLINE_KEYS,
+        (false, true) => VERIFY_INLINE_SUCCESSOR_KEYS,
+        (true, false) => VERIFY_PROTOCOL_KEYS,
+        (true, true) => VERIFY_PROTOCOL_SUCCESSOR_KEYS,
     };
     if let Err(reason) = require_exact_keys(object, admitted_keys) {
         return Err(("backup.verify", reason));
@@ -2527,10 +2552,10 @@ fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyRequest, (&'stat
     }
     let successor = admit_verify_successor(object)?;
     if !object.contains_key("verification") {
-        return Ok(AdmittedVerifyRequest::Inline((bundle_raw, successor)));
+        return Ok((bundle_raw, successor));
     }
-    let request: BackupVerifyAdmittedRequest = serde_json::from_value(Value::Object(object.clone()))
-        .map_err(|error| {
+    let request: BackupVerifyAdmittedRequest =
+        serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
             (
                 "backup.verification",
                 format!("is not an admitted archive-verification request: {error}"),
@@ -2542,7 +2567,10 @@ fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyRequest, (&'stat
             format!("is not a valid archive-verification request: {error}"),
         )
     })?;
-    Ok(AdmittedVerifyRequest::Protocol { request })
+    Err((
+        BACKUP_VERIFY_RETAINED_OWNER_FIELD,
+        BACKUP_VERIFY_RETAINED_OWNER_REASON.to_owned(),
+    ))
 }
 
 /// Admits the optional succession pointer and checks both of its digests for the
@@ -2755,36 +2783,45 @@ impl KernelComposition {
     /// installation mutation. The added effect is one durable readback row.
     ///
     /// #2862 (item I2) makes the admitted payload a CLOSED TWO-ARM UNION rather
-    /// than one inline-bytes shape. The INLINE arm is byte-for-byte what it was:
+    /// than one inline-bytes shape, and both arms are decided in
+    /// [`admit_verify_bundle`]. The INLINE arm is byte-for-byte what it was:
     /// caller-presented bytes, no protocol request, no owner provenance, a
-    /// durably replayable structural candidate. The PROTOCOL arm carries the
-    /// EXISTING `BackupArchiveVerification` beside those bytes, and it is
-    /// admitted only as a whole: the protocol request is REQUIRED once its key is
-    /// present, decoded into `BackupVerifyAdmittedRequest` (so an unknown field
-    /// at any depth is refused) and validated by the protocol's own
-    /// `BackupArchiveVerification::validate` at the admission seam. The arm then
-    /// runs the exhaustive checked adapter, which requires the request to be
-    /// about THIS operation and THESE bytes, and the pre-verdict gate, which
-    /// requires the OWNER to have issued the very handle the request names, the
-    /// capture operation and role behind the receipt, and the verifier role
-    /// behind the attestation. Presenting bytes does not bypass any of that: a
-    /// protocol request without owner evidence is refused at the gate exactly
-    /// like the inline arm's structural candidate, and neither can reach a
-    /// provenance-qualified verdict.
+    /// durably replayable structural candidate. It is the only arm that reaches
+    /// this function.
+    ///
+    /// The PROTOCOL arm carries the EXISTING `BackupArchiveVerification`, and it
+    /// is admitted as a whole — the request is REQUIRED once its key appears,
+    /// decoded into `BackupVerifyAdmittedRequest` so an unknown field at any depth
+    /// is refused, and validated by the protocol's own
+    /// `BackupArchiveVerification::validate` — and then refused there, because the
+    /// step it needs next is the resolution of an owner-issued handle into exact
+    /// bytes and the retained-archive owner that would do that does not exist on
+    /// this product. That refusal is upstream of this function on purpose: the
+    /// handler below has no bytes to decode and no owner to decode them with, so
+    /// a refusal here is the only truthful answer, and it is one the caller can
+    /// see rather than a silent downgrade to the inline arm. Falling back to the
+    /// caller's bytes would let a caller supply the very bytes the handle is meant
+    /// to stand for, which is the parallel shape this item exists to remove.
+    ///
+    /// What is already built for the arm's eventual owner is unchanged and still
+    /// on this route: `super::backup_verify_provenance::bind_protocol_request`
+    /// joins a protocol request to the archive and the operation, and
+    /// `check_provenance_binding` requires the owner to have issued the very
+    /// handle that request names, the capture operation and capture-owner role
+    /// behind the receipt, and the verifier role behind the attestation. Both take
+    /// the admitted request as a parameter, so a retained-archive owner supplies
+    /// bytes here and the rest of the route proceeds with no new shape.
     fn handle_backup_verify(
         &self,
         session: &Session,
         payload: &Value,
         idempotency_key: &str,
     ) -> Result<Value, TransportError> {
-        let (bundle_raw, successor, protocol_request) = match admit_verify_bundle(payload) {
-            Ok(AdmittedVerifyRequest::Inline((bundle_raw, successor))) => {
-                (bundle_raw, successor, None)
-            }
-            Ok(AdmittedVerifyRequest::Protocol { mut request }) => {
-                let successor = request.successor_of.take();
-                (bundle_raw, successor, Some(request))
-            }
+        // The PROTOCOL arm is admitted and refused inside the admission, so this
+        // destructuring is the INLINE arm only and there is no second admission
+        // path to keep in step with it.
+        let (bundle_raw, successor) = match admit_verify_bundle(payload) {
+            Ok(admitted) => admitted,
             Err((field, reason)) => {
                 return Ok(invalid_reply(
                     BACKUP_VERIFY_OPERATION,
@@ -2859,11 +2896,12 @@ impl KernelComposition {
         // The admitted protocol request is a GATE argument, not a fallback: a
         // frame that presented one has an owner-issued handle and receipt
         // REQUIRED, and a frame that presented none must have issued none, so
-        // neither arm can borrow the other's evidence.
+        // neither arm can borrow the other's evidence. On the INLINE arm — the
+        // only arm that reaches this point — that argument is `None`, and `None`
+        // is this arm's own answer rather than a default: it is exactly what makes
+        // the gate require the owner to have issued nothing.
         let provenance = OwnerProvenanceEvidence::unissued();
-        if let Err(refusal) =
-            check_provenance_binding(&provenance, protocol_request.as_ref(), &report, &bundle_raw)
-        {
+        if let Err(refusal) = check_provenance_binding(&provenance, None, &report, &bundle_raw) {
             return Ok(invalid_reply(
                 BACKUP_VERIFY_OPERATION,
                 idempotency_key,
@@ -2877,7 +2915,7 @@ impl KernelComposition {
             &report,
             &bundle_raw,
             &provenance,
-            protocol_request.as_ref(),
+            None,
             idempotency_key,
         ) {
             Ok(identity) => identity,

@@ -665,7 +665,56 @@ pub(crate) fn bind_protocol_request(
         });
     }
 
-    // THE ARCHIVE THIS OPERATION PRESENTED.
+    // The archive leg is its own function so this one keeps the operation and
+    // caller joins together with the projection that follows them.
+    check_protocol_archive_binding(verification, request, identity, report, presented_bytes)?;
+
+    // The PROJECTION. The protocol request's handle is the handle reference this
+    // operation vouches for, so it is what the ORS identity carries. The
+    // owner-issued handle is projected by `bind_into`; requiring the two to be
+    // the SAME value is what stops either from silently winning, and that
+    // equality is enforced in `check_provenance_binding`.
+    let projection = BackupVerifyArchiveHandleRef {
+        artifact_id: verification.handle.artifact_id.as_str().to_owned(),
+        owner_contract: verification.handle.contract.name.as_str().to_owned(),
+        source_revision: verification.handle.source_revision.clone(),
+        content_sha256: verification.handle.content_sha256.clone(),
+        byte_length: verification.handle.byte_length,
+    };
+    projection
+        .validate()
+        .map_err(|source| BackupProvenanceError::ProjectionRefused {
+            field: ARCHIVE_HANDLE_FIELD,
+            source,
+        })?;
+    identity.archive_handle = Some(projection);
+    Ok(())
+}
+
+/// Joins the admitted protocol request's ARCHIVE half to the archive this
+/// operation actually presented (issue #2862, item I2).
+///
+/// This is the third of the three joins [`bind_protocol_request`] makes, split
+/// out because the archive join is the largest of them and the two together no
+/// longer fit one function. It takes the three values it compares against —
+/// `report` (the capture owner's own record of the decoded archive),
+/// `presented_bytes` (the exact sequence it decoded) and `identity` (for the
+/// evidenced class the ORS identity already recorded) — so nothing is read from
+/// a sibling field of the value being written and no argument is carried that
+/// the body does not use.
+///
+/// Every comparison below is EXACT EQUALITY against a value this operation
+/// really holds. Nothing here is a second validation: the protocol's own
+/// `validate()` has already decided the wire identity, the digest shapes and both
+/// canonical digests, and this function decides only whether the request is about
+/// the archive in hand.
+fn check_protocol_archive_binding(
+    verification: &BackupArchiveVerification,
+    request: &BackupRequestIdentity,
+    identity: &BackupVerifyRequestIdentity,
+    report: &CaptureReport,
+    presented_bytes: &[u8],
+) -> Result<(), BackupProvenanceError> {
     if request.archive_id != report.backup_id {
         return Err(BackupProvenanceError::NotBound {
             field: "backup_verify.verification.identity.archive_id",
@@ -714,26 +763,6 @@ pub(crate) fn bind_protocol_request(
             field: "backup_verify.verification.identity.evidenced_class",
         });
     }
-
-    // The PROJECTION. The protocol request's handle is the handle reference this
-    // operation vouches for, so it is what the ORS identity carries. The
-    // owner-issued handle is projected by `bind_into`; requiring the two to be
-    // the SAME value is what stops either from silently winning, and that
-    // equality is enforced in `check_provenance_binding`.
-    let projection = BackupVerifyArchiveHandleRef {
-        artifact_id: verification.handle.artifact_id.as_str().to_owned(),
-        owner_contract: verification.handle.contract.name.as_str().to_owned(),
-        source_revision: verification.handle.source_revision.clone(),
-        content_sha256: verification.handle.content_sha256.clone(),
-        byte_length: verification.handle.byte_length,
-    };
-    projection
-        .validate()
-        .map_err(|source| BackupProvenanceError::ProjectionRefused {
-            field: ARCHIVE_HANDLE_FIELD,
-            source,
-        })?;
-    identity.archive_handle = Some(projection);
     Ok(())
 }
 
@@ -848,6 +877,58 @@ pub(crate) fn check_provenance_binding(
     report: &CaptureReport,
     presented_bytes: &[u8],
 ) -> Result<(), BackupProvenanceError> {
+    check_handle_binding(evidence, request, report, presented_bytes)?;
+    // The two pairs that must not be split. See the type doc.
+    if evidence.capture_receipt.is_some() != evidence.capture_owner.is_some() {
+        return Err(BackupProvenanceError::NotBound {
+            field: CAPTURE_OPERATION_FIELD,
+        });
+    }
+    if evidence.validity_attestation.is_some() != evidence.verifier.is_some() {
+        return Err(BackupProvenanceError::NotBound {
+            field: VALIDITY_ATTESTATION_FIELD,
+        });
+    }
+    if let (Some(receipt), Some(capture_owner)) =
+        (&evidence.capture_receipt, &evidence.capture_owner)
+    {
+        check_capture_receipt_against_operation(receipt, capture_owner)?;
+        // The capture operation → THIS archive and THIS operation.
+        check_capture_operation_binding(capture_owner, request, report)?;
+        if receipt.archive_id != report.backup_id {
+            return Err(BackupProvenanceError::NotBound {
+                field: "backup_verify.capture_receipt.archive_id",
+            });
+        }
+        if receipt.attesting_owner != report.owner_contract {
+            return Err(BackupProvenanceError::NotBound {
+                field: "backup_verify.capture_receipt.attesting_owner",
+            });
+        }
+    }
+    if let (Some(attestation), Some(verifier)) =
+        (&evidence.validity_attestation, &evidence.verifier)
+    {
+        check_validity_attestation_binding(attestation, *verifier, request, report)?;
+    }
+    Ok(())
+}
+
+/// Leg one: the retained handle, bound to the bytes in hand and to the protocol
+/// request that names it (issue #2862, items I2 and I4).
+///
+/// Two relations live here because they are the same fact seen from two sides,
+/// and the ORDER matters: the handle and the protocol request must first be the
+/// SAME value, and only then is either of them compared against the archive.
+/// A protocol request whose handle is for other content, or an owner-issued
+/// handle with no protocol request behind it, has no operation to belong to and
+/// refuses before any archive comparison is attempted.
+fn check_handle_binding(
+    evidence: &OwnerProvenanceEvidence,
+    request: Option<&BackupVerifyAdmittedRequest>,
+    report: &CaptureReport,
+    presented_bytes: &[u8],
+) -> Result<(), BackupProvenanceError> {
     // The retained handle and the admitted protocol request are the SAME fact.
     match (evidence.archive_handle.as_ref(), request) {
         (Some(_), None) => {
@@ -869,175 +950,216 @@ pub(crate) fn check_provenance_binding(
         }
         (None, None) => {}
     }
-    // The two pairs that must not be split. See the type doc.
-    if evidence.capture_receipt.is_some() != evidence.capture_owner.is_some() {
+    let Some(handle) = &evidence.archive_handle else {
+        return Ok(());
+    };
+    handle.validate(ARCHIVE_HANDLE_FIELD).map_err(|source| {
+        BackupProvenanceError::OwnerValueInvalid {
+            field: ARCHIVE_HANDLE_FIELD,
+            source,
+        }
+    })?;
+    if handle.content_sha256 != report.archive_sha256 {
         return Err(BackupProvenanceError::NotBound {
-            field: CAPTURE_OPERATION_FIELD,
+            field: "backup_verify.archive_handle.content_sha256",
         });
     }
-    if evidence.validity_attestation.is_some() != evidence.verifier.is_some() {
+    if handle.byte_length != presented_bytes.len() as u64 {
         return Err(BackupProvenanceError::NotBound {
-            field: VALIDITY_ATTESTATION_FIELD,
+            field: "backup_verify.archive_handle.byte_length",
         });
     }
-    if let Some(handle) = &evidence.archive_handle {
-        handle
-            .validate(ARCHIVE_HANDLE_FIELD)
-            .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
-                field: ARCHIVE_HANDLE_FIELD,
-                source,
-            })?;
-        if handle.content_sha256 != report.archive_sha256 {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.archive_handle.content_sha256",
-            });
-        }
-        if handle.byte_length != presented_bytes.len() as u64 {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.archive_handle.byte_length",
-            });
-        }
-        if handle.contract.name.as_str() != report.owner_contract {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.archive_handle.contract",
-            });
-        }
+    if handle.contract.name.as_str() != report.owner_contract {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.archive_handle.contract",
+        });
     }
-    if let (Some(receipt), Some(capture_owner)) = (&evidence.capture_receipt, &evidence.capture_owner) {
-        // The ORIGINAL RECORDED values through the protocol's OWN validators.
-        receipt
-            .validate()
-            .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
-                field: CAPTURE_RECEIPT_FIELD,
-                source,
-            })?;
-        capture_owner
-            .operation
-            .validate()
-            .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
-                field: CAPTURE_OPERATION_FIELD,
-                source,
-            })?;
-        // The protocol's own relation check, with the AUTHENTICATED role as its
-        // separate argument. It requires the role to equal the capture request
-        // identity's own `principal.role` AND to be `CaptureOwner`, and compares
-        // archive id, snapshot digest, member digest, class, exact fence and
-        // evidence currency. A receipt for another archive, snapshot,
-        // membership, class, fence, or one no capture owner authenticated,
-        // refuses HERE, before any verdict exists.
-        receipt
-            .validate_against(&capture_owner.operation.identity, capture_owner.authenticated_role)
-            .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
-                field: CAPTURE_RECEIPT_FIELD,
-                source,
-            })?;
-        // The capture operation → THIS archive.
-        if capture_owner.operation.identity.archive_id != report.backup_id {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.capture_operation.archive_id",
-            });
-        }
-        if capture_owner.operation.identity.archive_digest != report.archive_sha256 {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.capture_operation.archive_digest",
-            });
-        }
-        if capture_owner.operation.identity.owner_contract.name.as_str() != report.owner_contract {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.capture_operation.owner_contract",
-            });
-        }
-        if capture_owner.operation.identity.source_installation != report.source_installation {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.capture_operation.source_installation",
-            });
-        }
-        // The receipt's fence is tied BY VALUE to the capture operation's fence
-        // by `validate_against`, so the complete-fence digest below is taken
-        // over the fence the receipt was actually issued under rather than over
-        // the receipt's own copy of it.
-        if archived_state_fence_digest(&capture_owner.operation.identity.fence)
-            .map_err(|_| BackupProvenanceError::ArchiveFenceUndecidable)?
-            != report.archived_state_fence_digest
-        {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.capture_operation.fence",
-            });
-        }
-        // The evidenced class the capture operation declared, against the class
-        // the capture owner read out of the decoded archive.
-        BackupClassWire::validate_transition(
-            wire_class(report.class),
-            capture_owner.operation.identity.class,
-        )
+    Ok(())
+}
+
+/// Leg two: the capture receipt against the CAPTURE OPERATION it was issued
+/// under, with the authenticated capture-owner role (issue #2862, item I4).
+///
+/// This leg is the one that makes the receipt bound to an OPERATION rather than
+/// merely consistent with an archive, and it is stated entirely through the
+/// protocol's own validators:
+///
+/// - both values are validated as the ORIGINAL RECORDED values through their own
+///   `validate()`, so a recomputed digest never stands in for the check;
+/// - [`BackupCaptureReceipt::validate_against`] is then called with the capture
+///   request identity and the authenticated role as SEPARATE arguments, because a
+///   value in a payload never grants a role. It requires the role to equal the
+///   capture request identity's own `principal.role` AND to be
+///   `BackupRole::CaptureOwner`, and it compares the receipt's archive id,
+///   snapshot digest, member digest, class, exact fence and evidence currency
+///   against that operation.
+///
+/// A receipt for another archive, another snapshot, another membership, another
+/// class, another fence, or one that no capture owner channel authenticated,
+/// refuses HERE — before any verdict exists, and before the archive this
+/// operation presented is consulted at all.
+fn check_capture_receipt_against_operation(
+    receipt: &BackupCaptureReceipt,
+    capture_owner: &CaptureOwnerAttestation,
+) -> Result<(), BackupProvenanceError> {
+    receipt
+        .validate()
         .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
-            field: "backup_verify.capture_operation.class",
+            field: CAPTURE_RECEIPT_FIELD,
             source,
         })?;
-        // The capture operation → THIS operation, for the two digests the
-        // archive format does not carry. `validate_against` tied the receipt's
-        // copies to the capture operation's; these tie the capture operation's
-        // to the verification request that IS this operation, so the snapshot and
-        // membership the receipt attests are the ones this verification asked
-        // about.
-        if let Some(admitted) = request {
-            if capture_owner.operation.identity.snapshot_digest
-                != admitted.verification.identity.snapshot_digest
-            {
-                return Err(BackupProvenanceError::NotBound {
-                    field: "backup_verify.capture_operation.snapshot_digest",
-                });
-            }
-            if capture_owner.operation.identity.member_digest
-                != admitted.verification.identity.member_digest
-            {
-                return Err(BackupProvenanceError::NotBound {
-                    field: "backup_verify.capture_operation.member_digest",
-                });
-            }
+    capture_owner.operation.validate().map_err(|source| {
+        BackupProvenanceError::OwnerValueInvalid {
+            field: CAPTURE_OPERATION_FIELD,
+            source,
         }
-        if receipt.archive_id != report.backup_id {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.capture_receipt.archive_id",
-            });
-        }
-        if receipt.attesting_owner != report.owner_contract {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.capture_receipt.attesting_owner",
-            });
-        }
+    })?;
+    receipt
+        .validate_against(
+            &capture_owner.operation.identity,
+            capture_owner.authenticated_role,
+        )
+        .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
+            field: CAPTURE_RECEIPT_FIELD,
+            source,
+        })
+}
+
+/// Leg three: the capture operation against THIS archive and THIS verification
+/// operation (issue #2862, item I4).
+///
+/// Leg two tied the receipt to the capture operation; this leg ties that
+/// operation to the thing actually in hand, and every term is exact equality
+/// against a value this operation really holds. `request` is the admitted
+/// protocol request, and it is `None` only on the inline arm, where the two
+/// digest joins below are not applicable because no protocol request exists to
+/// join them to.
+fn check_capture_operation_binding(
+    capture_owner: &CaptureOwnerAttestation,
+    request: Option<&BackupVerifyAdmittedRequest>,
+    report: &CaptureReport,
+) -> Result<(), BackupProvenanceError> {
+    // The capture operation → THIS archive.
+    if capture_owner.operation.identity.archive_id != report.backup_id {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.capture_operation.archive_id",
+        });
     }
-    if let (Some(attestation), Some(verifier)) =
-        (&evidence.validity_attestation, &evidence.verifier)
+    if capture_owner.operation.identity.archive_digest != report.archive_sha256 {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.capture_operation.archive_digest",
+        });
+    }
+    if capture_owner
+        .operation
+        .identity
+        .owner_contract
+        .name
+        .as_str()
+        != report.owner_contract
     {
-        // The ORIGINAL RECORDED value through its own validator, then the
-        // protocol's own relation check against the admitted protocol request
-        // with the authenticated verifier role as its separate argument. Only
-        // `BackupRole::Verifier` is accepted, and the role must equal the
-        // request identity's own `principal.role`.
-        let Some(admitted) = request else {
-            return Err(BackupProvenanceError::NotBound {
-                field: ARCHIVE_VERIFICATION_FIELD,
-            });
-        };
-        attestation
-            .validate_against(&admitted.verification.identity, verifier.authenticated_role)
-            .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
-                field: VALIDITY_ATTESTATION_FIELD,
-                source,
-            })?;
-        if attestation.archive_id != report.backup_id
-            || attestation.archive_digest != report.archive_sha256
-        {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.validity_attestation.archive",
-            });
-        }
-        if attestation.attesting_owner != report.owner_contract {
-            return Err(BackupProvenanceError::NotBound {
-                field: "backup_verify.validity_attestation.attesting_owner",
-            });
-        }
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.capture_operation.owner_contract",
+        });
+    }
+    if capture_owner.operation.identity.source_installation != report.source_installation {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.capture_operation.source_installation",
+        });
+    }
+    // The receipt's fence is tied BY VALUE to the capture operation's fence by
+    // leg two, so the complete-fence digest below is taken over the fence the
+    // receipt was actually issued under rather than over the receipt's own copy.
+    if archived_state_fence_digest(&capture_owner.operation.identity.fence)
+        .map_err(|_| BackupProvenanceError::ArchiveFenceUndecidable)?
+        != report.archived_state_fence_digest
+    {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.capture_operation.fence",
+        });
+    }
+    // The evidenced class the capture operation declared, against the class the
+    // capture owner read out of the decoded archive.
+    BackupClassWire::validate_transition(
+        wire_class(report.class),
+        capture_owner.operation.identity.class,
+    )
+    .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
+        field: "backup_verify.capture_operation.class",
+        source,
+    })?;
+    // The capture operation → THIS operation, for the two digests the archive
+    // format does not carry. Leg two tied the receipt's copies to the capture
+    // operation's; these tie the capture operation's to the verification request
+    // that IS this operation, so the snapshot and membership the receipt attests
+    // are the ones this verification asked about.
+    let Some(admitted) = request else {
+        return Ok(());
+    };
+    if capture_owner.operation.identity.snapshot_digest
+        != admitted.verification.identity.snapshot_digest
+    {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.capture_operation.snapshot_digest",
+        });
+    }
+    if capture_owner.operation.identity.member_digest
+        != admitted.verification.identity.member_digest
+    {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.capture_operation.member_digest",
+        });
+    }
+    Ok(())
+}
+
+/// Leg four: the verifier's archive validity attestation against THIS operation
+/// (issue #2862, items I4 and A1).
+///
+/// The typed attestation is checked by the protocol's own
+/// [`BackupArchiveValidityAttestation::validate_against`] with the admitted
+/// protocol request identity and the authenticated verifier role as separate
+/// arguments. Only `BackupRole::Verifier` is accepted there, and the role must
+/// equal the request identity's own `principal.role` — so the verdict is never
+/// creditable to a role the payload merely names.
+///
+/// An attestation with no protocol request behind it has no operation to be
+/// valid FOR, so it refuses rather than being compared against the archive
+/// alone. Note that the attested fence is deliberately NOT compared against the
+/// archive's historical fence: a validity attestation states the archive is valid
+/// as observed NOW, so the protocol binds it to the request's current fence, and
+/// the archive's own historical fence is the separate archived-fence relation
+/// the capture owner already reports.
+fn check_validity_attestation_binding(
+    attestation: &BackupArchiveValidityAttestation,
+    // BY VALUE because the type is `Copy` — it is a single closed protocol role,
+    // and passing a reference to it would be a needless borrow.
+    verifier: VerifierAttestation,
+    request: Option<&BackupVerifyAdmittedRequest>,
+    report: &CaptureReport,
+) -> Result<(), BackupProvenanceError> {
+    let Some(admitted) = request else {
+        return Err(BackupProvenanceError::NotBound {
+            field: ARCHIVE_VERIFICATION_FIELD,
+        });
+    };
+    attestation
+        .validate_against(&admitted.verification.identity, verifier.authenticated_role)
+        .map_err(|source| BackupProvenanceError::OwnerValueInvalid {
+            field: VALIDITY_ATTESTATION_FIELD,
+            source,
+        })?;
+    if attestation.archive_id != report.backup_id
+        || attestation.archive_digest != report.archive_sha256
+    {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.validity_attestation.archive",
+        });
+    }
+    if attestation.attesting_owner != report.owner_contract {
+        return Err(BackupProvenanceError::NotBound {
+            field: "backup_verify.validity_attestation.attesting_owner",
+        });
     }
     Ok(())
 }
