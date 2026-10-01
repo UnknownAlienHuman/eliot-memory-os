@@ -6,6 +6,7 @@ use eliot_types::{
     DelegationState, ProviderCallBudgetState, ProviderCallLedger, ProviderCallReservation,
     ProviderCallReservationState, TaskId, WorkLease, WorktreeLease,
 };
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -234,7 +235,8 @@ impl ProviderCallReservationOwner {
             }
             let budget = ProviderCallBudgetState {
                 campaign_id: request.campaign_id,
-                schema_version: "provider-call-campaign-v1".to_owned(),
+                schema_version: eliot_types::delegation::PROVIDER_CALL_CAMPAIGN_SCHEMA_VERSION
+                    .to_owned(),
                 max_calls: request.max_calls,
                 next_slot_index: 1,
                 reserved_slots: 0,
@@ -572,7 +574,134 @@ fn refresh_provider_call_budget(ledger: &mut ProviderCallLedger, budget_index: u
     ledger.budgets[budget_index].updated_at = OffsetDateTime::now_utc();
 }
 
+/// State-specific evidence for one provider call reservation.
+///
+/// The transitions on `ProviderCallReservationOwner` are the only writer of
+/// these fields, so the evidence each state may carry is fixed: a reservation
+/// that claims a state must carry the evidence that state is recognised by, and
+/// must not carry evidence of a state it never reached. A record that inverts
+/// this reads as trusted dispatch, invocation, review or budget evidence it
+/// never recorded.
+fn validate_provider_call_reservation_evidence(
+    reservation: &ProviderCallReservation,
+) -> Result<(), EngineError> {
+    let started = reservation.dispatch_started_at.is_some();
+    let invoked = reservation.external_invocation_ref.is_some();
+    let reviewed = reservation.review_ref.is_some();
+    let terminal = reservation.terminal_at.is_some();
+    let explained = reservation.release_or_failure_reason.is_some();
+    let consistent = match reservation.state {
+        ProviderCallReservationState::Reserved | ProviderCallReservationState::Dispatching => {
+            !started
+                && !invoked
+                && !reviewed
+                && !terminal
+                && !explained
+                && reservation.consumes_budget
+        }
+        ProviderCallReservationState::Dispatched => {
+            started
+                && invoked
+                && !reviewed
+                && !terminal
+                && !explained
+                && reservation.consumes_budget
+        }
+        ProviderCallReservationState::Completed => {
+            started && invoked && reviewed && terminal && !explained
+        }
+        ProviderCallReservationState::Failed => {
+            started && invoked && !reviewed && terminal && explained
+        }
+        // An unknown outcome is reachable from `Dispatching` as well as from
+        // `Dispatched`, so whether it carries dispatch evidence is genuinely
+        // unknown; the terminal record and its reason are not.
+        ProviderCallReservationState::UnknownOutcome => {
+            !reviewed && terminal && explained && reservation.consumes_budget
+        }
+        ProviderCallReservationState::ReleasedPreDispatch => {
+            !started
+                && !invoked
+                && !reviewed
+                && terminal
+                && explained
+                && !reservation.consumes_budget
+        }
+    };
+    if consistent {
+        Ok(())
+    } else {
+        Err(rejected(
+            "provider call reservation evidence contradicts its recorded state",
+        ))
+    }
+}
+
+/// The complete relation a provider-call ledger must prove before any caller may
+/// read a campaign budget or a reservation out of it.
+///
+/// Budget arithmetic alone does not identify anything: an empty or
+/// version-foreign campaign, a duplicated campaign, reservation or idempotency
+/// identity, a reservation bound to no budget, a counter that does not match the
+/// reservations it summarises, or a state whose evidence contradicts it all
+/// decode as an ordinary ledger and are then trusted by `open_campaign`,
+/// `reserve` and every transition. This validator is the single owner of those
+/// relations and `load_provider_call_ledger` and `mutate` both run it, so a
+/// refusal here blocks new provider calls instead of admitting a fresh budget.
 fn validate_provider_call_ledger(ledger: &ProviderCallLedger) -> Result<(), EngineError> {
+    let mut campaign_ids: HashSet<&str> = HashSet::new();
+    for budget in &ledger.budgets {
+        if budget.campaign_id.trim().is_empty() {
+            return Err(rejected("provider call campaign ID must not be empty"));
+        }
+        if budget.schema_version != eliot_types::delegation::PROVIDER_CALL_CAMPAIGN_SCHEMA_VERSION {
+            return Err(rejected(
+                "provider call budget schema version is not owned by this build",
+            ));
+        }
+        if !campaign_ids.insert(budget.campaign_id.as_str()) {
+            return Err(rejected("provider call campaign ID is not unique"));
+        }
+    }
+
+    let mut reservation_ids: HashSet<&str> = HashSet::new();
+    let mut idempotency_keys: HashSet<(&str, &str)> = HashSet::new();
+    for reservation in &ledger.reservations {
+        for (label, value) in [
+            ("reservation ID", reservation.reservation_id.as_str()),
+            ("campaign ID", reservation.campaign_id.as_str()),
+            ("provider", reservation.provider.as_str()),
+            ("idempotency key", reservation.idempotency_key.as_str()),
+            (
+                "gate decision reference",
+                reservation.gate_decision_ref.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(rejected(&format!(
+                    "provider call reservation {label} must not be empty"
+                )));
+            }
+        }
+        if !reservation_ids.insert(reservation.reservation_id.as_str()) {
+            return Err(rejected("provider call reservation ID is not unique"));
+        }
+        if !campaign_ids.contains(reservation.campaign_id.as_str()) {
+            return Err(rejected(
+                "provider call reservation references no campaign budget",
+            ));
+        }
+        if !idempotency_keys.insert((
+            reservation.campaign_id.as_str(),
+            reservation.idempotency_key.as_str(),
+        )) {
+            return Err(rejected(
+                "provider call idempotency key is not unique within its campaign",
+            ));
+        }
+        validate_provider_call_reservation_evidence(reservation)?;
+    }
+
     for budget in &ledger.budgets {
         if budget.dispatched_slots > budget.max_calls
             || budget.remaining_calls > budget.max_calls
@@ -583,22 +712,62 @@ fn validate_provider_call_ledger(ledger: &ProviderCallLedger) -> Result<(), Engi
         {
             return Err(rejected("provider call budget invariant violated"));
         }
-        let mut slots = ledger
+        let scoped = ledger
             .reservations
             .iter()
             .filter(|reservation| reservation.campaign_id == budget.campaign_id)
+            .collect::<Vec<_>>();
+        let mut slots = scoped
+            .iter()
             .map(|reservation| reservation.slot_index)
             .collect::<Vec<_>>();
         slots.sort_unstable();
         slots.dedup();
-        if slots.len()
-            != ledger
-                .reservations
-                .iter()
-                .filter(|reservation| reservation.campaign_id == budget.campaign_id)
-                .count()
-        {
+        if slots.len() != scoped.len() {
             return Err(rejected("provider call reservation slot is not unique"));
+        }
+        // The counters are recomputed from the reservations themselves, using
+        // the same definitions `refresh_provider_call_budget` writes, so a
+        // budget that undercounts its own reservations cannot be trusted to
+        // admit another provider call.
+        let reserved = bounded_u32(
+            scoped
+                .iter()
+                .filter(|reservation| {
+                    matches!(
+                        reservation.state,
+                        ProviderCallReservationState::Reserved
+                            | ProviderCallReservationState::Dispatching
+                    )
+                })
+                .count(),
+        );
+        let dispatched = bounded_u32(
+            scoped
+                .iter()
+                .filter(|reservation| reservation.dispatch_started_at.is_some())
+                .count(),
+        );
+        let terminal = bounded_u32(
+            scoped
+                .iter()
+                .filter(|reservation| reservation.terminal_at.is_some())
+                .count(),
+        );
+        let remaining = budget.max_calls.saturating_sub(bounded_u32(
+            scoped
+                .iter()
+                .filter(|reservation| reservation.consumes_budget)
+                .count(),
+        ));
+        if budget.reserved_slots != reserved
+            || budget.dispatched_slots != dispatched
+            || budget.terminal_slots != terminal
+            || budget.remaining_calls != remaining
+        {
+            return Err(rejected(
+                "provider call budget counters do not match its reservations",
+            ));
         }
     }
     Ok(())
@@ -619,21 +788,77 @@ fn rejected(message: &str) -> EngineError {
     EngineError::WriteRejected(message.to_owned())
 }
 
+/// Bounded per-candidate decode diagnostic.
+///
+/// A candidate file is a durable authoritative record, so a failed candidate
+/// must stay distinguishable from an absent one without echoing a single byte
+/// of the stored ledger onto an operator surface. Only the candidate's file
+/// name, the serde error category and its position are retained.
+fn provider_call_ledger_diagnostic(candidate: &Path, error: &serde_json::Error) -> String {
+    let label = provider_call_ledger_candidate_label(candidate);
+    let category = error.classify();
+    format!("{label}: {category} at line {} column {}", error.line(), error.column())
+}
+
+fn provider_call_ledger_candidate_label(candidate: &Path) -> String {
+    candidate
+        .file_name()
+        .map_or_else(
+            || "<provider-call-ledger>".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+}
+
+/// Loads the authoritative provider-call ledger, or proves that there is none.
+///
+/// Absence and corruption are different states. When no candidate file exists
+/// yet this is a genuine first campaign and the default empty ledger is the
+/// correct answer. When at least one candidate exists and none of them decodes
+/// and validates, the historical coverage of that ledger is unknown: it must
+/// refuse as one typed, bounded corruption so `open_campaign` and `reserve`
+/// cannot open a fresh budget and admit a replacement provider effect while the
+/// prior calls remain unresolved. A decode failure is never a reason to start
+/// from empty.
 fn load_provider_call_ledger(path: &Path) -> Result<ProviderCallLedger, EngineError> {
+    let mut existing = 0usize;
+    let mut diagnostics: Vec<String> = Vec::new();
     for candidate in [
         path.to_path_buf(),
         path.with_extension("json.next"),
         path.with_extension("json.bak"),
     ] {
-        if candidate.is_file()
-            && let Ok(ledger) =
-                serde_json::from_reader::<_, ProviderCallLedger>(File::open(candidate)?)
-        {
-            validate_provider_call_ledger(&ledger)?;
-            return Ok(ledger);
+        if !candidate.is_file() {
+            continue;
+        }
+        existing += 1;
+        let label = provider_call_ledger_candidate_label(&candidate);
+        let decoded = match File::open(&candidate) {
+            Ok(file) => serde_json::from_reader::<_, ProviderCallLedger>(file)
+                .map_err(|error| provider_call_ledger_diagnostic(&candidate, &error)),
+            Err(error) => Err(format!("{label}: unreadable ({error:?})")),
+        };
+        let ledger = match decoded {
+            Ok(ledger) => ledger,
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                continue;
+            }
+        };
+        match validate_provider_call_ledger(&ledger) {
+            Ok(()) => return Ok(ledger),
+            Err(error) => diagnostics.push(format!("{label}: {error}")),
         }
     }
-    Ok(ProviderCallLedger::default())
+    if existing == 0 {
+        return Ok(ProviderCallLedger::default());
+    }
+    Err(EngineError::ServiceNotReady {
+        service: "provider_call_ledger".to_owned(),
+        reason: format!(
+            "provider call ledger state is unknown: {existing} candidate file(s) exist and none decoded and validated ({})",
+            diagnostics.join("; ")
+        ),
+    })
 }
 
 fn write_provider_call_ledger(path: &Path, ledger: &ProviderCallLedger) -> Result<(), EngineError> {
