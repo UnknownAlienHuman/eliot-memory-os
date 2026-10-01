@@ -331,7 +331,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.compiler-wasm/test_capsule.json",
-          "artifact_digest": "8f3232f774d3062d2c2875d292816b2025f5510975697f2057a4e4e906277d3e",
+          "artifact_digest": "4aa55153b20aff554908ecc44cb80b63ae06721842618c11cf845a63fe73eb2d",
           "contract_revision": "3b5dd504aad34b88"
         }
       }
@@ -380,7 +380,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.activation-wasm/test_capsule.json",
-          "artifact_digest": "2c6312e7fdb31a074e5d8c50482ed545248b7c394c8356c66aae9605400cd517",
+          "artifact_digest": "4d87f63d664e1fdc2fe52956068cfc342e1b8079d02612a06c4da012f2cb24da",
           "contract_revision": "67e4dffd10a5edac"
         }
       }
@@ -429,7 +429,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.curation-wasm/test_capsule.json",
-          "artifact_digest": "d630afb07ce8efce037646c6c67b1f855bed2eb88103192a6e3900fb76bf638d",
+          "artifact_digest": "bacf94169609396ba262a176170d5ba2074719534922a4a5ab06031effd126ee",
           "contract_revision": "b685ee154ff65911"
         }
       }
@@ -478,7 +478,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.cycle-wasm/test_capsule.json",
-          "artifact_digest": "9e445b412f45657c2e528f416863ab62b843e5bb1687d8b959690c70fc1cc7a0",
+          "artifact_digest": "2b9378438b3c9671d87f71e452a8394789955905430daa00e6dc330f9003d6f0",
           "contract_revision": "7810197208896e2b"
         }
       }
@@ -527,7 +527,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.orientation-wasm/test_capsule.json",
-          "artifact_digest": "b7de06d027106d96b50b87d9e1138a2ece457bae65992ec0c429ff8b008cdf52",
+          "artifact_digest": "2834e1000bf1bf08fb9c5d2b71814a1d420b1e3ff9da904b9c0ed771ce2882d3",
           "contract_revision": "3bb71e355e4a62d5"
         }
       }
@@ -576,7 +576,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.research-wasm/test_capsule.json",
-          "artifact_digest": "32b7ad42276ce22d16a11e516e4e1d38d34041961f035c9179bd80051ef3945b",
+          "artifact_digest": "517e2a838f9423df02e16b6363f26d3140f11fbf0c814a4424c930a4004a41a9",
           "contract_revision": "81baf5b909f83b08"
         }
       }
@@ -625,7 +625,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.applicability/test_capsule.json",
-          "artifact_digest": "be07be4c57667706e3f14af89495fd40d121483babd1c8d330656a21ca1a7784",
+          "artifact_digest": "5fb83d6bd94b8f52161832d38ee7c39057235e06dd88b4daa665d812dc6ce200",
           "contract_revision": "6a0039449f65f30c"
         }
       }
@@ -674,7 +674,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.curation-screen-wasm/test_capsule.json",
-          "artifact_digest": "0b27bbf3c3bb772c19aaef89207e45da43bea3928946f31d126b50add1bdacc7",
+          "artifact_digest": "97317f70a7f0220240e736eace42c19c75112bc31d763f04ffd87bc03990c5e7",
           "contract_revision": "89a3251a88537ffe"
         }
       }
@@ -741,8 +741,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 21,
-          "source_stu": 427157,
-          "sha256": "ae2a9941b09bf41250d081948e6b2f32ae3b3ee70b258fbbf87fa76b71c88390"
+          "source_stu": 431055,
+          "sha256": "52798806a70493379a626e0b7728666b15f52b1cabea23fce71972b2a4fbef17"
         },
         "source_classification": {
           "production_source_file_count": 19,
@@ -897,8 +897,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 18,
-          "source_stu": 221894,
-          "sha256": "5db0e10bf2e3dbdad804547f616fc2f5da861c2f063b2c92e45cbb9438786d1b"
+          "source_stu": 222187,
+          "sha256": "f9d2c5f5aab5bd62c56dca645e635fe868d7631fa6e4795dbb54da422c2b7426"
         },
         "source_classification": {
           "production_source_file_count": 17,
@@ -977,8 +977,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 68,
-          "source_stu": 1124453,
-          "sha256": "9107a2135f1b448eb0b62cf38f84e0ec48a95c3352aa178b353b514dd62c8a5a"
+          "source_stu": 1135336,
+          "sha256": "7000677005ebcc299f0bf7728e158b2dc541f5f403f47ae4a167671134627a6c"
         },
         "source_classification": {
           "production_source_file_count": 53,
@@ -1061,9 +1061,9 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 92,
-          "source_stu": 2133345,
-          "sha256": "38d99c3e8c62da3cea48fc19e99b1556f9e3ec009dc28ef10133e2b277762662"
+          "file_count": 95,
+          "source_stu": 2181069,
+          "sha256": "f388954698f16eb07346b0fb70917acc74fab0e19433843cb48ee4d627cf4539"
         },
         "source_classification": {
           "production_source_file_count": 3,
@@ -1076,7 +1076,7 @@
             "bins/eliot-kernel/src/tests/native_worker_replay_route.rs",
             "bins/eliot-kernel/src/tests/provider_capability_plumbing.rs"
           ],
-          "unselected_file_count": 72,
+          "unselected_file_count": 75,
           "unselected_files": [
             {
               "path": "bins/eliot-kernel/src/activation_lifecycle.rs",
@@ -1095,7 +1095,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/backup_capture.rs",
-              "bytes": 94279,
+              "bytes": 97396,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1105,22 +1105,22 @@
             },
             {
               "path": "bins/eliot-kernel/src/backup_owner_clients.rs",
-              "bytes": 59064,
+              "bytes": 68714,
               "reason": "production source not allocated to this cell"
             },
             {
               "path": "bins/eliot-kernel/src/backup_restore.rs",
-              "bytes": 207011,
+              "bytes": 219416,
               "reason": "production source not allocated to this cell"
             },
             {
               "path": "bins/eliot-kernel/src/backup_restore_ports.rs",
-              "bytes": 123587,
+              "bytes": 134865,
               "reason": "production source not allocated to this cell"
             },
             {
               "path": "bins/eliot-kernel/src/backup_verify_provenance.rs",
-              "bytes": 28595,
+              "bytes": 28709,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1145,12 +1145,17 @@
             },
             {
               "path": "bins/eliot-kernel/src/composition_bootstrap.rs",
-              "bytes": 109459,
+              "bytes": 109718,
               "reason": "production source not allocated to this cell"
             },
             {
               "path": "bins/eliot-kernel/src/control_plane.rs",
               "bytes": 114450,
+              "reason": "production source not allocated to this cell"
+            },
+            {
+              "path": "bins/eliot-kernel/src/coordination_mailbox.rs",
+              "bytes": 32730,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1190,7 +1195,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/dispatch_launch.rs",
-              "bytes": 380594,
+              "bytes": 380595,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1240,7 +1245,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/generation_control.rs",
-              "bytes": 66211,
+              "bytes": 74730,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1255,12 +1260,12 @@
             },
             {
               "path": "bins/eliot-kernel/src/host_request_route.rs",
-              "bytes": 483829,
+              "bytes": 490706,
               "reason": "production source not allocated to this cell"
             },
             {
               "path": "bins/eliot-kernel/src/host_request_route/daemon_claim_queue.rs",
-              "bytes": 59101,
+              "bytes": 61883,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1271,6 +1276,16 @@
             {
               "path": "bins/eliot-kernel/src/idle_lease_census.rs",
               "bytes": 23885,
+              "reason": "production source not allocated to this cell"
+            },
+            {
+              "path": "bins/eliot-kernel/src/integration_candidate.rs",
+              "bytes": 24795,
+              "reason": "production source not allocated to this cell"
+            },
+            {
+              "path": "bins/eliot-kernel/src/integration_lease.rs",
+              "bytes": 18066,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1305,7 +1320,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/native_worker_lifecycle_route.rs",
-              "bytes": 179089,
+              "bytes": 179082,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1315,7 +1330,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/native_worker_replay_route.rs",
-              "bytes": 43336,
+              "bytes": 43329,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1335,7 +1350,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/provider_capability_route.rs",
-              "bytes": 30267,
+              "bytes": 30412,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1345,7 +1360,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/request_dispatch.rs",
-              "bytes": 227028,
+              "bytes": 233618,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1916,8 +1931,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 24,
-          "source_stu": 357923,
-          "sha256": "093d32e3797ba8bf823c2f54d78fe2002c2c15df291bc7757dbd5b85469965e8"
+          "source_stu": 357956,
+          "sha256": "2d16eca61187fc390badea33e749fc441505a8c4b9b71593cf0cb85ac3c9b9cb"
         },
         "source_classification": {
           "production_source_file_count": 22,
@@ -1994,8 +2009,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 40,
-          "source_stu": 479810,
-          "sha256": "ddb143cb9f889c11948450ab005746576ad737fcb9097e0ecfa93f1c914b16ae"
+          "source_stu": 480107,
+          "sha256": "3a15c720c555e4d7b37c77c6d29c8e8231c91c6ff2d4891f363c534ae08881db"
         },
         "source_classification": {
           "production_source_file_count": 31,
@@ -2086,8 +2101,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 18,
-          "source_stu": 274371,
-          "sha256": "47beaf7bcede72dfdb9937e0906858eb0b4286b085f62b6c8fd674819d36baed"
+          "source_stu": 279380,
+          "sha256": "f262c8d712f71e2fcd936f04ddb9b129fbd4cc78ce7c69b6f6da9d08d0798b3a"
         },
         "source_classification": {
           "production_source_file_count": 14,
@@ -2241,16 +2256,22 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 4,
-          "source_stu": 87248,
-          "sha256": "f8697381e4e07700612ff245bbac118cc00b5bec02c933f2b5b3a51badddbf28"
+          "file_count": 5,
+          "source_stu": 89536,
+          "sha256": "7b573eb05d8004661dc796ac74ec686a4bac23da666affb382a9a2b0bdd4d1cf"
         },
         "source_classification": {
           "production_source_file_count": 3,
           "test_file_count": 1,
           "test_only_module_paths": [],
-          "unselected_file_count": 0,
-          "unselected_files": [],
+          "unselected_file_count": 1,
+          "unselected_files": [
+            {
+              "path": "crates/agent/eliot-agent-codex/src/route_tokenizer.rs",
+              "bytes": 6863,
+              "reason": "not reachable from any Cargo target root of this package"
+            }
+          ],
           "unresolved_cfg_or_module_cases": [],
           "note": "Classification is derived from Cargo target roots and module/cfg reachability, never from a path component name. An ambiguous cfg/module gate is listed as explicit uncertainty and stays production-reachable."
         },
@@ -2476,8 +2497,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 148,
-          "source_stu": 1283303,
-          "sha256": "f51820c63ef81359fae11c100c0a6c590ada14aba907f37b17f96e3d4eef1a07"
+          "source_stu": 1287996,
+          "sha256": "733da74d372f36975cff4fe0e19f739331a0f44f4c1e8ae7eff8dec747b1ae3c"
         },
         "source_classification": {
           "production_source_file_count": 89,
@@ -2636,8 +2657,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 63,
-          "source_stu": 349150,
-          "sha256": "2f2ee3d18c2db867ef154c23c85538e2a9cc1a326e5bbdbc43dac31ce330e6cb"
+          "source_stu": 352684,
+          "sha256": "337b1a545ec01eadb657abf3d22cf5805d57bf401770bc93515cc52854fef44e"
         },
         "source_classification": {
           "production_source_file_count": 52,
@@ -2948,8 +2969,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 24,
-          "source_stu": 364279,
-          "sha256": "d2ad6899ebeca10581adc09b6857e9183dd6e1f844635faf454807a2c22f522d"
+          "source_stu": 364954,
+          "sha256": "6c59b72c8bae66dd4eb97348993bad03c1bb8cbf79d24da6622c84586621c620"
         },
         "source_classification": {
           "production_source_file_count": 7,
@@ -2989,7 +3010,7 @@
             },
             {
               "path": "crates/foundation/eliot-protocol/src/reason_codes.rs",
-              "bytes": 13594,
+              "bytes": 16569,
               "reason": "not reachable from any Cargo target root of this package"
             },
             {
@@ -3228,8 +3249,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 7,
-          "source_stu": 72344,
-          "sha256": "e80b6293b88435b482a095d1a654175eb2f8719b1b6a9e4ae65d9ffa747a6535"
+          "source_stu": 77920,
+          "sha256": "192fabe5ba85af478a7a16f81658e995c1563ae1067e7c928e226b8e8b1de91e"
         },
         "source_classification": {
           "production_source_file_count": 7,
@@ -3540,8 +3561,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 1,
-          "source_stu": 32588,
-          "sha256": "8f0ade73d4f91e0c62875155c76ad03dff6dde7d6d7e2f658ae8c1cfdf9a62c0"
+          "source_stu": 33959,
+          "sha256": "27af73bb14ab1b2b6cac05d59515608be511ff8e5e8bd4211897789a89700471"
         },
         "source_classification": {
           "production_source_file_count": 1,
@@ -3696,8 +3717,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 8,
-          "source_stu": 166276,
-          "sha256": "ada85a6270a5f106ce33dbabf30d1519dc34002032423f37eb7c75bd5757b4d8"
+          "source_stu": 176549,
+          "sha256": "9acc0ce1e783315dd894953df3209dd002c6bcb9becaeaca80764bda60a4874a"
         },
         "source_classification": {
           "production_source_file_count": 7,
@@ -3774,8 +3795,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 2,
-          "source_stu": 18224,
-          "sha256": "35a007b5103f1b3b49d452c91b954a4e2e86e36e8069545bf76a0e6ac43614bb"
+          "source_stu": 18755,
+          "sha256": "79c3fa0c2277b87d3ca6d47c1f8cbae53fda842a0e2d55aa5a82f4a6775e4b56"
         },
         "source_classification": {
           "production_source_file_count": 2,
@@ -3851,12 +3872,12 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 56,
-          "source_stu": 888370,
-          "sha256": "dbef1d340b722630828e095d6d415875d37f0eaa67092b2ed6f6d57777a52821"
+          "file_count": 58,
+          "source_stu": 899948,
+          "sha256": "a67d74793464a4c6da93b1adedb44c546ad6584161593c2320c5592e8a5e1110"
         },
         "source_classification": {
-          "production_source_file_count": 54,
+          "production_source_file_count": 56,
           "test_file_count": 2,
           "test_only_module_paths": [],
           "unselected_file_count": 0,
@@ -4242,8 +4263,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 5,
-          "source_stu": 125716,
-          "sha256": "e5147dde6f0e9bba537c3cf249dd0907a27f8157c9cf45f25bb6f4fe02801737"
+          "source_stu": 126565,
+          "sha256": "f7ef49c6c66e1b14de5ec4b1d2c5183531386e022227539b61bfd572d8efcc11"
         },
         "source_classification": {
           "production_source_file_count": 5,
@@ -5099,12 +5120,12 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 16,
-          "source_stu": 284236,
-          "sha256": "d43d96518b0e6841df5d8446fc1c13d75a04a7bd5cd8820b29ce94032fa569ad"
+          "file_count": 17,
+          "source_stu": 286795,
+          "sha256": "8c931410e934ab280f3a9c00a2694216027c93014003220fc8008c0c140a7c79"
         },
         "source_classification": {
-          "production_source_file_count": 16,
+          "production_source_file_count": 17,
           "test_file_count": 0,
           "test_only_module_paths": [],
           "unselected_file_count": 0,
@@ -5724,8 +5745,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 4,
-          "source_stu": 48765,
-          "sha256": "31f618163b90f17af83534c1c679e5b25699d32479eeb372b55a5051e2510480"
+          "source_stu": 49383,
+          "sha256": "099e0e3ac034ab257441c2173281f49c7129566846b639d24749093866a15798"
         },
         "source_classification": {
           "production_source_file_count": 4,
@@ -6035,12 +6056,12 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 14,
-          "source_stu": 241580,
-          "sha256": "39f9049f63dfc93fc430c223e0478b343aad114a0b768a7b7e7446bfb96d3c4d"
+          "file_count": 15,
+          "source_stu": 253112,
+          "sha256": "57e1c529b74ad867878aac3bf08f19261de5d2cd4f34da74d0c525ec7ca3d388"
         },
         "source_classification": {
-          "production_source_file_count": 12,
+          "production_source_file_count": 13,
           "test_file_count": 2,
           "test_only_module_paths": [
             "crates/kernel/eliot-host-state/src/tests.rs"
@@ -6116,8 +6137,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 9,
-          "source_stu": 114387,
-          "sha256": "0f38c5b36307845eb90b78f31ce119a62266dcf8cb2ffad482b8c5463d0ff9df"
+          "source_stu": 116718,
+          "sha256": "2f3fb1e296d14d6fd40d4995b026f06b55e5847d99d1b80cae1f71e8f6814cd7"
         },
         "source_classification": {
           "production_source_file_count": 6,
@@ -6194,8 +6215,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 38,
-          "source_stu": 674338,
-          "sha256": "a856ec2afeca113c93c871acadd6489c2b667879650662d917553ea1239d3366"
+          "source_stu": 678990,
+          "sha256": "4301b5440f77c2c7195fc7ef4bb2af406d50f0eb383671823611e7e4ee0ebddc"
         },
         "source_classification": {
           "production_source_file_count": 34,
@@ -6672,8 +6693,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 15,
-          "source_stu": 173143,
-          "sha256": "cdb65061ca8166fda8318d3029a30d7b37415d761619b78bd62c45e08a5c19e3"
+          "source_stu": 188435,
+          "sha256": "55e77ef67f91cc0aadda0e5e620ad51c33d15c26e36d20aa2557a392635a09e4"
         },
         "source_classification": {
           "production_source_file_count": 15,
@@ -6906,8 +6927,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 9,
-          "source_stu": 443797,
-          "sha256": "c11c00e0d0a29223f146619def1010906330630b9830a31cf63b96bf74597dbc"
+          "source_stu": 446455,
+          "sha256": "9c2df02ca8f9ceceb2662abc10e6fdd5ffae9519cc0cb9265eb697c73a0013bb"
         },
         "source_classification": {
           "production_source_file_count": 8,
@@ -6984,8 +7005,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 2,
-          "source_stu": 74725,
-          "sha256": "91c66f271708654cbdfbe4c070b1155253d782306c7f866400308ff2518d284b"
+          "source_stu": 77390,
+          "sha256": "da01e58bc1f167376db5d0d095de746fe001c36ac62e271359d429f59e3f197f"
         },
         "source_classification": {
           "production_source_file_count": 1,
@@ -7140,8 +7161,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 5,
-          "source_stu": 47542,
-          "sha256": "9f602148406c71f1ec1209155dbc140aa4bb9f461bb21939388eabfbb494493a"
+          "source_stu": 47723,
+          "sha256": "12a14df3da9d9bf8fe9c5e63acfaf84af9131404a028b294d58e2f114cca3361"
         },
         "source_classification": {
           "production_source_file_count": 3,
@@ -7217,12 +7238,12 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 23,
-          "source_stu": 228542,
-          "sha256": "8c3ef0bc8ba784085dedd292038da191317bf0f67699e5f99cb1b13e43268468"
+          "file_count": 24,
+          "source_stu": 236258,
+          "sha256": "e8e4bf1c79dd762b1c268b16ea3285684f2c399315c6c8cdffd26e17087a8f0c"
         },
         "source_classification": {
-          "production_source_file_count": 11,
+          "production_source_file_count": 12,
           "test_file_count": 12,
           "test_only_module_paths": [],
           "unselected_file_count": 0,
@@ -7374,8 +7395,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 7,
-          "source_stu": 162833,
-          "sha256": "ee0cbd7fc9c917c3a5efb0ef9a3d580b402d8082362130773aad107e64339330"
+          "source_stu": 169171,
+          "sha256": "8d88d233158e6bc5db19a776a6977f0b66290a73c551c99d45068b2b22973117"
         },
         "source_classification": {
           "production_source_file_count": 6,
@@ -7530,8 +7551,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 42,
-          "source_stu": 510596,
-          "sha256": "0acc8993609633fb2a4c75887f365bca911af30e51bfd0db00c3c0b81f048de6"
+          "source_stu": 511586,
+          "sha256": "4cf47b725567bd71c2c36ec1f88297568727dd449ae4c7fe10aa310145e21f5b"
         },
         "source_classification": {
           "production_source_file_count": 26,
@@ -7614,8 +7635,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 7,
-          "source_stu": 144355,
-          "sha256": "6c89cf57a60604041a4d2c76f2ec55d507c0639af0acc7055e68efa1b9d29ba3"
+          "source_stu": 146479,
+          "sha256": "43b3ae329f737e608896a696f50f0e95fbc52ad0073291fe8ce4d33ed14dd003"
         },
         "source_classification": {
           "production_source_file_count": 1,
@@ -7696,12 +7717,12 @@
         },
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-          "file_count": 55,
-          "source_stu": 825389,
-          "sha256": "bdd2276393c8ffcd499b3c70882e21276b67b5c16769059b3f83cb6e8c7465ac"
+          "file_count": 56,
+          "source_stu": 832588,
+          "sha256": "aa2f45527a41d300127f4bfaa52287aef036bdcdda9d39321ea656726524b6c4"
         },
         "source_classification": {
-          "production_source_file_count": 41,
+          "production_source_file_count": 42,
           "test_file_count": 14,
           "test_only_module_paths": [
             "crates/storage/eliot-store-surreal-adapter/src/apply/tests.rs",
@@ -7856,8 +7877,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 3,
-          "source_stu": 97652,
-          "sha256": "dc56be3205f4be23f588b4db622c17db88b1791a4a2405dc8c27dce7dd9e711f"
+          "source_stu": 108165,
+          "sha256": "0bc82a940a3aca3503aea19d9887dde538f319785f4fb69109383d88aef70d25"
         },
         "source_classification": {
           "production_source_file_count": 2,
@@ -7934,8 +7955,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 15,
-          "source_stu": 144904,
-          "sha256": "f6457f47dbd1a46336250ec0fef15aa196e0ed74bbeb0db3af63382e33620526"
+          "source_stu": 145017,
+          "sha256": "88240b032a83e2f83281a178af5850647b4389d371e35736c275e4e208315d42"
         },
         "source_classification": {
           "production_source_file_count": 10,
@@ -8301,7 +8322,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent-bridge-core/test_capsule.json",
-          "artifact_digest": "e903865c642791509aaff4c5088b9410cbce89c2fbc7941284f4a67d6f64b685",
+          "artifact_digest": "e3c5400ef0e816dc57a16b55549f3a6034cbb68de90e6e9189aef061116d7d1a",
           "contract_revision": "6a9a6cd162ff0373"
         }
       }
@@ -8333,19 +8354,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.attempt/contract_kit.json",
-          "artifact_digest": "f85cf7f04ddf17f719e5c724b475aabba3e7f99eec503d8d1eea39dff8d39c5e",
+          "artifact_digest": "af9a53c88d52f0d3370df3dbacb5487805a784f7172a1ea77fe60d1c27cc4fee",
           "contract_revision": "9dfbcaa73fe0903c"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.attempt/context_capsule.json",
-          "artifact_digest": "820dba92b4f354559564d768494aa49cc84c4b8f0ad87f1cdc17f08d8f2a1b2a",
+          "artifact_digest": "75032a8ecf332c0df7f3282ff726c353f9d505bb4bf6e4f24368c449f0796646",
           "contract_revision": "20b5cfe0fd85d09e"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.attempt/test_capsule.json",
-          "artifact_digest": "1146f80fded72fe906be73afd0d4568ed6645a531d01cd4f2676c2f2b1c26d73",
+          "artifact_digest": "39c131696d09f66ea249561c147d7917281153bce059f1ceef86749950b0fd94",
           "contract_revision": "62a05def33507c78"
         }
       }
@@ -8377,19 +8398,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.effect-candidate/contract_kit.json",
-          "artifact_digest": "360af680341fa2ce9d17874b299c6f396d670d09f61c9d73bd1333af4671c4ac",
+          "artifact_digest": "7c6568d0b636d6a44e08abd56ab650ac88b21904c22b24fdd05e502c6fe18c5a",
           "contract_revision": "70acaf3563a0a9a0"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.effect-candidate/context_capsule.json",
-          "artifact_digest": "87d94c4dd746a69da03e6a85e71076141ac8291d8d40553a8071921d0698e1c4",
+          "artifact_digest": "e171d3d9c4613737725c04d59a9744a92907c3d3211f3ff685e3b99f5021672c",
           "contract_revision": "2868577c1112977c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.effect-candidate/test_capsule.json",
-          "artifact_digest": "302df81f49e88a8050d2028956e2e8d2bcb3923cffd25120b3934461d0424ab3",
+          "artifact_digest": "3a758ee8d1642e4162e0edfbe8632c42b2ce046a207c277a61846f57350147b3",
           "contract_revision": "425a9cd5b7428c9f"
         }
       }
@@ -8421,19 +8442,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.host-event/contract_kit.json",
-          "artifact_digest": "66a3ece762afd74c71164538ea1eb8a3092ee6d4ee6b4aebd9c010ed06efc5b5",
+          "artifact_digest": "1f1444ac13d377df0b4a08f036208493224a506b24399ef296130a9b50d93996",
           "contract_revision": "f0be6989b9b8bdb3"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.host-event/context_capsule.json",
-          "artifact_digest": "d2ee1ad38960d90b3fbc18179eafe3be712790d1ff3edadb08ecaa60dd82372c",
+          "artifact_digest": "43b3f3340e978d7ed2fad1da56777fba5924fdecd765fded9023e3d6ccf9f8bd",
           "contract_revision": "85435993110f8b2d"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.host-event/test_capsule.json",
-          "artifact_digest": "5b76f7dfc22f38c7f7ac00b0b2be9e8a65a53068b66e7cbb202f3c9601f92082",
+          "artifact_digest": "826f673a170581cefb9ca473c1b4d3da151d9837d1060f81088ac1ac981c9980",
           "contract_revision": "177ae8e944e7dabd"
         }
       }
@@ -8465,19 +8486,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.result-candidate/contract_kit.json",
-          "artifact_digest": "8619ae664319d88b9dd791a0cfe0036dba7f015440d8c94413b496d86c1cdc35",
+          "artifact_digest": "a27dfd1569ded8ae93d44e1b240bb90a6b0abdd25dcc31191e88a4ad23fbcfe3",
           "contract_revision": "3e3c41fb5db68032"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.result-candidate/context_capsule.json",
-          "artifact_digest": "5b38b2ca70d77e0372a2bc2fdb9c1c074f264a12697c78ce56631e820c9adfbd",
+          "artifact_digest": "0c860e4f38025143b8f808ae56626c8c15ae10fa7a42192e2fc148c545ebcdd2",
           "contract_revision": "85ff47a2d09cd8d8"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.result-candidate/test_capsule.json",
-          "artifact_digest": "24102bd38f5d82f79c3ff594f435b094f4f6bb19cd8f490e79b3c75e3117ca23",
+          "artifact_digest": "1569bb874af50d5f97391726edd53bc47ad376c0f03b6407116f5eaa5929993c",
           "contract_revision": "4cb042a54849f9ab"
         }
       }
@@ -8509,19 +8530,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.route-fingerprint/contract_kit.json",
-          "artifact_digest": "a6d4e907843d85625b51ee7da0f35280dc167936cee3345ee7a88dc428956932",
+          "artifact_digest": "2d3f88ebe4b0fa462cad2fcc50d832775b1e35f8c9c739c451670f5a1c8b8ef2",
           "contract_revision": "6cd8e8e178ec7a6f"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.route-fingerprint/context_capsule.json",
-          "artifact_digest": "24017bd122fe5367fd297627df6895e1a2712ccbf78f7460e7c656556c73d860",
+          "artifact_digest": "647d094245dd6392fa4d3b9e63dfe779cbcb03e4c7886bc1e493e75653a18eae",
           "contract_revision": "b2be9da49c847b68"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.route-fingerprint/test_capsule.json",
-          "artifact_digest": "9ac7f1b82cbed259553ba146371aac79998603a4be1484c95b53736976ea8b67",
+          "artifact_digest": "0fee96e48b8bc6d6e952fba6df64c29deacc0092a508e841ba29e260ae3c3fe3",
           "contract_revision": "820211cd76b94b9e"
         }
       }
@@ -8553,19 +8574,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/contract_kit.json",
-          "artifact_digest": "c00645836c7debbb0660ddfb8c4c51de4b3a7adff953b35428ea5b195d799842",
+          "artifact_digest": "0992785ca5dd8ccdfc3f5aaefc67937b333529b218071e5cf70b99ed84ce0fca",
           "contract_revision": "915e87ed6763ca5f"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/context_capsule.json",
-          "artifact_digest": "63b9477e69f2e32ce3b844d295b79c19a26d904cd11d32fdd4fcbd1fe15a024c",
+          "artifact_digest": "22ca5de02c164cbc35ba4c426d51dfd65dac092edf4b2f85fd283b39d2d9b676",
           "contract_revision": "db92688d14cf1704"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/test_capsule.json",
-          "artifact_digest": "7d1cb6dc44d9e9ff8f9fc282d8f0b9d26cc32bda7de216625deadc0c15f453c5",
+          "artifact_digest": "76d3410ef4159db20d0d355f95d7651743d469089a43c3c3a3b24df6f1800a28",
           "contract_revision": "ac1b32ae18357610"
         }
       }
@@ -8597,19 +8618,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/contract_kit.json",
-          "artifact_digest": "1f2798891817483a31507cc10380b9b4183a23415365521e2278055fc7f5148e",
+          "artifact_digest": "d14f368c559ac555caff29360eaa20dd11f3e0e75c5abbd5bca5cec74a223dca",
           "contract_revision": "c0c7367b3a4776d9"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/context_capsule.json",
-          "artifact_digest": "082463938a3df76af7d9d7b1377376d3076761023f5f886d12c768e7009391ce",
+          "artifact_digest": "87c15435817886de003f57306715306e495f708169f61d29e55ca4762003c839",
           "contract_revision": "36839ddf606b69b8"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/test_capsule.json",
-          "artifact_digest": "64de042bcd9dd3f827a7ec5f9876971b63b7ad5a1c9155026d87286fff4271a9",
+          "artifact_digest": "ca8ea75e94469a2b2e5040c8fdee4c03d9f8fe7f41cd59d75b9c602b16ad3bb6",
           "contract_revision": "eed4635295d58a35"
         }
       }
@@ -8641,19 +8662,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/contract_kit.json",
-          "artifact_digest": "95a76f5ce0a0b5499179c07ddc41c09f7d163ad92641d078522524836de2552b",
+          "artifact_digest": "286153170e5014a752bf620760445942f259e2b941323aa5458aec240cd18557",
           "contract_revision": "9153f5868b05ca43"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/context_capsule.json",
-          "artifact_digest": "b00d6d0591c6542b47e6055ae5303407087cd8ff80f8aa1aa01b46c14f2a6d82",
+          "artifact_digest": "7d5af6cadbec6b518426fa1fdacbba6a9f7709053a4f16b550ae321ee6d1887a",
           "contract_revision": "9a52ee1a3b894837"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/test_capsule.json",
-          "artifact_digest": "a01df2ef720480c61028a8721790903d3964c1143cef85443159f290b1d56a2c",
+          "artifact_digest": "0a802b0a71ae79f0001dd80a53eca2a1ba48e399ec41d5a8b172d9c797a7c7a6",
           "contract_revision": "33afc5d56012f969"
         }
       }
@@ -8685,19 +8706,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/contract_kit.json",
-          "artifact_digest": "370b152ab1b7a72f5df145f10e559e3b8b5c87e31a21dad5b07afb6db74bcdf7",
+          "artifact_digest": "f5a202e409b550a462cf1d9f527c88210149b8a3f0d8ca66f9d4edf4e14efa52",
           "contract_revision": "843794a1f88780ff"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/context_capsule.json",
-          "artifact_digest": "99a0bf6994aba1889e639cfed0d08cfb48a7d6bf8c210342a382f38b6489b218",
+          "artifact_digest": "15989be6f2bbce1b80b659007f91aaa6642b544bd52ca18089de22d04c7f3088",
           "contract_revision": "8d6f1980160504ab"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/test_capsule.json",
-          "artifact_digest": "c54a7bcfa335044b2d3e0d4eb02fdb363247c8e4447250c1b281411a4f8aab6d",
+          "artifact_digest": "6f7c08919b5f98b99c3e1657b27fab982eb8878672e4c7e2430ae9429c46acb0",
           "contract_revision": "b6c0e76122b52332"
         }
       }
@@ -8729,19 +8750,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/contract_kit.json",
-          "artifact_digest": "c28b795fbb518a4ca63b3cf379fbad880893f248e2e776b22bbc476d0039268a",
+          "artifact_digest": "6755ca18a81c6d3c5d27d81d9867dfce40078a2d4874d3620b9ba47c10c45fc8",
           "contract_revision": "48f216f0599fc005"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/context_capsule.json",
-          "artifact_digest": "676b7828194d0a6ff28befb58879729082e340f7d380b28ed56a0019045322f5",
+          "artifact_digest": "cfed71359bb61edab039e1ceb6a24b7bb42b29a9098ac06e21eaa8a46c942907",
           "contract_revision": "d3977ff99a830773"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/test_capsule.json",
-          "artifact_digest": "523bf29edefb319a0c75dae3a3ec79b615f732e3dadd91efd397ea422e2bd736",
+          "artifact_digest": "90d12a72a609bb7f3d8bb397da955b6097266be5df83980673c5ddd24146d264",
           "contract_revision": "bef03f79e4715e78"
         }
       }
@@ -8773,19 +8794,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/contract_kit.json",
-          "artifact_digest": "89a3e51cbd881a30feb83a52d6f771f97a3da871f17bbdc9db928b08d0b8b891",
+          "artifact_digest": "adb00b4ab722405b00fa38b3b3d830039931ae149e0159e202b0d2cf367f4fb4",
           "contract_revision": "eee1714c5a118e53"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/context_capsule.json",
-          "artifact_digest": "f336ecd7036dc700d76685fdae12ebdd909b1e09e9c6eccc4dac9a9e147ff339",
+          "artifact_digest": "49862d44b3b38aca0c72751760b9cef96a8558b7702bc4f2f03f6e2eaa26dec3",
           "contract_revision": "2e5ad772be6866eb"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/test_capsule.json",
-          "artifact_digest": "96bcccee61008313b08703d186ac2646fa7c93df4086707b775807c1f34bf65b",
+          "artifact_digest": "7c9309b2014da69f4853dfb349d0b1bf0970d29679aded2775ea3ae9d2d741fd",
           "contract_revision": "3eefc987da84178f"
         }
       }
@@ -8817,19 +8838,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/contract_kit.json",
-          "artifact_digest": "312681afe75b3700f6f91282524e0f76bdbda4690c478c644239425bf3ac8aab",
+          "artifact_digest": "d96ba2b92da02a8910283a97a352042f3c891d82b47c6779057b858550c0650d",
           "contract_revision": "c9205280107ee1de"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/context_capsule.json",
-          "artifact_digest": "25c1fd1a370a4506d7513442d5e11846fc58b8a16ed5e4c2b8b2cde22e91b655",
+          "artifact_digest": "16dc18865e58b0856174ca030f8beb879df62da0767672bfd02bb894fc0438dc",
           "contract_revision": "3a4e2d87e00b1106"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/test_capsule.json",
-          "artifact_digest": "b3c5b758ecfa540ffa40e54e261c555a81987fa7b089db5604ec04804d508484",
+          "artifact_digest": "377088f2826fe7777aafae8977d03756dc6ba44066b6d4547137e5face461438",
           "contract_revision": "02a910249c8d9cc6"
         }
       }
@@ -8861,19 +8882,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/contract_kit.json",
-          "artifact_digest": "71806a6c84d1dbca3cce8196b7a4962eef244f66d3031db43d88d433988a09f0",
+          "artifact_digest": "89659c0b9683e48c8ba2f443d34cece53f10ed4deb6807f886c501ee403e8257",
           "contract_revision": "1a1214c52a76bbe4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/context_capsule.json",
-          "artifact_digest": "3a17f8f5c4109bb7a4459617784ca7fc9f3fbbaa9527d3db5e37798063674dcf",
+          "artifact_digest": "87370555c07fe5eda98876d269bb7655edf5ec5c67cdf7bba27f6b817d5d25c7",
           "contract_revision": "c10139c37bf8f769"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/test_capsule.json",
-          "artifact_digest": "7d121781556cb2d57d4304f977e5a691856450f8577cdf2e02a8afdb060971be",
+          "artifact_digest": "2a10fe8c519db06fb0a80d5fce1340f28add09c7972420ded57337ad3b480d8b",
           "contract_revision": "25bc7605ee834fe4"
         }
       }
@@ -8917,7 +8938,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/controlboard/test_capsule.json",
-          "artifact_digest": "e16b1d69863599240cf1381e03b5f7b6f0e5da13aa08f426601ed3d00baa1a4b",
+          "artifact_digest": "def539ef94d96a0765aea4404ca9c759929a61cfc8e70171dd142438f0de8247",
           "contract_revision": "b64e07332f075d31"
         }
       }
@@ -8961,7 +8982,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/test_capsule.json",
-          "artifact_digest": "9346542935eedf604e1ef6a9a518e318f3747c3a5ba44eb8724b24586d9829fc",
+          "artifact_digest": "a1d2cd0ab7d4d99c5f5f436288d5dbb8b46970e02dca82cf7e57631e1f2ab307",
           "contract_revision": "925916dc3c4fb434"
         }
       }
@@ -9005,7 +9026,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.bootstrap.current-system-evidence/test_capsule.json",
-          "artifact_digest": "da83b01bbd5be1aca67e526e674fa9663f818cc4e250542ebd0c8b9d78a2e5ec",
+          "artifact_digest": "4e59a7c7f84e2baeb1f2438047f5df59fb2dade690d020fa98035881b1d512da",
           "contract_revision": "fa6a8bb0ac020567"
         }
       }
@@ -9049,7 +9070,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.bootstrap.rule-catalogue/test_capsule.json",
-          "artifact_digest": "1dec501d661c2bdc485615824a8fb9d4e7edd3dc80e88162b4d304dfd13ecf5b",
+          "artifact_digest": "b36fd311c026df222f90eac5b5b2c1f31dceab7431df2b84a4545b72bff0c1bb",
           "contract_revision": "505172fe0d75e47e"
         }
       }
@@ -9093,7 +9114,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.bootstrap.work-unit-brief/test_capsule.json",
-          "artifact_digest": "c93de3ccb1a739a5a2d75608dd553a26cdac16cab77b9451bc0f4784011e2b1b",
+          "artifact_digest": "9f59fea668f73fea479eba6b18b6e1bdc6fd95d4e79290047302acd492562476",
           "contract_revision": "e56994997b35ef86"
         }
       }
@@ -9137,7 +9158,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.conformance.support-contracts/test_capsule.json",
-          "artifact_digest": "b648915ea94d31866f0023ea48a99dac147534b7d540b3b2d1e0bb61cac4315b",
+          "artifact_digest": "27210f4881ef0708533eeb06ad2e057f17d0b1f480999419b1dd59dc751b7a9d",
           "contract_revision": "84d3473fd0e04a3a"
         }
       }
@@ -9181,7 +9202,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/test_capsule.json",
-          "artifact_digest": "42614ef8099a07092fee7b906a09225d7684f4a5ca3035176b8803e2b45eed60",
+          "artifact_digest": "c00bbd6d56faa1b2c01e9af8e5bebecbbb6ed05a286f1f2ecb3627e0bc2d30de",
           "contract_revision": "7de83039c357633a"
         }
       }
@@ -9225,7 +9246,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.memory.projection-contracts/test_capsule.json",
-          "artifact_digest": "ea1cd8ae2b7db490716ad69a3287885553c29f6e36bd020a0be2f312e55bcd0d",
+          "artifact_digest": "c13b71b3df110f1e6fcb8f67460de05ef4e36df6f2f4a45d9cbc082b2946e1e6",
           "contract_revision": "be344d61723a275e"
         }
       }
@@ -9257,19 +9278,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/contract_kit.json",
-          "artifact_digest": "fd097034bf788691875c495186a5b73d4c5e3d298ed80bb012722f008cc05572",
+          "artifact_digest": "3c589919b26f2faa2180aa7e7a28f8c2d0b9b74703541b0f91bc9558b162ce53",
           "contract_revision": "d1f99a3503bcf210"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/context_capsule.json",
-          "artifact_digest": "94f5428b73603153a8ba35737beb2c0871337eeb5e1ba7f17e38f093126c1989",
-          "contract_revision": "54d9325d51975fd5"
+          "artifact_digest": "9335be529eb7097c2e6880138a42374a8b9a5d80c8025bbb7ae4aaa8d5e438e0",
+          "contract_revision": "71d687d23044e7cf"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/test_capsule.json",
-          "artifact_digest": "59b9cd0302a38ef6c0f19459ff9b2c8109a6a71e0bbd24c0e86498045b063f75",
+          "artifact_digest": "6eac4f7d2316a452d720930e783c384752ce4381ef99f5ed2d90e37e459b1022",
           "contract_revision": "cf88728418c29fb6"
         }
       }
@@ -9301,19 +9322,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/contract_kit.json",
-          "artifact_digest": "89d00d1bff95dcbd8329224d7b6db5520b0dea96ff0cec3a294c0b9c067a25cf",
+          "artifact_digest": "648d579fe93b511642b3f58ab213a203c0641f8b31cf79644c4bdb28c02a8e0f",
           "contract_revision": "1b40302c21fd412d"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/context_capsule.json",
-          "artifact_digest": "f01bf41a2b0e22cc500fb9dafc18698809d6b2d4fb794bbd7f347ae734e262cf",
-          "contract_revision": "500accd1732be18c"
+          "artifact_digest": "3ebcc9511fe5b5c09decf8d7a8c5a33aaa81363f296d842b1a06959023788765",
+          "contract_revision": "1f269dda1b160398"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/test_capsule.json",
-          "artifact_digest": "b90b7b221811e692c2650bc2722f2d94812f6e041af95fbc5d8f2d467bc421cc",
+          "artifact_digest": "3b09f4073278cdc18da2f09f7e2424a2bb9b9c5b483aa44078e39a92d4d3040d",
           "contract_revision": "623c582fedf2708c"
         }
       }
@@ -9345,19 +9366,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/contract_kit.json",
-          "artifact_digest": "ecc5d936c84ae6258eb80841baee7f7acaf97e84d14bf03928ce1ba739133d6f",
+          "artifact_digest": "adcccb31f7665c632d6b60286aa58cf3627ce46a0278c2e634a28d88276d00db",
           "contract_revision": "c0d1a8fa69552d96"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/context_capsule.json",
-          "artifact_digest": "b8ed2244d4b583bcc7c0f8c205c26474ca0f063674708c3e58e9c6c3d50c7f85",
-          "contract_revision": "74cb5877e2bcf86d"
+          "artifact_digest": "1a8bb7ad33445eaf21d3f56c661ae4cd5ab357d12bbe07fd6417ae6d52d4328d",
+          "contract_revision": "4b3eac3251bbea35"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/test_capsule.json",
-          "artifact_digest": "1d9596d95d34b752c63f7657503386937c2426d66b4cc9964b1a746414a09b55",
+          "artifact_digest": "d4666590ec0bc0b8971019daa4980f2d6e65df5d34212cab72930d898271cdf0",
           "contract_revision": "f5ee27474521867f"
         }
       }
@@ -9389,19 +9410,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/contract_kit.json",
-          "artifact_digest": "d05ddaca2276798cd6f552429f0bcf5e8ecbe55d62a2bb135af2b971bd86e62d",
+          "artifact_digest": "16aa96fa5d72f85c957417dfdb66311023d23a21d37cb7e1d9942be3fb9d3689",
           "contract_revision": "b8b838b3d596f9bd"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/context_capsule.json",
-          "artifact_digest": "d9eebd3c548fb48a463679ceb695b541371bc161c09d2b29d469f6b2eb327d2c",
-          "contract_revision": "e261933211e19980"
+          "artifact_digest": "7961609823236c1ed5a09ed1a9949ae2c847f66830cfcb5b6f7d1abbcc032b98",
+          "contract_revision": "d58dd8ca0b88ba7a"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/test_capsule.json",
-          "artifact_digest": "3997708df2d74505b9deb574b26fe4d96bef4005338af031eb98833af9bbbe4f",
+          "artifact_digest": "be584b7937d1c4ec27eb610a7a84b3e8b2a1b95edf5d6e8105332de7972d30a0",
           "contract_revision": "c0fb7822a45995d2"
         }
       }
@@ -9433,19 +9454,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/contract_kit.json",
-          "artifact_digest": "ca0e252ea87d0f27ef0d24261e3c3fd3244f467076878b107f3ba923946d7e2d",
+          "artifact_digest": "5cd67d991b952e3dbcb2553c612165fc5bfbb62ac684e426a1df60af83fd15be",
           "contract_revision": "495d64b4b2f95d64"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/context_capsule.json",
-          "artifact_digest": "b621b2ff042d9f02b51ac149372151feadb63f637a82e4fe484b9ef26999fe45",
-          "contract_revision": "37796aa2869248a9"
+          "artifact_digest": "5d676334ce6fa1c45c79a7d68660a806248b118d6605b4b0ac53bef6aa633490",
+          "contract_revision": "9ec333bb912ef729"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/test_capsule.json",
-          "artifact_digest": "47a32c63316485e3ece76ad015572333591e6691cdc54ac6ad981acec8603462",
+          "artifact_digest": "141842489d4d35def8e250db033d5e7a7626741b1368d595fb85d9f8708850f9",
           "contract_revision": "059a6173362d669b"
         }
       }
@@ -9477,19 +9498,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/contract_kit.json",
-          "artifact_digest": "e8b5cfff89d2230fc34ca18ac4125984caec8b8dbecc6b216d740d695d49ff38",
+          "artifact_digest": "a224f002bc284f4af22b8b51cf71b89d231602d16b7f59f7ceea866852d6a915",
           "contract_revision": "5cc4eb7322c40bf7"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/context_capsule.json",
-          "artifact_digest": "a84f732894f547d80e58f47aebe99b53bf9fa691544e48afd0d48eec47d3ddd5",
-          "contract_revision": "210c8df33818cc07"
+          "artifact_digest": "db68b69cffda0df650ffc9293409ae88d99a0b045862003cf61df8520f0e2224",
+          "contract_revision": "790d89ca33e94020"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/test_capsule.json",
-          "artifact_digest": "8c07ad17125fce4aa9a3ba831f1cfffcadb7ef82dc6aa1371f7aff2fdd446ee9",
+          "artifact_digest": "7a8399526a6f091439ebe35c878cb4cb2481bb55d00436247a07fbab92ab1d42",
           "contract_revision": "8263ec2aaea9561f"
         }
       }
@@ -9521,19 +9542,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/contract_kit.json",
-          "artifact_digest": "a58906631b9271ae9767fe8c65d4dca6c0d787a582589b243f13086ea88228b0",
+          "artifact_digest": "53bb2748b1d3929bc6317bfe181fdf80ad0535728244fdae3f463874e633832e",
           "contract_revision": "a933a8087eca0da7"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/context_capsule.json",
-          "artifact_digest": "89c3181996bb1d2636b7d2e50d956c35500724e00c524d25680b29f95da18d7c",
-          "contract_revision": "a504f676bebdf83a"
+          "artifact_digest": "b6482562afd9730dca73c1ef9c727999ff566fc63176f5e2b88e3a7df0eb0df8",
+          "contract_revision": "a2e28ad26ed865b0"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/test_capsule.json",
-          "artifact_digest": "9595663fa15c52b11c701caa101573c70faadd6f8a4653e6b12300bf3e1041ae",
+          "artifact_digest": "8dd19aac935918360be09a3b25517b7999258c7662b4a0737aa9d98b3f9d1baf",
           "contract_revision": "d204162872ee241f"
         }
       }
@@ -9565,19 +9586,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/contract_kit.json",
-          "artifact_digest": "204597c547cb6cdd0617906ea3af75d01f21ea88b030e2f3037e47933f66026c",
+          "artifact_digest": "7a9383607f3a3f8d7e32bd45f1cdc8d1815a0cfa5cda5ffcd71a81a4c4175b31",
           "contract_revision": "631cfc9048ceaccc"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/context_capsule.json",
-          "artifact_digest": "455fc98e468b43046caa987c745cfa8cc2223fa11a5378d47f5397c45b621752",
-          "contract_revision": "9025e3e0c5067c89"
+          "artifact_digest": "d76d0bd197aa2c97ae3073dcfae36a56cecb14897332f2c84d669a2ab30269de",
+          "contract_revision": "0d35057e8fb4616d"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/test_capsule.json",
-          "artifact_digest": "9714e01a7c13ca27090850fc7c31c70f47e58d86dc673c53bd0b7566c4fdad65",
+          "artifact_digest": "c22d3d48c2588ff5e87a9b05f16fb69a851130094c25e6767bff70b6068c2d0f",
           "contract_revision": "d5e96633e525b97d"
         }
       }
@@ -9621,7 +9642,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.observation.admission/test_capsule.json",
-          "artifact_digest": "c8e5de62126a4b45fdaf0af3b553b0658a84cb516b9caaf34c81f9c57033e567",
+          "artifact_digest": "b19942cb7bc1281fd9ab155f1020a0b71bc09fb94444355fad8a8c5d15f5c198",
           "contract_revision": "fb57ddc89260e90f"
         }
       }
@@ -9665,7 +9686,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.observation.classifier/test_capsule.json",
-          "artifact_digest": "bea38b1730f672b8a9aab35734737e035a7b6b8dce811090aadf79930d3a129f",
+          "artifact_digest": "3516f57a3706bb18611594e2bf3637fdcdd08fdd58010372ad06cbea698f8af8",
           "contract_revision": "8176c065bb8eecb8"
         }
       }
@@ -9709,7 +9730,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.observation.journal_projection/test_capsule.json",
-          "artifact_digest": "0083e95fff4997696b07519d0d3d46f266ca40c08938640d430acb52ad4f562f",
+          "artifact_digest": "73d657d2eae873df3b2841f90663698de710be87c83368adfbe53fae1922c352",
           "contract_revision": "333deb54e775f102"
         }
       }
@@ -9753,7 +9774,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.observation.plan_compilation/test_capsule.json",
-          "artifact_digest": "454331a942c4fcc40d33caf0b34ff361315685c2f74a7a255c9d7ccf68afb858",
+          "artifact_digest": "06113fd214a7273b47322296952939cc540134c94c285be2653f28a2f321159c",
           "contract_revision": "f90dba5df72fedb9"
         }
       }
@@ -9797,7 +9818,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor_read/test_capsule.json",
-          "artifact_digest": "4b208a11e9e1e18ed0ff1d493335ffd5251e0ce2b723e353abfdf5ea42e82185",
+          "artifact_digest": "59eb9cf9c8e11ba7eed89d442ebaf061d1124fa2c72566e356635301b8f308b6",
           "contract_revision": "92e11b66d8e26deb"
         }
       }
@@ -9829,19 +9850,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/host-control-endpoint/contract_kit.json",
-          "artifact_digest": "0cb5953641f036529d4b939fa0813bc2695a27068b6e8253d1bdb00d2d838430",
+          "artifact_digest": "9af3cab810687697719574ea755b4adcc884ad158e88baea9ed762ba1eedfe37",
           "contract_revision": "f4bf8c3727e28c68"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/host-control-endpoint/context_capsule.json",
-          "artifact_digest": "8d9bb803ecb2602d9a84d683b2110a0de0df330648e39ef28552dd52ad85e820",
+          "artifact_digest": "987ab361273af4f5de9e93466b0bf4e9db94d695536aa303719b8c82f3de480a",
           "contract_revision": "bc95b92fd83ecb44"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/host-control-endpoint/test_capsule.json",
-          "artifact_digest": "95ce9ddcb21897b1bdccfd25410d885080f5609a231401bff5c2a268941f5540",
+          "artifact_digest": "5ab2f6ccd6ce1c3c4ff199e994d48b28f641f4ab9a7d95983b8b24725568128f",
           "contract_revision": "585d44b3d7d523c2"
         }
       }
@@ -9885,7 +9906,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/host-service/test_capsule.json",
-          "artifact_digest": "b65b498337f04be30f3871d8294e3c52cf954636236a5205deb05aa208db51d9",
+          "artifact_digest": "650d2369da4eabbc5ed4dfc7f59db5c732c05ef6d7cb2d8929fdb1c2c440f9be",
           "contract_revision": "2539d97ba3837cb9"
         }
       }
@@ -9917,19 +9938,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/installation/contract_kit.json",
-          "artifact_digest": "a03343f8bc470ab20208d1b3bca6942a4e65bea62b63173b117d4c742708c1eb",
+          "artifact_digest": "e927dd316318f46d1133369b936a4fdda8cf9f6073ba3bd7ff5f124dca3aecc0",
           "contract_revision": "174b4007676607d4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/installation/context_capsule.json",
-          "artifact_digest": "af608c457e924e8e4b3f9bfea9244977ecfbf118e126acb3abcc3434ed443050",
+          "artifact_digest": "4b45b74b831e716892f2597ffa7d57ad8b7bb5a903c201889c23e3b94156aed4",
           "contract_revision": "91e13d7eec882856"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/installation/test_capsule.json",
-          "artifact_digest": "c5e3f47d3c609ae3e9a4199314d9ecb78a905cc57a1f70948a7ed876eb2b4814",
+          "artifact_digest": "76143727d97e76aa8a3df71ddef73f3af419b3e3ea82049166be0f4c2508071f",
           "contract_revision": "bfcacd6e7c7c7dc6"
         }
       }
@@ -9961,19 +9982,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-core/contract_kit.json",
-          "artifact_digest": "1970ee388a38696f555043465a489fc9ebd7ae7368652d9cc9c9f79eba01de82",
+          "artifact_digest": "64f491d420acda5ce271f8250f7311967cc0188c82acfab334521007bd0e5a13",
           "contract_revision": "d82c246027a3965c"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-core/context_capsule.json",
-          "artifact_digest": "f5ef7bdad14e035a0641e2cb6bf95a44a5e3696d9adfef0b190d9592ab6bb9d6",
+          "artifact_digest": "b69394b29aacd86a7316386c95c8d89151ca6d04ddb6c17c6ec55c4373877100",
           "contract_revision": "de7c5eca426bb992"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-core/test_capsule.json",
-          "artifact_digest": "4219d10cfdc4556be40234a018e7b05ef72b0ecc1e5f193301570ecfa84e9c32",
+          "artifact_digest": "a640cc71b28d251e19563123d1e64dfe723c1dda5cd8b158f907b566f55b4a8b",
           "contract_revision": "e09011d8fd282f66"
         }
       }
@@ -10005,19 +10026,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-service/contract_kit.json",
-          "artifact_digest": "ff811aed33c782b45905f843075c298507b750037633cf3a52d3ed3e0586e6c1",
+          "artifact_digest": "878c21ebc354d0b1c4d60ca9fb80667d1a3badcb3f0f7f3ccc6d5fbe9aa56c00",
           "contract_revision": "5ea02eabb3332172"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/context_capsule.json",
-          "artifact_digest": "d0db527cdab8ab79f3fd69357ce779a3e70d5d00b03a4d593b3ab5c43f0fb1d8",
-          "contract_revision": "f3cecc24b1d8dc19"
+          "artifact_digest": "e50f7177fb209a55d4ed1717bcbd99c12fb337ced2af5faecfb22d7e62fa6efb",
+          "contract_revision": "9ecd7eeec495b53c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/test_capsule.json",
-          "artifact_digest": "f3ce75dd2c220308e6783811f9a957909eb492a22e2f729ceaa099ac4faba9ce",
+          "artifact_digest": "48665af724870d64f1b255f76bfa9510efe441628a93c1a89a697b3a8e68568d",
           "contract_revision": "01d9f1c2f17c8fc4"
         }
       }
@@ -10049,19 +10070,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/maintenance/contract_kit.json",
-          "artifact_digest": "54c6207f160cd12c1fadebceb1eea3be7e784bc2a78ce4631a9c5b58acb5f4ee",
+          "artifact_digest": "079ac6e8dc74b79c6ed72d63749aacf6fa988516b65b6f5c8f0dcaacbf4f166b",
           "contract_revision": "7f1fc356660d192e"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/maintenance/context_capsule.json",
-          "artifact_digest": "f05ae42d5adbc8102c7fd281758351b2f9b6df00b256d4c622b77a9fea0f384e",
+          "artifact_digest": "43b8c179587024d2d729c65b31647c920b1dd2c0f6f4e9ec716040d17b1a669b",
           "contract_revision": "f05a6acab6bea324"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/maintenance/test_capsule.json",
-          "artifact_digest": "76511216682c1719a49d80f30f01f6bed4f2e46dc3d68500aebe7e8dd65e614d",
+          "artifact_digest": "b2034cbdf25fdf1842080e1b6c591fbe9cdac107be35c3bb8f6c4408e26f5207",
           "contract_revision": "3dc3f785ebe18fbf"
         }
       }
@@ -10093,19 +10114,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/meta.improvement/contract_kit.json",
-          "artifact_digest": "a59674c2217b7610adad93a6a4e99b874d80ffc0fd850de5b2903e6e22b46c96",
+          "artifact_digest": "09c2a371c2e2a1e21f41229d43cf6971ff1f446506511d4aa46c68e6c0d5e003",
           "contract_revision": "986258d28dedd6eb"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/meta.improvement/context_capsule.json",
-          "artifact_digest": "62e1388fae4b312127ca144a5f0020fca5466ec04cb388054ec679db5b554067",
+          "artifact_digest": "be2612905a5adf0cf47086981a48bc46eddc89be5c04dc1fef8b60d561e8358b",
           "contract_revision": "9d4de791186b431a"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/meta.improvement/test_capsule.json",
-          "artifact_digest": "bfeba0326c21fb978f4ac813a57b130bef7bd262bec04d3e08ff20f071e54bbd",
+          "artifact_digest": "4f8f401e87b505c512d04472143e9ba058f61a1213cdebddb02666f29858012c",
           "contract_revision": "b62c1749ddaadc42"
         }
       }
@@ -10149,7 +10170,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/meta.learning.activation_assessment/test_capsule.json",
-          "artifact_digest": "40c1980f990156b2a96bec39357a0188c08ee6e2fb1a62af4c62c2889fe753a0",
+          "artifact_digest": "719f0650cd0a34df250467c4019c2f445a7e94783af72303f7c21390aba7e4c1",
           "contract_revision": "19800a3c2e326974"
         }
       }
@@ -10193,7 +10214,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/meta.self_quality.diagnosis/test_capsule.json",
-          "artifact_digest": "e6a332b0d0ef8c084344eb75fdd0c522edc656da0473ff95174b7038e2b176e1",
+          "artifact_digest": "f68f31e4afd38e9b59fc4e1d2b82c94cbc5185953297b9d22b2fc452a8b11b00",
           "contract_revision": "a6d918a507455a9b"
         }
       }
@@ -10225,19 +10246,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/mod-research-provider/contract_kit.json",
-          "artifact_digest": "45f35fafb799f31b4d68632cd8831fef190ad10274dea52842a73ebc9e5289ca",
+          "artifact_digest": "5bb5132beb2bdebe804887aaf96d4296168a84449aa2c06de0743ab2218a28fc",
           "contract_revision": "3abe7b6c265c350f"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/context_capsule.json",
-          "artifact_digest": "999cce2bf9acf28454637fbf994b754c2c928980fe205efdd4b215a12b8514fd",
+          "artifact_digest": "cc39a41b967ae5da1d1ded7ca8db202a96848c8f4ce239bffdb39bf5d5e712b5",
           "contract_revision": "050c795020fbeed1"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/test_capsule.json",
-          "artifact_digest": "df5c770a1cc7f80cb0a8b5c1bfc6ff778ff4a8e19a796cc31664b9df72a20e23",
+          "artifact_digest": "ee6aa623b1bd0a2e9423ad00e085189421728adb64ffd6fc9ed7f8ceca3e0b9c",
           "contract_revision": "03ae53f7e89b6ee3"
         }
       }
@@ -10269,19 +10290,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/native-worker-core/contract_kit.json",
-          "artifact_digest": "67359d2f227e27128c981198638e2c96b48a32d8e3eef5a30564aa837d4dac31",
+          "artifact_digest": "22a607a3ae0c6f6292bc6735a9b4d2710c1baf031ed62ec73ce444a35552a4ac",
           "contract_revision": "68b7c79b66a86651"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/native-worker-core/context_capsule.json",
-          "artifact_digest": "cebf5415e0600ab0c5cb610ba732de72967da8a0ac2a92996bfbb39bb8231215",
+          "artifact_digest": "8e5743521db92a8076b9da70333748473d2fd7d3eba4a1fa2dc1b645bad68431",
           "contract_revision": "70c2a5e003207eaa"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/native-worker-core/test_capsule.json",
-          "artifact_digest": "605f0148ceace5bdc99c5001e1916564e5ea1209912a5cc69b45e0d821a90785",
+          "artifact_digest": "0327ab57bf94913a21d3f029be2f7c20ddc734aede677b020fc744a38f13a24e",
           "contract_revision": "a26894575141fba4"
         }
       }
@@ -10325,7 +10346,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/observation-contracts/test_capsule.json",
-          "artifact_digest": "63c5a615d9f650c2c46fe4cb2c70c67d0012102ea9bbcc7b958e8fa6f561b031",
+          "artifact_digest": "15c8d0544cf00fa26854df9143977f87c7dc93c2e3fe25f5eef9f1374f8a44e5",
           "contract_revision": "95af289fb1cdf0c3"
         }
       }
@@ -10357,19 +10378,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/operational-recovery-state/contract_kit.json",
-          "artifact_digest": "b7c870c00365869cde730a7f2e82b2aacd24f97c21b3a5b04d73f877693e0851",
+          "artifact_digest": "d948fd474d0869c57a2c86c077b338e30bb4c764d5b27755de9c60b547950283",
           "contract_revision": "f0f817c31b0daaf2"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
-          "artifact_digest": "c94d219e9c9085e3b7ce552777096a7f8e4c6ff5b6f378602daff9227a013096",
+          "artifact_digest": "51b6390647f16e723a0f1c8926f8929400d0a6c4cc232d4d13e3c8ffe4e6e7c3",
           "contract_revision": "8d4e4476ef742678"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
-          "artifact_digest": "269231679b48134f4deaa8770d18f07d27f5bf7b148a6c5f13d732f4d0be20ac",
+          "artifact_digest": "7560456b806609108492495b3b97a3a38d58a03d3b4a06ce556b43fdd3a5fd7f",
           "contract_revision": "d874d82a1f33c0fc"
         }
       }
@@ -10413,7 +10434,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/runtime-contracts/test_capsule.json",
-          "artifact_digest": "1e79e4bde47f029053ff389bf7cb81a23098370ba0e2c28c28264257f71f99e7",
+          "artifact_digest": "80b4c5bd30757c5f05956f8887b12f5a3396553a3aedad58a3c3e76f37eda908",
           "contract_revision": "76ba5f1003d8974b"
         }
       }
@@ -10457,7 +10478,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cognitive.quality/test_capsule.json",
-          "artifact_digest": "c8d68819d8335b16abaf304954265a92fdb44ad1ddb6c66477885af444fe9a25",
+          "artifact_digest": "72a90a41b071612f24e1299a7f13d1c1d55b44d01657f1a3246de55dcdef37ad",
           "contract_revision": "901fb02088a6815b"
         }
       }
@@ -10489,19 +10510,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.admission/contract_kit.json",
-          "artifact_digest": "d68298d1408c776c40fc3a111a16473ff4a8441377beccec70a538e1f1544302",
+          "artifact_digest": "0640d3b56c8b4faa6029c888f9a1a605d280744bbb4c137b56798a79a0b4ac50",
           "contract_revision": "37f1ce4ac2ebf341"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.admission/context_capsule.json",
-          "artifact_digest": "8ec29c6a2accb131ce13599d81f6e048bc5b3fcaf26f06526344fb3a31389216",
+          "artifact_digest": "8ddcf4557e5f661248d539088f4d82cae46d2e1afc0d0e4ffd0903467ed3c59e",
           "contract_revision": "450462e44a43c833"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.admission/test_capsule.json",
-          "artifact_digest": "e28dcde61b49fc0f28d32a8cbe498b9a154e88f664cdb03b6cca8d84cc262391",
+          "artifact_digest": "8f1ff74cc8c71ba19b3da8a60e0e95c805d3f6d429bded0a05920032842d6e5b",
           "contract_revision": "a4bf13d66dbc6b17"
         }
       }
@@ -10533,19 +10554,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.assembly/contract_kit.json",
-          "artifact_digest": "95300187aa289c3aea1c77b5099c2460c2650cb7ec5a71b1fef964506804139d",
+          "artifact_digest": "b8ad84416b5dfbf367714a5348a133f9c3c3262f3bd6e6df4dafd556dc7c95ba",
           "contract_revision": "ccbe12a462a64602"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.assembly/context_capsule.json",
-          "artifact_digest": "987d9252cf01baa323b5668ad125e73aeb678b8544fe1d0ef9e9c1e22a6adb41",
+          "artifact_digest": "60c4931e05315710efbd82babbf95c23843ee2452f05772db48a358919a92ebb",
           "contract_revision": "b81496b603f71cfd"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.assembly/test_capsule.json",
-          "artifact_digest": "60cc22a1635fb531ecae5fa3e7d22fd1d8e47a32e16e070c914e7e049ad6ecfe",
+          "artifact_digest": "8dcabd6dca96baec1bf9b87c9edffc74b58270fe240b9321ac2071934c64c937",
           "contract_revision": "3d2f718e759888da"
         }
       }
@@ -10577,19 +10598,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.candidates/contract_kit.json",
-          "artifact_digest": "8c8fb776a7047babc0e4785ad4169a5f5329391e1d3d0a58d1714cde6907ee21",
+          "artifact_digest": "c20bcc83b48327ee7cf1e82080e94b02fec70c9a444261e258b15ca7e9af6642",
           "contract_revision": "4e845aae127cb8cd"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.candidates/context_capsule.json",
-          "artifact_digest": "d413f2da5569becf85a327c881fc4d9ba04020db324639d62aa8ca778e25cffe",
+          "artifact_digest": "648e5cd33137e90981c575dd9412e10ecec091013dc96a77d7ce1eb6a3ed0686",
           "contract_revision": "90c6e266aa88cd5f"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.candidates/test_capsule.json",
-          "artifact_digest": "8837e2366827bb3a3a44d21bafd48c8406a9b8359712b409062197ce1b462a66",
+          "artifact_digest": "660e89570774e40378e394791d058553fdf540bc11e636669f15e2b6fea21a07",
           "contract_revision": "152979de4b96d521"
         }
       }
@@ -10621,19 +10642,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.contracts/contract_kit.json",
-          "artifact_digest": "b607639fe7a5c7ab68500aaa25ad44bac31783668a423fbeccb7e8058468cdf0",
+          "artifact_digest": "6da0f0ab06d47b7e35fa6e958eb2836afcaf83564e4312ad4ffdcba1a694dff6",
           "contract_revision": "c8d8caf300d1e039"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.contracts/context_capsule.json",
-          "artifact_digest": "c264c51216dd08435eb24300c4927e6852e6e713b783970b24b055a733605a17",
+          "artifact_digest": "dae46b5780e2204146da2f9c9bed149c05baf37baf5d4f65eb7b4462e4b6103c",
           "contract_revision": "637d343bfe4ec9aa"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.contracts/test_capsule.json",
-          "artifact_digest": "e25c0d591a0a80111de04df3d7d290dd77941387bf4c1fe0fec019609356ef8a",
+          "artifact_digest": "53361cb2eac353ca259f03a8773f5394a61826cf9223f76885892cfb19deada9",
           "contract_revision": "950740f98dcd8c04"
         }
       }
@@ -10665,19 +10686,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.measurement/contract_kit.json",
-          "artifact_digest": "4481e06eb00d695fba60f469d961e46f6f1298b7293bb56a73bf87f2f740f728",
+          "artifact_digest": "ebbc28ac94427f2d72e67438356c219be63d29d5c794d71cc0071dca0387bf7d",
           "contract_revision": "3228265e138337f0"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.measurement/context_capsule.json",
-          "artifact_digest": "239db9425378d6bc916823fed5de65720dcce1c8027f43968f39efce314eb693",
+          "artifact_digest": "0f9d6289507c4b7f5c9c814b55adb8a9d8c991d00909d596730c8c37c2349148",
           "contract_revision": "7de4c80347dc30ae"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.measurement/test_capsule.json",
-          "artifact_digest": "239bc99c8caa0fabb2a9dfe343594dca907d077a5c006c78051a19b3a2344a09",
+          "artifact_digest": "00402bba060d5bb4316135e8baf61e3247ee1f7e4cfc2f0578461d9a3d687666",
           "contract_revision": "d7afbc6278b9c035"
         }
       }
@@ -10721,7 +10742,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.reactive_delivery_plan/test_capsule.json",
-          "artifact_digest": "c91839920a19767d7b6a834857b035bf37529d511bbb08180a8f31e356c12ba7",
+          "artifact_digest": "06d6030d5d7056847f6d0ae0738f8e0229eb1057474766e8dbcd3b6aba2cb7fc",
           "contract_revision": "ffc564a36b1a5d72"
         }
       }
@@ -10765,7 +10786,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.activation/test_capsule.json",
-          "artifact_digest": "25ed5066268bad25f4f47a9054618037943ae8244649dc30e52d242c2ec3b4fc",
+          "artifact_digest": "e13bc61e09d126067aa416fc118ab17fc15992153503bbdae868a3af8277d591",
           "contract_revision": "fd27f87a189493b6"
         }
       }
@@ -10809,7 +10830,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.contracts/test_capsule.json",
-          "artifact_digest": "72d7624b0b2fa105ed8788e38bd0569e1f930d790b68be7b200b46d20c05b2d3",
+          "artifact_digest": "61c0b2d09aa464468c1f9298984e9feedcf72ba8819bc62e4a40e67f9c37874a",
           "contract_revision": "f49e6943476a1625"
         }
       }
@@ -10853,7 +10874,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.index/test_capsule.json",
-          "artifact_digest": "7f8a89e3568e053d91799a7d5739d67f3b41b54bcf5b668afa9045ccde477fc9",
+          "artifact_digest": "febb89aecf6a52274f5aa843b6af190b253237b19d0b3d68546e09dd9929c79b",
           "contract_revision": "daa66d1211b0e2d9"
         }
       }
@@ -10897,7 +10918,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.bundle/test_capsule.json",
-          "artifact_digest": "2bba39ef317bcc35ec111075993d17a24756674dc60aebf9d75bae8e3bdedc06",
+          "artifact_digest": "b17e6329d79930ff5f295d965e1d160543b04feae84b98afa345972aca6f322a",
           "contract_revision": "923c16805fa0575a"
         }
       }
@@ -10941,7 +10962,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.candidate_validation/test_capsule.json",
-          "artifact_digest": "aa209d13f5f7fb940e2921741ed19a9786f261e1fc24487dc6799f8c4fb5cc7d",
+          "artifact_digest": "ea1a536511a6ab4ac68d17104cf6bb23f90d8316f0c10731a05282d073144683",
           "contract_revision": "bdd42eb6647a407e"
         }
       }
@@ -10985,7 +11006,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.claim_grounding/test_capsule.json",
-          "artifact_digest": "4b1bbb1a8da5868089c40a74d2334dc318a588cc48535357ef13b0db7c8b50c5",
+          "artifact_digest": "204871880bd1751a01edd3808d5cd06d69c5d9e20a2e25ff5b7beb71e1f7dfba",
           "contract_revision": "7bc0e35f84013d76"
         }
       }
@@ -11029,7 +11050,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.classification/test_capsule.json",
-          "artifact_digest": "e3b25722181ddcfcc28f62130ccdcf5b6a9441f1b5561ccc58ae613c390b610d",
+          "artifact_digest": "4f8161d6037c3c813e7b678814c81c0fd39b367ec4e48720d9de7d5d697a751f",
           "contract_revision": "25d92cfc6d1d7b23"
         }
       }
@@ -11061,19 +11082,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.dreamer.conflict_analysis/contract_kit.json",
-          "artifact_digest": "6242a3b8296a9c4d2bbaf7a400ba81b80f4aaf1f0ed362af133a828ab7318cb7",
+          "artifact_digest": "93a83e2790ce624e6fb59842d74e51415593f007cc6b29d041853a1c1022c84e",
           "contract_revision": "ad23c6c8c9853ab7"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.conflict_analysis/context_capsule.json",
-          "artifact_digest": "53f8102152dcdba6655b84ca119c7b9a54950ad6f8943c2e5f98e14688d24eea",
+          "artifact_digest": "ec69cf733dea7082e4475bb22ccca2517c704e65f696c882775702af217e40e9",
           "contract_revision": "232d2915356f8656"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.conflict_analysis/test_capsule.json",
-          "artifact_digest": "7b5881b775682656685090cf91cc86e8fb5e0fd57f6616641e5a6316f025ff9a",
+          "artifact_digest": "b43818d9b87075782b73454d0b89d31a653d20ef3196ec6f54dfde2316986962",
           "contract_revision": "4b55e337432be3c7"
         }
       }
@@ -11117,7 +11138,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.contracts/test_capsule.json",
-          "artifact_digest": "ba0dddff0a89cbee556ac086fdbfe2e7b2553aea2b2214d1453da7384de547b1",
+          "artifact_digest": "b31259a5285b0efd8dac7b1c61340f590c1f82cd67311ec4b2fc89b3d172cf54",
           "contract_revision": "76830ae62a406a41"
         }
       }
@@ -11161,7 +11182,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.curation/test_capsule.json",
-          "artifact_digest": "3347d5ec00f260bd1eada5597d22cc342b1f96ed32f0249ee4ef9110a2173ab8",
+          "artifact_digest": "2870e80f1a94d32eb7c5eb8da78ba5e79515a3546af565e093e1a0a472827233",
           "contract_revision": "5ff2bfc28fa2df3a"
         }
       }
@@ -11205,7 +11226,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.cycle/test_capsule.json",
-          "artifact_digest": "98489b912f18bba50a6a6804e0dd1707168c9e4f325ad01b9c8680f6ef4d78b2",
+          "artifact_digest": "6512ea9aa1a737e741d4bb5833f589835472829c6fac2b8db0e61cae3370d51a",
           "contract_revision": "03054f3346220176"
         }
       }
@@ -11249,7 +11270,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.failure/test_capsule.json",
-          "artifact_digest": "9629dc0e506329bfc1d9da84ff1c0b310c401bee17eb40cacf06315c277da70d",
+          "artifact_digest": "147d55e8b39515b87f25d034de19f2f02014e2c77bd0a12fdfe3417879f1cf00",
           "contract_revision": "32035344f07ae886"
         }
       }
@@ -11293,7 +11314,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.memory_revision/test_capsule.json",
-          "artifact_digest": "bb05b8df5ed7a261f995f6b164c4a6160b277d3643274640e6221b9e06506417",
+          "artifact_digest": "7e862267c335a2fcb7cf287bf657bcb76c3a0f0b7c7c1825302053ff5af4d89c",
           "contract_revision": "e245d5650d7f589d"
         }
       }
@@ -11337,7 +11358,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.orientation/test_capsule.json",
-          "artifact_digest": "52a0abba6e9dcdd994ea6d2a45eb86306b731a5155bccc164c7188d68b2e9abf",
+          "artifact_digest": "5d19d0e00cce0498962c632e8a7d40e1b8220ce8a8cfe6b7ba662bd03ff79d1d",
           "contract_revision": "277b0ba0b9c7394a"
         }
       }
@@ -11381,7 +11402,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.probe_plan/test_capsule.json",
-          "artifact_digest": "9c58c0a746529db29db5cf4b651074b192d6ca4b3baf0f308547236b4da60720",
+          "artifact_digest": "22dd358888ebf02867debca649cb181bc9f7790efce1cdf94bdec5d0210a5d89",
           "contract_revision": "42cc1698281e7e5b"
         }
       }
@@ -11425,7 +11446,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.rival_model/test_capsule.json",
-          "artifact_digest": "2c8dda91db1631987eb1e54e1519a01b370e45e4838b1280e9e76e11c2e0cc1b",
+          "artifact_digest": "f40f7294f0295059bd6c48b076e381a008a55973c2c93db515ab02ec4f1faef2",
           "contract_revision": "125d93c03e93bc29"
         }
       }
@@ -11469,7 +11490,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.epistemic.context_provider/test_capsule.json",
-          "artifact_digest": "98028c17b4a4523d65a667da83bc6ac969f83a312b9d7c2b8d5f7581763e32bc",
+          "artifact_digest": "5c57ee528a970c362295103c6c6fcef0010629f9c4602754c64ddfd49a69ea75",
           "contract_revision": "2e75adc023c7e216"
         }
       }
@@ -11513,7 +11534,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.epistemic.contracts/test_capsule.json",
-          "artifact_digest": "1eac8b08830295c06b8190016fab5d078be2e1d5446402e2bb95c4aba55db61d",
+          "artifact_digest": "7d12123b054de76fa009c67ac3513fedf418bc0951de398903e7461ea17118be",
           "contract_revision": "611558670ab39ef4"
         }
       }
@@ -11545,19 +11566,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.epistemic.position/contract_kit.json",
-          "artifact_digest": "d2a4328c89596df59181079cd54ab7c3c7753caf7900c0057ac5fecdaed0ebb0",
+          "artifact_digest": "0d2618aaa45a901b90393816729d1d0d65f18bd7f52bec4e7f9f2324d4f62538",
           "contract_revision": "a7e5194040577524"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.epistemic.position/context_capsule.json",
-          "artifact_digest": "a846f75b1f3430acfa89567ea9446b1f17d0adeaadc18974fa6a065e64daff73",
+          "artifact_digest": "4b7d803911428c9fa977bb6683619812fbf2fa4d7c5df8f84c1cce1d3e094792",
           "contract_revision": "abe7fa2fcfd824ee"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.epistemic.position/test_capsule.json",
-          "artifact_digest": "c56f7f544784335ea9948ca7d7982a55be8f3b59435708247fe0c42ee1b858b3",
+          "artifact_digest": "cd6c1875ddf53cfb66c41f5fea201395e71d14f315e1e816533c6b951ebe8b94",
           "contract_revision": "0b0e5dccc024a6b7"
         }
       }
@@ -11601,7 +11622,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.experience.projection/test_capsule.json",
-          "artifact_digest": "e10cfb7571a727d48e808edfe04ff5feee79dd72acddf792c60923c020bf6dc4",
+          "artifact_digest": "2a5ea776d0a4ee782d72383d682da3de4d62b23d27e7f69c2f20a234e7a71ce7",
           "contract_revision": "a9339e6ffc80be70"
         }
       }
@@ -11645,7 +11666,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.experience.provider/test_capsule.json",
-          "artifact_digest": "435075862311baef730519ad5f749c131c233f0d0c1feb67d6bef57f8794d083",
+          "artifact_digest": "5adfa159fda707b452784e27b1b17e83641a2f9caec77b184efd74ed163fe58c",
           "contract_revision": "d9e365dfcfc5d631"
         }
       }
@@ -11689,7 +11710,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.learning.contracts/test_capsule.json",
-          "artifact_digest": "aabc5866c3e332cf77a2e735d745905d5d5b13ba4d04cf9250f4ace135b03b96",
+          "artifact_digest": "2a559be05bf9bc288e880d2f479397e9e61db05ca1685c1a3d11e40f32fbcadc",
           "contract_revision": "c361b27b19aeca3a"
         }
       }
@@ -11733,7 +11754,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.learning.delta/test_capsule.json",
-          "artifact_digest": "7af461d574b9c154493887ebbc16cbb27d4fbd30155db9b5e027eb186a705ad9",
+          "artifact_digest": "846f6400a8f9e9dc1f0476d3f5fd4f0821947d7cf00b0ec0b8cc85be07d9ff59",
           "contract_revision": "14f5ef9a7c9383d4"
         }
       }
@@ -11777,7 +11798,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.learning.state_view/test_capsule.json",
-          "artifact_digest": "ebf5043f5a6c81ca79deb8f5d0a22a34c93fcfca38395e19c42c39b18955c4d1",
+          "artifact_digest": "fcca0a77978dacd8901e27a8f0ded779b416ed33899bd5b23e4c55cf3f584110",
           "contract_revision": "f6737141c050f5f4"
         }
       }
@@ -11821,7 +11842,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.ecology/test_capsule.json",
-          "artifact_digest": "d13e9b15534b4592ef51d9032c39b7a3b5946a14131c345a3032da36ef11dc51",
+          "artifact_digest": "313d5a85973c62da4380ab09464ea171363e4550f6ead7b0c366f525a55d6296",
           "contract_revision": "e77ee278151b8a3e"
         }
       }
@@ -11865,7 +11886,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.understanding.common_ground/test_capsule.json",
-          "artifact_digest": "b069a6e458ff97acfffbdec03f216fb370c767c93cec3b0bde7de67899b3e0b9",
+          "artifact_digest": "3ed9b9892e143d380b4ce0338477e23cf8497750d4d8de24d2ead245137ad5ba",
           "contract_revision": "1afdc380a46bf3ba"
         }
       }
@@ -11909,7 +11930,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/swarm/test_capsule.json",
-          "artifact_digest": "0e7a08ef0a3688f0b8e3faf307208f0343a76c850fcf8f855a98bfccb259d350",
+          "artifact_digest": "c3868443c28cef590af31a498538b19719e737adaf2375a2e892560c7ddc3f47",
           "contract_revision": "e39636735d0e8989"
         }
       }
@@ -11953,7 +11974,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/user-broker-core/test_capsule.json",
-          "artifact_digest": "c0e57bd353570ab94b44f0b8f5075995853c4eb753079e0040b337232e06be20",
+          "artifact_digest": "71ff936d9086d9529050730750751258f731a6261a74079469e93aa12c87f195",
           "contract_revision": "0db2ee03f9e94b79"
         }
       }
@@ -11997,7 +12018,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/wasm-runtime/test_capsule.json",
-          "artifact_digest": "5a18d58167a8a14dbfe52d32554beb4f29f20541f98a2935b9406b34596e76b7",
+          "artifact_digest": "370a0ed70b202a8e2ca7eb3ff4020d55366e90a3aea11f1bb11bd42ba4bb499d",
           "contract_revision": "da68cd6bdcd99978"
         }
       }
@@ -12064,8 +12085,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 10,
-          "source_stu": 103282,
-          "sha256": "4cf63c1dc77fa0a0e64c3c454db6728db611518cf01f155a73912631c0f756e8"
+          "source_stu": 105085,
+          "sha256": "eb1e96e8a774ef2b16037175b692d192f4ec33966e3da690599c68a9a06f557b"
         },
         "source_classification": {
           "production_source_file_count": 7,
@@ -12142,26 +12163,15 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 4,
-          "source_stu": 50124,
-          "sha256": "c7d40a87b2c727a11f91deeeca5bec046799c34957d6cfbb0ffa99dd9ab3088e"
+          "source_stu": 54294,
+          "sha256": "d961a3e00fd027efcd91e8d35a522454f88b3784fb51be0e14ed922be2311a82"
         },
         "source_classification": {
-          "production_source_file_count": 1,
+          "production_source_file_count": 3,
           "test_file_count": 1,
           "test_only_module_paths": [],
-          "unselected_file_count": 2,
-          "unselected_files": [
-            {
-              "path": "crates/bridges/eliot-git-bridge/src/generation.rs",
-              "bytes": 18553,
-              "reason": "not reachable from any Cargo target root of this package"
-            },
-            {
-              "path": "crates/bridges/eliot-git-bridge/src/removal.rs",
-              "bytes": 17631,
-              "reason": "not reachable from any Cargo target root of this package"
-            }
-          ],
+          "unselected_file_count": 0,
+          "unselected_files": [],
           "unresolved_cfg_or_module_cases": [],
           "note": "Classification is derived from Cargo target roots and module/cfg reachability, never from a path component name. An ambiguous cfg/module gate is listed as explicit uncertainty and stays production-reachable."
         },
@@ -12231,26 +12241,15 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 5,
-          "source_stu": 59317,
-          "sha256": "6133d67a73a1336f6c6678ecd116cd2da1be0de0fa6158a74a7d0d87d62cb4cb"
+          "source_stu": 62227,
+          "sha256": "a06493d04ee07ad68eb828c6854261da72688204adf8f25715e7314081d11ad2"
         },
         "source_classification": {
-          "production_source_file_count": 2,
+          "production_source_file_count": 4,
           "test_file_count": 1,
           "test_only_module_paths": [],
-          "unselected_file_count": 2,
-          "unselected_files": [
-            {
-              "path": "crates/bridges/eliot-lsp-bridge/src/generation.rs",
-              "bytes": 18402,
-              "reason": "not reachable from any Cargo target root of this package"
-            },
-            {
-              "path": "crates/bridges/eliot-lsp-bridge/src/removal.rs",
-              "bytes": 19024,
-              "reason": "not reachable from any Cargo target root of this package"
-            }
-          ],
+          "unselected_file_count": 0,
+          "unselected_files": [],
           "unresolved_cfg_or_module_cases": [],
           "note": "Classification is derived from Cargo target roots and module/cfg reachability, never from a path component name. An ambiguous cfg/module gate is listed as explicit uncertainty and stays production-reachable."
         },
@@ -12320,8 +12319,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 95,
-          "source_stu": 1790024,
-          "sha256": "b1674770968c01843a9a7cd868ad3c54743b351b5873a2875c128cf6b4728df8"
+          "source_stu": 1790391,
+          "sha256": "7669c2e291a23537e1b40656ea1c872e848d53b09794a41009a54fd5a58b42d5"
         },
         "source_classification": {
           "production_source_file_count": 71,
@@ -13005,7 +13004,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.memory.projection-provider/test_capsule.json",
-          "artifact_digest": "1b51ad49d5b9ae93178b2b333e250d6ee61d6333b7cd967b0a052d4319081427",
+          "artifact_digest": "ef47acb707151e123e6e750bf944b4d682d9cd08c1e8c161b40e7aad0b7c706c",
           "contract_revision": "bbcd32a5f88b23e4"
         }
       }
@@ -13049,7 +13048,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/sim-core/test_capsule.json",
-          "artifact_digest": "f39806f0491bd45108dd666f9f0a30ec570acb9ebee8a380fd6ebb18b71baae4",
+          "artifact_digest": "84aa6637cd4fb33a914f82218c4eb19e5a1e28293ef4799bb901fb38902deb6a",
           "contract_revision": "fc5a53892398c93d"
         }
       }
@@ -13093,7 +13092,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.binding/test_capsule.json",
-          "artifact_digest": "ec442d5c2cf8e5bb2daaa1f93822b576e3820e7e68b03e7b39f26352e9553250",
+          "artifact_digest": "400355d878071ea1c40fd2a94cffce77220cd6d20aa2bba0d2c3be58fb676829",
           "contract_revision": "e3432debd789264c"
         }
       }
@@ -13137,7 +13136,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.normalizer/test_capsule.json",
-          "artifact_digest": "8d4480093d118b9312f51623eb5e73c6a77860b9e640cd6fc5527c4babc800ac",
+          "artifact_digest": "b279b7ba24a792f76890f43be5dc234b5a93f4c57a37eaa6d7d16b02ffd1fc71",
           "contract_revision": "8ded0540f7cc9f4a"
         }
       }
@@ -13181,7 +13180,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.accessibility/test_capsule.json",
-          "artifact_digest": "caaa4e6882c0420bcabbfba1a56f8c59b97497c0f755c9db807dec0ed2a6db18",
+          "artifact_digest": "803ab4e668b0c713a9076c2e06c829924422bb007997dcc75e15c5584da4851e",
           "contract_revision": "c79b2fd0175449a1"
         }
       }
@@ -13225,7 +13224,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.architecture_brief/test_capsule.json",
-          "artifact_digest": "4faefc373b506fe3e900c202953fe7233e4687bc7cb384e750352b3992205122",
+          "artifact_digest": "b590dbeda41d1a2f910b1a8a6d0ecff298f17bba3323df474be6df0232bdda0e",
           "contract_revision": "4e9439c63d4864f8"
         }
       }
@@ -13269,7 +13268,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.clarification/test_capsule.json",
-          "artifact_digest": "96850fa4ac804bf8066b06798b3f5bf2c80e3e9a71d8fcfe489f26c3e3db708f",
+          "artifact_digest": "cc5d62d35a0243827b46def39528b5c6c9f3445a01b45c16954d00847984ae60",
           "contract_revision": "025a632c2765ef1a"
         }
       }
@@ -13313,7 +13312,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.concept/test_capsule.json",
-          "artifact_digest": "9c441fcc8f6a65e1535d1394d924724151c0d0d33793820bca0a46c8d1277df0",
+          "artifact_digest": "92de91da63cee175e65d563e81b1b94c45388748b7af0dee42163b2417d0ef08",
           "contract_revision": "3a3f0f80e5cb092f"
         }
       }
@@ -13357,7 +13356,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.configuration_plan/test_capsule.json",
-          "artifact_digest": "242b161323ecfbb4e42819b12f37eff38c2613f897512e03bd6f7d2cd23d8677",
+          "artifact_digest": "5b67b844757bdc0f25ad15d92c214a1f28a204bdc29626d072df5bdecb8d82d9",
           "contract_revision": "f01d94e337c256e0"
         }
       }
@@ -13401,7 +13400,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.development_diagnosis/test_capsule.json",
-          "artifact_digest": "d864e4c5cd85ed4c5e00d46dcd27460ae65f04620d00d15af4a50b5daad48d46",
+          "artifact_digest": "8fc2a614188257d80a0f339fc04426dff2a5f6d3e463fe81522a2065f953ac82",
           "contract_revision": "6b5432127a5ca470"
         }
       }
@@ -13445,7 +13444,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.episode/test_capsule.json",
-          "artifact_digest": "e6570acc2d77ca9ef73f447b2a9204d1dbc7f7cf93876ccd29cea8a77309e08b",
+          "artifact_digest": "5572c7815c80b1d67f71cbbd38ec48842935414681c196375353b59c5245e4b5",
           "contract_revision": "16223ac8aaf07d87"
         }
       }
@@ -13489,7 +13488,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.implementation_brief/test_capsule.json",
-          "artifact_digest": "ff02a520dd3285212d655af276d073003861e1ed7c7bc64f9e6e24c658a2e199",
+          "artifact_digest": "f9591bf8ae80813f0e7c56d421f579a307fda0d019f98873c89e24f9c297c59e",
           "contract_revision": "27d6463e14ee6d2d"
         }
       }
@@ -13533,7 +13532,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.maintenance_plan/test_capsule.json",
-          "artifact_digest": "06f97700bb994533bccb13af564a9eb3da17cce7ccc6f6c57d7a9a9e77ee8bd3",
+          "artifact_digest": "468371423580f0848d3da684f9da9a5867fe812949d290c7037ccd44d32ae0ed",
           "contract_revision": "7fc4d447a7525a18"
         }
       }
@@ -13577,7 +13576,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.memory_repair/test_capsule.json",
-          "artifact_digest": "438d22f6381d2db575148722dd57b1df30c779ec9e2526e6f08f0dd3ed631464",
+          "artifact_digest": "03cce5bc9d7721ee53f892808a456381f5d87acf1a97ef8389b20b446b08dadf",
           "contract_revision": "b0d32e89108bc8f6"
         }
       }
@@ -13621,7 +13620,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.orchestration_plan/test_capsule.json",
-          "artifact_digest": "325817d04168b124c59004b982b9147f481990fe563849426c32ed3fd82b4da0",
+          "artifact_digest": "b22e0ee161d6817798a915a931c5f55106f1a235ad99f0cb293e3416fb2b3982",
           "contract_revision": "46a353828fdf2113"
         }
       }
@@ -13665,7 +13664,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.procedure/test_capsule.json",
-          "artifact_digest": "21117d0a45409c4caf31c68055f4feaa74930fb57cb0a7548e308c3404f3721e",
+          "artifact_digest": "141d1f9f14220c5a5ae1158927a88fbd17c748c019d3ecd574f7ae312d8833b0",
           "contract_revision": "51b67dfdd647c85a"
         }
       }
@@ -13709,7 +13708,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.reconsolidation/test_capsule.json",
-          "artifact_digest": "9bd779c1c4d274ef20d5454b9775f52643256454c045b2ae2b57fe55b0b141c3",
+          "artifact_digest": "3a73063752c0f87588fc5204e4d4e1f0d191ee4596b133c32ea8ba4672e3d0e6",
           "contract_revision": "0b9339e52a0037bb"
         }
       }
@@ -13753,7 +13752,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.relation/test_capsule.json",
-          "artifact_digest": "bb6e60c389acd60876ac5cfe95a9ed5345b942a516670b2d0dcb1cd09e5bb276",
+          "artifact_digest": "fcd25d8dd3dac11643667c8b90c65013d4a9a8ade13107cb22db251f81123afe",
           "contract_revision": "70ad1b0ae2196924"
         }
       }
@@ -13797,7 +13796,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.research-synthesis/test_capsule.json",
-          "artifact_digest": "c74a20ab49bfa219ae6b6d6ab3d59f564b476be86294eedc293b6bc5c8538f7a",
+          "artifact_digest": "be28b62e08e65a595914cc0fcce0e72208070f0f73a4d1797fbfbe1451371f09",
           "contract_revision": "ad37bfe572698e9e"
         }
       }
@@ -13841,7 +13840,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.self_query/test_capsule.json",
-          "artifact_digest": "ead63377f58dc2bf31b39ec3958a7818ebb89872a7fa98be8da6817785e48b85",
+          "artifact_digest": "8fe29df22579e8fb8e7d742dbf4657204fcb6769d8bf297ea43cf00fdbe909e1",
           "contract_revision": "349d95b4f2fd1b9e"
         }
       }
@@ -13885,7 +13884,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.structure_repair/test_capsule.json",
-          "artifact_digest": "6fa95ae0dfe1b5e6c3126eb502739284577244fbcd93353ffd5b6291dc74ba07",
+          "artifact_digest": "2803ad45a585e49a6d9018a36cf3ddb0adfb3321ff0aed5a4ffa54758015cd1c",
           "contract_revision": "d843cd0515467a98"
         }
       }
@@ -13929,7 +13928,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.learning.overlay/test_capsule.json",
-          "artifact_digest": "8b809830fe2bd5fe1c30763edb17b5af6ed021960555ad0ac9b9af8cc078e3c2",
+          "artifact_digest": "05fa2996c51cf164eb77bd4100c5e350255a6532c905de2f6735a30e135ee42e",
           "contract_revision": "c58164e8312c3442"
         }
       }
@@ -13973,7 +13972,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.curation_contracts/test_capsule.json",
-          "artifact_digest": "5a1b7709ec2388d98648f8aeceea362dec298d9c28ad44358ba268c4ba1fd072",
+          "artifact_digest": "0e10e2981ccfaff0707e2b5801fe84210431da9079174aebe095517954bce2f1",
           "contract_revision": "f10f18c06c3d6961"
         }
       }
@@ -14017,7 +14016,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.curation_screen/test_capsule.json",
-          "artifact_digest": "ec65c5f918d05edb0a071f1ccbad204ccd31be5bf43cd5e3067ed1ab09d9cb19",
+          "artifact_digest": "cfc2e0f4f5d124e8483b52e97a233aa3ed800f9b765683a07dd671cb9e163989",
           "contract_revision": "d99cb49c1b291492"
         }
       }
@@ -14061,7 +14060,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/test-support/test_capsule.json",
-          "artifact_digest": "b927d7295137329d1f7ca80a4ff5655c632f9929dfe9a891cd0d94d1dfde8bca",
+          "artifact_digest": "5748c27db4a6c0d627d5daeabf2888b19546cdf3c2852faaa688161d8685875b",
           "contract_revision": "6d39703e1aeedc73"
         }
       }
@@ -14109,7 +14108,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent-bridge-core/test_capsule.json",
-          "artifact_digest": "e903865c642791509aaff4c5088b9410cbce89c2fbc7941284f4a67d6f64b685",
+          "artifact_digest": "e3c5400ef0e816dc57a16b55549f3a6034cbb68de90e6e9189aef061116d7d1a",
           "contract_revision": "6a9a6cd162ff0373"
         }
       },
@@ -14166,19 +14165,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.attempt/contract_kit.json",
-          "artifact_digest": "f85cf7f04ddf17f719e5c724b475aabba3e7f99eec503d8d1eea39dff8d39c5e",
+          "artifact_digest": "af9a53c88d52f0d3370df3dbacb5487805a784f7172a1ea77fe60d1c27cc4fee",
           "contract_revision": "9dfbcaa73fe0903c"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.attempt/context_capsule.json",
-          "artifact_digest": "820dba92b4f354559564d768494aa49cc84c4b8f0ad87f1cdc17f08d8f2a1b2a",
+          "artifact_digest": "75032a8ecf332c0df7f3282ff726c353f9d505bb4bf6e4f24368c449f0796646",
           "contract_revision": "20b5cfe0fd85d09e"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.attempt/test_capsule.json",
-          "artifact_digest": "1146f80fded72fe906be73afd0d4568ed6645a531d01cd4f2676c2f2b1c26d73",
+          "artifact_digest": "39c131696d09f66ea249561c147d7917281153bce059f1ceef86749950b0fd94",
           "contract_revision": "62a05def33507c78"
         }
       },
@@ -14235,19 +14234,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.effect-candidate/contract_kit.json",
-          "artifact_digest": "360af680341fa2ce9d17874b299c6f396d670d09f61c9d73bd1333af4671c4ac",
+          "artifact_digest": "7c6568d0b636d6a44e08abd56ab650ac88b21904c22b24fdd05e502c6fe18c5a",
           "contract_revision": "70acaf3563a0a9a0"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.effect-candidate/context_capsule.json",
-          "artifact_digest": "87d94c4dd746a69da03e6a85e71076141ac8291d8d40553a8071921d0698e1c4",
+          "artifact_digest": "e171d3d9c4613737725c04d59a9744a92907c3d3211f3ff685e3b99f5021672c",
           "contract_revision": "2868577c1112977c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.effect-candidate/test_capsule.json",
-          "artifact_digest": "302df81f49e88a8050d2028956e2e8d2bcb3923cffd25120b3934461d0424ab3",
+          "artifact_digest": "3a758ee8d1642e4162e0edfbe8632c42b2ce046a207c277a61846f57350147b3",
           "contract_revision": "425a9cd5b7428c9f"
         }
       },
@@ -14304,19 +14303,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.host-event/contract_kit.json",
-          "artifact_digest": "66a3ece762afd74c71164538ea1eb8a3092ee6d4ee6b4aebd9c010ed06efc5b5",
+          "artifact_digest": "1f1444ac13d377df0b4a08f036208493224a506b24399ef296130a9b50d93996",
           "contract_revision": "f0be6989b9b8bdb3"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.host-event/context_capsule.json",
-          "artifact_digest": "d2ee1ad38960d90b3fbc18179eafe3be712790d1ff3edadb08ecaa60dd82372c",
+          "artifact_digest": "43b3f3340e978d7ed2fad1da56777fba5924fdecd765fded9023e3d6ccf9f8bd",
           "contract_revision": "85435993110f8b2d"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.host-event/test_capsule.json",
-          "artifact_digest": "5b76f7dfc22f38c7f7ac00b0b2be9e8a65a53068b66e7cbb202f3c9601f92082",
+          "artifact_digest": "826f673a170581cefb9ca473c1b4d3da151d9837d1060f81088ac1ac981c9980",
           "contract_revision": "177ae8e944e7dabd"
         }
       },
@@ -14373,19 +14372,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.result-candidate/contract_kit.json",
-          "artifact_digest": "8619ae664319d88b9dd791a0cfe0036dba7f015440d8c94413b496d86c1cdc35",
+          "artifact_digest": "a27dfd1569ded8ae93d44e1b240bb90a6b0abdd25dcc31191e88a4ad23fbcfe3",
           "contract_revision": "3e3c41fb5db68032"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.result-candidate/context_capsule.json",
-          "artifact_digest": "5b38b2ca70d77e0372a2bc2fdb9c1c074f264a12697c78ce56631e820c9adfbd",
+          "artifact_digest": "0c860e4f38025143b8f808ae56626c8c15ae10fa7a42192e2fc148c545ebcdd2",
           "contract_revision": "85ff47a2d09cd8d8"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.result-candidate/test_capsule.json",
-          "artifact_digest": "24102bd38f5d82f79c3ff594f435b094f4f6bb19cd8f490e79b3c75e3117ca23",
+          "artifact_digest": "1569bb874af50d5f97391726edd53bc47ad376c0f03b6407116f5eaa5929993c",
           "contract_revision": "4cb042a54849f9ab"
         }
       },
@@ -14442,19 +14441,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.contracts.route-fingerprint/contract_kit.json",
-          "artifact_digest": "a6d4e907843d85625b51ee7da0f35280dc167936cee3345ee7a88dc428956932",
+          "artifact_digest": "2d3f88ebe4b0fa462cad2fcc50d832775b1e35f8c9c739c451670f5a1c8b8ef2",
           "contract_revision": "6cd8e8e178ec7a6f"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.route-fingerprint/context_capsule.json",
-          "artifact_digest": "24017bd122fe5367fd297627df6895e1a2712ccbf78f7460e7c656556c73d860",
+          "artifact_digest": "647d094245dd6392fa4d3b9e63dfe779cbcb03e4c7886bc1e493e75653a18eae",
           "contract_revision": "b2be9da49c847b68"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.contracts.route-fingerprint/test_capsule.json",
-          "artifact_digest": "9ac7f1b82cbed259553ba146371aac79998603a4be1484c95b53736976ea8b67",
+          "artifact_digest": "0fee96e48b8bc6d6e952fba6df64c29deacc0092a508e841ba29e260ae3c3fe3",
           "contract_revision": "820211cd76b94b9e"
         }
       },
@@ -14511,19 +14510,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/contract_kit.json",
-          "artifact_digest": "c00645836c7debbb0660ddfb8c4c51de4b3a7adff953b35428ea5b195d799842",
+          "artifact_digest": "0992785ca5dd8ccdfc3f5aaefc67937b333529b218071e5cf70b99ed84ce0fca",
           "contract_revision": "915e87ed6763ca5f"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/context_capsule.json",
-          "artifact_digest": "63b9477e69f2e32ce3b844d295b79c19a26d904cd11d32fdd4fcbd1fe15a024c",
+          "artifact_digest": "22ca5de02c164cbc35ba4c426d51dfd65dac092edf4b2f85fd283b39d2d9b676",
           "contract_revision": "db92688d14cf1704"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-health-projection/test_capsule.json",
-          "artifact_digest": "7d1cb6dc44d9e9ff8f9fc282d8f0b9d26cc32bda7de216625deadc0c15f453c5",
+          "artifact_digest": "76d3410ef4159db20d0d355f95d7651743d469089a43c3c3a3b24df6f1800a28",
           "contract_revision": "ac1b32ae18357610"
         }
       },
@@ -14580,19 +14579,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/contract_kit.json",
-          "artifact_digest": "1f2798891817483a31507cc10380b9b4183a23415365521e2278055fc7f5148e",
+          "artifact_digest": "d14f368c559ac555caff29360eaa20dd11f3e0e75c5abbd5bca5cec74a223dca",
           "contract_revision": "c0c7367b3a4776d9"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/context_capsule.json",
-          "artifact_digest": "082463938a3df76af7d9d7b1377376d3076761023f5f886d12c768e7009391ce",
+          "artifact_digest": "87c15435817886de003f57306715306e495f708169f61d29e55ca4762003c839",
           "contract_revision": "36839ddf606b69b8"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.attempt-reconciliation/test_capsule.json",
-          "artifact_digest": "64de042bcd9dd3f827a7ec5f9876971b63b7ad5a1c9155026d87286fff4271a9",
+          "artifact_digest": "ca8ea75e94469a2b2e5040c8fdee4c03d9f8fe7f41cd59d75b9c602b16ad3bb6",
           "contract_revision": "eed4635295d58a35"
         }
       },
@@ -14649,19 +14648,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/contract_kit.json",
-          "artifact_digest": "95a76f5ce0a0b5499179c07ddc41c09f7d163ad92641d078522524836de2552b",
+          "artifact_digest": "286153170e5014a752bf620760445942f259e2b941323aa5458aec240cd18557",
           "contract_revision": "9153f5868b05ca43"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/context_capsule.json",
-          "artifact_digest": "b00d6d0591c6542b47e6055ae5303407087cd8ff80f8aa1aa01b46c14f2a6d82",
+          "artifact_digest": "7d5af6cadbec6b518426fa1fdacbba6a9f7709053a4f16b550ae321ee6d1887a",
           "contract_revision": "9a52ee1a3b894837"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-catalogue-query/test_capsule.json",
-          "artifact_digest": "a01df2ef720480c61028a8721790903d3964c1143cef85443159f290b1d56a2c",
+          "artifact_digest": "0a802b0a71ae79f0001dd80a53eca2a1ba48e399ec41d5a8b172d9c797a7c7a6",
           "contract_revision": "33afc5d56012f969"
         }
       },
@@ -14718,19 +14717,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/contract_kit.json",
-          "artifact_digest": "370b152ab1b7a72f5df145f10e559e3b8b5c87e31a21dad5b07afb6db74bcdf7",
+          "artifact_digest": "f5a202e409b550a462cf1d9f527c88210149b8a3f0d8ca66f9d4edf4e14efa52",
           "contract_revision": "843794a1f88780ff"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/context_capsule.json",
-          "artifact_digest": "99a0bf6994aba1889e639cfed0d08cfb48a7d6bf8c210342a382f38b6489b218",
+          "artifact_digest": "15989be6f2bbce1b80b659007f91aaa6642b544bd52ca18089de22d04c7f3088",
           "contract_revision": "8d6f1980160504ab"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.model-preference-selection/test_capsule.json",
-          "artifact_digest": "c54a7bcfa335044b2d3e0d4eb02fdb363247c8e4447250c1b281411a4f8aab6d",
+          "artifact_digest": "6f7c08919b5f98b99c3e1657b27fab982eb8878672e4c7e2430ae9429c46acb0",
           "contract_revision": "b6c0e76122b52332"
         }
       },
@@ -14787,19 +14786,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/contract_kit.json",
-          "artifact_digest": "c28b795fbb518a4ca63b3cf379fbad880893f248e2e776b22bbc476d0039268a",
+          "artifact_digest": "6755ca18a81c6d3c5d27d81d9867dfce40078a2d4874d3620b9ba47c10c45fc8",
           "contract_revision": "48f216f0599fc005"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/context_capsule.json",
-          "artifact_digest": "676b7828194d0a6ff28befb58879729082e340f7d380b28ed56a0019045322f5",
+          "artifact_digest": "cfed71359bb61edab039e1ceb6a24b7bb42b29a9098ac06e21eaa8a46c942907",
           "contract_revision": "d3977ff99a830773"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.peer-delivery/test_capsule.json",
-          "artifact_digest": "523bf29edefb319a0c75dae3a3ec79b615f732e3dadd91efd397ea422e2bd736",
+          "artifact_digest": "90d12a72a609bb7f3d8bb397da955b6097266be5df83980673c5ddd24146d264",
           "contract_revision": "bef03f79e4715e78"
         }
       },
@@ -14856,19 +14855,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/contract_kit.json",
-          "artifact_digest": "89a3e51cbd881a30feb83a52d6f771f97a3da871f17bbdc9db928b08d0b8b891",
+          "artifact_digest": "adb00b4ab722405b00fa38b3b3d830039931ae149e0159e202b0d2cf367f4fb4",
           "contract_revision": "eee1714c5a118e53"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/context_capsule.json",
-          "artifact_digest": "f336ecd7036dc700d76685fdae12ebdd909b1e09e9c6eccc4dac9a9e147ff339",
+          "artifact_digest": "49862d44b3b38aca0c72751760b9cef96a8558b7702bc4f2f03f6e2eaa26dec3",
           "contract_revision": "2e5ad772be6866eb"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.provider-admission/test_capsule.json",
-          "artifact_digest": "96bcccee61008313b08703d186ac2646fa7c93df4086707b775807c1f34bf65b",
+          "artifact_digest": "7c9309b2014da69f4853dfb349d0b1bf0970d29679aded2775ea3ae9d2d741fd",
           "contract_revision": "3eefc987da84178f"
         }
       },
@@ -14925,19 +14924,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/contract_kit.json",
-          "artifact_digest": "312681afe75b3700f6f91282524e0f76bdbda4690c478c644239425bf3ac8aab",
+          "artifact_digest": "d96ba2b92da02a8910283a97a352042f3c891d82b47c6779057b858550c0650d",
           "contract_revision": "c9205280107ee1de"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/context_capsule.json",
-          "artifact_digest": "25c1fd1a370a4506d7513442d5e11846fc58b8a16ed5e4c2b8b2cde22e91b655",
+          "artifact_digest": "16dc18865e58b0856174ca030f8beb879df62da0767672bfd02bb894fc0438dc",
           "contract_revision": "3a4e2d87e00b1106"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.route-selection/test_capsule.json",
-          "artifact_digest": "b3c5b758ecfa540ffa40e54e261c555a81987fa7b089db5604ec04804d508484",
+          "artifact_digest": "377088f2826fe7777aafae8977d03756dc6ba44066b6d4547137e5face461438",
           "contract_revision": "02a910249c8d9cc6"
         }
       },
@@ -14994,19 +14993,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/contract_kit.json",
-          "artifact_digest": "71806a6c84d1dbca3cce8196b7a4962eef244f66d3031db43d88d433988a09f0",
+          "artifact_digest": "89659c0b9683e48c8ba2f443d34cece53f10ed4deb6807f886c501ee403e8257",
           "contract_revision": "1a1214c52a76bbe4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/context_capsule.json",
-          "artifact_digest": "3a17f8f5c4109bb7a4459617784ca7fc9f3fbbaa9527d3db5e37798063674dcf",
+          "artifact_digest": "87370555c07fe5eda98876d269bb7655edf5ec5c67cdf7bba27f6b817d5d25c7",
           "contract_revision": "c10139c37bf8f769"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/agent.coordinator.staffing-plan/test_capsule.json",
-          "artifact_digest": "7d121781556cb2d57d4304f977e5a691856450f8577cdf2e02a8afdb060971be",
+          "artifact_digest": "2a10fe8c519db06fb0a80d5fce1340f28add09c7972420ded57337ad3b480d8b",
           "contract_revision": "25bc7605ee834fe4"
         }
       },
@@ -15075,7 +15074,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/controlboard/test_capsule.json",
-          "artifact_digest": "e16b1d69863599240cf1381e03b5f7b6f0e5da13aa08f426601ed3d00baa1a4b",
+          "artifact_digest": "def539ef94d96a0765aea4404ca9c759929a61cfc8e70171dd142438f0de8247",
           "contract_revision": "b64e07332f075d31"
         }
       },
@@ -15144,7 +15143,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.authority.epoch-identity/test_capsule.json",
-          "artifact_digest": "9346542935eedf604e1ef6a9a518e318f3747c3a5ba44eb8724b24586d9829fc",
+          "artifact_digest": "a1d2cd0ab7d4d99c5f5f436288d5dbb8b46970e02dca82cf7e57631e1f2ab307",
           "contract_revision": "925916dc3c4fb434"
         }
       },
@@ -15213,7 +15212,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.bootstrap.current-system-evidence/test_capsule.json",
-          "artifact_digest": "da83b01bbd5be1aca67e526e674fa9663f818cc4e250542ebd0c8b9d78a2e5ec",
+          "artifact_digest": "4e59a7c7f84e2baeb1f2438047f5df59fb2dade690d020fa98035881b1d512da",
           "contract_revision": "fa6a8bb0ac020567"
         }
       },
@@ -15282,7 +15281,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.bootstrap.rule-catalogue/test_capsule.json",
-          "artifact_digest": "1dec501d661c2bdc485615824a8fb9d4e7edd3dc80e88162b4d304dfd13ecf5b",
+          "artifact_digest": "b36fd311c026df222f90eac5b5b2c1f31dceab7431df2b84a4545b72bff0c1bb",
           "contract_revision": "505172fe0d75e47e"
         }
       },
@@ -15351,7 +15350,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.bootstrap.work-unit-brief/test_capsule.json",
-          "artifact_digest": "c93de3ccb1a739a5a2d75608dd553a26cdac16cab77b9451bc0f4784011e2b1b",
+          "artifact_digest": "9f59fea668f73fea479eba6b18b6e1bdc6fd95d4e79290047302acd492562476",
           "contract_revision": "e56994997b35ef86"
         }
       },
@@ -15420,7 +15419,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.conformance.support-contracts/test_capsule.json",
-          "artifact_digest": "b648915ea94d31866f0023ea48a99dac147534b7d540b3b2d1e0bb61cac4315b",
+          "artifact_digest": "27210f4881ef0708533eeb06ad2e057f17d0b1f480999419b1dd59dc751b7a9d",
           "contract_revision": "84d3473fd0e04a3a"
         }
       },
@@ -15489,7 +15488,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.contracts.primitives/test_capsule.json",
-          "artifact_digest": "42614ef8099a07092fee7b906a09225d7684f4a5ca3035176b8803e2b45eed60",
+          "artifact_digest": "c00bbd6d56faa1b2c01e9af8e5bebecbbb6ed05a286f1f2ecb3627e0bc2d30de",
           "contract_revision": "7de83039c357633a"
         }
       },
@@ -15558,7 +15557,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/foundation.memory.projection-contracts/test_capsule.json",
-          "artifact_digest": "ea1cd8ae2b7db490716ad69a3287885553c29f6e36bd020a0be2f312e55bcd0d",
+          "artifact_digest": "c13b71b3df110f1e6fcb8f67460de05ef4e36df6f2f4a45d9cbc082b2946e1e6",
           "contract_revision": "be344d61723a275e"
         }
       },
@@ -15620,19 +15619,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/contract_kit.json",
-          "artifact_digest": "fd097034bf788691875c495186a5b73d4c5e3d298ed80bb012722f008cc05572",
+          "artifact_digest": "3c589919b26f2faa2180aa7e7a28f8c2d0b9b74703541b0f91bc9558b162ce53",
           "contract_revision": "d1f99a3503bcf210"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/context_capsule.json",
-          "artifact_digest": "94f5428b73603153a8ba35737beb2c0871337eeb5e1ba7f17e38f093126c1989",
-          "contract_revision": "54d9325d51975fd5"
+          "artifact_digest": "9335be529eb7097c2e6880138a42374a8b9a5d80c8025bbb7ae4aaa8d5e438e0",
+          "contract_revision": "71d687d23044e7cf"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.capability-admission/test_capsule.json",
-          "artifact_digest": "59b9cd0302a38ef6c0f19459ff9b2c8109a6a71e0bbd24c0e86498045b063f75",
+          "artifact_digest": "6eac4f7d2316a452d720930e783c384752ce4381ef99f5ed2d90e37e459b1022",
           "contract_revision": "cf88728418c29fb6"
         }
       },
@@ -15689,19 +15688,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/contract_kit.json",
-          "artifact_digest": "89d00d1bff95dcbd8329224d7b6db5520b0dea96ff0cec3a294c0b9c067a25cf",
+          "artifact_digest": "648d579fe93b511642b3f58ab213a203c0641f8b31cf79644c4bdb28c02a8e0f",
           "contract_revision": "1b40302c21fd412d"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/context_capsule.json",
-          "artifact_digest": "f01bf41a2b0e22cc500fb9dafc18698809d6b2d4fb794bbd7f347ae734e262cf",
-          "contract_revision": "500accd1732be18c"
+          "artifact_digest": "3ebcc9511fe5b5c09decf8d7a8c5a33aaa81363f296d842b1a06959023788765",
+          "contract_revision": "1f269dda1b160398"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.composition/test_capsule.json",
-          "artifact_digest": "b90b7b221811e692c2650bc2722f2d94812f6e041af95fbc5d8f2d467bc421cc",
+          "artifact_digest": "3b09f4073278cdc18da2f09f7e2424a2bb9b9c5b483aa44078e39a92d4d3040d",
           "contract_revision": "623c582fedf2708c"
         }
       },
@@ -15758,19 +15757,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/contract_kit.json",
-          "artifact_digest": "ecc5d936c84ae6258eb80841baee7f7acaf97e84d14bf03928ce1ba739133d6f",
+          "artifact_digest": "adcccb31f7665c632d6b60286aa58cf3627ce46a0278c2e634a28d88276d00db",
           "contract_revision": "c0d1a8fa69552d96"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/context_capsule.json",
-          "artifact_digest": "b8ed2244d4b583bcc7c0f8c205c26474ca0f063674708c3e58e9c6c3d50c7f85",
-          "contract_revision": "74cb5877e2bcf86d"
+          "artifact_digest": "1a8bb7ad33445eaf21d3f56c661ae4cd5ab357d12bbe07fd6417ae6d52d4328d",
+          "contract_revision": "4b3eac3251bbea35"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.kernel-transport/test_capsule.json",
-          "artifact_digest": "1d9596d95d34b752c63f7657503386937c2426d66b4cc9964b1a746414a09b55",
+          "artifact_digest": "d4666590ec0bc0b8971019daa4980f2d6e65df5d34212cab72930d898271cdf0",
           "contract_revision": "f5ee27474521867f"
         }
       },
@@ -15827,19 +15826,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/contract_kit.json",
-          "artifact_digest": "d05ddaca2276798cd6f552429f0bcf5e8ecbe55d62a2bb135af2b971bd86e62d",
+          "artifact_digest": "16aa96fa5d72f85c957417dfdb66311023d23a21d37cb7e1d9942be3fb9d3689",
           "contract_revision": "b8b838b3d596f9bd"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/context_capsule.json",
-          "artifact_digest": "d9eebd3c548fb48a463679ceb695b541371bc161c09d2b29d469f6b2eb327d2c",
-          "contract_revision": "e261933211e19980"
+          "artifact_digest": "7961609823236c1ed5a09ed1a9949ae2c847f66830cfcb5b6f7d1abbcc032b98",
+          "contract_revision": "d58dd8ca0b88ba7a"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.learning-closure/test_capsule.json",
-          "artifact_digest": "3997708df2d74505b9deb574b26fe4d96bef4005338af031eb98833af9bbbe4f",
+          "artifact_digest": "be584b7937d1c4ec27eb610a7a84b3e8b2a1b95edf5d6e8105332de7972d30a0",
           "contract_revision": "c0fb7822a45995d2"
         }
       },
@@ -15896,19 +15895,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/contract_kit.json",
-          "artifact_digest": "ca0e252ea87d0f27ef0d24261e3c3fd3244f467076878b107f3ba923946d7e2d",
+          "artifact_digest": "5cd67d991b952e3dbcb2553c612165fc5bfbb62ac684e426a1df60af83fd15be",
           "contract_revision": "495d64b4b2f95d64"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/context_capsule.json",
-          "artifact_digest": "b621b2ff042d9f02b51ac149372151feadb63f637a82e4fe484b9ef26999fe45",
-          "contract_revision": "37796aa2869248a9"
+          "artifact_digest": "5d676334ce6fa1c45c79a7d68660a806248b118d6605b4b0ac53bef6aa633490",
+          "contract_revision": "9ec333bb912ef729"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.operator-replay/test_capsule.json",
-          "artifact_digest": "47a32c63316485e3ece76ad015572333591e6691cdc54ac6ad981acec8603462",
+          "artifact_digest": "141842489d4d35def8e250db033d5e7a7626741b1368d595fb85d9f8708850f9",
           "contract_revision": "059a6173362d669b"
         }
       },
@@ -15965,19 +15964,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/contract_kit.json",
-          "artifact_digest": "e8b5cfff89d2230fc34ca18ac4125984caec8b8dbecc6b216d740d695d49ff38",
+          "artifact_digest": "a224f002bc284f4af22b8b51cf71b89d231602d16b7f59f7ceea866852d6a915",
           "contract_revision": "5cc4eb7322c40bf7"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/context_capsule.json",
-          "artifact_digest": "a84f732894f547d80e58f47aebe99b53bf9fa691544e48afd0d48eec47d3ddd5",
-          "contract_revision": "210c8df33818cc07"
+          "artifact_digest": "db68b69cffda0df650ffc9293409ae88d99a0b045862003cf61df8520f0e2224",
+          "contract_revision": "790d89ca33e94020"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.poll-contour/test_capsule.json",
-          "artifact_digest": "8c07ad17125fce4aa9a3ba831f1cfffcadb7ef82dc6aa1371f7aff2fdd446ee9",
+          "artifact_digest": "7a8399526a6f091439ebe35c878cb4cb2481bb55d00436247a07fbab92ab1d42",
           "contract_revision": "8263ec2aaea9561f"
         }
       },
@@ -16034,19 +16033,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/contract_kit.json",
-          "artifact_digest": "a58906631b9271ae9767fe8c65d4dca6c0d787a582589b243f13086ea88228b0",
+          "artifact_digest": "53bb2748b1d3929bc6317bfe181fdf80ad0535728244fdae3f463874e633832e",
           "contract_revision": "a933a8087eca0da7"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/context_capsule.json",
-          "artifact_digest": "89c3181996bb1d2636b7d2e50d956c35500724e00c524d25680b29f95da18d7c",
-          "contract_revision": "a504f676bebdf83a"
+          "artifact_digest": "b6482562afd9730dca73c1ef9c727999ff566fc63176f5e2b88e3a7df0eb0df8",
+          "contract_revision": "a2e28ad26ed865b0"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.skill-catalogue/test_capsule.json",
-          "artifact_digest": "9595663fa15c52b11c701caa101573c70faadd6f8a4653e6b12300bf3e1041ae",
+          "artifact_digest": "8dd19aac935918360be09a3b25517b7999258c7662b4a0737aa9d98b3f9d1baf",
           "contract_revision": "d204162872ee241f"
         }
       },
@@ -16103,19 +16102,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/contract_kit.json",
-          "artifact_digest": "204597c547cb6cdd0617906ea3af75d01f21ea88b030e2f3037e47933f66026c",
+          "artifact_digest": "7a9383607f3a3f8d7e32bd45f1cdc8d1815a0cfa5cda5ffcd71a81a4c4175b31",
           "contract_revision": "631cfc9048ceaccc"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/context_capsule.json",
-          "artifact_digest": "455fc98e468b43046caa987c745cfa8cc2223fa11a5378d47f5397c45b621752",
-          "contract_revision": "9025e3e0c5067c89"
+          "artifact_digest": "d76d0bd197aa2c97ae3073dcfae36a56cecb14897332f2c84d669a2ab30269de",
+          "contract_revision": "0d35057e8fb4616d"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.daemon.startup-binding/test_capsule.json",
-          "artifact_digest": "9714e01a7c13ca27090850fc7c31c70f47e58d86dc673c53bd0b7566c4fdad65",
+          "artifact_digest": "c22d3d48c2588ff5e87a9b05f16fb69a851130094c25e6767bff70b6068c2d0f",
           "contract_revision": "d5e96633e525b97d"
         }
       },
@@ -16184,7 +16183,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.memory.projection-provider/test_capsule.json",
-          "artifact_digest": "1b51ad49d5b9ae93178b2b333e250d6ee61d6333b7cd967b0a052d4319081427",
+          "artifact_digest": "ef47acb707151e123e6e750bf944b4d682d9cd08c1e8c161b40e7aad0b7c706c",
           "contract_revision": "bbcd32a5f88b23e4"
         }
       },
@@ -16258,7 +16257,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.observation.admission/test_capsule.json",
-          "artifact_digest": "c8e5de62126a4b45fdaf0af3b553b0658a84cb516b9caaf34c81f9c57033e567",
+          "artifact_digest": "b19942cb7bc1281fd9ab155f1020a0b71bc09fb94444355fad8a8c5d15f5c198",
           "contract_revision": "fb57ddc89260e90f"
         }
       },
@@ -16327,7 +16326,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.observation.classifier/test_capsule.json",
-          "artifact_digest": "bea38b1730f672b8a9aab35734737e035a7b6b8dce811090aadf79930d3a129f",
+          "artifact_digest": "3516f57a3706bb18611594e2bf3637fdcdd08fdd58010372ad06cbea698f8af8",
           "contract_revision": "8176c065bb8eecb8"
         }
       },
@@ -16396,7 +16395,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.observation.journal_projection/test_capsule.json",
-          "artifact_digest": "0083e95fff4997696b07519d0d3d46f266ca40c08938640d430acb52ad4f562f",
+          "artifact_digest": "73d657d2eae873df3b2841f90663698de710be87c83368adfbe53fae1922c352",
           "contract_revision": "333deb54e775f102"
         }
       },
@@ -16465,7 +16464,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor.observation.plan_compilation/test_capsule.json",
-          "artifact_digest": "454331a942c4fcc40d33caf0b34ff361315685c2f74a7a255c9d7ccf68afb858",
+          "artifact_digest": "06113fd214a7273b47322296952939cc540134c94c285be2653f28a2f321159c",
           "contract_revision": "f90dba5df72fedb9"
         }
       },
@@ -16534,7 +16533,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/governor_read/test_capsule.json",
-          "artifact_digest": "4b208a11e9e1e18ed0ff1d493335ffd5251e0ce2b723e353abfdf5ea42e82185",
+          "artifact_digest": "59eb9cf9c8e11ba7eed89d442ebaf061d1124fa2c72566e356635301b8f308b6",
           "contract_revision": "92e11b66d8e26deb"
         }
       },
@@ -16591,19 +16590,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/host-control-endpoint/contract_kit.json",
-          "artifact_digest": "0cb5953641f036529d4b939fa0813bc2695a27068b6e8253d1bdb00d2d838430",
+          "artifact_digest": "9af3cab810687697719574ea755b4adcc884ad158e88baea9ed762ba1eedfe37",
           "contract_revision": "f4bf8c3727e28c68"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/host-control-endpoint/context_capsule.json",
-          "artifact_digest": "8d9bb803ecb2602d9a84d683b2110a0de0df330648e39ef28552dd52ad85e820",
+          "artifact_digest": "987ab361273af4f5de9e93466b0bf4e9db94d695536aa303719b8c82f3de480a",
           "contract_revision": "bc95b92fd83ecb44"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/host-control-endpoint/test_capsule.json",
-          "artifact_digest": "95ce9ddcb21897b1bdccfd25410d885080f5609a231401bff5c2a268941f5540",
+          "artifact_digest": "5ab2f6ccd6ce1c3c4ff199e994d48b28f641f4ab9a7d95983b8b24725568128f",
           "contract_revision": "585d44b3d7d523c2"
         }
       },
@@ -16672,7 +16671,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/host-service/test_capsule.json",
-          "artifact_digest": "b65b498337f04be30f3871d8294e3c52cf954636236a5205deb05aa208db51d9",
+          "artifact_digest": "650d2369da4eabbc5ed4dfc7f59db5c732c05ef6d7cb2d8929fdb1c2c440f9be",
           "contract_revision": "2539d97ba3837cb9"
         }
       },
@@ -16729,19 +16728,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/installation/contract_kit.json",
-          "artifact_digest": "a03343f8bc470ab20208d1b3bca6942a4e65bea62b63173b117d4c742708c1eb",
+          "artifact_digest": "e927dd316318f46d1133369b936a4fdda8cf9f6073ba3bd7ff5f124dca3aecc0",
           "contract_revision": "174b4007676607d4"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/installation/context_capsule.json",
-          "artifact_digest": "af608c457e924e8e4b3f9bfea9244977ecfbf118e126acb3abcc3434ed443050",
+          "artifact_digest": "4b45b74b831e716892f2597ffa7d57ad8b7bb5a903c201889c23e3b94156aed4",
           "contract_revision": "91e13d7eec882856"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/installation/test_capsule.json",
-          "artifact_digest": "c5e3f47d3c609ae3e9a4199314d9ecb78a905cc57a1f70948a7ed876eb2b4814",
+          "artifact_digest": "76143727d97e76aa8a3df71ddef73f3af419b3e3ea82049166be0f4c2508071f",
           "contract_revision": "bfcacd6e7c7c7dc6"
         }
       },
@@ -16798,19 +16797,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-core/contract_kit.json",
-          "artifact_digest": "1970ee388a38696f555043465a489fc9ebd7ae7368652d9cc9c9f79eba01de82",
+          "artifact_digest": "64f491d420acda5ce271f8250f7311967cc0188c82acfab334521007bd0e5a13",
           "contract_revision": "d82c246027a3965c"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-core/context_capsule.json",
-          "artifact_digest": "f5ef7bdad14e035a0641e2cb6bf95a44a5e3696d9adfef0b190d9592ab6bb9d6",
+          "artifact_digest": "b69394b29aacd86a7316386c95c8d89151ca6d04ddb6c17c6ec55c4373877100",
           "contract_revision": "de7c5eca426bb992"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-core/test_capsule.json",
-          "artifact_digest": "4219d10cfdc4556be40234a018e7b05ef72b0ecc1e5f193301570ecfa84e9c32",
+          "artifact_digest": "a640cc71b28d251e19563123d1e64dfe723c1dda5cd8b158f907b566f55b4a8b",
           "contract_revision": "e09011d8fd282f66"
         }
       },
@@ -16867,19 +16866,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-service/contract_kit.json",
-          "artifact_digest": "ff811aed33c782b45905f843075c298507b750037633cf3a52d3ed3e0586e6c1",
+          "artifact_digest": "878c21ebc354d0b1c4d60ca9fb80667d1a3badcb3f0f7f3ccc6d5fbe9aa56c00",
           "contract_revision": "5ea02eabb3332172"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/context_capsule.json",
-          "artifact_digest": "d0db527cdab8ab79f3fd69357ce779a3e70d5d00b03a4d593b3ab5c43f0fb1d8",
-          "contract_revision": "f3cecc24b1d8dc19"
+          "artifact_digest": "e50f7177fb209a55d4ed1717bcbd99c12fb337ced2af5faecfb22d7e62fa6efb",
+          "contract_revision": "9ecd7eeec495b53c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/test_capsule.json",
-          "artifact_digest": "f3ce75dd2c220308e6783811f9a957909eb492a22e2f729ceaa099ac4faba9ce",
+          "artifact_digest": "48665af724870d64f1b255f76bfa9510efe441628a93c1a89a697b3a8e68568d",
           "contract_revision": "01d9f1c2f17c8fc4"
         }
       },
@@ -16936,19 +16935,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/maintenance/contract_kit.json",
-          "artifact_digest": "54c6207f160cd12c1fadebceb1eea3be7e784bc2a78ce4631a9c5b58acb5f4ee",
+          "artifact_digest": "079ac6e8dc74b79c6ed72d63749aacf6fa988516b65b6f5c8f0dcaacbf4f166b",
           "contract_revision": "7f1fc356660d192e"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/maintenance/context_capsule.json",
-          "artifact_digest": "f05ae42d5adbc8102c7fd281758351b2f9b6df00b256d4c622b77a9fea0f384e",
+          "artifact_digest": "43b8c179587024d2d729c65b31647c920b1dd2c0f6f4e9ec716040d17b1a669b",
           "contract_revision": "f05a6acab6bea324"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/maintenance/test_capsule.json",
-          "artifact_digest": "76511216682c1719a49d80f30f01f6bed4f2e46dc3d68500aebe7e8dd65e614d",
+          "artifact_digest": "b2034cbdf25fdf1842080e1b6c591fbe9cdac107be35c3bb8f6c4408e26f5207",
           "contract_revision": "3dc3f785ebe18fbf"
         }
       },
@@ -17005,19 +17004,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/meta.improvement/contract_kit.json",
-          "artifact_digest": "a59674c2217b7610adad93a6a4e99b874d80ffc0fd850de5b2903e6e22b46c96",
+          "artifact_digest": "09c2a371c2e2a1e21f41229d43cf6971ff1f446506511d4aa46c68e6c0d5e003",
           "contract_revision": "986258d28dedd6eb"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/meta.improvement/context_capsule.json",
-          "artifact_digest": "62e1388fae4b312127ca144a5f0020fca5466ec04cb388054ec679db5b554067",
+          "artifact_digest": "be2612905a5adf0cf47086981a48bc46eddc89be5c04dc1fef8b60d561e8358b",
           "contract_revision": "9d4de791186b431a"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/meta.improvement/test_capsule.json",
-          "artifact_digest": "bfeba0326c21fb978f4ac813a57b130bef7bd262bec04d3e08ff20f071e54bbd",
+          "artifact_digest": "4f8f401e87b505c512d04472143e9ba058f61a1213cdebddb02666f29858012c",
           "contract_revision": "b62c1749ddaadc42"
         }
       },
@@ -17091,7 +17090,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/meta.learning.activation_assessment/test_capsule.json",
-          "artifact_digest": "40c1980f990156b2a96bec39357a0188c08ee6e2fb1a62af4c62c2889fe753a0",
+          "artifact_digest": "719f0650cd0a34df250467c4019c2f445a7e94783af72303f7c21390aba7e4c1",
           "contract_revision": "19800a3c2e326974"
         }
       },
@@ -17165,7 +17164,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/meta.self_quality.diagnosis/test_capsule.json",
-          "artifact_digest": "e6a332b0d0ef8c084344eb75fdd0c522edc656da0473ff95174b7038e2b176e1",
+          "artifact_digest": "f68f31e4afd38e9b59fc4e1d2b82c94cbc5185953297b9d22b2fc452a8b11b00",
           "contract_revision": "a6d918a507455a9b"
         }
       },
@@ -17227,19 +17226,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/mod-research-provider/contract_kit.json",
-          "artifact_digest": "45f35fafb799f31b4d68632cd8831fef190ad10274dea52842a73ebc9e5289ca",
+          "artifact_digest": "5bb5132beb2bdebe804887aaf96d4296168a84449aa2c06de0743ab2218a28fc",
           "contract_revision": "3abe7b6c265c350f"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/context_capsule.json",
-          "artifact_digest": "999cce2bf9acf28454637fbf994b754c2c928980fe205efdd4b215a12b8514fd",
+          "artifact_digest": "cc39a41b967ae5da1d1ded7ca8db202a96848c8f4ce239bffdb39bf5d5e712b5",
           "contract_revision": "050c795020fbeed1"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/mod-research-provider/test_capsule.json",
-          "artifact_digest": "df5c770a1cc7f80cb0a8b5c1bfc6ff778ff4a8e19a796cc31664b9df72a20e23",
+          "artifact_digest": "ee6aa623b1bd0a2e9423ad00e085189421728adb64ffd6fc9ed7f8ceca3e0b9c",
           "contract_revision": "03ae53f7e89b6ee3"
         }
       },
@@ -17296,19 +17295,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/native-worker-core/contract_kit.json",
-          "artifact_digest": "67359d2f227e27128c981198638e2c96b48a32d8e3eef5a30564aa837d4dac31",
+          "artifact_digest": "22a607a3ae0c6f6292bc6735a9b4d2710c1baf031ed62ec73ce444a35552a4ac",
           "contract_revision": "68b7c79b66a86651"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/native-worker-core/context_capsule.json",
-          "artifact_digest": "cebf5415e0600ab0c5cb610ba732de72967da8a0ac2a92996bfbb39bb8231215",
+          "artifact_digest": "8e5743521db92a8076b9da70333748473d2fd7d3eba4a1fa2dc1b645bad68431",
           "contract_revision": "70c2a5e003207eaa"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/native-worker-core/test_capsule.json",
-          "artifact_digest": "605f0148ceace5bdc99c5001e1916564e5ea1209912a5cc69b45e0d821a90785",
+          "artifact_digest": "0327ab57bf94913a21d3f029be2f7c20ddc734aede677b020fc744a38f13a24e",
           "contract_revision": "a26894575141fba4"
         }
       },
@@ -17377,7 +17376,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/observation-contracts/test_capsule.json",
-          "artifact_digest": "63c5a615d9f650c2c46fe4cb2c70c67d0012102ea9bbcc7b958e8fa6f561b031",
+          "artifact_digest": "15c8d0544cf00fa26854df9143977f87c7dc93c2e3fe25f5eef9f1374f8a44e5",
           "contract_revision": "95af289fb1cdf0c3"
         }
       },
@@ -17434,19 +17433,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/operational-recovery-state/contract_kit.json",
-          "artifact_digest": "b7c870c00365869cde730a7f2e82b2aacd24f97c21b3a5b04d73f877693e0851",
+          "artifact_digest": "d948fd474d0869c57a2c86c077b338e30bb4c764d5b27755de9c60b547950283",
           "contract_revision": "f0f817c31b0daaf2"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
-          "artifact_digest": "c94d219e9c9085e3b7ce552777096a7f8e4c6ff5b6f378602daff9227a013096",
+          "artifact_digest": "51b6390647f16e723a0f1c8926f8929400d0a6c4cc232d4d13e3c8ffe4e6e7c3",
           "contract_revision": "8d4e4476ef742678"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
-          "artifact_digest": "269231679b48134f4deaa8770d18f07d27f5bf7b148a6c5f13d732f4d0be20ac",
+          "artifact_digest": "7560456b806609108492495b3b97a3a38d58a03d3b4a06ce556b43fdd3a5fd7f",
           "contract_revision": "d874d82a1f33c0fc"
         }
       },
@@ -17515,7 +17514,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/runtime-contracts/test_capsule.json",
-          "artifact_digest": "1e79e4bde47f029053ff389bf7cb81a23098370ba0e2c28c28264257f71f99e7",
+          "artifact_digest": "80b4c5bd30757c5f05956f8887b12f5a3396553a3aedad58a3c3e76f37eda908",
           "contract_revision": "76ba5f1003d8974b"
         }
       },
@@ -17584,7 +17583,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/sim-core/test_capsule.json",
-          "artifact_digest": "f39806f0491bd45108dd666f9f0a30ec570acb9ebee8a380fd6ebb18b71baae4",
+          "artifact_digest": "84aa6637cd4fb33a914f82218c4eb19e5a1e28293ef4799bb901fb38902deb6a",
           "contract_revision": "fc5a53892398c93d"
         }
       },
@@ -17653,7 +17652,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cognitive.quality/test_capsule.json",
-          "artifact_digest": "c8d68819d8335b16abaf304954265a92fdb44ad1ddb6c66477885af444fe9a25",
+          "artifact_digest": "72a90a41b071612f24e1299a7f13d1c1d55b44d01657f1a3246de55dcdef37ad",
           "contract_revision": "901fb02088a6815b"
         }
       },
@@ -17715,19 +17714,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.admission/contract_kit.json",
-          "artifact_digest": "d68298d1408c776c40fc3a111a16473ff4a8441377beccec70a538e1f1544302",
+          "artifact_digest": "0640d3b56c8b4faa6029c888f9a1a605d280744bbb4c137b56798a79a0b4ac50",
           "contract_revision": "37f1ce4ac2ebf341"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.admission/context_capsule.json",
-          "artifact_digest": "8ec29c6a2accb131ce13599d81f6e048bc5b3fcaf26f06526344fb3a31389216",
+          "artifact_digest": "8ddcf4557e5f661248d539088f4d82cae46d2e1afc0d0e4ffd0903467ed3c59e",
           "contract_revision": "450462e44a43c833"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.admission/test_capsule.json",
-          "artifact_digest": "e28dcde61b49fc0f28d32a8cbe498b9a154e88f664cdb03b6cca8d84cc262391",
+          "artifact_digest": "8f1ff74cc8c71ba19b3da8a60e0e95c805d3f6d429bded0a05920032842d6e5b",
           "contract_revision": "a4bf13d66dbc6b17"
         }
       },
@@ -17789,19 +17788,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.assembly/contract_kit.json",
-          "artifact_digest": "95300187aa289c3aea1c77b5099c2460c2650cb7ec5a71b1fef964506804139d",
+          "artifact_digest": "b8ad84416b5dfbf367714a5348a133f9c3c3262f3bd6e6df4dafd556dc7c95ba",
           "contract_revision": "ccbe12a462a64602"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.assembly/context_capsule.json",
-          "artifact_digest": "987d9252cf01baa323b5668ad125e73aeb678b8544fe1d0ef9e9c1e22a6adb41",
+          "artifact_digest": "60c4931e05315710efbd82babbf95c23843ee2452f05772db48a358919a92ebb",
           "contract_revision": "b81496b603f71cfd"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.assembly/test_capsule.json",
-          "artifact_digest": "60cc22a1635fb531ecae5fa3e7d22fd1d8e47a32e16e070c914e7e049ad6ecfe",
+          "artifact_digest": "8dcabd6dca96baec1bf9b87c9edffc74b58270fe240b9321ac2071934c64c937",
           "contract_revision": "3d2f718e759888da"
         }
       },
@@ -17863,19 +17862,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.candidates/contract_kit.json",
-          "artifact_digest": "8c8fb776a7047babc0e4785ad4169a5f5329391e1d3d0a58d1714cde6907ee21",
+          "artifact_digest": "c20bcc83b48327ee7cf1e82080e94b02fec70c9a444261e258b15ca7e9af6642",
           "contract_revision": "4e845aae127cb8cd"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.candidates/context_capsule.json",
-          "artifact_digest": "d413f2da5569becf85a327c881fc4d9ba04020db324639d62aa8ca778e25cffe",
+          "artifact_digest": "648e5cd33137e90981c575dd9412e10ecec091013dc96a77d7ce1eb6a3ed0686",
           "contract_revision": "90c6e266aa88cd5f"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.candidates/test_capsule.json",
-          "artifact_digest": "8837e2366827bb3a3a44d21bafd48c8406a9b8359712b409062197ce1b462a66",
+          "artifact_digest": "660e89570774e40378e394791d058553fdf540bc11e636669f15e2b6fea21a07",
           "contract_revision": "152979de4b96d521"
         }
       },
@@ -17954,7 +17953,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.compiler-wasm/test_capsule.json",
-          "artifact_digest": "8f3232f774d3062d2c2875d292816b2025f5510975697f2057a4e4e906277d3e",
+          "artifact_digest": "4aa55153b20aff554908ecc44cb80b63ae06721842618c11cf845a63fe73eb2d",
           "contract_revision": "3b5dd504aad34b88"
         }
       },
@@ -18016,19 +18015,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.contracts/contract_kit.json",
-          "artifact_digest": "b607639fe7a5c7ab68500aaa25ad44bac31783668a423fbeccb7e8058468cdf0",
+          "artifact_digest": "6da0f0ab06d47b7e35fa6e958eb2836afcaf83564e4312ad4ffdcba1a694dff6",
           "contract_revision": "c8d8caf300d1e039"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.contracts/context_capsule.json",
-          "artifact_digest": "c264c51216dd08435eb24300c4927e6852e6e713b783970b24b055a733605a17",
+          "artifact_digest": "dae46b5780e2204146da2f9c9bed149c05baf37baf5d4f65eb7b4462e4b6103c",
           "contract_revision": "637d343bfe4ec9aa"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.contracts/test_capsule.json",
-          "artifact_digest": "e25c0d591a0a80111de04df3d7d290dd77941387bf4c1fe0fec019609356ef8a",
+          "artifact_digest": "53361cb2eac353ca259f03a8773f5394a61826cf9223f76885892cfb19deada9",
           "contract_revision": "950740f98dcd8c04"
         }
       },
@@ -18090,19 +18089,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.context.measurement/contract_kit.json",
-          "artifact_digest": "4481e06eb00d695fba60f469d961e46f6f1298b7293bb56a73bf87f2f740f728",
+          "artifact_digest": "ebbc28ac94427f2d72e67438356c219be63d29d5c794d71cc0071dca0387bf7d",
           "contract_revision": "3228265e138337f0"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.context.measurement/context_capsule.json",
-          "artifact_digest": "239db9425378d6bc916823fed5de65720dcce1c8027f43968f39efce314eb693",
+          "artifact_digest": "0f9d6289507c4b7f5c9c814b55adb8a9d8c991d00909d596730c8c37c2349148",
           "contract_revision": "7de4c80347dc30ae"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.measurement/test_capsule.json",
-          "artifact_digest": "239bc99c8caa0fabb2a9dfe343594dca907d077a5c006c78051a19b3a2344a09",
+          "artifact_digest": "00402bba060d5bb4316135e8baf61e3247ee1f7e4cfc2f0578461d9a3d687666",
           "contract_revision": "d7afbc6278b9c035"
         }
       },
@@ -18176,7 +18175,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.context.reactive_delivery_plan/test_capsule.json",
-          "artifact_digest": "c91839920a19767d7b6a834857b035bf37529d511bbb08180a8f31e356c12ba7",
+          "artifact_digest": "06d6030d5d7056847f6d0ae0738f8e0229eb1057474766e8dbcd3b6aba2cb7fc",
           "contract_revision": "ffc564a36b1a5d72"
         }
       },
@@ -18250,7 +18249,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.activation/test_capsule.json",
-          "artifact_digest": "25ed5066268bad25f4f47a9054618037943ae8244649dc30e52d242c2ec3b4fc",
+          "artifact_digest": "e13bc61e09d126067aa416fc118ab17fc15992153503bbdae868a3af8277d591",
           "contract_revision": "fd27f87a189493b6"
         }
       },
@@ -18329,7 +18328,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.activation-wasm/test_capsule.json",
-          "artifact_digest": "2c6312e7fdb31a074e5d8c50482ed545248b7c394c8356c66aae9605400cd517",
+          "artifact_digest": "4d87f63d664e1fdc2fe52956068cfc342e1b8079d02612a06c4da012f2cb24da",
           "contract_revision": "67e4dffd10a5edac"
         }
       },
@@ -18403,7 +18402,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.binding/test_capsule.json",
-          "artifact_digest": "ec442d5c2cf8e5bb2daaa1f93822b576e3820e7e68b03e7b39f26352e9553250",
+          "artifact_digest": "400355d878071ea1c40fd2a94cffce77220cd6d20aa2bba0d2c3be58fb676829",
           "contract_revision": "e3432debd789264c"
         }
       },
@@ -18477,7 +18476,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.contracts/test_capsule.json",
-          "artifact_digest": "72d7624b0b2fa105ed8788e38bd0569e1f930d790b68be7b200b46d20c05b2d3",
+          "artifact_digest": "61c0b2d09aa464468c1f9298984e9feedcf72ba8819bc62e4a40e67f9c37874a",
           "contract_revision": "f49e6943476a1625"
         }
       },
@@ -18551,7 +18550,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.index/test_capsule.json",
-          "artifact_digest": "7f8a89e3568e053d91799a7d5739d67f3b41b54bcf5b668afa9045ccde477fc9",
+          "artifact_digest": "febb89aecf6a52274f5aa843b6af190b253237b19d0b3d68546e09dd9929c79b",
           "contract_revision": "daa66d1211b0e2d9"
         }
       },
@@ -18625,7 +18624,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.cue.normalizer/test_capsule.json",
-          "artifact_digest": "8d4480093d118b9312f51623eb5e73c6a77860b9e640cd6fc5527c4babc800ac",
+          "artifact_digest": "b279b7ba24a792f76890f43be5dc234b5a93f4c57a37eaa6d7d16b02ffd1fc71",
           "contract_revision": "8ded0540f7cc9f4a"
         }
       },
@@ -18699,7 +18698,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.accessibility/test_capsule.json",
-          "artifact_digest": "caaa4e6882c0420bcabbfba1a56f8c59b97497c0f755c9db807dec0ed2a6db18",
+          "artifact_digest": "803ab4e668b0c713a9076c2e06c829924422bb007997dcc75e15c5584da4851e",
           "contract_revision": "c79b2fd0175449a1"
         }
       },
@@ -18773,7 +18772,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.architecture_brief/test_capsule.json",
-          "artifact_digest": "4faefc373b506fe3e900c202953fe7233e4687bc7cb384e750352b3992205122",
+          "artifact_digest": "b590dbeda41d1a2f910b1a8a6d0ecff298f17bba3323df474be6df0232bdda0e",
           "contract_revision": "4e9439c63d4864f8"
         }
       },
@@ -18847,7 +18846,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.bundle/test_capsule.json",
-          "artifact_digest": "2bba39ef317bcc35ec111075993d17a24756674dc60aebf9d75bae8e3bdedc06",
+          "artifact_digest": "b17e6329d79930ff5f295d965e1d160543b04feae84b98afa345972aca6f322a",
           "contract_revision": "923c16805fa0575a"
         }
       },
@@ -18921,7 +18920,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.candidate_validation/test_capsule.json",
-          "artifact_digest": "aa209d13f5f7fb940e2921741ed19a9786f261e1fc24487dc6799f8c4fb5cc7d",
+          "artifact_digest": "ea1a536511a6ab4ac68d17104cf6bb23f90d8316f0c10731a05282d073144683",
           "contract_revision": "bdd42eb6647a407e"
         }
       },
@@ -18995,7 +18994,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.claim_grounding/test_capsule.json",
-          "artifact_digest": "4b1bbb1a8da5868089c40a74d2334dc318a588cc48535357ef13b0db7c8b50c5",
+          "artifact_digest": "204871880bd1751a01edd3808d5cd06d69c5d9e20a2e25ff5b7beb71e1f7dfba",
           "contract_revision": "7bc0e35f84013d76"
         }
       },
@@ -19069,7 +19068,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.clarification/test_capsule.json",
-          "artifact_digest": "96850fa4ac804bf8066b06798b3f5bf2c80e3e9a71d8fcfe489f26c3e3db708f",
+          "artifact_digest": "cc5d62d35a0243827b46def39528b5c6c9f3445a01b45c16954d00847984ae60",
           "contract_revision": "025a632c2765ef1a"
         }
       },
@@ -19143,7 +19142,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.classification/test_capsule.json",
-          "artifact_digest": "e3b25722181ddcfcc28f62130ccdcf5b6a9441f1b5561ccc58ae613c390b610d",
+          "artifact_digest": "4f8161d6037c3c813e7b678814c81c0fd39b367ec4e48720d9de7d5d697a751f",
           "contract_revision": "25d92cfc6d1d7b23"
         }
       },
@@ -19217,7 +19216,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.concept/test_capsule.json",
-          "artifact_digest": "9c441fcc8f6a65e1535d1394d924724151c0d0d33793820bca0a46c8d1277df0",
+          "artifact_digest": "92de91da63cee175e65d563e81b1b94c45388748b7af0dee42163b2417d0ef08",
           "contract_revision": "3a3f0f80e5cb092f"
         }
       },
@@ -19291,7 +19290,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.configuration_plan/test_capsule.json",
-          "artifact_digest": "242b161323ecfbb4e42819b12f37eff38c2613f897512e03bd6f7d2cd23d8677",
+          "artifact_digest": "5b67b844757bdc0f25ad15d92c214a1f28a204bdc29626d072df5bdecb8d82d9",
           "contract_revision": "f01d94e337c256e0"
         }
       },
@@ -19353,19 +19352,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.dreamer.conflict_analysis/contract_kit.json",
-          "artifact_digest": "6242a3b8296a9c4d2bbaf7a400ba81b80f4aaf1f0ed362af133a828ab7318cb7",
+          "artifact_digest": "93a83e2790ce624e6fb59842d74e51415593f007cc6b29d041853a1c1022c84e",
           "contract_revision": "ad23c6c8c9853ab7"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.conflict_analysis/context_capsule.json",
-          "artifact_digest": "53f8102152dcdba6655b84ca119c7b9a54950ad6f8943c2e5f98e14688d24eea",
+          "artifact_digest": "ec69cf733dea7082e4475bb22ccca2517c704e65f696c882775702af217e40e9",
           "contract_revision": "232d2915356f8656"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.conflict_analysis/test_capsule.json",
-          "artifact_digest": "7b5881b775682656685090cf91cc86e8fb5e0fd57f6616641e5a6316f025ff9a",
+          "artifact_digest": "b43818d9b87075782b73454d0b89d31a653d20ef3196ec6f54dfde2316986962",
           "contract_revision": "4b55e337432be3c7"
         }
       },
@@ -19439,7 +19438,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.contracts/test_capsule.json",
-          "artifact_digest": "ba0dddff0a89cbee556ac086fdbfe2e7b2553aea2b2214d1453da7384de547b1",
+          "artifact_digest": "b31259a5285b0efd8dac7b1c61340f590c1f82cd67311ec4b2fc89b3d172cf54",
           "contract_revision": "76830ae62a406a41"
         }
       },
@@ -19513,7 +19512,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.curation/test_capsule.json",
-          "artifact_digest": "3347d5ec00f260bd1eada5597d22cc342b1f96ed32f0249ee4ef9110a2173ab8",
+          "artifact_digest": "2870e80f1a94d32eb7c5eb8da78ba5e79515a3546af565e093e1a0a472827233",
           "contract_revision": "5ff2bfc28fa2df3a"
         }
       },
@@ -19592,7 +19591,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.curation-wasm/test_capsule.json",
-          "artifact_digest": "d630afb07ce8efce037646c6c67b1f855bed2eb88103192a6e3900fb76bf638d",
+          "artifact_digest": "bacf94169609396ba262a176170d5ba2074719534922a4a5ab06031effd126ee",
           "contract_revision": "b685ee154ff65911"
         }
       },
@@ -19666,7 +19665,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.cycle/test_capsule.json",
-          "artifact_digest": "98489b912f18bba50a6a6804e0dd1707168c9e4f325ad01b9c8680f6ef4d78b2",
+          "artifact_digest": "6512ea9aa1a737e741d4bb5833f589835472829c6fac2b8db0e61cae3370d51a",
           "contract_revision": "03054f3346220176"
         }
       },
@@ -19745,7 +19744,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.cycle-wasm/test_capsule.json",
-          "artifact_digest": "9e445b412f45657c2e528f416863ab62b843e5bb1687d8b959690c70fc1cc7a0",
+          "artifact_digest": "2b9378438b3c9671d87f71e452a8394789955905430daa00e6dc330f9003d6f0",
           "contract_revision": "7810197208896e2b"
         }
       },
@@ -19819,7 +19818,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.development_diagnosis/test_capsule.json",
-          "artifact_digest": "d864e4c5cd85ed4c5e00d46dcd27460ae65f04620d00d15af4a50b5daad48d46",
+          "artifact_digest": "8fc2a614188257d80a0f339fc04426dff2a5f6d3e463fe81522a2065f953ac82",
           "contract_revision": "6b5432127a5ca470"
         }
       },
@@ -19893,7 +19892,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.episode/test_capsule.json",
-          "artifact_digest": "e6570acc2d77ca9ef73f447b2a9204d1dbc7f7cf93876ccd29cea8a77309e08b",
+          "artifact_digest": "5572c7815c80b1d67f71cbbd38ec48842935414681c196375353b59c5245e4b5",
           "contract_revision": "16223ac8aaf07d87"
         }
       },
@@ -19967,7 +19966,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.failure/test_capsule.json",
-          "artifact_digest": "9629dc0e506329bfc1d9da84ff1c0b310c401bee17eb40cacf06315c277da70d",
+          "artifact_digest": "147d55e8b39515b87f25d034de19f2f02014e2c77bd0a12fdfe3417879f1cf00",
           "contract_revision": "32035344f07ae886"
         }
       },
@@ -20041,7 +20040,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.implementation_brief/test_capsule.json",
-          "artifact_digest": "ff02a520dd3285212d655af276d073003861e1ed7c7bc64f9e6e24c658a2e199",
+          "artifact_digest": "f9591bf8ae80813f0e7c56d421f579a307fda0d019f98873c89e24f9c297c59e",
           "contract_revision": "27d6463e14ee6d2d"
         }
       },
@@ -20115,7 +20114,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.maintenance_plan/test_capsule.json",
-          "artifact_digest": "06f97700bb994533bccb13af564a9eb3da17cce7ccc6f6c57d7a9a9e77ee8bd3",
+          "artifact_digest": "468371423580f0848d3da684f9da9a5867fe812949d290c7037ccd44d32ae0ed",
           "contract_revision": "7fc4d447a7525a18"
         }
       },
@@ -20189,7 +20188,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.memory_repair/test_capsule.json",
-          "artifact_digest": "438d22f6381d2db575148722dd57b1df30c779ec9e2526e6f08f0dd3ed631464",
+          "artifact_digest": "03cce5bc9d7721ee53f892808a456381f5d87acf1a97ef8389b20b446b08dadf",
           "contract_revision": "b0d32e89108bc8f6"
         }
       },
@@ -20263,7 +20262,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.memory_revision/test_capsule.json",
-          "artifact_digest": "bb05b8df5ed7a261f995f6b164c4a6160b277d3643274640e6221b9e06506417",
+          "artifact_digest": "7e862267c335a2fcb7cf287bf657bcb76c3a0f0b7c7c1825302053ff5af4d89c",
           "contract_revision": "e245d5650d7f589d"
         }
       },
@@ -20337,7 +20336,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.orchestration_plan/test_capsule.json",
-          "artifact_digest": "325817d04168b124c59004b982b9147f481990fe563849426c32ed3fd82b4da0",
+          "artifact_digest": "b22e0ee161d6817798a915a931c5f55106f1a235ad99f0cb293e3416fb2b3982",
           "contract_revision": "46a353828fdf2113"
         }
       },
@@ -20411,7 +20410,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.orientation/test_capsule.json",
-          "artifact_digest": "52a0abba6e9dcdd994ea6d2a45eb86306b731a5155bccc164c7188d68b2e9abf",
+          "artifact_digest": "5d19d0e00cce0498962c632e8a7d40e1b8220ce8a8cfe6b7ba662bd03ff79d1d",
           "contract_revision": "277b0ba0b9c7394a"
         }
       },
@@ -20490,7 +20489,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.orientation-wasm/test_capsule.json",
-          "artifact_digest": "b7de06d027106d96b50b87d9e1138a2ece457bae65992ec0c429ff8b008cdf52",
+          "artifact_digest": "2834e1000bf1bf08fb9c5d2b71814a1d420b1e3ff9da904b9c0ed771ce2882d3",
           "contract_revision": "3bb71e355e4a62d5"
         }
       },
@@ -20564,7 +20563,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.probe_plan/test_capsule.json",
-          "artifact_digest": "9c58c0a746529db29db5cf4b651074b192d6ca4b3baf0f308547236b4da60720",
+          "artifact_digest": "22dd358888ebf02867debca649cb181bc9f7790efce1cdf94bdec5d0210a5d89",
           "contract_revision": "42cc1698281e7e5b"
         }
       },
@@ -20638,7 +20637,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.procedure/test_capsule.json",
-          "artifact_digest": "21117d0a45409c4caf31c68055f4feaa74930fb57cb0a7548e308c3404f3721e",
+          "artifact_digest": "141d1f9f14220c5a5ae1158927a88fbd17c748c019d3ecd574f7ae312d8833b0",
           "contract_revision": "51b67dfdd647c85a"
         }
       },
@@ -20712,7 +20711,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.reconsolidation/test_capsule.json",
-          "artifact_digest": "9bd779c1c4d274ef20d5454b9775f52643256454c045b2ae2b57fe55b0b141c3",
+          "artifact_digest": "3a73063752c0f87588fc5204e4d4e1f0d191ee4596b133c32ea8ba4672e3d0e6",
           "contract_revision": "0b9339e52a0037bb"
         }
       },
@@ -20786,7 +20785,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.relation/test_capsule.json",
-          "artifact_digest": "bb6e60c389acd60876ac5cfe95a9ed5345b942a516670b2d0dcb1cd09e5bb276",
+          "artifact_digest": "fcd25d8dd3dac11643667c8b90c65013d4a9a8ade13107cb22db251f81123afe",
           "contract_revision": "70ad1b0ae2196924"
         }
       },
@@ -20860,7 +20859,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.research-synthesis/test_capsule.json",
-          "artifact_digest": "c74a20ab49bfa219ae6b6d6ab3d59f564b476be86294eedc293b6bc5c8538f7a",
+          "artifact_digest": "be28b62e08e65a595914cc0fcce0e72208070f0f73a4d1797fbfbe1451371f09",
           "contract_revision": "ad37bfe572698e9e"
         }
       },
@@ -20939,7 +20938,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.research-wasm/test_capsule.json",
-          "artifact_digest": "32b7ad42276ce22d16a11e516e4e1d38d34041961f035c9179bd80051ef3945b",
+          "artifact_digest": "517e2a838f9423df02e16b6363f26d3140f11fbf0c814a4424c930a4004a41a9",
           "contract_revision": "81baf5b909f83b08"
         }
       },
@@ -21013,7 +21012,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.rival_model/test_capsule.json",
-          "artifact_digest": "2c8dda91db1631987eb1e54e1519a01b370e45e4838b1280e9e76e11c2e0cc1b",
+          "artifact_digest": "f40f7294f0295059bd6c48b076e381a008a55973c2c93db515ab02ec4f1faef2",
           "contract_revision": "125d93c03e93bc29"
         }
       },
@@ -21087,7 +21086,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.self_query/test_capsule.json",
-          "artifact_digest": "ead63377f58dc2bf31b39ec3958a7818ebb89872a7fa98be8da6817785e48b85",
+          "artifact_digest": "8fe29df22579e8fb8e7d742dbf4657204fcb6769d8bf297ea43cf00fdbe909e1",
           "contract_revision": "349d95b4f2fd1b9e"
         }
       },
@@ -21161,7 +21160,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.dreamer.structure_repair/test_capsule.json",
-          "artifact_digest": "6fa95ae0dfe1b5e6c3126eb502739284577244fbcd93353ffd5b6291dc74ba07",
+          "artifact_digest": "2803ad45a585e49a6d9018a36cf3ddb0adfb3321ff0aed5a4ffa54758015cd1c",
           "contract_revision": "d843cd0515467a98"
         }
       },
@@ -21235,7 +21234,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.epistemic.context_provider/test_capsule.json",
-          "artifact_digest": "98028c17b4a4523d65a667da83bc6ac969f83a312b9d7c2b8d5f7581763e32bc",
+          "artifact_digest": "5c57ee528a970c362295103c6c6fcef0010629f9c4602754c64ddfd49a69ea75",
           "contract_revision": "2e75adc023c7e216"
         }
       },
@@ -21309,7 +21308,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.epistemic.contracts/test_capsule.json",
-          "artifact_digest": "1eac8b08830295c06b8190016fab5d078be2e1d5446402e2bb95c4aba55db61d",
+          "artifact_digest": "7d12123b054de76fa009c67ac3513fedf418bc0951de398903e7461ea17118be",
           "contract_revision": "611558670ab39ef4"
         }
       },
@@ -21371,19 +21370,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/smart.epistemic.position/contract_kit.json",
-          "artifact_digest": "d2a4328c89596df59181079cd54ab7c3c7753caf7900c0057ac5fecdaed0ebb0",
+          "artifact_digest": "0d2618aaa45a901b90393816729d1d0d65f18bd7f52bec4e7f9f2324d4f62538",
           "contract_revision": "a7e5194040577524"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/smart.epistemic.position/context_capsule.json",
-          "artifact_digest": "a846f75b1f3430acfa89567ea9446b1f17d0adeaadc18974fa6a065e64daff73",
+          "artifact_digest": "4b7d803911428c9fa977bb6683619812fbf2fa4d7c5df8f84c1cce1d3e094792",
           "contract_revision": "abe7fa2fcfd824ee"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.epistemic.position/test_capsule.json",
-          "artifact_digest": "c56f7f544784335ea9948ca7d7982a55be8f3b59435708247fe0c42ee1b858b3",
+          "artifact_digest": "cd6c1875ddf53cfb66c41f5fea201395e71d14f315e1e816533c6b951ebe8b94",
           "contract_revision": "0b0e5dccc024a6b7"
         }
       },
@@ -21457,7 +21456,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.experience.projection/test_capsule.json",
-          "artifact_digest": "e10cfb7571a727d48e808edfe04ff5feee79dd72acddf792c60923c020bf6dc4",
+          "artifact_digest": "2a5ea776d0a4ee782d72383d682da3de4d62b23d27e7f69c2f20a234e7a71ce7",
           "contract_revision": "a9339e6ffc80be70"
         }
       },
@@ -21531,7 +21530,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.experience.provider/test_capsule.json",
-          "artifact_digest": "435075862311baef730519ad5f749c131c233f0d0c1feb67d6bef57f8794d083",
+          "artifact_digest": "5adfa159fda707b452784e27b1b17e83641a2f9caec77b184efd74ed163fe58c",
           "contract_revision": "d9e365dfcfc5d631"
         }
       },
@@ -21605,7 +21604,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.learning.contracts/test_capsule.json",
-          "artifact_digest": "aabc5866c3e332cf77a2e735d745905d5d5b13ba4d04cf9250f4ace135b03b96",
+          "artifact_digest": "2a559be05bf9bc288e880d2f479397e9e61db05ca1685c1a3d11e40f32fbcadc",
           "contract_revision": "c361b27b19aeca3a"
         }
       },
@@ -21679,7 +21678,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.learning.delta/test_capsule.json",
-          "artifact_digest": "7af461d574b9c154493887ebbc16cbb27d4fbd30155db9b5e027eb186a705ad9",
+          "artifact_digest": "846f6400a8f9e9dc1f0476d3f5fd4f0821947d7cf00b0ec0b8cc85be07d9ff59",
           "contract_revision": "14f5ef9a7c9383d4"
         }
       },
@@ -21753,7 +21752,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.learning.overlay/test_capsule.json",
-          "artifact_digest": "8b809830fe2bd5fe1c30763edb17b5af6ed021960555ad0ac9b9af8cc078e3c2",
+          "artifact_digest": "05fa2996c51cf164eb77bd4100c5e350255a6532c905de2f6735a30e135ee42e",
           "contract_revision": "c58164e8312c3442"
         }
       },
@@ -21827,7 +21826,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.learning.state_view/test_capsule.json",
-          "artifact_digest": "ebf5043f5a6c81ca79deb8f5d0a22a34c93fcfca38395e19c42c39b18955c4d1",
+          "artifact_digest": "fcca0a77978dacd8901e27a8f0ded779b416ed33899bd5b23e4c55cf3f584110",
           "contract_revision": "f6737141c050f5f4"
         }
       },
@@ -21906,7 +21905,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.applicability/test_capsule.json",
-          "artifact_digest": "be07be4c57667706e3f14af89495fd40d121483babd1c8d330656a21ca1a7784",
+          "artifact_digest": "5fb83d6bd94b8f52161832d38ee7c39057235e06dd88b4daa665d812dc6ce200",
           "contract_revision": "6a0039449f65f30c"
         }
       },
@@ -21985,7 +21984,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.curation-screen-wasm/test_capsule.json",
-          "artifact_digest": "0b27bbf3c3bb772c19aaef89207e45da43bea3928946f31d126b50add1bdacc7",
+          "artifact_digest": "97317f70a7f0220240e736eace42c19c75112bc31d763f04ffd87bc03990c5e7",
           "contract_revision": "89a3251a88537ffe"
         }
       },
@@ -22059,7 +22058,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.curation_contracts/test_capsule.json",
-          "artifact_digest": "5a1b7709ec2388d98648f8aeceea362dec298d9c28ad44358ba268c4ba1fd072",
+          "artifact_digest": "0e10e2981ccfaff0707e2b5801fe84210431da9079174aebe095517954bce2f1",
           "contract_revision": "f10f18c06c3d6961"
         }
       },
@@ -22133,7 +22132,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.curation_screen/test_capsule.json",
-          "artifact_digest": "ec65c5f918d05edb0a071f1ccbad204ccd31be5bf43cd5e3067ed1ab09d9cb19",
+          "artifact_digest": "cfc2e0f4f5d124e8483b52e97a233aa3ed800f9b765683a07dd671cb9e163989",
           "contract_revision": "d99cb49c1b291492"
         }
       },
@@ -22207,7 +22206,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.memory.ecology/test_capsule.json",
-          "artifact_digest": "d13e9b15534b4592ef51d9032c39b7a3b5946a14131c345a3032da36ef11dc51",
+          "artifact_digest": "313d5a85973c62da4380ab09464ea171363e4550f6ead7b0c366f525a55d6296",
           "contract_revision": "e77ee278151b8a3e"
         }
       },
@@ -22281,7 +22280,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/smart.understanding.common_ground/test_capsule.json",
-          "artifact_digest": "b069a6e458ff97acfffbdec03f216fb370c767c93cec3b0bde7de67899b3e0b9",
+          "artifact_digest": "3ed9b9892e143d380b4ce0338477e23cf8497750d4d8de24d2ead245137ad5ba",
           "contract_revision": "1afdc380a46bf3ba"
         }
       },
@@ -22355,7 +22354,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/swarm/test_capsule.json",
-          "artifact_digest": "0e7a08ef0a3688f0b8e3faf307208f0343a76c850fcf8f855a98bfccb259d350",
+          "artifact_digest": "c3868443c28cef590af31a498538b19719e737adaf2375a2e892560c7ddc3f47",
           "contract_revision": "e39636735d0e8989"
         }
       },
@@ -22424,7 +22423,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/test-support/test_capsule.json",
-          "artifact_digest": "b927d7295137329d1f7ca80a4ff5655c632f9929dfe9a891cd0d94d1dfde8bca",
+          "artifact_digest": "5748c27db4a6c0d627d5daeabf2888b19546cdf3c2852faaa688161d8685875b",
           "contract_revision": "6d39703e1aeedc73"
         }
       },
@@ -22493,7 +22492,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/user-broker-core/test_capsule.json",
-          "artifact_digest": "c0e57bd353570ab94b44f0b8f5075995853c4eb753079e0040b337232e06be20",
+          "artifact_digest": "71ff936d9086d9529050730750751258f731a6261a74079469e93aa12c87f195",
           "contract_revision": "0db2ee03f9e94b79"
         }
       },
@@ -22562,7 +22561,7 @@
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/wasm-runtime/test_capsule.json",
-          "artifact_digest": "5a18d58167a8a14dbfe52d32554beb4f29f20541f98a2935b9406b34596e76b7",
+          "artifact_digest": "370a0ed70b202a8e2ca7eb3ff4020d55366e90a3aea11f1bb11bd42ba4bb499d",
           "contract_revision": "da68cd6bdcd99978"
         }
       },
@@ -22591,5 +22590,5 @@
       }
     }
   ],
-  "registry_digest": "73fc4c7db1bfe21e24d6a1b017849b18696de674d5710e95c99a1d557889afe2"
+  "registry_digest": "097b76d4b0edc98c95f0b521ee1c9d81757ab04821e15a7e7436fb6afd0c6063"
 }

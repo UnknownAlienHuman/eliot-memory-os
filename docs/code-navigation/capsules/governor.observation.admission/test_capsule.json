@@ -44,6 +44,10 @@
       "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
       "paths": []
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
     "unselected_package_files": []
   },
   "unit_property_model_tests": {
@@ -161,7 +165,7 @@
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "c8e5de62126a4b45fdaf0af3b553b0658a84cb516b9caaf34c81f9c57033e567",
+  "artifact_digest": "b19942cb7bc1281fd9ab155f1020a0b71bc09fb94444355fad8a8c5d15f5c198",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "fb57ddc89260e90f"

@@ -32,10 +32,10 @@
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
     "scope": "the selected decision workset of this cell",
-    "source_stu": 1474455,
+    "source_stu": 1504656,
     "test_stu": 86908,
     "selected_file_count": 94,
-    "physical_source_stu": 1561363,
+    "physical_source_stu": 1591564,
     "physical_file_count": 94,
     "inline_cfg_test_modules": 32,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
@@ -63,9 +63,9 @@
       },
       {
         "path": "bins/eliotd/src/agent_fabric.rs",
-        "bytes": 213053,
-        "sha256": "fa13ab10165192fefeef8c74dcba3dd5ff5b8ef7158859ef60a1974f59435daf",
-        "stu": 71018,
+        "bytes": 255030,
+        "sha256": "4d46d7c646ad79a1245d7de538d598a601946c86ebf06b9a9fbf39113c71030f",
+        "stu": 85010,
         "inline_cfg_test": true
       },
       {
@@ -77,9 +77,9 @@
       },
       {
         "path": "bins/eliotd/src/campaign_context_owner.rs",
-        "bytes": 14487,
-        "sha256": "62dd0c501370506f242be1cc3d5f3a65c3ffcc66ee996fb48729afb99d9332c9",
-        "stu": 4829,
+        "bytes": 15485,
+        "sha256": "d33dc4c03821bf38ee4fc1045607b9d09a448cf4b346fe6b459119e4fc6892ec",
+        "stu": 5162,
         "inline_cfg_test": false
       },
       {
@@ -98,9 +98,9 @@
       },
       {
         "path": "bins/eliotd/src/campaign_packet.rs",
-        "bytes": 101736,
-        "sha256": "5946d5e5a6612bdab050d8f8774fa0fa39c327655f1afc3ead721dcc3e484fec",
-        "stu": 33912,
+        "bytes": 103494,
+        "sha256": "d41876b6ed5f311a971e79352bab2fbd4b15cbdc2d84c6fa045368716769cd28",
+        "stu": 34498,
         "inline_cfg_test": false
       },
       {
@@ -175,9 +175,9 @@
       },
       {
         "path": "bins/eliotd/src/daemon_kernel_client.rs",
-        "bytes": 178678,
-        "sha256": "16010a8944321791bb4618fe647fa390591f241cb260fe9c890ad8c985e25931",
-        "stu": 59560,
+        "bytes": 180363,
+        "sha256": "37e977ba541edcb43f883b8a42c320ca09fc448d85b2e63e7fad5672d24d93df",
+        "stu": 60121,
         "inline_cfg_test": true
       },
       {
@@ -196,9 +196,9 @@
       },
       {
         "path": "bins/eliotd/src/daemon_runtime.rs",
-        "bytes": 381444,
-        "sha256": "9486cb3fb3380dc84cd1043599b7d42c7c306f4155e87ffbb66d90330bcf08f6",
-        "stu": 127148,
+        "bytes": 382047,
+        "sha256": "182164a89e81f77a33d149d841aaa546f4ce3336563a16afa520865bb2c45ac6",
+        "stu": 127349,
         "inline_cfg_test": true
       },
       {
@@ -210,9 +210,9 @@
       },
       {
         "path": "bins/eliotd/src/dreamer_admission.rs",
-        "bytes": 36732,
-        "sha256": "eb1f67f9cb22a32a43c3de4c2393c4d48925687bf9aad9d8c157dd0de338948e",
-        "stu": 12244,
+        "bytes": 45770,
+        "sha256": "d60f3bc39d2c67729b2684a2758ab081d957768fe61fdb96a9c119ed3b0609e4",
+        "stu": 15257,
         "inline_cfg_test": true
       },
       {
@@ -301,9 +301,9 @@
       },
       {
         "path": "bins/eliotd/src/improvement_candidate_dispatch.rs",
-        "bytes": 115467,
-        "sha256": "9d70bbad9d27c7b81a361f9b7057c4e9e5a461777c248859437d342b271128ca",
-        "stu": 38489,
+        "bytes": 127734,
+        "sha256": "e763bbbca04107d1f78c002ca4a2e3bc3969096aa9fb237cb5ca408882328c74",
+        "stu": 42578,
         "inline_cfg_test": true
       },
       {
@@ -343,9 +343,9 @@
       },
       {
         "path": "bins/eliotd/src/kernel_context_read_client.rs",
-        "bytes": 156113,
-        "sha256": "b1552514d02cfc2990f9adf61f1a2ca71805162a17791dfb9afe2dd80aec6a86",
-        "stu": 52038,
+        "bytes": 166458,
+        "sha256": "7baaf0130bbd00defd2deddab502954c8579dd921953a8292729800f29052eb4",
+        "stu": 55486,
         "inline_cfg_test": true
       },
       {
@@ -364,9 +364,9 @@
       },
       {
         "path": "bins/eliotd/src/lib.rs",
-        "bytes": 238673,
-        "sha256": "d894aa3e344aeb47c68fca73e17969442dc98f88f3ee8a8950509f138fc9f70c",
-        "stu": 79558,
+        "bytes": 239431,
+        "sha256": "fbc77a7549d0c362a4da7040f5c2d88243f59390068e1c248ca08d63180284d3",
+        "stu": 79811,
         "inline_cfg_test": true
       },
       {
@@ -399,9 +399,9 @@
       },
       {
         "path": "bins/eliotd/src/negative_memory_action_gate.rs",
-        "bytes": 35120,
-        "sha256": "39fb505a69dceb924c4d9d28e7db29f15c1b2eeab605f750b87be6ebf9efe50c",
-        "stu": 11707,
+        "bytes": 36927,
+        "sha256": "f6de58cfa51fa51644dceaabdbe42a37385a222b7629478263457b2066d9a793",
+        "stu": 12309,
         "inline_cfg_test": false
       },
       {
@@ -553,9 +553,9 @@
       },
       {
         "path": "bins/eliotd/src/solo_agent_driver.rs",
-        "bytes": 123894,
-        "sha256": "e0aff0e053f2bc0c331f243de8b74cebc4868dde58c93a9052437b26b4818571",
-        "stu": 41298,
+        "bytes": 133262,
+        "sha256": "dca21020ad34bf0081c67e3e8532ec7dde9885e38adeda697b1ac03df8f16cab",
+        "stu": 44421,
         "inline_cfg_test": true
       },
       {
@@ -759,11 +759,11 @@
         "classes": []
       }
     ],
-    "source_selection_digest": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
+    "source_selection_digest": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
   },
   "unselected_package_files": {
     "physical_inventory_file_count": 94,
-    "physical_inventory_digest": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41",
+    "physical_inventory_digest": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3",
     "unselected_files": [],
     "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
@@ -826,6 +826,7 @@
     "eliot-store-api",
     "eliot-swarm",
     "eliot-testd-core",
+    "eliot-types",
     "eliot-understanding-assessment",
     "eliot-watchdog-core",
     "eliot-workscope",
@@ -887,7 +888,7 @@
         },
         "package_manifest": {
           "path": "bins/eliotd/Cargo.toml",
-          "sha256": "710e97442794438631d2344b3f423d6dd82d26b0d00d1cc0ea23deed50cee444"
+          "sha256": "acba1fd649d8e5962b7cca70223ac251bbc263fb8d2455a89cd3c4bc48a84f2c"
         },
         "module_manifest": null
       },
@@ -898,22 +899,22 @@
         },
         "physical_source_inventory": {
           "path_count": 94,
-          "sha256": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
+          "sha256": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
         },
         "selected_workset": {
           "allocation_scope": "PACKAGE_WIDE",
           "allocation_state": "UNRESOLVED_ALLOCATION",
           "path_count": 94,
-          "sha256": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
+          "sha256": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
         }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "f01bf41a2b0e22cc500fb9dafc18698809d6b2d4fb794bbd7f347ae734e262cf",
+  "artifact_digest": "3ebcc9511fe5b5c09decf8d7a8c5a33aaa81363f296d842b1a06959023788765",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
-    "value": "500accd1732be18c"
+    "value": "1f269dda1b160398"
   }
 }

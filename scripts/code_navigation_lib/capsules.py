@@ -949,7 +949,44 @@ def _module_graph(root: Path, record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _allocated_module_closure(
+    root: Path, record: dict[str, Any], allocated: set[str]
+) -> set[str]:
+    """The production module closure of one accepted allocation.
+
+    A cell's allocated file cannot be read without the modules that file itself
+    declares, so those files are required common inputs of the cell rather than
+    unallocated siblings. Only production (non-`cfg(test)`) module edges are
+    followed, and only inside the same package, so the workset never widens past
+    what the allocation itself needs and a test-only subtree stays in the test
+    slice.
+    """
+    package_prefix = f"{record['root_path']}/"
+    known = set(record["rust_files"])
+    closure: set[str] = set()
+    frontier = sorted(allocated)
+    while frontier:
+        current = frontier.pop()
+        if current in closure:
+            continue
+        closure.add(current)
+        try:
+            text = (root / current).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for child, child_test_only, _reason in _module_declarations(text, current):
+            if (
+                not child_test_only
+                and child in known
+                and child.startswith(package_prefix)
+                and child not in closure
+            ):
+                frontier.append(child)
+    return closure
+
+
 def _cell_allocation(
+    root: Path,
     record: dict[str, Any],
     cells: list[str],
     cell: str,
@@ -968,6 +1005,17 @@ def _cell_allocation(
     """
     package_root = record["root_path"]
     if allocated:
+        # The selected workset of an accepted allocation is the allocation plus
+        # what it cannot be read without: the package's production target roots
+        # and the production module closure the allocated files themselves
+        # declare. Without that closure the cell would be handed a file whose
+        # own submodules are reported as unallocated, which is not a usable
+        # decision workset. The allocated files are not repeated as common
+        # inputs; they are already the allocation.
+        common_inputs = (
+            set(graph["production_target_roots"])
+            | _allocated_module_closure(root, record, allocated)
+        ) - set(allocated)
         return {
             "scope": ALLOCATION_PER_CELL,
             "state": "ACCEPTED_ALLOCATION",
@@ -980,13 +1028,18 @@ def _cell_allocation(
             "unallocated_source_paths": sorted(
                 path
                 for path in record["rust_files"]
-                if path.startswith(f"{package_root}/") and path not in allocated
+                if path.startswith(f"{package_root}/")
+                and path not in allocated
+                and path not in common_inputs
             ),
-            "required_common_inputs": sorted(graph["production_target_roots"]),
+            "required_common_inputs": sorted(common_inputs),
             "observation": (
                 "An accepted assignment names the bounded source slice for this "
-                "cell; everything else in the package is reported as unallocated "
-                "rather than silently selected."
+                "cell; the selected workset is that slice plus the package "
+                "production target roots and the production module closure the "
+                "slice itself declares, because an allocated file cannot be read "
+                "without them. Everything else in the package is reported as "
+                "unallocated rather than silently selected."
             ),
         }
     if len(cells) == 1:
@@ -1150,10 +1203,21 @@ def _source_selection(
         (entry["path"], entry["sha256"])
         for entry in [*production, *tests]
     ]
+    # An ambiguous module/cfg gate is an explicit uncertainty of this
+    # classification, not a silent guess, so it is reported for every cell
+    # rather than only for a package with no declared cell. The file stays
+    # production-reachable, which is the conservative direction: an
+    # unrecognised gate never hides production source behind a test.
+    unresolved_cases = [
+        {"path": path, "reason": graph["unresolved"][path]}
+        for path in sorted(graph["unresolved"])
+        if path.startswith(package_prefix)
+    ]
     return {
         "selected_source": production,
         "selected_tests": tests,
         "unselected_files": unselected,
+        "unresolved_cfg_or_module_cases": unresolved_cases,
         "allocation": allocation,
         "source_stu": -(-production_bytes // 3),
         "test_stu": -(-test_bytes // 3),
@@ -1678,6 +1742,17 @@ def _test_capsule(
                     entry["path"] for entry in selection["selected_tests"] if entry["test_only_module"]
                 ),
             },
+            "unresolved_cfg_or_module_cases": {
+                "rule": (
+                    "A cfg predicate that mentions `test` but can also hold "
+                    "without it is neither test-only nor an unconditional "
+                    "production edge. It is reported here as explicit "
+                    "uncertainty and the file stays production-reachable, so "
+                    "no path is renamed and no test is removed to shrink a "
+                    "context estimate."
+                ),
+                "cases": selection["unresolved_cfg_or_module_cases"],
+            },
             "unselected_package_files": selection["unselected_files"],
         },
         "unit_property_model_tests": {
@@ -2004,7 +2079,7 @@ def _package_workset(
             "test_only_module_paths": test_only,
             "unselected_file_count": len(selection["unselected_files"]),
             "unselected_files": selection["unselected_files"],
-            "unresolved_cfg_or_module_cases": sorted(graph["unresolved"].values()),
+            "unresolved_cfg_or_module_cases": selection["unresolved_cfg_or_module_cases"],
             "note": (
                 "Classification is derived from Cargo target roots and module/cfg "
                 "reachability, never from a path component name. An ambiguous "
@@ -2077,6 +2152,7 @@ def build_capsules(root: Path) -> dict[str, Any]:
                     _cell_allocation_key(root_path, cell)
                 ) or package_allocation
                 cell_allocation = _cell_allocation(
+                    root,
                     record,
                     declared_cells,
                     cell,
@@ -2142,6 +2218,7 @@ def build_capsules(root: Path) -> dict[str, Any]:
                 _cell_allocation_key(root_path, cell)
             ) or package_allocation
             cell_allocation = _cell_allocation(
+                root,
                 record,
                 declared_cells,
                 cell,

@@ -48,6 +48,10 @@
       "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
       "paths": []
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
     "unselected_package_files": []
   },
   "unit_property_model_tests": {
@@ -198,20 +202,20 @@
       },
       "physical_source_inventory": {
         "path_count": 11,
-        "sha256": "ed8f6a7272d221ce4aff7cff858661f174d26b735407c1d52cdd701588955fc9"
+        "sha256": "65793e63c523f6e00e69db604f40262527863dd239945364c02eb7a9df4088e9"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 11,
-        "sha256": "ed8f6a7272d221ce4aff7cff858661f174d26b735407c1d52cdd701588955fc9"
+        "sha256": "65793e63c523f6e00e69db604f40262527863dd239945364c02eb7a9df4088e9"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "8837e2366827bb3a3a44d21bafd48c8406a9b8359712b409062197ce1b462a66",
+  "artifact_digest": "660e89570774e40378e394791d058553fdf540bc11e636669f15e2b6fea21a07",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "152979de4b96d521"

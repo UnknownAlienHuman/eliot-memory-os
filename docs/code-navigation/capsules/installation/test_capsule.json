@@ -46,6 +46,10 @@
         "crates/kernel/eliot-installation/src/tests.rs"
       ]
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
     "unselected_package_files": []
   },
   "unit_property_model_tests": {
@@ -57,8 +61,8 @@
     "selected_tests": [
       {
         "path": "crates/kernel/eliot-installation/src/tests.rs",
-        "bytes": 393615,
-        "sha256": "6884f724f69c2716d0017608d57f6d939c80a5e32f42a93829817b5226389257",
+        "bytes": 393700,
+        "sha256": "5f8c0ef6f5f72072071def3979cfd03a2cd83e4ba075566a9302d535f7b1e6dc",
         "test_attributes": 155,
         "inline_cfg_test": false,
         "test_only_module": true,
@@ -129,7 +133,7 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 265,
-    "test_stu": 131205,
+    "test_stu": 131234,
     "nonzero": true
   },
   "bound_contract_digest": "174b4007676607d4",
@@ -160,20 +164,20 @@
       },
       "physical_source_inventory": {
         "path_count": 34,
-        "sha256": "751e764804b7efa3f1c792a0033818404071f2a2414c33a2d5085464b3302669"
+        "sha256": "613e4a01af8ff9f01b8189519d0fad30dca8e6077a5bbf4408a15fd91a6c8ee2"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 34,
-        "sha256": "751e764804b7efa3f1c792a0033818404071f2a2414c33a2d5085464b3302669"
+        "sha256": "613e4a01af8ff9f01b8189519d0fad30dca8e6077a5bbf4408a15fd91a6c8ee2"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "c5e3f47d3c609ae3e9a4199314d9ecb78a905cc57a1f70948a7ed876eb2b4814",
+  "artifact_digest": "76143727d97e76aa8a3df71ddef73f3af419b3e3ea82049166be0f4c2508071f",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "bfcacd6e7c7c7dc6"

@@ -25,10 +25,10 @@
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
     "scope": "the selected decision workset of this cell",
-    "source_stu": 18327,
+    "source_stu": 18387,
     "test_stu": 239681,
     "selected_file_count": 18,
-    "physical_source_stu": 1279123,
+    "physical_source_stu": 1289191,
     "physical_file_count": 60,
     "inline_cfg_test_modules": 1,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
@@ -42,15 +42,15 @@
     "required_common_inputs": [
       "crates/kernel/eliot-kernel-service/src/lib.rs"
     ],
-    "observation": "An accepted assignment names the bounded source slice for this cell; everything else in the package is reported as unallocated rather than silently selected."
+    "observation": "An accepted assignment names the bounded source slice for this cell; the selected workset is that slice plus the package production target roots and the production module closure the slice itself declares, because an allocated file cannot be read without them. Everything else in the package is reported as unallocated rather than silently selected."
   },
   "selected_source_and_tests": {
     "selected_source": [
       {
         "path": "crates/kernel/eliot-kernel-service/src/lib.rs",
-        "bytes": 28702,
-        "sha256": "d79d20a4054c2d12885b03a4cc21a284937fad92eb7804aa3276627342278fad",
-        "stu": 9568,
+        "bytes": 28884,
+        "sha256": "fd95fec69d30e596d6c8a80267e1a530a25e6496bd8a121cca54c73a667f0b21",
+        "stu": 9628,
         "inline_cfg_test": true
       },
       {
@@ -263,11 +263,11 @@
         ]
       }
     ],
-    "source_selection_digest": "0f404574000cdc7fab19513d4b31940dcf02f831dca31b05ec7c949c11a329bd"
+    "source_selection_digest": "c32437f92d9818ee4f6e60ff274502b3c600f94e87daf8c1dff753d7d4fffeb6"
   },
   "unselected_package_files": {
     "physical_inventory_file_count": 60,
-    "physical_inventory_digest": "da03f277ceba4f8fba4e4cf8aba3bbbf3fa175e6048d0ba5ab79f711b1a607bd",
+    "physical_inventory_digest": "10cf387689cb61de12cfa4892774a4bae8691135e229a4b8a9ded2fd479d2fc4",
     "unselected_files": [
       {
         "path": "crates/kernel/eliot-kernel-service/src/capacity_evidence.rs",
@@ -296,12 +296,12 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/host_request_binding.rs",
-        "bytes": 85180,
+        "bytes": 92678,
         "reason": "production source not allocated to this cell"
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/lifecycle.rs",
-        "bytes": 127520,
+        "bytes": 127570,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -321,7 +321,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/maintenance_trigger_delivery.rs",
-        "bytes": 66121,
+        "bytes": 70129,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -356,7 +356,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/protocol/native_worker_claim.rs",
-        "bytes": 72553,
+        "bytes": 72561,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -386,12 +386,12 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/storage_replacement.rs",
-        "bytes": 77345,
+        "bytes": 87265,
         "reason": "production source not allocated to this cell"
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/store_backup_client.rs",
-        "bytes": 40228,
+        "bytes": 41924,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -401,7 +401,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/store_gateway.rs",
-        "bytes": 551132,
+        "bytes": 554909,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -416,7 +416,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/store_write_status.rs",
-        "bytes": 5011,
+        "bytes": 7720,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -426,7 +426,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation.rs",
-        "bytes": 29789,
+        "bytes": 29807,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -436,12 +436,12 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation_execution.rs",
-        "bytes": 221721,
+        "bytes": 221791,
         "reason": "production source not allocated to this cell"
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation_execution_client.rs",
-        "bytes": 88485,
+        "bytes": 88515,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -461,7 +461,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/user_automation_store.rs",
-        "bytes": 112551,
+        "bytes": 112788,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -594,22 +594,22 @@
         },
         "physical_source_inventory": {
           "path_count": 60,
-          "sha256": "da03f277ceba4f8fba4e4cf8aba3bbbf3fa175e6048d0ba5ab79f711b1a607bd"
+          "sha256": "10cf387689cb61de12cfa4892774a4bae8691135e229a4b8a9ded2fd479d2fc4"
         },
         "selected_workset": {
           "allocation_scope": "PER_CELL",
           "allocation_state": "ACCEPTED_ALLOCATION",
           "path_count": 18,
-          "sha256": "0f404574000cdc7fab19513d4b31940dcf02f831dca31b05ec7c949c11a329bd"
+          "sha256": "c32437f92d9818ee4f6e60ff274502b3c600f94e87daf8c1dff753d7d4fffeb6"
         }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "d0db527cdab8ab79f3fd69357ce779a3e70d5d00b03a4d593b3ab5c43f0fb1d8",
+  "artifact_digest": "e50f7177fb209a55d4ed1717bcbd99c12fb337ced2af5faecfb22d7e62fa6efb",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
-    "value": "f3cecc24b1d8dc19"
+    "value": "9ecd7eeec495b53c"
   }
 }

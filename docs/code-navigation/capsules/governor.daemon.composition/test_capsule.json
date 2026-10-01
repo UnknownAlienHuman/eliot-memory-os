@@ -46,6 +46,10 @@
         "bins/eliotd/src/tests.rs"
       ]
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
     "unselected_package_files": []
   },
   "unit_property_model_tests": {
@@ -263,7 +267,7 @@
       },
       "package_manifest": {
         "path": "bins/eliotd/Cargo.toml",
-        "sha256": "710e97442794438631d2344b3f423d6dd82d26b0d00d1cc0ea23deed50cee444"
+        "sha256": "acba1fd649d8e5962b7cca70223ac251bbc263fb8d2455a89cd3c4bc48a84f2c"
       },
       "module_manifest": null
     },
@@ -274,20 +278,20 @@
       },
       "physical_source_inventory": {
         "path_count": 94,
-        "sha256": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
+        "sha256": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "UNRESOLVED_ALLOCATION",
         "path_count": 94,
-        "sha256": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
+        "sha256": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "b90b7b221811e692c2650bc2722f2d94812f6e041af95fbc5d8f2d467bc421cc",
+  "artifact_digest": "3b09f4073278cdc18da2f09f7e2424a2bb9b9c5b483aa44078e39a92d4d3040d",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "623c582fedf2708c"

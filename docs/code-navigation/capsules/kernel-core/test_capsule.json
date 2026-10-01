@@ -44,6 +44,10 @@
       "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
       "paths": []
     },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
     "unselected_package_files": []
   },
   "unit_property_model_tests": {
@@ -145,21 +149,21 @@
         "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
       "physical_source_inventory": {
-        "path_count": 24,
-        "sha256": "2c66c068f47f9f36b7bc7c467d3dd0e03cb52ecd1d9ca651251a941775bc5a38"
+        "path_count": 25,
+        "sha256": "627e0ffa6358759c081785dcb7fc3866580622810e40b93aa9ec4ff0aae7db2c"
       },
       "selected_workset": {
         "allocation_scope": "PACKAGE_WIDE",
         "allocation_state": "EXPLICIT_PACKAGE_WIDE",
-        "path_count": 24,
-        "sha256": "2c66c068f47f9f36b7bc7c467d3dd0e03cb52ecd1d9ca651251a941775bc5a38"
+        "path_count": 25,
+        "sha256": "627e0ffa6358759c081785dcb7fc3866580622810e40b93aa9ec4ff0aae7db2c"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0",
     "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "4219d10cfdc4556be40234a018e7b05ef72b0ecc1e5f193301570ecfa84e9c32",
+  "artifact_digest": "a640cc71b28d251e19563123d1e64dfe723c1dda5cd8b158f907b566f55b4a8b",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "e09011d8fd282f66"
