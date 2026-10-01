@@ -89,6 +89,17 @@ const TX_ERASURE_SCRUB_EVIDENCE: &str = "UPDATE write_receipt SET evidence_recor
 /// statement before commit; same-operation replay reads this row and returns
 /// the stored outcomes without duplicate destructive work (the single
 /// completion marker for the intent row above — never a second ledger).
+///
+/// The guard compares the outcomes only, and that is the whole identity the
+/// seal carries. The seal's recorded `scope_id` is the frozen intent's own copy
+/// (written by the `CREATE` content, never derived), and the scope that sealed
+/// these outcomes is already bound before this statement by
+/// `TX_ERASURE_INTENT`, which compares the entire frozen intent — `scope_id`
+/// included — against the stored intent row inside the same transaction. A
+/// second, independent scope comparison here would add no binding evidence and
+/// would instead refuse the same-operation replay of any seal written before
+/// this column existed, because such a row reads back with no `scope_id` at
+/// all.
 const TX_ERASURE_OUTCOME: &str = "LET $erasure_outcome_existing = (SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM ONLY type::record($erasure_outcome_table, $erasure_outcome_id)); IF type::is_object($erasure_outcome_existing) { IF $erasure_outcome_existing.outcomes != $erasure_outcomes { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_outcome_table, $erasure_outcome_id) CONTENT $erasure_outcome_record; };";
 
 /// Reads one sealed erasure-outcome row by exact operation id.
@@ -2032,8 +2043,15 @@ pub(crate) fn erasure_transaction_bindings(
             SurrealSurfaceOutcome::Unknown { surface } => format!("UNKNOWN:{surface:?}"),
         })
         .collect();
+    // The seal carries the frozen intent's own admitted scope verbatim, copied
+    // from the same validated intent the intent row and the scrub bindings
+    // already use, so a read of the ledger can attribute sealed outcomes to the
+    // scope whose data they purged. It is one copy of that one value, never a
+    // second derivation; the scope binding the seal's identity rests on is the
+    // intent row's, compared by `TX_ERASURE_INTENT` in the same transaction.
     let outcome_value = json!({
         "operation_id": intent.operation_id,
+        "scope_id": intent.scope_id.to_string(),
         "outcomes": outcome_strings,
     });
     bindings.insert(

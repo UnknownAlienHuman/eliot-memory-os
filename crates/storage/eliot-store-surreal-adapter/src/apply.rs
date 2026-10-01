@@ -1596,6 +1596,15 @@ async fn prepare_attempt_erasure_bundle(
     if transition.transition_class != TransitionClass::Erasure {
         return Ok(None);
     }
+    // Both halves of the ledger are read and written before any destructive
+    // statement, and a SCHEMALESS table that does not exist yet fails closed on
+    // that read instead of reading empty, so the sealed-replay check and the
+    // in-transaction intent/outcome steps below would both refuse the first
+    // erasure on a store where the tables were never created. Ensuring them
+    // here (idempotent) is the same closure the notification, reactive,
+    // automation, experience and learning slices apply, and it changes no
+    // migration chain and carries no data.
+    ensure_erasure_tables(db, &adapter.config).await?;
     let sealed =
         read_sealed_erasure_outcomes(db, &adapter.config, &transition.identity.operation_id)
             .await?;
@@ -1605,6 +1614,39 @@ async fn prepare_attempt_erasure_bundle(
     let intent = surreal_intent_from_transition(transition)?;
     let intent = record_surreal_erasure_intent(intent)?;
     Ok(Some(erasure_in_tx_parts(&intent)?))
+}
+
+/// Ensures the two erasure-ledger tables exist (idempotent).
+///
+/// Schemaless tables auto-create on write, but the sealed-outcome read and the
+/// in-transaction intent compare-and-set both fail closed on a missing table, so
+/// a store on which the erasure delta has never been applied could not run an
+/// admitted erasure at all. This one-shot definition is the closed operation
+/// that gives the source purge ledger its tables on first use, exactly as
+/// `ensure_notification_table` / `ensure_reactive_tables` /
+/// `ensure_automation_tables` / `ensure_experience_tables` / `ensure_learning_tables`
+/// do for their own slices. It declares no field, adds no data statement and
+/// writes nothing but the two table definitions.
+///
+/// It does NOT make the ledger a captured ECXF source class: the census in
+/// `backup_snapshot.rs` admits a member table only when the *admitted* schema
+/// generation's own baseline defines it, and the admitted generation is still
+/// pinned to v2. This closes the missing-table refusal, not
+/// `EcxfCaptureGap::SourcePurgeLedgerUnavailable`.
+async fn ensure_erasure_tables(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<(), AdapterError> {
+    let sql = format!(
+        "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
+        schema::table::ERASURE_INTENT,
+        schema::table::ERASURE_OUTCOME,
+    );
+    let mut response = client::query(db, config, "erasure.ensure_tables", &sql, Map::new()).await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(())
 }
 
 /// Proves one error-free canonical transaction actually committed before
