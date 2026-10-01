@@ -1815,6 +1815,10 @@ async fn run_loop(
                 // its own queue and attempt type. Both drain on their own
                 // bounded budgets after the shared flights settle.
                 drain_campaign_packet_on_shutdown(&mut campaign_packet_flight).await?;
+                // #2564: a claimed state pair owns a fenced attempt, so it drains
+                // on the same bounded budget as the sibling legs rather than
+                // being dropped with the flight.
+                drain_state_on_shutdown(&mut state_flight).await?;
                 drain_task_controller_on_shutdown(&mut task_controller_flight).await?;
                 drain_finish_on_shutdown(&mut finish_flight).await?;
                 return Ok(exit);
@@ -4878,13 +4882,19 @@ async fn submit_local_read_result_idempotent(
     }
 }
 
-/// Bounded record bound for one retained `eliot.state` projection field.
+/// Requested record bound for one retained `eliot.state` projection field.
 ///
 /// One closed bound for the whole preview, shared by every owner read the
 /// preview performs, so the served answer stays inside the I12.14 4 MiB frame
-/// ceiling. It is a DECLARED bound the store re-validates on its leg, never a
-/// truncation of what an owner returned: a preview that would exceed it is
-/// reported as the owner's own refusal, never as a shortened healthy answer.
+/// ceiling.
+///
+/// This is a bound REQUESTED OF THE OWNER, not a ceiling this leg enforces on
+/// what comes back, and it is not silently truncating: the owner decides what
+/// `max_records` means for its own read and returns either an answer or its own
+/// refusal. This leg never shortens an owner payload to fit. If an owner were
+/// to answer with more records than were asked for, that answer is served as the
+/// owner produced it - the declared carrier byte bound in `hot-path.toml` is
+/// what bounds the frame, not this value.
 const STATE_PREVIEW_MAX_RECORDS: &str = "8";
 
 /// Issue #2564: the closed capability of the retained `eliot.state` pair.
@@ -5018,19 +5028,18 @@ fn state_pair_selectors(
         }
         Some(_) => return Err("retained state include is not a list".to_owned()),
     };
-    let scope_text = envelope
-        .identity
-        .work_scope_id
-        .as_deref()
-        .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
-        .or_else(|| {
-            envelope
-                .identity
-                .session_id
-                .as_deref()
-                .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
-        })
-        .ok_or_else(|| "retained state pair binds no trusted scope".to_owned())?;
+    let scope_text =
+        envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
+            .or_else(|| {
+                envelope.identity.session_id.as_deref().filter(|scope| {
+                    !scope.trim().is_empty() && !scope.chars().any(char::is_control)
+                })
+            })
+            .ok_or_else(|| "retained state pair binds no trusted scope".to_owned())?;
     let scope = eliot_store_api::ScopeId::new(scope_text.to_owned())
         .map_err(|error| format!("retained state pair scope is invalid: {error}"))?;
     Ok(StatePairSelectors { scope, include })
@@ -5056,11 +5065,11 @@ fn state_pair_selectors(
 ///    never be read back as a complete healthy answer.
 ///
 /// A no-task discovery is a REAL positive result: with no admitted task
-/// binding, only the attention and position facts are read and the response
+/// binding, only the scope-revision and attention facts are read and the response
 /// says so explicitly under `task_selection: "none"` instead of inventing a
 /// task contract or refusing the authenticated request outright.
 async fn serve_local_state_pair(
-    composition: &DaemonComposition,
+    client: crate::KernelContextReadClient,
     kernel: &Arc<DaemonKernelClient>,
     envelope: &eliot_protocol::HostRequestEnvelope,
     tool: &serde_json::Value,
@@ -5085,19 +5094,14 @@ async fn serve_local_state_pair(
     {
         return Err("state attempt does not bind the claimed pair".to_owned());
     }
-    let client = composition
-        .context_read_client(kernel)
-        .map_err(|error| format!("daemon state read composition: {error}"))?;
     let ctx = state_preview_context(envelope, &retained_fence)?;
     // The scope revision head is OBSERVED first and becomes the declared
     // dependency minimum, so a head that moves between the head read and the
     // fact reads fails closed as the read owner's own stale verdict instead of
     // being served as current. Nothing is synthesized when no head exists.
-    let scope_key = eliot_store_api::RevisionKey::new(format!(
-        "scope:{}",
-        selectors.scope.as_str()
-    ))
-    .map_err(|error| format!("state scope revision key: {error}"))?;
+    let scope_key =
+        eliot_store_api::RevisionKey::new(format!("scope:{}", selectors.scope.as_str()))
+            .map_err(|error| format!("state scope revision key: {error}"))?;
     let observed = client
         .revision_heads(vec![scope_key.clone()])
         .await
@@ -5169,8 +5173,18 @@ async fn serve_local_state_pair(
     // retained record of exactly that, so a caller can never read a degraded
     // answer as a healthy one. The verdict is computed BEFORE the projections
     // consume the facts, so the projection can never be what decides it.
-    let complete =
-        task_fact.is_observed() && attention_fact.is_observed() && position_fact.is_observed();
+    //
+    // The three facts are exactly the ones the issue names: the task/scope
+    // projection (`GetTaskState` plus `GetScopeRevisionView`) and the
+    // attention/problems set. There is deliberately no epistemic-position
+    // member: `GetCurrentEpistemicPosition` requires a caller-supplied
+    // `position` subject (bins/eliotd/src/kernel_context_read_client.rs:264-289
+    // refuses the read without a non-blank one), the retained state pair
+    // carries no such subject, and inventing one would fabricate the preview's
+    // subject rather than read it.
+    let complete = task_fact.is_observed()
+        && attention_fact.is_observed()
+        && scope_revision_fact.is_observed();
     let response = serde_json::json!({
         "capability": STATE_PAIR_CAPABILITY,
         "scope_id": selectors.scope.as_str(),
@@ -5186,8 +5200,8 @@ async fn serve_local_state_pair(
                     "reason": "authenticated discovery selected no task",
                 })
             },
+            "scope_revision": scope_revision_fact.into_json("GetScopeRevisionView"),
             "attention": attention_fact.into_json("GetAttentionAndProblems"),
-            "epistemic_position": position_fact.into_json("GetCurrentEpistemicPosition"),
         },
         "read_state_fence": retained_fence,
     });
@@ -5464,7 +5478,9 @@ fn start_state_poll(
     composition: SharedComposition,
 ) -> Pin<Box<dyn std::future::Future<Output = StateCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
-    Box::pin(async move { StateCompletion::Settled(run_state_poll(&kernel_clone, composition).await) })
+    Box::pin(
+        async move { StateCompletion::Settled(run_state_poll(&kernel_clone, composition).await) },
+    )
 }
 
 /// Starts the `eliot.state` poll step when its flight is idle.
@@ -5554,15 +5570,24 @@ async fn run_state_poll(
     let Some((envelope, tool, attempt)) = pair else {
         return Ok(StatePollOutcome::IdleBackoff);
     };
-    // The composition guard is taken only around the per-call read-client
-    // construction and the serve, and the read client it hands out holds no
-    // lock: the bounded owner reads therefore run with no composition guard
-    // held, so no owner await ever crosses a shared lock.
+    // The composition is borrowed ONLY to build the read client, and the guard
+    // is released before the serve runs. Every owner read below is therefore an
+    // await with no composition guard held: the issue's Slice 3 item 16 requires
+    // that no composition lock is held across a reconstruction/compiler owner
+    // read, and holding one for the whole serve would serialise every state poll
+    // against all other composition users for the duration of the round trip.
     let body = {
-        let guard = composition.lock().await;
-        Box::pin(serve_local_state_pair(&guard, kernel, &envelope, &tool, &attempt))
-            .await
-            .map_err(|error| format!("daemon state serve: {error}"))?
+        let client = {
+            let guard = composition.lock().await;
+            guard
+                .context_read_client(kernel)
+                .map_err(|error| format!("daemon state read composition: {error}"))?
+        };
+        Box::pin(serve_local_state_pair(
+            client, kernel, &envelope, &tool, &attempt,
+        ))
+        .await
+        .map_err(|error| format!("daemon state serve: {error}"))?
     };
     match submit_local_state_result_idempotent(kernel, &body).await? {
         LocalReadSubmitOutcome::Accepted => Ok(StatePollOutcome::Accepted),
@@ -5592,9 +5617,7 @@ async fn submit_local_state_result_idempotent(
         Err(first_error) => kernel
             .submit_local_state_result_async(body)
             .await
-            .map_err(|error| {
-                format!("Kernel state result submit: {first_error}; retry: {error}")
-            }),
+            .map_err(|error| format!("Kernel state result submit: {first_error}; retry: {error}")),
     }
 }
 
@@ -5899,6 +5922,24 @@ async fn drain_campaign_packet_on_shutdown(
     };
     match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
         Ok(CampaignPacketCompletion::Settled(Err(error))) => Err(error),
+        _ => Ok(RunLoopExit::Shutdown),
+    }
+}
+
+/// Drains a claimed-but-unanswered `eliot.state` flight on shutdown.
+///
+/// A state pair that has been claimed from the carrier owns a fenced attempt on
+/// the Kernel, so dropping it silently would leave a claimed row with no result
+/// and no report. The flight is settled on the same bounded shutdown budget the
+/// sibling local-read legs use, and a settle failure is returned rather than
+/// swallowed, exactly like [`drain_campaign_packet_on_shutdown`].
+async fn drain_state_on_shutdown(flight: &mut StateFlight) -> Result<RunLoopExit, String> {
+    let previous = std::mem::replace(flight, StateFlight::Idle);
+    let StateFlight::InFlight(state) = previous else {
+        return Ok(RunLoopExit::Shutdown);
+    };
+    match tokio::time::timeout(SHUTDOWN_ACTIVATION_DRAIN, state.future).await {
+        Ok(StateCompletion::Settled(Err(error))) => Err(error),
         _ => Ok(RunLoopExit::Shutdown),
     }
 }
