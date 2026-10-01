@@ -736,3 +736,72 @@ fn bounded_local_change_with_matching_refs_admits_with_receipt() {
     assert_eq!(receipt.admitted_at_ms, 1_000);
     assert!(admit_local(&candidate, &fixture.view, &deltas, 1_000).is_ok());
 }
+
+// WORK_UNIT_CASE: 943/1
+//
+// A fence that names no parent task revision gives the admission guard nothing
+// to compare against `candidate.parent_revision`, so local admission must refuse
+// with `Missing { field: "parent_revision" }` instead of admitting a candidate
+// whose parent lineage was never bound.
+//
+// `admit_local` is the reachable producer of that refusal: it reads
+// `view.binding.state_fence.task_revision` directly and never validates a
+// recipe, while composition refuses a parentless fence before it can mint a
+// candidate. The fixture below therefore takes an already-admitted candidate and
+// its view and removes only the parent revision from both sides of the
+// comparison, resealing each record so every stored digest still matches its
+// content. Nothing else about the candidate changes, so the refusal can only be
+// caused by the absent parent revision.
+//
+// Positive control first: the identical candidate, view and deltas, with
+// `Some(TaskRevision::genesis())` on both sides of the guard, admit and yield a
+// receipt. If that control ever stopped admitting, this case could not tell a
+// real parent-revision refusal from a blanket admission failure.
+#[test]
+fn unnamed_parent_task_revision_refused_at_local_admission() {
+    let fixture = fixture();
+    let (deltas, candidate) = valid_candidate(&fixture);
+
+    // Positive control: a named parent revision equal to the candidate parent
+    // reaches the admission receipt rather than any refusal.
+    let named_parent = fixture.view.binding.state_fence.task_revision;
+    assert!(named_parent.is_some_and(|parent| parent == candidate.parent_revision));
+    let admitted_receipt =
+        admit_local(&candidate, &fixture.view, &deltas, 1_000).expect("named parent admits");
+    assert_eq!(admitted_receipt.overlay_id, candidate.overlay_id.as_str());
+    assert_eq!(admitted_receipt.admitted_at_ms, 1_000);
+
+    // Remove the parent revision from the recipe and the view fence together, so
+    // the pair stays internally consistent and only the parent lineage is gone.
+    let mut recipe = fixture.recipe.clone();
+    recipe.binding.state_fence.task_revision = None;
+    recipe.seal().expect("parentless recipe reseal");
+
+    let mut parentless = fixture.view.clone();
+    parentless.binding.state_fence.task_revision = None;
+    for resolution in &mut parentless.provenance.source_resolutions {
+        resolution.read_state_fence = parentless.binding.state_fence.clone();
+        if let Some(reference) = resolution.reference.as_mut() {
+            reference.recorded_state_fence = parentless.binding.state_fence.clone();
+        }
+    }
+    parentless.recipe_digest = recipe.canonical_digest.clone();
+    parentless.seal_content_addressed().expect("parentless view reseal");
+    assert!(parentless.binding.state_fence.task_revision.is_none());
+
+    // The candidate follows the view: same parentless binding, same base view
+    // digest, resealed so its canonical digest still covers its content. Its
+    // `parent_revision` stays named, because the refusal is caused by the fence
+    // side of the comparison carrying no revision to compare.
+    let mut parentless_candidate = candidate.clone();
+    parentless_candidate.binding = parentless.binding.clone();
+    parentless_candidate.base_view_digest = parentless.canonical_digest.clone();
+    parentless_candidate.seal().expect("parentless candidate reseal");
+
+    assert!(matches!(
+        admit_local(&parentless_candidate, &parentless, &deltas, 1_000),
+        Err(OverlayError::Contract(LearningContractError::Missing {
+            field: "parent_revision"
+        }))
+    ));
+}
