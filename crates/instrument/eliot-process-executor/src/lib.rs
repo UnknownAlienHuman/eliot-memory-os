@@ -1958,9 +1958,12 @@ impl WindowsProcessExecutor {
     /// Reads back the exact retained stdout bytes for one reconciled process
     /// operation. The process owner remains the only source of the bytes: the
     /// capture must have reached EOF without truncation, and its byte count
-    /// and SHA-256 must match the independently returned typed evidence. A
-    /// policy-withheld or transformed preview is refused before raw bytes are
-    /// exposed; callers receive no partial prefix as a provider result.
+    /// and SHA-256 must match the independently returned typed evidence. The
+    /// exact P-04 policy is also required, and its bounded-prefix ceiling
+    /// remains in force: complete captures larger than the permitted preview
+    /// are refused instead of exposing the executor's private capture buffer.
+    /// A policy-withheld or transformed preview is refused before raw bytes
+    /// are exposed; callers receive no partial prefix as a provider result.
     ///
     /// # Errors
     /// Returns `UnknownOutcome` when identity, completion, privacy, or byte
@@ -1974,11 +1977,33 @@ impl WindowsProcessExecutor {
         if evidence.operation_id() != id {
             return Err(ProcessExecutionError::UnknownOutcome);
         }
+        #[cfg(windows)]
+        {
+            let operation = self.operation(id)?;
+            let owner_binding = operation
+                .lock()
+                .map_err(|_| unavailable("operation lock poisoned"))?
+                .state
+                .binding()
+                .clone();
+            if evidence.binding() != &owner_binding {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = evidence;
+            return Err(unavailable(
+                "Windows ProcessExecutor is unavailable on this target",
+            ));
+        }
         let stdout = evidence
             .stdout()
             .ok_or(ProcessExecutionError::UnknownOutcome)?;
         let preview = stdout.preview();
+        let expected_policy = p04_stream_policy()?;
         if stdout.stream() != ProcessStreamKind::Stdout
+            || stdout.policy() != &expected_policy
             || stdout.transport() != StreamTransportStatus::Complete
             || preview.representation() != eliot_process::StreamPreviewRepresentation::TransportBytes
             || stdout.gaps().iter().any(|gap| {
@@ -1998,7 +2023,7 @@ impl WindowsProcessExecutor {
             || captured.total_bytes != stdout.observed_bytes()
             || short_digest(&captured.bytes) != stdout.observed_sha256()
             || u64::try_from(preview.bytes().len()).ok() != Some(preview.retained_bytes())
-            || !captured.bytes.starts_with(preview.bytes())
+            || captured.bytes.as_slice() != preview.bytes()
         {
             return Err(ProcessExecutionError::UnknownOutcome);
         }
@@ -5378,11 +5403,11 @@ mod tests {
         Ok(())
     }
 
-    /// #22 Work/Acceptance: exercise the named full-output readback target.
-    /// Positive corpus: complete raw stdout larger than the inline preview
-    /// but smaller than the admitted capture ceiling. Refusal cases: foreign
-    /// operation identity, policy-withheld bytes, and policy-transformed
-    /// bytes never expose the raw capture.
+    /// #22 Work/Acceptance: exercise the named P-04 bounded raw readback
+    /// target. Positive corpus: complete raw stdout fully represented by the
+    /// exact P-04 preview. Refusal cases: bytes beyond the inline preview,
+    /// foreign operation identity, policy-withheld bytes, and
+    /// policy-transformed bytes never expose the private full capture.
     #[test]
     #[cfg(windows)]
     fn complete_stdout_readback_requires_exact_complete_raw_owner_evidence()
@@ -5393,7 +5418,7 @@ mod tests {
             StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
         };
 
-        let payload_len = super::EVIDENCE_PREVIEW_CEILING + 512;
+        let payload_len = 2_048;
         let payload = vec![b'x'; payload_len];
         let payload_path = std::env::temp_dir().join(format!(
             "eliot-readback-{}-{}.txt",
@@ -5419,8 +5444,11 @@ mod tests {
             .stdout()
             .ok_or("complete stdout evidence is required")?;
         assert_eq!(stdout.transport(), StreamTransportStatus::Complete);
-        assert_eq!(stdout.preview().retained_bytes(), super::EVIDENCE_PREVIEW_CEILING as u64);
-        assert!(stdout.preview().is_truncated());
+        assert_eq!(
+            stdout.preview().retained_bytes(),
+            u64::try_from(payload_len)?
+        );
+        assert!(!stdout.preview().is_truncated());
         assert_eq!(
             executor.readback_complete_stdout_bytes(&operation_id, &evidence)?,
             payload
@@ -5429,6 +5457,16 @@ mod tests {
         let foreign_operation = OperationId::new("foreign-readback-operation")?;
         assert!(matches!(
             executor.readback_complete_stdout_bytes(&foreign_operation, &evidence),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+
+        let mut foreign_policy_wire = serde_json::to_value(&evidence)?;
+        foreign_policy_wire["stdout"]["policy"]["policy_ref"] =
+            serde_json::json!("caller:unissued-full-output");
+        let foreign_policy: eliot_process::ProcessEvidence =
+            serde_json::from_value(foreign_policy_wire)?;
+        assert!(matches!(
+            executor.readback_complete_stdout_bytes(&operation_id, &foreign_policy),
             Err(ProcessExecutionError::UnknownOutcome)
         ));
 
@@ -5497,6 +5535,44 @@ mod tests {
         )?;
         assert!(matches!(
             executor.readback_complete_stdout_bytes(&operation_id, &transformed),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        let _ = std::fs::remove_file(payload_path);
+        Ok(())
+    }
+
+    /// #22 Work/Acceptance refusal: a complete owner capture larger than
+    /// P-04's bounded raw preview is not disclosed to a parser. A separate
+    /// owner-issued ephemeral parse policy must authorize that readback.
+    #[test]
+    #[cfg(windows)]
+    fn complete_stdout_readback_refuses_bytes_beyond_p04_prefix_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload_len = super::EVIDENCE_PREVIEW_CEILING + 512;
+        let payload = vec![b'x'; payload_len];
+        let payload_path = std::env::temp_dir().join(format!(
+            "eliot-readback-prefix-{}-{}.txt",
+            std::process::id(),
+            super::now_ms()
+        ));
+        std::fs::write(&payload_path, &payload)?;
+        let capture_limit = payload_len + 1_024;
+        let (executor, operation_id, evidence) = start_and_reconcile_with_capture_limit(
+            "prefix-only-readback",
+            vec![
+                "/c".to_owned(),
+                "type".to_owned(),
+                format!("\"{}\"", payload_path.to_string_lossy()),
+            ],
+            u64::try_from(capture_limit)?,
+            4_096,
+            Arc::new(RecordingSink::default()),
+            capture_limit,
+        )?;
+        let stdout = evidence.stdout().ok_or("complete stdout evidence is required")?;
+        assert!(stdout.preview().is_truncated());
+        assert!(matches!(
+            executor.readback_complete_stdout_bytes(&operation_id, &evidence),
             Err(ProcessExecutionError::UnknownOutcome)
         ));
         let _ = std::fs::remove_file(payload_path);
