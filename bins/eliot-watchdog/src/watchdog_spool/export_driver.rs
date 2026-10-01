@@ -1320,7 +1320,15 @@ pub fn reconcile_watchdog_intents(
             )
         })?;
     let sink_id = sink.sink_id().to_owned();
-    let export_batch = sensor.export_spool_batch(&sink_id, WatchdogSpoolExportLimits::default())?;
+    // The intent window is read with the intent contour's own sink identity,
+    // not the export window: both contours share one stored cursor, and the
+    // export contour binds it to its own sink on its first acknowledgement.
+    // The intent window still enforces the stored sequence and lineage; only
+    // the stored sink binding is tolerated, because this pass never advances
+    // the cursor — exactly-once stays with the per-record submit-once
+    // receipts below.
+    let export_batch =
+        sensor.export_intent_window_batch(&sink_id, WatchdogSpoolExportLimits::default())?;
     if export_batch.predecessor_cursor.sink_id != sink_id {
         return Err(SpoolError::Corrupt(
             "watchdog intent export predecessor does not match the captured sink identity"
