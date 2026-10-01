@@ -1216,6 +1216,76 @@ fn build_accepted_bridge_transport(
     })
 }
 
+/// Owner-supplied role admission inputs for one bridge-admitted transport.
+///
+/// Every text binding is owner-observed and validated fail-closed by
+/// [`CapabilityContext::admit`]; this struct interprets none of them. The
+/// exact `State Fence` is never carried here: it is cloned from the
+/// server-selected admission evidence, so the issued token fence always
+/// matches the admitted fence (I7.21, issue #1943).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeRoleAdmission {
+    /// Owner-assigned capability context identity.
+    pub context_id: String,
+    /// Exact role to compile.
+    pub role: AgentRole,
+    /// Narrow role scope (e.g. task envelope or evaluation scope).
+    pub scope: String,
+    /// Exact task identifier.
+    pub task_id: String,
+    /// Exact work item; required for Worker and Verifier roles.
+    pub work_item_id: Option<String>,
+    /// Exact route the capability is valid on.
+    pub route: String,
+    /// `GovernanceProfile` revision the capability is compiled against.
+    pub governance_revision: String,
+    /// Owner-assigned lease epoch; bumped on every role transition.
+    pub lease_epoch: u64,
+    /// Owner-observed issuance time (Unix ms).
+    pub issued_at_unix_ms: u64,
+    /// Owner-observed expiry (Unix ms); must exceed issuance.
+    pub expires_at_unix_ms: u64,
+}
+
+/// Admits the first role capability context for a bridge-admitted transport.
+///
+/// This is the server admission production caller for [`compile_capability`]
+/// (issue #1943 W1/W2): role defaults become a server-enforced capability
+/// token only through this path, bound to the exact admitted transport
+/// evidence. The [`ScopeBinding`] state fence is cloned from the
+/// server-selected challenge fence, never from caller input; every other
+/// binding is the owner's exact value, validated fail-closed by
+/// [`CapabilityContext::admit`]. `WorkScope` and delegation narrow only.
+///
+/// # Errors
+///
+/// Returns [`RoleLeaseError`] when any binding or narrowing input is invalid.
+pub fn admit_bridge_role_context(
+    transport: &AcceptedAgentBridgeTransport,
+    admission: BridgeRoleAdmission,
+    workscope: &WorkScopePolicy,
+    delegated: &DelegatedAuthority,
+) -> Result<CapabilityContext, RoleLeaseError> {
+    let binding = ScopeBinding {
+        scope: admission.scope,
+        task_id: admission.task_id,
+        work_item_id: admission.work_item_id,
+        route: admission.route,
+        governance_revision: admission.governance_revision,
+        state_fence: transport.challenge().state_fence.clone(),
+        lease_epoch: admission.lease_epoch,
+        issued_at_unix_ms: admission.issued_at_unix_ms,
+        expires_at_unix_ms: admission.expires_at_unix_ms,
+    };
+    CapabilityContext::admit(
+        admission.context_id,
+        admission.role,
+        binding,
+        workscope,
+        delegated,
+    )
+}
+
 fn canonical_json_bytes<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
     fn canonicalize(value: serde_json::Value) -> serde_json::Value {
         match value {
