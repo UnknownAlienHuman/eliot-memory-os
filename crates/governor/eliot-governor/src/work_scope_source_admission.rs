@@ -22,8 +22,9 @@ use eliot_store_api::{
 };
 use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_workscope::{
-    GoverningSourceSet, PrivacyProfile, ScopeBinding, WorkScopeBindingOwner,
-    WorkScopeBindingSnapshot, WorkScopeDescriptor, admit_initial_binding,
+    GoverningSourceSet, ObservedScopeResources, PrivacyProfile, ScopeBinding, ScopeIdentity,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
+    admit_initial_binding, observed_scope_binding,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -111,8 +112,9 @@ pub fn prepare_initial_work_scope_source_admission(
     authority: &AuthorityBinding,
     causal: &CausalBinding,
     descriptor: &WorkScopeDescriptor,
-    binding: &ScopeBinding,
-    observed: &ScopeBinding,
+    observed_resources: &ObservedScopeResources,
+    privacy_class: eliot_security_contracts::PrivacyClass,
+    governing_source_generation: u64,
     sources: &GoverningSourceSet,
     privacy: &PrivacyProfile,
     capture: &NormativePairSourceCapture,
@@ -130,11 +132,19 @@ pub fn prepare_initial_work_scope_source_admission(
             EffectClass::ReversibleMutation,
             authority.allowed_effect,
         )
-        || binding.scope.generation != fence.resource_generation.value()
-        || observed.scope.generation != fence.resource_generation.value()
+        || descriptor.state_fence != *fence
+        || descriptor.generation.resource_generation != fence.resource_generation
+        || observed_resources.generation.resource_generation != fence.resource_generation
+        || governing_source_generation != sources.generation
     {
         return Err(WorkScopeSourceAdmissionError::FenceMismatch);
     }
+    let (binding, observed) = derive_initial_scope_bindings(
+        descriptor,
+        observed_resources,
+        privacy_class,
+        governing_source_generation,
+    )?;
     let (expected_revision, expected_digest) = match owner_readback {
         WorkScopeOwnerSnapshotReadback::Empty {
             state_fence,
@@ -168,8 +178,8 @@ pub fn prepare_initial_work_scope_source_admission(
         descriptor,
         owner_revision,
         fence,
-        binding,
-        observed,
+        &binding,
+        &observed,
         sources,
         privacy,
     )
@@ -286,6 +296,68 @@ pub fn prepare_initial_work_scope_source_admission(
         receipt_work_scope_binding_json,
         receipt_work_scope_binding_sha256,
     })
+}
+
+/// Derives the expected and observed initial bindings from the authenticated
+/// descriptor and one live explicit-root observation. It never chooses among
+/// multiple observed workspaces or descriptor instances.
+fn derive_initial_scope_bindings(
+    descriptor: &WorkScopeDescriptor,
+    observed: &ObservedScopeResources,
+    privacy_class: eliot_security_contracts::PrivacyClass,
+    governing_source_generation: u64,
+) -> Result<(ScopeBinding, ScopeBinding), WorkScopeSourceAdmissionError> {
+    descriptor
+        .validate()
+        .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))?;
+    observed
+        .validate()
+        .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))?;
+    if observed.kind != descriptor.kind || observed.instances.len() != 1 {
+        return Err(WorkScopeSourceAdmissionError::InitialAdmission(
+            "explicit root must identify exactly one descriptor-compatible workspace instance"
+                .to_owned(),
+        ));
+    }
+    let observed_instance = &observed.instances[0];
+    let mut matching_instances = descriptor.instances.iter().filter(|instance| {
+        instance.instance_ref == observed_instance.instance_ref
+            && instance.root_identity == observed_instance.root_identity
+            && instance.generation == observed_instance.generation
+    });
+    let instance = matching_instances.next().ok_or_else(|| {
+        WorkScopeSourceAdmissionError::InitialAdmission(
+            "observed explicit root is not an exact descriptor instance".to_owned(),
+        )
+    })?;
+    if matching_instances.next().is_some() {
+        return Err(WorkScopeSourceAdmissionError::InitialAdmission(
+            "descriptor has multiple identical workspace instances".to_owned(),
+        ));
+    }
+    let expected = ScopeBinding {
+        scope: ScopeIdentity {
+            scope_ref: descriptor.scope_ref.clone(),
+            kind: descriptor.kind,
+            lineage_ref: descriptor
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.lineage_ref.clone()),
+            instance_ref: instance.instance_ref.clone(),
+            root_identity: instance.root_identity.clone(),
+            generation: instance.generation,
+        },
+        privacy_class,
+        governing_source_generation,
+    };
+    let observed_binding = observed_scope_binding(
+        &expected,
+        observed,
+        privacy_class,
+        governing_source_generation,
+    )
+    .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))?;
+    Ok((expected, observed_binding))
 }
 
 fn is_sha256(value: &str) -> bool {
