@@ -1092,6 +1092,8 @@ impl ProviderRegistry {
             rustfmt_entry(fingerprints, generation)?,
             nextest_entry(fingerprints, generation)?,
             scip_entry(fingerprints, generation)?,
+            rust_analyzer_diagnostics_entry(fingerprints, generation)?,
+            rust_analyzer_version_entry(fingerprints, generation)?,
             dotnet_entry(fingerprints, generation)?,
         ];
         let registry = Self::build(entries, generation, normative_pair_digest)?;
@@ -1618,6 +1620,90 @@ fn scip_entry(
             timeout: "not applicable: decoder-only, decode is bounded by MAX_SCIP_BYTES".to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract,
+        }),
+        generation,
+    })
+}
+
+/// Rust Analyzer diagnostics entry: one-shot process, normalized by the LSP bridge.
+fn rust_analyzer_diagnostics_entry(
+    fingerprints: &InvalidationSet,
+    generation: u64,
+) -> Result<RegistryEntry, ContractError> {
+    rust_analyzer_entry(
+        fingerprints,
+        generation,
+        crate::profile::RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT,
+        crate::profile::DIAGNOSTIC_PARSER_CONTRACT,
+        "one-shot diagnostics invocation through the shared ProcessExecutor",
+        "P-03 OperationId for one-shot Rust Analyzer diagnostics under the admitted State Fence",
+    )
+}
+
+/// Rust Analyzer version entry: one-shot process with its own parser identity.
+fn rust_analyzer_version_entry(
+    fingerprints: &InvalidationSet,
+    generation: u64,
+) -> Result<RegistryEntry, ContractError> {
+    rust_analyzer_entry(
+        fingerprints,
+        generation,
+        crate::profile::RUST_ANALYZER_VERSION_INSTRUMENT,
+        crate::profile::LSP_BRIDGE_NORMALIZER_CONTRACT,
+        "one-shot --version probe through the shared ProcessExecutor",
+        "P-03 OperationId for one-shot Rust Analyzer version probe under the admitted State Fence",
+    )
+}
+
+fn rust_analyzer_entry(
+    fingerprints: &InvalidationSet,
+    generation: u64,
+    instrument_name: &'static str,
+    parser_name: &'static str,
+    artifact: &'static str,
+    operation: &'static str,
+) -> Result<RegistryEntry, ContractError> {
+    let instrument = contract_id(instrument_name)?;
+    let resource_contract =
+        "composition-root ProcessExecutor admission bounds one-shot stdout/stderr and runtime";
+    let cancellation_contract =
+        "P-03 cancel/reconcile through the original OperationId and State Fence";
+    let toolchain = "rust-analyzer installed by the admitted Rust toolchain owner";
+    let executable = "rust-analyzer";
+    Ok(RegistryEntry {
+        profile: contract_id(instrument_name)?,
+        profile_version: ContractVersion::new(1, 0, 0),
+        instrument,
+        kinds: vec![InstrumentKind::Inspect],
+        adapter: crate::profile::RUST_ANALYZER_PROFILE.to_owned(),
+        adapter_version: ContractVersion::new(1, 0, 0),
+        executable: ExecutableIdentity::process(
+            executable,
+            "Rust toolchain owner resolves installed rust-analyzer and supplies the original canonical path, content digest, version, and environment digest; a PATH name is not admission",
+        ),
+        toolchain: toolchain.to_owned(),
+        targets: worktree_targets(),
+        environment_class: ISOLATED_PROCESS.to_owned(),
+        resource_contract: resource_contract.to_owned(),
+        cancellation_contract: cancellation_contract.to_owned(),
+        parser: contract_id(parser_name)?,
+        normalizer: contract_id(crate::profile::LSP_BRIDGE_NORMALIZER_CONTRACT)?,
+        evaluator: contract_id(crate::profile::LSP_BRIDGE_NORMALIZER_CONTRACT)?,
+        verifier: verifier_id()?,
+        invalidation: fingerprints.clone(),
+        identities: ProfileIdentities::new(ProfileIdentityParams {
+            source: fingerprints.source.clone(),
+            lock: fingerprints.lock.clone(),
+            toolchain: toolchain.to_owned(),
+            executable: executable.to_owned(),
+            features: ADMITTED_FEATURES.to_owned(),
+            environment: ISOLATED_PROCESS.to_owned(),
+            artifact: artifact.to_owned(),
+            fence: ADMITTED_FENCE.to_owned(),
+            operation: operation.to_owned(),
+            timeout: ADMITTED_TIMEOUT.to_owned(),
+            cancellation: cancellation_contract.to_owned(),
+            resource: resource_contract.to_owned(),
         }),
         generation,
     })
