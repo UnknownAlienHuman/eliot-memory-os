@@ -73,6 +73,7 @@ use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
     TestJob, TestdBlobProcessStreamCallOutcome, TestdBlobProcessStreamReserve,
+    TestdBlobProcessStreamGrantResolution, TestdBlobProcessStreamReadyReceipt,
     TestdBlobProcessStreamTokenRef, TestdError, TestdStore, TestdTerminalCompletionNotice,
     TestdVerifierDispatchBinding, verification_receipt_sha256,
 };
@@ -939,6 +940,7 @@ pub struct KernelBlobStreamCallSequence {
     tokens: Arc<Mutex<VecDeque<BlobProcessStreamCallToken>>>,
     job_id: String,
     store: TestdStore,
+    process_binding_sha256: String,
     grant_deadline_ms: u64,
 }
 
@@ -959,6 +961,20 @@ impl KernelBlobStreamCallSequence {
         capability
             .validate()
             .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let process_binding_sha256 = match store
+            .resolve_blob_process_stream_grant(job_id, capability_ref)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+        {
+            TestdBlobProcessStreamGrantResolution::Active(grant) => {
+                grant.process_binding_sha256
+            }
+            TestdBlobProcessStreamGrantResolution::NotFound
+            | TestdBlobProcessStreamGrantResolution::Revoked => {
+                return Err(TestdIpcError::Contract(
+                    "Blob process-stream grant is not active".to_owned(),
+                ));
+            }
+        };
         if tokens.is_empty() || tokens.len() > 8_336 || grant_deadline_ms == 0 {
             return Err(TestdIpcError::Contract(
                 "Blob process-stream grant has no bounded token sequence".to_owned(),
@@ -990,8 +1006,80 @@ impl KernelBlobStreamCallSequence {
             tokens: Arc::new(Mutex::new(values)),
             job_id: job_id.to_owned(),
             store,
+            process_binding_sha256,
             grant_deadline_ms,
         })
+    }
+
+    /// Looks up the exact retained CompleteSource Finalize receipt by all
+    /// independently read source/session/terminal selectors.
+    pub fn lookup_retained_ready_finalize_receipt(
+        &self,
+        session_id: &str,
+        source_id: &str,
+        terminal_id: &str,
+        ready_receipt_ref: &str,
+    ) -> Result<Option<TestdBlobProcessStreamReadyReceipt>, TestdIpcError> {
+        let Some(proof) = self.store
+            .resolve_blob_process_stream_ready_receipt(
+                &self.job_id,
+                &self.capability.reference,
+                &self.process_binding_sha256,
+                session_id,
+                source_id,
+                terminal_id,
+                ready_receipt_ref,
+            )
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        proof
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+
+        // The local row is only a selector. Re-read the exact Kernel ORS
+        // outcome using the original consumed token and operation digest;
+        // this path is observe-only and cannot repeat the Store effect.
+        let response = self.reconcile(
+            BlobProcessStreamCallToken {
+                reference: proof.token.reference.clone(),
+                ordinal: proof.token.ordinal,
+            },
+            &proof.operation_sha256,
+        )?;
+        let response_ref = match &response.outcome {
+            BlobProcessStreamKernelOutcome::Completed {
+                response_ref,
+                operation_sha256,
+                original_terminal_operation_sha256,
+                ..
+            } if operation_sha256 == &proof.operation_sha256
+                && original_terminal_operation_sha256.as_deref()
+                    == Some(proof.operation_sha256.as_str()) =>
+            {
+                response_ref
+            }
+            _ => {
+                return Err(TestdIpcError::UnknownOutcome {
+                    job_id: self.job_id.clone(),
+                    request_digest: proof.operation_sha256,
+                });
+            }
+        };
+        let exact_response_bytes = canonical_json_bytes(&response)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        if response_ref != &proof.response_ref
+            || sha256_hex(&exact_response_bytes) != proof.response_sha256
+            || completed_ready_receipt(None, &response, &self.process_binding_sha256)
+                != Some(proof.ready_receipt.clone())
+        {
+            return Err(TestdIpcError::Contract(
+                "the retained Kernel Finalize outcome differs from its durable Ready receipt proof"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(proof.ready_receipt))
     }
 
     /// Derives a short operation deadline no later than the Kernel-issued
@@ -1099,6 +1187,7 @@ impl KernelBlobStreamCallSequence {
                 return self.reconcile_exact(token, &operation_sha256);
             }
         }
+        let operation_for_receipt = operation.clone();
         let response = self.client.exchange(
             self.capability.clone(),
             token.clone(),
@@ -1112,6 +1201,11 @@ impl KernelBlobStreamCallSequence {
                 TestdBlobProcessStreamCallOutcome::Completed {
                     response_sha256: sha256_hex(&response_bytes),
                     response_ref: Some(response_ref.clone()),
+                    ready_receipt: completed_ready_receipt(
+                        Some(&operation_for_receipt),
+                        &response,
+                        &self.process_binding_sha256,
+                    ),
                 }
             }
             BlobProcessStreamKernelOutcome::NotStarted { .. } => {
@@ -1236,6 +1330,11 @@ impl KernelBlobStreamCallSequence {
                 TestdBlobProcessStreamCallOutcome::Completed {
                     response_sha256: sha256_hex(&response_bytes),
                     response_ref: Some(response_ref.clone()),
+                    ready_receipt: completed_ready_receipt(
+                        None,
+                        &response,
+                        &self.process_binding_sha256,
+                    ),
                 }
             }
             BlobProcessStreamKernelOutcome::NotStarted { .. } => {
@@ -1803,6 +1902,68 @@ fn terminal_from_projection(
         return Err(ProcessStreamSinkError::TerminalIdentityConflict);
     }
     Ok(terminal)
+}
+
+fn completed_ready_receipt(
+    requested_operation: Option<&BlobProcessStreamKernelOperationRequest>,
+    response: &BlobProcessStreamKernelResponse,
+    process_binding_sha256: &str,
+) -> Option<TestdBlobProcessStreamReadyReceipt> {
+    let BlobProcessStreamKernelOutcome::Completed {
+        response,
+        original_terminal_request,
+        ..
+    } = &response.outcome
+    else {
+        return None;
+    };
+    let original = original_terminal_request
+        .as_deref()
+        .or(requested_operation)?;
+    if requested_operation.is_some_and(|requested| requested != original) {
+        return None;
+    }
+    let BlobProcessStreamKernelOperationRequest::SinkFinalize { binding, .. } = original else {
+        return None;
+    };
+    let BlobProcessStreamOperationResponse::Sink {
+        response: ProcessStreamSinkWireResponse::Finalized {
+            body,
+            blob_ready_receipt_json: Some(receipt_json),
+            blob_ready_receipt_sha256: Some(receipt_sha256),
+        },
+    } = &response.operation
+    else {
+        return None;
+    };
+    let projection: TerminalProjection = serde_json::from_value((**body).clone()).ok()?;
+    if projection.state != ProcessStreamSinkState::CompleteSource
+        || projection.session_id.as_str()? != binding.session_id
+        || projection.source_id.as_str()? != binding.source_id
+        || projection.terminal_id.as_str()? != binding.terminal_id
+        || projection.open_request_sha256 != binding.open_request_sha256
+    {
+        return None;
+    }
+    let binding_bytes = canonical_json_bytes(projection.evidence.binding()).ok()?;
+    if sha256_hex(&binding_bytes) != process_binding_sha256 {
+        return None;
+    }
+    let source = projection.evidence.source()?;
+    let receipt = TestdBlobProcessStreamReadyReceipt {
+        process_binding_sha256: process_binding_sha256.to_owned(),
+        binding_ref: binding.binding_ref.clone(),
+        session_id: binding.session_id.clone(),
+        source_id: binding.source_id.clone(),
+        terminal_id: binding.terminal_id.clone(),
+        ready_receipt_ref: source.ready_receipt_ref().to_owned(),
+        source_sha256: source.sha256().to_owned(),
+        source_byte_length: source.byte_length(),
+        receipt_json: receipt_json.clone(),
+        receipt_sha256: receipt_sha256.clone(),
+    };
+    receipt.validate().ok()?;
+    Some(receipt)
 }
 
 fn terminal_from_retained_operation(

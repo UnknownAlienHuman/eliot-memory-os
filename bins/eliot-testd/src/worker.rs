@@ -393,6 +393,10 @@ fn validate_ready_process_source_admission(
         || open.stream() != source.stream
         || ready.whole_source_sha256 != expected_source_sha256
         || ready.whole_source_byte_length != expected_source_byte_length
+        || owner.finalized_blob_ready_receipt_json.as_deref()
+            != Some(ready.blob_ready_receipt_json.as_str())
+        || owner.finalized_blob_ready_receipt_sha256.as_deref()
+            != Some(ready.blob_ready_receipt_sha256.as_str())
         || ready_write_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
         || write_receipt_operation_id != expected_ready_operation_id
         || receipt_operation_id != expected_ready_operation_id

@@ -666,6 +666,11 @@ pub struct TestdReplayOwnerReadback {
     pub source_admission_write_receipt_json: String,
     /// SHA-256 of the exact canonical Ready-CAS WriteReceipt bytes.
     pub source_admission_write_receipt_sha256: String,
+    /// Exact BlobReadyReceipt pair retained with the original CompleteSource
+    /// Finalize call in TestdStore's token/op-bound call record.
+    pub finalized_blob_ready_receipt_json: Option<String>,
+    /// SHA-256 of the retained original Finalize BlobReadyReceipt JSON.
+    pub finalized_blob_ready_receipt_sha256: Option<String>,
     /// Canonical verified WorkScope/source/policy owner facts.
     pub owner_facts_json: String,
     /// SHA-256 of the exact canonical owner-facts JSON bytes.
@@ -692,6 +697,10 @@ impl std::fmt::Debug for TestdReplayOwnerReadback {
             .field(
                 "generation_admission_sha256",
                 &self.generation_admission_sha256,
+            )
+            .field(
+                "finalized_blob_ready_receipt_sha256",
+                &self.finalized_blob_ready_receipt_sha256,
             )
             .finish()
     }
@@ -748,6 +757,36 @@ impl TestdReplayOwnerReadback {
                 let _ = (json_field, digest_field);
                 return Err(TestdEvidenceError::BindingMismatch {
                     reason: "fresh replay owner facts disagree with their canonical digest",
+                });
+            }
+        }
+        match (
+            self.finalized_blob_ready_receipt_json.as_deref(),
+            self.finalized_blob_ready_receipt_sha256.as_deref(),
+        ) {
+            (Some(json), Some(digest)) => {
+                let value: serde_json::Value = serde_json::from_str(json).map_err(|_| {
+                    TestdEvidenceError::BindingMismatch {
+                        reason: "retained Finalize Ready receipt is not valid JSON",
+                    }
+                })?;
+                let canonical = canonical_json_bytes(&value).map_err(|_| {
+                    TestdEvidenceError::BindingMismatch {
+                        reason: "retained Finalize Ready receipt cannot be canonically serialized",
+                    }
+                })?;
+                if String::from_utf8(canonical.clone()).ok().as_deref() != Some(json)
+                    || sha256_hex(&canonical) != digest
+                {
+                    return Err(TestdEvidenceError::BindingMismatch {
+                        reason: "retained Finalize Ready receipt disagrees with its canonical digest",
+                    });
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(TestdEvidenceError::BindingMismatch {
+                    reason: "retained Finalize Ready receipt requires its exact digest pair",
                 });
             }
         }
