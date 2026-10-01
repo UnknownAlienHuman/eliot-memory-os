@@ -1,6 +1,6 @@
 //! Parser replay over owner-verified immutable Testd stream bytes.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
 use eliot_bootstrap::{
     NormativePair,
@@ -231,6 +231,16 @@ pub fn current_testd_provider_registry(
         .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
     let receipt = parse_normative_pair_receipt_identity(&observations.normative_pair_receipt)
         .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    let captured_sources = eliot_bootstrap::capture::capture_normative_pair_sources(Path::new(
+        &observations.source.before.repository_root,
+    ))
+    .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    if captured_sources.receipt != receipt
+        || captured_sources.architecture.content_sha256 != receipt.pair.architecture_sha256
+        || captured_sources.implementation.content_sha256 != receipt.pair.implementation_sha256
+    {
+        return Err(ProfileReplayError::NormativePairSourceAdmission);
+    }
     let admitted_pair = admitted_work_scope_normative_pair(
         work_scope_binding,
         &observations.source.before.repository_root,
