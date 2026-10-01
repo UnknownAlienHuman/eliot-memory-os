@@ -254,6 +254,50 @@ pub struct InstrumentStageRequest {
     pub adapter_version: ContractVersion,
     /// Whether the stage requires a process or is decoder-only.
     pub execution: StageExecutionKind,
+    /// Exact command projected from the runner's current admitted stage.
+    /// TestD validates and executes this only after its owner has independently
+    /// resolved the same stage and measured the selected tool executable.
+    #[serde(default)]
+    pub stage_command: Option<InstrumentStageCommand>,
+}
+
+/// Closed executable selector and argv copied from one compiled runner stage.
+///
+/// The selector is a catalog identity (`cargo` or `cargo-nextest`), never a
+/// filesystem path. The runtime resolves it only through owner-observed tool
+/// identities retained with the durable job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentStageCommand {
+    /// Registered tool selector from the immutable InstrumentSpec.
+    pub executable: String,
+    /// Exact argv compiled by the admitted stage.
+    pub argv: Vec<String>,
+    /// Exact registered InstrumentSpec digest for this command.
+    pub spec_digest: String,
+}
+
+impl InstrumentStageCommand {
+    /// Validates closed selector, argument bounds, and exact specification
+    /// linkage without granting execution authority.
+    pub fn validate_for(&self, stage: &InstrumentStageRequest) -> Result<(), TestdError> {
+        if !matches!(self.executable.as_str(), "cargo" | "cargo-nextest")
+            || self.argv.is_empty()
+            || self.argv.len() > 64
+            || self.argv.iter().any(|argument| {
+                argument.is_empty()
+                    || argument.len() > 4_096
+                    || argument.chars().any(char::is_control)
+            })
+            || self.spec_digest != stage.spec_digest
+        {
+            return Err(TestdError::Invalid {
+                field: "stage_request.stage_command",
+                reason: "the command must be a bounded registered selector/argv bound to the exact stage spec digest",
+            });
+        }
+        Ok(())
+    }
 }
 
 impl InstrumentStageRequest {
@@ -296,12 +340,28 @@ impl InstrumentStageRequest {
         if let Some(lifecycle) = &self.provider_catalog_lifecycle {
             lifecycle.validate()?;
         }
-        if self.profile_name == TESTD_PRODUCTIVE_PROFILE
+        if is_testd_executor_profile(&self.profile_name)
             && (self.provider_freshness.is_none() || self.provider_catalog_lifecycle.is_none())
         {
             return Err(TestdError::Invalid {
                 field: "stage_request.provider_currentness",
                 reason: "productive stages require provider freshness and accepted catalog lifecycle evidence",
+            });
+        }
+        if is_testd_executor_profile(&self.profile_name)
+            && self.execution == StageExecutionKind::Process
+        {
+            self.stage_command
+                .as_ref()
+                .ok_or(TestdError::Invalid {
+                    field: "stage_request.stage_command",
+                    reason: "productive process stages require the exact runner-compiled command",
+                })?
+                .validate_for(self)?;
+        } else if self.stage_command.is_some() {
+            return Err(TestdError::Invalid {
+                field: "stage_request.stage_command",
+                reason: "only an admitted productive process stage may carry an executable command",
             });
         }
         Ok(())
@@ -596,13 +656,7 @@ fn profile_limits(profile: &str) -> (u64, Option<u64>, Option<u64>, u64, u64, u3
 /// Returns true only for the closed admitted testd profile name.
 #[must_use]
 pub fn is_admitted_testd_profile(profile: &str) -> bool {
-    matches!(
-        profile,
-        TESTD_ADMITTED_PROFILE
-            | TESTD_PRODUCTIVE_PROFILE
-            | TESTD_LIST_PROFILE
-            | TESTD_SCOPED_PROFILE
-    )
+    profile == TESTD_ADMITTED_PROFILE || is_productive_testd_profile(profile)
 }
 
 /// Returns true only for the slotted list/scoped profiles, whose
@@ -620,8 +674,22 @@ pub fn is_slotted_testd_profile(profile: &str) -> bool {
 pub fn is_productive_testd_profile(profile: &str) -> bool {
     matches!(
         profile,
-        TESTD_PRODUCTIVE_PROFILE | TESTD_LIST_PROFILE | TESTD_SCOPED_PROFILE
+        TESTD_PRODUCTIVE_PROFILE
+            | TESTD_LIST_PROFILE
+            | TESTD_SCOPED_PROFILE
+            | "compiler"
+            | "test"
+            | "package-verification"
+            | "bundle-verification"
     )
+}
+
+/// Returns true only for current runner catalog profiles whose process stages
+/// are admitted for productive TestD execution. The command itself always
+/// comes from the exact compiled stage, not from this classification.
+#[must_use]
+pub fn is_testd_executor_profile(profile: &str) -> bool {
+    is_productive_testd_profile(profile)
 }
 
 /// Resolves the closed binding for one admitted profile.
@@ -4144,10 +4212,12 @@ impl TestdStore {
         job.blob_process_stream_grant = Some(grant);
         let encoded = serde_json::to_vec(&job)
             .map_err(|error| TestdError::Corrupt(error.to_string()))?;
-        let mut table = write.open_table(JOBS).map_err(database)?;
-        table
-            .insert(job_id, encoded.as_slice())
-            .map_err(database)?;
+        {
+            let mut table = write.open_table(JOBS).map_err(database)?;
+            table
+                .insert(job_id, encoded.as_slice())
+                .map_err(database)?;
+        }
         write.commit().map_err(database)?;
         Ok(job)
     }
