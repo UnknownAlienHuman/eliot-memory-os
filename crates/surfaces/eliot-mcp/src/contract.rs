@@ -65,7 +65,7 @@ pub struct ApplicationRequest {
     pub tool: ToolRequest,
 }
 
-/// Authenticated Kernel selector for the UserAutomation operator route.
+/// Authenticated Kernel selector for the `UserAutomation` operator route.
 pub const USER_AUTOMATION_ROUTE: &str = "eliot_user_automation";
 
 /// Closed typed requests used by the MCP hot surface and the authenticated
@@ -105,7 +105,7 @@ pub enum ToolRequest {
     /// Candidate finish attempt.
     #[serde(rename = "eliot.finish")]
     Finish(FinishAttemptDraft),
-    /// Authenticated UserAutomation operator operation carried by Host/CLI.
+    /// Authenticated `UserAutomation` operator operation carried by Host/CLI.
     #[serde(rename = "eliot_user_automation")]
     UserAutomation(UserAutomationInput),
     /// Hotset intake for Skill delivery (host-request skill leg only).
@@ -174,11 +174,11 @@ impl ToolRequest {
     }
 }
 
-/// Typed UserAutomation operator input for the authenticated Host/MCP route.
+/// Typed `UserAutomation` operator input for the authenticated Host/MCP route.
 ///
 /// The surface carries only the closed Kernel-owned operation vocabulary and a
 /// retry-stable idempotency key. Principal, session, request metadata,
-/// StateFence, WorkScope authority, provider identity, scheduler state and
+/// `StateFence`, `WorkScope` authority, provider identity, scheduler state and
 /// Store receipts are authenticated and supplied by Kernel composition.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
