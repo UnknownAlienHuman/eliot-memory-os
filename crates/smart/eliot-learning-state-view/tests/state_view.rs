@@ -279,6 +279,10 @@ fn compile_with(
     current_state_fence: Option<&StateFence>,
 ) -> Result<CampaignLearningStateView, eliot_learning_contracts::LearningContractError> {
     let mut bound_recipe = recipe.clone();
+    // The recipe is validated here, before this helper binds projection
+    // digests and reseals it. A caller that mutated a sealed recipe without
+    // resealing must still be refused with DigestMismatch rather than having
+    // its digest silently repaired by the reseal below.
     bound_recipe.validate()?;
     for requirement in &mut bound_recipe.source_requirements {
         if let Some(reference) = requirement.expected_reference.as_mut() {
@@ -578,20 +582,52 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
         Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
     ));
 
-    let mut oversized_dependency = recipe(
+    // A `depends_on` that names no declared slot is a dependency-resolution
+    // failure, whatever its length.
+    let mut unresolved_dependency = recipe(
         vec![SlotRequirement::Required],
         vec![1],
         OmissionPolicy::RequiredSlots,
     )?;
+    unresolved_dependency.slots[0].requirement = SlotRequirement::Conditional {
+        depends_on: SlotId::from_artifact(artifact("slot-absent")?),
+    };
+    unresolved_dependency.seal()?;
+    let unresolved_projection = projection(&unresolved_dependency, 0, SlotDisposition::Current)?;
+    assert!(matches!(
+        compile(
+            &mut unresolved_dependency,
+            &[unresolved_projection],
+            &[artifact("ref")?]
+        ),
+        Err(eliot_learning_contracts::LearningContractError::ScopeMismatch {
+            field: "slot.requirement.depends_on"
+        })
+    ));
+
+    // The `slot.depends_on` label bound is reached only once the dependency
+    // resolves, so the over-long identity is installed as a DECLARED sibling
+    // slot that slot 0 genuinely depends on. An over-long `depends_on` naming
+    // no declared slot would be refused earlier as unresolvable, and the size
+    // bound would never be the reason the compilation is refused.
+    let mut oversized_dependency = recipe(
+        vec![SlotRequirement::Required, SlotRequirement::Required],
+        vec![1, 1],
+        OmissionPolicy::RequiredSlots,
+    )?;
+    let oversized_identity =
+        SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?);
+    oversized_dependency.slots[1].slot_id = oversized_identity.clone();
     oversized_dependency.slots[0].requirement = SlotRequirement::Conditional {
-        depends_on: SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?),
+        depends_on: oversized_identity,
     };
     oversized_dependency.seal()?;
-    let oversized_projection = projection(&oversized_dependency, 0, SlotDisposition::Current)?;
+    let first_projection = projection(&oversized_dependency, 0, SlotDisposition::Current)?;
+    let second_projection = projection(&oversized_dependency, 1, SlotDisposition::Current)?;
     assert!(matches!(
         compile(
             &mut oversized_dependency,
-            &[oversized_projection],
+            &[first_projection, second_projection],
             &[artifact("ref")?]
         ),
         Err(eliot_learning_contracts::LearningContractError::Bound {
@@ -664,7 +700,11 @@ fn omission_policy_and_conditional_unknown_remain_explicit() -> TestResult {
             .map(|slot| slot.slot_id.clone())
             .collect::<Vec<_>>()
     );
-    assert_eq!(view.completeness, Completeness::Partial);
+    // The frontier is named for every declared slot, and the recipe declares a
+    // REQUIRED slot among them, so the required coverage is open: BLOCKED, not
+    // PARTIAL and not a silent COMPLETE.
+    assert_eq!(view.completeness, Completeness::Blocked);
+    assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     view.validate_against(&frontier)?;
     Ok(())
 }
@@ -693,7 +733,10 @@ fn optional_stale_and_explicit_disagreement_are_preserved() -> TestResult {
         std::slice::from_ref(&disagreement),
         None,
     )?;
-    assert_eq!(view.completeness, Completeness::CompleteForDeclaredRecipe);
+    // The optional slot is preserved verbatim, and its STALE owner ref is what
+    // the view reports: STALE, never a laundered COMPLETE.
+    assert_eq!(view.completeness, Completeness::Stale);
+    assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     assert_eq!(view.slots[1], optional);
     let mut expected_disagreement = disagreement;
     expected_disagreement
@@ -1054,10 +1097,14 @@ fn exact_current_owner_projection_preserved() -> TestResult {
 // WORK_UNIT_CASE: 614/7
 #[test]
 fn historical_stale_superseded_invalidated_projections() -> TestResult {
+    // Every non-current disposition is reported under its own completeness
+    // value; none of them may be reported as a current recipe. The slot is
+    // REQUIRED here, so a non-current owner ref is a load-bearing gap (BLOCKED)
+    // and only the freshness vocabulary keeps its own value (STALE).
     for (disposition, expected) in [
-        (SlotDisposition::Historical, Completeness::Partial),
+        (SlotDisposition::Historical, Completeness::Blocked),
         (SlotDisposition::Stale, Completeness::Stale),
-        (SlotDisposition::Superseded, Completeness::Partial),
+        (SlotDisposition::Superseded, Completeness::Blocked),
     ] {
         let mut recipe = recipe(
             vec![SlotRequirement::Required],
@@ -1182,9 +1229,11 @@ fn conditional_required_true_false_unknown() -> TestResult {
         view.frontier,
         vec![frontier_recipe.slots[1].slot_id.clone()]
     );
-    assert_eq!(view.completeness, Completeness::Partial);
-    // Predicate unknown: an Unknown conditional slot is partial, never
-    // complete-as-empty.
+    // The conditional slot's dependency IS present, so the conditional is active
+    // and its absence is a load-bearing gap: BLOCKED, never PARTIAL.
+    assert_eq!(view.completeness, Completeness::Blocked);
+    assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
+    // Predicate unknown: an Unknown conditional slot is never complete-as-empty.
     let mut unknown_recipe = recipe(
         vec![
             SlotRequirement::Required,
@@ -1205,7 +1254,7 @@ fn conditional_required_true_false_unknown() -> TestResult {
         &[artifact("ref-1")?],
     )?;
     assert_eq!(view.slots[1].disposition, SlotDisposition::Unknown);
-    assert_eq!(view.completeness, Completeness::Partial);
+    assert_eq!(view.completeness, Completeness::Blocked);
     assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     view.validate_against(&unknown_recipe)?;
     Ok(())
@@ -1277,9 +1326,12 @@ fn owner_disagreement_conflict_set_preserved() -> TestResult {
         .map(OwnerId::as_str)
         .collect();
     assert_eq!(owners, vec!["owner-a", "owner-b"]);
-    // Conflict is preserved, never resolved: the view stays partial.
+    // Conflict is preserved, never resolved. A REQUIRED slot whose owners
+    // disagree is a load-bearing gap, so the view reports BLOCKED and the
+    // conflict set stays visible; it is never laundered into PARTIAL.
     assert_eq!(view.slots[0].disposition, SlotDisposition::Conflicted);
-    assert_eq!(view.completeness, Completeness::Partial);
+    assert_eq!(view.completeness, Completeness::Blocked);
+    assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     // Erasing a disagreement changes the projection: disagreement is material.
     let without_projections = [
         projection(&recipe, 0, SlotDisposition::Conflicted)?,
@@ -1328,7 +1380,8 @@ fn no_latest_confidence_majority_selection() -> TestResult {
     assert!(digests.contains(&digest("rival-alpha")));
     assert!(digests.contains(&digest("rival-beta")));
     assert_eq!(view.slots[0].disposition, SlotDisposition::Conflicted);
-    assert_eq!(view.completeness, Completeness::Partial);
+    assert_eq!(view.completeness, Completeness::Blocked);
+    assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     Ok(())
 }
 
@@ -1560,7 +1613,10 @@ fn known_empty_against_unavailable_partial_unknown() -> TestResult {
         std::slice::from_ref(&unknown),
         &[artifact("ref-1")?],
     )?;
-    assert_eq!(view.completeness, Completeness::Partial);
+    // UNKNOWN is not an empty declaration, and on a REQUIRED slot it is a
+    // load-bearing gap: BLOCKED rather than PARTIAL.
+    assert_eq!(view.completeness, Completeness::Blocked);
+    assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     // Unevidenced emptiness and emptiness over declared members both fail.
     let mut bare = empty.clone();
     bare.evidence.clear();
@@ -1629,9 +1685,12 @@ fn unexpected_and_duplicate_projection_disposition() -> TestResult {
         Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
     ));
     // A declared-but-absent required slot lands on the frontier instead.
+    // A load-bearing omission cannot leave the view PARTIAL, so the frontier
+    // entry itself is what blocks the projection.
     let view = compile(&mut recipe, &[], &[artifact("ref-1")?])?;
     assert_eq!(view.frontier, vec![recipe.slots[0].slot_id.clone()]);
-    assert_eq!(view.completeness, Completeness::Partial);
+    assert_eq!(view.completeness, Completeness::Blocked);
+    assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     view.validate_against(&recipe)?;
     Ok(())
 }
@@ -1658,7 +1717,11 @@ fn exact_structural_filter_and_visible_exclusion() -> TestResult {
     assert_eq!(view.slots[0].slot_id, recipe.slots[0].slot_id);
     assert_eq!(view.slots[1].slot_id, recipe.slots[2].slot_id);
     assert_eq!(view.slots[1].disposition, SlotDisposition::Blocked);
-    assert_eq!(view.completeness, Completeness::CompleteForDeclaredRecipe);
+    // A supplied slot whose owner reported Blocked is a missing/stale owner ref,
+    // so the view is PARTIAL. COMPLETE_FOR_DECLARED_RECIPE would claim every
+    // recipe member is current, which this one demonstrably is not.
+    assert_eq!(view.completeness, Completeness::Partial);
+    assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     // Nothing is silently dropped: every declared slot is represented exactly once.
     assert_eq!(
         view.slots.len() + view.omissions.len() + view.frontier.len(),
@@ -1795,7 +1858,10 @@ fn bound_cutting_required_slot_yields_partial() -> TestResult {
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
-    assert_eq!(view.completeness, Completeness::Partial);
+    // Cutting a REQUIRED slot is a load-bearing omission, so the view is
+    // BLOCKED, not PARTIAL: PARTIAL is reserved for omissions that are
+    // explicitly non-load-bearing (an absent OPTIONAL slot).
+    assert_eq!(view.completeness, Completeness::Blocked);
     assert_ne!(view.completeness, Completeness::CompleteForDeclaredRecipe);
     assert_eq!(view.frontier, vec![recipe.slots[1].slot_id.clone()]);
     assert_eq!(view.denominator.declared, 2);
@@ -2352,27 +2418,34 @@ fn no_store_clock_transcript_provider_mutation_path() -> TestResult {
             "compiler references {forbidden}"
         );
     }
-    // Pure shared borrows only: identical inputs compile identically with
-    // inputs intact, which a clock, store read or mutation would break.
+    // Pure shared borrows only: compiling the same bound recipe twice yields
+    // the identical view and leaves the recipe exactly as the first compilation
+    // left it, which a clock read, a store read or a mutation would break.
+    //
+    // The baseline is taken AFTER the first compilation because binding the
+    // projection digests into the recipe's source manifest and resealing it is
+    // this file's own fixture step, not a product mutation. The compiler itself
+    // borrows the recipe immutably, which is what comparing the second
+    // compilation against this baseline proves.
     let mut recipe = recipe(
         vec![SlotRequirement::Required],
         vec![1],
         OmissionPolicy::RequiredSlots,
     )?;
     let supplied = projection(&recipe, 0, SlotDisposition::Current)?;
-    let digest_before = recipe.canonical_digest.clone();
     let first = compile(
         &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
+    let bound_recipe_digest = recipe.canonical_digest.clone();
     let second = compile(
         &mut recipe,
         std::slice::from_ref(&supplied),
         &[artifact("ref-1")?],
     )?;
     assert_eq!(first, second);
-    assert_eq!(recipe.canonical_digest, digest_before);
+    assert_eq!(recipe.canonical_digest, bound_recipe_digest);
     assert_eq!(supplied.members.len(), 1);
     Ok(())
 }

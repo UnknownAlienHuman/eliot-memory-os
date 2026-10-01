@@ -53,7 +53,7 @@ pub struct CampaignHistoryPlanInput<'a> {
     pub policy_slice_handles: Vec<ArtifactId>,
 }
 
-/// Complete pure-compiler input. Owner reads and the runtime clock are
+/// Complete pure-compiler input. Owner reads and the observation timestamps are
 /// supplied by the authenticated caller; this API performs no I/O.
 #[derive(Clone, Copy)]
 pub struct CampaignLearningStateCompilationInput<'a> {
@@ -75,9 +75,9 @@ pub struct CampaignLearningStateCompilationInput<'a> {
     pub frozen_anchor_digest: &'a str,
     /// Actual existing `RetrievalPlans` and their bounded results.
     pub history_plans: &'a [CampaignHistoryPlanInput<'a>],
-    /// Runtime clock's generation time in milliseconds.
+    /// Caller-supplied generation time in milliseconds.
     pub generated_at_ms: i64,
-    /// Runtime clock's expiration boundary in milliseconds, if configured.
+    /// Caller-supplied expiration boundary in milliseconds, if configured.
     pub expires_at_ms: Option<i64>,
     /// Typed reason a prior immutable view was rebuilt.
     pub rebuild_reason: Option<CampaignViewRebuildReason>,
