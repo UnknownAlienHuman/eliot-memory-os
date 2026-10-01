@@ -147,9 +147,7 @@ impl ProviderCapabilityRouteError {
             Self::Session(_)
             | Self::Store(_)
             | Self::Capability(_)
-            | Self::ReservationBlocked { .. } => {
-                TransportError::SessionFenced
-            }
+            | Self::ReservationBlocked { .. } => TransportError::SessionFenced,
         }
     }
 }
