@@ -8,10 +8,11 @@
 //! owning daemon ingress.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use eliot_bootstrap::capture::NormativePairSourceCapture;
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{ProductId, SourceId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{AuthorityBinding, CausalBinding};
 use eliot_store_api::{
@@ -22,12 +23,402 @@ use eliot_store_api::{
 };
 use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_workscope::{
-    GoverningSourceSet, ObservedScopeResources, PrivacyProfile, ScopeBinding, ScopeIdentity,
+    AuthorityBasis, GoverningSource, GoverningSourceRole, GoverningSourceSet,
+    ObservedScopeResources, PrivacyProfile, ScopeBinding, ScopeIdentity, SourceStatus,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
     admit_initial_binding, observed_scope_binding,
 };
+use eliot_security_contracts::{
+    CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, InstructionTaint,
+    IndependenceLevel, IntegrityStatus, QuarantineState, SourceAssurance,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+/// Wire/schema revision for the Human-approved normative source closure.
+pub const GOVERNING_SOURCE_APPROVAL_SCHEMA: &str = "eliot.governing-source-approval.v1";
+
+/// The exact source document approved for one governing normative role.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedNormativeSource {
+    /// Exact source manifest path from the accepted pair receipt.
+    pub source_ref: String,
+    /// Exact entry document path from the accepted pair receipt.
+    pub entry_ref: String,
+    /// Exact compatibility map path from the accepted pair receipt.
+    pub compatibility_ref: String,
+    /// SHA-256 of the reconstructed normalized source bytes.
+    pub content_sha256: String,
+    /// Explicitly approved privacy classification for this source.
+    pub privacy_class: eliot_security_contracts::PrivacyClass,
+}
+
+/// Explicit first-run Human approval of the exact normative source pair.
+///
+/// This record is only authority-bearing after it is included in the signed
+/// initial configuration payload and read back through that payload's
+/// existing verifier. It is not an approval signature or an identity
+/// assertion by itself. Its source rows are checked against a fresh
+/// `NormativePairSourceCapture` at the WorkScope admission boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GoverningSourceApproval {
+    /// Closed approval schema revision.
+    pub schema_version: String,
+    /// Authenticated Human principal that explicitly approved this closure.
+    pub approver_principal_ref: String,
+    /// Product identity covered by the approval.
+    pub product_id: ProductId,
+    /// Source identity covered by the approval.
+    pub source_id: SourceId,
+    /// Canonical explicit repository root identity covered by the approval.
+    pub explicit_root_identity: String,
+    /// Exact state fence at which the approval was signed.
+    pub state_fence: StateFence,
+    /// Explicitly approved WorkScope privacy boundary.
+    pub privacy: PrivacyProfile,
+    /// Explicitly approved privacy class for the WorkScope binding itself.
+    pub scope_privacy_class: eliot_security_contracts::PrivacyClass,
+    /// Accepted pair key from `docs/normative-pair.toml`.
+    pub pair_key: String,
+    /// Approved Architecture document identity and classification.
+    pub architecture: ApprovedNormativeSource,
+    /// Approved Implementation document identity and classification.
+    pub implementation: ApprovedNormativeSource,
+}
+
+impl GoverningSourceApproval {
+    /// Construct the value presented for Human confirmation during setup.
+    ///
+    /// Callers must obtain `approver_principal_ref`, product/source, root and
+    /// privacy selections from the authenticated setup interaction. The
+    /// returned value has no authority until the existing trusted
+    /// `InitialSnapshotSigner` signs it as part of the initial config payload.
+    pub fn from_setup_confirmation(
+        approver_principal_ref: impl Into<String>,
+        product_id: ProductId,
+        source_id: SourceId,
+        explicit_root_identity: impl Into<String>,
+        state_fence: StateFence,
+        privacy: PrivacyProfile,
+        scope_privacy_class: eliot_security_contracts::PrivacyClass,
+        architecture_privacy: eliot_security_contracts::PrivacyClass,
+        implementation_privacy: eliot_security_contracts::PrivacyClass,
+        capture: &NormativePairSourceCapture,
+    ) -> Result<Self, WorkScopeSourceAdmissionError> {
+        let approval = Self {
+            schema_version: GOVERNING_SOURCE_APPROVAL_SCHEMA.to_owned(),
+            approver_principal_ref: approver_principal_ref.into(),
+            product_id,
+            source_id,
+            explicit_root_identity: explicit_root_identity.into(),
+            state_fence,
+            privacy,
+            scope_privacy_class,
+            pair_key: capture.receipt.pair_key.clone(),
+            architecture: ApprovedNormativeSource {
+                source_ref: capture.architecture.source_ref.clone(),
+                entry_ref: capture.architecture.entry_ref.clone(),
+                compatibility_ref: capture.architecture.compatibility_ref.clone(),
+                content_sha256: capture.architecture.content_sha256.clone(),
+                privacy_class: architecture_privacy,
+            },
+            implementation: ApprovedNormativeSource {
+                source_ref: capture.implementation.source_ref.clone(),
+                entry_ref: capture.implementation.entry_ref.clone(),
+                compatibility_ref: capture.implementation.compatibility_ref.clone(),
+                content_sha256: capture.implementation.content_sha256.clone(),
+                privacy_class: implementation_privacy,
+            },
+        };
+        approval.validate()?;
+        Ok(approval)
+    }
+
+    /// Validate the complete signed approval's structure.
+    pub fn validate(&self) -> Result<(), WorkScopeSourceAdmissionError> {
+        if self.schema_version != GOVERNING_SOURCE_APPROVAL_SCHEMA
+            || self.approver_principal_ref.trim().is_empty()
+            || self.approver_principal_ref.chars().any(char::is_control)
+            || self.explicit_root_identity.trim().is_empty()
+            || self.explicit_root_identity.chars().any(char::is_control)
+            || !Path::new(&self.explicit_root_identity).is_absolute()
+            || self.pair_key.trim().is_empty()
+            || self.pair_key.chars().any(char::is_control)
+        {
+            return Err(WorkScopeSourceAdmissionError::InvalidSourceApproval);
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| WorkScopeSourceAdmissionError::InvalidSourceApproval)?;
+        self.privacy
+            .validate()
+            .map_err(|_| WorkScopeSourceAdmissionError::InvalidSourceApproval)?;
+        if !self.privacy.admits(self.scope_privacy_class) {
+            return Err(WorkScopeSourceAdmissionError::InvalidSourceApproval);
+        }
+        validate_approved_document(&self.architecture)?;
+        validate_approved_document(&self.implementation)?;
+        if self.architecture.source_ref == self.implementation.source_ref
+            || !self.privacy.admits(self.architecture.privacy_class)
+            || !self.privacy.admits(self.implementation.privacy_class)
+        {
+            return Err(WorkScopeSourceAdmissionError::InvalidSourceApproval);
+        }
+        Ok(())
+    }
+
+    /// Re-join this signed approval to the exact live setup and source inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn validate_live_binding(
+        &self,
+        capture: &NormativePairSourceCapture,
+        explicit_root_identity: &str,
+        product_id: &ProductId,
+        source_id: &SourceId,
+        privacy: &PrivacyProfile,
+        scope_privacy_class: eliot_security_contracts::PrivacyClass,
+        state_fence: &StateFence,
+        authenticated_approver_principal_ref: &str,
+    ) -> Result<(), WorkScopeSourceAdmissionError> {
+        self.validate()?;
+        let architecture_matches = self.architecture.source_ref == capture.architecture.source_ref
+            && self.architecture.entry_ref == capture.architecture.entry_ref
+            && self.architecture.compatibility_ref == capture.architecture.compatibility_ref
+            && self.architecture.content_sha256 == capture.architecture.content_sha256;
+        let implementation_matches = self.implementation.source_ref
+            == capture.implementation.source_ref
+            && self.implementation.entry_ref == capture.implementation.entry_ref
+            && self.implementation.compatibility_ref
+                == capture.implementation.compatibility_ref
+            && self.implementation.content_sha256 == capture.implementation.content_sha256;
+        if self.pair_key != capture.receipt.pair_key
+            || !architecture_matches
+            || !implementation_matches
+            || self.architecture.content_sha256
+                != capture.receipt.pair.architecture_sha256
+            || self.implementation.content_sha256
+                != capture.receipt.pair.implementation_sha256
+            || self.explicit_root_identity != explicit_root_identity
+            || &self.product_id != product_id
+            || &self.source_id != source_id
+            || &self.privacy != privacy
+            || self.scope_privacy_class != scope_privacy_class
+            || &self.state_fence != state_fence
+            || self.approver_principal_ref != authenticated_approver_principal_ref
+        {
+            return Err(WorkScopeSourceAdmissionError::SourceApprovalBindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Build the two-source WorkScope closure authorized by this verified
+    /// approval and the exact current normative capture.
+    #[allow(clippy::too_many_arguments)]
+    fn derive_work_scope_sources(
+        &self,
+        capture: &NormativePairSourceCapture,
+        explicit_root_identity: &str,
+        product_id: &ProductId,
+        source_id: &SourceId,
+        privacy: &PrivacyProfile,
+        scope_privacy_class: eliot_security_contracts::PrivacyClass,
+        state_fence: &StateFence,
+        authenticated_approver_principal_ref: &str,
+        scope_ref: &str,
+        generation: u64,
+    ) -> Result<GoverningSourceSet, WorkScopeSourceAdmissionError> {
+        self.validate_live_binding(
+            capture,
+            explicit_root_identity,
+            product_id,
+            source_id,
+            privacy,
+            scope_privacy_class,
+            state_fence,
+            authenticated_approver_principal_ref,
+        )?;
+        if state_fence.resource_generation.value() != generation {
+            return Err(WorkScopeSourceAdmissionError::FenceMismatch);
+        }
+        let source = |document: &ApprovedNormativeSource, role, provenance: &str| {
+            GoverningSource {
+                source_ref: document.source_ref.clone(),
+                role,
+                assurance: SourceAssurance {
+                    source_ref: document.source_ref.clone(),
+                    provenance_ref: provenance.to_owned(),
+                    integrity: IntegrityStatus::Verified,
+                    freshness: FreshnessStatus::Current,
+                    competence: CompetenceLevel::Unknown,
+                    independence: IndependenceLevel::Unknown,
+                    privacy_class: document.privacy_class,
+                    instruction_taint: InstructionTaint::DataOnly,
+                    allowed_epistemic_use: vec![EpistemicUse::Observation],
+                    allowed_effects: vec![EffectCeiling::NoExternalEffect],
+                    required_verifier: None,
+                    quarantine: QuarantineState::ReviewRequired,
+                    state_fence: state_fence.clone(),
+                },
+                applicable_generation: generation,
+                status: SourceStatus::Admitted,
+                domains: Vec::new(),
+                digest: document.content_sha256.clone(),
+                authority_basis: Some(AuthorityBasis::HumanOwner {
+                    owner_ref: self.approver_principal_ref.clone(),
+                }),
+            }
+        };
+        GoverningSourceSet::new(
+            scope_ref,
+            generation,
+            vec![
+                source(
+                    &self.architecture,
+                    GoverningSourceRole::Architecture,
+                    &self.pair_key,
+                ),
+                source(
+                    &self.implementation,
+                    GoverningSourceRole::Implementation,
+                    &self.pair_key,
+                ),
+            ],
+            Vec::new(),
+        )
+        .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))
+    }
+
+    /// Serialize this approval as canonical bytes for the existing signed
+    /// InitialSnapshotPayload field.
+    pub fn canonical_json(&self) -> Result<String, WorkScopeSourceAdmissionError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(self)
+            .map_err(|error| WorkScopeSourceAdmissionError::CaptureSerialization(error.to_string()))?;
+        String::from_utf8(bytes)
+            .map_err(|error| WorkScopeSourceAdmissionError::CaptureSerialization(error.to_string()))
+    }
+
+    /// Decode the approval only from the payload exposed by the sealed
+    /// initial-config verifier. The Human principal must equal the owner
+    /// principal already covered by that verified setup payload.
+    pub fn from_verified_initial_snapshot(
+        snapshot: &eliot_config::initial_snapshot::VerifiedInitialConfigSnapshot,
+    ) -> Result<Self, WorkScopeSourceAdmissionError> {
+        let payload = snapshot.payload();
+        let approval_json = payload
+            .governing_source_approval_json
+            .as_deref()
+            .ok_or(WorkScopeSourceAdmissionError::SourceApprovalMissing)?;
+        let approval: Self = serde_json::from_str(approval_json)
+            .map_err(|error| {
+                WorkScopeSourceAdmissionError::SourceApprovalEncoding(error.to_string())
+            })?;
+        approval.validate()?;
+        if approval.approver_principal_ref != payload.owner_ref
+            || approval.state_fence != payload.snapshot.state_fence
+        {
+            return Err(WorkScopeSourceAdmissionError::SourceApprovalBindingMismatch);
+        }
+        if approval.canonical_json()? != approval_json {
+            return Err(WorkScopeSourceAdmissionError::SourceApprovalEncoding(
+                "approval JSON is not canonical".to_owned(),
+            ));
+        }
+        Ok(approval)
+    }
+}
+
+fn validate_approved_document(
+    document: &ApprovedNormativeSource,
+) -> Result<(), WorkScopeSourceAdmissionError> {
+    for value in [
+        &document.source_ref,
+        &document.entry_ref,
+        &document.compatibility_ref,
+    ] {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(WorkScopeSourceAdmissionError::InvalidSourceApproval);
+        }
+    }
+    if !is_sha256(&document.content_sha256) {
+        return Err(WorkScopeSourceAdmissionError::InvalidSourceApproval);
+    }
+    Ok(())
+}
+
+/// A source approval extracted from a trust-anchor-verified initial snapshot.
+/// Its private fields prevent callers from promoting an unverified JSON value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedGoverningSourceApproval {
+    approval: GoverningSourceApproval,
+    signed_snapshot_digest: String,
+}
+
+impl VerifiedGoverningSourceApproval {
+    /// Parses and joins the approval embedded in the sealed setup snapshot.
+    pub fn from_verified_initial_snapshot(
+        snapshot: &eliot_config::initial_snapshot::VerifiedInitialConfigSnapshot,
+    ) -> Result<Self, WorkScopeSourceAdmissionError> {
+        let approval = GoverningSourceApproval::from_verified_initial_snapshot(snapshot)?;
+        let signed_snapshot_digest = snapshot
+            .envelope_digest()
+            .to_owned();
+        if !is_sha256(&signed_snapshot_digest) {
+            return Err(WorkScopeSourceAdmissionError::SourceApprovalEncoding(
+                "verified snapshot has an invalid envelope digest".to_owned(),
+            ));
+        }
+        Ok(Self {
+            approval,
+            signed_snapshot_digest,
+        })
+    }
+
+    /// The exact Human approval whose containing setup payload was verified.
+    #[must_use]
+    pub const fn approval(&self) -> &GoverningSourceApproval {
+        &self.approval
+    }
+
+    /// Digest of the trust-anchor-verified signed initial snapshot envelope.
+    #[must_use]
+    pub fn signed_snapshot_digest(&self) -> &str {
+        &self.signed_snapshot_digest
+    }
+
+    /// Derives the closed WorkScope source set from signed approval and a
+    /// fresh byte-verified normative capture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive_work_scope_sources(
+        &self,
+        capture: &NormativePairSourceCapture,
+        explicit_root_identity: &str,
+        product_id: &ProductId,
+        source_id: &SourceId,
+        privacy: &PrivacyProfile,
+        scope_privacy_class: eliot_security_contracts::PrivacyClass,
+        state_fence: &StateFence,
+        scope_ref: &str,
+        generation: u64,
+    ) -> Result<GoverningSourceSet, WorkScopeSourceAdmissionError> {
+        self.approval.derive_work_scope_sources(
+            capture,
+            explicit_root_identity,
+            product_id,
+            source_id,
+            privacy,
+            scope_privacy_class,
+            state_fence,
+            &self.approval.approver_principal_ref,
+            scope_ref,
+            generation,
+        )
+    }
+}
 
 /// Fully prepared initial owner snapshot and the ordinary canonical write
 /// transition that persists it.
@@ -71,6 +462,18 @@ pub enum WorkScopeSourceAdmissionError {
     /// The source capture could not be rendered as canonical JSON.
     #[error("normative pair source capture serialization failed: {0}")]
     CaptureSerialization(String),
+    /// The signed approval does not have the closed source-approval shape.
+    #[error("governing source approval is malformed")]
+    InvalidSourceApproval,
+    /// The signed source approval differs from current authenticated inputs.
+    #[error("governing source approval does not bind the current request and source pair")]
+    SourceApprovalBindingMismatch,
+    /// The verified setup payload does not include a Human source approval.
+    #[error("verified initial configuration has no governing source approval")]
+    SourceApprovalMissing,
+    /// The signed source approval JSON is absent, malformed, or noncanonical.
+    #[error("governing source approval encoding is invalid: {0}")]
+    SourceApprovalEncoding(String),
     /// The initial scope, source closure, or matched-guard admission refused.
     #[error("initial WorkScope binding admission refused: {0}")]
     InitialAdmission(String),
@@ -85,14 +488,12 @@ pub enum WorkScopeSourceAdmissionError {
 /// Creates a source-admission snapshot from genuine initial-scope inputs and
 /// prepares its normal canonical `RecordWorkScopeSnapshot` transition.
 ///
-/// `binding`, `observed`, `descriptor`, `sources`, and `privacy` must be the
-/// exact values obtained at the authenticated cold-start/initial-scope edge.
-/// The function re-runs the existing initial binding admission and computes
-/// the matched guard itself. It never accepts a caller-created guard receipt.
-/// `capture` must be the parsed result of
-/// `capture_normative_pair_sources` over the same explicit repository root;
-/// WorkScope validates its canonical bytes and the role/reference/content
-/// digest join against the admitted `sources` before accepting the snapshot.
+/// The function re-runs initial binding admission and computes the matched
+/// guard itself. It never accepts caller-created source statuses, authority
+/// bases, or guard receipts. `approval` can only be constructed from the
+/// trust-anchor-verified first-run config snapshot; the current
+/// `NormativePairSourceCapture` is joined against that signed approval before
+/// the WorkScope source set is derived.
 /// `operation_id` is the exact admitted Store operation identity retained by
 /// the authenticated Task Controller attempt; this producer never aliases it
 /// to the transport `RequestId`.
@@ -113,10 +514,8 @@ pub fn prepare_initial_work_scope_source_admission(
     causal: &CausalBinding,
     descriptor: &WorkScopeDescriptor,
     observed_resources: &ObservedScopeResources,
-    privacy_class: eliot_security_contracts::PrivacyClass,
     governing_source_generation: u64,
-    sources: &GoverningSourceSet,
-    privacy: &PrivacyProfile,
+    approval: &VerifiedGoverningSourceApproval,
     capture: &NormativePairSourceCapture,
     owner_readback: &WorkScopeOwnerSnapshotReadback,
 ) -> Result<PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError> {
@@ -135,14 +534,29 @@ pub fn prepare_initial_work_scope_source_admission(
         || descriptor.state_fence != *fence
         || descriptor.generation.resource_generation != fence.resource_generation
         || observed_resources.generation.resource_generation != fence.resource_generation
-        || governing_source_generation != sources.generation
+        || governing_source_generation != fence.resource_generation.value()
     {
         return Err(WorkScopeSourceAdmissionError::FenceMismatch);
+    }
+    let approved = approval.approval();
+    if descriptor.privacy != approved.privacy {
+        return Err(WorkScopeSourceAdmissionError::SourceApprovalBindingMismatch);
     }
     let (binding, observed) = derive_initial_scope_bindings(
         descriptor,
         observed_resources,
-        privacy_class,
+        approved.scope_privacy_class,
+        governing_source_generation,
+    )?;
+    let sources = approval.derive_work_scope_sources(
+        capture,
+        &binding.scope.root_identity,
+        &identity.request.metadata.product_id,
+        &identity.request.metadata.source_id,
+        &approved.privacy,
+        approved.scope_privacy_class,
+        fence,
+        &binding.scope.scope_ref,
         governing_source_generation,
     )?;
     let (expected_revision, expected_digest) = match owner_readback {
@@ -180,8 +594,8 @@ pub fn prepare_initial_work_scope_source_admission(
         fence,
         &binding,
         &observed,
-        sources,
-        privacy,
+        &sources,
+        &approved.privacy,
     )
     .map_err(|error| WorkScopeSourceAdmissionError::InitialAdmission(error.to_string()))?;
     let initial_snapshot = initially_admitted
@@ -200,7 +614,7 @@ pub fn prepare_initial_work_scope_source_admission(
         initial_snapshot.binding.clone(),
         initial_snapshot.guard_receipt.clone(),
         sources.clone(),
-        privacy.clone(),
+        approved.privacy.clone(),
         product_id.clone(),
         capture_json,
         capture_sha256,
