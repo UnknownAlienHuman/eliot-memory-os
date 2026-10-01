@@ -1546,6 +1546,23 @@ impl AcpResultEnvelope {
         Ok(())
     }
 
+    /// Checks that this envelope answers the bound attempt (issue #2641 W4):
+    /// the envelope attempt identity must equal the bound attempt identity by
+    /// typed `==`, so a foreign-attempt envelope cannot ride a valid binding
+    /// on any adoption path. Route/session agreement stays with
+    /// [`Self::check_acp_result_binding`], never merged into this check.
+    fn check_envelope_attempt_binding(
+        &self,
+        binding: &ProviderExecutionBinding,
+    ) -> Result<(), AcpAdapterError> {
+        if self.attempt_id != binding.attempt_id {
+            return Err(AcpAdapterError::ContractValidation(
+                eliot_agent_api::ContractError::BindingMismatch,
+            ));
+        }
+        Ok(())
+    }
+
     fn acp_result_disposition(outcome: AcpResultOutcome) -> (ResultDisposition, Option<String>) {
         match outcome {
             AcpResultOutcome::Completed => (ResultDisposition::DegradedNoProof, None),
@@ -1646,6 +1663,7 @@ impl AcpResultEnvelope {
             return Err(AcpAdapterError::InvalidInput("operation_id"));
         }
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
+        self.check_envelope_attempt_binding(binding)?;
         // The typed wire code travels beside the outcome, not inside the
         // untrusted prose: it is captured here and rendered only after the
         // sanitizer below has run, so default-deny redaction keeps distinct
@@ -1775,9 +1793,11 @@ impl AcpResultEnvelope {
     ///   Finish authority.
     ///
     /// Fail-closed before delegation: the envelope attempt identity must equal
-    /// the bound attempt identity by typed `==` (`into_agent_result` checks
-    /// route and session agreement but never the envelope attempt itself, so
-    /// a foreign-attempt envelope cannot ride a valid binding here).
+    /// the bound attempt identity by typed `==`
+    /// ([`Self::check_envelope_attempt_binding`], also enforced centrally by
+    /// [`Self::into_agent_result`], which checks route, session and envelope
+    /// attempt agreement — so a foreign-attempt envelope cannot ride a valid
+    /// binding on any adoption path).
     /// Cancellation and provider-reported failure carry caller reasons the
     /// envelope does not record; assembling those stays on
     /// [`Self::into_agent_result`] with an explicit [`AcpResultOutcome`].
@@ -1787,11 +1807,9 @@ impl AcpResultEnvelope {
         binding: &ProviderExecutionBinding,
         admission: &AdmittedRouteReceipt,
     ) -> Result<AgentResult, AcpAdapterError> {
-        if self.attempt_id != binding.attempt_id {
-            return Err(AcpAdapterError::ContractValidation(
-                eliot_agent_api::ContractError::BindingMismatch,
-            ));
-        }
+        // The single envelope-attempt binding check also runs centrally in
+        // `into_agent_result` below; this site keeps its fail-closed order.
+        self.check_envelope_attempt_binding(binding)?;
         let (outcome, diagnostic_caller) = if self.terminal {
             (AcpResultOutcome::Completed, None)
         } else {
