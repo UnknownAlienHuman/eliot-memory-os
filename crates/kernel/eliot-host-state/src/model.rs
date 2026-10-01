@@ -1251,6 +1251,74 @@ impl ManagedDependencyRecord {
         }
         Ok(())
     }
+
+    /// Production constructor for the canonical-store
+    /// [`HostStateRecord::Dependency`] (issue #1887 W-startup).
+    ///
+    /// Host records this operational entry when it starts or reuses the
+    /// canonical-store Job Object the Kernel requested through the existing
+    /// service/containment ports. The entry binds immutable launch lineage
+    /// (`process_manifest`, `process_generation`), the approved artifact and
+    /// config hashes, Job Object/PID lineage (`pid_job_lineage_refs`), the
+    /// Host/Watchdog process observation (`outcome`), and the remaining
+    /// lifecycle/resource budgets. It carries no DB claim, task state, schema
+    /// meaning, or canonical authority, and it persists no
+    /// version/schema/transaction probe verdict: semantic readiness is
+    /// evaluated independently by the caller of
+    /// [`HostState::canonical_store_startup_write_readiness`] and is never
+    /// stored in this journal.
+    ///
+    /// The assembled record is validated before it is returned, so an
+    /// `Active` state without a live liveness observation is refused here
+    /// rather than appended: a managed dependency is alive only when
+    /// Host/Watchdog observed it alive, never because no stop was recorded.
+    /// This function starts no process and runs no probe.
+    ///
+    /// Caller: STITCH — the Host journal writer appends the returned record
+    /// through `HostStateJournal::append` (`service.rs`
+    /// `ProductionHostStateJournal`, driven by the `bins/eliot-host`
+    /// start/reuse path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Invalid`] when the assembled record fails its
+    /// own validation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn canonical_store_dependency_record(
+        fence: RecordFence,
+        operation: IdempotencyIdentity,
+        dependency: PlatformHandle,
+        process_manifest: ImmutableProcessManifest,
+        requester_identity: PlatformHandle,
+        process_generation: EpochTransition,
+        state: DependencyState,
+        outcome: PortOutcome<ServiceProcessRecord>,
+        pid_job_lineage_refs: Vec<PlatformHandle>,
+        lifecycle_budget: DependencyLifecycleBudget,
+        resource_budget: DependencyResourceBudget,
+        approved_artifact_hash: PlatformHandle,
+        approved_config_hash: PlatformHandle,
+        disposition_evidence: Vec<PlatformHandle>,
+    ) -> Result<HostStateRecord, JournalError> {
+        let record = Self {
+            fence,
+            operation,
+            dependency,
+            process_manifest,
+            requester_identity,
+            process_generation,
+            state,
+            outcome,
+            pid_job_lineage_refs,
+            lifecycle_budget,
+            resource_budget,
+            approved_artifact_hash,
+            approved_config_hash,
+            disposition_evidence,
+        };
+        record.validate()?;
+        Ok(HostStateRecord::Dependency(record))
+    }
 }
 
 /// Why canonical-store writes remain closed for a managed dependency.
@@ -3256,6 +3324,58 @@ impl HostState {
         self.dependencies
             .iter()
             .find(|record| &record.dependency == dependency)
+    }
+
+    /// Startup-path caller of
+    /// [`ManagedDependencyRecord::canonical_store_write_readiness`]
+    /// (issue #1887 W-startup).
+    ///
+    /// After the Kernel requests Host to start or reuse the canonical-store
+    /// Job Object, startup waits for both evidence categories before enabling
+    /// normal canonical writes: Host/Watchdog liveness from this journal's
+    /// [`ManagedDependencyRecord`] (read through [`Self::managed_dependency`])
+    /// and independent store-bridge readiness. The three probe verdicts arrive
+    /// as three separate inputs — version compatibility, schema
+    /// compatibility, and transaction execution viability — never as one
+    /// boolean; they are joined with `&&` only to derive the combined verdict
+    /// the predicate takes. A live process with a failed schema probe stays
+    /// refused, and a responsive bridge with no Host-managed record for
+    /// `dependency` is refused as missing lineage rather than accepted.
+    ///
+    /// Failures stay typed as [`CanonicalStoreWriteRefusal`]. This function
+    /// starts no process and runs no probe.
+    ///
+    /// Caller: STITCH — the Kernel startup/write gate owns the call, joining
+    /// this Host half with the bridge's current typed version/schema/
+    /// transaction receipt (see
+    /// `crates/kernel/eliot-kernel-service/src/store_write_status.rs::project_canonical_store_write_status`,
+    /// fed from `bins/eliot-kernel/src/canonical_store_runtime.rs` and
+    /// `composition_bootstrap.rs`); that owner, not this crate, decides when
+    /// the probes have been (re-)evaluated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn canonical_store_startup_write_readiness(
+        &self,
+        dependency: &PlatformHandle,
+        required_process_manifest: &ImmutableProcessManifest,
+        required_process_generation: &EpochTransition,
+        required_artifact_hash: &PlatformHandle,
+        required_config_hash: &PlatformHandle,
+        required_pid_job_lineage_refs: &[PlatformHandle],
+        version_compatible: bool,
+        schema_compatible: bool,
+        transaction_viable: bool,
+    ) -> Result<(), CanonicalStoreWriteRefusal> {
+        let Some(record) = self.managed_dependency(dependency) else {
+            return Err(CanonicalStoreWriteRefusal::MissingPidJobLineage);
+        };
+        record.canonical_store_write_readiness(
+            required_process_manifest,
+            required_process_generation,
+            required_artifact_hash,
+            required_config_hash,
+            required_pid_job_lineage_refs,
+            version_compatible && schema_compatible && transaction_viable,
+        )
     }
 }
 
