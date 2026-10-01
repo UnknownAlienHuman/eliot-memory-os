@@ -10020,9 +10020,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// revocation, builds no graph, and holds no closure-source port: the
     /// closure it reconciles is the owner's committed bytes, proven binding
     /// before the first canonical write.
-    async fn resume_committed_closure_second_phase<
-        L: GrantClosureCanonicalLinkPort + ?Sized,
-    >(
+    async fn resume_committed_closure_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
         &mut self,
         request: &GrantRevocationRequest,
         closure: &GrantClosureReceipt,
