@@ -2397,6 +2397,21 @@ fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
         &rendered,
     )
     .expect("view output digest");
+    // The card grades THIS packet, so it records THIS packet's own output
+    // digests and omission handles rather than the intrinsic placeholders.
+    // `ActiveUnderstandingView::validate` recomputes the rendered half and
+    // `validate_against` recomputes the admitted half from their own owners, so
+    // a card left on `fixture_output_binding`'s placeholder digests is refused
+    // as `QualityIncomplete` before any membership is proved. The serializer,
+    // route and options identities already come from the execution the view is
+    // assembled under, so they need no second value here.
+    quality.output.recipe_digest = recipe_digest.clone();
+    quality.output.fence_digest = fence_digest.clone();
+    quality.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("admitted payload digest");
+    quality.output.rendered_digest = output_digest.clone();
+    quality.output.omission_handles = admitted.economy.displaced.clone();
     let rendered_bytes = ActiveUnderstandingView::canonical_output_utf8_bytes(
         &admitted.binding,
         &recipe_digest,
@@ -2639,10 +2654,15 @@ fn no_scalar_weighted_or_average_quality_compensation_path() {
     assert!(!padded.all_pass().expect("padded evaluated"));
 
     // The closed wire surface carries no aggregate scalar to compensate with.
+    // The exact field set is pinned, so a scalar could not appear beside it:
+    // `schema_version` and `output` are members of the same closed surface,
+    // where `output` names the graded packet rather than scoring it.
     let value = serde_json::to_value(&baseline).expect("scorecard value");
     let object = value.as_object().expect("scorecard object");
-    assert_eq!(object.len(), 3);
+    assert_eq!(object.len(), 5);
+    assert!(object.contains_key("schema_version"));
     assert!(object.contains_key("binding"));
+    assert!(object.contains_key("output"));
     assert!(object.contains_key("applicability"));
     assert!(object.contains_key("results"));
     for rejected in ["score", "average", "weighted", "total"] {
