@@ -2152,7 +2152,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         Ok(BridgeStatusProjection::project(
             line.current(),
             line.retained(),
-            ObservedHealth::from_last_exit(stitch.last_exit),
+            stitch.last_exit,
             &stitch.per_operation_exits,
         ))
     }
