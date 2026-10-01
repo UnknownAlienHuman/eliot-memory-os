@@ -75,6 +75,12 @@ use eliot_store_api::{
 use serde::Deserialize;
 
 use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
+use super::anchored_review_bridge::{
+    ANCHORED_REVIEW_ACCEPT_OPERATION, ANCHORED_REVIEW_ADVANCE_OPERATION,
+    ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION, ANCHORED_REVIEW_ESCALATE_OPERATION,
+    ANCHORED_REVIEW_OBSERVE_OPERATION, ANCHORED_REVIEW_ROUTE_OPERATION,
+    ANCHORED_REVIEW_SUBMIT_OPERATION,
+};
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
     ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
@@ -649,6 +655,17 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "store_named" => "store_named",
         NOTIFICATION_STATE_MUTATION_OPERATION => NOTIFICATION_STATE_MUTATION_OPERATION,
         NOTIFICATION_STATE_READ_OPERATION => NOTIFICATION_STATE_READ_OPERATION,
+        // Issue #1823 (I10.18/I10.21): the anchored-review Store-bridge legs.
+        // Each marker is the slice-A stable name the bridge registered, so the
+        // admitted transport vocabulary and the Kernel surface are the same
+        // strings and cannot drift apart.
+        ANCHORED_REVIEW_SUBMIT_OPERATION => ANCHORED_REVIEW_SUBMIT_OPERATION,
+        ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION => ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION,
+        ANCHORED_REVIEW_OBSERVE_OPERATION => ANCHORED_REVIEW_OBSERVE_OPERATION,
+        ANCHORED_REVIEW_ADVANCE_OPERATION => ANCHORED_REVIEW_ADVANCE_OPERATION,
+        ANCHORED_REVIEW_ROUTE_OPERATION => ANCHORED_REVIEW_ROUTE_OPERATION,
+        ANCHORED_REVIEW_ACCEPT_OPERATION => ANCHORED_REVIEW_ACCEPT_OPERATION,
+        ANCHORED_REVIEW_ESCALATE_OPERATION => ANCHORED_REVIEW_ESCALATE_OPERATION,
         // Issue #1678 W3/W5 (REQ4, REQ6, A3, A4): the admitted daemon-channel
         // coordinator that drives the canonical `ADMITTED` readback, its
         // launch-outbox intent proof, and the one activation of the exact
@@ -3371,6 +3388,56 @@ impl KernelComposition {
             }
             NOTIFICATION_STATE_READ_OPERATION => {
                 Box::pin(self.notification_state_read_operation(session, payload.clone())).await
+            }
+            // Issue #1823 (I10.18/I10.21): the anchored-review Store-bridge
+            // legs. Each arm admits exactly one registered slice-A name,
+            // proves the live session fence, and routes to the one
+            // Kernel-mechanical entry point that name owns; the computed
+            // record or row returns for the existing coordination Store
+            // owner to persist. No arm mints identity, stores rows, or
+            // reaches any other operation: unrelated traffic still falls
+            // through to the typed refusal below.
+            ANCHORED_REVIEW_SUBMIT_OPERATION => {
+                anchored_review_bridge::anchored_review_submit_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION => {
+                anchored_review_bridge::anchored_review_batch_submit_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_OBSERVE_OPERATION => {
+                anchored_review_bridge::anchored_review_observe_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_ADVANCE_OPERATION => {
+                anchored_review_bridge::anchored_review_advance_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_ROUTE_OPERATION => {
+                anchored_review_bridge::anchored_review_route_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_ACCEPT_OPERATION => {
+                anchored_review_bridge::anchored_review_accept_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_ESCALATE_OPERATION => {
+                anchored_review_bridge::anchored_review_escalate_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
             }
             // Issue #1678 W3/W5/REQ4/REQ6/A3/A4/A7: the admit + activate leg of
             // the normative admission-reservation saga. The arm never mints an

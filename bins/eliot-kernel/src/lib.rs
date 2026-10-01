@@ -321,6 +321,7 @@ use eliot_kernel_core::{
 
 mod activation_lifecycle;
 mod admission_reservation_saga;
+mod anchored_review_bridge;
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
