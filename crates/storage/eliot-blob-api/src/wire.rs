@@ -993,10 +993,14 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                 || operation.state_fence != self.state_fence
                 || expected_effect.is_none_or(|effect| operation.effect != effect)
             {
-                return Err(WireValidationError::InvalidField("kernel_operation_binding"));
+                return Err(WireValidationError::InvalidField(
+                    "kernel_operation_binding",
+                ));
             }
         } else if self.purpose != BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant {
-            return Err(WireValidationError::InvalidField("kernel_operation_binding"));
+            return Err(WireValidationError::InvalidField(
+                "kernel_operation_binding",
+            ));
         }
         if let Some(work_scope_ref) = &self.expected_work_scope_ref {
             validate_text("expected_work_scope_ref", work_scope_ref)?;
@@ -1209,12 +1213,13 @@ impl BlobProcessStreamVerifiedOwnerFacts {
         ] {
             validate_canonical_owner_json(name, json, digest)?;
         }
-        let scope_binding: eliot_receipts::WorkScopeBinding = serde_json::from_str(
-            &self.work_scope_receipt_binding_json,
-        )
-        .map_err(|_| WireValidationError::InvalidField("work_scope_receipt_binding"))?;
+        let scope_binding: eliot_receipts::WorkScopeBinding =
+            serde_json::from_str(&self.work_scope_receipt_binding_json)
+                .map_err(|_| WireValidationError::InvalidField("work_scope_receipt_binding"))?;
         if scope_binding.state_fence.resource_generation != scope_binding.resource_generation {
-            return Err(WireValidationError::InvalidField("work_scope_receipt_binding"));
+            return Err(WireValidationError::InvalidField(
+                "work_scope_receipt_binding",
+            ));
         }
         validate_optional_canonical_owner_json_pair(
             "stage_operation_binding",
@@ -1572,26 +1577,30 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             owner_facts_json, ..
         } = &self.outcome
         {
-            let owner_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
-                owner_facts_json,
-            )
-            .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
-            let scope_binding: eliot_receipts::WorkScopeBinding = serde_json::from_str(
-                &owner_facts.work_scope_receipt_binding_json,
-            )
-            .map_err(|_| WireValidationError::InvalidField("work_scope_receipt_binding"))?;
+            let owner_facts: BlobProcessStreamVerifiedOwnerFacts =
+                serde_json::from_str(owner_facts_json)
+                    .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
+            let scope_binding: eliot_receipts::WorkScopeBinding =
+                serde_json::from_str(&owner_facts.work_scope_receipt_binding_json)
+                    .map_err(|_| WireValidationError::InvalidField("work_scope_receipt_binding"))?;
             let scope_ref = match &self.outcome {
                 BlobProcessStreamOwnerFactsPullOutcome::Available { work_scope_ref, .. } => {
                     work_scope_ref.as_str()
                 }
-                _ => return Err(WireValidationError::InvalidField("work_scope_receipt_binding")),
+                _ => {
+                    return Err(WireValidationError::InvalidField(
+                        "work_scope_receipt_binding",
+                    ));
+                }
             };
             if scope_binding.product_id.as_str() != request.product_id
                 || scope_binding.scope_id.as_str() != scope_ref
                 || scope_binding.state_fence != request.state_fence
                 || scope_binding.resource_generation != request.state_fence.resource_generation
             {
-                return Err(WireValidationError::InvalidField("work_scope_receipt_binding"));
+                return Err(WireValidationError::InvalidField(
+                    "work_scope_receipt_binding",
+                ));
             }
             let current_operation = request.kernel_operation_binding_json.as_ref();
             let context_matches = match request.purpose {
@@ -2704,12 +2713,10 @@ fn validate_effect_context_pair(
     match (operation_json, authority_json, causal_json) {
         (None, None, None) => Ok(()),
         (Some(operation_json), Some(authority_json), Some(causal_json)) => {
-            let operation: eliot_receipts::OperationBinding =
-                serde_json::from_str(operation_json)
-                    .map_err(|_| WireValidationError::InvalidField("operation_binding"))?;
-            let authority: eliot_receipts::AuthorityBinding =
-                serde_json::from_str(authority_json)
-                    .map_err(|_| WireValidationError::InvalidField("authority_binding"))?;
+            let operation: eliot_receipts::OperationBinding = serde_json::from_str(operation_json)
+                .map_err(|_| WireValidationError::InvalidField("operation_binding"))?;
+            let authority: eliot_receipts::AuthorityBinding = serde_json::from_str(authority_json)
+                .map_err(|_| WireValidationError::InvalidField("authority_binding"))?;
             let causal: eliot_receipts::CausalBinding = serde_json::from_str(causal_json)
                 .map_err(|_| WireValidationError::InvalidField("causal_binding"))?;
             if operation.operation_kind != BLOB_PROCESS_STREAM_WIRE_ID

@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_bootstrap::capture::NormativePairSourceCapture;
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -16,15 +17,13 @@ use eliot_protocol::RequestIdentity;
 use eliot_receipts::{AuthorityBinding, CausalBinding};
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationId, ScopeId, SecurityContext, TransitionClass,
-    generated_operation_manifests, operation_manifest_set_digest,
-    supported_admission_contract_set_digest,
+    OperationId, ScopeId, SecurityContext, TransitionClass, generated_operation_manifests,
+    operation_manifest_set_digest, supported_admission_contract_set_digest,
 };
-use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_workscope::{
     GoverningSourceSet, ObservedScopeResources, PrivacyProfile, ScopeBinding, ScopeIdentity,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
-    admit_initial_binding, observed_scope_binding,
+    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor, admit_initial_binding,
+    observed_scope_binding,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -127,7 +126,9 @@ pub fn prepare_initial_work_scope_source_admission(
     if identity.request.metadata.state_fence != *fence
         || authority.state_fence != *fence
         || causal.state_fence != *fence
-        || !fence.authority_epoch.is_same_authority(&authority.authority_epoch)
+        || !fence
+            .authority_epoch
+            .is_same_authority(&authority.authority_epoch)
         || !eliot_store_api::effect_is_at_most(
             EffectClass::ReversibleMutation,
             authority.allowed_effect,
@@ -150,12 +151,10 @@ pub fn prepare_initial_work_scope_source_admission(
             state_fence,
             owner_revision,
             value_digest,
-        } if state_fence == fence
-            && *owner_revision > 0
-            && is_sha256(value_digest) => (*owner_revision, value_digest.clone()),
-        WorkScopeOwnerSnapshotReadback::Empty { state_fence, .. }
-            if state_fence != fence =>
-        {
+        } if state_fence == fence && *owner_revision > 0 && is_sha256(value_digest) => {
+            (*owner_revision, value_digest.clone())
+        }
+        WorkScopeOwnerSnapshotReadback::Empty { state_fence, .. } if state_fence != fence => {
             return Err(WorkScopeSourceAdmissionError::FenceMismatch);
         }
         WorkScopeOwnerSnapshotReadback::Empty { .. } => {
@@ -236,10 +235,7 @@ pub fn prepare_initial_work_scope_source_admission(
         "expected_work_scope_digest".to_owned(),
         Value::String(expected_digest),
     );
-    parameters.insert(
-        "snapshot_json".to_owned(),
-        Value::String(snapshot_json),
-    );
+    parameters.insert("snapshot_json".to_owned(), Value::String(snapshot_json));
     let operation_manifest_digest = operation_manifest_set_digest(
         &generated_operation_manifests()
             .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?,

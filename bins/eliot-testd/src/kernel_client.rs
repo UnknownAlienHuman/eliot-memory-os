@@ -72,8 +72,8 @@ use eliot_process::{
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    TestJob, TestdBlobProcessStreamCallOutcome, TestdBlobProcessStreamReserve,
-    TestdBlobProcessStreamGrantResolution, TestdBlobProcessStreamReadyReceipt,
+    TestJob, TestdBlobProcessStreamCallOutcome, TestdBlobProcessStreamGrantResolution,
+    TestdBlobProcessStreamReadyReceipt, TestdBlobProcessStreamReserve,
     TestdBlobProcessStreamTokenRef, TestdError, TestdStore, TestdTerminalCompletionNotice,
     TestdVerifierDispatchBinding, verification_receipt_sha256,
 };
@@ -965,9 +965,7 @@ impl KernelBlobStreamCallSequence {
             .resolve_blob_process_stream_grant(job_id, capability_ref)
             .map_err(|error| TestdIpcError::Contract(error.to_string()))?
         {
-            TestdBlobProcessStreamGrantResolution::Active(grant) => {
-                grant.process_binding_sha256
-            }
+            TestdBlobProcessStreamGrantResolution::Active(grant) => grant.process_binding_sha256,
             TestdBlobProcessStreamGrantResolution::NotFound
             | TestdBlobProcessStreamGrantResolution::Revoked => {
                 return Err(TestdIpcError::Contract(
@@ -1020,7 +1018,8 @@ impl KernelBlobStreamCallSequence {
         terminal_id: &str,
         ready_receipt_ref: &str,
     ) -> Result<Option<TestdBlobProcessStreamReadyReceipt>, TestdIpcError> {
-        let Some(proof) = self.store
+        let Some(proof) = self
+            .store
             .resolve_blob_process_stream_ready_receipt(
                 &self.job_id,
                 &self.capability.reference,
@@ -1527,11 +1526,8 @@ impl KernelProcessStreamSinkClient {
         // optional echo. A conflicting echo is refused above. Restart
         // reconciliation has no such local request and remains fail-closed
         // unless Kernel returns its durable original terminal request.
-        let terminal = terminal_from_projection(
-            &session,
-            TerminalCommand::Finalize(request),
-            *body,
-        )?;
+        let terminal =
+            terminal_from_projection(&session, TerminalCommand::Finalize(request), *body)?;
         validate_finalized_blob_ready_receipt(
             &terminal,
             blob_ready_receipt_json.as_deref(),
@@ -1955,11 +1951,7 @@ fn completed_ready_receipt(
         original_terminal_request.as_deref(),
         original_terminal_operation_sha256.as_deref(),
     ) {
-        (Some(original), Some(original_sha256))
-            if original_sha256 == operation_sha256 =>
-        {
-            original
-        }
+        (Some(original), Some(original_sha256)) if original_sha256 == operation_sha256 => original,
         (None, None) => {
             let requested = requested_operation?;
             if sha256_hex(&canonical_json_bytes(requested).ok()?).as_str()
@@ -1978,11 +1970,12 @@ fn completed_ready_receipt(
         return None;
     };
     let BlobProcessStreamOperationResponse::Sink {
-        response: ProcessStreamSinkWireResponse::Finalized {
-            body,
-            blob_ready_receipt_json: Some(receipt_json),
-            blob_ready_receipt_sha256: Some(receipt_sha256),
-        },
+        response:
+            ProcessStreamSinkWireResponse::Finalized {
+                body,
+                blob_ready_receipt_json: Some(receipt_json),
+                blob_ready_receipt_sha256: Some(receipt_sha256),
+            },
     } = &response.operation
     else {
         return None;

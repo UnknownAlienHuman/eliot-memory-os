@@ -2151,18 +2151,17 @@ impl DaemonComposition {
         let admission = snapshot
             .source_admission()
             .ok_or_else(|| "current WorkScope owner lacks admitted source provenance".to_owned())?;
-        let product_id = admission
-            .product_id
-            .as_ref()
-            .ok_or_else(|| "current WorkScope owner lacks its admitted product identity".to_owned())?;
+        let product_id = admission.product_id.as_ref().ok_or_else(|| {
+            "current WorkScope owner lacks its admitted product identity".to_owned()
+        })?;
         if product_id != expected_product_id {
-            return Err("current WorkScope product differs from the authenticated selector".to_owned());
+            return Err(
+                "current WorkScope product differs from the authenticated selector".to_owned(),
+            );
         }
         let work_scope = eliot_receipts::WorkScopeBinding {
-            scope_id: eliot_receipts::WorkScopeId::new(
-                snapshot.binding.scope.scope_ref.clone(),
-            )
-            .map_err(|error| format!("invalid current WorkScope identifier: {error}"))?,
+            scope_id: eliot_receipts::WorkScopeId::new(snapshot.binding.scope.scope_ref.clone())
+                .map_err(|error| format!("invalid current WorkScope identifier: {error}"))?,
             product_id: product_id.clone(),
             resource_generation: state_fence.resource_generation.clone(),
             state_fence: state_fence.clone(),

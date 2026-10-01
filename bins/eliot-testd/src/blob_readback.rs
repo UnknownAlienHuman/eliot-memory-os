@@ -379,8 +379,15 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             .as_ref()
             .ok_or_else(|| integrity_error(stream))?;
         let mut replay_owner = replay_owner_readback.ok_or_else(|| integrity_error(stream))?;
-        self.bind_finalize_receipt(request, &process_binding_sha256, source_fence, &mut replay_owner)?;
-        replay_owner.validate().map_err(|_| integrity_error(stream))?;
+        self.bind_finalize_receipt(
+            request,
+            &process_binding_sha256,
+            source_fence,
+            &mut replay_owner,
+        )?;
+        replay_owner
+            .validate()
+            .map_err(|_| integrity_error(stream))?;
         let observed_at_unix_ms = observed_at.ok_or_else(|| integrity_error(stream))?;
         let observed_at_unix_ms =
             i64::try_from(observed_at_unix_ms).map_err(|_| integrity_error(stream))?;
@@ -418,8 +425,11 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
         };
 
         let facts: eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts =
-            serde_json::from_str(&owner.owner_facts_json).map_err(|_| integrity_error(request.stream))?;
-        facts.validate().map_err(|_| integrity_error(request.stream))?;
+            serde_json::from_str(&owner.owner_facts_json)
+                .map_err(|_| integrity_error(request.stream))?;
+        facts
+            .validate()
+            .map_err(|_| integrity_error(request.stream))?;
         let scope: serde_json::Value = serde_json::from_str(&facts.work_scope_binding_json)
             .map_err(|_| integrity_error(request.stream))?;
         let work_scope_ref = scope
@@ -437,16 +447,15 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 .ok_or_else(|| integrity_error(request.stream))?,
         )
         .map_err(|_| integrity_error(request.stream))?;
-        let process_readback: BlobProcessSourceAdmissionReadback = serde_json::from_str(
-            &owner.process_source_admission_readback_json,
-        )
-        .map_err(|_| integrity_error(request.stream))?;
+        let process_readback: BlobProcessSourceAdmissionReadback =
+            serde_json::from_str(&owner.process_source_admission_readback_json)
+                .map_err(|_| integrity_error(request.stream))?;
         let admission = &process_readback.admission;
-        let open: eliot_process::ProcessStreamSinkOpenRequest = serde_json::from_str(
-            &admission.open_request_json,
-        )
-        .map_err(|_| integrity_error(request.stream))?;
-        open.validate().map_err(|_| integrity_error(request.stream))?;
+        let open: eliot_process::ProcessStreamSinkOpenRequest =
+            serde_json::from_str(&admission.open_request_json)
+                .map_err(|_| integrity_error(request.stream))?;
+        open.validate()
+            .map_err(|_| integrity_error(request.stream))?;
         let identity = BlobProcessSourceAdmissionIdentity {
             work_scope_ref: work_scope_ref.to_owned(),
             session_id: open.session_id().as_str().to_owned(),
@@ -492,7 +501,9 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 &request.ready_receipt_ref,
             )?
             .ok_or_else(|| integrity_error(request.stream))?;
-        receipt.validate().map_err(|_| integrity_error(request.stream))?;
+        receipt
+            .validate()
+            .map_err(|_| integrity_error(request.stream))?;
         let ready_receipt: serde_json::Value = serde_json::from_str(&receipt.receipt_json)
             .map_err(|_| integrity_error(request.stream))?;
         let ready_blob_hash = ready_receipt

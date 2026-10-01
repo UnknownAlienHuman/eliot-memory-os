@@ -5749,12 +5749,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                             .to_owned(),
                     ));
                 }
-                Ok(WorkScopeOwnerSnapshotReadback::Bound(WorkScopeOwnerReadback {
-                    state_fence: reply.state_fence,
-                    owner_revision: reply.revision,
-                    value_digest: reply.value_digest,
-                    snapshot: snapshot.clone(),
-                }))
+                Ok(WorkScopeOwnerSnapshotReadback::Bound(
+                    WorkScopeOwnerReadback {
+                        state_fence: reply.state_fence,
+                        owner_revision: reply.revision,
+                        value_digest: reply.value_digest,
+                        snapshot: snapshot.clone(),
+                    },
+                ))
             }
             _ => Err(CompositionError::Recovery(
                 "fresh Store WorkScope owner presence differs from the canonical Governor owner"
@@ -5777,8 +5779,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         expected
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if self.snapshot.state_fence() != &expected.state_fence
-            || self.owners.work_scope.is_some()
+        if self.snapshot.state_fence() != &expected.state_fence || self.owners.work_scope.is_some()
         {
             return Err(CompositionError::Recovery(
                 "initial WorkScope readback requires the current fence and an unbound in-memory owner"

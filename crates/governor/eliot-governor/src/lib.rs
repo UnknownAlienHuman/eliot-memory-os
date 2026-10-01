@@ -176,10 +176,6 @@ pub use capability_evidence_commit::{
     commit_capability_evidence_record,
 };
 pub use composition::*;
-pub use work_scope_source_admission::{
-    PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError,
-    prepare_initial_work_scope_source_admission,
-};
 pub use controlboard_projection::{
     ControlBoardAttentionEvaluationRow, ControlBoardGovernorSnapshot, ControlBoardOwnerBinding,
     ControlBoardProjectionError, ControlBoardReviewBatch, ControlBoardReviewBatchObligation,
@@ -333,6 +329,10 @@ pub use task_lifecycle::{
 pub use wasm_resolution::{
     CONFORMANCE_COMPONENT, CONFORMANCE_INPUT, CONFORMANCE_SEED, ContourAdmission,
     GovernorWasmAdmission, PromotionExpectations,
+};
+pub use work_scope_source_admission::{
+    PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError,
+    prepare_initial_work_scope_source_admission,
 };
 
 use std::collections::BTreeMap;

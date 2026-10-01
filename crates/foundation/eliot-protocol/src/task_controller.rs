@@ -221,22 +221,39 @@ impl TaskControllerInvocation {
                     "task_controller_invocation.task_id",
                 )?;
                 bounded_text(
-                    self.work_scope_id.as_deref().ok_or(ProtocolError::InvalidField {
-                        field: "task_controller_invocation.work_scope_id",
-                        reason: "is required for PROPOSE and APPLY",
-                    })?,
+                    self.work_scope_id
+                        .as_deref()
+                        .ok_or(ProtocolError::InvalidField {
+                            field: "task_controller_invocation.work_scope_id",
+                            reason: "is required for PROPOSE and APPLY",
+                        })?,
                     "task_controller_invocation.work_scope_id",
                 )?;
                 for (value, field) in [
-                    (&self.learning_state_view_recipe, "task_controller_invocation.learning_state_view_recipe"),
-                    (&self.context_campaign_recipe_catalogue, "task_controller_invocation.context_campaign_recipe_catalogue"),
-                    (&self.context_campaign_recipe, "task_controller_invocation.context_campaign_recipe"),
-                    (&self.context_input, "task_controller_invocation.context_input"),
+                    (
+                        &self.learning_state_view_recipe,
+                        "task_controller_invocation.learning_state_view_recipe",
+                    ),
+                    (
+                        &self.context_campaign_recipe_catalogue,
+                        "task_controller_invocation.context_campaign_recipe_catalogue",
+                    ),
+                    (
+                        &self.context_campaign_recipe,
+                        "task_controller_invocation.context_campaign_recipe",
+                    ),
+                    (
+                        &self.context_input,
+                        "task_controller_invocation.context_input",
+                    ),
                 ] {
-                    structured_object(value.as_ref().ok_or(ProtocolError::InvalidField {
+                    structured_object(
+                        value.as_ref().ok_or(ProtocolError::InvalidField {
+                            field,
+                            reason: "is required for PROPOSE and APPLY",
+                        })?,
                         field,
-                        reason: "is required for PROPOSE and APPLY",
-                    })?, field)?;
+                    )?;
                 }
             }
         }
@@ -297,9 +314,15 @@ fn validate_initial_scope_bind_input(value: &Value) -> Result<(), ProtocolError>
     })?;
     if object.len() != 4
         || object.keys().any(|key| {
-            !matches!(key.as_str(), "explicit_root" | "descriptor" | "sources" | "privacy")
+            !matches!(
+                key.as_str(),
+                "explicit_root" | "descriptor" | "sources" | "privacy"
+            )
         })
-        || object.get("explicit_root").and_then(Value::as_str).is_none_or(|root| root.trim().is_empty())
+        || object
+            .get("explicit_root")
+            .and_then(Value::as_str)
+            .is_none_or(|root| root.trim().is_empty())
     {
         return Err(ProtocolError::InvalidField {
             field: "task_controller_invocation.task_input",
@@ -307,10 +330,13 @@ fn validate_initial_scope_bind_input(value: &Value) -> Result<(), ProtocolError>
         });
     }
     for field in ["descriptor", "sources", "privacy"] {
-        structured_object(object.get(field).ok_or(ProtocolError::InvalidField {
-            field: "task_controller_invocation.task_input",
-            reason: "is missing a required BIND_SCOPE object",
-        })?, "task_controller_invocation.task_input")?;
+        structured_object(
+            object.get(field).ok_or(ProtocolError::InvalidField {
+                field: "task_controller_invocation.task_input",
+                reason: "is missing a required BIND_SCOPE object",
+            })?,
+            "task_controller_invocation.task_input",
+        )?;
     }
     Ok(())
 }

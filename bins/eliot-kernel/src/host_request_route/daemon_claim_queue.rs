@@ -432,7 +432,8 @@ impl KernelComposition {
                         owner_session_epoch: session.session_epoch,
                     };
                 }
-                let bind_scope = invocation.action == eliot_protocol::TaskControllerAction::BindScope;
+                let bind_scope =
+                    invocation.action == eliot_protocol::TaskControllerAction::BindScope;
                 let task_id = envelope
                     .identity
                     .task_id
@@ -1037,8 +1038,7 @@ fn task_controller_stale_attempt(
     if body.attempt.operation_id != body.operation_id
         || body.attempt.attempt_id != state.attempt_id
         || body.attempt.fencing_generation != state.generation
-        || body.attempt.task_id.as_ref().map(ToString::to_string)
-            != envelope.identity.task_id
+        || body.attempt.task_id.as_ref().map(ToString::to_string) != envelope.identity.task_id
         || body.attempt.scope_id != envelope.identity.work_scope_id
         || body.attempt.session_id
             != envelope
@@ -1306,8 +1306,7 @@ fn task_controller_admission(
             && envelope.identity.work_scope_id.is_none()
             && envelope.state_fence.task_revision.is_none()
     } else {
-        invocation.task_id.as_ref().map(ToString::to_string)
-            == envelope.identity.task_id
+        invocation.task_id.as_ref().map(ToString::to_string) == envelope.identity.task_id
             && invocation.work_scope_id == envelope.identity.work_scope_id
             && envelope.state_fence.task_revision.is_some()
     };

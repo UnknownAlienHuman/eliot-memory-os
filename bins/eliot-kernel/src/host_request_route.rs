@@ -1534,9 +1534,7 @@ impl KernelComposition {
                 )
                 .ok()
             })
-            .map(|invocation| {
-                invocation.action != eliot_protocol::TaskControllerAction::BindScope
-            });
+            .map(|invocation| invocation.action != eliot_protocol::TaskControllerAction::BindScope);
         let (receipt, record) = self
             .admit_host_request_envelope_with_tool_binding_under_transition(
                 envelope,

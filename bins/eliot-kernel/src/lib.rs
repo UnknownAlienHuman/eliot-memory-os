@@ -999,8 +999,9 @@ fn blob_operation_binding_json(
         effect,
         state_fence: identity.request.state_fence.clone(),
     };
-    let json = String::from_utf8(canonical_json_bytes(&operation).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())?;
+    let json =
+        String::from_utf8(canonical_json_bytes(&operation).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
     let digest = sha256_hex(json.as_bytes());
     Ok((json, digest))
 }
@@ -1945,8 +1946,7 @@ impl KernelComposition {
         store_open_request.owner_update_identity_json = None;
         store_open_request.owner_update_identity_sha256 = None;
         store_open_request.kernel_operation_binding_json = Some(kernel_operation_binding_json);
-        store_open_request.kernel_operation_binding_sha256 =
-            Some(kernel_operation_binding_sha256);
+        store_open_request.kernel_operation_binding_sha256 = Some(kernel_operation_binding_sha256);
         store_open_request.source_admission_json = Some(process_source_admission_json);
         store_open_request.source_admission_sha256 = Some(process_source_admission_sha256);
         store_open_request.source_admission_write_receipt_json =

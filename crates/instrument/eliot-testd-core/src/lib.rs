@@ -2021,7 +2021,10 @@ impl TestdBlobProcessStreamReadyReceipt {
             ("blob_stream.session_id", self.session_id.as_str()),
             ("blob_stream.source_id", self.source_id.as_str()),
             ("blob_stream.terminal_id", self.terminal_id.as_str()),
-            ("blob_stream.ready_receipt_ref", self.ready_receipt_ref.as_str()),
+            (
+                "blob_stream.ready_receipt_ref",
+                self.ready_receipt_ref.as_str(),
+            ),
         ] {
             validate_text(value, field)?;
         }
