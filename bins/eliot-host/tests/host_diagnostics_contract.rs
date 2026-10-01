@@ -685,6 +685,10 @@ fn empty_handle_input_renders_missing() {
         "empty handle must not render present: {text}"
     );
 }
+
+// WORK_UNIT_CASE: 889/8
+#[test]
+fn terminal_projection_shares_phase_identity() {
     // Positive: the terminal record for an operation carries the same
     // identity tuple as its phase records, so one failure correlates to
     // its operation under concurrency.
