@@ -57,8 +57,8 @@ pub use model::{
 pub use model_preferences::{
     MAX_MODEL_PREFERENCE_DOCUMENT_BYTES, MODEL_PREFERENCE_ENVELOPE_VERSION,
     MODEL_PREFERENCE_STORE_MAGIC, ModelPreferenceCasOutcome, ModelPreferencePublication,
-    ModelPreferenceStore, ModelPreferenceStoreError, PreferenceCasExpected,
-    StoredModelPreferenceEnvelope,
+    ModelPreferencePublicationReceipt, ModelPreferenceStore, ModelPreferenceStoreError,
+    PreferenceCasExpected, StoredModelPreferenceEnvelope,
 };
 pub use reactive_context::{
     DEFAULT_REACTIVE_CONTEXT_MAX_ATTEMPT_ITEMS, DEFAULT_REACTIVE_CONTEXT_MAX_BYTES,
