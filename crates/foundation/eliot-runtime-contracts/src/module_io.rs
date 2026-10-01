@@ -48,10 +48,7 @@ impl ProtocolRangeDeclaration {
             return Err(RuntimeContractError::Blank { field: "protocol" });
         }
         if self.protocol.chars().any(char::is_control) {
-            return Err(invalid(
-                "protocol",
-                "must not contain control characters",
-            ));
+            return Err(invalid("protocol", "must not contain control characters"));
         }
         if self.min_version > self.max_version {
             return Err(invalid(
@@ -106,11 +103,7 @@ impl ModuleProtocolRanges {
             ));
         }
         for protocol in &contract.protocols {
-            if !self
-                .ranges
-                .iter()
-                .any(|range| &range.protocol == protocol)
-            {
+            if !self.ranges.iter().any(|range| &range.protocol == protocol) {
                 return Err(invalid(
                     "protocol_ranges",
                     "contract protocol has no admitted range declaration",
