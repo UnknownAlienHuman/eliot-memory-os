@@ -2653,12 +2653,9 @@ impl VerifyAdmissionRefusal {
     /// refusal class has to choose its rendering here rather than inheriting one.
     fn into_reply(self, idempotency_key: &str) -> Value {
         match self {
-            Self::Shape { field, reason } => invalid_reply(
-                BACKUP_VERIFY_OPERATION,
-                idempotency_key,
-                field,
-                &reason,
-            ),
+            Self::Shape { field, reason } => {
+                invalid_reply(BACKUP_VERIFY_OPERATION, idempotency_key, field, &reason)
+            }
             Self::RetainedOwnerAbsent {
                 missing_owner,
                 reason,
@@ -4469,7 +4466,8 @@ const fn restore_error_code(error: &KernelRestoreError) -> &'static str {
         KernelRestoreError::OwnerEvidenceInvalid(_) => "restore-owner-evidence-invalid",
         KernelRestoreError::CutoverNotAuthorized => "cutover-not-authorized",
         KernelRestoreError::TargetFailed(_)
-        | KernelRestoreError::StagedCleanupIncomplete { .. } => "restore-engine-failed",
+        | KernelRestoreError::StagedCleanupIncomplete { .. }
+        | KernelRestoreError::RetainedForResume { .. } => "restore-engine-failed",
     }
 }
 
