@@ -65,12 +65,57 @@ impl ContextExecutionIdentity {
         )
     }
 
+    /// Require that this execution's serializer identity is the render owner's.
+    ///
+    /// I2.16 places `serializer_id_version_and_options` on
+    /// `SerializedContextMeasurement` and states at `:163` that "Context
+    /// admission and profile qualification use the exact bytes that the selected
+    /// route will receive", and at `:181` that "Any change to route, tokenizer,
+    /// serializer, tool surface or provider rewrite behavior invalidates the
+    /// qualification". This record is the assembly owner's statement of the
+    /// codec it actually applied to the delivered bytes, so its three values
+    /// name a codec and must be the ones the codec owner published.
+    ///
+    /// [`binds_measurement`](Self::binds_measurement) cannot establish that on
+    /// its own: it compares this record against the independently recorded
+    /// measurement, and both are written by the same execution, so two records
+    /// agreeing on a foreign codec satisfy it. `SerializedContextMeasurement::
+    /// validate` is a closed shape check and names no codec either. This is the
+    /// relation that names the owner, exactly as
+    /// [`crate::MeasurementCompositionProfile::binds_canonical_render_serializer`]
+    /// does for the admission profile, and it is the same single owner record
+    /// (`crate::canonical_render_serializer`) rather than a second one.
+    ///
+    /// Both sides are compared as recorded: nothing is recomputed to stand in
+    /// for this identity, and no value is defaulted or substituted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidField`] when this record does not satisfy
+    /// its own closed contract, and [`ContextError::IdentityConflict`] when this
+    /// execution names another serializer, another revision, or another options
+    /// digest than the owner issued.
+    pub fn binds_canonical_render_serializer(&self) -> Result<(), ContextError> {
+        self.validate()?;
+        crate::canonical_render_serializer()?.binds(
+            &self.serializer_id,
+            &self.serializer_version,
+            &self.serializer_options_digest,
+        )
+    }
+
     /// Require that the independently recorded measurement is this execution's.
     ///
     /// The ORIGINAL recorded values of both records are compared. No digest is
     /// recomputed to stand in for the measurement, and this execution identity
     /// is not an input to any digest the measurement is checked against, so the
     /// comparison cannot be satisfied by a record describing itself.
+    ///
+    /// This is a two-record agreement and is deliberately not an owner check:
+    /// both sides are written by the same execution, so it says the delivery is
+    /// internally consistent about its codec and nothing about which codec that
+    /// is. [`binds_canonical_render_serializer`](Self::binds_canonical_render_serializer)
+    /// is the relation that names the owner.
     pub fn binds_measurement(
         &self,
         measurement: &SerializedContextMeasurement,

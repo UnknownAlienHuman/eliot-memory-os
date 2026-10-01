@@ -344,6 +344,117 @@ fn valid_input_binds_measurement_floor_priority_and_rule() {
     );
 }
 
+/// A shape-valid exact UTF-8 measurement for the given binding, used to show
+/// what the two-record agreement sees and does not see.
+fn exact_utf8_measurement(context: &ContextBinding) -> SerializedContextMeasurement {
+    SerializedContextMeasurement {
+        measurement_id: id("measurement"),
+        context: context.clone(),
+        schema_version: CONTEXT_CONTRACT_VERSION,
+        envelope_digest: digest(),
+        serializer_id: "json-v1".to_owned(),
+        serializer_version: "1".to_owned(),
+        serializer_options_digest: digest(),
+        route_id: "route".to_owned(),
+        model_id: "model".to_owned(),
+        rendered_utf8_bytes: 13,
+        stu_estimate: None,
+        tokenizer: None,
+        status: MeasurementStatus::ExactUtf8,
+        fixed_overhead: 2,
+        output_reserve: 3,
+        review_reserve: 4,
+        false_safe_overflow: None,
+        false_rejection_or_decomposition: None,
+        valid_until: None,
+    }
+}
+
+/// The execution identity the campaign Context lane delivers, stamped with the
+/// owner-issued codec rather than a fixture string.
+///
+/// #1862 BLOCK-2. The triple is read from the one owner record through its
+/// accessors, so the positive case cannot pass by naming a hard-coded constant
+/// that happens to match a copy of the identity: if the owner's issuance
+/// changes, this fixture changes with it and the refusal cases below still hold.
+fn owner_stamped_execution() -> ContextExecutionIdentity {
+    let owner = canonical_render_serializer().expect("owner-issued codec identity");
+    ContextExecutionIdentity {
+        ordering_revision: "a18.declared-role-position.v1".to_owned(),
+        serializer_id: owner.serializer_id().to_owned(),
+        serializer_version: owner.serializer_version().to_owned(),
+        serializer_options_digest: owner.serializer_options_digest().to_owned(),
+        route_id: "route".to_owned(),
+        model_id: "model".to_owned(),
+        measurement_status: MeasurementStatus::ExactUtf8,
+    }
+}
+
+#[test]
+fn delivered_execution_identity_binds_the_owner_issued_serializer() {
+    // Positive: the owner-issued triple is accepted, and it is accepted as the
+    // values the owner actually published rather than as a shape that merely
+    // looks like an identity.
+    let execution = owner_stamped_execution();
+    execution
+        .binds_canonical_render_serializer()
+        .expect("owner-issued serializer identity binds");
+    let owner = canonical_render_serializer().expect("owner-issued codec identity");
+    assert_eq!(execution.serializer_id, owner.serializer_id());
+    assert_eq!(execution.serializer_version, owner.serializer_version());
+    assert_eq!(
+        execution.serializer_options_digest,
+        owner.serializer_options_digest()
+    );
+
+    // Refusal: a foreign serializer id on an otherwise well-formed execution
+    // identity is refused and cannot reach a positive verdict. A blank one is
+    // refused too, and by the shape validator rather than the owner comparison,
+    // so it never gets as far as naming a codec.
+    let mut foreign = execution.clone();
+    foreign.serializer_id = "foreign-serializer".to_owned();
+    assert_eq!(
+        foreign.binds_canonical_render_serializer(),
+        Err(ContextError::IdentityConflict)
+    );
+    // A wrong options digest is the same defect observed on the other half of
+    // the record, so it is refused by name rather than only the id being read.
+    let mut wrong_options = execution.clone();
+    wrong_options.serializer_options_digest = "b".repeat(64);
+    assert_eq!(
+        wrong_options.binds_canonical_render_serializer(),
+        Err(ContextError::IdentityConflict)
+    );
+    // A wrong revision likewise.
+    let mut wrong_version = execution.clone();
+    wrong_version.serializer_version = "not-the-owner-revision".to_owned();
+    assert_eq!(
+        wrong_version.binds_canonical_render_serializer(),
+        Err(ContextError::IdentityConflict)
+    );
+    let mut blank = execution.clone();
+    blank.serializer_id = "   ".to_owned();
+    assert_eq!(
+        blank.binds_canonical_render_serializer(),
+        Err(ContextError::InvalidField("execution.serializer_id"))
+    );
+    // The two-record agreement this replaces cannot see any of the three
+    // foreign cases, because it only compares the execution against a
+    // measurement written by the same execution. That is why the owner
+    // comparison is a separate relation and not a restatement of it.
+    let mut agreeing_measurement = exact_utf8_measurement(&binding());
+    agreeing_measurement.serializer_id = "foreign-serializer".to_owned();
+    let mut agreeing_execution = foreign;
+    agreeing_execution.serializer_id = agreeing_measurement.serializer_id.clone();
+    agreeing_execution
+        .binds_measurement(&agreeing_measurement)
+        .expect("two records written by the same execution agree");
+    assert_eq!(
+        agreeing_execution.binds_canonical_render_serializer(),
+        Err(ContextError::IdentityConflict)
+    );
+}
+
 #[test]
 fn canonical_digest_is_stable_for_set_permutations() {
     let mut first = input();

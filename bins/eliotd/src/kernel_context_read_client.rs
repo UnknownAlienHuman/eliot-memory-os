@@ -87,12 +87,12 @@ use eliot_context_candidates::{
 };
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasurement, AdmissionRuleIdentity,
-    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError, ContextOutcome,
-    ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
-    HeadroomAllocationLedger, HeadroomDimension, MeasurementCompositionProfile,
-    PriorityPolicyIdentity, ProviderId, QualityRefusal, QualityScorecard, ResolvedContextRecipe,
-    SafetyFloorIdentity, SerializedContextMeasurement, SuppliedOmissionBinding,
-    canonical_render_serializer,
+    AdmittedContextSet, CONTEXT_CONTRACT_VERSION, ContextBinding, ContextError,
+    ContextExecutionIdentity, ContextOutcome, ContextRecipe, DecisionContextIncomplete,
+    DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAllocationLedger,
+    HeadroomDimension, MeasurementCompositionProfile, MeasurementStatus, PriorityPolicyIdentity,
+    ProviderId, QualityRefusal, QualityScorecard, ResolvedContextRecipe, SafetyFloorIdentity,
+    SerializedContextMeasurement, SuppliedOmissionBinding, canonical_render_serializer,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, ResourceGeneration, SourceId,
@@ -2451,6 +2451,13 @@ impl KernelContextReadClient {
         assembled
             .verify_boundaries()
             .map_err(|error| PacketCompositionError::Assembly(Box::new(error)))?;
+        // #1862 BLOCK-2: the delivered execution identity is the record that
+        // travels with the bytes, so it is the one that must name the Context
+        // render owner's codec. The input policy was bound above; this binds the
+        // output, and a packet that reaches `Ok` cannot be handed over naming a
+        // codec the owner never published.
+        require_delivered_context_render_codec(&assembled.view.execution)
+            .map_err(|error| PacketCompositionError::Assembly(Box::new(AssemblyError::from(error))))?;
         recheck_packet_headroom(&assembled, recipe, &headroom)?;
         // Release through the owner's own port. The evidence is DISCARDED here
         // for the same pre-existing reason the Context-side release
@@ -2515,6 +2522,34 @@ fn require_context_render_codec_id(serializer_id: &str) -> Result<(), ContextErr
         owner.serializer_version(),
         owner.serializer_options_digest(),
     )
+}
+
+/// Require the DELIVERED view's execution identity to be the owner-issued codec.
+///
+/// #1862 BLOCK-2, delivery half. `require_context_render_codec` above binds the
+/// route's *input* `AssemblyPolicy` to the Context render owner, and
+/// `MeasurementCompositionProfile::binds_canonical_render_serializer` binds the
+/// admission profile. Neither of those is the record that travels with the
+/// bytes. `applied_execution_identity` in `eliot-context-assembly` copies the
+/// policy's triple onto the view, and `ActiveUnderstandingView::validate`
+/// compares that execution identity against the view's own measurement with
+/// `binds_measurement` — a two-record agreement in which both sides are written
+/// by the same execution, so a view naming a foreign codec on both satisfies it.
+///
+/// I2.16:181 makes any change to the serializer invalidate the qualification,
+/// and I2.16:163 requires that admission and profile qualification use the exact
+/// bytes the selected route will receive. That is only a statement about a real
+/// codec if the delivered identity is compared against the owner that published
+/// the codec, so the DELIVERED execution identity is bound here, at the point
+/// the packet is returned to the caller and before `Ok` hands it over. This adds
+/// one relation and removes none: the two comparisons above still run, and the
+/// owner's typed `ContextError` still crosses as
+/// [`PacketCompositionError::Assembly`], carrying the assembly owner's own
+/// refusal rather than a generic code.
+fn require_delivered_context_render_codec(
+    execution: &ContextExecutionIdentity,
+) -> Result<(), ContextError> {
+    execution.binds_canonical_render_serializer()
 }
 
 /// Require one serializer triple to be the owner-issued canonical render codec.
@@ -3496,5 +3531,62 @@ mod tests {
             Err(StoreError::UnknownOperation)
         ));
         Ok(())
+    }
+
+    /// #1862 BLOCK-2: the delivered execution identity stamped with the codec
+    /// the Context render owner actually published, read through the owner's own
+    /// accessors so this fixture cannot drift into a second copy of the
+    /// identity.
+    fn owner_stamped_execution() -> Result<ContextExecutionIdentity, ContextError> {
+        let owner = canonical_render_serializer()?;
+        Ok(ContextExecutionIdentity {
+            ordering_revision: "a18.declared-role-position.v1".to_owned(),
+            serializer_id: owner.serializer_id().to_owned(),
+            serializer_version: owner.serializer_version().to_owned(),
+            serializer_options_digest: owner.serializer_options_digest().to_owned(),
+            route_id: "route".to_owned(),
+            model_id: "model".to_owned(),
+            measurement_status: MeasurementStatus::ExactUtf8,
+        })
+    }
+
+    #[test]
+    fn delivered_serializer_identity_must_be_the_owner_issued_one() {
+        // Positive: the owner-issued identity passes the delivery check, so the
+        // real codec is not refused by the check that closes BLOCK-2.
+        let owner_stamped = owner_stamped_execution().expect("owner-issued identity");
+        require_delivered_context_render_codec(&owner_stamped)
+            .expect("owner-issued delivered identity binds");
+
+        // Refusal: a foreign codec on an otherwise well-formed delivered
+        // identity is refused and never reaches a positive verdict. Empty and
+        // blank identities are refused by the shape validator first, so neither
+        // can pass as "some serializer".
+        let mut foreign = owner_stamped.clone();
+        foreign.serializer_id = "foreign-serializer".to_owned();
+        assert_eq!(
+            require_delivered_context_render_codec(&foreign),
+            Err(ContextError::IdentityConflict)
+        );
+        let mut wrong_options = owner_stamped.clone();
+        wrong_options.serializer_options_digest = "b".repeat(64);
+        assert_eq!(
+            require_delivered_context_render_codec(&wrong_options),
+            Err(ContextError::IdentityConflict)
+        );
+        let mut empty = owner_stamped.clone();
+        empty.serializer_id = String::new();
+        assert_eq!(
+            require_delivered_context_render_codec(&empty),
+            Err(ContextError::InvalidField("execution.serializer_id"))
+        );
+        let mut blank = owner_stamped;
+        blank.serializer_options_digest = "   ".to_owned();
+        assert_eq!(
+            require_delivered_context_render_codec(&blank),
+            Err(ContextError::InvalidField(
+                "execution.serializer_options_digest"
+            ))
+        );
     }
 }
