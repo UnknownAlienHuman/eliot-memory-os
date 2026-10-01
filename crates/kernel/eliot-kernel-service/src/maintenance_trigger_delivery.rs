@@ -1557,3 +1557,38 @@ pub fn handle_maintenance_trigger_gap(
     session.service_context(service)?;
     ledger.record_gap(trigger_id, kind, detail, now_unix_ms)
 }
+
+/// Compacts one settled row through live authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::compact`]: only the consumed
+/// live-claim binding is dropped after exact ack or terminal disposition,
+/// so the record, decision receipt, terminal disposition, and gap records
+/// stay readable under the retention policy. Compaction of an unsettled
+/// row is refused; an unresolved trigger is never deleted here.
+pub fn handle_maintenance_trigger_compact(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    trigger_id: &str,
+) -> Result<(), MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.compact(trigger_id)
+}
+
+/// Reports per-disposition recovery counts through live authority.
+///
+/// Re-validates the session, then delegates to
+/// [`MaintenanceTriggerDeliveryLedger::recovery_counts`]: pending, claimed,
+/// decision-recorded, and acknowledged states (plus reconciling, expired,
+/// and superseded) for the role-filtered recovery surface. Terminal rows
+/// report with identity and evidence preserved; reporting never resolves
+/// or deletes an unresolved trigger.
+pub fn handle_maintenance_trigger_recovery_counts(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &MaintenanceTriggerDeliveryLedger,
+) -> Result<MaintenanceTriggerRecoveryCounts, MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    Ok(ledger.recovery_counts())
+}
