@@ -55,7 +55,7 @@ pub(crate) mod surreal_swarm;
 pub(crate) mod surreal_task_acceptance;
 use atomic_write::{
     ErasureInTx, TxLane, erasure_in_tx_parts, read_sealed_erasure_outcomes, to_value,
-    write_canonical_transaction,
+    write_canonical_transaction_with_expected_heads,
 };
 #[cfg(test)]
 use atomic_write::{ordering_write_template, revision_write_template, write_transaction};
@@ -1495,7 +1495,7 @@ async fn apply_with_retry(
             rendezvous_before_transaction(adapter).await?;
         }
 
-        match write_canonical_transaction(
+        let transaction = write_canonical_transaction_with_expected_heads(
             db,
             &adapter.config,
             &transition,
@@ -1512,6 +1512,9 @@ async fn apply_with_retry(
                 .map_or(1, |value| value.next_outbox_sequence),
             &verified.current_revisions,
             &verified.current_orderings,
+            &expected_revision_heads,
+            &expected_ordering_heads,
+            &verified.current_chain_tips,
             lane,
             &legs.notification,
             &legs.reactive,
@@ -1520,8 +1523,21 @@ async fn apply_with_retry(
             &legs.learning,
             erasure,
         )
-        .await
-        {
+        .await;
+        // The provider RPC can return a serialization error after the
+        // transaction request was sent, while decoding its response. Since
+        // this boundary does not expose whether serialization failed before
+        // or after submission, preserve the operation as unknown instead of
+        // asserting cancellation and inviting a new operation identity.
+        let transaction = transaction.map_err(|error| match error {
+            AdapterError::Serialization(_) | AdapterError::Store(StoreError::Serialization(_)) => {
+                AdapterError::UnknownOutcome {
+                    operation_id: transition.identity.operation_id.to_string(),
+                }
+            }
+            other => other,
+        });
+        match transaction {
             Ok(()) => {
                 // The error-free RPC proved its terminal allocation slot;
                 // the returned receipt is the durable readback, never the
