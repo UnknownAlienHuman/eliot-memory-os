@@ -10,38 +10,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use eliot_agent_api::{AttemptId, RouteFingerprint};
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize};
-use thiserror::Error;
+
+pub use eliot_agent_contracts::{
+    BillingClass, HumanModelPreferencePolicy, ModelControlError, ModelRole, ModelSelector,
+    RoleModelPreference, MODEL_PREFERENCE_SCHEMA_VERSION,
+};
+pub(crate) use eliot_agent_contracts::preference_policy_digest;
 
 use crate::CoordinatedAttemptState;
 
 pub const MODEL_CATALOGUE_SCHEMA_VERSION: &str = "eliot.agent-model-catalogue/v1";
-pub const MODEL_PREFERENCE_SCHEMA_VERSION: &str = "eliot.agent-model-preference/v1";
 pub const MODEL_QUERY_RECEIPT_VERSION: &str = "eliot.agent-model-query-receipt/v1";
 pub const MODEL_SELECTION_RECEIPT_VERSION: &str = "eliot.agent-model-selection-receipt/v2";
 pub const ATTEMPT_HEALTH_PROJECTION_VERSION: &str = "eliot.agent-attempt-health/v1";
 
 const MAX_CATALOGUE_ENTRIES: usize = 4096;
 const MAX_QUERY_RESULTS: usize = 512;
-const MAX_SELECTORS: usize = 256;
 const MAX_EVIDENCE_REFS: usize = 256;
-
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum ModelControlError {
-    #[error("invalid model-control field: {0}")]
-    InvalidField(&'static str),
-    #[error("unsupported model-control schema: {0}")]
-    UnsupportedSchema(&'static str),
-    #[error("duplicate model-control identity: {0}")]
-    DuplicateIdentity(&'static str),
-    #[error("catalogue observation is stale")]
-    StaleCatalogue,
-    #[error("Human preference policy has no entry for role {0:?}")]
-    MissingRolePolicy(ModelRole),
-    #[error("no dispatchable route exists for role {0:?}")]
-    NoDispatchableRoute(ModelRole),
-    #[error("canonical serialization failed: {0}")]
-    Serialization(String),
-}
 
 fn validate_text(value: &str, field: &'static str) -> Result<(), ModelControlError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
@@ -110,28 +95,6 @@ pub(crate) fn catalogue_digest(
         .entries
         .sort_by(|left, right| left.deterministic_key().cmp(&right.deterministic_key()));
     canonical_digest(&normalized)
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ModelRole {
-    MainAgent,
-    Worker,
-    Challenger,
-    Verifier,
-    Researcher,
-    Synthesis,
-    Watchdog,
-    Dreamer,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum BillingClass {
-    Free,
-    SubscriptionIncluded,
-    Paid,
-    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -584,129 +547,6 @@ pub fn query_model_catalogue(
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelSelector {
-    pub host_family: Option<String>,
-    pub provider_id: Option<String>,
-    pub model_id: Option<String>,
-    pub model_family: Option<String>,
-}
-
-impl ModelSelector {
-    pub(crate) fn validate(&self) -> Result<(), ModelControlError> {
-        let values = [
-            self.host_family.as_deref(),
-            self.provider_id.as_deref(),
-            self.model_id.as_deref(),
-            self.model_family.as_deref(),
-        ];
-        if values.iter().all(Option::is_none) {
-            return Err(ModelControlError::InvalidField("selector"));
-        }
-        for value in values.into_iter().flatten() {
-            validate_text(value, "selector.value")?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn matches(&self, entry: &ModelCatalogueEntry) -> bool {
-        self.host_family
-            .as_deref()
-            .is_none_or(|value| value == entry.host_family)
-            && self
-                .provider_id
-                .as_deref()
-                .is_none_or(|value| value == entry.provider_id)
-            && self
-                .model_id
-                .as_deref()
-                .is_none_or(|value| value == entry.model_id)
-            && self
-                .model_family
-                .as_deref()
-                .is_none_or(|value| value == entry.model_family)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoleModelPreference {
-    pub role: ModelRole,
-    pub preferred: Vec<ModelSelector>,
-    pub denied: Vec<ModelSelector>,
-    pub allowed_billing: BTreeSet<BillingClass>,
-    pub allow_paid_fallback: bool,
-    pub allow_degraded_routes: bool,
-    pub minimum_context_window: u64,
-    pub maximum_cost_class: u16,
-    pub maximum_latency_class: u16,
-    pub required_capabilities: BTreeSet<String>,
-}
-
-impl RoleModelPreference {
-    fn validate(&self) -> Result<(), ModelControlError> {
-        if self.preferred.len() > MAX_SELECTORS
-            || self.denied.len() > MAX_SELECTORS
-            || self.allowed_billing.is_empty()
-            || self.minimum_context_window == 0
-        {
-            return Err(ModelControlError::InvalidField("role_preference"));
-        }
-        for selector in self.preferred.iter().chain(&self.denied) {
-            selector.validate()?;
-        }
-        for capability in &self.required_capabilities {
-            validate_text(capability, "role_preference.required_capability")?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanModelPreferencePolicy {
-    pub schema_version: String,
-    pub policy_id: String,
-    pub revision: String,
-    pub account_scope: String,
-    pub roles: Vec<RoleModelPreference>,
-}
-
-impl HumanModelPreferencePolicy {
-    pub fn validate(&self) -> Result<(), ModelControlError> {
-        if self.schema_version != MODEL_PREFERENCE_SCHEMA_VERSION {
-            return Err(ModelControlError::UnsupportedSchema("model_preference"));
-        }
-        validate_text(&self.policy_id, "policy.policy_id")?;
-        validate_text(&self.revision, "policy.revision")?;
-        validate_text(&self.account_scope, "policy.account_scope")?;
-        if self.roles.is_empty() || self.roles.len() > 64 {
-            return Err(ModelControlError::InvalidField("policy.roles"));
-        }
-        let mut roles = BTreeSet::new();
-        for role in &self.roles {
-            role.validate()?;
-            if !roles.insert(role.role) {
-                return Err(ModelControlError::DuplicateIdentity("policy.role"));
-            }
-        }
-        Ok(())
-    }
-}
-
-pub(crate) fn preference_policy_digest(
-    policy: &HumanModelPreferencePolicy,
-) -> Result<String, ModelControlError> {
-    let mut normalized = policy.clone();
-    normalized.roles.sort_by_key(|preference| preference.role);
-    for preference in &mut normalized.roles {
-        preference.denied.sort();
-        preference.denied.dedup();
-    }
-    canonical_digest(&normalized)
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "kind", content = "detail")]
 pub enum SelectionRejection {
     Dispatch(DispatchBlocker),
@@ -908,6 +748,29 @@ impl ModelSelectionReceipt {
     }
 }
 
+/// Catalogue-dependent selector matching. This stays in the coordinator with
+/// ranking and queries: the contract crate owns the selector shape and its
+/// structural validation, but matching a selector against a catalogue entry
+/// requires the catalogue types that live here.
+pub(crate) fn model_selector_matches(
+    selector: &ModelSelector,
+    entry: &ModelCatalogueEntry,
+) -> bool {
+    selector.host_family.as_deref().is_none_or(|value| value == entry.host_family)
+        && selector
+            .provider_id
+            .as_deref()
+            .is_none_or(|value| value == entry.provider_id)
+        && selector
+            .model_id
+            .as_deref()
+            .is_none_or(|value| value == entry.model_id)
+        && selector
+            .model_family
+            .as_deref()
+            .is_none_or(|value| value == entry.model_family)
+}
+
 pub(crate) fn selection_rejections_with_blockers(
     entry: &ModelCatalogueEntry,
     preference: &RoleModelPreference,
@@ -923,7 +786,7 @@ pub(crate) fn selection_rejections_with_blockers(
     if preference
         .denied
         .iter()
-        .any(|selector| selector.matches(entry))
+        .any(|selector| model_selector_matches(selector, entry))
     {
         reasons.insert(SelectionRejection::DeniedByHumanPolicy);
     }
