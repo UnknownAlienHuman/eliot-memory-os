@@ -85,6 +85,7 @@ pub use profile::{
     package_verification_profile, test_profile,
 };
 pub use profile_replay::{ProfileReplayError, ProfileReplayReceipt, replay_profile_stream};
+pub use eliot_module_registry::VerifiedModuleCatalogGeneration;
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
     ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,

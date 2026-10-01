@@ -34,6 +34,7 @@ use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
 use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
 use eliot_instrument_scip::{MAX_SCIP_BYTES, SCIP_INSTRUMENT};
+use eliot_module_registry::VerifiedModuleCatalogGeneration;
 use eliot_verifier::CONTRACT_NAME as VERIFIER_CONTRACT_NAME;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1046,6 +1047,9 @@ pub struct ProviderRegistry {
     entries: BTreeMap<(String, String), RegistryEntry>,
     generation: u64,
     normative_pair_digest: String,
+    /// Present only when a current accepted Module Catalog readback issued
+    /// this registry. Fixture and legacy in-process registries stay unproven.
+    lifecycle: Option<VerifiedModuleCatalogGeneration>,
 }
 
 impl ProviderRegistry {
@@ -1098,7 +1102,27 @@ impl ProviderRegistry {
             entries: map,
             generation,
             normative_pair_digest,
+            lifecycle: None,
         })
+    }
+
+    /// Assembles the one provider registry against a current accepted module
+    /// catalog lifecycle. The catalog semantic revision supplies the provider
+    /// generation domain; runtime activation and ProfileRegistry generations
+    /// are not accepted here.
+    ///
+    /// The `fingerprints` must be independently observed by the caller for
+    /// this run. This constructor preserves those exact values in the registry
+    /// and refuses any missing axis through [`ProviderRegistry::ready`].
+    pub fn ready_for_catalog_generation(
+        lifecycle: VerifiedModuleCatalogGeneration,
+        normative_pair_digest: String,
+        fingerprints: &InvalidationSet,
+    ) -> Result<Self, RegistryError> {
+        let generation = lifecycle.provider_registry_generation();
+        let mut registry = Self::ready(generation, normative_pair_digest, fingerprints)?;
+        registry.lifecycle = Some(lifecycle);
+        Ok(registry)
     }
 
     /// Assembles the six ready provider entries.
@@ -1325,6 +1349,13 @@ impl ProviderRegistry {
     /// Normative-pair digest this registry was assembled against.
     pub fn normative_pair_digest(&self) -> &str {
         &self.normative_pair_digest
+    }
+
+    /// The exact accepted Module Catalog lifecycle that issued this registry,
+    /// when the production owner-readback constructor was used.
+    #[must_use]
+    pub fn lifecycle_binding(&self) -> Option<&VerifiedModuleCatalogGeneration> {
+        self.lifecycle.as_ref()
     }
 
     /// Verifies the declared profile identities of every registered entry.
