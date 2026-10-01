@@ -418,10 +418,34 @@ impl KernelComposition {
             .map_err(|_| NativeWorkerRouteError::Fence {
                 field: "registration_binding",
             })?;
+        let record = self.load_claim_record(&claim_id)?;
+        let owner_record_json = record
+            .executable_binding_record_json
+            .as_deref()
+            .ok_or(NativeWorkerRouteError::Fence {
+                field: "executable_binding_owner_record",
+            })?;
+        let owner_binding: eliot_kernel_service::NativeWorkerExecutableBindingPublication =
+            serde_json::from_str(owner_record_json).map_err(|_| {
+                NativeWorkerRouteError::Fence {
+                    field: "executable_binding_owner_record",
+                }
+            })?;
+        owner_binding
+            .validate_original_binding()
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "executable_binding_owner_record",
+            })?;
+        Self::require_owner_binding_matches_claim_row(
+            &owner_binding,
+            &record,
+            request.attempt_id.as_str(),
+        )?;
         let service = self.service_guard()?;
         let live_epoch = service.authority_epoch();
         let expectation = Self::build_executable_expectation(
-            request.executable_binding.as_ref(),
+            &owner_binding,
+            &record,
             registration,
             &registration_fence,
             &live_epoch,
@@ -435,7 +459,6 @@ impl KernelComposition {
                 field: "executable_binding",
             })?;
         drop(service);
-        let record = self.load_claim_record(&claim_id)?;
         // Bind the presentation to the durable admission: the presented
         // claim digest must equal the staged digest, so a re-cut join under
         // the known claim identity cannot ride this transport. The T9-02

@@ -28,7 +28,8 @@ use crate::protocol::{
     KernelActivationQuery, KernelActivationReceipt, KernelControlCommand, KernelReadyReceipt,
     NATIVE_WORKER_CLAIM_WIRE_ID, NativeWorkerClaimConflict, NativeWorkerClaimReceipt,
     NativeWorkerClaimRejection, NativeWorkerClaimRejectionReason, NativeWorkerClaimRequest,
-    NativeWorkerClaimResponse,
+    NativeWorkerClaimResponse, NativeWorkerExecutableBindingPublication,
+    NativeWorkerExecutableExpectation,
 };
 use crate::validate_text;
 
@@ -1632,7 +1633,11 @@ fn native_worker_claim_identity<T>(
 /// from the exact presented bytes so replay comparison is byte-exact.
 fn native_worker_claim_staged_record(
     request: &NativeWorkerClaimRequest,
+    owner_binding: Option<&NativeWorkerExecutableBindingPublication>,
 ) -> Result<NativeWorkerClaimRecord, KernelServiceError> {
+    let owner_json = owner_binding
+        .map(NativeWorkerExecutableBindingPublication::canonical_record_json)
+        .transpose()?;
     Ok(NativeWorkerClaimRecord {
         contract_version: eliot_ors::CONTRACT_VERSION,
         claim_id: native_worker_claim_identity(
@@ -1680,23 +1685,19 @@ fn native_worker_claim_staged_record(
         authority_epoch: request.authority_epoch.sequence.get(),
         binding_digest: request.binding_digest.clone(),
         request_digest: request.request_digest.clone(),
-        // The staged executable digest is the presented v2 join value. It
-        // becomes owner-verified when the route's enforce gate compares this
-        // identical value against the live owner record before Admitted is
-        // emitted; v1/absent joins stage empty and never verify.
-        executable_binding_digest: request
-            .executable_binding
-            .as_ref()
-            .map(|join| join.executable_binding_digest.clone())
+        // Only the independent Governor publication populates this owner
+        // binding. The worker's presented join never supplies retained proof.
+        executable_binding_digest: owner_binding
+            .map(|binding| binding.binding_digest.clone())
             .unwrap_or_default(),
+        executable_binding_record_json: owner_json,
         execution_unit_schema_version: request.execution_unit_schema_version,
         predecessor_revision: native_worker_claim_identity(
             OpaqueLabel::new(request.predecessor_revision.as_str()),
             "native_worker_claim.predecessor_revision",
         )?,
         resource_envelope_digest: native_worker_claim_resource_envelope_digest(request)?,
-        capability_cell: request
-            .executable_binding
+        capability_cell: owner_binding
             .as_ref()
             .map(|binding| {
                 native_worker_claim_identity(
@@ -1705,8 +1706,7 @@ fn native_worker_claim_staged_record(
                 )
             })
             .transpose()?,
-        capability_cell_registry_digest: request
-            .executable_binding
+        capability_cell_registry_digest: owner_binding
             .as_ref()
             .map(|binding| binding.capability_cell_registry_digest.clone()),
         state: NativeWorkerClaimState::Requested,
@@ -1788,6 +1788,14 @@ fn native_worker_claim_changed_fields(
         durable.request_digest == staged.request_digest,
         "request_digest",
     );
+    note(
+        durable.executable_binding_digest == staged.executable_binding_digest,
+        "executable_binding_digest",
+    );
+    note(
+        durable.executable_binding_record_json == staged.executable_binding_record_json,
+        "executable_binding_record",
+    );
     if changed.is_empty() {
         changed.push("binding_digest".to_owned());
     }
@@ -1836,6 +1844,26 @@ impl KernelService {
         &self,
         store: &S,
         request: &NativeWorkerClaimRequest,
+        now_unix_ms: u64,
+    ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
+        self.admit_native_worker_claim_with_expectation(
+            store,
+            request,
+            None,
+            None,
+            now_unix_ms,
+        )
+    }
+
+    /// Admits one claim only against a full, independently retained Governor
+    /// binding. Without that owner record the exact claim is staged as
+    /// `Requested` and refused; a worker join can never populate owner fields.
+    pub fn admit_native_worker_claim_with_expectation<S: OperationalRecoveryStore>(
+        &self,
+        store: &S,
+        request: &NativeWorkerClaimRequest,
+        owner_binding: Option<&NativeWorkerExecutableBindingPublication>,
+        expectation: Option<&NativeWorkerExecutableExpectation>,
         now_unix_ms: u64,
     ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
         self.admit_shadow_effect()?;
@@ -1893,7 +1921,100 @@ impl KernelService {
                 "native_worker_claim.deadline_unix_ms",
             ));
         }
-        Self::stage_and_finish_native_worker_claim_admission(store, request, now_unix_ms)
+        let Some(owner_binding) = owner_binding else {
+            let staged = native_worker_claim_staged_record(request, None)?;
+            match store.stage_native_worker_claim(&staged) {
+                Ok(outcome) if outcome.record().same_binding(&staged) => {}
+                Ok(outcome) => {
+                    return Ok(NativeWorkerClaimResponse::Conflict(
+                        native_worker_claim_conflict(outcome.record(), request, &staged)?,
+                    ));
+                }
+                Err(OrsError::NativeWorkerClaimIdentityConflict { .. }) => {
+                    let claim_id = native_worker_claim_identity(
+                        OperationIdentity::new(request.claim_id.as_str()),
+                        "native_worker_claim.claim_id",
+                    )?;
+                    let durable = store
+                        .load_native_worker_claim(&claim_id)
+                        .map_err(|error| native_worker_claim_store_error(&error))?
+                        .ok_or_else(|| {
+                            KernelServiceError::Platform(
+                                "conflicting claim disappeared before reconciliation".to_owned(),
+                            )
+                        })?;
+                    return Ok(NativeWorkerClaimResponse::Conflict(
+                        native_worker_claim_conflict(&durable, request, &staged)?,
+                    ));
+                }
+                Err(error) => return Err(native_worker_claim_store_error(&error)),
+            }
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::MissingOwnerField,
+                "native_worker_claim.executable_binding_owner_record",
+            ));
+        };
+        let Some(expectation) = expectation else {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::MissingOwnerField,
+                "native_worker_claim.executable_binding_expectation",
+            ));
+        };
+        if let Err(error) = owner_binding.validate_original_binding() {
+            let (reason, detail) = native_worker_claim_rejection_reason(&error);
+            return Ok(rejected(reason, detail));
+        }
+        if expectation.current != owner_binding.to_kernel_binding()
+            || owner_binding.claim_id != request.claim_id
+            || owner_binding.registration_id != request.registration_id
+            || owner_binding.task_id != request.task_id
+            || owner_binding.work_scope_id != request.work_scope_id
+            || owner_binding.operation_id != request.operation_id
+            || owner_binding.worker_generation != request.worker_generation
+            || owner_binding.installation_id != request.installation_id
+            || owner_binding.artifact_digest != request.worker_artifact_digest
+            || owner_binding.config_digest != request.worker_config_digest
+            || !owner_binding
+                .authority_epoch
+                .is_same_authority(&request.authority_epoch)
+            || owner_binding.state_fence != request.state_fence
+            || owner_binding.deadline_unix_ms != request.deadline_unix_ms
+            || now_unix_ms >= owner_binding.deadline_unix_ms
+            || now_unix_ms >= owner_binding.expires_at_unix_ms
+        {
+            return Ok(rejected(
+                NativeWorkerClaimRejectionReason::BindingConflict,
+                "native_worker_claim.executable_binding_owner_tuple",
+            ));
+        }
+        if let Err(error) = request.require_executable_binding(expectation, now_unix_ms) {
+            let reason = match error {
+                KernelServiceError::HandshakeMismatch { field } if field.ends_with(".expired") => {
+                    NativeWorkerClaimRejectionReason::ExpiredDeadline
+                }
+                KernelServiceError::HandshakeMismatch { field }
+                    if field.ends_with(".epoch_binding") =>
+                {
+                    NativeWorkerClaimRejectionReason::StaleEpoch
+                }
+                KernelServiceError::HandshakeMismatch { field }
+                    if field.ends_with(".fence_binding") =>
+                {
+                    NativeWorkerClaimRejectionReason::StaleFence
+                }
+                _ => NativeWorkerClaimRejectionReason::BindingConflict,
+            };
+            return Ok(rejected(
+                reason,
+                "native_worker_claim.executable_binding_currentness",
+            ));
+        }
+        Self::stage_and_finish_native_worker_claim_admission(
+            store,
+            request,
+            Some(owner_binding),
+            now_unix_ms,
+        )
     }
 
     /// Stages one validated claim intent and binds its admission receipt.
@@ -1908,9 +2029,10 @@ impl KernelService {
     fn stage_and_finish_native_worker_claim_admission<S: OperationalRecoveryStore>(
         store: &S,
         request: &NativeWorkerClaimRequest,
+        owner_binding: Option<&NativeWorkerExecutableBindingPublication>,
         now_unix_ms: u64,
     ) -> Result<NativeWorkerClaimResponse, KernelServiceError> {
-        let staged = native_worker_claim_staged_record(request)?;
+        let staged = native_worker_claim_staged_record(request, owner_binding)?;
         let durable = match store.stage_native_worker_claim(&staged) {
             Ok(outcome) => outcome.record().clone(),
             Err(OrsError::NativeWorkerClaimIdentityConflict { .. }) => {
