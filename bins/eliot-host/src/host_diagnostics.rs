@@ -1125,7 +1125,7 @@ pub fn observe_host_request(projection: &HostRequestProjection) {
 /// #985-oracle/#891-leaf ceiling; this turn provides the facade symbols);
 /// (4) effect and adoption — one bounded stderr `tracing` record, sink
 /// outcome never changing results; (5) persisted owner result — the
-/// HostState journal sequence, terminal exit and durable fence/receipts,
+/// `HostState` journal sequence, terminal exit and durable fence/receipts,
 /// owned and persisted by HostState/journal/registry and projected
 /// read-only here (diagnostics persist nothing: that absence names its
 /// ceiling, the owner journal); (6) ordinary read/status/cancel/restart
