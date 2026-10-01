@@ -667,7 +667,8 @@ pub const LOOSE_SCAN_DISCLOSURE_SUFFIX: &str = ".json";
 /// principal/session, host generation, discovery lease, privacy boundary and
 /// `StateFence`/`AuthorityEpoch` (where available before `WorkScope`
 /// creation), plus the operation/idempotency key, policy revision and
-/// deadline. The capability carries no filesystem path: a caller cannot
+/// deadline and the original ticket cancellation identity. The capability
+/// carries no filesystem path: a caller cannot
 /// choose a directory, UNC target or reparse destination because the API has
 /// no path input at all. The durable owner admits the contour and performs
 /// the write; the scanner only constructs and validates the receipt
@@ -689,6 +690,10 @@ pub struct ScanDisclosureOwnerBinding {
     pub authority_epoch_ref: Option<String>,
     pub operation_id: String,
     pub idempotency_key: String,
+    /// Exact cancellation identity copied from the original activation ticket.
+    /// It is carried as inert operation identity and is never minted here.
+    #[serde(default)]
+    pub cancellation_ref: String,
     /// Discovery lease consumption units already consumed when the owner
     /// issued this binding. [`BootstrapScanner::scan`] charges the lease
     /// before the write and refuses a binding that claims more consumption
@@ -729,6 +734,7 @@ impl ScanDisclosureOwnerBinding {
         }
         text(&self.operation_id, "scan_binding.operation_id")?;
         text(&self.idempotency_key, "scan_binding.idempotency_key")?;
+        text(&self.cancellation_ref, "scan_binding.cancellation_ref")?;
         counter(self.policy_revision, "scan_binding.policy_revision")?;
         counter(self.deadline, "scan_binding.deadline")?;
         Ok(())
@@ -767,7 +773,7 @@ impl ScanDisclosureOwnerBinding {
     pub fn request_hash(&self, receipt_digest: &str, schema_version: u32) -> String {
         sha256_hex(
             format!(
-                "{domain}\n{idempotency_namespace}\n{encoding_version}\n{installation}\n{receipt_digest}\n{principal}:{session}:{host}:{lease}:{lease_consumed}:{root}:{boundary}\n{fence}:{epoch}\n{operation}:{idempotency}\n{policy}:{deadline}\n{schema_version}",
+                "{domain}\n{idempotency_namespace}\n{encoding_version}\n{installation}\n{receipt_digest}\n{principal}:{session}:{host}:{lease}:{lease_consumed}:{root}:{boundary}\n{fence}:{epoch}\n{operation}:{idempotency}:{cancellation}\n{policy}:{deadline}\n{schema_version}",
                 domain = SCAN_DISCLOSURE_OPERATION_DOMAIN,
                 idempotency_namespace = self.operation_key(),
                 encoding_version = SCAN_DISCLOSURE_SCHEMA_VERSION,
@@ -783,6 +789,7 @@ impl ScanDisclosureOwnerBinding {
                 epoch = self.authority_epoch_ref.as_deref().unwrap_or("-"),
                 operation = self.operation_id,
                 idempotency = self.idempotency_key,
+                cancellation = self.cancellation_ref,
                 policy = self.policy_revision,
                 deadline = self.deadline,
             )
