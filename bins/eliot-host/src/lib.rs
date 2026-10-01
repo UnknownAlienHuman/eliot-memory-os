@@ -2280,6 +2280,15 @@ struct HostSupervisionControlContext {
     next_sequence: u64,
 }
 
+#[cfg(windows)]
+struct KernelReadinessApproval<'a> {
+    generation: &'a PlatformHandle,
+    kernel_artifact: &'a PlatformHandle,
+    store_artifact: &'a PlatformHandle,
+    config: &'a PlatformHandle,
+    supervision_evidence: &'a HostStartupEvidence,
+}
+
 /// Independent branch disposition after one bounded reconciliation pass.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3147,8 +3156,39 @@ impl HostJobBranches {
         runtime.block_on(self.revoke_host_supervision_evidence_async(generation))
     }
 
+    #[cfg(windows)]
+    fn fresh_supervision_revocation_runtime(
+        &mut self,
+    ) -> Result<tokio::runtime::Runtime, HostError> {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => Ok(runtime),
+            Err(error) => {
+                let cleanup = self.terminate_kernel();
+                Err(match cleanup {
+                    Ok(()) => HostError::RecoveryRequired(error.to_string()),
+                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                        "could not create the authenticated revocation runtime ({error}); retained Kernel Job containment failed ({cleanup})"
+                    )),
+                })
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn contain_fresh_supervision_preparation_failure(&mut self, error: HostError) -> HostError {
+        match self.terminate_kernel() {
+            Ok(()) => error,
+            Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                "supervision preparation failed ({error}); retained Kernel Job containment failed ({cleanup})"
+            )),
+        }
+    }
+
     /// Opens the exact-fence revocation on the authenticated Kernel connection
-    /// that this fresh heartbeat attempt will use for its report and ProbeReady.
+    /// that this fresh heartbeat attempt will use for its report and `ProbeReady`.
     /// Kernel anchors its owner-local freshness Instant when it admits this
     /// revocation; retaining the connection makes its sequence and anchor
     /// inseparable from the following Host observation.
@@ -3158,21 +3198,7 @@ impl HostJobBranches {
         generation: &PlatformHandle,
     ) -> Result<HostSupervisionControlContext, HostError> {
         let expected_selector = self.current_supervision_observation_digest.clone();
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let cleanup = self.terminate_kernel();
-                return Err(match cleanup {
-                    Ok(()) => HostError::RecoveryRequired(error.to_string()),
-                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
-                        "could not create the authenticated revocation runtime ({error}); retained Kernel Job containment failed ({cleanup})"
-                    )),
-                });
-            }
-        };
+        let runtime = self.fresh_supervision_revocation_runtime()?;
         let preparation = (|| {
             let launch = self.launch.as_ref().ok_or_else(|| {
                 HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
@@ -3211,13 +3237,7 @@ impl HostJobBranches {
             match preparation {
                 Ok(preparation) => preparation,
                 Err(error) => {
-                    let cleanup = self.terminate_kernel();
-                    return Err(match cleanup {
-                        Ok(()) => error,
-                        Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
-                            "supervision preparation failed ({error}); retained Kernel Job containment failed ({cleanup})"
-                        )),
-                    });
+                    return Err(self.contain_fresh_supervision_preparation_failure(error));
                 }
             };
         let result = runtime.block_on(async {
@@ -3253,6 +3273,26 @@ impl HostJobBranches {
                 });
             }
         };
+        self.finish_fresh_supervision_control_context(
+            expected_selector,
+            runtime,
+            transport,
+            disposition,
+            candidate_digest,
+            authority_generation,
+        )
+    }
+
+    #[cfg(windows)]
+    fn finish_fresh_supervision_control_context(
+        &mut self,
+        expected_selector: Option<PlatformHandle>,
+        runtime: tokio::runtime::Runtime,
+        transport: NamedPipeTransport,
+        disposition: HostSupervisionRevocationDisposition,
+        candidate_digest: String,
+        generation: ResourceGeneration,
+    ) -> Result<HostSupervisionControlContext, HostError> {
         match disposition {
             HostSupervisionRevocationDisposition::Revoked
             | HostSupervisionRevocationDisposition::AlreadyAbsent => {
@@ -3275,7 +3315,7 @@ impl HostJobBranches {
             runtime,
             transport,
             candidate_digest,
-            generation: authority_generation,
+            generation,
             next_sequence: 2,
         })
     }
@@ -4915,14 +4955,17 @@ impl HostJobBranches {
     )]
     fn probe_kernel_readiness(
         &mut self,
-        approved_generation: &PlatformHandle,
-        approved_kernel_artifact: &PlatformHandle,
-        approved_store_artifact: &PlatformHandle,
-        approved_config: &PlatformHandle,
-        supervision_evidence: &HostStartupEvidence,
+        approval: KernelReadinessApproval<'_>,
         supervision_heartbeat: Option<&watchdog_heartbeat::AdmittedHostHeartbeat>,
         mut control: HostSupervisionControlContext,
     ) -> Result<AuthenticatedKernelReadiness, HostError> {
+        let KernelReadinessApproval {
+            generation: approved_generation,
+            kernel_artifact: approved_kernel_artifact,
+            store_artifact: approved_store_artifact,
+            config: approved_config,
+            supervision_evidence,
+        } = approval;
         let reported_observation_digest = supervision_heartbeat
             .map(kernel_heartbeat_observation_digest)
             .transpose()?;
@@ -12914,11 +12957,13 @@ impl HostComposition {
         // evidence to Kernel. ProbeReady and its material consumers follow
         // that combined report on the same authenticated command sequence.
         let proof = self.jobs.probe_kernel_readiness(
-            generation,
-            kernel_artifact,
-            store_artifact,
-            &materialized_config_digest,
-            &supervision_evidence,
+            KernelReadinessApproval {
+                generation,
+                kernel_artifact,
+                store_artifact,
+                config: &materialized_config_digest,
+                supervision_evidence: &supervision_evidence,
+            },
             admitted_heartbeat.as_ref(),
             control,
         )?;
