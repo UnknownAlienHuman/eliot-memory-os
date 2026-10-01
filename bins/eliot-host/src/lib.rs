@@ -1664,6 +1664,10 @@ use eliot_kernel_service::{
 use eliot_observation_contracts::{
     CoverageGap, GapDisposition, ObservationRecordEnvelope, ObservationRecordKind,
 };
+use eliot_observability_runtime::{
+    CrashDigestAlgorithm, CrashOwnerHead, CrashOwnerHeadKind, CrashReportError,
+    CrashReporterHandle, CrashRuntimeContext,
+};
 #[cfg(windows)]
 use eliot_ors::{
     EpochIdentity as OrsEpochIdentity, EpochLineage, OpaqueLabel, OperationIdentity,
@@ -5558,6 +5562,9 @@ pub struct HostComposition {
     )]
     runtime_control_boundary: HostRuntimeControlProductionBoundary,
     journal: ProductionHostStateJournal,
+    /// Live non-authoritative crash context publisher installed by the
+    /// composition entrypoint after reporter construction.
+    crash_reporter: Option<CrashReporterHandle>,
     /// Retained canonical Host state root for short-lived installation-registry
     /// opens (#1339, A13.9).
     ///
@@ -6362,7 +6369,18 @@ impl HostComposition {
             });
         }
         let mut sink = DelegatedPreparation::new(HostStatePreparationJournal::new(&self.journal));
-        let prepared = sink.prepare(&evidence, request)?;
+        let prepared = match sink.prepare(&evidence, request) {
+            Ok(prepared) => {
+                self.publish_crash_context(true);
+                prepared
+            }
+            Err(error) => {
+                // The owner may have crossed an append whose outcome is
+                // unknown; do not keep presenting its previous journal head.
+                self.publish_crash_context(false);
+                return Err(error);
+            }
+        };
         Ok((sink, prepared))
     }
 
@@ -7099,13 +7117,22 @@ impl HostComposition {
             )))?;
         let activation_id = activation.activation_id.clone();
         let activation_generation = activation.fence.activation_generation.clone();
-        let (committed, barrier) = execute_cutover(
+        let (committed, barrier) = match execute_cutover(
             self,
             &validated,
             retirement,
             &activation_id,
             &activation_generation,
-        )?;
+        ) {
+            Ok(result) => {
+                self.publish_crash_context(true);
+                result
+            }
+            Err(error) => {
+                self.publish_crash_context(false);
+                return Err(error);
+            }
+        };
         // Bounded reconciliation closed by a real owner readback under the
         // same operation identity. The retirement is resolved through the same
         // journal-owner lookup the disposition port uses, so this projection
@@ -7371,13 +7398,22 @@ impl HostComposition {
             )));
         }
         Self::validate_backup_dispatch_prepare_routing(Self::register_backup_dispatch());
-        let retired = retire_authorized_generation(
+        let retired = match retire_authorized_generation(
             self,
             request,
             evidence,
             barrier,
             retirement_authorization,
-        )?;
+        ) {
+            Ok(retired) => {
+                self.publish_crash_context(true);
+                retired
+            }
+            Err(error) => {
+                self.publish_crash_context(false);
+                return Err(error);
+            }
+        };
         // #983 R1: the same disposition rule as the two sibling cutover
         // boundaries. `retire_authorized_generation` returns `Ok` for a
         // bounded `Unknown` retirement state, and a `Failed` word from the
@@ -7615,6 +7651,7 @@ impl HostComposition {
             store_rebind_boundary: HostStoreRebindProductionBoundary,
             runtime_control_boundary: HostRuntimeControlProductionBoundary,
             journal,
+            crash_reporter: None,
             registry_host_root: host_state_root,
             #[cfg(all(windows, not(test)))]
             profile_root_leases,
@@ -9167,6 +9204,100 @@ impl HostComposition {
         self.journal.snapshot().map_err(HostError::Journal)
     }
 
+    /// Attaches the process crash reporter and seeds it from this Host's
+    /// current approved generation, exact authority fence, and durable journal
+    /// head. The reporter remains a non-authoritative sidecar.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reporter cannot accept the initial snapshot.
+    pub fn attach_crash_reporter(
+        &mut self,
+        handle: CrashReporterHandle,
+    ) -> Result<(), CrashReportError> {
+        if self.crash_reporter.is_some() {
+            return Err(CrashReportError::InvalidMetadata(
+                "crash_reporter.already_attached",
+            ));
+        }
+        handle.update_context(self.crash_runtime_context(true))?;
+        let journal_reporter = handle.clone();
+        self.journal
+            .set_append_observer(Arc::new(move |head| {
+                let journal_head = head.map(|(sequence, digest)| CrashOwnerHead {
+                    kind: CrashOwnerHeadKind::HostStateJournal,
+                    algorithm: CrashDigestAlgorithm::Sha256,
+                    sequence,
+                    digest,
+                });
+                let _ = journal_reporter.update_journal_head(journal_head);
+            }))
+            .map_err(|_| CrashReportError::InvalidMetadata("crash_reporter.journal_observer"))?;
+        self.crash_reporter = Some(handle);
+        Ok(())
+    }
+
+    /// Returns the crash-report sidecar directory under the validated Host
+    /// installation state root. It does not create the directory.
+    #[must_use]
+    pub fn crash_report_directory(&self) -> PathBuf {
+        self.registry_host_root.join("crash-reports")
+    }
+
+    fn crash_runtime_context(&self, journal_head_current: bool) -> CrashRuntimeContext {
+        let state = self.journal.snapshot().ok();
+        let active = if self.registry.pending_activation().is_none() {
+            self.registry.active()
+        } else {
+            None
+        };
+        let module_generation_ref = active
+            .map(|generation| generation.manifest.runtime_launch.generation.as_str().to_owned());
+        // Host has no retained self-process start receipt. Its activation
+        // epoch identifies the admitted Host lifecycle contour, not the
+        // operating-system process incarnation, so process generation stays
+        // explicitly missing here.
+        let process_generation_ref = None;
+        let state_fence = active.and_then(|generation| {
+            self.registry
+                .last_committed_activation_fence()
+                .filter(|fence| fence.generation == generation.manifest.generation)
+                .map(|fence| fence.authority_state_fence.clone())
+        });
+        let journal_head = if journal_head_current {
+            state.as_ref().and_then(|state| {
+                state
+                    .last_checksum
+                    .as_ref()
+                    .filter(|checksum| state.sequence > 0)
+                    .map(|digest| CrashOwnerHead {
+                        kind: CrashOwnerHeadKind::HostStateJournal,
+                        algorithm: CrashDigestAlgorithm::Sha256,
+                        sequence: state.sequence,
+                        digest: digest.clone(),
+                    })
+            })
+        } else {
+            None
+        };
+        CrashRuntimeContext::from_observations(
+            module_generation_ref,
+            process_generation_ref,
+            state_fence,
+            None,
+            None,
+            None,
+            Vec::new(),
+            journal_head,
+        )
+    }
+
+    fn publish_crash_context(&self, journal_head_current: bool) {
+        if let Some(handle) = self.crash_reporter.as_ref() {
+            let _ = handle.update_context(self.crash_runtime_context(journal_head_current));
+        }
+    }
+
     /// Returns the installation-owned approved-generation registry.
     #[must_use]
     pub const fn registry(&self) -> &ApprovedGenerationRegistry {
@@ -9178,7 +9309,14 @@ impl HostComposition {
             && let Err(error) = append_reconciled(&self.journal, pending.clone())
         {
             self.pending_record = Some(pending);
+            if matches!(&error, HostError::Journal(JournalError::OutcomeUnknown { .. })) {
+                self.publish_crash_context(false);
+            }
             return Err(error);
+        } else if self.pending_record.is_none() {
+            // A pending record may have been durably resolved above. Publishing
+            // a fresh readback keeps the sidecar from retaining an older head.
+            self.publish_crash_context(true);
         }
         Ok(())
     }
@@ -9186,9 +9324,13 @@ impl HostComposition {
     fn append_record(&mut self, record: HostStateRecord) -> Result<AppendReceipt, HostError> {
         self.resume_pending_record()?;
         match append_reconciled(&self.journal, record.clone()) {
-            Ok(receipt) => Ok(receipt),
+            Ok(receipt) => {
+                self.publish_crash_context(true);
+                Ok(receipt)
+            }
             Err(error @ HostError::Journal(JournalError::OutcomeUnknown { .. })) => {
                 self.pending_record = Some(record);
+                self.publish_crash_context(false);
                 Err(error)
             }
             Err(error) => Err(error),

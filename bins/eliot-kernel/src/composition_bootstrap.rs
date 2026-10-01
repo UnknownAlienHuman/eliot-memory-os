@@ -2134,6 +2134,7 @@ impl KernelComposition {
             p07_ors: Arc::clone(&ors),
             kernel_audit: Mutex::new(kernel_audit),
             audit_fallback: Mutex::new(audit_fallback),
+            crash_reporter: Mutex::new(None),
             diagnostic_brief: Mutex::new(None),
             store_rebind_boundary: KernelStoreRebindProductionBoundary,
             // This is the canonical path passed to the same open that

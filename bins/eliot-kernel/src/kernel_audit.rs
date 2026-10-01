@@ -3019,6 +3019,127 @@ impl crate::KernelComposition {
             .map(|policy| policy.module_generation.state_fence.clone())
     }
 
+    /// Attaches the reporter after the binary has validated the exact
+    /// Host-injected Kernel generation. Dynamic snapshots thereafter come
+    /// from the current admitted module fence and the Kernel audit owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reporter rejects the snapshot or attachment is
+    /// already present.
+    pub fn attach_crash_reporter(
+        &self,
+        handle: eliot_observability_runtime::CrashReporterHandle,
+        kernel_process_generation: Option<String>,
+    ) -> Result<(), eliot_observability_runtime::CrashReportError> {
+        let attached = self.crash_reporter.lock().map_err(|_| {
+            eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                "crash_reporter.binding_poisoned",
+            )
+        })?.is_some();
+        if attached {
+            return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                "crash_reporter.already_attached",
+            ));
+        }
+        handle.update_context(self.crash_runtime_context(
+            kernel_process_generation.as_deref(),
+            false,
+        ))?;
+        let mut binding = self.crash_reporter.lock().map_err(|_| {
+            eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                "crash_reporter.binding_poisoned",
+            )
+        })?;
+        if binding.is_some() {
+            return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                "crash_reporter.already_attached",
+            ));
+        }
+        *binding = Some(crate::CrashReporterBinding {
+            handle,
+            kernel_process_generation,
+        });
+        Ok(())
+    }
+
+    fn crash_runtime_context(
+        &self,
+        kernel_process_generation: Option<&str>,
+        try_only: bool,
+    ) -> eliot_observability_runtime::CrashRuntimeContext {
+        let policy_available = if try_only {
+            self.generation_poison
+                .try_lock()
+                .is_ok_and(|poison| poison.is_none())
+        } else {
+            self.generation_poison
+                .lock()
+                .is_ok_and(|poison| poison.is_none())
+        };
+        let policy = if policy_available {
+            if try_only {
+                self.front_door_policy.try_lock().ok()
+            } else {
+                self.front_door_policy.lock().ok()
+            }
+        } else {
+            None
+        };
+        let module_generation_ref = policy.as_ref().map(|policy| {
+            format!(
+                "{}:{}",
+                policy.module_generation.module_id.as_str(),
+                policy.module_generation.generation.get()
+            )
+        });
+        let state_fence = policy.map(|policy| policy.module_generation.state_fence.clone());
+        let head = if try_only {
+            self.kernel_audit.try_lock().ok().map(|chain| {
+                (chain.head_seq(), chain.head_hash().to_owned())
+            })
+        } else {
+            self.kernel_audit.lock().ok().map(|chain| {
+                (chain.head_seq(), chain.head_hash().to_owned())
+            })
+        };
+        let audit_head = head.map(|(sequence, digest)| {
+            eliot_observability_runtime::CrashOwnerHead {
+                kind: eliot_observability_runtime::CrashOwnerHeadKind::KernelAuditChain,
+                algorithm: eliot_observability_runtime::CrashDigestAlgorithm::Blake3,
+                sequence,
+                digest,
+            }
+        });
+        eliot_observability_runtime::CrashRuntimeContext::from_observations(
+            module_generation_ref,
+            kernel_process_generation.map(str::to_owned),
+            state_fence,
+            None,
+            None,
+            audit_head,
+            Vec::new(),
+            None,
+        )
+    }
+
+    pub(crate) fn publish_crash_context(&self) {
+        let binding = self.crash_reporter.lock().ok().and_then(|binding| {
+            binding.as_ref().map(|binding| {
+                (
+                    binding.handle.clone(),
+                    binding.kernel_process_generation.clone(),
+                )
+            })
+        });
+        if let Some((handle, kernel_process_generation)) = binding {
+            let _ = handle.update_context(self.crash_runtime_context(
+                kernel_process_generation.as_deref(),
+                true,
+            ));
+        }
+    }
+
     /// Observes one audit event through the I16.11 fallback cascade.
     ///
     /// Uniform observational posture: best-effort, never changes an
@@ -3060,34 +3181,44 @@ impl crate::KernelComposition {
             );
         }
         let now = crate::unix_ms();
-        let Ok(mut chain) = self.kernel_audit.lock() else {
-            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
-            return None;
-        };
-        let Ok(mut fallback) = self.audit_fallback.lock() else {
-            if let Ok(record) = chain.append(draft, now) {
-                return Some(record);
-            }
-            crate::kernel_diagnostics::observe_terminal_error(KERNEL_AUDIT_APPEND_TERMINAL_CODE);
-            return None;
-        };
-        // I16.5 (issue #1841): the cascade terminal is also the
-        // audit-fallback metric sample, counted once per submission and never
-        // sampled. The sample carries the stage only, never record content.
-        let outcome = fallback.observe(&mut chain, draft, now);
-        crate::observe_audit_fallback_submission(&outcome);
-        match outcome {
-            crate::audit_fallback::AuditFallbackOutcome::Appended(record) => Some(record),
-            outcome => {
+        let outcome = (|| {
+            let Ok(mut chain) = self.kernel_audit.lock() else {
                 crate::kernel_diagnostics::observe_terminal_error(
                     KERNEL_AUDIT_APPEND_TERMINAL_CODE,
                 );
-                if let Some(code) = outcome.retention_code() {
-                    crate::kernel_diagnostics::observe_terminal_error(code);
+                return None;
+            };
+            let Ok(mut fallback) = self.audit_fallback.lock() else {
+                if let Ok(record) = chain.append(draft, now) {
+                    return Some(record);
                 }
-                None
+                crate::kernel_diagnostics::observe_terminal_error(
+                    KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+                );
+                return None;
+            };
+            // I16.5 (issue #1841): the cascade terminal is also the
+            // audit-fallback metric sample, counted once per submission and never
+            // sampled. The sample carries the stage only, never record content.
+            let outcome = fallback.observe(&mut chain, draft, now);
+            crate::observe_audit_fallback_submission(&outcome);
+            match outcome {
+                crate::audit_fallback::AuditFallbackOutcome::Appended(record) => Some(record),
+                outcome => {
+                    crate::kernel_diagnostics::observe_terminal_error(
+                        KERNEL_AUDIT_APPEND_TERMINAL_CODE,
+                    );
+                    if let Some(code) = outcome.retention_code() {
+                        crate::kernel_diagnostics::observe_terminal_error(code);
+                    }
+                    None
+                }
             }
-        }
+        })();
+        // Both audit guards have left scope before the reporter snapshots the
+        // canonical head, preserving chain-then-fallback lock order.
+        self.publish_crash_context();
+        outcome
     }
 
     /// Spools both result-leg drafts durably ahead of the ORS completion.
@@ -3270,10 +3401,12 @@ impl crate::KernelComposition {
     /// retained chain does not verify.
     pub fn audit_chain_records(&self) -> Result<Vec<AuditRecord>, KernelAuditError> {
         self.reconcile_pending_result_bindings();
-        self.kernel_audit
+        let records = self.kernel_audit
             .lock()
             .map_err(|_| KernelAuditError::LockPoisoned)?
-            .records()
+            .records()?;
+        self.publish_crash_context();
+        Ok(records)
     }
 
     /// Verifies the full retained audit chain.
@@ -3337,9 +3470,13 @@ impl crate::KernelComposition {
     /// lock is poisoned.
     pub fn reconcile_audit_spool(&self) -> Option<crate::audit_fallback::AuditReconcileReport> {
         let now = crate::unix_ms();
-        let mut chain = self.kernel_audit.lock().ok()?;
-        let mut fallback = self.audit_fallback.lock().ok()?;
-        Some(fallback.reconcile(&mut chain, now))
+        let report = {
+            let mut chain = self.kernel_audit.lock().ok()?;
+            let mut fallback = self.audit_fallback.lock().ok()?;
+            fallback.reconcile(&mut chain, now)
+        };
+        self.publish_crash_context();
+        Some(report)
     }
 
     /// Counts spool records still awaiting reconciliation.
