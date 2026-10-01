@@ -173,10 +173,15 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// publishes the retained broker session strictly BEFORE it publishes the
     /// Governor connection this check runs against, so on the establishing path
     /// the principal is necessarily present and the no-principal arm cannot
-    /// fire there. That arm is reached on the paths where the retained session
-    /// has genuinely ended under a request that was already past admission: the
-    /// disposal race in which `DisposeAsync` releases the binding, and a
-    /// retained pipe that no longer reports itself connected. The
+    /// fire there. That arm is reached on the path where the retained session has
+    /// genuinely ended under a request that was already past admission: the
+    /// disposal race in which `DisposeAsync` releases the binding, after which
+    /// `RetainedPrincipal` reports null because `ReleaseOperatorBinding` nulled
+    /// the field under the binding gate. That single condition is the whole
+    /// mechanism; there is no pipe-liveness arm to reach, because the broker
+    /// drops its pipe end after writing `redeemed`, this client never writes to
+    /// the retained handle again, and `IsConnected` therefore cannot observe
+    /// that closure. The
     /// capability arm is the ordinary one - `ValidateEndpoint` admits any
     /// non-empty subset of the closed two-capability vocabulary, so a
     /// read-only broker-issued binding is a real admitted shape and reaches
@@ -984,8 +989,10 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// bounded by two teardown allowances in the worst case: the gate wait and
     /// then the aborted connection's stream disposal. The retained broker
     /// binding is released after both, whether or not the gate was acquired, so
-    /// the hold on the broker-issued principal ends with the session instead of
-    /// outliving it.
+    /// a request that outlives the teardown allowance is not the reason the hold
+    /// on the broker-issued principal outlives the session. See the release site
+    /// below for the residual window that ungated teardown opens, and for what
+    /// closes it.
     public async ValueTask DisposeAsync()
     {
         // Only the transition from OPEN owns the teardown. A repeated or
@@ -1065,10 +1072,27 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         // cannot replace a refusal already being reported with a close failure,
         // and wrapping it would only hide a future change that broke that
         // property. It runs AFTER the transport abort above, so the Governor
-        // pipe is closed first and the broker binding second, and it runs even
-        // when the gate could not be acquired - an in-flight request that
-        // outlived the teardown allowance must not be the reason a retained
-        // principal outlives the session.
+        // pipe is closed first and the broker binding second.
+        //
+        // The honest reason it runs even when the gate wait above TIMED OUT
+        // (`acquired == false`) is that this is teardown: refusing to end the
+        // hold until an in-flight request drains would make the principal's
+        // lifetime depend on a request that may never finish. Running
+        // ungated is the deliberate choice, and it is not free - it OPENS a
+        // window rather than closing one. A request that is already past the
+        // gate can be inside `EnsureConnectedAsync` ->
+        // `RedeemOperatorHandoffAsync` while this release runs, and if that
+        // redemption succeeds it would `PublishSession` a fresh session AFTER
+        // this line, leaving a retained principal that outlives the session.
+        // What closes that window in practice is the `_closing.Cancel()` at
+        // the top of this method, which fires before the gate wait and before
+        // this release: the redemption observes that token and fails instead of
+        // publishing. The cancellation is the real guard here; running without
+        // the gate is not what prevents a principal outliving its session. No
+        // locking is restructured on the strength of this comment - the race is
+        // not demonstrably reachable and the release's concurrency behaviour is
+        // deliberately unchanged - but the rationale is recorded so the next
+        // reader does not mistake this line for a liveness guarantee.
         BrokerPipeClient.ReleaseOperatorBinding();
         Interlocked.Exchange(ref _lifecycle, LifecycleDisposed);
     }

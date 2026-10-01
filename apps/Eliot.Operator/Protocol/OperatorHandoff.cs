@@ -114,12 +114,19 @@ public sealed record OperatorRoleBinding(
 /// lives only in this process's memory: it is never persisted, never logged and
 /// never sent on another pipe. It is retained for the lifetime of the session
 /// that redeemed it and no longer: `GovernorPipeClient.DisposeAsync` calls
-/// `BrokerPipeClient.ReleaseOperatorBinding`, which takes the session out from
-/// under its gate and disposes it exactly once, and `RetainedPrincipal`
-/// reports null for any session that has been released or whose pipe no longer
-/// reports itself connected. That release is what this sentence claims, and it
-/// is a single call site: no other code path ends the hold, so a session that
-/// outlives its client would be a defect rather than a supported lifetime.
+/// `BrokerPipeClient.ReleaseOperatorBinding`, which nulls the retained session
+/// under the binding gate in the same critical section and disposes it exactly
+/// once, and `RetainedPrincipal` reports null for exactly that reason - the
+/// field is already null when the getter next reads it, under that same gate.
+/// There is no second condition and no weaker liveness fallback behind it:
+/// the broker disposes its pipe end as soon as it has written `redeemed`, this
+/// client never writes to the retained handle again, and so
+/// `NamedPipeClientStream.IsConnected` can never report the closure. A real
+/// liveness signal would require a zero-byte write to the handle or a
+/// heartbeat the broker answers, and neither exists - the absence is deliberate
+/// and documented, not an oversight. That release is what this sentence claims,
+/// and it is a single call site: no other code path ends the hold, so a session
+/// that outlives its client would be a defect rather than a supported lifetime.
 ///
 /// The consequence is stated plainly rather than as a guarantee about the
 /// process: a restarted UI retains nothing here and has to earn a fresh token

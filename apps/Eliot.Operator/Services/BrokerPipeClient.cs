@@ -30,7 +30,8 @@ namespace Eliot.Operator.Services;
 /// handle to keep the binding's identity and lifetime - not to expect the peer
 /// to still be reading. That is why `RetainedPrincipal` decides liveness from
 /// this process's own release rather than from peer liveness: there is no
-/// observation of the broker here that a later request could rely on.
+/// observation of the broker here that a later request could rely on, and a
+/// check built on `IsConnected` would be one that can never fire.
 ///
 /// Retention is process memory and is never persisted or carried across
 /// processes, so a restarted UI comes up with no retained session at all and
@@ -275,27 +276,49 @@ internal static class BrokerPipeClient
     }
 
     /// The broker-issued Human principal this process retained at redemption,
-    /// or null when no LIVE redeemed session is retained.
+    /// or null when no redeemed session is retained.
     ///
     /// Null is a refusal, never an authorization. It is returned whenever there
-    /// is nothing to report: no session retained, a session whose release has
-    /// run (see <see cref="ReleaseOperatorBinding"/>), or a session whose bound
-    /// pipe no longer reports itself connected. The read therefore fails closed
-    /// in the same direction as <see cref="GovernorPipeClient.GrantedBinding"/>,
-    /// which returns null rather than a grant it can no longer prove.
+    /// is nothing to report, and there is exactly ONE such condition: no
+    /// session retained. `ReleaseOperatorBinding` nulls `_session` under
+    /// <see cref="BindingGate"/>, and this getter reads `_session` under that
+    /// same gate, so once a release runs the field is already null by the time
+    /// any reader can observe it. That nulling is the whole fail-closed
+    /// mechanism; there is deliberately no second, weaker one behind it, so the
+    /// read fails closed in the same direction as
+    /// <see cref="GovernorPipeClient.GrantedBinding"/>, which returns null
+    /// rather than a grant it can no longer prove.
+    ///
+    /// What this getter does NOT consult is any peer-liveness signal, and the
+    /// absence is deliberate rather than forgotten. There is none available:
+    /// `serve_operator_pipe_connection` in the User Broker returns and drops its
+    /// end of the pipe as soon as it has written `redeemed`, so the peer is
+    /// already gone before this method ever runs, and
+    /// `NamedPipeClientStream.IsConnected` cannot observe that closure - it
+    /// keeps reporting true and only flips after a CLIENT-SIDE WRITE hits the
+    /// closed peer. This client never writes to the retained handle again
+    /// (`BrokerPipeSession` exposes no read or write member), so such a write
+    /// never happens and no closure is ever observed. A real liveness check
+    /// would therefore need one of: a zero-byte write to probe the handle, or a
+    /// heartbeat the broker answers, with the broker keeping the pipe open past
+    /// `redeemed`. Neither exists, so a check built on `IsConnected` here would
+    /// be a check that can never fire.
     ///
     /// The value is read off the retained session under the same gate that
     /// publishes and clears it, so it is exactly the binding of the session
     /// this process currently holds - never a remembered one from a superseded
     /// session, and never one whose handle this process has already released.
+    /// Both supersession and release clear the field in the same critical
+    /// section BEFORE disposing, which is also why no liveness test on the
+    /// session object could add anything here: a session that is simultaneously
+    /// the value of `_session` has not been disposed.
     internal static OperatorHumanPrincipal? RetainedPrincipal
     {
         get
         {
             lock (BindingGate)
             {
-                var session = _session;
-                return session is not null && session.IsLive ? session.Principal : null;
+                return _session?.Principal;
             }
         }
     }
@@ -606,6 +629,18 @@ internal static class BrokerPipeClient
 /// broker already decided for this exchange, never a credential this client can
 /// present anywhere the broker does not check again.
 ///
+/// This type deliberately exposes NO liveness member, and the reason is worth
+/// recording before someone adds one back. The broker's operator-pipe handler
+/// disposes its end the moment it has written `redeemed`, and
+/// `NamedPipeClientStream.IsConnected` only notices a closed peer after a
+/// CLIENT-SIDE WRITE - this type exposes no read or write member, so that write
+/// never happens and `IsConnected` would read true for the whole lifetime. The
+/// `_disposed` flag is no better: every disposal site clears or replaces
+/// `_session` under `BindingGate` first, so a session that is still `_session`
+/// is never disposed and the flag cannot be observed either. Both halves would
+/// be a check that can never fire. Liveness is therefore not re-derived from the
+/// handle at all; see <see cref="BrokerPipeClient.RetainedPrincipal"/>.
+///
 /// Disposal is deterministic and idempotent: it closes the pipe and is the
 /// only way the hold ends. It is reached from exactly three places - the
 /// session's end via <see cref="BrokerPipeClient.ReleaseOperatorBinding"/>, a
@@ -629,41 +664,6 @@ internal sealed class BrokerPipeSession : IDisposable
     /// construction, and never recomputed or refreshed, so it always describes
     /// the exchange that published this handle rather than a later one.
     internal OperatorHumanPrincipal? Principal { get; }
-
-    /// Whether this session still holds a binding this process may report.
-    ///
-    /// This is the same fail-closed shape
-    /// <see cref="GovernorPipeClient.GrantedBinding"/> uses: a session that has
-    /// been disposed reports no binding, and a pipe that no longer reports
-    /// itself connected reports no binding. The disposal check is the one that
-    /// actually fires in production, because the broker's operator-pipe handler
-    /// returns and disposes its end as soon as it has written the `redeemed`
-    /// response, while `NamedPipeClientStream.IsConnected` keeps reporting true
-    /// until a client-side write observes the closure. So `IsConnected` is
-    /// reported as the bound-state fact it is and the disposed flag is what
-    /// makes the release deterministic; neither is treated as a proof of
-    /// continued broker liveness, because no such proof is retained.
-    internal bool IsLive
-    {
-        get
-        {
-            if (Volatile.Read(ref _disposed) != 0)
-            {
-                return false;
-            }
-            try
-            {
-                return _pipe.IsConnected;
-            }
-            catch (Exception error) when (error is ObjectDisposedException or IOException or InvalidOperationException)
-            {
-                // An unreadable transport reports no binding, exactly as a
-                // dropped one does. Refusing is the only safe reading of a
-                // handle whose state cannot be observed.
-                return false;
-            }
-        }
-    }
 
     internal BrokerPipeSession(
         NamedPipeClientStream pipe,
