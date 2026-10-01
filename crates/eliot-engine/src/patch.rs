@@ -465,35 +465,6 @@ impl<'a> VerifierHarness<'a> {
         self
     }
 
-    /// The exact governed child environment this harness launches Cargo with.
-    ///
-    /// Issue #1897 (AUD7). `Err(())` means this harness holds no admitted lane,
-    /// which the caller records as a fail-closed verifier run rather than
-    /// launching anything. `admit` is the COMPLETE gate — a non-empty claim set,
-    /// every claim leased, every lease claimed, every lease granted to this work
-    /// item — so an unadmitted lane never reaches a process.
-    ///
-    /// The lane binds BOTH governed halves: the Cargo roots this invocation
-    /// needs, and the fixture pair whose physical directory the namespace owns.
-    /// Emitting the fixture bindings here is what makes the namespace an input
-    /// to real fixture isolation on this lane rather than a stored label, and it
-    /// reads the same one [`GovernedWorkEnvelope::fixture_environment`]
-    /// derivation the `TestD` lane reads, so there is one fixture-root authority
-    /// in the workspace.
-    fn governed_lane_environment(&self) -> Result<Vec<(String, String)>, ()> {
-        let lane = self.lane.as_ref().ok_or(())?;
-        lane.admit()
-            .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
-        let mut environment = lane
-            .cargo_environment()
-            .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
-        environment.extend(
-            lane.fixture_environment()
-                .map_err(|error| EngineError::WriteRejected(error.to_string()))?,
-        );
-        Ok(environment)
-    }
-
     pub async fn run_plan(
         &self,
         project_id: eliot_types::ProjectId,
@@ -605,22 +576,21 @@ impl<'a> VerifierHarness<'a> {
         };
         // Issue #1897 (AUD7): this is the lane's only mutating build launch, and it
         // must run under the governed target root its retained envelope derives.
-        // `governed_lane_environment` owns that admission; without a lane there
-        // is no governed root at all, and a Cargo invocation with no
-        // `CARGO_TARGET_DIR` falls back to the repository `target/` directory —
-        // the shared directory this item exists to remove — so nothing launches.
-        let cargo_environment = match self.governed_lane_environment() {
-            Ok(environment) => environment,
-            Err(()) => {
-                return Ok(ungoverned_verifier_run(
-                    project_id,
-                    task_id,
-                    agent_id,
-                    requirement,
-                    started_at,
-                ));
-            }
+        // Without a lane there is no governed root at all, and a Cargo invocation
+        // with no `CARGO_TARGET_DIR` falls back to the repository `target/`
+        // directory — the shared directory this item exists to remove — so nothing
+        // launches and the refusal is RECORDED rather than propagated. A lane
+        // that IS present but fails admission is a real error and stays one.
+        let Some(lane) = self.lane.as_ref() else {
+            return Ok(ungoverned_verifier_run(
+                project_id,
+                task_id,
+                agent_id,
+                requirement,
+                started_at,
+            ));
         };
+        let cargo_environment = governed_lane_environment(lane)?;
         let output = run_bounded_instrument_command(
             &admitted[0],
             &admitted[1..],
@@ -655,6 +625,37 @@ impl<'a> VerifierHarness<'a> {
             started_at,
         ))
     }
+}
+
+/// The exact governed child environment one admitted lane launches Cargo with.
+///
+/// Issue #1897 (AUD7). `admit` is the COMPLETE gate — a non-empty claim set,
+/// every claim leased, every lease claimed, every lease granted to this work
+/// item — so an unadmitted lane never reaches a process. A lane that is present
+/// but fails this gate is a real error, not the absence of a lane: the caller
+/// distinguishes the two, so this returns the composed environment as a value
+/// and never reports "no lane" itself.
+///
+/// The lane binds BOTH governed halves: the Cargo roots this invocation needs,
+/// and the fixture pair whose physical directory the namespace owns. Emitting
+/// the fixture bindings here is what makes the namespace an input to real
+/// fixture isolation on this lane rather than a stored label, and it reads the
+/// same one [`GovernedWorkEnvelope::fixture_environment`] derivation the `TestD`
+/// lane reads, so there is one fixture-root authority in the workspace. This
+/// composes nothing of its own: it extends one derivation with another.
+fn governed_lane_environment(
+    lane: &GovernedWorkEnvelope,
+) -> Result<Vec<(String, String)>, EngineError> {
+    lane.admit()
+        .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
+    let mut environment = lane
+        .cargo_environment()
+        .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
+    environment.extend(
+        lane.fixture_environment()
+            .map_err(|error| EngineError::WriteRejected(error.to_string()))?,
+    );
+    Ok(environment)
 }
 
 /// The refusal a Cargo verifier requirement records when no lane was admitted.
