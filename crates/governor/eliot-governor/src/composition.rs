@@ -9559,19 +9559,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// reporting as revoked, a later activation is refused, and an exhausted
     /// denominator stays partial/recovery-required, never complete. The record
     /// is removed only when the second-phase link commits.
-    pub async fn resume_committed_closure_second_phase<LinkFn, LinkFut>(
-        &mut self,
+    /// Requires one committed closure to bind the exact re-admitted resume
+    /// request before any canonical write (issue #2100, audit 5924750035).
+    ///
+    /// The composition must be `Ready`; the closure revalidates under its own
+    /// receipt contract and must bind the re-admitted request, snapshot,
+    /// State Fence and authority epoch with both closure and authority
+    /// receipt `Revoked`; the live composition fence and the admitted
+    /// canonical request identity fence must equal the closure fence; and a
+    /// retained presentation or pending stricter revocation for the same
+    /// grant must carry the exact same bytes/snapshot, else `IdentityConflict`
+    /// with no transition. A diagnostic tick alone never satisfies this.
+    fn check_resume_second_phase_admission(
+        &self,
         request: &GrantRevocationRequest,
         closure: &GrantClosureReceipt,
-        canonical_operation_id: &OperationId,
         canonical_request_identity: &RequestIdentity,
-        operation: &RevocationOperationIdentity,
-        link: LinkFn,
-    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
-    where
-        LinkFn: FnOnce(String, ReceiptIdentity) -> LinkFut,
-        LinkFut: Future<Output = Result<GrantClosureSecondPhaseLink, KernelPortError>>,
-    {
+    ) -> Result<(), CompositionError> {
         self.require_ready_for_authority()?;
         closure
             .validate()
@@ -9624,27 +9628,98 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             return Err(CompositionError::Authority(P07PortError::IdentityConflict));
         }
+        Ok(())
+    }
+
+    /// Retains one pending canonical revocation and returns the refusal that
+    /// caused it (issue #2100, audit 5924750035).
+    ///
+    /// Every failure after the committed closure validates keeps the grant
+    /// reporting as revoked with its exact snapshot/revocation coordinates, so
+    /// the mechanical fence stays visible and the record is removed only when
+    /// the second-phase link commits.
+    fn retain_pending_second_phase(
+        &mut self,
+        grant_id: &str,
+        snapshot_id: String,
+        revocation_id: String,
+        phase: CanonicalRevocationPhase,
+        error: CompositionError,
+    ) -> CompositionError {
+        self.pending_canonical_revocations.insert(
+            grant_id.to_owned(),
+            PendingCanonicalRevocation {
+                grant_id: grant_id.to_owned(),
+                snapshot_id,
+                revocation_id,
+                phase,
+            },
+        );
+        error
+    }
+
+    /// Finishes one resumed second phase from the linked read-back
+    /// (issue #2100, audit 5924750035 items 5, 6).
+    ///
+    /// The read-back must bind the ORIGINAL first-phase bytes (operation
+    /// identity, declaration) plus the Store-issued receipt identity by
+    /// content; only then is the pending record removed and the
+    /// reconciliation returned. The authority receipt below is a projection
+    /// of the committed closure's own authority reference, not a fresh
+    /// Kernel presentation: the first phase already committed, nothing here
+    /// presents to P-07, and the receipt identity, snapshot, epoch and
+    /// terminal state are the owner's committed bytes verbatim.
+    fn finish_resume_second_phase(
+        &mut self,
+        closure: &GrantClosureReceipt,
+        canonical_receipt: &WriteReceipt,
+        closure_projection: GrantClosureSecondPhaseLink,
+        receipt_identity: &ReceiptIdentity,
+        grant_id: &str,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError> {
+        if closure_projection.closure().operation_id != closure.operation_id
+            || closure_projection.closure().declaration != closure.declaration
+            || closure_projection.canonical_receipt() != receipt_identity
+        {
+            return Err(CompositionError::Recovery(
+                "durable second-phase readback does not bind the canonical closure receipt"
+                    .to_owned(),
+            ));
+        }
+        let authority_receipt = AuthorityRevocationReceipt {
+            revocation_id: closure.authority_receipt.receipt_id.clone(),
+            snapshot_id: closure.authority_receipt.snapshot_id.clone(),
+            authority_epoch: closure.authority_receipt.authority_epoch.clone(),
+            state: AuthorityState::Revoked,
+        };
+        self.pending_canonical_revocations.remove(grant_id);
+        Ok(AuthorityRevocationReconciliation {
+            authority_receipt,
+            canonical_receipt: canonical_receipt.clone(),
+            closure_projection,
+        })
+    }
+
+    pub async fn resume_committed_closure_second_phase<LinkFn, LinkFut>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        closure: &GrantClosureReceipt,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
+        link: LinkFn,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
+    where
+        LinkFn: FnOnce(String, ReceiptIdentity) -> LinkFut,
+        LinkFut: Future<Output = Result<GrantClosureSecondPhaseLink, KernelPortError>>,
+    {
+        self.check_resume_second_phase_admission(request, closure, canonical_request_identity)?;
         // The committed closure validated above is the proof the mechanical
         // fence already took effect, so every refusal from here retains the
         // pending stricter revocation instead of clearing it.
         let pending_snapshot = closure.authority_receipt.snapshot_id.clone();
         let pending_revocation = closure.authority_receipt.receipt_id.clone();
-        let retain =
-            |phase: CanonicalRevocationPhase,
-             error: CompositionError,
-             pending_canonical_revocations: &mut BTreeMap<String, PendingCanonicalRevocation>,
-             grant_id: &str| {
-                pending_canonical_revocations.insert(
-                    grant_id.to_owned(),
-                    PendingCanonicalRevocation {
-                        grant_id: grant_id.to_owned(),
-                        snapshot_id: pending_snapshot.clone(),
-                        revocation_id: pending_revocation.clone(),
-                        phase,
-                    },
-                );
-                error
-            };
+        let grant_id = request.grant_id.as_str();
         let commit = CanonicalRevocationCommit {
             canonical_operation_id,
             canonical_request_identity,
@@ -9652,11 +9727,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         };
         if let Err(error) = self.prepare_revocation_transition_for_commit(request, closure, &commit)
         {
-            return Err(retain(
+            return Err(self.retain_pending_second_phase(
+                grant_id,
+                pending_snapshot.clone(),
+                pending_revocation.clone(),
                 CanonicalRevocationPhase::ClosureReadback,
                 error,
-                &mut self.pending_canonical_revocations,
-                request.grant_id.as_str(),
             ));
         }
         if let Err(error) = self
@@ -9665,11 +9741,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .grants
             .revoke_declared_closure(&request.grant_id, &closure.declaration.affected_grants())
         {
-            return Err(retain(
+            return Err(self.retain_pending_second_phase(
+                grant_id,
+                pending_snapshot.clone(),
+                pending_revocation.clone(),
                 CanonicalRevocationPhase::ClosureReadback,
                 CompositionError::Owner(error.to_string()),
-                &mut self.pending_canonical_revocations,
-                request.grant_id.as_str(),
             ));
         }
         self.owners.authority.invalidate_owner_hydrations();
@@ -9680,11 +9757,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         ) {
             Ok(envelope) => envelope,
             Err(error) => {
-                return Err(retain(
+                return Err(self.retain_pending_second_phase(
+                    grant_id,
+                    pending_snapshot.clone(),
+                    pending_revocation.clone(),
                     CanonicalRevocationPhase::CanonicalCommit,
                     error,
-                    &mut self.pending_canonical_revocations,
-                    request.grant_id.as_str(),
                 ));
             }
         };
@@ -9694,22 +9772,24 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             Ok(receipt) => receipt,
             Err(error) => {
-                return Err(retain(
+                return Err(self.retain_pending_second_phase(
+                    grant_id,
+                    pending_snapshot.clone(),
+                    pending_revocation.clone(),
                     CanonicalRevocationPhase::CanonicalCommit,
                     error,
-                    &mut self.pending_canonical_revocations,
-                    request.grant_id.as_str(),
                 ));
             }
         };
         let receipt_identity = match canonical_receipt_identity(&canonical_receipt) {
             Ok(identity) => identity,
             Err(error) => {
-                return Err(retain(
+                return Err(self.retain_pending_second_phase(
+                    grant_id,
+                    pending_snapshot.clone(),
+                    pending_revocation.clone(),
                     CanonicalRevocationPhase::SecondPhaseLink,
                     error,
-                    &mut self.pending_canonical_revocations,
-                    request.grant_id.as_str(),
                 ));
             }
         };
@@ -9719,45 +9799,30 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             match link(closure.operation_id.clone(), receipt_identity.clone()).await {
                 Ok(projection) => projection,
                 Err(error) => {
-                    return Err(retain(
+                    return Err(self.retain_pending_second_phase(
+                        grant_id,
+                        pending_snapshot.clone(),
+                        pending_revocation.clone(),
                         CanonicalRevocationPhase::SecondPhaseLink,
                         CompositionError::Owner(error.to_string()),
-                        &mut self.pending_canonical_revocations,
-                        request.grant_id.as_str(),
                     ));
                 }
             };
-        if closure_projection.closure().operation_id != closure.operation_id
-            || closure_projection.closure().declaration != closure.declaration
-            || closure_projection.canonical_receipt() != &receipt_identity
-        {
-            return Err(retain(
-                CanonicalRevocationPhase::SecondPhaseLink,
-                CompositionError::Recovery(
-                    "durable second-phase readback does not bind the canonical closure receipt"
-                        .to_owned(),
-                ),
-                &mut self.pending_canonical_revocations,
-                request.grant_id.as_str(),
-            ));
-        }
-        // The authority receipt below is a projection of the committed closure's
-        // own authority reference, not a fresh Kernel presentation: the first
-        // phase already committed, nothing here presents to P-07, and the
-        // receipt identity, snapshot, epoch and terminal state are the owner's
-        // committed bytes verbatim.
-        let authority_receipt = AuthorityRevocationReceipt {
-            revocation_id: closure.authority_receipt.receipt_id.clone(),
-            snapshot_id: closure.authority_receipt.snapshot_id.clone(),
-            authority_epoch: closure.authority_receipt.authority_epoch.clone(),
-            state: AuthorityState::Revoked,
-        };
-        self.pending_canonical_revocations
-            .remove(request.grant_id.as_str());
-        Ok(AuthorityRevocationReconciliation {
-            authority_receipt,
-            canonical_receipt,
+        self.finish_resume_second_phase(
+            closure,
+            &canonical_receipt,
             closure_projection,
+            &receipt_identity,
+            grant_id,
+        )
+        .map_err(|error| {
+            self.retain_pending_second_phase(
+                grant_id,
+                pending_snapshot,
+                pending_revocation,
+                CanonicalRevocationPhase::SecondPhaseLink,
+                error,
+            )
         })
     }
 
