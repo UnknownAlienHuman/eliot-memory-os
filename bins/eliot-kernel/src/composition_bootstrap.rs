@@ -1911,6 +1911,13 @@ impl KernelComposition {
                 EntrypointStage::Composition,
                 "kernel.composition.generation_recovery_shadow_skipped",
             );
+            // Issue #1678 REQ9: the admission-reservation inventory is a durable
+            // enumeration with the same posture, so a shadow candidate inspects no
+            // reservation row either and adopts no committed one.
+            observe_entrypoint_with_detail(
+                EntrypointStage::Composition,
+                "kernel.composition.admission_reservation_recovery_shadow_skipped",
+            );
         } else {
             generation_gateway
                 .recover(&mut generations, &mut service, &mut policy)
@@ -1927,6 +1934,24 @@ impl KernelComposition {
                     observe_entrypoint_with_detail(
                         EntrypointStage::Composition,
                         "kernel.composition.cutover_ownership_recovery_rejected",
+                    );
+                    KernelBuildError::Ors(error)
+                })?;
+            // Issue #1678 REQ9/A2/A7/A12: load every durable admission reservation
+            // before the Kernel admits any overlapping work, so a reservation
+            // staged before a crash is reloaded under its ORIGINAL identity rather
+            // than silently forgotten and re-staged. This pass only enumerates,
+            // reads and dispositions durable rows: it holds no process gateway,
+            // builds no process admission, and launches nothing, so recovery
+            // cannot provision or launch as a side effect of loading state. The
+            // recovered rows stay exactly as durable, and every dispatch path
+            // refuses a non-ACTIVE one by name at launch.
+            generation_gateway
+                .recover_admission_reservations()
+                .map_err(|error| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.admission_reservation_recovery_rejected",
                     );
                     KernelBuildError::Ors(error)
                 })?;

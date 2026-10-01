@@ -334,6 +334,15 @@ impl KernelComposition {
         self.validate_candidate_process_binding(&candidate)
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let outer_binding = candidate;
+        // #1678 W8: the daemon launch passes the ONE admission-reservation
+        // launch gate before the process start. The `eliotd` contour stages no
+        // admission reservation, so this resolves none and passes unchanged; but
+        // if a reservation is ever bound to this launch's own operation identity
+        // and is not `Active`, the gate refuses the launch by name rather than
+        // letting a staged/released/expired/reconciling reservation reach the
+        // gateway. The gate is a pure read plus the ORS owner's verifier: it
+        // stages nothing, launches nothing and mutates no lifecycle position.
+        self.require_eliotd_launch_reservation(&operation_id)?;
         {
             let mut state = self.daemon_runtime.lock().map_err(|_| {
                 KernelBuildError::Service("daemon runtime lock poisoned".to_owned())
@@ -391,6 +400,77 @@ impl KernelComposition {
         drop(state);
         self.note_agent_bridge_peer_set_change();
         Ok(receipt)
+    }
+
+    /// Applies the #1678 admission-reservation launch gate to the `eliotd`
+    /// process start (W8).
+    ///
+    /// This is the production caller of
+    /// [`admission_reservation_saga::require_bound_admission_reservation_launch`]
+    /// for the daemon contour, reached from
+    /// [`KernelComposition::launch_eliotd_inner`] immediately before the single
+    /// `gateway.start`.
+    ///
+    /// It runs after the live activation checks and BEFORE the gateway, so a
+    /// refused launch has built no process intent, retained no path proof and
+    /// contacted no executor. The `eliotd` contour stages no admission
+    /// reservation today, so this resolves no reservation and passes; the gate
+    /// exists so that a reservation bound to this launch's own operation
+    /// identity can never reach a spawn while `STAGED`, `RELEASED`, `EXPIRED`,
+    /// `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`,
+    /// `MISSING`, or unreadable. It never stages a reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KernelBuildError::Service`] carrying the owner's own refusal
+    /// discriminant, so the diagnostic names the state that blocked the launch
+    /// instead of a generic "launch denied".
+    #[cfg(windows)]
+    fn require_eliotd_launch_reservation(
+        &self,
+        operation_id: &eliot_process::OperationId,
+    ) -> Result<(), KernelBuildError> {
+        use eliot_ors::{OperationIdentity, StateFenceSnapshot, epoch_lineage_for};
+        // The launch's OWN operation identity is the work item and attempt the
+        // gate searches under: a reservation is only ever resolved for the exact
+        // launch identity that produced it.
+        let work_item = OperationIdentity::new(operation_id.as_str())
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let proposed_attempt = work_item.clone();
+        // The live authority epoch/fence come from the composition's own current
+        // fence, validated by the ORS owner before the store is searched.
+        let state_fence = self.current_state_fence().ok_or_else(|| {
+            KernelBuildError::Service("eliotd launch has no current State Fence".to_owned())
+        })?;
+        let authority_epoch = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| KernelBuildError::Service("service lock poisoned".to_owned()))?;
+            service.authority_epoch().clone()
+        };
+        let lineage = epoch_lineage_for(&authority_epoch, None)
+            .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let fence_snapshot =
+            StateFenceSnapshot::capture(&state_fence, authority_epoch.sequence.get())
+                .and_then(|snapshot| {
+                    snapshot
+                        .validate_against_epoch(&authority_epoch)
+                        .map(|()| snapshot)
+                })
+                .map_err(|error| KernelBuildError::Service(error.to_string()))?;
+        let now_unix_ms = i64::try_from(unix_ms())
+            .map_err(|_| KernelBuildError::Service("eliotd launch clock is unusable".to_owned()))?;
+        super::admission_reservation_saga::require_bound_admission_reservation_launch(
+            self.generation_gateway.ors.as_ref(),
+            &work_item,
+            &proposed_attempt,
+            &lineage,
+            &fence_snapshot,
+            now_unix_ms,
+        )
+        .map(|_| ())
+        .map_err(|refusal| KernelBuildError::Service(refusal.to_string()))
     }
 
     #[cfg(windows)]

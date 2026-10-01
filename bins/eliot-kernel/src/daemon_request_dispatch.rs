@@ -74,6 +74,7 @@ use eliot_store_api::{
 };
 use serde::Deserialize;
 
+use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
     ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
@@ -648,6 +649,13 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "store_named" => "store_named",
         NOTIFICATION_STATE_MUTATION_OPERATION => NOTIFICATION_STATE_MUTATION_OPERATION,
         NOTIFICATION_STATE_READ_OPERATION => NOTIFICATION_STATE_READ_OPERATION,
+        // Issue #1678 W3/W5 (REQ4, REQ6, A3, A4): the admitted daemon-channel
+        // coordinator that drives the canonical `ADMITTED` readback, its
+        // launch-outbox intent proof, and the one activation of the exact
+        // staged reservation. It is served on this channel because the
+        // canonical owner receipt it must read is live `KernelStoreGateway`
+        // IO, which the synchronous claim route structurally cannot reach.
+        ADMISSION_RESERVATION_ADMIT_OPERATION => ADMISSION_RESERVATION_ADMIT_OPERATION,
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
@@ -716,7 +724,12 @@ struct StoreNamedOperation {
 /// application data: it is already bound to the dispatched `operation` string,
 /// so removing it cannot lose or invent a request field, and a body that is
 /// not an object still fails closed exactly as before.
-fn without_daemon_routing_key(
+///
+/// Shared with the #1678 admission-reservation admit/activate coordinator
+/// (`admission_reservation_saga`), so the routing key is removed by ONE
+/// implementation: a second spelling would risk decoding a body the
+/// dispatcher did not route.
+pub(crate) fn without_daemon_routing_key(
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     match payload {
@@ -3358,6 +3371,17 @@ impl KernelComposition {
             }
             NOTIFICATION_STATE_READ_OPERATION => {
                 Box::pin(self.notification_state_read_operation(session, payload.clone())).await
+            }
+            // Issue #1678 W3/W5/REQ4/REQ6/A3/A4/A7: the admit + activate leg of
+            // the normative admission-reservation saga. The arm never mints an
+            // admission: it reads the canonical owner's OWN committed
+            // `WriteReceipt` for the ORIGINAL operation identity through the
+            // retained production gateway, proves the exact launch-outbox row
+            // from that receipt, and activates the staged reservation under
+            // the reservation-bound activation identity. Every non-committed
+            // outcome keeps the reservation inactive and launch blocked.
+            ADMISSION_RESERVATION_ADMIT_OPERATION => {
+                Box::pin(self.admission_reservation_admit_operation(session, payload.clone())).await
             }
             "receipt" => {
                 // F-LOG-KERNEL-1 (#897 T20): only a dispatch failure carries
@@ -11135,8 +11159,15 @@ impl KernelComposition {
         Err(TransportError::SessionFenced)
     }
 
+    /// Returns the retained production canonical-store gateway.
+    ///
+    /// Shared with the #1678 admission-reservation admit/activate coordinator
+    /// (`admission_reservation_saga`) so the #1678 owner-receipt readback
+    /// reaches the canonical owner through the SAME retained generation-routed
+    /// gateway every other canonical write on this channel uses, rather than
+    /// opening a second client or a second store route.
     #[cfg(windows)]
-    fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
+    pub(crate) fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
         self.canonical_store_gateway
             .lock()
             .map_err(|_| TransportError::SessionFenced)?
@@ -12102,7 +12133,12 @@ fn notification_state_read_selectors(
     })
 }
 
-fn validate_store_session_fence(
+/// Proves the presented session and State Fence are the same live binding.
+///
+/// Shared with the #1678 admission-reservation admit/activate coordinator so
+/// its canonical owner-receipt readback is admitted by the SAME session-fence
+/// check as every other canonical read on this channel.
+pub(crate) fn validate_store_session_fence(
     session: &Session,
     state_fence: &StateFence,
 ) -> Result<(), TransportError> {

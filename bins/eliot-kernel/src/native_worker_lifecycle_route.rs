@@ -66,7 +66,7 @@ use eliot_ors::{
     NativeWorkerClaimState, OpaqueLabel, OperationIdentity, OrsError, StateFenceSnapshot,
     admission_reservation_identity, epoch_lineage_for, reconcile_canonical_admission,
     reload_staged_admission_reservation, stage_admission_reservation_inactive,
-    stage_operation_identity, verify_admission_reservation_launch_prerequisite,
+    stage_operation_identity,
 };
 use eliot_process::OperationId;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -268,6 +268,23 @@ pub(crate) enum NativeWorkerRouteError {
         // As with `TerminalCanonicalAdmission`, the sealed disposition is not
         // carried here; the owner verifier is the single source for it.
     },
+    /// The launch gate refused the claim because its admission reservation is
+    /// not in the one admissible state (#1678 W8, I14.20).
+    ///
+    /// This is the W8 refusal on the provider/worker dispatch path: a claim may
+    /// only be admitted for launch while its durable reservation is exactly
+    /// `Active` under the caller's current Authority Epoch lineage, State Fence,
+    /// work item and proposed attempt. A reservation that is `STAGED`,
+    /// `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`,
+    /// `IDENTITY_CONFLICT` or `MISSING` — or a durable row the owner itself
+    /// refused to read — cannot provision or launch, so the claim is refused
+    /// rather than admitted against it.
+    ///
+    /// The refusal is TYPED and NAMES THE STATE: it carries the owner's own
+    /// discriminant through [`admission_reservation_saga::AdmissionReservationLaunchRefusal`]
+    /// rather than collapsing every non-admissible reservation into one opaque
+    /// fence, so a caller can tell a staged reservation from a released one.
+    LaunchRefused(super::admission_reservation_saga::AdmissionReservationLaunchRefusal),
 }
 
 impl std::fmt::Display for NativeWorkerRouteError {
@@ -306,6 +323,10 @@ impl std::fmt::Display for NativeWorkerRouteError {
                 f,
                 "native-worker canonical admission unresolved for reservation {reservation_id} under operation {operation_id} ({reason:?})",
             ),
+            // The refusal renders the owner's own state discriminant, so the
+            // message says WHICH state blocked the launch rather than that
+            // something unnamed did.
+            Self::LaunchRefused(refusal) => write!(f, "native-worker {refusal}"),
         }
     }
 }
@@ -333,6 +354,13 @@ impl NativeWorkerRouteError {
             Self::Conflict(_) | Self::TerminalCanonicalAdmission { .. } => {
                 TransportError::IdentityConflict
             }
+            // A launch refused by the admission-reservation gate is an
+            // identity-level refusal about THIS claim's reservation, not a
+            // transport fault: the caller must reconcile or activate that exact
+            // reservation rather than retry the claim blind. Reporting it as
+            // `SessionFenced` would discard the named state and fence a session
+            // whose claim is still valid once the reservation is admissible.
+            Self::LaunchRefused(_) => TransportError::IdentityConflict,
         }
     }
 }
@@ -2442,8 +2470,18 @@ impl KernelComposition {
         })?;
         // Durably read the staged reservation back. This is the A2/A7 recovery
         // read: a restart lands on the identical row, and a missing reservation
-        // is `Unknown` rather than silently created here.
-        let current = reload_staged_admission_reservation(
+        // is `Unknown` rather than silently created here. It is a pure read plus
+        // the owner's own `validate()` and
+        // `verify_staged_claim_completeness()`: it provisions nothing, launches
+        // nothing, allocates no environment and mints no second reservation.
+        //
+        // The launch disposition below is read from this row through the shared
+        // gate, so this load is the SAME row the gate reads: it is kept as the
+        // explicit recovery proof that the reservation is durable and still
+        // inactive before anything else in this saga is attempted, and it is
+        // what turns a reservation that is not durably staged into a typed
+        // `Unknown` rather than a silent pass.
+        reload_staged_admission_reservation(
             self.generation_gateway.ors.as_ref(),
             reservation_id,
             now_unix_ms,
@@ -2466,33 +2504,62 @@ impl KernelComposition {
             .map_err(|_| NativeWorkerRouteError::Fence {
             field: "admission_reservation.reconcile",
         })?;
-        // Read the launch prerequisite back through the SINGLE owner verifier.
-        // It is a pure read that re-derives the reservation's current
-        // disposition; only an exact `Active` record carrying both owner receipts
-        // yields active authority, and every other state is a distinct inert
-        // variant. It launches nothing (#1701's single issuance point). This runs
-        // on EVERY path, so the refusal below carries the same sealed evidence a
-        // consumer would have read, rather than a route-local guess.
-        let disposition = verify_admission_reservation_launch_prerequisite(
-            Some(&current),
-            &work_item_id,
-            &proposed_attempt_id,
-            &authority_epoch,
-            &state_fence,
-            now_unix_ms,
-        )
-        .map_err(|_| NativeWorkerRouteError::Fence {
-            field: "admission_reservation.launch_prerequisite",
-        })?;
+        // Read the launch prerequisite back through the SINGLE shared read
+        // (`admission_reservation_saga::read_admission_reservation_launch_prerequisite`),
+        // so this route and every path that is about to start a child apply the
+        // SAME owner verifier to the SAME durable row instead of a route-local
+        // load plus a route-local verify. It is a pure read: it provisions
+        // nothing, launches nothing and changes no lifecycle position. The nine
+        // states are NOT re-derived here — `MISSING`, `STAGED`, `RELEASED`,
+        // `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER` and
+        // `IDENTITY_CONFLICT` are the owner's own variants, and only its sealed
+        // `Active` typestate carries launch authority (#1701's single issuance
+        // point). This runs on EVERY path, so the refusal below carries the same
+        // sealed evidence a consumer would have read.
+        let disposition =
+            super::admission_reservation_saga::read_admission_reservation_launch_prerequisite(
+                self.generation_gateway.ors.as_ref(),
+                reservation_id,
+                &work_item_id,
+                &proposed_attempt_id,
+                &authority_epoch,
+                &state_fence,
+                now_unix_ms,
+            )
+            .map_err(|_| NativeWorkerRouteError::Fence {
+                field: "admission_reservation.launch_prerequisite",
+            })?;
         match resolution {
             CanonicalAdmissionResolution::Committed => {
-                // Proven committed `ADMITTED` with its exact launch intent. The
-                // activation still needs an owner-issued `WriteReceipt` for that
-                // operation, which this route cannot produce or read back (see
-                // this method's docs), so the readback above reports the
-                // reservation's true current state instead of asserting an
-                // activation that was never performed.
-                Ok(disposition)
+                // #1678 W8: the launch gate. A committed `ADMITTED` decision is
+                // NOT launch authority. I14.6 requires the Kernel to activate
+                // the exact reservation afterwards, and I14.20 forbids a
+                // reservation that is not `Active` from provisioning or
+                // launching. So the claim is admitted for launch only when the
+                // owner verifier returns its sealed `Active` typestate for this
+                // exact reservation, under this caller's current Authority Epoch
+                // lineage, State Fence, work item and attempt.
+                //
+                // `require_admission_reservation_launch` is the ONE gate: it
+                // returns the sealed value or refuses with the owner's own
+                // discriminant — `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`,
+                // `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`
+                // or `UNREADABLE:<tag>` — as a TYPED refusal that says which
+                // state blocked the launch. A reservation still `STAGED` behind
+                // an unrun activation is therefore refused by name rather than
+                // admitted for launch.
+                match super::admission_reservation_saga::require_active_admission_reservation(
+                    self.generation_gateway.ors.as_ref(),
+                    reservation_id,
+                    &work_item_id,
+                    &proposed_attempt_id,
+                    &authority_epoch,
+                    &state_fence,
+                    now_unix_ms,
+                ) {
+                    Ok(prerequisite) => Ok(prerequisite),
+                    Err(refusal) => Err(NativeWorkerRouteError::LaunchRefused(refusal)),
+                }
             }
             CanonicalAdmissionResolution::ProvenNonCommit => {
                 // A proven terminal non-commit may be retried only under this
