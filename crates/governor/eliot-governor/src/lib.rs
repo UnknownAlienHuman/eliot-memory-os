@@ -145,6 +145,7 @@ mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
 mod task_lifecycle;
 mod wasm_resolution;
+mod work_scope_source_admission;
 
 pub use activation_outcome::*;
 pub use campaign_source_publishers::{
@@ -175,6 +176,10 @@ pub use capability_evidence_commit::{
     commit_capability_evidence_record,
 };
 pub use composition::*;
+pub use work_scope_source_admission::{
+    PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError,
+    prepare_initial_work_scope_source_admission,
+};
 pub use controlboard_projection::{
     ControlBoardAttentionEvaluationRow, ControlBoardGovernorSnapshot, ControlBoardOwnerBinding,
     ControlBoardProjectionError, ControlBoardReviewBatch, ControlBoardReviewBatchObligation,
