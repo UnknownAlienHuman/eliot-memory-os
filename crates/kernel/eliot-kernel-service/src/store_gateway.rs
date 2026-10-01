@@ -1576,13 +1576,29 @@ impl KernelStoreGateway {
                 ))
             }
             Err(error) => {
-                // Deterministic refusal: the Store owner proves no effect, so
-                // the still-`Eligible` token releases cleanly and nothing
-                // orphans.
-                let refusal =
-                    refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
+                // The Store call crossed the submission boundary. An error
+                // label by itself does not prove that the provider transaction
+                // rolled back, so keep the exact reservation under receipt
+                // reconciliation instead of releasing its ordering position.
+                // A future terminal path must carry transaction-owner evidence
+                // bound to this operation and fence; missing receipt and
+                // provider conflicts cannot manufacture that evidence.
+                let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
+                begin_execute_after_send(&owner, &sealed.token, &post_send)
+                    .map_err(|state_error| {
+                        format!(
+                            "reserved write error for operation {operation_id} is ambiguous ({error}); reservation handoff also failed ({state_error}); retain for exact receipt reconciliation"
+                        )
+                    })?;
+                mark_unknown_outcome(&owner, &sealed.token).map_err(|state_error| {
+                    format!(
+                        "reserved write error for operation {operation_id} is ambiguous ({error}); unknown-outcome retention failed ({state_error})"
+                    )
+                })?;
                 drop(lease);
-                Err(refusal)
+                Err(format!(
+                    "reserved write outcome unknown for operation {operation_id}: {error}; reservation retained for exact Store receipt reconciliation"
+                ))
             }
         }
     }
