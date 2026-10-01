@@ -208,8 +208,8 @@ static ADMITTED_SEMANTIC_PROFILES: OnceLock<Mutex<BTreeMap<String, BTreeMap<Stri
 /// same way the daemon catalogue handle does: a previous holder panicked, so
 /// the held state is returned rather than bricking the skill path on a stale
 /// poison flag.
-fn lock_admitted_semantic_profiles(
-) -> std::sync::MutexGuard<'static, BTreeMap<String, BTreeMap<String, String>>> {
+fn lock_admitted_semantic_profiles()
+-> std::sync::MutexGuard<'static, BTreeMap<String, BTreeMap<String, String>>> {
     ADMITTED_SEMANTIC_PROFILES
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
@@ -262,10 +262,7 @@ pub fn record_semantic_profile_admission(
 /// admitted — so the reconcile caller treats the gap as unbound, never as
 /// agreement.
 #[must_use]
-pub fn admitted_semantic_profile_version(
-    skill_id: &str,
-    canonical_tool: &str,
-) -> Option<String> {
+pub fn admitted_semantic_profile_version(skill_id: &str, canonical_tool: &str) -> Option<String> {
     lock_admitted_semantic_profiles()
         .get(skill_id)
         .and_then(|tools| tools.get(canonical_tool))

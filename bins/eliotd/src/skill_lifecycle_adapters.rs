@@ -655,12 +655,7 @@ impl<T> ForwardingSkillLifecycle<T> {
                     missing,
                     entry.admitted_definition_version != live,
                     entry.admitted_definition_version.clone(),
-                    Self::profile_drifted_tools(
-                        skill_id,
-                        &entry.body.tool_refs,
-                        source,
-                        aliases,
-                    ),
+                    Self::profile_drifted_tools(skill_id, &entry.body.tool_refs, source, aliases),
                 )
             };
             let mut catalogue = self.lock_catalogue();
