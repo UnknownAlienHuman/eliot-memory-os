@@ -78,7 +78,7 @@ fn handle(value: &PlatformHandle, field: &'static str) -> Result<(), KernelServi
 /// Stable identity for the Host↔Kernel lifecycle control wire.
 pub const KERNEL_CONTROL_WIRE_ID: &str = "eliot.kernel.host-control";
 /// Current version of the Host↔Kernel lifecycle control wire.
-pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 7;
+pub const KERNEL_CONTROL_WIRE_VERSION: u16 = 8;
 /// Canonical authenticated Kernel front-door pipe.
 pub const KERNEL_CONTROL_PIPE: &str = r"\\.\pipe\eliot\kernel\frontdoor";
 /// Stable identity for the Kernel-owned `eliotd` launch descriptor.
@@ -1413,6 +1413,17 @@ impl KernelControlRequest {
         if let KernelControlCommand::RevokeRuntimeLease(query) = &self.command {
             query.validate()?;
         }
+        if let KernelControlCommand::RevokeHostSupervisionEvidence(query) = &self.command {
+            query.validate()?;
+            if query.candidate_digest != self.candidate.compute_digest()?
+                || query.state_fence.resource_generation != self.generation
+                || query.state_fence.authority_epoch != self.candidate.kernel_epoch
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "supervision_revocation.candidate_or_fence",
+                });
+            }
+        }
         if let KernelControlCommand::Activate(permit) = &self.command {
             permit.validate(&self.candidate, self.generation)?;
         }
@@ -1458,6 +1469,22 @@ impl KernelControlRequest {
     }
 }
 
+/// Typed outcome for matched Host supervision revocation.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostSupervisionRevocationDisposition {
+    /// The exact current heartbeat observation was withdrawn.
+    Revoked,
+    /// No current observation remained to withdraw.
+    AlreadyAbsent,
+    /// A newer original heartbeat superseded the requested old observation.
+    Superseded {
+        /// Digest of the preserved current original observation, returned only
+        /// so Host can update its exact compare-and-swap selector.
+        current_observation_digest: PlatformHandle,
+    },
+}
+
 /// Typed response to one authenticated Host lifecycle command.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1495,6 +1522,9 @@ pub struct KernelControlResponse {
     /// the caller compares against presented evidence; never authority by
     /// themselves.
     pub introduction_rows: Option<Vec<IntroductionRow>>,
+    /// Closed outcome for an exact Host supervision revocation command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_revocation: Option<HostSupervisionRevocationDisposition>,
     /// Stable rejection detail, when the command was not accepted.
     pub error: Option<String>,
     /// Digest over all fields except this digest.
@@ -1518,6 +1548,7 @@ impl KernelControlResponse {
             supervision_lease: &'a Option<SupervisionLeaseSnapshot>,
             runtime_lease_census: &'a Option<RuntimeLeaseCensus>,
             introduction_rows: &'a Option<Vec<IntroductionRow>>,
+            supervision_revocation: &'a Option<HostSupervisionRevocationDisposition>,
             error: &'a Option<String>,
         }
         serde_json::to_vec(&Unsigned {
@@ -1533,6 +1564,7 @@ impl KernelControlResponse {
             supervision_lease: &self.supervision_lease,
             runtime_lease_census: &self.runtime_lease_census,
             introduction_rows: &self.introduction_rows,
+            supervision_revocation: &self.supervision_revocation,
             error: &self.error,
         })
         .map_err(|_| KernelServiceError::InvalidField {
@@ -1576,6 +1608,15 @@ impl KernelControlResponse {
         }
         if let Some(error) = &self.error {
             validate_text(error, "control.error")?;
+        }
+        if let Some(HostSupervisionRevocationDisposition::Superseded {
+            current_observation_digest,
+        }) = &self.supervision_revocation
+        {
+            validate_digest(
+                current_observation_digest.as_str(),
+                "control.supervision_revocation.current_observation_digest",
+            )?;
         }
         if self.receipt.is_some() != self.supervision_lease.is_some() {
             return Err(KernelServiceError::InvalidField {
@@ -3189,6 +3230,46 @@ impl HostStartupEvidence {
     }
 }
 
+/// Exact authenticated scope for withdrawing one current Host-owned
+/// supervision observation before a readiness attempt begins.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSupervisionEvidenceRevocation {
+    /// Exact candidate digest whose observation may be withdrawn.
+    pub candidate_digest: String,
+    /// Exact consumer fence whose observation may be withdrawn.
+    pub state_fence: StateFence,
+    /// Original observation digest that must match the current proof. `None`
+    /// is accepted only when no current observation remains; it never means
+    /// revoke-any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_observation_digest: Option<PlatformHandle>,
+}
+
+impl HostSupervisionEvidenceRevocation {
+    /// Validates the closed command shape before the authenticated consumer
+    /// compares it with its current candidate and observation.
+    pub fn validate(&self) -> Result<(), KernelServiceError> {
+        validate_digest(
+            &self.candidate_digest,
+            "supervision_revocation.candidate_digest",
+        )?;
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::InvalidField {
+                field: "supervision_revocation.state_fence",
+                reason: "must be a valid complete fence",
+            })?;
+        if let Some(expected) = &self.expected_observation_digest {
+            validate_digest(
+                expected.as_str(),
+                "supervision_revocation.expected_observation_digest",
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// One authenticated startup report with an optional typed Host journal readback.
 ///
 /// Candidate activation sends `Some(rows)` after Host has read the exact rows
@@ -3203,6 +3284,103 @@ pub struct HostStartupEvidenceReport {
     /// Complete canonical module rows freshly read back from the Host journal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module_build_provenance: Option<Vec<ModuleBuildProvenanceRecord>>,
+    /// Original admitted Watchdog heartbeat proof for I1.11 step 11.
+    /// Process-only startup evidence never completes or refreshes supervision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_heartbeat: Option<AdmittedWatchdogHeartbeatProof>,
+}
+
+/// Coverage classification carried by the original Host-admitted heartbeat.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum HostStartupHeartbeatCoverage {
+    /// Host proved uninterrupted heartbeat continuity for this observation.
+    Continuous,
+    /// Host observed a beat but could not prove an uninterrupted chain.
+    Partial,
+    /// Host could not observe heartbeat coverage.
+    Blind,
+}
+
+/// The original Host-admitted Watchdog heartbeat, bound by its existing
+/// observation and verified transport-descriptor digests. These are the
+/// values measured by the heartbeat admission path; Kernel never recaptures
+/// them or substitutes a report/lease timestamp.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedWatchdogHeartbeatProof {
+    /// Digest of the original canonical Host heartbeat observation.
+    pub observation_digest: PlatformHandle,
+    /// Digest of the exact verified Host transport descriptor, including its
+    /// challenge nonce and per-instance pipe binding.
+    pub transport_descriptor_digest: PlatformHandle,
+    /// Pipe named by the verified descriptor and admitted heartbeat.
+    pub pipe_name: String,
+    /// Pipe instance GUID named by the verified descriptor and heartbeat.
+    pub service_instance_guid: String,
+    /// Original Watchdog writer sequence admitted by Host.
+    pub readiness_sequence: u64,
+    /// Original Host wall-clock receive time in milliseconds since Unix epoch.
+    pub received_wall_ms: u64,
+    /// Original Host monotonic receive time in milliseconds since boot.
+    pub received_monotonic_ms: u64,
+    /// Original finite Host freshness deadline in wall-clock milliseconds.
+    pub freshness_deadline_wall_ms: u64,
+    /// Host boot identity that owns the monotonic receive measurement.
+    pub host_boot_id: u64,
+    /// SCM-verified Watchdog process identifier paired with its start time.
+    pub scm_watchdog_pid: u32,
+    /// SCM-verified Watchdog process creation time in 100ns ticks.
+    pub scm_watchdog_start_100ns: u64,
+    /// Kernel epoch sequence echoed by the original heartbeat wire message.
+    pub kernel_epoch_sequence: u64,
+    /// Watchdog epoch sequence echoed by the original heartbeat wire message.
+    pub watchdog_epoch_sequence: u64,
+    /// Coverage classification Host admitted from the observation chain.
+    pub coverage: HostStartupHeartbeatCoverage,
+    /// Host-observed pipe handshake count carried by the original observation.
+    pub handshake_count: u64,
+}
+
+impl AdmittedWatchdogHeartbeatProof {
+    fn validate(&self, candidate: &HostKernelCandidateBinding) -> Result<(), KernelServiceError> {
+        validate_digest(
+            self.observation_digest.as_str(),
+            "startup_evidence.supervision_heartbeat.observation_digest",
+        )?;
+        validate_digest(
+            self.transport_descriptor_digest.as_str(),
+            "startup_evidence.supervision_heartbeat.transport_descriptor_digest",
+        )?;
+        validate_text(
+            &self.pipe_name,
+            "startup_evidence.supervision_heartbeat.pipe_name",
+        )?;
+        validate_text(
+            &self.service_instance_guid,
+            "startup_evidence.supervision_heartbeat.service_instance_guid",
+        )?;
+        let invalid = || KernelServiceError::InvalidField {
+            field: "startup_evidence.supervision_heartbeat",
+            reason: "must be an original fresh continuous admitted heartbeat with a complete owner binding",
+        };
+        if self.readiness_sequence == 0
+            || self.received_wall_ms == 0
+            || self.received_monotonic_ms == 0
+            || self.freshness_deadline_wall_ms <= self.received_wall_ms
+            || self.host_boot_id == 0
+            || self.scm_watchdog_pid == 0
+            || self.scm_watchdog_start_100ns == 0
+            || self.kernel_epoch_sequence != candidate.kernel_epoch.sequence.get()
+            || self.watchdog_epoch_sequence
+                != candidate.supervision_incarnation.watchdog_epoch.sequence
+            || self.coverage != HostStartupHeartbeatCoverage::Continuous
+            || self.handshake_count == 0
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
 }
 
 impl HostStartupEvidenceReport {
@@ -3224,6 +3402,26 @@ impl HostStartupEvidenceReport {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "startup_evidence.fence",
             });
+        }
+        if let Some(heartbeat) = &self.supervision_heartbeat {
+            heartbeat.validate(candidate)?;
+            let mut parts = self
+                .startup_evidence
+                .scm_watchdog_observation_digest
+                .as_str()
+                .split(':');
+            if parts.next() != Some("host-scm-watchdog")
+                || parts.next().and_then(|value| value.parse::<u32>().ok())
+                    != Some(heartbeat.scm_watchdog_pid)
+                || parts.next().and_then(|value| value.parse::<u64>().ok())
+                    != Some(heartbeat.scm_watchdog_start_100ns)
+                || parts.next().is_none()
+                || parts.next().is_some()
+            {
+                return Err(KernelServiceError::HandshakeMismatch {
+                    field: "startup_evidence.supervision_heartbeat.scm_incarnation",
+                });
+            }
         }
         let Some(records) = &self.module_build_provenance else {
             return Ok(());
@@ -3556,6 +3754,9 @@ pub enum KernelControlCommand {
     /// command through the canonical ORS owner. This cannot issue or renew
     /// authority; drain and stop never revoke.
     RevokeRuntimeLease(RuntimeLeaseRevokeQuery),
+    /// Withdraw one exact-candidate Host heartbeat observation before a fresh
+    /// readiness attempt. This changes no service or lease lifecycle state.
+    RevokeHostSupervisionEvidence(HostSupervisionEvidenceRevocation),
     /// Close normal admission while retaining recovery control.
     Degrade(PlatformHandle),
     /// Read current capability-introduction rows for exact subjects from
@@ -3573,8 +3774,9 @@ pub enum KernelControlCommand {
     Fail(PlatformHandle),
     /// Report closed Host-owned startup evidence (I1.11 steps 1, 2, 4) bound
     /// to the request candidate, plus optional typed module rows Host read
-    /// back from its journal. The records remain evidence and do not mint a
-    /// generation receipt.
+    /// back from its journal and an optional original admitted heartbeat.
+    /// Process-only evidence never completes or renews I1.11 step 11; only the
+    /// complete heartbeat-bound record can establish that revocable claim.
     ReportHostStartupEvidence(HostStartupEvidenceReport),
 }
 
@@ -4528,6 +4730,7 @@ mod tests {
             command: KernelControlCommand::ReportHostStartupEvidence(HostStartupEvidenceReport {
                 startup_evidence: evidence,
                 module_build_provenance: None,
+                supervision_heartbeat: None,
             }),
             payload_digest: String::new(),
         }

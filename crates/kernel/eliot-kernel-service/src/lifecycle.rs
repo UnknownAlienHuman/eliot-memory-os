@@ -643,6 +643,12 @@ impl KernelService {
                     reason: "RuntimeLease revocation requires the authenticated Kernel composition boundary",
                 });
             }
+            KernelControlCommand::RevokeHostSupervisionEvidence(_) => {
+                return Err(KernelServiceError::InvalidField {
+                    field: "supervision_revocation",
+                    reason: "Host supervision evidence revocation requires the authenticated Kernel composition boundary",
+                });
+            }
             KernelControlCommand::ReadIntroductionRows(_) => {
                 return Err(KernelServiceError::InvalidField {
                     field: "introduction_readback",

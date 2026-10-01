@@ -24,7 +24,7 @@
 //! mechanics, no credentials. `KernelComposition` owns the single instance
 //! and consults it from normal-write and Material/Critical admission paths.
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{EpochId, StateFence};
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::SupervisionJournalEpoch;
 use serde::Serialize;
@@ -451,12 +451,11 @@ pub struct StartupStatus {
 /// consumer State Fence it was observed under, and to the moment it was taken.
 ///
 /// I1.5 (#1750): a supervision claim is not a retained string. It is an
-/// owner-produced observation that carries its own observation time, its own
-/// progress position and a finite validity interval. The closed shape of the
-/// carrier is proven once, where the record is created; currency, contour
-/// binding and fence binding are proven at every consumer, on the Kernel
-/// supervision clock. A renewed signed lease advances no field here, so a lease
-/// renewal can never be counted as a physical observation.
+/// owner-produced, typed admitted heartbeat proof that carries the original
+/// receive time, owner sequence, descriptor identity and finite deadline. The
+/// Kernel stores those values unchanged; currency, contour binding and fence
+/// binding are proven at every consumer. A renewed signed lease advances no
+/// field here, so lease renewal can never be counted as a physical observation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WatchdogSupervisionObservation {
     /// The exact live SCM Watchdog incarnation digest the owner observed:
@@ -471,18 +470,43 @@ pub struct WatchdogSupervisionObservation {
     /// out of a lease, so the observation is consumed by the coverage
     /// comparison rather than sitting beside it.
     pub watchdog_epoch: SupervisionJournalEpoch,
-    /// Observation time on the Kernel supervision clock, in milliseconds. This
-    /// is the causal moment the owner observation was accepted, not a value the
-    /// observation carried about itself.
+    /// Original admitted heartbeat proof as received from the Host owner.
+    pub heartbeat_proof: eliot_kernel_service::AdmittedWatchdogHeartbeatProof,
+    /// Original Host receive wall-clock time in milliseconds since Unix epoch.
     pub observed_at_ms: u64,
-    /// Monotonic count of independent owner observations accepted by this
-    /// coordinator. Only [`StartupCoordinator::record_live_supervision_evidence`]
-    /// advances it, so re-reading retained text or renewing a lease cannot
-    /// move the frontier.
+    /// Original owner readiness sequence. Kernel never increments or
+    /// substitutes this frontier.
     pub progress_frontier: u64,
-    /// Finite validity interval in milliseconds, supplied by the single
-    /// supervision timing owner rather than invented here.
+    /// Finite validity interval derived from the original Host receive and
+    /// deadline values.
     pub valid_for_ms: u64,
+}
+
+/// Last original source-sequence position for one original Watchdog epoch and
+/// SCM incarnation. Candidate, fence, Kernel epoch, and descriptor are kept as
+/// provenance for the latest accepted proof, but do not reset the Watchdog's
+/// global source sequence. The frontier survives observation withdrawal so an
+/// in-window proof cannot be replayed across A→B→A contour changes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SupervisionOwnerSequenceFrontier {
+    candidate_digest: PlatformHandle,
+    state_fence: StateFence,
+    kernel_epoch: EpochId,
+    incarnation: PlatformHandle,
+    watchdog_epoch: SupervisionJournalEpoch,
+    transport_descriptor_digest: PlatformHandle,
+    highest_readiness_sequence: u64,
+}
+
+impl SupervisionOwnerSequenceFrontier {
+    fn matches_progress_epoch(
+        &self,
+        incarnation: &PlatformHandle,
+        watchdog_epoch: &SupervisionJournalEpoch,
+    ) -> bool {
+        self.incarnation == *incarnation
+            && self.watchdog_epoch == *watchdog_epoch
+    }
 }
 
 /// Explicit startup coordinator whose transitions correspond to I1.11 steps
@@ -499,21 +523,18 @@ pub struct StartupCoordinator {
     store_schema_probed: bool,
     epoch_recovered: bool,
     supervision_evidence_complete: bool,
-    /// The current independent Watchdog supervision observation: exact
-    /// incarnation, contour, consumer fence, observed Watchdog epoch,
-    /// observation time, progress position and finite validity interval. It is
-    /// withdrawn with the revocable step, so a supervision claim can never
-    /// outlive the observation that established it and can never be asserted
-    /// from lease bookkeeping alone.
+    /// The current independent Watchdog supervision observation: original
+    /// heartbeat proof, exact incarnation, contour, consumer fence, owner
+    /// sequence, receive time and finite deadline. It is withdrawn with the
+    /// revocable step, so a claim can never be asserted from process-only
+    /// evidence or lease bookkeeping alone.
     current_supervision_observation: Option<WatchdogSupervisionObservation>,
     /// The observation the current one superseded or contradicted. It is kept
-    /// as a fact and never overwritten, and it never gates anything.
+    /// as the immediately superseded fact and never gates anything.
     superseded_supervision_observation: Option<WatchdogSupervisionObservation>,
-    /// Monotonic count of independent owner observations accepted. Only
-    /// [`Self::record_live_supervision_evidence`] advances it, and contour
-    /// revocation leaves it alone: the number of physical observations is a
-    /// property of this Kernel, not of one activation contour.
-    supervision_progress_frontier: u64,
+    /// Highest actual owner sequence for the current exact contour. Unlike the
+    /// proof history, this scalar frontier survives revocation to reject replay.
+    supervision_owner_sequence_frontier: Option<SupervisionOwnerSequenceFrontier>,
     /// Current Governor-issued authority projection (I7.16, #1935 AUD1).
     /// `None` until the Governor derivation is first recorded across the
     /// authenticated boundary; while `None` every Material/Critical gate
@@ -543,7 +564,7 @@ impl StartupCoordinator {
             supervision_evidence_complete: false,
             current_supervision_observation: None,
             superseded_supervision_observation: None,
-            supervision_progress_frontier: 0,
+            supervision_owner_sequence_frontier: None,
             governor_authority: None,
             blob_degraded: false,
             capability_degraded: false,
@@ -1006,7 +1027,9 @@ impl StartupCoordinator {
                 "the recorded Watchdog observation belongs to a different consumer State Fence",
             );
         }
-        if now_ms.saturating_sub(current.observed_at_ms) > current.valid_for_ms {
+        if now_ms < current.observed_at_ms
+            || now_ms >= current.heartbeat_proof.freshness_deadline_wall_ms
+        {
             return Err(
                 "the recorded Watchdog observation is outside its finite validity interval",
             );
@@ -1024,14 +1047,12 @@ impl StartupCoordinator {
     /// shape is proven here, once, where the record is created, so no consumer
     /// ever decides supervision from re-parsed retained text.
     ///
-    /// Re-observing the same incarnation is progress: the record is replaced in
-    /// place, its observation time and frontier advance, and the retained
-    /// superseded fact is left untouched. Observing a different incarnation
-    /// under the same contour and fence contradicts the standing claim: both
-    /// facts are retained, the claim is withdrawn, and the caller is told, so
-    /// dependent supervision and Material admission narrow until the owner
-    /// observes again. The contiguous I1.11 cursor is never rolled back, so no
-    /// earlier step is un-observed.
+    /// Only a strictly newer original owner readiness sequence advances the
+    /// claim. An exact replay is idempotent and retains the original receive
+    /// time and deadline. An older sequence or substituted proof contradicts
+    /// the standing claim: the prior record is retained, the claim is
+    /// withdrawn, and the caller is told. The contiguous I1.11 cursor is never
+    /// rolled back, so no earlier step is un-observed.
     ///
     /// # Errors
     ///
@@ -1045,40 +1066,100 @@ impl StartupCoordinator {
         candidate_digest: PlatformHandle,
         state_fence: StateFence,
         watchdog_epoch: SupervisionJournalEpoch,
+        heartbeat_proof: eliot_kernel_service::AdmittedWatchdogHeartbeatProof,
         observed_at_ms: u64,
         valid_for_ms: u64,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if valid_for_ms == 0 {
             return Err(
                 "a Watchdog supervision observation needs a non-zero validity interval".to_owned(),
             );
         }
         crate::verify_scm_watchdog_observation_shape(&incarnation).map_err(str::to_owned)?;
-        let contradicts_recorded = self
-            .current_supervision_observation
-            .as_ref()
-            .is_some_and(|current| current.incarnation != incarnation);
-        if contradicts_recorded {
-            self.superseded_supervision_observation = self.current_supervision_observation.take();
-            self.supervision_evidence_complete = false;
-            return Err(
-                "a different Watchdog incarnation was observed for the same contour and fence; the contradicted observation is retained and the supervision claim is withdrawn until the owner observes again"
-                    .to_owned(),
-            );
+        let has_current = self.current_supervision_observation.is_some();
+        let kernel_epoch = state_fence.authority_epoch.clone();
+        if !has_current
+            && let Some(frontier) = self.supervision_owner_sequence_frontier.as_ref()
+            && frontier.matches_progress_epoch(&incarnation, &watchdog_epoch)
+        {
+            if heartbeat_proof.readiness_sequence <= frontier.highest_readiness_sequence {
+                let binding_changed = frontier.candidate_digest != candidate_digest
+                    || frontier.state_fence != state_fence
+                    || frontier.kernel_epoch != kernel_epoch;
+                let reason = if binding_changed {
+                    "candidate, fence, or Kernel epoch rotation cannot lower the retained original Watchdog sequence"
+                } else if frontier.transport_descriptor_digest
+                    != heartbeat_proof.transport_descriptor_digest
+                {
+                    "the transport descriptor changed without advancing the retained owner sequence"
+                } else {
+                    "the admitted Watchdog heartbeat sequence does not advance the retained exact-owner frontier"
+                };
+                return Err(
+                    reason.to_owned(),
+                );
+            }
+        }
+        if let Some(current) = self.current_supervision_observation.as_ref() {
+            if current.candidate_digest == candidate_digest
+                && current.state_fence == state_fence
+                && current.incarnation == incarnation
+                && current.watchdog_epoch == watchdog_epoch
+                && current.heartbeat_proof == heartbeat_proof
+                && current.observed_at_ms == observed_at_ms
+                && current.valid_for_ms == valid_for_ms
+            {
+                return Ok(false);
+            }
+            if current.candidate_digest != candidate_digest
+                || current.state_fence != state_fence
+                || current.incarnation != incarnation
+                || current.heartbeat_proof.transport_descriptor_digest
+                    != heartbeat_proof.transport_descriptor_digest
+                || current.heartbeat_proof.pipe_name != heartbeat_proof.pipe_name
+                || current.heartbeat_proof.service_instance_guid
+                    != heartbeat_proof.service_instance_guid
+                || current.heartbeat_proof.host_boot_id != heartbeat_proof.host_boot_id
+                || current.heartbeat_proof.observation_digest
+                    == heartbeat_proof.observation_digest
+                || heartbeat_proof.readiness_sequence <= current.progress_frontier
+            {
+                if let Some(previous) = self.current_supervision_observation.take() {
+                    self.superseded_supervision_observation = Some(previous);
+                }
+                self.supervision_evidence_complete = false;
+                self.record_governor_coverage_loss();
+                return Err(
+                    "the admitted Watchdog heartbeat proof is older or substituted for the current owner observation; the prior observation is retained and supervision is withdrawn until a fresh owner proof arrives"
+                        .to_owned(),
+                );
+            }
         }
         self.record_step_evidence(STARTUP_FINAL_STEP)?;
         self.supervision_evidence_complete = true;
-        self.supervision_progress_frontier = self.supervision_progress_frontier.saturating_add(1);
+        if let Some(previous) = self.current_supervision_observation.take() {
+            self.superseded_supervision_observation = Some(previous);
+        }
+        self.supervision_owner_sequence_frontier = Some(SupervisionOwnerSequenceFrontier {
+            candidate_digest: candidate_digest.clone(),
+            state_fence: state_fence.clone(),
+            kernel_epoch,
+            incarnation: incarnation.clone(),
+            watchdog_epoch: watchdog_epoch.clone(),
+            transport_descriptor_digest: heartbeat_proof.transport_descriptor_digest.clone(),
+            highest_readiness_sequence: heartbeat_proof.readiness_sequence,
+        });
         self.current_supervision_observation = Some(WatchdogSupervisionObservation {
             incarnation,
             candidate_digest,
             state_fence,
             watchdog_epoch,
+            progress_frontier: heartbeat_proof.readiness_sequence,
+            heartbeat_proof,
             observed_at_ms,
-            progress_frontier: self.supervision_progress_frontier,
             valid_for_ms,
         });
-        Ok(())
+        Ok(true)
     }
 
     /// Revokes the recorded independent-supervision evidence.
@@ -1096,6 +1177,71 @@ impl StartupCoordinator {
         if let Some(previous) = self.current_supervision_observation.take() {
             self.superseded_supervision_observation = Some(previous);
         }
+        self.record_governor_coverage_loss();
+    }
+
+    /// Withdraws the current heartbeat record only when the authenticated
+    /// command names its exact candidate, consumer fence, and original
+    /// observation digest. `None` is idempotent only when current is absent;
+    /// a known superseded digest returns a typed stale-attempt outcome with
+    /// the newer proof digest and preserves that current proof.
+    pub(crate) fn revoke_supervision_evidence_for(
+        &mut self,
+        candidate_digest: &str,
+        state_fence: &StateFence,
+        expected_observation_digest: Option<&str>,
+    ) -> Result<eliot_kernel_service::HostSupervisionRevocationDisposition, String> {
+        let has_current = self.current_supervision_observation.is_some();
+        if let Some(current) = self.current_supervision_observation.as_ref() {
+            if current.candidate_digest.as_str() != candidate_digest
+                || current.state_fence != *state_fence
+            {
+                return Err(
+                    "supervision revocation names a different candidate or consumer fence"
+                    .to_owned(),
+                );
+            }
+            let Some(expected_observation_digest) = expected_observation_digest else {
+                return Err(
+                    "supervision revocation requires the exact current heartbeat observation digest"
+                        .to_owned(),
+                );
+            };
+            if current.heartbeat_proof.observation_digest.as_str() != expected_observation_digest {
+                if self
+                    .superseded_supervision_observation
+                    .as_ref()
+                    .is_some_and(|superseded| {
+                        superseded.candidate_digest.as_str() == candidate_digest
+                            && superseded.state_fence == *state_fence
+                            && superseded.heartbeat_proof.observation_digest.as_str()
+                                == expected_observation_digest
+                            && current.progress_frontier > superseded.progress_frontier
+                            && current.watchdog_epoch == superseded.watchdog_epoch
+                            && current.incarnation == superseded.incarnation
+                    })
+                {
+                    return Ok(
+                        eliot_kernel_service::HostSupervisionRevocationDisposition::Superseded {
+                            current_observation_digest: current
+                                .heartbeat_proof
+                                .observation_digest
+                                .clone(),
+                        },
+                    );
+                }
+                return Err("supervision revocation observation digest does not match the current proof".to_owned());
+            }
+        }
+        if has_current {
+            self.revoke_supervision_evidence();
+            Ok(eliot_kernel_service::HostSupervisionRevocationDisposition::Revoked)
+        } else {
+            Ok(eliot_kernel_service::HostSupervisionRevocationDisposition::AlreadyAbsent)
+        }
+    }
+
+    fn record_governor_coverage_loss(&mut self) {
         // I7.16 (#1935 AUD1): admitting a new contour supersedes the recorded
         // Governor derivation with it. The old revision's fingerprint binding
         // no longer describes the live contour, so record coverage loss under
