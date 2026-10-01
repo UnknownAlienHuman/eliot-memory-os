@@ -448,7 +448,9 @@ fn check_instrument_registry_commit_freshness(
     expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<(), CompositionError> {
     receipt.validate().map_err(|error| {
-        CompositionError::Owner(format!("instrument registry commit receipt invalid: {error}"))
+        CompositionError::Owner(format!(
+            "instrument registry commit receipt invalid: {error}"
+        ))
     })?;
     if receipt.status != WriteReceiptStatus::Committed {
         return Err(CompositionError::Owner(
