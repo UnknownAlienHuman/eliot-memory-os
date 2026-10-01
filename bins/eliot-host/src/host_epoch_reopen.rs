@@ -2,11 +2,12 @@ use std::path::Path;
 
 use super::{
     ActivationState, ActivePhaseBRebindRecoveryKind, ApprovedGenerationRegistry, EpochTransition,
-    HostError, HostInstallationEpoch, HostStateJournalService, HostStateRecord, JournalBackend,
-    JournalError, PendingActivationState, PlatformHandle, ProductionHostStateJournal,
-    ReconcileOutcome, RedbJournalBackend, StoreRecoveryReopenFence, StoreRecoveryStartupFence,
-    active_phase_b_rebind_recovery_kind, append_reconciled, child_host_epoch, epoch_contract_error,
-    fresh_host_epoch, fresh_identity, fresh_lineage_id, initial_activation_record, root_epoch,
+    HostError, HostInstallationEpoch, HostState, HostStateJournalService, HostStateRecord,
+    JournalBackend, JournalError, KernelActivationState, PendingActivationState, PlatformHandle,
+    PriorKernelDisposition, ProductionHostStateJournal, ReconcileOutcome, RedbJournalBackend,
+    StoreRecoveryReopenFence, StoreRecoveryStartupFence, active_phase_b_rebind_recovery_kind,
+    append_reconciled, child_host_epoch, epoch_contract_error, fresh_host_epoch, fresh_identity,
+    fresh_lineage_id, initial_activation_record, root_epoch,
 };
 use crate::activation_lifecycle::{ActivationTriggerClass, control_contour_capabilities};
 use crate::journal_append::ActivationIngress;
@@ -84,6 +85,75 @@ fn host_epoch_observe(detail: &str) {
         crate::host_diagnostics::EntrypointStage::Startup,
         detail,
     );
+}
+
+/// I14.16 step 6 (issue #1953 W5): verifies the retired Kernel contour left
+/// no unproven authority behind before Host records a new installation epoch
+/// with a fresh one-time host-process nonce.
+///
+/// This is the epoch-owner half of the cutover ordering the activation
+/// driver enforces live (`handoff_prepared` ->
+/// `prior_disposition_committed`, the sole transition to `OldTerminated`,
+/// -> `issue_nonce`, which refuses before `OldTerminated`): a new
+/// `HostInstallationEpoch` must not be recorded while the replayed journal
+/// still carries a prior Kernel that never reached a proven-terminated
+/// disposition or a terminal activation state. Such a record means process
+/// termination and exclusive lock release were never proven, so minting a
+/// fresh epoch and nonce here would fork an ambiguous owner lineage; the
+/// open stops in manual recovery instead, and the retained record stays
+/// queryable.
+///
+/// The live operating-system proof half (`prove_released` on the retired
+/// contour's exclusive owner object) lives in the activation driver
+/// (`kernel_activation_driver.rs` via `kernel_owner_exclusivity.rs`) and is
+/// not re-probed here: by the time a new Host process reaches this path, a
+/// Host-owned kill-on-close Job has already terminated the old children, so
+/// only the durable disposition is re-checked, never re-proven.
+///
+/// Accepted unchanged: no retained Kernel record; a retained record in
+/// `OldTerminated` (whose durable transition already ran the release proof),
+/// `Active` (clean-shutdown path: the shutdown manifest observed child
+/// termination before exit), `Failed`, `ManualRecovery` or `Idle`; and a
+/// `NoPriorKernel`/`Terminated` durable disposition. Refused: unknown
+/// prior-Kernel authority, a `Running`/`Unknown` durable disposition, or a
+/// retained record still in a pre-termination live state
+/// (`ShadowNoAuthority`, `HandoffPrepared`, `NonceIssued`, `Activating`).
+fn require_prior_kernel_released_for_new_epoch(replayed: &HostState) -> Result<(), HostError> {
+    if replayed.prior_kernel_unknown {
+        host_epoch_observe("host.epoch prior kernel unknown observed");
+        return Err(HostError::RecoveryRequired(
+            "new Host installation epoch requires a known prior-Kernel disposition; unknown observations stop activation but remain queryable".to_owned(),
+        ));
+    }
+    let kernel = match replayed.kernel.as_ref() {
+        None => return Ok(()),
+        Some(kernel) => kernel,
+    };
+    match &kernel.prior_kernel_disposition {
+        PriorKernelDisposition::NoPriorKernel | PriorKernelDisposition::Terminated(_) => {}
+        PriorKernelDisposition::Running(_) | PriorKernelDisposition::Unknown(_) => {
+            host_epoch_observe("host.epoch prior kernel unverified observed");
+            return Err(HostError::RecoveryRequired(
+                "new Host installation epoch requires a terminated prior-Kernel disposition; the retained disposition is still live or unknown".to_owned(),
+            ));
+        }
+    }
+    match kernel.state {
+        KernelActivationState::ShadowNoAuthority
+        | KernelActivationState::HandoffPrepared
+        | KernelActivationState::NonceIssued
+        | KernelActivationState::Activating => {
+            host_epoch_observe("host.epoch prior kernel unverified observed");
+            Err(HostError::RecoveryRequired(
+                "new Host installation epoch requires prior Kernel termination and exclusive lock release; the retained Kernel never reached OldTerminated".to_owned(),
+            ))
+        }
+        KernelActivationState::Idle
+        | KernelActivationState::OldTerminated
+        | KernelActivationState::Active
+        | KernelActivationState::Failed
+        | KernelActivationState::ManualRecovery => Ok(()),
+    }
 }
 
 pub(super) fn reopen_existing_epoch<B: JournalBackend>(
@@ -179,6 +249,12 @@ pub(super) fn reopen_existing_epoch<B: JournalBackend>(
     {
         last_host.clone()
     } else {
+        // I14.16 step 6 (#1953 W5): Host verification of prior termination
+        // and exclusive lock release comes before recording the new
+        // installation epoch and its one-time host-process nonce. The fenced
+        // and prepared arms above retain the exact prior epoch; only this
+        // advancing arm mints fresh lineage, so only it takes the gate.
+        require_prior_kernel_released_for_new_epoch(&replayed)?;
         child_host_epoch(last_host)?
     };
     if store_recovery_startup_fence.is_fenced()
