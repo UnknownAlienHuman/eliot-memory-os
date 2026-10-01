@@ -26,6 +26,7 @@
 //! `I3.15` keeps the `InstallationTransaction` the single installation owner.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -253,7 +254,12 @@ pub struct SurveyProbeAnswer {
 /// The three methods are the first three stages of [`SurveyStage::ORDER`].
 /// There is deliberately no method for `AdmittedSafeProbe`, because this
 /// coordinator has no execution port to call.
-pub trait SurveyObservationSource {
+pub(crate) mod observation_source_sealed {
+    pub trait Sealed {}
+}
+
+#[allow(private_bounds)]
+pub trait SurveyObservationSource: observation_source_sealed::Sealed {
     /// Inspects known configuration paths and manifests.
     ///
     /// The inspected inputs are the entry's `known_locations`, so an input
@@ -281,6 +287,282 @@ pub trait SurveyObservationSource {
         &self,
         entry: &IntegrationDiscoveryCatalogueEntry,
     ) -> Result<Vec<SurveyInputObservation>, InstallationError>;
+}
+
+/// Production metadata source for bounded catalogue paths on the local host.
+///
+/// It only inspects absolute locations explicitly retained in the accepted
+/// catalogue and PATH entries whose basename is one of those locations. It
+/// never scans unrelated directories, executes a candidate, or mutates the
+/// surveyed environment. Unsupported location syntax remains `Withheld`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsSurveyObservationSource;
+
+impl observation_source_sealed::Sealed for WindowsSurveyObservationSource {}
+
+impl SurveyObservationSource for WindowsSurveyObservationSource {
+    fn observe_known_config_or_manifest(
+        &self,
+        entry: &IntegrationDiscoveryCatalogueEntry,
+    ) -> Result<Vec<SurveyInputObservation>, InstallationError> {
+        entry
+            .known_locations
+            .iter()
+            .map(|input| {
+                let Some(path) = absolute_location(input) else {
+                    return Ok(observation(input.clone(), SurveyStageOutcome::Withheld, None, None));
+                };
+                let outcome = match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => SurveyStageOutcome::Denied,
+                    Ok(_) => SurveyStageOutcome::Found,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        SurveyStageOutcome::NotFound
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        SurveyStageOutcome::Denied
+                    }
+                    Err(_) => SurveyStageOutcome::Unreadable,
+                };
+                Ok(observation(input.clone(), outcome, None, None))
+            })
+            .collect()
+    }
+
+    fn observe_path_metadata(
+        &self,
+        entry: &IntegrationDiscoveryCatalogueEntry,
+    ) -> Result<Vec<SurveyInputObservation>, InstallationError> {
+        let paths = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .collect::<Vec<_>>();
+        entry
+            .known_locations
+            .iter()
+            .map(|input| {
+                let Some(name) = executable_basename(input) else {
+                    return Ok(observation(input.clone(), SurveyStageOutcome::Withheld, None, None));
+                };
+                let mut matches = Vec::new();
+                let mut denied = false;
+                let mut unreadable = false;
+                for root in &paths {
+                    let candidate = root.join(name);
+                    match std::fs::symlink_metadata(&candidate) {
+                        Ok(metadata)
+                            if metadata.is_file() && !metadata.file_type().is_symlink() =>
+                        {
+                            matches.push(candidate);
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            denied = true;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => unreadable = true,
+                    }
+                }
+                let outcome = match matches.len() {
+                    0 if denied => SurveyStageOutcome::Denied,
+                    0 if unreadable => SurveyStageOutcome::Unreadable,
+                    _ if denied => SurveyStageOutcome::Denied,
+                    _ if unreadable => SurveyStageOutcome::Unreadable,
+                    0 => SurveyStageOutcome::NotFound,
+                    1 => SurveyStageOutcome::Found,
+                    _ => SurveyStageOutcome::Ambiguous,
+                };
+                Ok(observation(input.clone(), outcome, None, None))
+            })
+            .collect()
+    }
+
+    fn observe_file_identity(
+        &self,
+        entry: &IntegrationDiscoveryCatalogueEntry,
+    ) -> Result<Vec<SurveyInputObservation>, InstallationError> {
+        let mut candidates = BTreeSet::new();
+        let mut unresolved = Vec::new();
+        for location in &entry.known_locations {
+            if let Some(path) = absolute_location(location) {
+                if executable_basename(location).is_some() {
+                    candidates.insert(path.to_path_buf());
+                } else {
+                    unresolved.push(location.clone());
+                }
+                continue;
+            }
+            if let Some(name) = executable_basename(location) {
+                unresolved.push(location.clone());
+                for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+                    let candidate = root.join(name);
+                    if std::fs::symlink_metadata(&candidate).is_ok() {
+                        candidates.insert(candidate);
+                    }
+                }
+            } else {
+                unresolved.push(location.clone());
+            }
+        }
+
+        let mut observations = candidates
+            .into_iter()
+            .map(|path| {
+                let input = path_handle(&path)?;
+                match inspect_executable_identity(&path) {
+                    Ok((identity, evidence)) => Ok(observation(
+                        input,
+                        SurveyStageOutcome::Found,
+                        Some(identity),
+                        Some(evidence),
+                    )),
+                    Err(IdentityObservationFailure::NotFound) => Ok(observation(
+                        input,
+                        SurveyStageOutcome::NotFound,
+                        None,
+                        None,
+                    )),
+                    Err(IdentityObservationFailure::Denied) => Ok(observation(
+                        input,
+                        SurveyStageOutcome::Denied,
+                        None,
+                        None,
+                    )),
+                    Err(IdentityObservationFailure::Unreadable) => Ok(observation(
+                        input,
+                        SurveyStageOutcome::Unreadable,
+                        None,
+                        None,
+                    )),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        unresolved.sort();
+        unresolved.dedup();
+        observations.extend(unresolved.into_iter().map(|input| {
+            observation(input, SurveyStageOutcome::Withheld, None, None)
+        }));
+        Ok(observations)
+    }
+}
+
+#[cfg(windows)]
+const MAX_SURVEY_EXECUTABLE_BYTES: u64 = 134_217_728;
+
+fn absolute_location(input: &PlatformHandle) -> Option<&Path> {
+    let path = Path::new(input.as_str());
+    path.is_absolute().then_some(path)
+}
+
+fn executable_basename(input: &PlatformHandle) -> Option<&std::ffi::OsStr> {
+    let name = Path::new(input.as_str()).file_name()?;
+    let extension = Path::new(name).extension()?.to_string_lossy();
+    (extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com"))
+        .then_some(name)
+}
+
+fn observation(
+    input: PlatformHandle,
+    outcome: SurveyStageOutcome,
+    observed_identity: Option<PlatformHandle>,
+    evidence: Option<PlatformHandle>,
+) -> SurveyInputObservation {
+    SurveyInputObservation {
+        input,
+        outcome,
+        observed_identity,
+        evidence,
+    }
+}
+
+fn path_handle(path: &Path) -> Result<PlatformHandle, InstallationError> {
+    let text = path.to_string_lossy();
+    PlatformHandle::new(text.as_ref()).map_err(|error| InstallationError::InvalidField {
+        field: "survey.path".to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum IdentityObservationFailure {
+    NotFound,
+    Denied,
+    Unreadable,
+}
+
+#[cfg(windows)]
+fn inspect_executable_identity(
+    path: &Path,
+) -> Result<(PlatformHandle, PlatformHandle), IdentityObservationFailure> {
+    use std::io::Read as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    use eliot_platform_windows::{
+        AuthenticodeVerifier as _, WindowsAuthenticodeVerifier, file_identity_for_open_handle,
+    };
+    use sha2::{Digest as _, Sha256};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(map_identity_io)?;
+    let metadata = file.metadata().map_err(|_| IdentityObservationFailure::Unreadable)?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(IdentityObservationFailure::Denied);
+    }
+    if metadata.len() > MAX_SURVEY_EXECUTABLE_BYTES {
+        return Err(IdentityObservationFailure::Unreadable);
+    }
+    let file_id = file_identity_for_open_handle(&file)
+        .map_err(|_| IdentityObservationFailure::Unreadable)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_SURVEY_EXECUTABLE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| IdentityObservationFailure::Unreadable)?;
+    if bytes.len() as u64 > MAX_SURVEY_EXECUTABLE_BYTES {
+        return Err(IdentityObservationFailure::Unreadable);
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let canonical_path = std::fs::canonicalize(path)
+        .map_err(|_| IdentityObservationFailure::Unreadable)?;
+    let signature = WindowsAuthenticodeVerifier
+        .verify(&canonical_path, file_id, &sha256)
+        .map_err(|_| IdentityObservationFailure::Unreadable)?;
+    let canonical_path_digest = format!("{:x}", Sha256::digest(canonical_path.to_string_lossy().to_lowercase().as_bytes()));
+    let signer = signature.signer_certificate_sha256.as_deref().unwrap_or("unsigned");
+    let identity = format!(
+        "windows-file:v1:{canonical_path_digest}:{:08x}:{:016x}:{sha256}:{:?}:{signer}",
+        file_id.volume_serial_number,
+        file_id.file_index,
+        signature.verdict,
+    );
+    let evidence = format!(
+        "survey-evidence:v1:{canonical_path_digest}:{sha256}:{:?}:{signer}",
+        signature.verdict,
+    );
+    let identity = PlatformHandle::new(identity).map_err(|_| IdentityObservationFailure::Unreadable)?;
+    let evidence = PlatformHandle::new(format!("{:x}", Sha256::digest(evidence.as_bytes())))
+        .map_err(|_| IdentityObservationFailure::Unreadable)?;
+    Ok((identity, evidence))
+}
+
+#[cfg(not(windows))]
+fn inspect_executable_identity(
+    _path: &Path,
+) -> Result<(PlatformHandle, PlatformHandle), IdentityObservationFailure> {
+    Err(IdentityObservationFailure::Unreadable)
+}
+
+#[cfg(windows)]
+fn map_identity_io(error: std::io::Error) -> IdentityObservationFailure {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => IdentityObservationFailure::NotFound,
+        std::io::ErrorKind::PermissionDenied => IdentityObservationFailure::Denied,
+        _ => IdentityObservationFailure::Unreadable,
+    }
 }
 
 /// One complete, deterministic, metadata-only survey of a discovery catalogue.

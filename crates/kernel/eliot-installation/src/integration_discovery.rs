@@ -30,8 +30,9 @@ use eliot_config::initial_snapshot::{
 
 use super::setup_binding::profile_ref;
 use super::{
-    InstallationError, InstallationSurvey, PlatformHandle, RedbInstallationTransactionStore,
-    SurveyObservationSource, VerifiedSetupBinding, handle, handles, text,
+    InstallationError, InstallationSurvey, ManagedEnvironmentAction,
+    ManagedEnvironmentChangeRequest, PlatformHandle, RedbInstallationTransactionStore,
+    StateFence, SurveyObservationSource, VerifiedSetupBinding, handle, handles, text,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -523,6 +524,13 @@ pub const DISCOVERY_CATALOGUE_SCHEMA: &str = "eliot.integration-discovery-catalo
 /// by a second catalogue registry.
 pub const DISCOVERY_CATALOGUE_SETTING_KEY: &str = "integration.discovery_catalogue";
 
+/// Configuration setting key for System Owner-approved managed requests.
+/// Rows are carried in the same retained, signed publication as the catalogue.
+pub const MANAGED_CHANGE_APPROVALS_SETTING_KEY: &str = "installation.managed_change_approvals";
+
+/// Strict schema marker for the signed managed-change approval set.
+pub const MANAGED_CHANGE_APPROVALS_SCHEMA: &str = "eliot.managed-change-approvals.v1";
+
 /// The only value prefix an inline configuration setting may carry. The
 /// configuration owner already uses `literal:` for deterministic values.
 pub const LITERAL_VALUE_PREFIX: &str = "literal:";
@@ -832,6 +840,151 @@ pub enum CatalogueAdmissionError {
     /// The retained publication is not this installation's own publication.
     #[error("accepted discovery catalogue belongs to a different installation")]
     ForeignInstallation,
+    /// No exact signed approval row exists for the requested operation.
+    #[error("managed change has no exact System Owner approval in the accepted publication")]
+    ApprovalRequired,
+    /// The signed approval does not bind the current accepted catalogue revision.
+    #[error("managed change approval is bound to a different catalogue revision")]
+    ApprovalCatalogueMismatch,
+    /// The signed approval has expired against the current clock reading.
+    #[error("managed change approval expired at {0} Unix milliseconds")]
+    ApprovalExpired(u64),
+    /// The independent installation clock could not provide a valid time.
+    #[error("installation owner clock is unavailable")]
+    ClockUnavailable,
+}
+
+/// One System Owner-signed approval row for one exact managed request.
+///
+/// The request body is carried in the same retained signed publication as the
+/// catalogue. Catalogue provenance, expected target identity, expiry and the
+/// exact authority fence are separately bound so the row cannot be reused
+/// after drift.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedChangeApproval {
+    /// Stable approval identity, distinct from the managed request identity.
+    pub approval_id: PlatformHandle,
+    /// Exact request body the owner approved.
+    pub request: ManagedEnvironmentChangeRequest,
+    /// Accepted catalogue origin this approval was reviewed against.
+    pub catalogue_origin: PlatformHandle,
+    /// Accepted catalogue revision this approval was reviewed against.
+    pub catalogue_revision: u64,
+    /// Exact observed executable identity approved for non-install actions.
+    /// `Install` has no current target and therefore requires `None`.
+    pub expected_identity: Option<PlatformHandle>,
+    /// Authority fence the owner approved; dispatch must match it exactly.
+    pub state_fence: StateFence,
+    /// Expiry in Unix milliseconds.
+    pub expires_at_ms: u64,
+}
+
+impl ManagedChangeApproval {
+    fn validate(&self, owner: &PlatformHandle) -> Result<(), InstallationError> {
+        handle(&self.approval_id, "managed_change_approval.approval_id")?;
+        self.request.validate()?;
+        handle(
+            &self.catalogue_origin,
+            "managed_change_approval.catalogue_origin",
+        )?;
+        if self.catalogue_revision == 0 || self.expires_at_ms == 0 {
+            return Err(InstallationError::InvalidField {
+                field: "managed_change_approval".to_owned(),
+                reason: "catalogue revision and approval expiry must be positive".to_owned(),
+            });
+        }
+        let expected_identity = match self.request.action {
+            ManagedEnvironmentAction::Install => None,
+            ManagedEnvironmentAction::Update
+            | ManagedEnvironmentAction::Repair
+            | ManagedEnvironmentAction::Remove
+            | ManagedEnvironmentAction::Register
+            | ManagedEnvironmentAction::Reconfigure => Some(&self.request.exact_candidate),
+        };
+        let mut role_ids = BTreeSet::new();
+        if [
+            &self.approval_id,
+            &self.request.request_id,
+            &self.request.target_family,
+            &self.request.exact_candidate,
+        ]
+        .iter()
+        .any(|identity| !role_ids.insert((*identity).clone()))
+            || self.request.required_owner != *owner
+            || self.expected_identity.as_ref() != expected_identity
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        self.state_fence
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "managed_change_approval.state_fence".to_owned(),
+                reason: error.to_string(),
+            })?;
+        Ok(())
+    }
+
+    /// Returns the distinct signed approval identity.
+    #[must_use]
+    pub const fn approval_id(&self) -> &PlatformHandle {
+        &self.approval_id
+    }
+
+    /// Returns the owner-approved target identity, when the action has one.
+    #[must_use]
+    pub const fn expected_identity(&self) -> Option<&PlatformHandle> {
+        self.expected_identity.as_ref()
+    }
+
+    /// Returns the exact state fence the owner approved.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+
+    /// Returns the approval expiry in Unix milliseconds.
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+}
+
+/// System Owner-owned approval set retained in the signed configuration
+/// publication. Duplicate approval and request identities are refused.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedChangeApprovalSet {
+    schema: PlatformHandle,
+    approvals: Vec<ManagedChangeApproval>,
+}
+
+impl ManagedChangeApprovalSet {
+    fn validate(&self, owner: &PlatformHandle) -> Result<(), InstallationError> {
+        if self.schema.as_str() != MANAGED_CHANGE_APPROVALS_SCHEMA {
+            return Err(InstallationError::MigrationRequired {
+                reason: "managed change approval set schema requires explicit migration"
+                    .to_owned(),
+            });
+        }
+        let mut requests = BTreeSet::new();
+        let mut approval_ids = BTreeSet::new();
+        for approval in &self.approvals {
+            approval.validate(owner)?;
+            if !requests.insert(approval.request.request_id.clone())
+                || !approval_ids.insert(approval.approval_id.clone())
+            {
+                return Err(InstallationError::Duplicate {
+                    kind: "managed change approval".to_owned(),
+                    identity: approval.request.request_id.as_str().to_owned(),
+                });
+            }
+        }
+        if requests.iter().any(|request_id| approval_ids.contains(request_id)) {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
 }
 
 /// The bounded, System Owner accepted discovery catalogue revision.
@@ -854,6 +1007,8 @@ pub struct AcceptedIntegrationCatalogue {
     installation_id: String,
     accepted_by: PlatformHandle,
     signed_publication_ref: PlatformHandle,
+    managed_approvals: Vec<ManagedChangeApproval>,
+    accepted_at_ms: u64,
 }
 
 impl AcceptedIntegrationCatalogue {
@@ -885,6 +1040,53 @@ impl AcceptedIntegrationCatalogue {
     #[must_use]
     pub const fn signed_publication_ref(&self) -> &PlatformHandle {
         &self.signed_publication_ref
+    }
+
+    /// Returns the exact System Owner-signed approval for `request`.
+    ///
+    /// The approval row comes from the same verified retained publication as
+    /// this catalogue. The full request is compared with the separately
+    /// retained approved request, and the row must still be live for this
+    /// accepted revision and clock reading.
+    pub fn approval_for(
+        &self,
+        request: &ManagedEnvironmentChangeRequest,
+    ) -> Result<&ManagedChangeApproval, CatalogueAdmissionError> {
+        let approval = self
+            .managed_approvals
+            .iter()
+            .find(|approval| approval.request.request_id == request.request_id)
+            .ok_or(CatalogueAdmissionError::ApprovalRequired)?;
+        if approval.request != *request {
+            return Err(CatalogueAdmissionError::ApprovalRequired);
+        }
+        if approval.catalogue_origin != self.catalogue.origin
+            || approval.catalogue_revision != self.catalogue.revision
+        {
+            return Err(CatalogueAdmissionError::ApprovalCatalogueMismatch);
+        }
+        let now_ms = super::wall_clock_millis();
+        if now_ms == 0 {
+            return Err(CatalogueAdmissionError::ClockUnavailable);
+        }
+        if let Some(expires_at_ms) = self.catalogue.expires_at_ms
+            && now_ms >= expires_at_ms
+        {
+            return Err(CatalogueAdmissionError::Expired(expires_at_ms));
+        }
+        if now_ms >= approval.expires_at_ms {
+            return Err(CatalogueAdmissionError::ApprovalExpired(
+                approval.expires_at_ms,
+            ));
+        }
+        Ok(approval)
+    }
+
+    /// Returns the independent clock observation at which this retained
+    /// publication was accepted.
+    #[must_use]
+    pub const fn accepted_at_ms(&self) -> u64 {
+        self.accepted_at_ms
     }
 
     /// Returns the accepted catalogue revision number.
@@ -924,10 +1126,11 @@ pub enum ManagedChangeAdmissionError {
     Installation(#[from] InstallationError),
 }
 
-/// The exact installation, publication, authority, platform and instant one
-/// accepted catalogue revision is resolved against.
+/// The exact installation, publication, authority and platform one accepted
+/// catalogue revision is resolved against. Time is read independently from
+/// the installation owner's clock and is not caller-controlled.
 ///
-/// These six values travel together at every level of the accepted-catalogue
+/// These five values travel together at every level of the accepted-catalogue
 /// path, so they are grouped here to bind the load, the survey and the compiled
 /// plan to *one* admission context by construction rather than by six separate
 /// arguments a caller could pair inconsistently.
@@ -936,8 +1139,8 @@ pub enum ManagedChangeAdmissionError {
 /// carries the installation's own durable store, the transaction whose retained
 /// publication is read, the installation-pinned anchor those retained bytes are
 /// verified against, the already-admitted authority whose confirmed owner must
-/// have signed them, the platform the installation was actually observed on,
-/// and the instant expiry is judged at. Every admission rule still lives in
+/// have signed them, and the platform the installation was actually observed
+/// on. Every admission rule still lives in
 /// [`load_accepted_catalogue`]: a context value is not an accepted catalogue,
 /// not a capability, and not permission to install.
 pub struct AcceptedCatalogueContext<'a> {
@@ -953,8 +1156,6 @@ pub struct AcceptedCatalogueContext<'a> {
     pub authority: &'a VerifiedSetupBinding,
     /// The platform the installation was actually observed on.
     pub observed_platform: &'a PlatformHandle,
-    /// The instant catalogue expiry is judged at, in Unix milliseconds.
-    pub now_ms: u64,
 }
 
 /// Admits the accepted catalogue revision, surveys it in the mandatory order,
@@ -1012,6 +1213,43 @@ pub fn admit_installation_survey_and_compile_change(
     // one exact identity and still supplies no fact about them.
     let advertisement = super::requalify_managed_capability(&plan, context, source)?;
     Ok((admitted, plan, advertisement))
+}
+
+/// Production metadata-only caller for one accepted local-host installation.
+///
+/// This entry point owns construction of the sealed platform observer; callers
+/// cannot substitute an implementation that asserts arbitrary sightings.
+/// # Errors
+/// Returns the same typed catalogue or survey refusal as the underlying
+/// accepted-survey path.
+pub fn survey_accepted_installation_on_host(
+    context: &AcceptedCatalogueContext<'_>,
+) -> Result<AcceptedInstallationSurvey, CatalogueAdmissionError> {
+    let source = super::WindowsSurveyObservationSource;
+    survey_accepted_installation(context, &source)
+}
+
+/// Production request-to-plan caller for one accepted local-host installation.
+///
+/// The observer is created inside the installation owner, the approval is
+/// loaded from the retained signed publication, and capability requalification
+/// consumes a second survey from the same sealed source.
+/// # Errors
+/// Returns the same typed catalogue, approval, survey, or plan refusal as the
+/// underlying admission chain.
+pub fn admit_installation_survey_and_compile_change_on_host(
+    context: &AcceptedCatalogueContext<'_>,
+    request: &super::ManagedEnvironmentChangeRequest,
+) -> Result<
+    (
+        AcceptedInstallationSurvey,
+        super::ManagedEnvironmentChangePlan,
+        super::ManagedCapabilityAdvertisement,
+    ),
+    ManagedChangeAdmissionError,
+> {
+    let source = super::WindowsSurveyObservationSource;
+    admit_installation_survey_and_compile_change(context, &source, request)
 }
 
 /// One ordered, metadata-only survey of the accepted catalogue together with
@@ -1101,7 +1339,8 @@ pub fn survey_accepted_installation(
 ///    an authority that never admitted this installation;
 /// 3. the decoded catalogue validates, accounts for the whole independent
 ///    `I3.3.1` seed set, and declares the observed platform;
-/// 4. the catalogue is not expired against the context's `now_ms`.
+/// 4. the catalogue is not expired against the installation owner's current
+///    clock reading. Callers cannot select the time used for expiry.
 ///
 /// Nothing here installs software, grants a credential, mutates PATH or
 /// advertises a capability, and an absent publication is an explicit refusal
@@ -1115,6 +1354,10 @@ pub fn survey_accepted_installation(
 pub fn load_accepted_catalogue(
     context: &AcceptedCatalogueContext<'_>,
 ) -> Result<AcceptedIntegrationCatalogue, CatalogueAdmissionError> {
+    let now_ms = super::wall_clock_millis();
+    if now_ms == 0 {
+        return Err(CatalogueAdmissionError::ClockUnavailable);
+    }
     handle(context.observed_platform, "catalogue.observed_platform")?;
     let Some(snapshot) = context
         .store
@@ -1175,8 +1418,18 @@ pub fn load_accepted_catalogue(
     if catalogue.accepted_by != *context.authority.confirmed_owner() {
         return Err(CatalogueAdmissionError::ForeignInstallation);
     }
+    let managed_approvals = decode_managed_approvals_setting(
+        verified.payload().snapshot.settings.as_slice(),
+        context.authority.confirmed_owner(),
+    )?;
+    if managed_approvals.iter().any(|approval| {
+        approval.catalogue_origin != catalogue.origin
+            || approval.catalogue_revision != catalogue.revision
+    }) {
+        return Err(CatalogueAdmissionError::ApprovalCatalogueMismatch);
+    }
     if let Some(expires_at_ms) = catalogue.expires_at_ms
-        && context.now_ms >= expires_at_ms
+        && now_ms >= expires_at_ms
     {
         return Err(CatalogueAdmissionError::Expired(expires_at_ms));
     }
@@ -1190,6 +1443,8 @@ pub fn load_accepted_catalogue(
             }
         })?,
         signed_publication_ref,
+        managed_approvals,
+        accepted_at_ms: now_ms,
         catalogue,
     })
 }
@@ -1229,4 +1484,35 @@ fn decode_catalogue_setting(
         }
         .into()
     })
+}
+
+/// Decodes exact managed-change approvals from the same retained signed
+/// publication that carries the accepted catalogue.
+fn decode_managed_approvals_setting(
+    settings: &[eliot_config::Setting],
+    confirmed_owner: &PlatformHandle,
+) -> Result<Vec<ManagedChangeApproval>, CatalogueAdmissionError> {
+    let Some(setting) = settings
+        .iter()
+        .find(|setting| setting.key == MANAGED_CHANGE_APPROVALS_SETTING_KEY)
+    else {
+        return Ok(Vec::new());
+    };
+    if setting.owner_ref != confirmed_owner.as_str() {
+        return Err(CatalogueAdmissionError::ForeignInstallation);
+    }
+    let Some(literal) = setting.value_ref.strip_prefix(LITERAL_VALUE_PREFIX) else {
+        return Err(InstallationError::InvalidField {
+            field: MANAGED_CHANGE_APPROVALS_SETTING_KEY.to_owned(),
+            reason: "must carry a literal approval payload".to_owned(),
+        }
+        .into());
+    };
+    let approvals: ManagedChangeApprovalSet =
+        serde_json::from_str(literal).map_err(|error| InstallationError::InvalidField {
+            field: MANAGED_CHANGE_APPROVALS_SETTING_KEY.to_owned(),
+            reason: format!("approval payload is not the current strict shape: {error}"),
+        })?;
+    approvals.validate(confirmed_owner)?;
+    Ok(approvals.approvals)
 }

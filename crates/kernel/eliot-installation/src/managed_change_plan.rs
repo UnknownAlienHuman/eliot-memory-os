@@ -36,9 +36,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AcceptedIntegrationCatalogue, InstallationError, InstallationProfile, InstallationSurvey,
-    ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, PlatformHandle, SurveyFamilyReport,
-    VerifiedSetupBinding, handle, is_lower_sha256, resolve_bounded_probe,
+    AcceptedIntegrationCatalogue, CatalogueAdmissionError, InstallationError,
+    InstallationProfile, InstallationSurvey,
+    ManagedChangeApproval, ManagedEnvironmentAction, ManagedEnvironmentChangeRequest,
+    PlatformHandle, SurveyFamilyReport, VerifiedSetupBinding, handle, is_lower_sha256,
+    resolve_bounded_probe,
 };
 
 /// One immutable, side-effect-free plan compiled from an exact survey.
@@ -63,6 +65,11 @@ use super::{
 pub struct ManagedEnvironmentChangePlan {
     /// The governing request, bound unchanged.
     pub request: ManagedEnvironmentChangeRequest,
+    /// Exact independently signed approval row retained with this plan.
+    ///
+    /// This is a carrier for revalidation, not authority by itself. Every use
+    /// compares it with the row reloaded from the accepted signed publication.
+    pub approval: ManagedChangeApproval,
     /// Lowercase SHA-256 of the canonical exact survey this plan was compiled
     /// from.
     ///
@@ -131,6 +138,27 @@ impl ManagedEnvironmentChangePlan {
         if self.catalogue_accepted_by != self.confirmed_owner {
             return Err(InstallationError::IdentityConflict);
         }
+        if self.approval.request != self.request
+            || self.approval.approval_id == self.request.request_id
+            || self.approval.approval_id == self.family_id
+            || self.approval.approval_id == self.request.exact_candidate
+            || self.approval.catalogue_origin != self.catalogue_origin
+            || self.approval.catalogue_revision != self.catalogue_revision
+            || self.approval.expected_identity.as_ref() != self.target_identity.as_ref()
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        handle(
+            &self.approval.approval_id,
+            "managed_change_plan.approval.approval_id",
+        )?;
+        self.approval
+            .state_fence
+            .validate()
+            .map_err(|error| InstallationError::InvalidField {
+                field: "managed_change_plan.approval.state_fence".to_owned(),
+                reason: error.to_string(),
+            })?;
         for pair in self.observed_target_identities.windows(2) {
             if pair[0] >= pair[1] {
                 return Err(InstallationError::InvalidField {
@@ -252,6 +280,10 @@ impl ManagedEnvironmentChangePlan {
         )?;
         if probe.family_id != self.family_id
             || self.target_identity.as_ref() != Some(&probe.executable_identity)
+            || probe.probe_id == self.family_id
+            || probe.probe_id == self.request.request_id
+            || probe.probe_id == self.approval.approval_id
+            || probe.probe_id == probe.executable_identity
         {
             return Err(InstallationError::IdentityConflict);
         }
@@ -283,6 +315,26 @@ pub(crate) fn survey_content_digest(
             reason: error.to_string(),
         }
     })
+}
+
+fn approval_refusal(error: CatalogueAdmissionError) -> InstallationError {
+    match error {
+        CatalogueAdmissionError::ApprovalRequired => InstallationError::ManagedApprovalRequired,
+        CatalogueAdmissionError::ApprovalCatalogueMismatch => {
+            InstallationError::ManagedApprovalStale
+        }
+        CatalogueAdmissionError::ApprovalExpired(expires_at_ms)
+        | CatalogueAdmissionError::Expired(expires_at_ms) => {
+            InstallationError::ManagedApprovalExpired { expires_at_ms }
+        }
+        CatalogueAdmissionError::ClockUnavailable => {
+            InstallationError::ManagedApprovalClockUnavailable
+        }
+        CatalogueAdmissionError::NotPublished
+        | CatalogueAdmissionError::ForeignInstallation
+        | CatalogueAdmissionError::Snapshot(_) => InstallationError::ManagedApprovalStale,
+        CatalogueAdmissionError::Installation(error) => error,
+    }
 }
 
 /// Compiles one request against the exact survey, the exact accepted catalogue
@@ -320,6 +372,10 @@ pub fn compile_managed_change_plan(
         return Err(InstallationError::IdentityConflict);
     }
     let entry = catalogue.entry(&request.target_family)?;
+    let approval = accepted
+        .approval_for(request)
+        .map_err(approval_refusal)?
+        .clone();
     let family = surveyed_family(survey, &request.target_family)?;
     if family.category != entry.category {
         return Err(InstallationError::IdentityConflict);
@@ -357,6 +413,7 @@ pub fn compile_managed_change_plan(
 
     let plan = ManagedEnvironmentChangePlan {
         request: request.clone(),
+        approval,
         target_probe,
         survey_content_digest: survey_content_digest(survey)?,
         catalogue_origin: survey.catalogue_origin.clone(),
@@ -419,6 +476,12 @@ pub fn revalidate_managed_change_plan(
     if accepted.signed_publication_ref() != &plan.catalogue_publication_ref
         || accepted.accepted_by() != &plan.catalogue_accepted_by
     {
+        return Err(InstallationError::IdentityConflict);
+    }
+    let current_approval = accepted
+        .approval_for(&plan.request)
+        .map_err(approval_refusal)?;
+    if current_approval != &plan.approval {
         return Err(InstallationError::IdentityConflict);
     }
     if authority.confirmed_owner() != &plan.confirmed_owner

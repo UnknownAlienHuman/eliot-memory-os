@@ -184,8 +184,11 @@ pub use integration_discovery::{
     DISCOVERY_CATALOGUE_SETTING_KEY, INTEGRATION_SEED_FAMILIES, IntegrationCategory,
     IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry, MAX_CATALOGUE_FAMILIES,
     ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
+    MANAGED_CHANGE_APPROVALS_SCHEMA, MANAGED_CHANGE_APPROVALS_SETTING_KEY,
+    ManagedChangeApproval,
     admit_installation_survey_and_compile_change, integration_seed_family_ids,
-    load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
+    admit_installation_survey_and_compile_change_on_host, load_accepted_catalogue,
+    resolve_bounded_probe, survey_accepted_installation, survey_accepted_installation_on_host,
 };
 
 pub use managed_change_admission::{
@@ -202,7 +205,7 @@ pub use survey::{
     InstallationSurvey, SurveyCandidate, SurveyFamilyReport, SurveyInputObservation,
     SurveyObservationSource, SurveyProbeAdmission, SurveyProbeAnswer, SurveyStage,
     SurveyStageOutcome, SurveyStageResult,
-    survey_installation,
+    WindowsSurveyObservationSource, survey_installation,
 };
 
 pub use activation::{
@@ -484,6 +487,21 @@ pub enum InstallationError {
     /// A caller attempted to use a request for another transaction.
     #[error("installation transaction identity conflict")]
     IdentityConflict,
+    /// One exact owner-signed managed change approval was required but absent.
+    #[error("managed change is not admitted by an exact System Owner approval")]
+    ManagedApprovalRequired,
+    /// The signed approval or accepted catalogue binding changed after planning.
+    #[error("managed change approval or accepted catalogue binding is stale")]
+    ManagedApprovalStale,
+    /// The accepted managed-change publication expired at the recorded time.
+    #[error("managed change approval expired at {expires_at_ms} Unix milliseconds")]
+    ManagedApprovalExpired {
+        /// Expiry read from the verified owner publication.
+        expires_at_ms: u64,
+    },
+    /// The independent installation clock could not establish a live approval.
+    #[error("installation owner clock is unavailable for managed-change admission")]
+    ManagedApprovalClockUnavailable,
     /// A provider changed an external object without a durable acknowledgement.
     #[error("installation effect outcome is unknown at stage {stage:?}")]
     UnknownOutcome {
