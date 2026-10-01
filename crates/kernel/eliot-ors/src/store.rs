@@ -11469,7 +11469,10 @@ impl RedbRecoveryStore {
     /// The first retained receipt stands: an at-least-once replay of the same
     /// evaluated completion returns the existing row unchanged and can neither
     /// replace nor erase the retained receipt, exactly like the retained
-    /// evidence and lineage written with the result.
+    /// evidence and lineage written with the result. A recorded `TRUNCATED`
+    /// delivery outcome is monotonic: presenting a non-truncated receipt for
+    /// an operation whose retained receipt records truncation fails typed
+    /// instead of collapsing the truncation into success.
     pub fn record_host_request_tool_exposure_receipt(
         &self,
         operation_id: &crate::OperationIdentity,
@@ -11521,14 +11524,34 @@ impl RedbRecoveryStore {
         }
         // First retained receipt stands: a replay of the same evaluated
         // completion reads back the existing row instead of rewriting or
-        // erasing the observation the operation already recorded.
-        let already_retained = {
+        // erasing the observation the operation already recorded. A
+        // recorded `TRUNCATED` outcome stands in particular: a later
+        // non-truncated presentation for the same operation fails typed
+        // instead of rewriting the recorded truncation into success, so a
+        // truncated delivery can never be counted as delivered-full or
+        // evidence-used through this row. The retained row is decoded
+        // through the existing receipt codec owner; only this table's own
+        // rows are ever read back here.
+        let retained = {
             let table = write
                 .open_table(HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS)
                 .map_err(storage)?;
-            table.get(key.as_str()).map_err(storage)?.is_some()
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<eliot_receipts::ToolExposureReceiptV2>(value.value()))
+                .transpose()?
         };
-        if already_retained {
+        if let Some(retained) = retained {
+            if matches!(
+                retained.result_delivery,
+                eliot_receipts::ResultDelivery::Truncated
+            ) && !matches!(
+                receipt.result_delivery,
+                eliot_receipts::ResultDelivery::Truncated
+            ) {
+                return Err(OrsError::InvalidTransition);
+            }
             return Ok(Some(existing));
         }
         let payload = encode(receipt)?;

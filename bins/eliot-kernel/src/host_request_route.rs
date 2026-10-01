@@ -4690,10 +4690,17 @@ impl KernelComposition {
         // I7.24 (#1945): advance the evaluated exposure receipt through its
         // measured stages for this persisted completion, and retain the
         // completed receipt on the durable operation row it evidences —
-        // never dropped. Observational only: every missing input, failed
-        // transition, or failed attach inside the two calls leaves the
-        // submit disposition and the durability contract unchanged, so they
-        // never gain a receipt-shaped failure mode.
+        // never dropped, whatever its delivery outcome. Retention is
+        // delivery-agnostic: a `TRUNCATED` completed receipt presented for
+        // this evaluated operation by its delivery owner (the bridge
+        // hot-view seam, which measures the withheld bytes itself and never
+        // copies caller digests) is retained on the same durable row with
+        // `transport_completed: true`, and is never rewritten as full nor
+        // counted as delivered-full or evidence-used. Observational only:
+        // every missing input, failed transition, or failed attach inside
+        // the two calls leaves the submit disposition and the durability
+        // contract unchanged, so they never gain a receipt-shaped failure
+        // mode.
         if let Some((request, receipt)) = advance_tool_exposure_receipt_for_persisted_result(
             queue,
             queued_envelope.as_ref(),
@@ -4713,11 +4720,18 @@ impl KernelComposition {
             // completion, use/outcome where lane-measured; every other stage
             // explicitly unresolved) persists through the existing observation
             // path under the same operation:digest idempotency lineage as the
-            // dispatch draft. Observational only: a populate failure is
-            // terminal-visible but never changes the submit disposition or the
-            // durability contract.
+            // dispatch draft. The draft's owner observes only digest-bound
+            // full delivery, so it is emitted only while the retained
+            // completed receipt satisfies the receipt's own delivered-full
+            // predicate; a truncated completed receipt stays retained
+            // durably without a full-delivery draft, and its truncation is
+            // never collapsed into success. Observational only: a populate
+            // failure is terminal-visible but never changes the submit
+            // disposition or the durability contract.
             let campaign_lane = matches!(queue, DaemonReadQueue::CampaignPacket);
-            if let Some(envelope) = queued_envelope.as_ref() {
+            if let Some(envelope) = queued_envelope.as_ref()
+                && receipt.is_delivered_full()
+            {
                 super::tool_exposure::observe_completion_exposure(
                     envelope,
                     &request,
@@ -4764,8 +4778,12 @@ impl KernelComposition {
 /// Skill lanes record no observable use: the Kernel serves their bytes
 /// without deciding from content. Truncation has no owner signal on this
 /// path (oversize bodies are rejected, never cut), so only the complete
-/// delivery is recorded; a token-truncated outcome stays unwired until the
-/// route tokenizer owner exists.
+/// delivery is measured here and a token-truncated outcome stays unmeasured
+/// until the route tokenizer owner exists; nothing truncated is ever
+/// inferred. A `TRUNCATED` completed receipt measured by its real owner
+/// (the bridge hot-view seam) for this evaluated operation is still
+/// retained on the durable row by the submit-path caller, where the
+/// recorded truncation stands and never collapses into success.
 ///
 /// Observational only and infallible by construction: every missing input
 /// or failed transition returns `None`, so the submit disposition and the
