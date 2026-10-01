@@ -46,3 +46,33 @@ pub(super) fn write_response(response: &Response) -> bool {
         && output.write_all(b"\n").is_ok()
         && output.flush().is_ok()
 }
+
+/// Combines the primary console outcome with the single drain outcome.
+///
+/// Audit 5910117501 item 1 (cases 8, 9, 11): a read/write/protocol failure is
+/// the primary console outcome, so it stays failure even when cleanup
+/// (`finish_console_shutdown`) succeeds and `main` still reaches the existing
+/// `console_failed` terminal/capsule/exit path. The drain itself still runs
+/// exactly once per `run_console` path; this only decides the returned bool.
+#[must_use]
+pub(super) fn console_run_ok(primary_ok: bool, drained: bool) -> bool {
+    primary_ok && drained
+}
+
+#[cfg(test)]
+mod tests {
+    use super::console_run_ok;
+
+    // Positive: a clean console run with a clean drain stays successful.
+    #[test]
+    fn console_run_ok_keeps_clean_drain_successful() {
+        assert!(console_run_ok(true, true));
+    }
+
+    // Refusal: audit 5910117501 item 1 — a read/write/protocol failure must
+    // remain failure even when cleanup succeeds (drain `true`).
+    #[test]
+    fn console_run_ok_keeps_protocol_failure_failed_after_clean_drain() {
+        assert!(!console_run_ok(false, true));
+    }
+}
