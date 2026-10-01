@@ -900,10 +900,16 @@ fn persist_projection(
     Ok(())
 }
 
-fn load_projection(
+/// Reads the durable projection file bytes for one operation.
+///
+/// This is the durable byte source. The bytes come from the FILE through its
+/// [`ProtectedRuntimePathLease`](eliot_platform_windows::ProtectedRuntimePathLease)
+/// under the recorded path identity and the `SOLO_PROJECTION_MAX_BYTES` bound.
+/// No already-typed in-memory projection can stand in for it.
+fn read_projection_bytes(
     state_root: &std::path::Path,
     operation_id: &str,
-) -> Result<SoloPersistedAttempt, DaemonError> {
+) -> Result<Vec<u8>, DaemonError> {
     require_text(operation_id, "operation identity").map_err(DaemonError::ProviderAdmission)?;
     let path = solo_projection_path(state_root, operation_id);
     let lease = eliot_platform_windows::ProtectedRuntimePathLease::open_or_create_absolute(&path)
@@ -913,10 +919,21 @@ fn load_projection(
             "solo projection path identity changed".to_owned(),
         )));
     }
-    let bytes = lease
+    lease
         .read_bounded(SOLO_PROJECTION_MAX_BYTES)
-        .map_err(DaemonError::Protected)?;
-    let file: SoloProjectionFile = serde_json::from_slice(&bytes).map_err(|error| {
+        .map_err(DaemonError::Protected)
+}
+
+/// Verifies one durable projection envelope over its own bytes (issue #370
+/// W24/W25/W26/A2/A28).
+///
+/// The recorded envelope is validated, not recomputed: the wire version must
+/// be current, `sha256_hex(&payload_bytes)` must equal the RECORDED
+/// `file.sha256`, and the payload must address this exact operation. This runs
+/// to completion BEFORE any caller selects the coordinator document out of
+/// these bytes, so a document is never read out of an unverified envelope.
+fn verify_projection(bytes: &[u8], operation_id: &str) -> Result<SoloProjectionFile, DaemonError> {
+    let file: SoloProjectionFile = serde_json::from_slice(bytes).map_err(|error| {
         DaemonError::Composition(CompositionError::Recovery(format!(
             "solo projection decode: {error}"
         )))
@@ -943,7 +960,78 @@ fn load_projection(
             ),
         ));
     }
-    Ok(file.payload)
+    Ok(file)
+}
+
+fn load_projection(
+    state_root: &std::path::Path,
+    operation_id: &str,
+) -> Result<SoloPersistedAttempt, DaemonError> {
+    let bytes = read_projection_bytes(state_root, operation_id)?;
+    Ok(verify_projection(&bytes, operation_id)?.payload)
+}
+
+/// Verified durable readback: the typed state carrier plus the coordinator
+/// document selected out of the SAME verified file bytes.
+///
+/// `payload` is a state carrier only — it is compared against the live
+/// coordinator config and carries the fabric, semantic and admission state.
+/// The coordinator itself is restored from `coordinator_document`, which is the
+/// JSON selected by pointer out of the durable bytes. The typed value is never
+/// the byte source, and the selected document must be the same coordinator
+/// state the accepted envelope carries, so the carrier can never contradict
+/// the bytes it was decoded from.
+#[cfg(not(test))]
+struct VerifiedSoloProjection {
+    /// Typed carrier for config comparison and fabric/semantic state.
+    payload: SoloPersistedAttempt,
+    /// Coordinator snapshot JSON selected out of the durable file bytes.
+    coordinator_document: String,
+}
+
+/// Durable ingress readback for the production restore seam (issue #370
+/// W24/W25/W26/A2/A28).
+///
+/// Order is the security property: the file bytes are read under the lease
+/// and bound, the envelope is verified over those bytes, and only then is the
+/// coordinator document selected out of them by JSON pointer.
+#[cfg(not(test))]
+fn load_verified_projection(
+    state_root: &std::path::Path,
+    operation_id: &str,
+) -> Result<VerifiedSoloProjection, DaemonError> {
+    let bytes = read_projection_bytes(state_root, operation_id)?;
+    let file = verify_projection(&bytes, operation_id)?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        DaemonError::Composition(CompositionError::Recovery(format!(
+            "solo coordinator document decode: {error}"
+        )))
+    })?;
+    let coordinator_document = document
+        .pointer("/payload/snapshot/coordinator_snapshot")
+        .ok_or_else(|| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo projection carries no coordinator document".to_owned(),
+            ))
+        })?;
+    let carrier =
+        serde_json::to_value(&file.payload.snapshot.coordinator_snapshot).map_err(|error| {
+            DaemonError::Composition(CompositionError::Recovery(format!(
+                "solo coordinator carrier encode: {error}"
+            )))
+        })?;
+    if *coordinator_document != carrier {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "durable coordinator document does not match the verified projection carrier"
+                    .to_owned(),
+            ),
+        ));
+    }
+    Ok(VerifiedSoloProjection {
+        payload: file.payload,
+        coordinator_document: coordinator_document.to_string(),
+    })
 }
 
 /// Guards the solo slice shape: one lane, no fanout, the solo recipe.
@@ -2178,11 +2266,19 @@ fn restore_solo_fabric(
 /// The caller holds the composition guard across the seam await (see
 /// [`solo_fair_pull_recovery`]); this function takes `&DaemonComposition`
 /// like the construct path and performs no locking of its own.
+///
+/// `coordinator_document` is the coordinator snapshot JSON selected out of the
+/// persisted projection FILE bytes by [`load_verified_projection`] after that
+/// file's envelope was verified. It, not `projection.snapshot.coordinator_snapshot`,
+/// is what the coordinator is restored from: the typed projection stays a
+/// state carrier for the config comparison and the fabric state, and the
+/// in-memory snapshot is never reserialized to stand in for the durable bytes.
 #[cfg(not(test))]
 async fn restore_solo_fabric_async(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     projection: &SoloPersistedAttempt,
+    coordinator_document: &str,
 ) -> Result<AgentFabric, DaemonError> {
     let material = projection.claimed.material();
     let ports = composition.production_fabric_ports()?;
@@ -2193,6 +2289,7 @@ async fn restore_solo_fabric_async(
             ports,
             material,
             &projection.claimed,
+            coordinator_document,
         )
         .await?;
     // Reconcile the unknown: an emitted dispatch with no ingested result
@@ -2394,11 +2491,21 @@ pub async fn solo_fair_pull_recovery(
         live
     };
     let composition = composition.lock().await;
+    // Production restores the coordinator from the durable document selected
+    // out of the verified projection bytes; the test-only synchronous seam
+    // keeps the typed readback it has always used.
+    #[cfg(not(test))]
+    let (mut projection, coordinator_document) = {
+        let verified = load_verified_projection(composition.state_root(), &operation_id)?;
+        (verified.payload, verified.coordinator_document)
+    };
+    #[cfg(test)]
     let mut projection = load_projection(composition.state_root(), &operation_id)?;
     #[cfg(test)]
     let mut fabric = restore_solo_fabric(&composition, kernel, &projection)?;
     #[cfg(not(test))]
-    let mut fabric = restore_solo_fabric_async(&composition, kernel, &projection).await?;
+    let mut fabric =
+        restore_solo_fabric_async(&composition, kernel, &projection, &coordinator_document).await?;
     let profile = load_scheduling_profile(&composition)?;
     let outcome = fabric.drive_fair_pull(&profile, true)?;
     repersist_after_control(&composition, &fabric, &mut projection)?;

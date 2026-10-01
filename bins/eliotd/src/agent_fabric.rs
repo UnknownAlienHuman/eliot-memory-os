@@ -4975,6 +4975,85 @@ impl AgentFabric {
         semantic_revisions: Option<&SemanticRevisionStore>,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, FabricError> {
+        let coordinator_snapshot = snapshot.coordinator_snapshot.clone();
+        Self::restore_through_coordinator_ingress(
+            snapshot,
+            config,
+            ports,
+            semantic_revisions,
+            capability,
+            move |config, capability| {
+                Ok(AgentCoordinator::restore_with_admitted_provider(
+                    coordinator_snapshot,
+                    config,
+                    capability,
+                )?)
+            },
+        )
+    }
+
+    /// Restores the fabric with its coordinator restored from a DURABLE
+    /// coordinator document (issue #370 W24/W25/W26/A2/A28).
+    ///
+    /// Sibling of [`Self::restore_with_admitted_provider`] that differs in
+    /// exactly one thing: the coordinator is rebuilt through
+    /// [`AgentCoordinator::restore_snapshot_json`] from
+    /// `coordinator_document` — the JSON the daemon selected out of the
+    /// persisted projection FILE bytes after verifying that file's envelope —
+    /// instead of from the in-memory typed snapshot. `snapshot` keeps carrying
+    /// the fabric state and the coordinator config comparison, so the typed
+    /// value is a state carrier and never the byte source.
+    ///
+    /// Every other check, the semantic/tool/semantic-store recovery, the
+    /// admission rebuild, and the freshly admitted capability are the SAME
+    /// ones the typed restore runs; there is no second recovery path here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the coordinator owner restore rejection from the durable
+    /// document, a stale-config conflict, or a stale/revoked binding rejection
+    /// unchanged.
+    pub fn restore_durable_snapshot_with_admitted_provider(
+        snapshot: FabricSnapshot,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        semantic_revisions: Option<&SemanticRevisionStore>,
+        coordinator_document: &str,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, FabricError> {
+        let document = coordinator_document.to_owned();
+        Self::restore_through_coordinator_ingress(
+            snapshot,
+            config,
+            ports,
+            semantic_revisions,
+            capability,
+            move |config, capability| {
+                Ok(AgentCoordinator::restore_snapshot_json(
+                    &document, config, capability,
+                )?)
+            },
+        )
+    }
+
+    /// The one shared restore body behind both admitted-provider restore
+    /// entrypoints.
+    ///
+    /// `build_coordinator` is the only difference between them: it decides
+    /// whether the coordinator is rebuilt from the typed snapshot or from a
+    /// durable document, and it receives the same freshly admitted capability
+    /// either way. Everything checked here is checked once, for both.
+    fn restore_through_coordinator_ingress(
+        snapshot: FabricSnapshot,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        semantic_revisions: Option<&SemanticRevisionStore>,
+        capability: AdmittedProviderCapability,
+        build_coordinator: impl FnOnce(
+            CoordinatorConfig,
+            AdmittedProviderCapability,
+        ) -> Result<AgentCoordinator, FabricError>,
+    ) -> Result<Self, FabricError> {
         if snapshot.coordinator_snapshot.config != config {
             return Err(FabricError::IdentityConflict(
                 "restore config does not match the snapshotted coordinator config".to_owned(),
@@ -5002,11 +5081,7 @@ impl AgentFabric {
             recover_semantic_revisions(store, &snapshot)?;
         }
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
-        let coordinator = AgentCoordinator::restore_with_admitted_provider(
-            snapshot.coordinator_snapshot.clone(),
-            config.clone(),
-            capability,
-        )?;
+        let coordinator = build_coordinator(config.clone(), capability)?;
         let mut definition_bytes = BTreeMap::new();
         for (key, definition) in &snapshot.definitions {
             definition_bytes.insert(key.clone(), definition.definition_digest.clone());
