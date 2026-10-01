@@ -819,7 +819,45 @@ pub async fn run_skill_influence(config_path: &Path, project: &str, task: &str) 
     });
     write_skill_influence_to_memory(config_path, &mut report).await?;
     write_skill_influence_report(&root, &report)?;
-    write_json(&report)
+    // 783/21: `SkillInfluenceReport::estimated_context_cost` is owned by
+    // `eliot-types` and carries no qualifier, so the recorded figure is
+    // republished beside it through the canonical owner. The value is the
+    // engine's own sum of #704 measurements over the exact Skill bytes
+    // supplied above; the app never re-derives it, never applies a `/4` or
+    // character ratio and never supplies a literal. A reported
+    // `CONTEXT_COST_UNAVAILABLE` sentinel is republished as
+    // `MeasurementStatus::Unavailable` with a null value, so "unmeasured"
+    // cannot be read as a small number.
+    //
+    // The canonical memory write and the stored report artifact above still
+    // carry the owned report exactly as the engine produced it; the qualifier
+    // is added only to the published response, and the legacy bare field is
+    // kept beside it for wire compatibility.
+    let mut influence = serde_json::to_value(&report)?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    influence.insert(
+        "estimated_context_cost_measurement".to_owned(),
+        mcp_stdio::recorded_planning_wire(
+            "stu_estimate",
+            recorded_context_cost(report.estimated_context_cost),
+        ),
+    );
+    write_json(&serde_json::Value::Object(influence))
+}
+
+/// 783/21/783/22: the engine's recorded context cost, or `None` when the
+/// owning report carries its "unmeasured" sentinel.
+///
+/// `CONTEXT_COST_UNAVAILABLE` (`crates/eliot-engine/src/skill.rs`) is
+/// `u64::MAX` - a sentinel chosen to sit outside the range of any real STU
+/// total, not a measurement, and deliberately not re-exported from
+/// `eliot-engine`. Republishing it as a number would let a consumer compare it
+/// against a budget as though it were an enormous cost, so it is republished as
+/// an explicitly unavailable figure instead.
+fn recorded_context_cost(estimated_context_cost: u64) -> Option<u64> {
+    (estimated_context_cost != u64::MAX).then_some(estimated_context_cost)
 }
 
 pub fn run_skill_report(config_path: &Path) -> Result<()> {

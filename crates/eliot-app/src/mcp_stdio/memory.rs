@@ -130,6 +130,14 @@ pub(super) async fn dispatch_memory_distillation_preview(
         "at_revision": snapshot_revision,
         "read_only": true,
         "plan": plan,
+        // W13: the unit and measurement state that qualify each candidate's
+        // `token_units`, keyed by the candidate's own `record_ref` and taken
+        // over that candidate's own exact serialized bytes. A reader tells an
+        // STU estimate from an actual token count by reading this object, not
+        // the source. W14: `state` is a tagged value, so not-attempted,
+        // invalid, unavailable, stale, estimated and actual stay six separate
+        // wire states and none of them can be spelled as a bare number.
+        "record_measurements": canonical_distillation_measurements(&records)?,
         // A22/W9: the pre-#783 `token_units` basis, in its own explicit legacy
         // shape, beside the current plan. It is never merged into the plan's
         // own `token_units`, and it never converts to one.
@@ -852,6 +860,36 @@ fn collect_memory_target_refs(
     }
 }
 
+/// Keyed by the same `record_ref` the item carries, so a published
+/// discriminator can only be read beside the figure it qualifies.
+type DistillationItemMeasurements = BTreeMap<String, Value>;
+
+/// The on-record unit/status discriminator for every distillable corpus item,
+/// keyed by the same `record_ref` the item carries.
+///
+/// W13: `MemoryDistillationCorpusItem::token_units` is a bare `u64` owned by
+/// `eliot-types`, so this is where the app publishes what that number is. It is
+/// built by the one owner, [`canonical_memory_payload_measurement`], over the
+/// exact serialized bytes of the very record the key names - so the evidence is
+/// bound to THIS item rather than to the existence or shape of a measurement,
+/// and a reader distinguishes an STU estimate from an actual token count by
+/// reading this record rather than a source doc comment.
+pub(crate) fn canonical_distillation_measurements(
+    records: &[CanonicalRecord<Value>],
+) -> Result<DistillationItemMeasurements> {
+    records
+        .iter()
+        .filter(|record| is_distillable_record_kind(&record.receipt_kind))
+        .map(|record| {
+            let measurement = canonical_memory_payload_measurement(&record.receipt_body)?;
+            Ok((
+                format!("canonical:{}", record.record_id),
+                measurement_wire(&measurement),
+            ))
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn canonical_distillation_items(
     records: &[CanonicalRecord<Value>],
@@ -923,13 +961,14 @@ pub(crate) fn canonical_distillation_items(
                     "counterexample" | "minority" | "audit_history" | "current_truth"
                 );
             let measurement = canonical_memory_payload_measurement(&record.receipt_body)?;
+            let record_ref = format!("canonical:{}", record.record_id);
             let mut evidence_refs =
                 distillation_strings(metadata, &record.receipt_body, "evidence_refs");
             evidence_refs.push(format!("receipt:{}", record.canonical_receipt.receipt_id));
             evidence_refs.sort();
             evidence_refs.dedup();
             Ok(MemoryDistillationCorpusItem {
-                record_ref: format!("canonical:{}", record.record_id),
+                record_ref,
                 target_ref: record.subject_ref.clone(),
                 record_kind: record.receipt_kind.clone(),
                 task_id: record.task_id,
@@ -959,6 +998,12 @@ pub(crate) fn canonical_distillation_items(
                     .copied()
                     .unwrap_or(MemoryLifecycleState::Active),
                 status,
+                // W13: `token_units` is the unvalidated #704 STU over the exact
+                // serialized bytes of THIS record. What that number is travels
+                // on the record itself, in `record_measurements` beside the
+                // plan, keyed by this item's own `record_ref`; see
+                // `canonical_distillation_measurements`. No reader needs this
+                // comment to know it is an estimate and not actual tokens.
                 token_units: measurement.stu_estimate,
                 current_truth,
                 negative_memory,
