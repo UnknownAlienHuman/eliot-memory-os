@@ -887,6 +887,8 @@ pub struct RegistryEntry {
     pub normalizer: ContractId,
     /// Evaluator contract identity.
     pub evaluator: ContractId,
+    /// Exact evaluator implementation version owned by this provider entry.
+    pub evaluator_version: ContractVersion,
     /// Verifier contract identity.
     pub verifier: ContractId,
     /// Fingerprints this entry was validated against.
@@ -1384,6 +1386,7 @@ fn cargo_entry(
         parser: diagnostic_id()?,
         normalizer: diagnostic_id()?,
         evaluator: diagnostic_id()?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1437,6 +1440,7 @@ fn rustc_entry(
         parser: contract_id(RUSTC_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(RUSTC_INSTRUMENT)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1492,6 +1496,7 @@ fn rustfmt_entry(
         parser: contract_id(RUSTFMT_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(RUSTFMT_INSTRUMENT)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1548,6 +1553,7 @@ fn nextest_entry(
         parser: contract_id(NEXTEST_INSTRUMENT)?,
         normalizer: diagnostic_id()?,
         evaluator: contract_id(NEXTEST_INSTRUMENT)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1602,6 +1608,7 @@ fn scip_entry(
         parser: contract_id(SCIP_INSTRUMENT)?,
         normalizer: contract_id(SCIP_INSTRUMENT)?,
         evaluator: contract_id(SCIP_INSTRUMENT)?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -1662,6 +1669,7 @@ fn dotnet_entry(
         parser: diagnostic_id()?,
         normalizer: diagnostic_id()?,
         evaluator: diagnostic_id()?,
+        evaluator_version: ContractVersion::new(1, 0, 0),
         verifier: verifier_id()?,
         invalidation: fingerprints.clone(),
         identities: ProfileIdentities::new(ProfileIdentityParams {
@@ -2133,3 +2141,4 @@ mod tests {
         ));
     }
 }
+
