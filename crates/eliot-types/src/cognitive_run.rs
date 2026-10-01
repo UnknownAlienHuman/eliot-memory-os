@@ -457,3 +457,410 @@ pub fn require_current_cognitive_run_schema<T: CognitiveRunSchemaVersioned>(
             supported_version: COGNITIVE_RUN_SCHEMA_VERSION,
         })
 }
+
+#[cfg(test)]
+mod schema_selection_tests {
+    use super::*;
+
+    const ATTEMPT: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v2",
+      "run_id": "run-fixture-001",
+      "call_id": "LC-01-source-opencode",
+      "call_number": 5,
+      "run_revision": 9,
+      "expected_previous_revision": 8,
+      "contract_receipt": {
+        "receipt_id": "11111111-1111-1111-1111-111111111111",
+        "write_id": "22222222-2222-2222-2222-222222222222"
+      },
+      "invocation_id": "invocation-fixture-001",
+      "candidate_write_id": null,
+      "provider_calls_consumed": 4,
+      "hard_provider_call_cap": 18,
+      "status": "attempting",
+      "execution": {
+        "executable_sha256": "seal-executable-fixture",
+        "provider_executable_sha256": "seal-provider-fixture",
+        "argv_sha256": "seal-argv-fixture",
+        "environment_sha256": "seal-environment-fixture",
+        "cwd_sha256": "seal-cwd-fixture",
+        "bundle_sha256": "seal-bundle-fixture",
+        "prompt_sha256": "seal-prompt-fixture"
+      },
+      "capability": null,
+      "shared_gate": null,
+      "created_at": "2026-09-30T11:41:12Z"
+    }"#;
+
+    const ATTEMPT_FOREIGN: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v1",
+      "run_id": "run-fixture-001",
+      "call_id": "LC-01-source-opencode",
+      "call_number": 5,
+      "run_revision": 9,
+      "expected_previous_revision": 8,
+      "contract_receipt": {
+        "receipt_id": "11111111-1111-1111-1111-111111111111",
+        "write_id": "22222222-2222-2222-2222-222222222222"
+      },
+      "invocation_id": "invocation-fixture-001",
+      "candidate_write_id": null,
+      "provider_calls_consumed": 4,
+      "hard_provider_call_cap": 18,
+      "status": "attempting",
+      "execution": {
+        "executable_sha256": "seal-executable-fixture",
+        "provider_executable_sha256": "seal-provider-fixture",
+        "argv_sha256": "seal-argv-fixture",
+        "environment_sha256": "seal-environment-fixture",
+        "cwd_sha256": "seal-cwd-fixture",
+        "bundle_sha256": "seal-bundle-fixture",
+        "prompt_sha256": "seal-prompt-fixture"
+      },
+      "capability": null,
+      "shared_gate": null,
+      "created_at": "2026-09-30T11:41:12Z"
+    }"#;
+
+    const TERMINAL: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v2",
+      "run_id": "run-fixture-001",
+      "call_id": "LC-01-source-opencode",
+      "call_number": 5,
+      "run_revision": 10,
+      "expected_previous_revision": 9,
+      "attempt_receipt": {
+        "receipt_id": "33333333-3333-3333-3333-333333333333",
+        "write_id": "44444444-4444-4444-4444-444444444444"
+      },
+      "status": "succeeded",
+      "execution": {
+        "executable_sha256": "seal-executable-fixture",
+        "provider_executable_sha256": "seal-provider-fixture",
+        "argv_sha256": "seal-argv-fixture",
+        "environment_sha256": "seal-environment-fixture",
+        "cwd_sha256": "seal-cwd-fixture",
+        "bundle_sha256": "seal-bundle-fixture",
+        "prompt_sha256": "seal-prompt-fixture"
+      },
+      "process_sha256": null,
+      "stdout_sha256": null,
+      "stderr_sha256": null,
+      "provider_output_sha256": null,
+      "candidate_write_id": null,
+      "candidate_receipt": null,
+      "host_observation": null,
+      "tool_observation_receipts": [],
+      "raw_verifier_receipts": [],
+      "reason": "provider exited zero",
+      "no_redispatch": true,
+      "finished_at": "2026-09-30T11:42:12Z"
+    }"#;
+
+    const TERMINAL_FOREIGN: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v1",
+      "run_id": "run-fixture-001",
+      "call_id": "LC-01-source-opencode",
+      "call_number": 5,
+      "run_revision": 10,
+      "expected_previous_revision": 9,
+      "attempt_receipt": {
+        "receipt_id": "33333333-3333-3333-3333-333333333333",
+        "write_id": "44444444-4444-4444-4444-444444444444"
+      },
+      "status": "succeeded",
+      "execution": {
+        "executable_sha256": "seal-executable-fixture",
+        "provider_executable_sha256": "seal-provider-fixture",
+        "argv_sha256": "seal-argv-fixture",
+        "environment_sha256": "seal-environment-fixture",
+        "cwd_sha256": "seal-cwd-fixture",
+        "bundle_sha256": "seal-bundle-fixture",
+        "prompt_sha256": "seal-prompt-fixture"
+      },
+      "process_sha256": null,
+      "stdout_sha256": null,
+      "stderr_sha256": null,
+      "provider_output_sha256": null,
+      "candidate_write_id": null,
+      "candidate_receipt": null,
+      "host_observation": null,
+      "tool_observation_receipts": [],
+      "raw_verifier_receipts": [],
+      "reason": "provider exited zero",
+      "no_redispatch": true,
+      "finished_at": "2026-09-30T11:42:12Z"
+    }"#;
+
+    const OBSERVATION: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v2",
+      "run_id": "run-fixture-001",
+      "call_subject_ref": "subject-fixture-001",
+      "observation_id": "55555555-5555-5555-5555-555555555555",
+      "call_id": "LC-01-source-opencode",
+      "call_number": 5,
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "session_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "host": "opencode",
+      "attempt_receipt": {
+        "receipt_id": "33333333-3333-3333-3333-333333333333",
+        "write_id": "44444444-4444-4444-4444-444444444444"
+      },
+      "tool_name": "eliot_recall_l0",
+      "outcome": "observed",
+      "sealed_truth_revision": "fixture-revision-5",
+      "observed_memory_revision": null,
+      "arguments_sha256": "arguments-fixture",
+      "result_sha256": "result-fixture",
+      "requested_handles": [],
+      "returned_handles": [],
+      "observed_at": "2026-09-30T11:41:30Z"
+    }"#;
+
+    const OBSERVATION_FOREIGN: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v1",
+      "run_id": "run-fixture-001",
+      "call_subject_ref": "subject-fixture-001",
+      "observation_id": "55555555-5555-5555-5555-555555555555",
+      "call_id": "LC-01-source-opencode",
+      "call_number": 5,
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "session_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "host": "opencode",
+      "attempt_receipt": {
+        "receipt_id": "33333333-3333-3333-3333-333333333333",
+        "write_id": "44444444-4444-4444-4444-444444444444"
+      },
+      "tool_name": "eliot_recall_l0",
+      "outcome": "observed",
+      "sealed_truth_revision": "fixture-revision-5",
+      "observed_memory_revision": null,
+      "arguments_sha256": "arguments-fixture",
+      "result_sha256": "result-fixture",
+      "requested_handles": [],
+      "returned_handles": [],
+      "observed_at": "2026-09-30T11:41:30Z"
+    }"#;
+
+    const EVIDENCE: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v2",
+      "run_id": "run-fixture-001",
+      "call_id": "LC-01-target-opencode-treatment",
+      "call_number": 1,
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "attempt_receipt": {
+        "receipt_id": "33333333-3333-3333-3333-333333333333",
+        "write_id": "44444444-4444-4444-4444-444444444444"
+      },
+      "execution": {
+        "executable_sha256": "seal-executable-fixture",
+        "provider_executable_sha256": "seal-provider-fixture",
+        "argv_sha256": "seal-argv-fixture",
+        "environment_sha256": "seal-environment-fixture",
+        "cwd_sha256": "seal-cwd-fixture",
+        "bundle_sha256": "seal-bundle-fixture",
+        "prompt_sha256": "seal-prompt-fixture"
+      },
+      "process_sha256": null,
+      "stdout_sha256": null,
+      "stderr_sha256": null,
+      "provider_output_sha256": null,
+      "host_observation": null,
+      "tool_observation_receipts": [],
+      "verifier_version": "verifier-fixture-1",
+      "checks_sha256": "checks-fixture",
+      "passed": true,
+      "verified_at": "2026-09-30T11:43:12Z"
+    }"#;
+
+    const EVIDENCE_FOREIGN: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v1",
+      "run_id": "run-fixture-001",
+      "call_id": "LC-01-target-opencode-treatment",
+      "call_number": 1,
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "attempt_receipt": {
+        "receipt_id": "33333333-3333-3333-3333-333333333333",
+        "write_id": "44444444-4444-4444-4444-444444444444"
+      },
+      "execution": {
+        "executable_sha256": "seal-executable-fixture",
+        "provider_executable_sha256": "seal-provider-fixture",
+        "argv_sha256": "seal-argv-fixture",
+        "environment_sha256": "seal-environment-fixture",
+        "cwd_sha256": "seal-cwd-fixture",
+        "bundle_sha256": "seal-bundle-fixture",
+        "prompt_sha256": "seal-prompt-fixture"
+      },
+      "process_sha256": null,
+      "stdout_sha256": null,
+      "stderr_sha256": null,
+      "provider_output_sha256": null,
+      "host_observation": null,
+      "tool_observation_receipts": [],
+      "verifier_version": "verifier-fixture-1",
+      "checks_sha256": "checks-fixture",
+      "passed": true,
+      "verified_at": "2026-09-30T11:43:12Z"
+    }"#;
+
+    const CONTRACT: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v2",
+      "harness_version": "harness-fixture-1",
+      "instance_name": "instance-fixture",
+      "run_id": "run-fixture-001",
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "governor_nonce": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+      "harness_script_sha256": "harness-script-fixture",
+      "cases_sha256": "cases-fixture",
+      "exposure_map_sha256": "exposure-map-fixture",
+      "output_contract_sha256": "output-contract-fixture",
+      "models_sha256": "models-fixture",
+      "source_commit": "source-commit-fixture",
+      "policy_snapshot_id": "policy-snapshot-fixture",
+      "output_root": "output-root-fixture",
+      "timeout_seconds": 120,
+      "exact_plan": [],
+      "hard_provider_call_cap": 18,
+      "contract_sha256": "contract-fixture",
+      "sealed_at": "2026-09-30T11:40:12Z"
+    }"#;
+
+    const CONTRACT_FOREIGN: &str = r#"{
+      "schema_version": "eliot-cognitive-run-v1",
+      "harness_version": "harness-fixture-1",
+      "instance_name": "instance-fixture",
+      "run_id": "run-fixture-001",
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "governor_nonce": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+      "harness_script_sha256": "harness-script-fixture",
+      "cases_sha256": "cases-fixture",
+      "exposure_map_sha256": "exposure-map-fixture",
+      "output_contract_sha256": "output-contract-fixture",
+      "models_sha256": "models-fixture",
+      "source_commit": "source-commit-fixture",
+      "policy_snapshot_id": "policy-snapshot-fixture",
+      "output_root": "output-root-fixture",
+      "timeout_seconds": 120,
+      "exact_plan": [],
+      "hard_provider_call_cap": 18,
+      "contract_sha256": "contract-fixture",
+      "sealed_at": "2026-09-30T11:40:12Z"
+    }"#;
+
+    fn refused<T>(raw: &str, kind: &'static str) -> Result<CognitiveRunSchemaMismatch, String>
+    where
+        T: serde::de::DeserializeOwned + CognitiveRunSchemaVersioned,
+    {
+        let record: T = serde_json::from_str(raw)
+            .map_err(|error| format!("fixture {kind} must decode structurally: {error}"))?;
+        match require_current_cognitive_run_schema(&record) {
+            Ok(admitted) => Err(format!("fixture {kind} must be refused, admitted {admitted:?}")),
+            Err(mismatch) => {
+                assert_eq!(mismatch.record_kind, kind);
+                assert_eq!(mismatch.declared_version, "eliot-cognitive-run-v1");
+                assert_eq!(mismatch.supported_version, COGNITIVE_RUN_SCHEMA_VERSION);
+                Ok(mismatch)
+            }
+        }
+    }
+
+    // WORK_UNIT_CASE: 935/9
+    #[test]
+    fn run_schema_selection_admits_only_the_current_owner_version() {
+        assert_eq!(
+            cognitive_run_schema_selection(COGNITIVE_RUN_SCHEMA_VERSION),
+            Some(COGNITIVE_RUN_SCHEMA_VERSION)
+        );
+        // No supported legacy is recorded anywhere in the repository: the only
+        // emitted literal is `COGNITIVE_RUN_SCHEMA_VERSION`, so even the
+        // plausible-looking predecessor name is refused rather than migrated.
+        for foreign in [
+            "",
+            "v2",
+            "eliot-cognitive-run-v1",
+            "eliot-cognitive-run-v3",
+            "ELIOT-COGNITIVE-RUN-V2",
+            " eliot-cognitive-run-v2",
+        ] {
+            assert_eq!(
+                cognitive_run_schema_selection(foreign),
+                None,
+                "owner selection must refuse {foreign:?}"
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 935/7
+    #[test]
+    fn current_run_records_decode_and_pass_owner_selection() -> Result<(), serde_json::Error> {
+        fn admitted<T>(raw: &str) -> Result<&'static str, CognitiveRunSchemaMismatch>
+        where
+            T: serde::de::DeserializeOwned + CognitiveRunSchemaVersioned,
+        {
+            let record: T = serde_json::from_str(raw)?;
+            require_current_cognitive_run_schema(&record)
+        }
+        assert_eq!(
+            admitted::<CognitiveRunContract>(CONTRACT)?,
+            COGNITIVE_RUN_SCHEMA_VERSION
+        );
+        assert_eq!(
+            admitted::<CognitiveRunAttempt>(ATTEMPT)?,
+            COGNITIVE_RUN_SCHEMA_VERSION
+        );
+        assert_eq!(
+            admitted::<CognitiveRunTerminal>(TERMINAL)?,
+            COGNITIVE_RUN_SCHEMA_VERSION
+        );
+        assert_eq!(
+            admitted::<CognitiveToolObservation>(OBSERVATION)?,
+            COGNITIVE_RUN_SCHEMA_VERSION
+        );
+        assert_eq!(
+            admitted::<CognitiveRawVerifierEvidence>(EVIDENCE)?,
+            COGNITIVE_RUN_SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    // WORK_UNIT_CASE: 935/8
+    #[test]
+    fn foreign_run_records_decode_but_fail_owner_selection() -> Result<(), String> {
+        refused::<CognitiveRunContract>(CONTRACT_FOREIGN, "cognitive_run_contract")?;
+        refused::<CognitiveRunAttempt>(ATTEMPT_FOREIGN, "cognitive_run_attempt")?;
+        refused::<CognitiveRunTerminal>(TERMINAL_FOREIGN, "cognitive_run_terminal")?;
+        refused::<CognitiveToolObservation>(OBSERVATION_FOREIGN, "cognitive_tool_observation")?;
+        refused::<CognitiveRawVerifierEvidence>(EVIDENCE_FOREIGN, "cognitive_raw_verifier")?;
+        Ok(())
+    }
+
+    // WORK_UNIT_CASE: 935/15
+    #[test]
+    fn owner_refusal_precedes_any_authority_consumption() -> Result<(), String> {
+        let attempt: CognitiveRunAttempt = serde_json::from_str(ATTEMPT_FOREIGN)
+            .map_err(|error| format!("foreign attempt must still decode structurally: {error}"))?;
+        // The candidate-submit path consumes `status`, `capability` and
+        // `candidate_write_id` as authority. The refusal must land first: no
+        // authority field may be read before this check passes.
+        let message = match require_current_cognitive_run_schema(&attempt) {
+            Ok(admitted) => {
+                return Err(format!("foreign attempt must be refused, admitted {admitted:?}"));
+            }
+            Err(refusal) => refusal.to_string(),
+        };
+        assert!(
+            message.contains("cognitive_run_attempt")
+                && message.contains("eliot-cognitive-run-v1")
+                && message.contains(COGNITIVE_RUN_SCHEMA_VERSION),
+            "refusal must name the kind, the declared version and the supported version: {message}"
+        );
+        Ok(())
+    }
+}

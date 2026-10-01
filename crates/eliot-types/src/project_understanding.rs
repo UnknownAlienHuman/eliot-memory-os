@@ -206,3 +206,298 @@ pub fn project_understanding_schema_selection(version: &str) -> Option<&'static 
         None
     }
 }
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    const MODEL: &str = r#"{
+      "schema_version": "project-understanding-v1",
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "revision_fence": 7,
+      "intent": {
+        "exact_user_goal_ref": "eliot/task/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@7",
+        "normalized_goal": "fixture goal",
+        "desired_state_transition": "fixture transition",
+        "non_goals": [],
+        "acceptance_refs": ["accept:fixture-1"]
+      },
+      "system": {
+        "project_purpose": "fixture purpose",
+        "subsystem_refs": ["sub:core"],
+        "owner_modules": ["mod:core"],
+        "entrypoint_refs": ["ep:main"]
+      },
+      "causal_model": {
+        "hops": [
+          {
+            "hop_kind": "intent_to_concept",
+            "from": "intent:task-fixture",
+            "relation": "scoped_to",
+            "to": "concept:core",
+            "evidence_refs": ["artifact:fixture-1"],
+            "status": "supported"
+          }
+        ],
+        "unknown_hops": [],
+        "required_probes": []
+      },
+      "invariants": ["inv:fixture-1"],
+      "danger_and_negative_memory": [],
+      "current_truth_refs": ["claim:fixture-1"],
+      "historical_or_stale_refs": [],
+      "memory_refs_used": [],
+      "files_to_inspect": [],
+      "files_to_change": [],
+      "predicted_changed_paths": [],
+      "predicted_failing_verifiers": [],
+      "next_allowed_action": "act-fixture",
+      "expected_observable": "obs-fixture",
+      "verifier_ref": "verifier:ci-fixture",
+      "stop_condition": "stop-fixture"
+    }"#;
+
+    const MODEL_ABSENT_LISTS: &str = r#"{
+      "schema_version": "project-understanding-v1",
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "revision_fence": 7,
+      "intent": {
+        "exact_user_goal_ref": "eliot/task/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@7",
+        "normalized_goal": "fixture goal",
+        "desired_state_transition": "fixture transition",
+        "non_goals": [],
+        "acceptance_refs": []
+      },
+      "system": {
+        "project_purpose": "fixture purpose",
+        "subsystem_refs": [],
+        "owner_modules": [],
+        "entrypoint_refs": []
+      },
+      "causal_model": {
+        "hops": [],
+        "unknown_hops": [],
+        "required_probes": []
+      },
+      "invariants": [],
+      "danger_and_negative_memory": [],
+      "current_truth_refs": [],
+      "historical_or_stale_refs": [],
+      "memory_refs_used": [],
+      "files_to_inspect": [],
+      "files_to_change": [],
+      "predicted_changed_paths": [],
+      "predicted_failing_verifiers": [],
+      "next_allowed_action": "act-fixture",
+      "expected_observable": "obs-fixture",
+      "verifier_ref": "verifier:ci-fixture",
+      "stop_condition": "stop-fixture"
+    }"#;
+
+    const MODEL_FOREIGN: &str = r#"{
+      "schema_version": "project-understanding-v9",
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "revision_fence": 7,
+      "intent": {
+        "exact_user_goal_ref": "eliot/task/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@7",
+        "normalized_goal": "fixture goal",
+        "desired_state_transition": "fixture transition",
+        "non_goals": [],
+        "acceptance_refs": ["accept:fixture-1"]
+      },
+      "system": {
+        "project_purpose": "fixture purpose",
+        "subsystem_refs": ["sub:core"],
+        "owner_modules": ["mod:core"],
+        "entrypoint_refs": ["ep:main"]
+      },
+      "causal_model": {
+        "hops": [
+          {
+            "hop_kind": "intent_to_concept",
+            "from": "intent:task-fixture",
+            "relation": "scoped_to",
+            "to": "concept:core",
+            "evidence_refs": ["artifact:fixture-1"],
+            "status": "supported"
+          }
+        ],
+        "unknown_hops": [],
+        "required_probes": []
+      },
+      "invariants": ["inv:fixture-1"],
+      "danger_and_negative_memory": [],
+      "current_truth_refs": ["claim:fixture-1"],
+      "historical_or_stale_refs": [],
+      "memory_refs_used": [],
+      "files_to_inspect": [],
+      "files_to_change": [],
+      "predicted_changed_paths": [],
+      "predicted_failing_verifiers": [],
+      "next_allowed_action": "act-fixture",
+      "expected_observable": "obs-fixture",
+      "verifier_ref": "verifier:ci-fixture",
+      "stop_condition": "stop-fixture"
+    }"#;
+
+    const MODEL_EMPTY_VERIFIER: &str = r#"{
+      "schema_version": "project-understanding-v1",
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "revision_fence": 7,
+      "intent": {
+        "exact_user_goal_ref": "eliot/task/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@7",
+        "normalized_goal": "fixture goal",
+        "desired_state_transition": "fixture transition",
+        "non_goals": [],
+        "acceptance_refs": ["accept:fixture-1"]
+      },
+      "system": {
+        "project_purpose": "fixture purpose",
+        "subsystem_refs": ["sub:core"],
+        "owner_modules": ["mod:core"],
+        "entrypoint_refs": ["ep:main"]
+      },
+      "causal_model": {
+        "hops": [
+          {
+            "hop_kind": "intent_to_concept",
+            "from": "intent:task-fixture",
+            "relation": "scoped_to",
+            "to": "concept:core",
+            "evidence_refs": ["artifact:fixture-1"],
+            "status": "supported"
+          }
+        ],
+        "unknown_hops": [],
+        "required_probes": []
+      },
+      "invariants": ["inv:fixture-1"],
+      "danger_and_negative_memory": [],
+      "current_truth_refs": ["claim:fixture-1"],
+      "historical_or_stale_refs": [],
+      "memory_refs_used": [],
+      "files_to_inspect": [],
+      "files_to_change": [],
+      "predicted_changed_paths": [],
+      "predicted_failing_verifiers": [],
+      "next_allowed_action": "act-fixture",
+      "expected_observable": "obs-fixture",
+      "verifier_ref": "",
+      "stop_condition": "stop-fixture"
+    }"#;
+
+    const MODEL_UNEVIDENCED_VERIFIED: &str = r#"{
+      "schema_version": "project-understanding-v1",
+      "project_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "task_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "revision_fence": 7,
+      "intent": {
+        "exact_user_goal_ref": "eliot/task/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@7",
+        "normalized_goal": "fixture goal",
+        "desired_state_transition": "fixture transition",
+        "non_goals": [],
+        "acceptance_refs": ["accept:fixture-1"]
+      },
+      "system": {
+        "project_purpose": "fixture purpose",
+        "subsystem_refs": ["sub:core"],
+        "owner_modules": ["mod:core"],
+        "entrypoint_refs": ["ep:main"]
+      },
+      "causal_model": {
+        "hops": [
+          {
+            "hop_kind": "owner_to_symbol",
+            "from": "owner:core",
+            "relation": "implemented_by",
+            "to": "symbol:main",
+            "evidence_refs": [],
+            "status": "verified"
+          }
+        ],
+        "unknown_hops": [],
+        "required_probes": []
+      },
+      "invariants": ["inv:fixture-1"],
+      "danger_and_negative_memory": [],
+      "current_truth_refs": ["claim:fixture-1"],
+      "historical_or_stale_refs": [],
+      "memory_refs_used": [],
+      "files_to_inspect": [],
+      "files_to_change": [],
+      "predicted_changed_paths": [],
+      "predicted_failing_verifiers": [],
+      "next_allowed_action": "act-fixture",
+      "expected_observable": "obs-fixture",
+      "verifier_ref": "verifier:ci-fixture",
+      "stop_condition": "stop-fixture"
+    }"#;
+
+    // WORK_UNIT_CASE: 935/7
+    #[test]
+    fn admitted_project_understanding_passes_owner_admission() -> Result<(), serde_json::Error> {
+        let model: ProjectUnderstandingModel = serde_json::from_str(MODEL)?;
+        assert_eq!(
+            model.admission(),
+            Some(PROJECT_UNDERSTANDING_SCHEMA_VERSION)
+        );
+        // Absent acceptance/causal lists are `unknown`, not false claims: the
+        // owner boundary refuses claims of satisfaction without a record, not
+        // empty knowledge, so the absent-lists model is still admitted here
+        // while no downstream consumer may read it as completeness.
+        let absent: ProjectUnderstandingModel = serde_json::from_str(MODEL_ABSENT_LISTS)?;
+        assert_eq!(
+            absent.admission(),
+            Some(PROJECT_UNDERSTANDING_SCHEMA_VERSION)
+        );
+        Ok(())
+    }
+
+    // WORK_UNIT_CASE: 935/8
+    #[test]
+    fn unadmitted_project_understanding_fails_owner_admission() -> Result<(), String> {
+        for (name, raw) in [
+            ("foreign version", MODEL_FOREIGN),
+            ("empty verifier ref", MODEL_EMPTY_VERIFIER),
+            ("verified hop without evidence", MODEL_UNEVIDENCED_VERIFIED),
+        ] {
+            // Each refusal fixture still decodes structurally: shape closure is
+            // not semantic selection, so admission must fail on the decoded value.
+            let model: ProjectUnderstandingModel = serde_json::from_str(raw)
+                .map_err(|error| format!("{name} must still decode structurally: {error}"))?;
+            if model.admission().is_some() {
+                return Err(format!("{name} must not be admitted"));
+            }
+        }
+        let foreign: ProjectUnderstandingModel = serde_json::from_str(MODEL_FOREIGN)
+            .map_err(|error| format!("foreign model must still decode: {error}"))?;
+        assert_eq!(foreign.schema_selection(), None);
+        Ok(())
+    }
+
+    // WORK_UNIT_CASE: 935/9
+    #[test]
+    fn understanding_selection_admits_only_the_current_owner_version() {
+        assert_eq!(
+            project_understanding_schema_selection(PROJECT_UNDERSTANDING_SCHEMA_VERSION),
+            Some(PROJECT_UNDERSTANDING_SCHEMA_VERSION)
+        );
+        for foreign in [
+            "",
+            "v1",
+            "project-understanding-v0",
+            "project-understanding-v2",
+            "PROJECT-UNDERSTANDING-V1",
+        ] {
+            assert_eq!(
+                project_understanding_schema_selection(foreign),
+                None,
+                "owner selection must refuse {foreign:?}"
+            );
+        }
+    }
+}
