@@ -297,9 +297,17 @@ pub(super) struct UserBrokerClientMaterialization {
 /// identity; the broker therefore had no installed, hashed front-door
 /// declaration at all and could not state the capability set the Kernel demands.
 ///
-/// The digest recomputed here is compared with the value the profile *recorded*
-/// for the same canonical bytes, and the declaration is re-validated in place:
-/// a freshly recomputed digest never substitutes for the recorded one.
+/// The two digests recomputed here cover the *full* canonical bytes just
+/// materialised, digest field included, and are the values Phase B records and
+/// observes. They are deliberately not compared against `profile_sha256` and
+/// `declaration_sha256`: each of those is the digest of the same record taken
+/// over the bytes with its own digest field removed, and each record re-checks
+/// itself against exactly that quantity inside
+/// `UserBrokerInstallationProfile::validate`, which runs below. A freshly
+/// recomputed full-bytes digest is not a substitute for either, so the guard
+/// here refuses only what Phase B alone can judge: a profile that is not bound
+/// to the launch being materialised, because the broker image digest and the
+/// executable path must be the ones this exact launch just proved.
 #[cfg(windows)]
 pub(super) fn materialize_user_broker_client_declaration(
     launch: &eliot_installation::RuntimeLaunchDescriptor,
@@ -321,9 +329,7 @@ pub(super) fn materialize_user_broker_client_declaration(
         .map_err(|error| HostError::ProcessContour(error.to_string()))?;
     let profile_digest = phase_b_bytes_digest(&profile_bytes)?;
     let declaration_digest = phase_b_bytes_digest(&declaration_bytes)?;
-    if profile.profile_sha256 != profile_digest
-        || profile.client_declaration.declaration_sha256 != declaration_digest.as_str()
-        || profile.broker_artifact_sha256 != launch.user_broker_artifact_digest
+    if profile.broker_artifact_sha256 != launch.user_broker_artifact_digest
         || profile.broker_executable_path != launch.user_broker_executable_path
     {
         return Err(HostError::RecoveryRequired(
