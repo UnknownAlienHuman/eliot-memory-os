@@ -5568,11 +5568,8 @@ async fn read_current_observe_binding(
     if guard.governor_kernel_fence() != retained.state_fence {
         return Err("Observe request fence is no longer current".to_owned());
     }
-    let binding = current_observation_owner_binding(
-        &guard,
-        &retained.policy_origin,
-        &retained.state_fence,
-    )?;
+    let binding =
+        current_observation_owner_binding(&guard, &retained.policy_origin, &retained.state_fence)?;
     let value = binding
         .canonical_value()
         .map_err(|error| format!("current Observe owner binding: {error}"))?;
@@ -5902,11 +5899,8 @@ async fn prepare_governed_capture(
     let operation_id = OperationId::new(host_request_operation_id(&retained.claimed.envelope))
         .map_err(|error| format!("Observe operation identity is invalid: {error}"))?;
     let guard = services.composition.lock().await;
-    let current = current_observation_owner_binding(
-        &guard,
-        &retained.policy_origin,
-        &retained.state_fence,
-    )?;
+    let current =
+        current_observation_owner_binding(&guard, &retained.policy_origin, &retained.state_fence)?;
     let current_value = current
         .canonical_value()
         .map_err(|error| error.to_string())?;

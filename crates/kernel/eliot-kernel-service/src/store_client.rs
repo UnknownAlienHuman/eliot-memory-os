@@ -926,7 +926,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                                 operation_id: request.operation_id.clone(),
                             }),
                         }
-                    },
+                    }
                     Ok(_) => Err(StoreError::UnknownOutcome {
                         operation_id: request.operation_id.clone(),
                     }),

@@ -673,7 +673,7 @@ pub struct DaemonComposition {
     /// Explicit workspace locator retained from the last accepted
     /// authenticated activation. It is only a locator for a fresh Host-side
     /// resource observation; identity and authority always come from the
-    /// current WorkScope owner and the current Task Controller selection.
+    /// current `WorkScope` owner and the current Task Controller selection.
     /// The locator is keyed by the complete semantic activation binding so a
     /// later request cannot borrow another task's workspace path.
     activation_workspace_locator: Option<RetainedActivationWorkspaceLocator>,
@@ -777,7 +777,7 @@ pub struct DaemonComposition {
 /// repeat the mechanical observation at a later ingress. Its typed origin is
 /// either an authenticated application selection or the exact Host peer
 /// receipt. This path never supplies authority; every consumer re-observes it
-/// and compares the result with the current owner-issued WorkScope binding.
+/// and compares the result with the current owner-issued `WorkScope` binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RetainedActivationWorkspaceLocator {
     origin: RetainedWorkspaceLocatorOrigin,
@@ -2128,7 +2128,7 @@ impl DaemonComposition {
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
-    /// Re-reads the current activation's exact Session, WorkScope, and
+    /// Re-reads the current activation's exact Session, `WorkScope`, and
     /// Observation Policy owners. The activation task remains context only;
     /// this projection always has no task-selection applicability.
     pub fn current_activation_observation_owner_binding(
@@ -2144,7 +2144,7 @@ impl DaemonComposition {
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
-    /// Re-reads the current Policy and WorkScope owners for an authenticated
+    /// Re-reads the current Policy and `WorkScope` owners for an authenticated
     /// cold Observe capture. This owner read is tied to the retained Session
     /// and State Fence and does not require a unique active task selection.
     pub fn current_cold_observation_owner_binding(
@@ -2164,7 +2164,7 @@ impl DaemonComposition {
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
-    /// Reads the current Policy and WorkScope owners for the exact Host peer
+    /// Reads the current Policy and `WorkScope` owners for the exact Host peer
     /// admission origin. This path deliberately has no semantic application
     /// principal, session, or task applicability.
     pub fn host_origin_observation_owner_binding(
@@ -2491,7 +2491,7 @@ impl DaemonComposition {
 
     /// Retains the explicit Host workspace selector from an accepted,
     /// owner-authenticated activation. The path is only a locator: callers
-    /// must observe it again and compare the result with the live WorkScope
+    /// must observe it again and compare the result with the live `WorkScope`
     /// owner before admitting any task-bound transition.
     pub fn note_activation_workspace_locator(
         &mut self,
@@ -2693,7 +2693,7 @@ impl DaemonComposition {
     }
 
     /// Returns the retained Host workspace locator for a task-free request
-    /// whose authenticated principal/session and exact current WorkScope
+    /// whose authenticated principal/session and exact current `WorkScope`
     /// snapshot match the accepted activation. The locator supplies only a
     /// candidate root for fresh Host observation; the snapshot and that
     /// observation remain the independent admission authorities.
@@ -2740,7 +2740,7 @@ impl DaemonComposition {
     }
 
     /// Returns a Host-origin locator only for the exact retained peer receipt
-    /// and current owner WorkScope snapshot. The path itself has no authority.
+    /// and current owner `WorkScope` snapshot. The path itself has no authority.
     pub fn host_origin_workspace_locator_for_scope(
         &self,
         receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
@@ -2810,8 +2810,8 @@ impl DaemonComposition {
     }
 
     /// Completes the split owner selection read after Kernel I/O. Governor
-    /// re-reads the active selection, WorkScope, and live fence before it
-    /// accepts the unchanged canonical TaskContract response.
+    /// re-reads the active selection, `WorkScope`, and live fence before it
+    /// accepts the unchanged canonical `TaskContract` response.
     pub fn finish_task_selection_for_request(
         &self,
         pending: eliot_governor::PendingTaskSelectionRequest,
@@ -3560,7 +3560,7 @@ impl DaemonComposition {
         )
     }
 
-    /// Reads exact current Session, Policy, and WorkScope owners for one
+    /// Reads exact current Session, Policy, and `WorkScope` owners for one
     /// authenticated Observe request before the protected request content is
     /// prepared for capture.
     pub fn observation_capture_owner_binding(
@@ -4791,7 +4791,7 @@ impl DaemonComposition {
     /// # Attach-transport boundary (issue #1929)
     ///
     /// This rebind/attach method currently has zero call sites, and it cannot
-    /// acquire one without inventing authority. Initial WorkScope binding is
+    /// acquire one without inventing authority. Initial `WorkScope` binding is
     /// admitted through the separate authenticated Task Controller
     /// `BIND_SCOPE` action; that path checks the current task and policy owners,
     /// independently observes the explicit root, and durably installs the
