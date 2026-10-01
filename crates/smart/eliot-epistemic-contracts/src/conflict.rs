@@ -4,6 +4,12 @@
 //! flag, plus common lineage, unresolved residue and owners, probe, and receipt digest. Count, recency, and
 //! scalar confidence never resolve a conflict: a set closes only when its residue is empty and its lifecycle
 //! says so.
+//!
+//! A [`MissingPosition`] declaration carries the one case in which a set below
+//! the two-position minimum is not a dropped position: the owner attests the
+//! expected member is absent from the frozen scope, so the denominator is a
+//! declared incompleteness. Without that declaration the member is missing for
+//! no stated reason and the set is refused.
 use std::collections::BTreeSet;
 
 use eliot_contracts::{ArtifactId, SourceId, TaskId};
@@ -124,6 +130,37 @@ impl ConflictPosition {
     }
 }
 
+/// One expected conflict position the set declares and does not supply.
+///
+/// A declaration is a claim about an ABSENT member, so it must name which
+/// member is missing, why it is absent, and who attests to that absence. The
+/// member is named rather than counted away for the same reason a declared
+/// unresolved owner is: a bare count cannot distinguish an owner-attested
+/// absence from a silently dropped position.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MissingPosition {
+    /// Source whose position is expected but not supplied.
+    pub source: SourceId,
+    /// Bounded owner-attested reason the position is absent.
+    pub reason: String,
+}
+impl MissingPosition {
+    /// Constructs a missing-position declaration.
+    pub fn new(source: SourceId, reason: impl Into<String>) -> Result<Self, ContractError> {
+        let missing = Self {
+            source,
+            reason: reason.into(),
+        };
+        missing.validate()?;
+        Ok(missing)
+    }
+    /// Validates the declaration's bounded reason.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        validate_bounded_text(&self.reason, "conflict.missing_reason", MAX_SHORT_TEXT)
+    }
+}
+
 /// The preserved conflict set: every position, owner, and residue kept.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +187,15 @@ pub struct ConflictSet {
     pub unresolved: BTreeSet<String>,
     /// Owners whose positions remain unresolved; order carries no meaning.
     pub unresolved_owners: BTreeSet<SourceId>,
+    /// Expected positions the set declares but cannot supply as stances.
+    ///
+    /// This is the qualified missing-rival denominator: a one-sided set whose
+    /// second member is a declared, authoritatively absent rival is not a
+    /// suppression of that rival but an owner-attested incompleteness. Without
+    /// this declaration a one-position set has no way to say why the second side
+    /// is missing, and it is refused; with it, the absence is carried in the
+    /// canonical denominator instead of in caller prose.
+    pub missing_positions: BTreeSet<MissingPosition>,
     /// Acceptability of the claims inside this set.
     pub acceptability: ArgumentAcceptability,
     /// Defeated argument references; order carries no meaning.
@@ -182,6 +228,7 @@ struct ConflictDigestShape<'a> {
     resolved_parts: &'a BTreeSet<String>,
     unresolved: &'a BTreeSet<String>,
     unresolved_owners: &'a BTreeSet<SourceId>,
+    missing_positions: &'a BTreeSet<MissingPosition>,
     acceptability: &'a ArgumentAcceptability,
     defeated_refs: &'a BTreeSet<ArtifactId>,
     probe: &'a Option<String>,
@@ -205,6 +252,7 @@ pub struct ConflictSetParams {
     pub resolved_parts: BTreeSet<String>,
     pub unresolved: BTreeSet<String>,
     pub unresolved_owners: BTreeSet<SourceId>,
+    pub missing_positions: BTreeSet<MissingPosition>,
     pub acceptability: ArgumentAcceptability,
     pub defeated_refs: BTreeSet<ArtifactId>,
     pub probe: Option<String>,
@@ -227,6 +275,7 @@ impl ConflictSet {
             resolved_parts: params.resolved_parts,
             unresolved: params.unresolved,
             unresolved_owners: params.unresolved_owners,
+            missing_positions: params.missing_positions,
             acceptability: params.acceptability,
             defeated_refs: params.defeated_refs,
             probe: params.probe,
@@ -253,6 +302,7 @@ impl ConflictSet {
             resolved_parts: &self.resolved_parts,
             unresolved: &self.unresolved,
             unresolved_owners: &self.unresolved_owners,
+            missing_positions: &self.missing_positions,
             acceptability: &self.acceptability,
             defeated_refs: &self.defeated_refs,
             probe: &self.probe,
@@ -271,10 +321,29 @@ impl ConflictSet {
     fn validate_shape(&self) -> Result<(), ContractError> {
         validate_bounded_text(&self.conflict_id, "conflict.conflict_id", MAX_SHORT_TEXT)?;
         validate_bounded_text(&self.scope, "conflict.scope", MAX_SHORT_TEXT)?;
-        if self.positions.len() < 2 {
+        // A set below the two-position minimum is refused UNLESS it declares a
+        // qualified missing-rival denominator that accounts for the absent side.
+        // The declaration is the qualifier: it names the member and the owner's
+        // reason for its absence, so the denominator is an owner-attested
+        // incompleteness rather than a silently dropped position.
+        if self.positions.len() + self.missing_positions.len() < 2 {
             return Err(ContractError::EmptyCollection {
                 field: "conflict.positions",
             });
+        }
+        if self.missing_positions.len() > MAX_HANDLES {
+            return Err(ContractError::TooMany {
+                field: "conflict.missing_positions",
+            });
+        }
+        let supplied: BTreeSet<&str> = self.positions.iter().map(|p| p.source.as_str()).collect();
+        for missing in &self.missing_positions {
+            missing.validate()?;
+            if supplied.contains(missing.source.as_str()) {
+                return Err(ContractError::ImpossibleCombination {
+                    field: "conflict.missing_positions",
+                });
+            }
         }
         if self.positions.len() > MAX_POSITIONS {
             return Err(ContractError::TooMany {

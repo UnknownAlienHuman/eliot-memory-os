@@ -1350,6 +1350,7 @@ fn conflict_fixture_set() -> RivalDeclarationSet {
         resolved_parts: BTreeSet::new(),
         unresolved: BTreeSet::from(["needs-inquiry".to_owned()]),
         unresolved_owners: BTreeSet::from([source_b.clone()]),
+        missing_positions: BTreeSet::new(),
         acceptability: ArgumentAcceptability::Contested,
         defeated_refs: BTreeSet::new(),
         probe: None,

@@ -456,6 +456,7 @@ fn conflict() -> Result<ConflictSet, ContractError> {
         resolved_parts: BTreeSet::new(),
         unresolved: BTreeSet::from(["open-question-1".to_owned()]),
         unresolved_owners: BTreeSet::from([source("source-b")?]),
+        missing_positions: BTreeSet::new(),
         acceptability: ArgumentAcceptability::Contested,
         defeated_refs: BTreeSet::new(),
         probe: Some("probe-1".to_owned()),

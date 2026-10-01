@@ -69,17 +69,23 @@
 //! the recommendation stays unnamed instead of adopting a kind-derived default.
 //!
 //! A fourth rule bounds the position denominator itself. Fewer than
-//! [`MINIMUM_CONFLICT_POSITIONS`] positions is not a conflict, and a position
-//! the set declares as an unresolved owner but does not supply has left the
-//! denominator rather than been decided in it, so it is refused instead of
-//! counted away. Both legs are read from the set's own declaration: a bare count
-//! of the supplied `positions` would let a caller drop a declared member and
-//! receive a clean analysis of a narrower conflict than the one that exists.
-//! There is no typed missing-rival exception here yet, and the reason is
-//! structural rather than an oversight: a `ConflictPosition` carries no
-//! availability axis, and the crate's one omission type,
-//! [`RivalDenominator`], is scoped to a causal claim's rival/confounder models
-//! and says nothing about how many conflict positions exist.
+//! [`MINIMUM_CONFLICT_POSITIONS`] positions is not a conflict unless the set
+//! carries a qualified missing-rival denominator: a
+//! [`eliot_epistemic_contracts::MissingPosition`] declaration on the canonical
+//! set says the owner attests the expected member
+//! is absent from the frozen scope, so the one-sided set is a declared
+//! incompleteness and is preserved with the gap named rather than refused. A
+//! one-sided set with no such declaration, and a position the set declares as
+//! an unresolved owner but neither supplies nor attests, are refused instead of
+//! counted away, because a bare count of the supplied `positions` would let a
+//! caller drop a declared member and receive a clean analysis of a narrower
+//! conflict than the one that exists. The qualifier is read from the canonical
+//! set's own declaration, never from a caller-set flag on this crate's inputs:
+//! [`PositionDispositionKind::Withheld`] and
+//! [`PositionDispositionKind::Unavailable`] name the outcome, and the crate's
+//! one omission type, [`RivalDenominator`], is scoped to a causal claim's
+//! rival/confounder models and says nothing about how many conflict positions
+//! exist.
 //!
 //! Absence note: this file contains no persistence, identifier allocation,
 //! graph traversal beyond the bounded member lists, source acquisition, probe
@@ -3190,16 +3196,19 @@ fn validate_supplement_shapes(
 /// every declared member must be present as a position and the refused member is
 /// named rather than counted away.
 ///
-/// A declared member with no position is refused here rather than preserved as
-/// a withheld or unavailable disposition. [`PositionDispositionKind::Withheld`]
-/// and [`PositionDispositionKind::Unavailable`] name that outcome, but this cell
-/// has no typed INPUT that can carry one: a `ConflictPosition` is stance text
-/// plus its assumptions, counters, and minority flag, with no availability axis,
-/// and the closest existing omission type, [`RivalDenominator`], is scoped to a
-/// causal claim's rival/confounder models and says nothing about how many
-/// conflict positions exist. Admitting the exception on a caller-set flag would
-/// hand back exactly the power this check removes, so the refusal stands until
-/// a typed missing-position declaration exists to carry it.
+/// A declared member with no position is refused here unless the set ALSO
+/// carries a qualified missing-rival declaration naming that member: an
+/// [`eliot_epistemic_contracts::MissingPosition`] says the owner attests the
+/// member is absent from the frozen scope, which is an incompleteness the
+/// analysis can preserve, whereas a bare `unresolved_owners` entry with no such
+/// declaration is a suppression the set cannot account for. The two cases are
+/// therefore distinguished rather than refused identically. The declaration is
+/// read from the canonical set, never from a caller-set flag on this crate's
+/// inputs: [`PositionDispositionKind::Withheld`] and
+/// [`PositionDispositionKind::Unavailable`] name the outcome for the absent
+/// member, and the closest existing omission type, [`RivalDenominator`], is
+/// scoped to a causal claim's rival/confounder models and says nothing about how
+/// many conflict positions exist, so neither could carry it.
 fn validate_conflict_denominators(
     conflict_set: &ConflictSet,
     policy: &ConflictAnalysisPolicy,
@@ -3211,9 +3220,19 @@ fn validate_conflict_denominators(
         conflict_set.positions.len(),
         policy.max_positions.min(MAX_POSITIONS),
     )?;
-    if conflict_set.positions.len() < MINIMUM_CONFLICT_POSITIONS {
+    // The qualified denominator is read once so the minimum guard and the
+    // declared-member check below agree on the same qualifier. Below the
+    // minimum, a declared-but-absent rival is admitted only when the set also
+    // attests to it; otherwise the set is one-sided with nothing accounting for
+    // the missing side and is refused.
+    let qualified = qualified_missing_rival_sources(conflict_set);
+    if (conflict_set.positions.len() + qualified.len()) < MINIMUM_CONFLICT_POSITIONS {
         return Err(ConflictAnalysisError::Denominator {
-            detail: format!("conflict requires at least {MINIMUM_CONFLICT_POSITIONS} positions"),
+            detail: format!(
+                "conflict requires at least {MINIMUM_CONFLICT_POSITIONS} positions; the supplied set \
+                 has {} and declares no qualified missing-rival denominator for the rest",
+                conflict_set.positions.len()
+            ),
         });
     }
     let mut seen_sources: Vec<String> = Vec::with_capacity(conflict_set.positions.len());
@@ -3244,15 +3263,37 @@ fn validate_conflict_denominators(
             .iter()
             .any(|source| source.as_str() == owner.as_str())
         {
-            return Err(ConflictAnalysisError::Denominator {
-                detail: format!(
-                    "a declared unresolved owner has no position and would leave the denominator: {}",
-                    redact(owner.as_str())
-                ),
-            });
+            // A member named on both axes is accounted for: the set attests the
+            // owner is absent, so it is preserved as an incomplete denominator
+            // rather than refused as a silent drop. A member named on only one
+            // axis is still refused.
+            if !qualified.iter().any(|source| source == owner.as_str()) {
+                return Err(ConflictAnalysisError::Denominator {
+                    detail: format!(
+                        "a declared unresolved owner has no position and no qualified \
+                         missing-position declaration, and would leave the denominator: {}",
+                        redact(owner.as_str())
+                    ),
+                });
+            }
         }
     }
     Ok(())
+}
+
+/// Returns the sources the set's own `missing_positions` declarations attest
+/// are absent from the frozen scope.
+///
+/// The declaration is the qualifier: a member named here has an owner-attested
+/// reason for being absent, so the denominator is a declared incompleteness
+/// rather than a silent suppression. The set is read as given; no value is
+/// inferred from a source that happens to be absent from `positions`.
+fn qualified_missing_rival_sources(conflict_set: &ConflictSet) -> BTreeSet<String> {
+    conflict_set
+        .missing_positions
+        .iter()
+        .map(|missing| missing.source.as_str().to_owned())
+        .collect()
 }
 
 /// Returns the sorted source handles of every position in the set.
@@ -6040,8 +6081,8 @@ mod tests {
         curation::{ProcedurePayload, TargetEvidence},
     };
     use eliot_epistemic_contracts::{
-        ConflictPosition, ConflictSetParams, ContractError, LineageRootId, Precision,
-        ValidityBounds,
+        ConflictPosition, ConflictSetParams, ContractError, LineageRootId, MissingPosition,
+        Precision, ValidityBounds,
     };
     use std::collections::BTreeSet;
     use std::num::NonZeroU64;
@@ -6182,6 +6223,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: probe_id.map(str::to_owned),
@@ -6556,6 +6598,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -6584,7 +6627,7 @@ mod tests {
 
     // WORK_UNIT_CASE: 673/3
     #[test]
-    fn case_03_empty_and_single_position_are_not_conflicts() {
+    fn case_03_qualified_missing_rival_distinguishes_the_two_denominators() {
         let receipt = test_receipt();
         let owners = BTreeSet::from([SourceId::new("source-a").expect("valid source")]);
         let empty = ConflictSet::new(ConflictSetParams {
@@ -6599,6 +6642,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
             unresolved_owners: owners.clone(),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -6627,6 +6671,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
             unresolved_owners: owners,
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -6641,7 +6686,103 @@ mod tests {
                 Err(ContractError::EmptyCollection { field })
                 if field == "conflict.positions"
             ),
-            "one position without a qualified missing-rival denominator is not a conflict"
+            "one position with no declared rival at all is not a conflict"
+        );
+        // The same one-sided shape, now carrying the owner's qualified
+        // missing-rival declaration for the absent second side. This reaches a
+        // DIFFERENT arm: the set is admitted, and the analyzer must preserve the
+        // one live position plus name the absent rival rather than refuse.
+        let qualified = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-qualified".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![test_position("source-a", "cache helps tail latency", false)],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            missing_positions: BTreeSet::from([MissingPosition::new(
+                SourceId::new("source-b").expect("valid source"),
+                "rival owner withdrew before the frozen receipt",
+            )
+            .expect("valid missing position")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        })
+        .expect("a qualified missing-rival denominator is admitted");
+        // The analyzer's own guard is exercised on this path, not just the
+        // contract constructor: a hand-built set is refused here only when it
+        // carries no qualifier.
+        let policy = test_policy();
+        let supplement = test_supplements();
+        let candidate =
+            match analyze_conflict(
+                &test_item(),
+                &test_draft(),
+                &test_grounded(),
+                &qualified,
+                &supplement,
+                &policy,
+            ) {
+                Ok(candidate) => candidate,
+                Err(err) => panic!("qualified missing-rival analysis: {err:?}"),
+            };
+        assert_eq!(
+            candidate.positions.len(),
+            1,
+            "the supplied position is preserved, and the absent rival is not invented"
+        );
+        // A declaration naming a member that IS supplied is refused outright, so
+        // the qualifier cannot be used to smuggle a second stance past the guard.
+        let contradicted = ConflictSet::new(ConflictSetParams {
+            conflict_id: "conflict-contradicted".to_owned(),
+            kind: ConflictKind::Epistemic,
+            scope: "scope-1".to_owned(),
+            task_id: None,
+            positions: vec![
+                test_position("source-a", "cache helps tail latency", false),
+                test_position("source-b", "cache harms tail latency", false),
+            ],
+            evidence_refs: BTreeSet::new(),
+            owners: BTreeSet::from([
+                SourceId::new("source-a").expect("valid source"),
+                SourceId::new("source-b").expect("valid source"),
+            ]),
+            common_lineage: BTreeSet::new(),
+            resolved_parts: BTreeSet::new(),
+            unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
+            unresolved_owners: BTreeSet::new(),
+            missing_positions: BTreeSet::from([MissingPosition::new(
+                SourceId::new("source-a").expect("valid source"),
+                "claims a supplied position is absent",
+            )
+            .expect("valid missing position")]),
+            acceptability: ArgumentAcceptability::Contested,
+            defeated_refs: BTreeSet::new(),
+            probe: None,
+            decision_owner: SourceId::new("source-a").expect("valid source"),
+            affected_actions: vec!["decide-cache".to_owned()],
+            lifecycle: ConflictLifecycle::Open,
+            receipt_digest: receipt.bundle_digest.clone(),
+        });
+        assert!(
+            matches!(
+                contradicted,
+                Err(ContractError::ImpossibleCombination { field })
+                if field == "conflict.missing_positions"
+            ),
+            "a declaration that contradicts a supplied position is refused"
         );
     }
 
@@ -6675,6 +6816,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["help rate".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -6765,6 +6907,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["load effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-e").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -6863,6 +7006,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["scope boundary".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -6955,6 +7099,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -7097,6 +7242,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -7298,6 +7444,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -7360,6 +7507,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -7485,6 +7633,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -7535,6 +7684,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -7689,6 +7839,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-c").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -7776,6 +7927,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -7909,6 +8061,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -8189,6 +8342,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["load effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -8610,6 +8764,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -8730,6 +8885,7 @@ mod tests {
             resolved_parts: BTreeSet::from(["warm key effect".to_owned()]),
             unresolved: BTreeSet::from(["burst load effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -8783,6 +8939,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::from([ArtifactId::new("ctr-1").expect("valid artifact")]),
             probe: None,
@@ -8876,6 +9033,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -8956,6 +9114,7 @@ mod tests {
             resolved_parts: BTreeSet::from(["warm key effect".to_owned()]),
             unresolved: BTreeSet::from(["burst load effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9006,6 +9165,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["tail latency effect".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9073,6 +9233,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["rate comparison".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9146,6 +9307,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["objective trade-off".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9202,6 +9364,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["effect permission".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9269,6 +9432,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["measurement coverage".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9345,6 +9509,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["causal mechanism".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9427,6 +9592,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["scope overlap".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9498,6 +9664,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["permission and intent".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9564,6 +9731,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["mechanism support".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9624,6 +9792,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["latency definition".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9704,6 +9873,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["felt speed".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9776,6 +9946,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["latency cause".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9848,6 +10019,7 @@ mod tests {
                 "confounders".to_owned(),
             ]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -9936,6 +10108,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["prediction versus intervention support".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -10024,6 +10197,7 @@ mod tests {
                 "evaluator verdict".to_owned(),
             ]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-b").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -10112,6 +10286,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["supported precision ceiling".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -10196,6 +10371,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -10689,6 +10865,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["coverage sufficiency".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -10766,6 +10943,7 @@ mod tests {
                 SourceId::new("source-a").expect("valid source"),
                 SourceId::new("source-b").expect("valid source"),
             ]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -10854,6 +11032,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["plan value trade-off".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -10919,6 +11098,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["effect permission".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -10998,6 +11178,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["intent satisfiability".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
@@ -11077,6 +11258,7 @@ mod tests {
             resolved_parts: BTreeSet::new(),
             unresolved: BTreeSet::from(["coverage sufficiency".to_owned()]),
             unresolved_owners: BTreeSet::from([SourceId::new("source-a").expect("valid source")]),
+            missing_positions: BTreeSet::new(),
             acceptability: ArgumentAcceptability::Contested,
             defeated_refs: BTreeSet::new(),
             probe: None,
