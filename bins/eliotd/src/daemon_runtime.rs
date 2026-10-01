@@ -6065,7 +6065,7 @@ fn admit_over_restored_registry(
 ///   claim NAMING THIS BRIEF REVISION was observed on this pass. The exact
 ///   symbols that would let this daemon say more — an `Undecided` member on
 ///   `OwnerDecisionKind`, an `Option` on `ImprovementArtifact::decision`, and a
-//!   queue depth or epoch on the `improvement_decision_claim` answer — are named
+///   queue depth or epoch on the `improvement_decision_claim` answer — are named
 ///   in `improvement_intake_dispatch`'s "Undecided is not representable, and
 ///   the gap is named rather than faked".
 async fn run_improvement_intake(
