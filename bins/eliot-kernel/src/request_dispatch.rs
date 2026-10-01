@@ -123,18 +123,47 @@
 //!   non-owner from the operation it wants to read. The verify payload is therefore
 //!   `{bundle_hex}` or `{bundle_hex, successor_of}`.
 //!
-//!   The succession evidence is CALLER-PRESENTED, not owner-issued, and the route
-//!   does not pretend otherwise. It is a POINTER, never an authorization: the pair
-//!   only selects which row is read, and the route is scope-guarded, the
+//!   The succession evidence is CALLER-PRESENTED, and the route does not pretend
+//!   otherwise. It is a POINTER, never an authorization: the pair only selects which
+//!   row is read. What authorizes the read is the OWNER-ISSUED succession grant the
+//!   capture owner records for each ELIGIBLE verification operation
+//!   (`eliot_ors::BackupVerifySuccessionGrant`, issued by
+//!   `backup_capture.rs::KernelBackupCapture::issue_verify_succession_grant` and
+//!   redeemed through `p07_ors::redeem_backup_verify_succession_grant`): one durable
+//!   row per operation, whose content is entirely owner-decided or authenticated,
+//!   whose durable key the owner derives from that content, which is consumed once
+//!   inside the redeeming transaction and can never be re-armed because its key is
+//!   a function of its own binding. That durable single-use record is the grant's
+//!   order: there is deliberately NO transport session-fence gate, because no
+//!   per-session value on this tree is monotone across live sessions
+//!   (`Session::session_epoch` is a literal `1` in every production constructor,
+//!   `crates/kernel/eliot-ipc/src/lib.rs:1450`, `:1478`, `:1540`) and because the
+//!   successor in the I14.21 case is this same principal in this same logon session
+//!   reconnecting after a lost response -- so an order excluding the issuing session
+//!   would refuse exactly the reconciliation acceptance clause 3 requires. Nothing
+//!   a transport caller holds reaches any of that -- the predecessor pair is on the
+//!   wire in the predecessor's own `ok` reply and still authorizes nothing on its
+//!   own.
+//!
+//!   "ELIGIBLE" is decided, not assumed, and it is decided PER-DISPOSITION of the
+//!   verification write's I14.21 commit outcome rather than per operation kind or
+//!   without limit: `eliot_ors::BackupVerifySuccessionEligibility` admits exactly
+//!   the `committed -> reconcile ORS` arm, the store's only writer asks it before
+//!   it opens a write transaction, and every other arm of this route's disposition
+//!   match reaches it with the disposition I14.21 actually gives that outcome. The
+//!   `unknown` arm -- a store failure, whose landing this route cannot observe --
+//!   is REFUSED BY NAME rather than granted, because I14.21 routes it to a
+//!   Human/Doctor "evidence-backed reconciliation" decision that no owner on this
+//!   front door can record; `answer_unknown_verify_outcome` holds that refusal.
+//!   Alongside all of this, unchanged: the route is scope-guarded, the
 //!   authorization checks answer with ONE static sentence that names no class, the
 //!   integrity/no-row arms answer with the fail-closed
 //!   `verification_not_recorded_reply`, and the original operation identity is
-//!   preserved on the answer. What the evidence cannot do is authorize a REPEAT
-//!   reconciliation, because no owner issues a one-shot backup-verify succession or
-//!   reconciliation receipt on this product; that owner is `backup-capture-owner
-//!   (#959)`, OPEN. What it CAN do, and does, is force the owner to re-decide the
-//!   named operation: nothing here invents
-//!   a capability, a receipt type, or an owner value to paper over that.
+//!   preserved on the answer. A caller that can name its own operation identity
+//!   does not need the grant at all: it replays through the ordinary bound path,
+//!   which is what acceptance clause 2 and I14.21 require, and the grant is for the
+//!   one case the namespace key cannot separate -- a session that must reconcile an
+//!   operation it cannot re-derive its own identity for.
 //! - `backup.restore-test` runs the FULL isolated rehearsal PATH, not a shape
 //!   report — though since the destination-admission gate (#955) that path
 //!   ends in the owner's own typed refusal on this front door, for the reason
@@ -226,7 +255,8 @@ use eliot_ipc::{PeerIdentity, Session, TransportError};
 use eliot_ors::{
     BACKUP_VERIFICATION_RESULT_RECORD_TYPE, BACKUP_VERIFY_PROFILE_ID,
     BACKUP_VERIFY_PROFILE_VERSION, BACKUP_VERIFY_RETENTION_WINDOW, BackupVerificationDisposition,
-    BackupVerificationResultRecord, BackupVerifyRequestIdentity,
+    BackupVerificationResultRecord, BackupVerifyRequestIdentity, BackupVerifySuccessionDisposition,
+    BackupVerifySuccessionEligibility, BackupVerifySuccessionRedemption,
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, LegacyFenceBoundBackupVerificationClass,
     LegacyUnscopedBackupVerificationClass, OrsError, RestoreJournalArchiveClass,
 };
@@ -1883,6 +1913,65 @@ fn successor_caller_principal(session: &Session) -> Result<&str, TransportError>
     authenticated_backup_principal(session).map(|(principal, _)| principal)
 }
 
+/// Builds the durable succession redemption this reconciling session presents to
+/// the owner-issued grant (`eliot_ors::BackupVerifySuccessionRedemption`).
+///
+/// It is a carrier, not an authority: every term is read from a source that is
+/// already proved on this path and none of it is taken as a lookup key. The
+/// predecessor pair is the caller's presented text and is carried verbatim, so the
+/// STORE — not this function — decides whether it names the operation the grant
+/// authorizes; the archive digest is the capture owner's own value for the bytes it
+/// just decoded, never a digest of the presented spelling; the successor principal
+/// and session come from the one shared
+/// [`authenticated_backup_principal`] reader, so the principal the route compares
+/// against the stored row and the principal the grant authorizes cannot drift
+/// apart; the scope and the authority LINEAGE are the admitted session's own; and
+/// the instant is the crate-wide [`unix_ms`](crate::unix_ms) the rest of the
+/// Kernel's durable timestamping reads.
+///
+/// No transport session ordering is carried here, deliberately. The store gates
+/// the redemption on the grant's durable single-use record rather than on a
+/// session fence, because no per-session value on this tree is monotone across
+/// live sessions (`Session::session_epoch` is a literal `1` in every production
+/// constructor) and because the successor in the I14.21 case this exists for is
+/// this same principal in this same logon session reconnecting after a lost
+/// response — so an order that excluded the issuing session would refuse exactly
+/// the reconciliation acceptance clause 3 requires. See
+/// `eliot_ors::BackupVerifySuccessionGrant` for the full measurement.
+///
+/// The LINEAGE is carried and the epoch SEQUENCE deliberately is not, for the same
+/// reason the durable verification key binds the lineage alone: a rotation on one
+/// lineage must still permit an I14.21 reconciliation, while a different authority
+/// is a different key and a different grant.
+///
+/// `Err` is unreachable — [`admit_backup_caller`] already fenced the frame on an
+/// unauthenticated peer — so the caller treats it as a fenced transport error and
+/// answers with the same single static sentence as the other authorization
+/// refusals, not as a scope decision.
+fn verify_succession_redemption(
+    session: &Session,
+    successor: &VerifySuccessorEvidence,
+    owner_archive_sha256: &str,
+) -> Result<BackupVerifySuccessionRedemption, TransportError> {
+    let (principal, session_id) = authenticated_backup_principal(session)?;
+    Ok(BackupVerifySuccessionRedemption {
+        predecessor_namespace_digest: successor.predecessor_namespace_digest.clone(),
+        predecessor_identity_digest: successor.predecessor_identity_digest.clone(),
+        predecessor_archive_sha256: owner_archive_sha256.to_owned(),
+        successor_principal: principal.to_owned(),
+        successor_scope_id: session.module_generation.module_id.as_str().to_owned(),
+        successor_authority_lineage_id: session
+            .module_generation
+            .state_fence
+            .authority_epoch
+            .lineage_id
+            .as_str()
+            .to_owned(),
+        redeeming_session_id: session_id.to_owned(),
+        observed_at_unix_ms: crate::unix_ms(),
+    })
+}
+
 /// Returns whether the owner re-decides, for the bytes just decoded, exactly the
 /// operation the named predecessor row already holds.
 ///
@@ -1948,12 +2037,13 @@ fn owner_reproves_predecessor_operation(
 /// path answer with (instructions 4, 5, 7 and 8 on that path).
 ///
 /// This function's sibling refusal call sites do NOT use this sentence. The load
-/// miss, the row that cannot be rebuilt, and the `reply_digest` that does not
-/// re-derive all answer with the fail-closed `verification_not_recorded_reply`,
-/// which is the same refusal the caller's own replay path returns for an
-/// untrustworthy row. So a caller can tell "no row at that key" from "a row you may
-/// not read" — that residue is deliberate, and the full accounting, including the
-/// count of arms on each side, is on [`answer_successor_verification`].
+/// miss, a store FAILURE while redeeming the owner-issued succession grant, the row
+/// that cannot be rebuilt, and the `reply_digest` that does not re-derive all answer
+/// with the fail-closed `verification_not_recorded_reply`, which is the same refusal
+/// the caller's own replay path returns for an untrustworthy row. So a caller can
+/// tell "no row at that key" from "a row you may not read" — that residue is
+/// deliberate, and the full accounting, including the count of arms on each side, is
+/// on [`answer_successor_verification`].
 ///
 /// It is deliberately a SINGLE sentence for all of them, and that is a security
 /// property, not brevity. A caller that learns a namespace digest can probe for
@@ -2036,9 +2126,9 @@ fn verification_not_recorded_reply(idempotency_key: &str) -> Value {
 /// collision case would misdescribe the case that actually happens, and splitting it
 /// into two typed reasons would give the caller a distinguishability it has no need
 /// for. The reconciliation path's own authorization refusals are a different
-/// mechanism entirely — the four authorization checks there are all
-/// [`successor_not_observed_reply`], one static sentence, so a caller
-/// cannot use them to probe for rows it may not read.
+/// mechanism entirely - the authorization checks there, the owner-issued succession
+/// grant redemption among them, are all [`successor_not_observed_reply`], one static
+/// sentence, so a caller cannot use them to probe for rows it may not read.
 fn foreign_operation_reply(idempotency_key: &str) -> Value {
     invalid_reply(
         BACKUP_VERIFY_OPERATION,
@@ -2302,20 +2392,24 @@ enum PriorVerification {
 /// The pair is a POINTER, never an authorization on its own: both halves were
 /// already on the wire in the predecessor's own `ok` reply, so their shape and
 /// even their value prove nothing by themselves. What authorizes the
-/// reconciliation is [`owner_reproves_predecessor_operation`] — the capture
-/// owner, re-deciding the presented bytes on this call, must land on exactly the
-/// operation the named row holds — together with the scope, lineage and
-/// principal joins. The pair selects WHICH row is read; the owner decides
-/// whether that row is the operation the caller is reconciling.
+/// reconciliation is the OWNER-ISSUED succession grant
+/// (`eliot_ors::BackupVerifySuccessionGrant`), which the capture owner mints once
+/// per decided verification operation and which a later session redeems once —
+/// together with the scope, lineage and principal joins above and
+/// [`owner_reproves_predecessor_operation`]. The pair selects WHICH row is read;
+/// the owner's grant says whether that row is an operation this caller may
+/// reconcile AT ALL, and the owner re-deciding the presented bytes says whether it
+/// is the operation being reconciled.
 ///
-/// What the pair still is NOT is an owner-ISSUED, one-shot succession capability:
-/// no owner issues a backup-verify succession or reconciliation receipt on this
-/// product, so there is no due time and no single-use consumption, and a holder
-/// of the pair may reconcile the same operation again. That residual belongs to
-/// `backup-capture-owner (#959)`, which is OPEN. It is a narrower claim than
-/// "the owner did not authorise this reconciliation": the owner does re-prove
-/// that the reconciled operation IS the named operation, and it does so over the
-/// whole archive content, not over a correlation the caller chose.
+/// What the pair therefore still is NOT is the authorization itself, and saying so
+/// is the point: no caller-presented value can stand in for the grant, because the
+/// grant's content is owner-decided, its durable key is derived from that content,
+/// its redemption is gated on a durable owner-issued single-use record and can
+/// never be re-armed, so the second and every later reconciliation of the same
+/// operation is refused however many times this pair is replayed. Before that
+/// grant existed, this pair plus those joins authorized a REPEAT reconciliation of
+/// the same row, unboundedly, from any transcript of the predecessor's own `ok`
+/// body. It no longer does.
 struct VerifySuccessorEvidence {
     /// The predecessor operation's durable namespace key.
     predecessor_namespace_digest: String,
@@ -2352,8 +2446,10 @@ type AdmittedVerifyBundle = (Vec<u8>, Option<VerifySuccessorEvidence>);
 /// only checked for 64-hex shape. Every check that decides whether the named
 /// operation may be observed happens AFTER the real store read, and not all of it
 /// is in one function: the `WorkScope` and authority-lineage joins are in
-/// [`successor_may_observe`], while the principal comparison and the
-/// digest-and-archive equality are in [`answer_successor_verification`].
+/// [`successor_may_observe`], the principal comparison and the
+/// digest-and-archive equality are in [`answer_successor_verification`], and the
+/// owner-issued succession grant the caller cannot present at all is redeemed
+/// through `p07_ors::redeem_backup_verify_succession_grant` from there.
 fn admit_verify_bundle(payload: &Value) -> Result<AdmittedVerifyBundle, (&'static str, String)> {
     let Some(object) = payload.as_object() else {
         return Err(("backup.verify", "payload must be a JSON object".to_owned()));
@@ -2552,8 +2648,10 @@ impl KernelComposition {
     /// own row, not from a recompute of the presented bytes, so the presented bundle
     /// must be that predecessor's archive: the owner re-decides the decoded bytes
     /// and the whole of that decision is compared against the stored row by
-    /// [`owner_reproves_predecessor_operation`] before anything is projected. The
-    /// bundle is still
+    /// [`owner_reproves_predecessor_operation`] before anything is projected, and
+    /// the owner-issued, single-use succession grant minted when that predecessor was
+    /// decided is redeemed durably before anything is projected either. The bundle is
+    /// still
     /// decoded and validated first either way, so a reconciliation never skips the
     /// capture owner's admission gate.
     ///
@@ -2700,7 +2798,7 @@ impl KernelComposition {
         else {
             return Ok(verification_not_recorded_reply(idempotency_key));
         };
-        Ok(self.answer_backup_verify(prior, &identity, &fresh, idempotency_key))
+        Ok(self.answer_backup_verify(session, prior, &identity, &fresh, idempotency_key))
     }
 
     /// Answers the I5.27 identity conflict for presented bytes that are NOT the archive
@@ -2822,7 +2920,10 @@ impl KernelComposition {
 
     /// Answers one reconciliation from the predecessor row the caller named.
     ///
-    /// Three independent things are proved before anything is projected.
+    /// FOUR independent things are proved before anything is projected, and the
+    /// fourth is the one instruction 4 is about: the first three are joins over
+    /// values the caller and the owner already held, and only the fourth is an
+    /// authorization the caller cannot derive.
     ///
     /// (1) The caller is admitted for this front door in the SAME scope as the
     /// predecessor. The reconciling session is already authenticated and admitted
@@ -2837,12 +2938,12 @@ impl KernelComposition {
     /// is still a permitted reconciliation, which is exactly what instruction 7
     /// allows, while a foreign authority lineage is refused.
     ///
-    /// The PRINCIPAL compare is a FOURTH check and a separate call site, not part
-    /// of [`successor_may_observe`] — see that function's own note on what it
+    /// The PRINCIPAL compare is a separate check and a separate call site, not
+    /// part of [`successor_may_observe`] — see that function's own note on what it
     /// deliberately does not compare. It is the one check a same-scope caller on the
     /// same lineage would otherwise slip past, and the one that makes `successor_of`
-    /// a non-owner case at all. Like the other three it answers with
-    /// [`successor_not_observed_reply`], so the four are indistinguishable to a
+    /// a non-owner case at all. Like the others it answers with
+    /// [`successor_not_observed_reply`], so they are indistinguishable to a
     /// caller that fails one.
     ///
     /// (2) The named predecessor is a real stored `backup.verify` row in that
@@ -2861,6 +2962,22 @@ impl KernelComposition {
     /// a valid but different archive and be answered with the predecessor's
     /// identity, class, counts and fence relation, which would be a projection
     /// about bytes the caller did not present.
+    ///
+    /// (4) The OWNER has authorized this reconciliation AT ALL, through the
+    /// single-use succession grant minted when the predecessor was decided:
+    /// `eliot_ors::BackupVerifySuccessionGrant`, redeemed through
+    /// `p07_ors::redeem_backup_verify_succession_grant`. The first three checks are
+    /// all re-derivable from a transcript of the predecessor's own `ok` reply plus
+    /// the same archive bytes, so they answer "is this the same operation, and may
+    /// this caller observe it"; the grant answers "did the owner ever permit a
+    /// reconciliation of it", and it is the only one of the four a caller cannot
+    /// hold. It is redeemed last of the four and before any projection, and it is
+    /// redeemed exactly once: the store writes the consumption in the same
+    /// transaction that reads the grant and the named row, so a second attempt at
+    /// the same operation is refused and the grant cannot be re-armed, because its
+    /// durable key is derived from its own binding and re-issuing writes nothing.
+    /// Like the other three it answers with [`successor_not_observed_reply`], so the
+    /// four remain indistinguishable to a caller that fails one.
     ///
     /// The answer then keeps BOTH facts the transport needs. The envelope
     /// correlation is always the reconciling caller's own `idempotency_key`,
@@ -2884,23 +3001,32 @@ impl KernelComposition {
     ///
     /// NO CALLER-SUPPLIED-DIGEST PATH CAN RENDER A STORED VALUE, AND NONE OF THEM
     /// NAMES A CLASS EITHER, BUT THE ONE-SENTENCE CLAIM IS ABOUT THE AUTHORIZATION
-    /// ARMS ONLY, NOT ALL SIX ARMS OF THIS FUNCTION. This function has six refusal
+    /// ARMS ONLY, NOT ALL TEN ARMS OF THIS FUNCTION. This function has ten refusal
     /// call sites, and they answer with TWO different sentences:
-    /// - the three AUTHORIZATION call sites — the scope/lineage join, the separate
-    ///   principal compare, and the presented-digest + owner re-proof compare —
-    ///   all answer with the ONE [`successor_not_observed_reply`], whose reason is a
+    /// - the SIX AUTHORIZATION call sites — the scope/lineage join, the separate
+    ///   principal compare, the presented-digest + owner re-proof compare, the
+    ///   unauthenticated-peer arm of the redemption carrier, and the TWO arms of the
+    ///   grant redemption (unauthorized, and an unbuildable redemption) — all answer
+    ///   with the ONE [`successor_not_observed_reply`], whose reason is a
     ///   single static sentence naming no principal, no session, no scope, no
     ///   lineage, no digest, no archive identity, no count and no store error;
-    /// - the three INTEGRITY/NO-ROW call sites — the load miss, the row that cannot
-    ///   be rebuilt, and the `reply_digest` that does not re-derive — all answer
+    /// - the four INTEGRITY/NO-ROW call sites — the load miss, a store FAILURE while
+    ///   redeeming the grant, the row that cannot be rebuilt, and the `reply_digest`
+    ///   that does not re-derive — all answer
     ///   with the fail-closed [`verification_not_recorded_reply`], the same refusal
     ///   the caller's OWN replay path returns for a key holding nothing
     ///   trustworthy. So a caller CAN distinguish "there is no row at that key" (and
-    ///   "a row whose body does not verify") from "there is a row you may not read".
+    ///   "a row whose body does not verify", and "the store could not answer") from
+    ///   "there is a row you may not read".
+    ///
+    /// The grant adds one authorization arm and one integrity arm and no new
+    /// sentence, which is the point: an unauthorized grant, a wrong archive, a
+    /// foreign principal and an out-of-scope successor are the same answer, and a
+    /// store outage during redemption is not an authorization answer at all.
     ///
     /// That residue is deliberate and it is the non-concealment paragraph below
     /// stated in the other direction: it is an OUTAGE signal, not an authorization
-    /// oracle, because every one of those three arms is equally reachable by the
+    /// oracle, because every one of those four arms is equally reachable by the
     /// caller for its own key. Collapsing them onto the authorization sentence would
     /// only hide a store fault behind an authorization refusal.
     ///
@@ -2941,19 +3067,76 @@ impl KernelComposition {
     /// (d) is what separates this from a successor that is merely ACCEPTED because
     /// the pair it presented is well formed. The pair is a pointer: both halves were
     /// on the wire in the predecessor's own `ok` reply, so nothing about their shape
-    /// or their value authorizes anything. What authorizes the read is that the OWNER
-    /// re-decided this archive and reached the same archive identity, declared
-    /// source and owner contract, export and archived fence digests, evidenced
-    /// class, evidence level and class ceiling, publication receipt and independent
-    /// member denominators the row recorded.
+    /// or their value authorizes anything. What authorizes the read is the OWNER-ISSUED
+    /// succession grant this call redeems, plus the fact that the OWNER re-decided this
+    /// archive and reached the same archive identity, declared source and owner
+    /// contract, export and archived fence digests, evidenced class, evidence level
+    /// and class ceiling, publication receipt and independent member denominators the
+    /// row recorded.
     ///
-    /// What it still does NOT prove is that the owner would authorise a REPEAT
-    /// reconciliation by the same caller: no owner issues a one-shot backup-verify
-    /// succession or reconciliation receipt on this product, so the pair may be
-    /// replayed for as long as the row lives. That residual belongs to
-    /// `backup-capture-owner (#959)`, which is OPEN, and closing it would mean
-    /// inventing a capability, a receipt type or an owner value that does not exist
-    /// — not something this issue's own scope may add.
+    /// (e) — the grant — is the check that instruction 4's "only through an explicit
+    /// owner-authorized succession/recovery contract" asks for and that this route
+    /// previously did not have. `eliot_ors::BackupVerifySuccessionGrant` is minted by
+    /// the capture owner once per decided operation, out of the owner's own archive
+    /// digest and the accepted identity it was called under; its durable key is derived
+    /// from that content, so a caller holding the pair on the wire addresses nothing;
+    /// and the redemption is consumed durably inside its own transaction, so a second
+    /// attempt is refused and the grant cannot be re-armed, because re-issuing
+    /// addresses the same content-derived key and writes nothing. There is
+    /// deliberately NO session-fence gate on that redemption: it could never be
+    /// satisfied (every live `Session` carries `session_epoch == 1`), and excluding
+    /// the issuing session would refuse the I14.21 lost-response reconciliation this
+    /// very clause exists to permit — the successor there is the same principal in
+    /// the same logon session.
+    ///
+    /// #2883 SETTLED: WHICH OPERATIONS ARE ELIGIBLE, AND WHOSE DECISION IS
+    /// RECORDED. The earlier delivery of this branch left both open in this very
+    /// paragraph and escalated them. They are now decided in code, and the two
+    /// sentences that decide them are I14.21's three-way split of a commit outcome
+    /// and I5.27's "performs no transition".
+    ///
+    /// ELIGIBILITY IS PER-DISPOSITION, not per-operation-kind and not
+    /// unrestricted. I14.21 gives each commit outcome a DIFFERENT next step --
+    /// `committed -> reconcile ORS`, `known rollback -> retry under same identity`,
+    /// `unknown -> pause Ordering Scope, preserve operation and open Problem State;
+    /// Human/Doctor chooses evidence-backed reconciliation` -- and only the first is
+    /// a succession. So a grant exists exactly for the operations whose durable
+    /// result row is COMMITTED, and the enforcement is
+    /// `eliot_ors::BackupVerifySuccessionEligibility`, asked by the store's only
+    /// writer BEFORE it opens a write transaction, so an ineligible disposition
+    /// cannot leave a durable authorization behind. Concretely: `Stored` and
+    /// `AlreadyBound` are eligible; the exact-replay `Bound` arm is eligible and is
+    /// what recovers a grant write that failed while the first answer was produced;
+    /// `ForeignOperation` is not, because I5.27 says reusing a key with a different
+    /// canonical request hash "returns `IDENTITY_CONFLICT` and performs no
+    /// transition", so nothing was decided to succeed; the legacy and unreadable
+    /// rows are not, because no current owner certified them; and a store FAILURE
+    /// is not, because it is I14.21's `unknown` arm.
+    ///
+    /// THE OWNER'S DECISION IS RECORDED BEFORE REDEMPTION, and the record is the
+    /// grant itself rather than something beside it. It is written durably by the
+    /// capture owner at the instant it decided the operation, from content only
+    /// that owner holds, and a redemption can only CONSUME it -- never produce one.
+    /// So for the committed disposition the sequence I14.21 asks for holds by
+    /// construction and NO further ceremony is required: the owner that decides a
+    /// `backup.verify` result is the capture owner that just decided it, and its
+    /// decision is the whole of the evidence. Inventing an approval UI, an operator
+    /// identity or a ticket type to satisfy a reading I14.21 does not ask for would
+    /// be a second scheme, and A2.2's rule that "a role description defines
+    /// function, not implicit permission" cuts against it.
+    ///
+    /// WHAT IS STILL MISSING IS NAMED, NOT PAPERED OVER. I14.21's `unknown` arm
+    /// needs a Human/Doctor who "chooses evidence-backed reconciliation", and this
+    /// route publishes no such owner for `backup.verify` -- so that disposition is
+    /// refused by name rather than granted.
+    /// `KernelComposition::answer_unknown_verify_outcome` asks the owner to record a
+    /// grant for an unknown outcome, gets
+    /// `OrsError::BackupVerifySuccessionIneligible { disposition, required_owner }`
+    /// back, and answers without one. `required_owner` is A2.2's Recovery Principal,
+    /// who "performs a narrow break-glass transition"; there is no such token on this
+    /// front door, no Problem State transition reachable from it and no operator
+    /// surface able to present one. `backup-capture-owner (#959)` remains OPEN and
+    /// that is the honest state of the residue.
     ///
     /// # OPEN POINT FOR THE OWNER — the issue's clause-1 phrase. Clause 1 says "two
     /// authenticated principals OR SESSIONS" may use the same human idempotency text
@@ -2999,6 +3182,45 @@ impl KernelComposition {
         {
             return successor_not_observed_reply(idempotency_key);
         }
+        // (4) The OWNER-ISSUED, SINGLE-USE succession grant, redeemed durably. This
+        // is the authorization the caller-presented pair is not: everything above
+        // is a JOIN over values the caller and the owner already held, and all of
+        // it is re-derivable from a transcript of the predecessor's own `ok` body
+        // plus the same archive bytes, so on its own it authorized a REPEAT
+        // reconciliation of this row, unboundedly, from any later session of the same
+        // principal. The grant is not derivable that way: the owner minted it, its
+        // key is derived from its own binding, and redeeming it spends it for good.
+        //
+        // It is redeemed AFTER the joins above and BEFORE any projection, so the
+        // three joins still decide for free, and a refusal here is the same single
+        // static sentence, so the four authorization failures stay
+        // indistinguishable. A store FAILURE is deliberately not folded into it: an
+        // outage is not an authorization answer, and the caller must be able to tell
+        // them apart — that is the fail-closed `verification_not_recorded_reply` arm.
+        //
+        // The redemption re-reads the named row inside its own transaction, so the
+        // grant is proved against the ORIGINAL RECORDED values and the projection
+        // below still comes from the row this function loaded and already validated.
+        // Spending a grant on a mis-presentation is the intended direction: the
+        // owner's decision to allow this reconciliation at all was already made, the
+        // grant is one-shot by design, and the failure is the caller's own.
+        let Ok(redemption) =
+            verify_succession_redemption(session, successor, report.archive_sha256.as_str())
+        else {
+            return successor_not_observed_reply(idempotency_key);
+        };
+        let Ok(disposition) = self
+            .p07_ors
+            .redeem_backup_verify_succession_grant(&redemption)
+        else {
+            return verification_not_recorded_reply(idempotency_key);
+        };
+        match disposition {
+            BackupVerifySuccessionDisposition::Redeemed { .. } => {}
+            BackupVerifySuccessionDisposition::NotAuthorized => {
+                return successor_not_observed_reply(idempotency_key);
+            }
+        }
         let Ok(projection) = projection_from_record(&stored) else {
             return verification_not_recorded_reply(idempotency_key);
         };
@@ -3028,6 +3250,7 @@ impl KernelComposition {
     /// projection.
     fn answer_backup_verify(
         &self,
+        session: &Session,
         prior: PriorVerification,
         identity: &BackupVerifyRequestIdentity,
         fresh: &VerifiedProjection,
@@ -3035,6 +3258,45 @@ impl KernelComposition {
     ) -> Value {
         match prior {
             PriorVerification::Bound(record) => {
+                // #2883 ELIGIBILITY, on the REPLAY path. The exact-replay arm is
+                // also the recovery path for a grant write that failed while the
+                // FIRST answer was produced, and that is a commitment rather than
+                // an optimisation: the operation is in I14.21's `committed`
+                // disposition, so under
+                // `BackupVerifySuccessionEligibility` it IS succession-eligible,
+                // and an operation whose grant never landed would otherwise be
+                // permanently unreconcilable through the succession contract
+                // instruction 4 asks for — the very clause whose whole purpose is
+                // recovery of a LOST RESPONSE.
+                //
+                // The predicate compares the row's OWN RECORDED values against
+                // the values this call's owner just decided. It deliberately does
+                // NOT infer one from the other: a caller that presented the same
+                // bytes and a row whose recorded archive digest differs is not a
+                // replay of that row, and no digest is recomputed here to stand in
+                // for that comparison.
+                //
+                // It also deliberately does NOT include the row's own `reply_digest`
+                // re-derivation, because that answers a different question. The
+                // grant authorizes RECONCILING this decided operation — its
+                // identity, its owner and its single-use consumption — while the
+                // reply digest is about whether the stored ANSWER BODY still
+                // rebuilds, and `answer_bound_verification` below is where that is
+                // decided. A row whose recorded body does not rebuild therefore
+                // still holds a grant and still fails closed on this call, and it
+                // also fails closed at redemption before anything is projected, so
+                // nothing untrustworthy is ever rendered; folding the check in here
+                // as well would put the same comparison in two places and buy no
+                // additional refusal.
+                let replay_is_this_operation = record.request_digest == fresh.request_digest
+                    && record.archive_sha256 == fresh.archive_sha256;
+                if replay_is_this_operation {
+                    self.issue_committed_succession_grant(
+                        session,
+                        &record.identity,
+                        record.archive_sha256.as_str(),
+                    );
+                }
                 answer_bound_verification(&record, fresh, idempotency_key)
             }
             PriorVerification::LegacyUnscoped => legacy_unscoped_evidence_reply(idempotency_key),
@@ -3043,7 +3305,10 @@ impl KernelComposition {
             // is answered as legacy unqualified evidence, never upgraded and
             // never projected as a current-profile answer. A NEW explicit
             // verification operation is what produces a row under the current
-            // profile.
+            // profile. Neither legacy class is succession-eligible either: neither
+            // is a row this profile decided, so neither is I14.21's `committed`
+            // disposition for THIS operation, and granting one would authorize a
+            // reconciliation of evidence no current owner certified.
             PriorVerification::LegacyUnqualified => {
                 legacy_unqualified_evidence_reply(idempotency_key)
             }
@@ -3053,12 +3318,53 @@ impl KernelComposition {
             // only honest answer is no verification result at all.
             PriorVerification::Unreadable => verification_not_recorded_reply(idempotency_key),
             PriorVerification::Absent => {
-                self.stage_backup_verification(identity, fresh, idempotency_key)
+                self.stage_backup_verification(session, identity, fresh, idempotency_key)
             }
         }
     }
 
-    /// Records the fresh owner-proved answer and returns the body to send.
+    /// Asks the CAPTURE OWNER to record the single-use succession grant for one
+    /// `committed`-disposition verification operation.
+    ///
+    /// All three callers have already proved that the operation this grant names is
+    /// durably committed — two hold the store's own `Stored` and `AlreadyBound`
+    /// dispositions, and one re-read the row at that exact key itself — so all
+    /// three pass [`BackupVerifySuccessionEligibility::CommittedResult`] and this
+    /// helper exists only to keep that one decision written once instead of at
+    /// three call sites.
+    ///
+    /// It returns nothing on purpose. The grant is not what the caller came for:
+    /// the verification answer is already decided and, on the staging path,
+    /// already durable, so an owner refusal here must not turn a recorded
+    /// verification into a reported-unrecorded one. The refusal is still a real
+    /// typed failure the owner reads, and its effect is narrower and fail-closed —
+    /// no grant exists, so a later session that needs one is refused with the
+    /// single static sentence that names nothing, and the next replay of the same
+    /// operation retries this same idempotent call.
+    fn issue_committed_succession_grant(
+        &self,
+        session: &Session,
+        recorded_identity: &BackupVerifyRequestIdentity,
+        recorded_archive_sha256: &str,
+    ) {
+        // Resolved here rather than passed in, so the issuing session is always
+        // the session the owner was actually called under. `Err` cannot happen:
+        // `admit_backup_caller` already fenced the frame on an unauthenticated
+        // peer on this same call.
+        let Ok((_, issued_by_session_id)) = authenticated_backup_principal(session) else {
+            return;
+        };
+        let _grant = self.backup_capture().issue_verify_succession_grant(
+            recorded_archive_sha256,
+            recorded_identity,
+            BackupVerifySuccessionEligibility::CommittedResult,
+            issued_by_session_id,
+            crate::unix_ms(),
+        );
+    }
+
+    /// Records the fresh owner-proved answer, issues the owner-issued succession
+    /// grant that lets a LATER session reconcile it, and returns the body to send.
     ///
     /// Persist-before-answer: the durable row is committed before the body is
     /// returned, so a lost response reconciles to this same persisted result
@@ -3069,8 +3375,28 @@ impl KernelComposition {
     /// durable winner. A fresh verify is not a reconciliation, so the envelope
     /// correlation and the `operation_id` field are the same value and are both
     /// the caller's own key.
+    ///
+    /// #2883 instruction 4: the grant is issued here, once the operation is decided
+    /// and durable, and it is issued by the CAPTURE OWNER
+    /// ([`KernelBackupCapture::issue_verify_succession_grant`]) rather than
+    /// constructed by this route, because every content term of it is an owner answer
+    /// or an authenticated identity. That is the whole of the owner-authorized half
+    /// of instruction 4: a session that must reconcile this operation later redeems
+    /// a durable row it could not have produced, and a session that re-derives its
+    /// OWN `operation_id` never needs it and replays through the ordinary bound path
+    /// instead, so the grant costs that path nothing.
+    ///
+    /// A grant OUTAGE is deliberately not this answer's outage. The verification
+    /// result this body reports is already committed above, so failing the answer
+    /// would report an unrecorded verification that IS recorded, which is the false
+    /// proof claim `verification_not_recorded_reply` exists to prevent. The
+    /// consequence is narrower and still fail-closed: no grant authorizes a later
+    /// reconciliation, so a session that needs one is refused with the single static
+    /// sentence that names nothing, and the next replay of the same operation retries
+    /// the idempotent owner call. Nothing is ever reported as granted that is not.
     fn stage_backup_verification(
         &self,
+        session: &Session,
         identity: &BackupVerifyRequestIdentity,
         fresh: &VerifiedProjection,
         idempotency_key: &str,
@@ -3080,13 +3406,46 @@ impl KernelComposition {
             return verification_not_recorded_reply(idempotency_key);
         };
         let record = record_from_projection(identity, fresh, reply_digest);
+        // #2883 ELIGIBILITY is decided here, from the store's OWN disposition, and
+        // it is decided in the same match that picks the answer: `Stored` and
+        // `AlreadyBound` are the two arms in which this operation's result row is
+        // durably committed, which is I14.21's `committed -> reconcile ORS` and
+        // the only arm a succession may be issued for. `ForeignOperation` never
+        // reaches a grant at all, and a store FAILURE is I14.21's `unknown` arm
+        // and is handled apart below. Deciding it in this match rather than after
+        // it is what stops a future arm of the disposition enum from inheriting an
+        // eligibility nobody granted it.
         match self.p07_ors.stage_backup_verification_result(&record) {
-            Ok(BackupVerificationDisposition::Stored) => body,
+            // `Stored` is this call's first answer for the operation; the store's
+            // `AlreadyBound` is a load-then-stage race against a concurrent
+            // writer, where the row is durable and the first writer may have died
+            // between its own stage and its own grant. Both issue the grant, and
+            // that is what makes a lost grant write recoverable instead of a
+            // permanently un-reconcilable operation: the owner call is idempotent,
+            // because the grant's key is derived from its own binding, so a second
+            // issuance writes nothing and a grant that was already spent stays
+            // spent.
+            Ok(BackupVerificationDisposition::Stored) => {
+                self.issue_committed_succession_grant(
+                    session,
+                    identity,
+                    fresh.archive_sha256.as_str(),
+                );
+                body
+            }
             // `AlreadyBound` means the full canonical request hash already matched,
             // so the stored principal and session are necessarily the candidate's
             // own and re-checking them here could never fail. It is answered
-            // directly; the store's own cross-identity branch is below.
+            // directly; the store's own cross-identity branch is below. The bound
+            // row's OWN recorded identity and archive digest are what the grant is
+            // built from, not this caller's projection, so the grant names the
+            // operation durable state holds.
             Ok(BackupVerificationDisposition::AlreadyBound(bound)) => {
+                self.issue_committed_succession_grant(
+                    session,
+                    &bound.identity,
+                    bound.archive_sha256.as_str(),
+                );
                 answer_bound_verification(&bound, fresh, idempotency_key)
             }
             // Store-side refusal on a row that already occupies this key but whose
@@ -3101,15 +3460,98 @@ impl KernelComposition {
             // is in the request hash, and `foreign_to` is true because it is not.
             // See `BackupVerificationResultRecord::foreign_to` for exactly which
             // fields it compares. A different PRINCIPAL at the same key would be a
-            // SHA-256 collision and is not reachable through this route; that
+            // SHA-256 collision and is not reachable through the route; that
             // narrower case is a hand-edited row, and the same class answers it.
             // Either way the stored row is never read back, so the typed class is
             // the whole of what leaves the store.
+            //
+            // I5.27 settles this arm's eligibility in one sentence: "Reusing an
+            // idempotency key with a different canonical request hash returns
+            // `IDENTITY_CONFLICT` and performs no transition." No transition means
+            // nothing was decided here, so this operation is not succession-
+            // eligible and NO grant is issued for it — not a grant naming the
+            // foreign row either, which would hand this caller an authorization
+            // over an operation it is not the owner of.
             Ok(BackupVerificationDisposition::ForeignOperation) => {
-                foreign_operation_reply(idempotency_key)
+                return foreign_operation_reply(idempotency_key);
             }
-            Err(error) => answer_failed_stage(&fresh.request_digest, idempotency_key, &error),
+            // The write's durable outcome is not observable here, which is
+            // precisely I14.21's third arm. See
+            // [`Self::answer_unknown_verify_outcome`].
+            Err(error) => {
+                return self.answer_unknown_verify_outcome(
+                    session,
+                    identity,
+                    fresh,
+                    idempotency_key,
+                    &error,
+                );
+            }
         }
+    }
+
+    /// Answers one verification whose durable commit outcome is UNKNOWN, and
+    /// emits the typed refusal that names the owner I14.21 requires for that
+    /// disposition.
+    ///
+    /// This is the arm #2883's instruction 4 turned on. The store refused, so
+    /// this route cannot observe whether the verification result was committed;
+    /// I14.21 then says the next step is not a reconciliation at all but "pause
+    /// Ordering Scope, preserve operation and open Problem State; Human/Doctor
+    /// chooses evidence-backed reconciliation; no blind duplicate effect".
+    ///
+    /// So the capture owner is asked to record a succession grant for an
+    /// `unknown` outcome and refuses by name:
+    /// `eliot_ors::BackupVerifySuccessionEligibility::UnknownCommitOutcome`
+    /// yields `OrsError::BackupVerifySuccessionIneligible`, which names the I14.21
+    /// arm and the A2.2 Recovery Principal whose recorded evidence-backed decision
+    /// that arm requires. THIS ROUTE PUBLISHES NO SUCH OWNER for `backup.verify`:
+    /// there is no Human Control Plane decision reachable from this front door,
+    /// no Recovery Principal break-glass token on it, no Problem State transition
+    /// it may open, and no operator surface able to present one. That is the
+    /// answer to report, and it is why this arm cannot simply mint the grant it
+    /// would otherwise mint: a grant minted here would stand in for a choice no
+    /// one made, which is the "blind" outcome I14.21 forbids.
+    ///
+    /// The `is_ok` arm is the fail-closed direction and it is not defensive: if
+    /// the owner ever did issue for this disposition, the route would be holding a
+    /// durable authorization whose justifying decision does not exist, and it says
+    /// so by reporting no verification result at all rather than answering `ok`
+    /// beside an unexplainable row.
+    ///
+    /// The refusal's TEXT is deliberately not echoed on the wire: it names the
+    /// disposition and the missing owner, and every authorization refusal on this
+    /// route is one static sentence so a caller cannot probe with them. The typed
+    /// refusal is for the owner reading the failure, not for the caller, which is
+    /// also why [`answer_failed_stage`] still chooses the wire answer here.
+    fn answer_unknown_verify_outcome(
+        &self,
+        session: &Session,
+        identity: &BackupVerifyRequestIdentity,
+        fresh: &VerifiedProjection,
+        idempotency_key: &str,
+        error: &OrsError,
+    ) -> Value {
+        // Resolved BEFORE the owner is asked, and never defaulted: an
+        // unauthenticated peer was already fenced by `admit_backup_caller` on this
+        // same call, so `Err` is unreachable here rather than a case to substitute
+        // an identity for. Should it ever become reachable, the answer is the
+        // fail-closed one and the owner is never asked under a session it did not
+        // decide.
+        let Ok((_, issued_by_session_id)) = authenticated_backup_principal(session) else {
+            return verification_not_recorded_reply(idempotency_key);
+        };
+        let succession = self.backup_capture().issue_verify_succession_grant(
+            fresh.archive_sha256.as_str(),
+            identity,
+            BackupVerifySuccessionEligibility::UnknownCommitOutcome,
+            issued_by_session_id,
+            crate::unix_ms(),
+        );
+        if succession.is_ok() {
+            return verification_not_recorded_reply(idempotency_key);
+        }
+        answer_failed_stage(&fresh.request_digest, idempotency_key, error)
     }
 }
 

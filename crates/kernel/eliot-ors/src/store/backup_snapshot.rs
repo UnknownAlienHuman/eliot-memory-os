@@ -94,10 +94,10 @@
 //! not refused. The census names the store's tables by referencing `store.rs`'s
 //! own constants, so a renamed table cannot drift from its entry, and it compares
 //! that list with the tables redb reports for the file being read, under the same
-//! transaction as the pages. Counted at the time of writing: 74 distinct declared
-//! tables, 45 backing a dispositioned row family and 29 carrying an explicit
+//! transaction as the pages. Counted at the time of writing: 76 distinct declared
+//! tables, 47 backing a dispositioned row family and 29 carrying an explicit
 //! source-bound nonrestorable/forensic exclusion with the reason written next to
-//! it; 43 dispositioned families, each bound to at least one table, so none is
+//! it; 44 dispositioned families, each bound to at least one table, so none is
 //! excused from having one. A table with no disposition is refused with
 //! [`OrsError::MigrationRequired`] on all three paths that run —
 //! [`export_page`], [`export_snapshot`] and [`import_page_quarantined`] — so it
@@ -136,6 +136,22 @@
 //! family's disposition delegates to [`RowFamilyKind::disposition`], which routes
 //! it to `ForensicOnly` alongside the `UnknownCommitRecovery` sibling, so an
 //! exported row lands as forensics and never as an importable answer.
+//!
+//! Issue #2883 instruction 4 adds the succession-GRANT family to that same
+//! denominator, and it had to: `RowFamilyKind::BackupVerifySuccessionGrants`
+//! backs `ors_backup_verify_succession_grants_v1`, which
+//! `initialize_ors_tables` MATERIALISES on every open. An uncensused table is
+//! excused above only while "no write has materialised it yet", and that excuse
+//! never applied to this one — so leaving it out would have made check 2 answer
+//! [`OrsError::MigrationRequired`] for the WHOLE FILE on every `export_page`,
+//! `export_snapshot` and quarantined import of every store, which is a wider
+//! breakage than the grant's own delivery and is repaired here rather than
+//! deferred to the retention owner. Its disposition is `ForensicOnly` for its
+//! sibling's reason (no `import_*_suspended` path exists) and for one specific to
+//! an authorization: a restored UNCONSUMED grant would be a live token letting a
+//! restored installation redeem a reconciliation its own transport never earned,
+//! since single-use is durable and the issuing session belonged to an authority
+//! epoch that no longer exists here. No eviction, TTL, cap or deletion is added.
 //!
 //! Issue #1971 registers the versioned-artifact family in that same
 //! denominator. `RowFamilyKind::VersionedArtifacts` carries the
@@ -745,6 +761,17 @@ pub(super) fn row_family_denominator() -> Vec<RowFamilyDisposition> {
         // a restored installation can never read a prior installation's
         // verification answer back as its own.
         RowFamilyDisposition::of(RowFamilyKind::BackupVerificationResults),
+        // Owner-issued succession grants are an AUTHORIZATION, not an answer
+        // (#2883 instruction 4). `ForensicOnly` for the sibling's reason — no
+        // `import_*_suspended` path exists, so `Restorable` would advertise a
+        // re-import that does not exist — and for one that is stronger here: a
+        // restored UNCONSUMED grant is a live token that would let a restored
+        // installation redeem a reconciliation its own transport never earned,
+        // because single-use is durable and the issuing session belonged to an
+        // authority epoch that no longer exists here. No eviction, TTL, cap or
+        // deletion is added; bounded retirement stays with the ORS retention
+        // owner, exactly as for the results family.
+        RowFamilyDisposition::of(RowFamilyKind::BackupVerifySuccessionGrants),
     ]
 }
 
@@ -915,9 +942,9 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 75 distinct declared tables, of which 46 back a dispositioned
+/// time of writing: 76 distinct declared tables, of which 47 back a dispositioned
 /// row family and 29 are explicit source-bound exclusions.
-/// `row_family_denominator` carries 43 families and every one of them is now bound
+/// `row_family_denominator` carries 44 families and every one of them is now bound
 /// to a table by this census.
 ///
 /// That count is a MEASUREMENT, not an enforced invariant, and the difference
@@ -934,7 +961,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 28 source-bound exclusions.
+/// checking it: 47 table-backed tables and 29 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -969,7 +996,7 @@ fn excluded(
     }
 }
 
-/// The 45 tables that back a dispositioned row family.
+/// The 46 tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -977,7 +1004,7 @@ fn family_backed_tables() -> Vec<DispositionedTable> {
     tables
 }
 
-/// The 22 tables backing the canonical operational and recovery row families.
+/// The 24 tables backing the canonical operational and recovery row families.
 fn canonical_family_tables() -> Vec<DispositionedTable> {
     vec![
         family(super::ENVELOPES, RowFamilyKind::Envelopes),
@@ -1029,6 +1056,19 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
         family(
             super::BACKUP_VERIFICATION_RESULTS,
             RowFamilyKind::BackupVerificationResults,
+        ),
+        // #2883 instruction 4: the owner-issued succession grant is its own
+        // family beside the answer it authorizes, NOT a member of the results
+        // table. Both tables are declared and MATERIALISED on every open by
+        // `initialize_ors_tables`, so leaving this one out is not a paper gap: check
+        // 2 enumerates `read.list_tables()` and would answer
+        // `MigrationRequired` for the WHOLE FILE on every export, page and
+        // quarantined import. The module's own doc excused an uncensused table only
+        // "because no write has materialised it yet", and this table materialises
+        // on every open, so that excuse does not apply to it.
+        family(
+            super::BACKUP_VERIFY_SUCCESSION_GRANTS,
+            RowFamilyKind::BackupVerifySuccessionGrants,
         ),
         family(super::CUTOVER_OWNERSHIP, RowFamilyKind::CutoverOwnership),
         family(super::HOST_REQUESTS, RowFamilyKind::HostRequests),
@@ -1521,7 +1561,7 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 71-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 76-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 ///

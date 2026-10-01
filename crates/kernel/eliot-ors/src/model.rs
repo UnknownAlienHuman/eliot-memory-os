@@ -4615,6 +4615,33 @@ pub enum OrsError {
         record_type: &'static str,
         reason: String,
     },
+    /// The capture owner refused to issue a `backup.verify` succession grant
+    /// because the operation's I14.21 commit disposition is not one a
+    /// succession may be issued for.
+    ///
+    /// I14.21 splits a commit outcome three ways and gives each a different next
+    /// step: `committed → reconcile ORS`, `known rollback → retry under same
+    /// identity`, and `unknown → pause Ordering Scope, preserve operation and
+    /// open Problem State; Human/Doctor chooses evidence-backed reconciliation;
+    /// no blind duplicate effect`. Only the first is a succession. This refusal
+    /// is the third, and it carries the role I14.21 requires instead of a grant
+    /// standing in for a choice nobody made.
+    ///
+    /// Both fields are `&'static str` and therefore cannot carry a value a
+    /// caller chose: `disposition` is the I14.21 arm's own word and
+    /// `required_owner` is [`BACKUP_VERIFY_SUCCESSION_DECISION_OWNER`]. Naming
+    /// the missing owner in the TYPE rather than in prose is what keeps the
+    /// refusal from becoming an implicit promise that a later author will supply
+    /// one.
+    #[error(
+        "backup verify succession refused for commit outcome {disposition:?}: I14.21 requires a recorded evidence-backed reconciliation decision from {required_owner:?}, and this route publishes no such owner for backup.verify"
+    )]
+    BackupVerifySuccessionIneligible {
+        /// The I14.21 commit disposition, in that document's own word.
+        disposition: &'static str,
+        /// The A2.2 role whose recorded decision this disposition requires.
+        required_owner: &'static str,
+    },
     #[error(
         "host request {operation_id} with digest {request_digest} conflicts with durable ORS state: IDENTITY_CONFLICT"
     )]
@@ -10326,4 +10353,706 @@ pub enum ColdStartReadinessStageOutcome {
 
 fn cold_start_readiness_record_key(base_identity_digest: &str, revision: u64) -> String {
     format!("cold-start-readiness:{base_identity_digest}:{revision:020}")
+}
+
+/// Stable ORS record-type name of one durable `backup.verify` succession grant.
+///
+/// Published rather than spelled as a literal at the call site, for the same reason
+/// [`BACKUP_VERIFICATION_RESULT_RECORD_TYPE`] is: the store's codec envelope names
+/// this family by contract.
+pub const BACKUP_VERIFY_SUCCESSION_GRANT_RECORD_TYPE: &str = "backup_verify_succession_grant";
+
+/// Wire and storage contract version of one durable succession-grant row.
+///
+/// A bump is a new row contract, so a retained grant is never reinterpreted under
+/// new semantics. It is deliberately a SEPARATE version from
+/// [`BACKUP_VERIFY_PROFILE_VERSION`]: that constant versions the request identity
+/// a verification is asked under, while this one versions the owner-issued
+/// succession contract a LATER session redeems. A succession grant that could
+/// change meaning with a request-profile bump would let a profile change re-arm
+/// or invalidate a grant that was issued under the old one.
+pub const BACKUP_VERIFY_SUCCESSION_GRANT_CONTRACT_VERSION: u16 = 1;
+
+/// Digest domain separator of the `backup.verify` succession-grant family.
+///
+/// A constant, so no other family's digest over the same binding bytes can
+/// collide with this one, and a refusal names a family rather than a coincidence.
+pub const BACKUP_VERIFY_SUCCESSION_GRANT_DOMAIN_SEPARATOR: &str =
+    "eliot.backup.verify.succession-grant.v1";
+
+/// Durable key prefix of one succession-grant row.
+///
+/// The key is this prefix over the grant's own integrity digest, so it is
+/// derived by the OWNER from owner-decided content and is never caller text, a
+/// caller digest or a caller spelling. It is not a bare digest so a grant key can
+/// never be confused with, or collide with, a verification-result namespace
+/// digest in any shared scan.
+pub const BACKUP_VERIFY_SUCCESSION_GRANT_KEY_PREFIX: &str = "backup-verify-succession:";
+
+/// The eight immutable terms every `backup.verify` succession binding is derived
+/// from, and the ONE place their canonical preimage is built.
+///
+/// #2883 instruction 4 requires that a new session may reconcile a prior
+/// verification "only through an explicit owner-authorized succession/recovery
+/// contract, not by guessing the old key". A durable row a later session redeems
+/// therefore has to name, in exactly one derivation, all three of:
+///
+/// - WHICH prior operation: its durable namespace key AND its canonical request
+///   hash. Both are required because either alone is a guess — the namespace
+///   digest is on the wire as `operation_namespace` in the predecessor's own
+///   `ok` reply, so a caller already holds it;
+/// - WHICH archive: the capture owner's own digest of the decoded bytes, which is
+///   an owner decision about presented content and not a caller spelling;
+/// - WHO may succeed it: the authenticated principal, the `WorkScope` and the
+///   authority LINEAGE.
+///
+/// Those eight entries are simultaneously the whole integrity digest and the
+/// whole durable key, so the issuer and the redeemer derive the SAME key from
+/// values each of them already holds, and no caller can name a grant that does
+/// not exist.
+///
+/// Deliberately NOT in the preimage, each for a stated reason, and the split is
+/// the same one the activation family makes between
+/// `ActivationSuccessorBinding` (immutable identity) and
+/// `ActivationLifecycleRecord`'s mutable state:
+///
+/// - `issued_by_session_id` is retained owner evidence of WHICH session the owner
+///   issued under, and it is not in the identity: if it were, a redeemer would
+///   have to already know it in order to find the row that tells it, which is a
+///   bootstrap inversion;
+/// - `issued_at_unix_ms` is retained owner observation of when the succession
+///   window was opened, and is explicitly NOT a gate;
+/// - the consumption members are the mutable lifecycle, changed exactly once by
+///   the store inside the redeeming transaction and never by a caller.
+///
+/// There is deliberately NO session-order term here at all, and the reason is a
+/// measurement of this tree rather than a preference. #2883's earlier delivery
+/// carried an `issued_by_session_epoch` due-order gate requiring a redeeming
+/// session to present a strictly greater transport session fence; that gate could
+/// never be false in production, because every production `Session` constructor
+/// sets `session_epoch` to a literal `1`
+/// (`crates/kernel/eliot-ipc/src/lib.rs:1450`, `:1478`, `:1540`) and the only
+/// increment, `Session::fence()` (`:1567`), runs at teardown and also sets
+/// `SessionState::Fenced`, which live dispatch forbids
+/// (`Session::accepts`, `:1582`). Two successive LIVE sessions therefore both
+/// carried `1`, every redemption was refused, and the whole contract authorised
+/// nothing. It was removed rather than repaired, because there is no value on
+/// this tree that orders two live sessions AND because ordering them would forbid
+/// the reconciliation this grant exists to enable — see
+/// [`BackupVerifySuccessionGrant`]'s own doc for the full argument. The grant's
+/// order is the STORE's single-use linearisation, not a session order.
+struct BackupVerifySuccessionBindingTerms<'a> {
+    domain_separator: &'a str,
+    contract_version: u16,
+    predecessor_namespace_digest: &'a str,
+    predecessor_identity_digest: &'a str,
+    predecessor_archive_sha256: &'a str,
+    successor_principal: &'a str,
+    successor_scope_id: &'a str,
+    successor_authority_lineage_id: &'a str,
+}
+
+impl BackupVerifySuccessionBindingTerms<'_> {
+    /// Returns the canonical preimage bytes of exactly these eight entries.
+    ///
+    /// It is the one place the entry set is enumerated, so the grant's integrity
+    /// digest, the grant's durable key and the redemption's lookup key cannot
+    /// drift apart.
+    fn canonical_bytes(&self) -> Result<Vec<u8>, OrsError> {
+        let preimage = serde_json::json!({
+            "domain_separator": self.domain_separator,
+            "grant_contract_version": self.contract_version,
+            "predecessor_archive_sha256": self.predecessor_archive_sha256,
+            "predecessor_identity_digest": self.predecessor_identity_digest,
+            "predecessor_namespace_digest": self.predecessor_namespace_digest,
+            "successor_authority_lineage_id": self.successor_authority_lineage_id,
+            "successor_principal": self.successor_principal,
+            "successor_scope_id": self.successor_scope_id,
+        });
+        canonical_json_bytes(&preimage).map_err(|_| OrsError::InvalidField {
+            field: "backup_verify_succession_binding",
+            reason: "canonical succession binding bytes are not serializable",
+        })
+    }
+}
+
+/// Owner-issued, single-use durable succession grant for ONE `backup.verify`
+/// reconciliation (issue #2883 instruction 4, acceptance clause 3).
+///
+/// This is the explicit owner-authorized succession/recovery contract the verify
+/// route was missing. It is not a pointer and it is not a value a caller can
+/// present: the capture owner mints one row per decided verification operation,
+/// at the moment it decided that operation, out of content only it holds — its own
+/// archive digest of the decoded bytes and the accepted request identity it was
+/// called under. A later session redeems the row to reconcile that operation. The
+/// caller presents nothing to obtain it and can influence none of its content.
+///
+/// Three properties are what make it a grant rather than a fourth look-alike of
+/// the caller-presented predecessor pair:
+///
+/// - OWNER-ISSUED. Every content term is owner-decided or authenticated:
+///   `predecessor_*` comes from the accepted identity and the capture owner's own
+///   report, `successor_*` from the authenticated peer, the scope and the authority
+///   lineage. There is no field a caller supplies, and the durable key is derived
+///   by the owner, so naming a key a caller did not receive names nothing.
+/// - CONSUMED ONCE, DURABLY. [`Self::is_consumed`] is the only unconsumed test, it
+///   is set exactly once inside the redeeming transaction, and it is set on the
+///   grant's own durable row. Because the row's key is DERIVED from its binding
+///   content, re-issuing is structurally unable to re-arm it: an existing row at
+///   that key is the same binding, and the store returns
+///   [`BackupVerifySuccessionGrantDisposition::AlreadyBound`] without writing.
+/// - NOT RE-DERIVABLE BY A CALLER. Every term is either the owner's own digest of
+///   the decoded bytes or an authenticated identity the owner was itself called
+///   under, and the store derives the ONE key a redemption can address from the
+///   redemption's own terms. A caller holding the predecessor digest pair — which
+///   is on the wire in the predecessor's own `ok` reply — therefore names a key
+///   nothing is filed under, which is a refusal and not a lookup.
+///
+/// There is deliberately NO session-order gate, and the reason is a measurement of
+/// this tree. An earlier delivery required a redeeming session to present a
+/// strictly greater transport `session_epoch` than the issuing session's, on the
+/// stated claim that this "excludes the issuing session and every earlier one by
+/// construction". That claim was false and the gate was inert: every production
+/// `Session` constructor sets `session_epoch` to a literal `1`
+/// (`crates/kernel/eliot-ipc/src/lib.rs:1450`, `:1478`, `:1540`), and the only
+/// increment, `Session::fence()` (`:1567`), runs at connection TEARDOWN and also
+/// sets `SessionState::Fenced`, which live dispatch forbids
+/// (`Session::accepts`, `:1582`). Two successive live sessions both carried `1`, so
+/// the comparison was always true and EVERY redemption was refused: an
+/// owner-authorized contract that authorized nothing.
+///
+/// No replacement order was invented, because two measurements say there is
+/// nothing to order BY. First, no per-session value on this tree is monotone
+/// across live sessions: `PeerIdentity::Authenticated::session_identity` is the
+/// Windows LOGON session id (`lib.rs:175`, parsed as `u32` at `lib.rs:1212`), not
+/// a connection; `connection_id` and `launch_nonce` are caller-presented
+/// (`bins/eliotd/src/daemon_kernel_client.rs:1618`,
+/// `bins/eliotd/src/daemon_config.rs:264`); and `EpochId::sequence` is monotone in
+/// Authority Epoch ROTATIONS, so two sessions on one lineage share it. Second, and
+/// decisively: in the reconciliation case this grant exists for — I14.21 recovery
+/// of a LOST RESPONSE — the successor IS the same principal in the same logon
+/// session reconnecting. Any gate excluding "the issuing session" would refuse the
+/// exact case acceptance clause 3 requires. An order that excluded it would be an
+/// order that blocked the delivery it was added to authorize.
+///
+/// So what now prevents an immediate double-redemption is the store's own
+/// single-use linearisation, and it is a real one rather than a convention: the
+/// consumption flag is set inside the SAME write transaction that reads the
+/// unconsumed state, so two sessions redeeming one grant serialise on that
+/// transaction and the second reads the first's committed consumption and is
+/// refused. On top of that, no code path clears `consumed_at_unix_ms`, and
+/// re-issuing cannot re-arm the row because its key is a function of its own
+/// binding (see CONSUMED ONCE, DURABLY). What is deliberately NOT claimed: that a
+/// grant cannot be redeemed by the very session that issued it. That session is
+/// the same principal, in the same scope, on the same lineage, reconciling the
+/// operation it itself just decided — so redeeming it discloses nothing the
+/// issuer does not already hold, and denying it would be denying the I14.21
+/// recovery. The single-use flag, not a session order, is what bounds how many
+/// times any session can observe the reconciliation.
+///
+/// #2883 ELIGIBILITY AND THE RECORDED OWNER DECISION. Which operations may hold
+/// a grant at all is settled by [`BackupVerifySuccessionEligibility`], which is
+/// asked BEFORE the store opens a write transaction. And the grant IS the
+/// recorded owner decision, not a stand-in for one: it is written durably by
+/// the capture owner at the moment it decided the operation, from content only
+/// that owner holds, and a redemption can only consume it — never produce it.
+/// So the sequence I14.21 requires, a recorded decision BEFORE the
+/// reconciliation, holds by construction here for the `committed` disposition.
+/// What it does NOT do is cover I14.21's `unknown` disposition, which requires a
+/// Human/Doctor evidence-backed reconciliation choice this route does not have
+/// an owner for; that disposition is refused by name rather than granted, and
+/// see [`BackupVerifySuccessionEligibility::require_succession_eligibility`].
+///
+/// It deliberately does NOT weaken the namespace-plus-identity binding that was
+/// already there. The grant names BOTH halves and the store re-derives the named
+/// row's OWN key, canonical request hash and archive digest from the recorded row
+/// before it consumes anything, so a grant is an ADDITIONAL authorization on top
+/// of the existing pair, never a replacement for it.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupVerifySuccessionGrant {
+    /// ORS wire and storage contract version of this row.
+    pub contract_version: u16,
+    /// Digest domain separator, pinned to
+    /// [`BACKUP_VERIFY_SUCCESSION_GRANT_DOMAIN_SEPARATOR`].
+    pub domain_separator: String,
+    /// The durable key: [`BACKUP_VERIFY_SUCCESSION_GRANT_KEY_PREFIX`] over
+    /// [`Self::grant_digest`]. It is derived, never supplied.
+    pub grant_id: String,
+    /// Integrity digest over the eight recorded binding terms, computed by the
+    /// owner at issue time and re-validated against the RECORDED values on every
+    /// read.
+    pub grant_digest: String,
+    /// Durable namespace key of the prior verification operation this grant
+    /// authorizes a reconciliation of.
+    pub predecessor_namespace_digest: String,
+    /// Canonical request hash of that same prior operation. Required as well as
+    /// the namespace digest: the namespace digest is on the wire, so the hash is
+    /// the half a caller cannot already hold.
+    pub predecessor_identity_digest: String,
+    /// The capture owner's own digest of the archive this operation verified.
+    pub predecessor_archive_sha256: String,
+    /// Authenticated principal the grant authorizes to succeed the operation.
+    pub successor_principal: String,
+    /// `WorkScope` the grant is valid in.
+    pub successor_scope_id: String,
+    /// Authority LINEAGE the grant is valid on. The epoch sequence is deliberately
+    /// not part of it, for the same reason it is not in the durable verification
+    /// key: a rotation on one lineage must still permit an I14.21 reconciliation.
+    pub successor_authority_lineage_id: String,
+    /// Authenticated session the owner issued this grant under. Retained owner
+    /// evidence of who issued it, shape-validated on every read, and deliberately
+    /// NOT compared at redemption: the successor in the reconciliation this
+    /// contract exists for is the same principal in the same logon session
+    /// reconnecting, so such a compare could only refuse the case the grant was
+    /// issued to authorize. It is not in the durable key either — a redeemer must
+    /// be able to derive that key before it knows this value, and a term it has to
+    /// already hold in order to find the row would be a bootstrap inversion.
+    pub issued_by_session_id: String,
+    /// Owner observation of the instant the succession window was opened.
+    /// Retained evidence, explicitly NOT a gate: `Some(_)` on the consumption
+    /// member is the only test of "spent", so even a zero instant is not read as
+    /// "unconsumed".
+    pub issued_at_unix_ms: u64,
+    /// Instant this grant was consumed, or `None` while it is unspent. This is the
+    /// single-use record and it is durable: it lives on the grant's own row and is
+    /// written in the same transaction that authorizes the reconciliation.
+    #[serde(default)]
+    pub consumed_at_unix_ms: Option<u64>,
+    /// Authenticated session that consumed this grant. Present exactly when
+    /// [`Self::consumed_at_unix_ms`] is, so a half-written consumption is not a
+    /// readable row.
+    #[serde(default)]
+    pub consumed_by_session_id: Option<String>,
+}
+
+impl BackupVerifySuccessionGrant {
+    /// Returns the durable key this grant is filed under.
+    #[must_use]
+    pub fn record_key(&self) -> &str {
+        &self.grant_id
+    }
+
+    /// Returns this grant's own binding terms.
+    fn terms(&self) -> BackupVerifySuccessionBindingTerms<'_> {
+        BackupVerifySuccessionBindingTerms {
+            domain_separator: self.domain_separator.as_str(),
+            contract_version: self.contract_version,
+            predecessor_namespace_digest: self.predecessor_namespace_digest.as_str(),
+            predecessor_identity_digest: self.predecessor_identity_digest.as_str(),
+            predecessor_archive_sha256: self.predecessor_archive_sha256.as_str(),
+            successor_principal: self.successor_principal.as_str(),
+            successor_scope_id: self.successor_scope_id.as_str(),
+            successor_authority_lineage_id: self.successor_authority_lineage_id.as_str(),
+        }
+    }
+
+    /// Computes the integrity digest over the grant's own RECORDED binding terms.
+    ///
+    /// It is never used to stand in for a recorded value elsewhere: the only
+    /// comparison is the self-consistency check inside [`Self::validate`], which is
+    /// the same pattern [`BackupVerifyRequestIdentity::validate`] uses for
+    /// `identity_digest` and for the same reason — a stored row's own digest is
+    /// the only thing that proves its binding was not rewritten in place.
+    pub fn compute_digest(&self) -> Result<String, OrsError> {
+        Ok(sha256_hex(&self.terms().canonical_bytes()?))
+    }
+
+    /// Populates the derived integrity digest and durable key.
+    ///
+    /// The owner calls this once, at issue time, with every binding term already
+    /// decided from owner or authenticated sources. Nothing else may write a grant.
+    pub fn with_computed_digest(mut self) -> Result<Self, OrsError> {
+        let digest = self.compute_digest()?;
+        self.grant_id = format!("{BACKUP_VERIFY_SUCCESSION_GRANT_KEY_PREFIX}{digest}");
+        self.grant_digest = digest;
+        Ok(self)
+    }
+
+    /// Returns whether this grant has already been spent.
+    #[must_use]
+    pub fn is_consumed(&self) -> bool {
+        self.consumed_at_unix_ms.is_some()
+    }
+
+    /// Returns whether the RECORDED binding names exactly this redemption.
+    ///
+    /// Every term compared is a cross-boundary comparison between a value the
+    /// live authenticated session or the capture owner holds and a value recorded
+    /// on the grant, so each can fail. The constant members are not compared here
+    /// because [`Self::validate`] pins them.
+    #[must_use]
+    pub fn binds(&self, redemption: &BackupVerifySuccessionRedemption) -> bool {
+        self.predecessor_namespace_digest == redemption.predecessor_namespace_digest
+            && self.predecessor_identity_digest == redemption.predecessor_identity_digest
+            && self.predecessor_archive_sha256 == redemption.predecessor_archive_sha256
+            && self.successor_principal == redemption.successor_principal
+            && self.successor_scope_id == redemption.successor_scope_id
+            && self.successor_authority_lineage_id == redemption.successor_authority_lineage_id
+    }
+
+    /// Validates the pinned constants, every field shape, the derived key, the
+    /// integrity digest against the RECORDED binding, and the consumption pair.
+    ///
+    /// Field names are unique and prefixed `backup_verify_succession_` so a refusal
+    /// names exactly the field that failed. `consumed_at_unix_ms` is deliberately
+    /// NOT required to be non-zero: absence is the only unconsumed value, so a
+    /// zero instant must not read as a spent grant's twin.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != BACKUP_VERIFY_SUCCESSION_GRANT_CONTRACT_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        if self.domain_separator != BACKUP_VERIFY_SUCCESSION_GRANT_DOMAIN_SEPARATOR {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_succession_domain_separator",
+                reason: "must equal the succession-grant domain separator",
+            });
+        }
+        for (value, field) in [
+            (self.grant_id.as_str(), "backup_verify_succession_grant_id"),
+            (
+                self.successor_principal.as_str(),
+                "backup_verify_succession_successor_principal",
+            ),
+            (
+                self.successor_scope_id.as_str(),
+                "backup_verify_succession_successor_scope_id",
+            ),
+            (
+                self.successor_authority_lineage_id.as_str(),
+                "backup_verify_succession_successor_authority_lineage_id",
+            ),
+            (
+                self.issued_by_session_id.as_str(),
+                "backup_verify_succession_issued_by_session_id",
+            ),
+        ] {
+            validate_text(value, field)?;
+        }
+        for (value, field) in [
+            (
+                self.grant_digest.as_str(),
+                "backup_verify_succession_grant_digest",
+            ),
+            (
+                self.predecessor_namespace_digest.as_str(),
+                "backup_verify_succession_predecessor_namespace_digest",
+            ),
+            (
+                self.predecessor_identity_digest.as_str(),
+                "backup_verify_succession_predecessor_identity_digest",
+            ),
+            (
+                self.predecessor_archive_sha256.as_str(),
+                "backup_verify_succession_predecessor_archive_sha256",
+            ),
+        ] {
+            validate_digest(value, field)?;
+        }
+        let expected_id = format!(
+            "{BACKUP_VERIFY_SUCCESSION_GRANT_KEY_PREFIX}{}",
+            self.grant_digest
+        );
+        if self.grant_id != expected_id {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_succession_grant_id",
+                reason: "must be the succession key prefix over the recorded grant digest",
+            });
+        }
+        if self.grant_digest != self.compute_digest()? {
+            return Err(OrsError::InvalidField {
+                field: "backup_verify_succession_grant_digest",
+                reason: "does not match the recorded succession binding",
+            });
+        }
+        match (&self.consumed_at_unix_ms, &self.consumed_by_session_id) {
+            (Some(_), Some(session_id)) => validate_text(
+                session_id.as_str(),
+                "backup_verify_succession_consumed_by_session_id",
+            ),
+            (Some(_), None) => Err(OrsError::InvalidField {
+                field: "backup_verify_succession_consumed_by_session_id",
+                reason: "a consumed succession grant binds its consuming session",
+            }),
+            (None, Some(_)) => Err(OrsError::InvalidField {
+                field: "backup_verify_succession_consumed_at_unix_ms",
+                reason: "an unconsumed succession grant cannot name a consuming session",
+            }),
+            (None, None) => Ok(()),
+        }
+    }
+}
+
+/// One later session's attempt to redeem an owner-issued succession grant.
+///
+/// It is NOT persisted and it is not a request identity: it carries the values a
+/// live session and the capture owner already hold, from which the store derives
+/// the one durable key that could authorize this reconciliation. It is validated
+/// through the same `validate_text` and `validate_digest` shapes the grant itself
+/// uses, so a malformed redemption is a typed refusal rather than a lookup under a
+/// nonsense key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackupVerifySuccessionRedemption {
+    /// Durable namespace key the caller names, verbatim from its presented
+    /// predecessor pair.
+    pub predecessor_namespace_digest: String,
+    /// Canonical request hash the caller names, verbatim from its presented
+    /// predecessor pair.
+    pub predecessor_identity_digest: String,
+    /// The capture owner's own digest of the archive this call decoded.
+    pub predecessor_archive_sha256: String,
+    /// Authenticated principal of the redeeming session.
+    pub successor_principal: String,
+    /// `WorkScope` of the redeeming session.
+    pub successor_scope_id: String,
+    /// Authority LINEAGE of the redeeming session.
+    pub successor_authority_lineage_id: String,
+    /// Authenticated session redeeming the grant, recorded as the grant's
+    /// consumption evidence. It is deliberately never compared against
+    /// [`BackupVerifySuccessionGrant::issued_by_session_id`]: see that field's doc
+    /// for why the two are not required to differ.
+    pub redeeming_session_id: String,
+    /// Owner clock reading recorded as the consumption instant.
+    pub observed_at_unix_ms: u64,
+}
+
+impl BackupVerifySuccessionRedemption {
+    /// Returns this redemption's own binding terms.
+    fn terms(&self) -> BackupVerifySuccessionBindingTerms<'_> {
+        BackupVerifySuccessionBindingTerms {
+            domain_separator: BACKUP_VERIFY_SUCCESSION_GRANT_DOMAIN_SEPARATOR,
+            contract_version: BACKUP_VERIFY_SUCCESSION_GRANT_CONTRACT_VERSION,
+            predecessor_namespace_digest: self.predecessor_namespace_digest.as_str(),
+            predecessor_identity_digest: self.predecessor_identity_digest.as_str(),
+            predecessor_archive_sha256: self.predecessor_archive_sha256.as_str(),
+            successor_principal: self.successor_principal.as_str(),
+            successor_scope_id: self.successor_scope_id.as_str(),
+            successor_authority_lineage_id: self.successor_authority_lineage_id.as_str(),
+        }
+    }
+
+    /// Derives the one durable grant key this redemption could ever address.
+    ///
+    /// It is derived by the STORE from values the live session and the capture
+    /// owner already hold, never taken from the caller as a key: a caller that
+    /// guesses gets a key nothing is filed under, which is a refusal and not a
+    /// lookup.
+    pub fn grant_key(&self) -> Result<String, OrsError> {
+        Ok(format!(
+            "{BACKUP_VERIFY_SUCCESSION_GRANT_KEY_PREFIX}{}",
+            sha256_hex(&self.terms().canonical_bytes()?)
+        ))
+    }
+
+    /// Validates the same field shapes the grant itself validates.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        for (value, field) in [
+            (
+                self.predecessor_namespace_digest.as_str(),
+                "backup_verify_succession_redemption_predecessor_namespace_digest",
+            ),
+            (
+                self.predecessor_identity_digest.as_str(),
+                "backup_verify_succession_redemption_predecessor_identity_digest",
+            ),
+            (
+                self.predecessor_archive_sha256.as_str(),
+                "backup_verify_succession_redemption_predecessor_archive_sha256",
+            ),
+            (
+                self.successor_principal.as_str(),
+                "backup_verify_succession_redemption_successor_principal",
+            ),
+            (
+                self.successor_scope_id.as_str(),
+                "backup_verify_succession_redemption_successor_scope_id",
+            ),
+            (
+                self.successor_authority_lineage_id.as_str(),
+                "backup_verify_succession_redemption_successor_authority_lineage_id",
+            ),
+            (
+                self.redeeming_session_id.as_str(),
+                "backup_verify_succession_redemption_redeeming_session_id",
+            ),
+        ] {
+            validate_text(value, field)?;
+        }
+        for (value, field) in [
+            (
+                self.predecessor_namespace_digest.as_str(),
+                "backup_verify_succession_redemption_predecessor_namespace_digest",
+            ),
+            (
+                self.predecessor_identity_digest.as_str(),
+                "backup_verify_succession_redemption_predecessor_identity_digest",
+            ),
+            (
+                self.predecessor_archive_sha256.as_str(),
+                "backup_verify_succession_redemption_predecessor_archive_sha256",
+            ),
+        ] {
+            validate_digest(value, field)?;
+        }
+        Ok(())
+    }
+}
+
+/// Typed outcome of one attempt to record an owner-issued succession grant.
+///
+/// Both arms mean the same thing to a caller — one owner-issued grant is on
+/// record for this operation — and the distinction exists so a reader can see
+/// that re-issuing is a refusal to re-arm rather than a second write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackupVerifySuccessionGrantDisposition {
+    /// This candidate is now the durable grant row.
+    Issued,
+    /// An identical grant already occupies this key. Its consumption state was
+    /// left exactly as it was, so a spent grant is never re-armed.
+    AlreadyBound,
+}
+
+/// Typed outcome of one attempt to redeem an owner-issued succession grant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackupVerifySuccessionDisposition {
+    /// No owner-issued grant authorizes this reconciliation, and none was
+    /// consumed. Carries no stored value and no stored digest, so it cannot
+    /// become an oracle.
+    NotAuthorized,
+    /// The grant was unspent, due, bound to the presented predecessor and
+    /// principal, and its consumption is now durable.
+    Redeemed {
+        /// The consumed grant, exactly as it is now recorded.
+        grant: Box<BackupVerifySuccessionGrant>,
+    },
+}
+
+/// A2.2's own name for the role that "performs a narrow break-glass
+/// transition" (`docs/architecture/A02-02-roles.md`).
+///
+/// It is published as a constant rather than spelled at the call site because
+/// [`OrsError::BackupVerifySuccessionIneligible`] carries it as a `&'static str`
+/// and nothing on this path may name an operator identity of its own. I14.21
+/// writes the same role as "Human/Doctor"; the role that owns a break-glass
+/// reconciliation decision is the Recovery Principal, and the constant says so
+/// once instead of at every refusal.
+pub const BACKUP_VERIFY_SUCCESSION_DECISION_OWNER: &str = "A2.2 Recovery Principal";
+
+/// The I14.21 COMMIT DISPOSITION of one decided `backup.verify` operation, and
+/// therefore whether its capture owner may issue a succession grant for it.
+///
+/// #2883's instruction 4 leaves one decision open and this type is where it is
+/// settled: "which decided operations are succession-eligible at all". The
+/// answer is PER-DISPOSITION, not per-operation-kind and not unrestricted, and
+/// the sentence that settles it is I14.21's own three-way split of the commit
+/// outcome (`docs/architecture/I14-21-unknown-commit-recovery.md`):
+///
+/// ```text
+/// if committed -> reconcile ORS;
+/// if known rollback -> retry under same identity;
+/// if unknown -> pause Ordering Scope, preserve operation and open Problem State;
+/// Human/Doctor chooses evidence-backed reconciliation; no blind duplicate effect.
+/// ```
+///
+/// Each of those three arms authorizes a DIFFERENT next step, and only the first
+/// is a succession:
+///
+/// - `committed` names ORS reconciliation, and the owner that decides a
+///   `backup.verify` result is the capture owner that just decided it. Its
+///   decision is the recorded owner decision, and this grant is that decision
+///   made durable and spendable exactly once. Nothing further is required of
+///   anyone, and no new authority is invented to require it.
+/// - `known rollback` names a retry UNDER THE SAME IDENTITY. A same-identity
+///   retry re-derives its own namespace key and replays through the ordinary
+///   bound path, so a succession grant there would authorize a reconciliation of
+///   an operation that never committed, and would be a second and weaker name
+///   for a path that already exists.
+/// - `unknown` names a PAUSE, a preserved operation, an opened Problem State,
+///   and a "Human/Doctor" who "chooses evidence-backed reconciliation". That is
+///   not an owner-issued grant, and this route must not stand in for it: see
+///   [`Self::require_succession_eligibility`].
+///
+/// I5.27 settles the same boundary from the other side, in the sentence
+/// "Database idempotency and external-effect idempotency remain separate. An
+/// external effect has its own effect identity, provider capability statement
+/// and reconciliation state; a committed canonical intent never proves that the
+/// effect occurred exactly once" — so a grant is an authorization to OBSERVE an
+/// already-committed operation once, never evidence that it was performed once,
+/// and never an effect reconciliation of its own. `backup.verify` performs no
+/// external effect at all (issue #2883 acceptance clause 7), which is why the
+/// "no blind duplicate effect" half of I14.21 is satisfied by the single-use
+/// consumption rather than by any additional ceremony.
+///
+/// The enum has exactly the two arms this route can OBSERVE. `known rollback` is
+/// deliberately absent because redb's commit failure does not report whether the
+/// write landed, so a `backup.verify` write that did not succeed is `unknown`
+/// from here and never `rollback`; adding a third arm would be an arm no caller
+/// can construct.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackupVerifySuccessionEligibility {
+    /// I14.21 `if committed -> reconcile ORS`.
+    ///
+    /// The verification result this grant would name is durably committed, so
+    /// reconciling it IS ORS reconciliation, and the capture owner's own recorded
+    /// decision is the whole of the owner evidence I14.21 requires.
+    CommittedResult,
+    /// I14.21 `if unknown -> pause Ordering Scope, preserve operation and open
+    /// Problem State; Human/Doctor chooses evidence-backed reconciliation`.
+    ///
+    /// The durable outcome of the verification write is not observable here, so
+    /// I14.21's third arm governs and the next step is NOT a succession.
+    UnknownCommitOutcome,
+}
+
+impl BackupVerifySuccessionEligibility {
+    /// Returns the I14.21 commit disposition this value names, in that
+    /// document's own word, so a refusal quotes the arm it refused instead of
+    /// paraphrasing it.
+    #[must_use]
+    pub fn disposition(self) -> &'static str {
+        match self {
+            Self::CommittedResult => "committed",
+            Self::UnknownCommitOutcome => "unknown",
+        }
+    }
+
+    /// Returns `Ok(())` when the capture owner may issue a succession grant for
+    /// an operation in this disposition, and the typed refusal naming the owner
+    /// whose RECORDED decision I14.21 requires instead where it may not. This is
+    /// the ONE spelling of the eligibility question, deliberately: a
+    /// variant test written beside it could drift away and let a disposition be
+    /// admitted by one reader and refused by another.
+    ///
+    /// The match is exhaustive over both arms on purpose: adding a third
+    /// disposition to this enum makes the compiler refuse to build until that
+    /// disposition's owner decision has been decided here too. An eligibility
+    /// rule that a new arm silently escapes is not a rule.
+    ///
+    /// The refusal is [`OrsError::BackupVerifySuccessionIneligible`], and the
+    /// STORE asks this question BEFORE it opens any write transaction, so a
+    /// disposition that is not succession-eligible cannot leave a durable
+    /// authorization behind even if a caller ignores the answer afterwards.
+    pub fn require_succession_eligibility(self) -> Result<(), OrsError> {
+        match self {
+            // I14.21 `if committed -> reconcile ORS`. The capture owner that
+            // decided the operation records that decision by issuing this grant,
+            // so there is no further owner to ask and nothing to refuse.
+            Self::CommittedResult => Ok(()),
+            // I14.21 `if unknown -> ... Human/Doctor chooses evidence-backed
+            // reconciliation; no blind duplicate effect.` The role I14.21 names is
+            // `BACKUP_VERIFY_SUCCESSION_DECISION_OWNER`, and this route publishes
+            // no such owner for `backup.verify`: there is no Human Control Plane
+            // decision on this front door, no Recovery Principal break-glass
+            // token, no Problem State transition reachable from it, and no
+            // operator surface able to present one. Rather than let the
+            // automatically-minted grant stand in for a choice nobody made, the
+            // disposition is refused BY NAME, and the reported answer is that the
+            // owner an evidence-backed reconciliation decision needs does not
+            // exist here.
+            Self::UnknownCommitOutcome => Err(OrsError::BackupVerifySuccessionIneligible {
+                disposition: self.disposition(),
+                required_owner: BACKUP_VERIFY_SUCCESSION_DECISION_OWNER,
+            }),
+        }
+    }
 }

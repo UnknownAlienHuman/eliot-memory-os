@@ -73,7 +73,12 @@ use eliot_backup::{
     PublishedArchive, RestoreEvidenceLevel, WatchdogSpoolFence,
 };
 use eliot_contracts::{EpochRelation, StateFence, canonical_json_bytes, sha256_hex};
-use eliot_ors::RedbRecoveryStore;
+use eliot_ors::{
+    BACKUP_VERIFY_SUCCESSION_GRANT_CONTRACT_VERSION,
+    BACKUP_VERIFY_SUCCESSION_GRANT_DOMAIN_SEPARATOR, BackupVerifyRequestIdentity,
+    BackupVerifySuccessionEligibility, BackupVerifySuccessionGrant,
+    BackupVerifySuccessionGrantDisposition, RedbRecoveryStore,
+};
 use eliot_security_contracts::PurgeLedgerEntry;
 use eliot_store_api::WriteReceipt;
 
@@ -1018,6 +1023,113 @@ impl KernelBackupCapture {
         relation: &SnapshotRelation,
     ) -> Result<(), KernelCaptureError> {
         relation.validate_relation()
+    }
+
+    /// Mints and durably records the owner-issued, single-use succession grant
+    /// that lets a LATER session reconcile this decided verification operation
+    /// (issue #2883 instruction 4, acceptance clause 3).
+    ///
+    /// This is the explicit owner-authorized succession/recovery contract the
+    /// verify route needs, and the point at which the owner actually makes the
+    /// decision: one grant per decided operation, minted at the moment this owner
+    /// decided that operation, out of content only the owner holds. It is issued
+    /// by the CAPTURE OWNER here and not by the transport route, because every
+    /// content term of the grant is either the owner's own archive answer or an
+    /// authenticated identity this owner was itself called under, and the durable
+    /// row is written through the same `RedbRecoveryStore` this coordinator is
+    /// already bound to as its purge ledger owner — so the grant is durable in the
+    /// same installation and the same ORS file as the verification result it
+    /// authorizes.
+    ///
+    /// Nothing a transport caller can present reaches any term of it. The archive
+    /// digest is this owner's own `BackupBundle::bundle_sha256` of the DECODED
+    /// archive; the predecessor namespace and request digests are the accepted
+    /// request identity's own; the successor principal, scope and authority LINEAGE
+    /// are that same identity's authenticated and admitted terms; the issuing
+    /// session is the session this owner was called under, recorded as evidence and
+    /// deliberately not compared at redemption, because the successor in the I14.21
+    /// case this grant exists for is this same principal in this same logon session
+    /// reconnecting after a lost response. The durable key is DERIVED from the
+    /// binding by
+    /// [`BackupVerifySuccessionGrant`], so a caller holding the predecessor digest
+    /// pair — which is on the wire in the predecessor's own `ok` reply — still
+    /// holds nothing that addresses this row.
+    ///
+    /// The two durable dispositions both mean the same thing to a caller and are
+    /// returned rather than collapsed: one owner-issued grant is on record. The
+    /// distinction matters because re-issuing is a refusal to RE-ARM — the key is
+    /// content-derived, so a second issuance of the same succession writes nothing
+    /// and a grant that was already consumed stays consumed. That is why this is
+    /// safe to call on every ELIGIBLE decided answer, including an exact replay:
+    /// the call is idempotent, and on a replay it is also the recovery of a grant
+    /// write that failed while the first answer was produced.
+    ///
+    /// A refusal is the owner's own typed
+    /// [`KernelCaptureError::OwnerEvidenceInvalid`], never a silent absence, so a
+    /// caller can tell "no grant was recorded" from "the owner refused to record
+    /// one".
+    ///
+    /// #2883 ELIGIBILITY. `eligibility` is the I14.21 commit disposition of the
+    /// verification write, and it is the owner's answer to the question #2883 left
+    /// open — which decided operations are succession-eligible at all. The answer
+    /// is per-disposition: only I14.21's `committed -> reconcile ORS` arm is, and
+    /// the owner passes its `unknown` arm through to the store, which refuses it
+    /// by name because the Human/Doctor evidence-backed reconciliation decision
+    /// that arm requires has no owner on this route. The owner does not widen
+    /// eligibility to avoid a refusal: an authorization it cannot justify is not
+    /// one it issues.
+    pub fn issue_verify_succession_grant(
+        &self,
+        owner_archive_sha256: &str,
+        identity: &BackupVerifyRequestIdentity,
+        eligibility: BackupVerifySuccessionEligibility,
+        issued_by_session_id: &str,
+        issued_at_unix_ms: u64,
+    ) -> Result<BackupVerifySuccessionGrantDisposition, KernelCaptureError> {
+        eligibility
+            .require_succession_eligibility()
+            .map_err(|error| {
+                KernelCaptureError::OwnerEvidenceInvalid(error.to_string())
+            })?;
+        let predecessor_namespace_digest = identity.namespace_digest().map_err(|error| {
+            KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "succession grant cannot name the predecessor operation: {error}"
+            ))
+        })?;
+        let grant = BackupVerifySuccessionGrant {
+            contract_version: BACKUP_VERIFY_SUCCESSION_GRANT_CONTRACT_VERSION,
+            domain_separator: BACKUP_VERIFY_SUCCESSION_GRANT_DOMAIN_SEPARATOR.to_owned(),
+            grant_id: String::new(),
+            grant_digest: String::new(),
+            predecessor_namespace_digest,
+            predecessor_identity_digest: identity.identity_digest.clone(),
+            predecessor_archive_sha256: owner_archive_sha256.to_owned(),
+            successor_principal: identity.principal.clone(),
+            successor_scope_id: identity.scope_id.clone(),
+            successor_authority_lineage_id: identity.authority_epoch.lineage_id.as_str().to_owned(),
+            issued_by_session_id: issued_by_session_id.to_owned(),
+            issued_at_unix_ms,
+            consumed_at_unix_ms: None,
+            consumed_by_session_id: None,
+        }
+        .with_computed_digest()
+        .map_err(|error| {
+            KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "succession grant is not derivable: {error}"
+            ))
+        })?;
+        grant.validate().map_err(|error| {
+            KernelCaptureError::OwnerEvidenceInvalid(format!(
+                "succession grant is not well formed: {error}"
+            ))
+        })?;
+        self.purge_ledger_owner
+            .issue_backup_verify_succession_grant(&grant, eligibility)
+            .map_err(|error| {
+                KernelCaptureError::OwnerEvidenceInvalid(format!(
+                    "succession grant is not recorded: {error}"
+                ))
+            })
     }
 }
 

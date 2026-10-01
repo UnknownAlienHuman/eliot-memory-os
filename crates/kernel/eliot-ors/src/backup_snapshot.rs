@@ -442,6 +442,37 @@ pub enum RowFamilyKind {
     /// installation can read a prior installation's verification answer back as
     /// its own.
     BackupVerificationResults,
+    /// Durable owner-issued `backup.verify` succession grants (issue #2883
+    /// instruction 4): one row per reconciliation the capture owner has
+    /// authorized for a decided verification operation, keyed by a digest the
+    /// OWNER derives from that operation's identity, its own archive digest and
+    /// the authenticated principal, scope and authority lineage allowed to succeed
+    /// it. The sibling [`RowFamilyKind::BackupVerificationResults`] holds the
+    /// ANSWER; this family holds the owner's authorization to observe it, and it is
+    /// a separate table rather than a member of that one because it must never
+    /// become mutable state of a row whose `reply_digest` and `same_binding`
+    /// contract the verification answer already depends on.
+    ///
+    /// The family is DECLARED in the EXISTING ORS operational retention/export
+    /// contract whose [`RowFamilyKind::disposition`] this enum already is. As with
+    /// its sibling, #2883 adds no deletion, no eviction, no TTL and no cap; bounded
+    /// retirement stays with the separate ORS retention owner, and a second
+    /// retention rule beside that contract is exactly the unbounded growth
+    /// instruction 10 forbids. Real cardinality is one row per decided operation:
+    /// the key is derived from the binding content, so re-issuing addresses the same
+    /// row and is refused rather than re-arming it.
+    ///
+    /// `ForensicOnly`, for the sibling's reason and one more that is specific to
+    /// this family. The sibling's reason holds: there is no `import_*_suspended`
+    /// path, so `Restorable` would advertise a durable re-import that does not
+    /// exist. The reason specific to a grant is stronger still — a restored
+    /// UNCONSUMED grant is a live authorization token: it would let a restored
+    /// installation redeem a reconciliation its own transport fence never earned,
+    /// because the grant's single-use flag is durable and its issuing session
+    /// belongs to an authority epoch that no longer exists here. Exporting a grant
+    /// as forensics preserves the evidence that the reconciliation was authorized;
+    /// importing one as authority would re-arm a spent decision.
+    BackupVerifySuccessionGrants,
 }
 /// Backup disposition of one row family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -469,6 +500,15 @@ impl RowFamilyKind {
             Self::StoreRebindReplay
             | Self::StoreFailureRetention
             | Self::BackupVerificationResults
+            // `BackupVerifySuccessionGrants` is listed EXPLICITLY for its
+            // sibling's reason plus one of its own. No `import_*_suspended` path
+            // exists, so `Restorable` would advertise a re-import that does not
+            // exist; and this family's row is an AUTHORIZATION rather than an
+            // answer, so a restored unconsumed grant would be a live token letting
+            // a restored installation redeem a reconciliation its own transport
+            // never earned. Forensics preserve that the reconciliation was
+            // authorized; authority would re-arm a spent decision.
+            | Self::BackupVerifySuccessionGrants
             // `ProcessEvidence` (issue #269, A1) is listed EXPLICITLY for the
             // same reason `BackupVerificationResults` is. The family has no
             // `import_*_suspended` path at all, so `Restorable` would advertise
