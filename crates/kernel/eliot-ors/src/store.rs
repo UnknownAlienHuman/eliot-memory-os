@@ -99,17 +99,17 @@ use crate::{
     RecoveryProblemRecoveryCursor, RecoveryProblemRecoveryPage, RecoveryWriteBinding,
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
     RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView,
-    SessionBindingReceipt, SessionDetach, StageReceipt, StagedOperation, StateFenceSnapshot,
-    StreamRecoveryActivation, StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
+    SessionBindingReceipt, SessionDetach, StageReceipt, StagedEnvelopeRecoveryCursor,
+    StagedEnvelopeRecoveryEntry, StagedEnvelopeRecoveryPage, StagedOperation,
+    StagedWriteRecoveryReport, StateFenceSnapshot, StreamRecoveryActivation,
+    StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
     SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
     SupervisionLeaseStageReceipt, SupervisionLeaseStageResolution,
     SupervisionLeaseStageResolutionDisposition, SupervisionLeaseTicketReconciliation,
-    StagedEnvelopeRecoveryCursor, StagedEnvelopeRecoveryEntry, StagedEnvelopeRecoveryPage,
-    StagedWriteRecoveryReport, UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence,
-    UserBrokerHeartbeat, UserBrokerRegistration, UserBrokerRegistrationReceipt,
-    UserBrokerRegistrationSnapshot, UserBrokerResourceSelection,
-    UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry,
+    UnknownCommitOutcome, UnknownCommitRecord, UserBrokerFence, UserBrokerHeartbeat,
+    UserBrokerRegistration, UserBrokerRegistrationReceipt, UserBrokerRegistrationSnapshot,
+    UserBrokerResourceSelection, UserBrokerResourceSelectionSnapshot, VersionedArtifactEntry,
     VersionedArtifactRegistry, WorkerReplayAck, WorkerReplayAckRecord, WorkerReplayBegin,
     WorkerReplayCursors, WorkerReplayDraft, WorkerReplayEvent, WorkerReplayRequestDecision,
     WorkerReplayRequestRecord, WorkerReplayStreamRecord, WriteIdempotencyRecoveryCursor,
@@ -34576,10 +34576,13 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             });
         }
         let next_cursor = if continues {
-            Some(cursor.continue_after(last_key.ok_or(OrsError::IntegrityProblem {
-                record_type: "recovery_envelope",
-                reason: "continuing staged envelope page has no exclusive continuation".to_owned(),
-            })?))
+            Some(
+                cursor.continue_after(last_key.ok_or(OrsError::IntegrityProblem {
+                    record_type: "recovery_envelope",
+                    reason:
+                        "continuing staged envelope page has no exclusive continuation".to_owned(),
+                })?),
+            )
         } else {
             None
         };

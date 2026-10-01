@@ -2001,14 +2001,13 @@ impl KernelComposition {
             // receipt observation stays with the Store-receipt owner. A
             // non-exhaustive scan or a retained problem is reported as
             // incomplete here rather than folded into a clean composition.
-            let staged_write_recovery_detail =
-                if staged_write_recovery.truncated
-                    || staged_write_recovery_has_problem(&staged_write_recovery)
-                {
-                    "kernel.composition.staged_write_recovery_incomplete"
-                } else {
-                    "kernel.composition.staged_write_recovery_recovered"
-                };
+            let staged_write_recovery_detail = if staged_write_recovery.truncated
+                || staged_write_recovery_has_problem(&staged_write_recovery)
+            {
+                "kernel.composition.staged_write_recovery_incomplete"
+            } else {
+                "kernel.composition.staged_write_recovery_recovered"
+            };
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
                 staged_write_recovery_detail,
