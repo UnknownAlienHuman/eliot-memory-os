@@ -1859,6 +1859,17 @@ pub struct AcpWireResultIds {
 /// receiving-owner identities) is still BLOCKED-BY that driver slice.
 /// Forbidden: a synthetic or test-only message to manufacture a caller.
 ///
+/// Receiving-owner lookup (issue #2641 AUD3): `receiving_owner` carries the
+/// existing durable journal handle plus the owner-issued key/receipt for this
+/// `recovery_ref` (all sourced from the owning driver slice, never minted or
+/// constructed here). The journal check runs read-only; on acceptance the
+/// owner disposition travels verbatim (`Applied` stays success as
+/// candidate-only `CandidateSucceeded`, `Rejected` stays terminal
+/// `FailedVerification`, `Unknown` never upgrades). Absence, a
+/// `receiving_operation` mismatch, or a lookup failure keeps the existing
+/// typed result unchanged (fail-closed, never fabricated). Typed
+/// [`AcpAdapterError`] failures propagate unchanged.
+///
 /// # Errors
 ///
 /// Returns [`AcpAdapterError`] when the bound identities are blank, the
@@ -1870,11 +1881,16 @@ pub fn drain_wire_result(
     route: RouteFingerprint,
     binding: &ProviderExecutionBinding,
     admission: &AdmittedRouteReceipt,
+    receiving_owner: Option<(
+        &DurableHostEventJournal,
+        &EventKey,
+        &durable_host_event_ingest::ReceivingOwnerAcceptance,
+    )>,
 ) -> Result<AgentResult, AcpAdapterError> {
     if ids.operation_id.trim().is_empty() {
         return Err(AcpAdapterError::InvalidInput("operation_id"));
     }
-    match message {
+    let base: Result<AgentResult, AcpAdapterError> = match message {
         AcpJsonRpcMessage::Request(_) => Err(AcpAdapterError::InvalidInput(
             "acp request is never a result",
         )),
@@ -1923,7 +1939,33 @@ pub fn drain_wire_result(
                 ))
             }
         }
+    };
+    let mut result = base?;
+    if let Some((journal, key, receipt)) = receiving_owner {
+        let recovery_matches = result
+            .actual_route
+            .recovery_ref
+            .as_deref()
+            .is_some_and(|recovery| recovery == receipt.receiving_operation.as_str());
+        if recovery_matches
+            && let Ok(disposition) = journal.check_receiving_owner_acceptance(key, receipt)
+        {
+            match disposition {
+                durable_host_event_ingest::ReceivingOwnerDisposition::Applied => {
+                    if result.disposition != ResultDisposition::CancelledObserved {
+                        result.disposition = ResultDisposition::CandidateSucceeded;
+                    }
+                }
+                durable_host_event_ingest::ReceivingOwnerDisposition::Rejected => {
+                    if result.disposition != ResultDisposition::CancelledObserved {
+                        result.disposition = ResultDisposition::FailedVerification;
+                    }
+                }
+                durable_host_event_ingest::ReceivingOwnerDisposition::Unknown => {}
+            }
+        }
     }
+    Ok(result)
 }
 
 /// Short result alias.
@@ -2210,7 +2252,7 @@ impl<T: AcpTransport> AcpWire<T> {
         }
         match self.receive().await? {
             AcpOutcome::Completed(message) => {
-                let result = drain_wire_result(&message, ids, route, binding, admission)?;
+                let result = drain_wire_result(&message, ids, route, binding, admission, None)?;
                 Ok(AcpOutcome::Completed(result))
             }
             AcpOutcome::Unknown(unknown) => Ok(AcpOutcome::Unknown(AcpUnknownOutcome {
