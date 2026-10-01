@@ -3469,7 +3469,7 @@ impl GrantActivationPort {
         let introduction_ids = introduction_ids.into_iter().collect::<Vec<_>>();
         let introduction_fences =
             closure_introduction_fences(boundary, &introduction_ids, &request.operation_id)?;
-        derived.fenced_introductions = introduction_ids.clone();
+        derived.fenced_introductions.clone_from(&introduction_ids);
         derived.fenced_introduction_records = introduction_fences
             .iter()
             .map(|fence| fence.record().clone())
