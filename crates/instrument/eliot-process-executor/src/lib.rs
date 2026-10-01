@@ -6467,15 +6467,18 @@ mod tests {
         operation_id: OperationId,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match block_on(executor.inspect(operation_id.clone())) {
-            Ok(view) => assert_eq!(
-                view.lifecycle(),
-                ProcessLifecycle::UnknownOutcome,
-                "inspection must not promote quarantined operation {operation_id}"
-            ),
+            Ok(view) => {
+                assert_eq!(view.operation_id(), &operation_id);
+                assert_eq!(
+                    view.lifecycle(),
+                    ProcessLifecycle::UnknownOutcome,
+                    "inspection must not promote quarantined operation {operation_id:?}"
+                );
+            }
             Err(ProcessExecutionError::UnknownOutcome) => {}
             Err(other) => {
                 return Err(format!(
-                    "quarantined operation {operation_id} must remain inspectable as unknown, got {other:?}"
+                    "quarantined operation {operation_id:?} must remain inspectable as unknown, got {other:?}"
                 )
                 .into());
             }
@@ -6487,7 +6490,7 @@ mod tests {
             .find(|record| record.operation_id() == &operation_id)
         else {
             return Err(
-                format!("quarantine projection lost original operation {operation_id}").into(),
+                format!("quarantine projection lost original operation {operation_id:?}").into(),
             );
         };
         assert_eq!(record.lifecycle(), ProcessLifecycle::UnknownOutcome);
