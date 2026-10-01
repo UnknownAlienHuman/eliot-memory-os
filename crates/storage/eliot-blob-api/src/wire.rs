@@ -613,6 +613,7 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             .validate()
             .map_err(|_| WireValidationError::InvalidField("observed_state_fence"))?;
         if let BlobProcessStreamOwnerFactsPullOutcome::Available {
+            work_scope_ref,
             owner_facts_ref,
             owner_facts_sha256,
             work_scope_snapshot_sha256,
@@ -838,7 +839,7 @@ impl BlobProcessStreamKernelResponse {
                         request.validate()?;
                         validate_digest("original_terminal_operation_sha256", original_sha256)?;
                         if !matches!(
-                            request,
+                            request.as_ref(),
                             BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
                                 | BlobProcessStreamKernelOperationRequest::SinkAbort { .. }
                         ) || sha256_hex(
