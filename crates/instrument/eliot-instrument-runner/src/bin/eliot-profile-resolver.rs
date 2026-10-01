@@ -36,6 +36,16 @@
 //!   tool whose bytes cannot be read, or whose observed bytes differ from the
 //!   admitted receipt, fails closed instead of yielding a receipt with a
 //!   defaulted identity;
+//! - an admitted spec names a toolchain MEMBER — every builtin declares the bare
+//!   name `cargo` — and that name is resolved through the selected toolchain
+//!   root by the one [`resolve_tool`] owner, never through a bare `PATH` lookup.
+//!   A `PATH` lookup returns the rustup PROXY (`~/.cargo/bin/cargo`, canonically
+//!   `rustup.exe`) on a normal install, which is a different FILE from the one
+//!   the profile declares, so the identity pinned here, the identity sealed into
+//!   the process intent, and the file actually launched would disagree. There is
+//!   no `PATH` fallback and no "resolve to whatever exists": a workspace with no
+//!   resolvable toolchain is refused rather than receipted against some ambient
+//!   binary;
 //! - every stage really starts as a real child through the sole
 //!   [`WindowsProcessExecutor`] under a Kernel-issued dispatch permit, so the
 //!   per-stage evidence the receipt carries came from a process this entry
@@ -460,7 +470,7 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
     // registry generation and digest `launch_plan_live` checks before it
     // admits anything.
     let specs = builtin_specs()?;
-    let receipts = observed_supply_chain(&specs)?;
+    let receipts = observed_supply_chain(&specs, &layout.source_root)?;
     let registry = InstrumentRegistry::with_verification_route_profiles(
         VERIFICATION_REGISTRY_GENERATION,
         receipts.clone(),
@@ -659,18 +669,22 @@ fn stage_refusals(aggregate: &ProfileAggregate) -> String {
 /// the admitted spec digest, for the admitted generation. That receipt is what
 /// `require_provenance` compares the launch-recorded identity against, so a
 /// swapped tool fails closed instead of being receipted under a declared
-/// identity. An executable this process cannot read, or one that is not on
-/// `PATH` at all, is refused here rather than admitted with no digest.
+/// identity. An executable this process cannot read, or one the selected
+/// toolchain does not contain, is refused here rather than admitted with no
+/// digest.
 ///
 /// One receipt is pinned per admitted spec, keyed by the spec's own kind
 /// identity — which is the key `SupplyChainTable` admits and `compile_exact`
 /// looks a stage's receipt up by — so the receipt set can never collide on two
 /// specs that happen to name the same executable.
-fn observed_supply_chain(specs: &[InstrumentSpec]) -> Result<Vec<SupplyChainReceipt>, CliError> {
+fn observed_supply_chain(
+    specs: &[InstrumentSpec],
+    source_root: &str,
+) -> Result<Vec<SupplyChainReceipt>, CliError> {
     specs
         .iter()
         .map(|spec| {
-            let executable = resolve_tool(&spec.executable)?;
+            let executable = resolve_tool(&spec.executable, source_root)?;
             Ok(SupplyChainReceipt::new(
                 ContractId::new(spec.kind.as_str())?,
                 spec.executable.clone(),
@@ -702,43 +716,241 @@ fn admitted_root(path: &Path) -> Result<String, CliError> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
-/// Resolves one admitted executable name to its real path on this machine.
+/// Resolves one admitted executable name to the real toolchain file it names.
 ///
-/// An admitted spec names a tool, not a path (`cargo`, `rustc`), so the bytes
-/// are located through `PATH` and then canonicalized: the identity that gets
-/// pinned and the identity that gets executed are the same resolved file. On
-/// Windows a tool name without its extension resolves through the same
-/// `PATHEXT` suffixes the shell uses, because the admitted name carries no
-/// extension and the file on disk does.
-fn resolve_tool(name: &str) -> Result<PathBuf, CliError> {
+/// An admitted spec names a TOOLCHAIN MEMBER, not a `PATH` entry: every
+/// builtin spec declares the bare name `cargo`, and the file that actually
+/// compiles the workspace is the `cargo` inside the selected rustup toolchain
+/// (issue #1914). A bare `PATH` lookup returns the FIRST `cargo` on `PATH`,
+/// which under a normal rustup install is `~/.cargo/bin/cargo` — a rustup
+/// PROXY, canonically `rustup.exe` itself. Pinning and launching that file
+/// made this process declare one identity (the proxy's bytes) while the
+/// profile declared another (the toolchain's `cargo`), and the executor
+/// correctly refused it as "not the admitted executable". The refusal was
+/// right; the resolution that produced the proxy was wrong.
+///
+/// So the admitted name is resolved through the SELECTED TOOLCHAIN ROOT, not
+/// through `PATH`. `eliot-testd` already owns this exact resolution
+/// (`resolve_selected_toolchain` in `bins/eliot-testd`), and this is the same
+/// rule rather than a second one: the workspace `rust-toolchain.toml` override
+/// wins, else the rustup default, else refusal. There is deliberately NO
+/// `PATH` fallback here — a fallback that resolved to whatever existed would
+/// reintroduce exactly the shim this defect is about, and "no toolchain" must
+/// read as a refusal rather than as a pass over some ambient binary.
+///
+/// Both identities therefore come from ONE owner function: the path this
+/// returns is the file that is hashed into the supply-chain receipt, the path
+/// `ExecutableObservation::observe_at_path` re-hashes into the sealed intent,
+/// and the path the child is launched as. The spec's declared name and the
+/// resolved file name are checked against each other by
+/// `AdmittedStage::check_executable`, so the two cannot silently disagree.
+fn resolve_tool(name: &str, source_root: &str) -> Result<PathBuf, CliError> {
     let candidate = Path::new(name);
     if candidate.is_absolute() || candidate.components().count() > 1 {
         return Err(CliError::Contract(format!(
-            "admitted executable '{name}' must be a bare tool name resolved through PATH"
+            "admitted executable '{name}' must be a bare tool name resolved through the selected toolchain"
         )));
     }
-    let path = std::env::var_os("PATH").ok_or_else(|| {
-        CliError::Contract(format!(
-            "admitted executable '{name}' cannot be located: PATH is unset"
-        ))
-    })?;
-    let suffixes = executable_suffixes();
-    for directory in std::env::split_paths(&path) {
-        for suffix in &suffixes {
-            let candidate = directory.join(format!("{name}{suffix}"));
-            if candidate.is_file() {
-                return std::fs::canonicalize(&candidate).map_err(|error| {
-                    CliError::Contract(format!(
-                        "admitted executable {} is unavailable: {error}",
-                        candidate.display()
-                    ))
-                });
-            }
+    let root = selected_toolchain_root(source_root)?;
+    for suffix in executable_suffixes() {
+        let candidate = root.join(format!("{name}{suffix}"));
+        if candidate.is_file() {
+            return std::fs::canonicalize(&candidate).map_err(|error| {
+                CliError::Contract(format!(
+                    "admitted executable {} is unavailable: {error}",
+                    candidate.display()
+                ))
+            });
         }
     }
     Err(CliError::Contract(format!(
-        "admitted executable '{name}' is not on PATH; an unpinned tool cannot be receipted"
+        "admitted executable '{name}' is not a member of the selected toolchain {}; an unpinned tool cannot be receipted",
+        root.display()
     )))
+}
+
+/// The `bin` directory of the ONE toolchain this workspace is verified with.
+///
+/// Selection reads the owner-published rustup metadata rather than probing for
+/// a directory that happens to contain a `cargo`: the workspace
+/// `rust-toolchain.toml` override names the channel the repo pins, and absent
+/// an override the rustup default is the toolchain the owner selected. Both
+/// are required to name exactly one INSTALLED toolchain — an ambiguous or
+/// absent selection fails closed rather than picking one.
+fn selected_toolchain_root(source_root: &str) -> Result<PathBuf, CliError> {
+    let rustup_home = rustup_home()?;
+    let source_root = current_source_root(source_root)?;
+    let settings = read_bounded_metadata(
+        &Path::new(&rustup_home).join("settings.toml"),
+        "rustup settings",
+    )?;
+    let host = toml_string_value(&settings, "default_host_triple");
+    let requested = read_toolchain_override(Path::new(&source_root))
+        .or_else(|| toml_string_value(&settings, "default_toolchain"))
+        .ok_or_else(|| {
+            CliError::Contract(format!(
+                "no toolchain is selected: {source_root} pins none and {rustup_home} names no default"
+            ))
+        })?;
+    let toolchains = Path::new(&rustup_home).join("toolchains");
+    let mut candidates = std::fs::read_dir(&toolchains)
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "toolchain root {} is unavailable: {error}",
+                toolchains.display()
+            ))
+        })?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(std::fs::FileType::is_dir)
+                .map(|_| entry.file_name().to_string_lossy().into_owned())
+        })
+        .filter(|name| name == &requested || name.starts_with(&format!("{requested}-")))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    if let Some(host) = host.as_deref() {
+        let host_candidates = candidates
+            .iter()
+            .filter(|name| name.ends_with(host))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !host_candidates.is_empty() {
+            candidates = host_candidates;
+        }
+    }
+    let [selected] = candidates.as_slice() else {
+        return Err(CliError::Contract(format!(
+            "toolchain '{requested}' is not installed under {}; an unpinned toolchain cannot be receipted",
+            toolchains.display()
+        )));
+    };
+    Ok(toolchains.join(selected).join("bin"))
+}
+
+/// The owner-published rustup home, resolved without inventing a default.
+///
+/// `RUSTUP_HOME` wins when published; otherwise the per-user `.rustup`
+/// directory. A home that is absent, relative, or not an existing directory is
+/// a refusal: guessing a second location here would be the same
+/// "resolve to whatever exists" fallback this function exists to remove.
+fn rustup_home() -> Result<String, CliError> {
+    let candidate = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|home| PathBuf::from(home).join(".rustup"))
+        })
+        .ok_or_else(|| {
+            CliError::Contract("toolchain root is unknown: RUSTUP_HOME is unset".to_owned())
+        })?;
+    if !candidate.is_absolute() || !candidate.is_dir() {
+        return Err(CliError::Contract(format!(
+            "toolchain root {} is not an existing absolute directory",
+            candidate.display()
+        )));
+    }
+    Ok(std::fs::canonicalize(&candidate)
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "toolchain root {} cannot be canonicalized: {error}",
+                candidate.display()
+            ))
+        })?
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// The workspace this run verifies, as an absolute path.
+///
+/// The toolchain override is read from the same admitted root the stages run
+/// in rather than from the process working directory, so which toolchain is
+/// selected is a property of the admitted layout and not of wherever the
+/// caller happened to invoke this binary.
+fn current_source_root(source_root: &str) -> Result<String, CliError> {
+    let root = PathBuf::from(source_root);
+    if !root.is_absolute() || !root.is_dir() {
+        return Err(CliError::Contract(format!(
+            "admitted source root {} is not an existing absolute directory",
+            root.display()
+        )));
+    }
+    Ok(std::fs::canonicalize(&root)
+        .map_err(|error| {
+            CliError::Contract(format!(
+                "admitted source root {} cannot be canonicalized: {error}",
+                root.display()
+            ))
+        })?
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// The channel the admitted workspace root pins, when it pins one.
+///
+/// A workspace with no override is not an error: the rustup default is then the
+/// owner's selected toolchain. The same two override file names and the same
+/// `channel` key `eliot-testd` honours are used, so both surfaces select the
+/// same toolchain for the same workspace.
+fn read_toolchain_override(source_root: &Path) -> Option<String> {
+    for name in ["rust-toolchain.toml", "rust-toolchain"] {
+        let path = source_root.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let text = read_bounded_metadata(&path, "rust-toolchain override").ok()?;
+        let value = if name.eq_ignore_ascii_case(".toml") {
+            toml_string_value(&text, "channel").or_else(|| toml_string_value(&text, "toolchain"))
+        } else {
+            text.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(ToOwned::to_owned)
+        };
+        return value
+            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control));
+    }
+    None
+}
+
+/// Reads one small owner metadata file under a fixed size bound.
+///
+/// The bound keeps an unreadable or substituted metadata file from being read
+/// into memory as part of identity selection; a file that is not UTF-8 or is
+/// implausibly large is refused rather than parsed leniently.
+fn read_bounded_metadata(path: &Path, what: &str) -> Result<String, CliError> {
+    const MAX_METADATA_BYTES: usize = 64 * 1024;
+    let bytes = std::fs::read(path).map_err(|error| {
+        CliError::Contract(format!("{what} {} is unreadable: {error}", path.display()))
+    })?;
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err(CliError::Contract(format!(
+            "{what} {} exceeds the bounded read size",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| CliError::Contract(format!("{what} {} is not UTF-8", path.display())))
+}
+
+/// One top-level `key = "value"` string from a small TOML metadata file.
+///
+/// This reads only the flat scalar keys the rustup metadata actually publishes
+/// (`default_toolchain`, `default_host_triple`, `channel`). It is a lookup,
+/// not a parser, so an unrecognised file shape yields "absent" and the caller
+/// fails closed on that absence rather than proceeding on a guess.
+fn toml_string_value(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        if name.trim() != key {
+            return None;
+        }
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 /// The filename suffixes one bare tool name may resolve to on this host.
@@ -1517,7 +1729,7 @@ fn seal_stage_request(
     executable_name: &str,
     argv: &[String],
 ) -> Result<ProcessRequest, CliError> {
-    let executable = resolve_tool(executable_name)?;
+    let executable = resolve_tool(executable_name, &layout.source_root)?;
     let projection = isolated_projection()?;
     let observed = ExecutableObservation::observe_at_path(
         &executable,
