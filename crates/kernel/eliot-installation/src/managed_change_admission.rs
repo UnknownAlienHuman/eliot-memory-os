@@ -204,23 +204,64 @@ pub struct ManagedCapabilityState {
 /// This is what a consumer shows instead of the frozen plan. It always carries
 /// the [`RequalificationBinding`] it was derived from, so "what is true now" is
 /// answerable without trusting the plan it narrows.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ManagedCapabilityAdvertisement {
     /// Catalogue family this advertisement is about.
-    pub family_id: PlatformHandle,
+    family_id: PlatformHandle,
     /// Discovery category carried by the validated **live** catalogue entry.
-    pub category: super::IntegrationCategory,
+    category: super::IntegrationCategory,
     /// The exact identity being advertised, when the change acts on one.
     ///
     /// `None` for an `Install` plan, which by definition names no current
     /// installation: a prospective change advertises nothing about a candidate
     /// that does not exist yet.
-    pub target_identity: Option<PlatformHandle>,
+    target_identity: Option<PlatformHandle>,
     /// What is true about this candidate right now.
-    pub state: ManagedCapabilityState,
+    state: ManagedCapabilityState,
     /// The exact live values this advertisement was derived from.
-    pub requalified_against: RequalificationBinding,
+    requalified_against: RequalificationBinding,
+    /// In-memory proof that this carrier was created by live requalification.
+    /// It is never serialized or deserialized, so retained wire data cannot
+    /// recreate an authority-bearing advertisement.
+    #[serde(skip)]
+    #[schemars(skip)]
+    live_requalification_seal: LiveRequalificationSeal,
+}
+
+/// Private, non-wire brand installed only after the live survey requalifies.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq)]
+struct LiveRequalificationSeal;
+
+impl ManagedCapabilityAdvertisement {
+    /// Returns the requalified catalogue family.
+    #[must_use]
+    pub const fn family_id(&self) -> &PlatformHandle {
+        &self.family_id
+    }
+
+    /// Returns the live catalogue category.
+    #[must_use]
+    pub const fn category(&self) -> super::IntegrationCategory {
+        self.category
+    }
+
+    /// Returns the observed target identity, when one exists.
+    #[must_use]
+    pub const fn target_identity(&self) -> Option<&PlatformHandle> {
+        self.target_identity.as_ref()
+    }
+
+    /// Returns the live requalified capability state.
+    #[must_use]
+    pub const fn state(&self) -> &ManagedCapabilityState {
+        &self.state
+    }
+
+    /// Returns the exact binding consumed by live requalification.
+    #[must_use]
+    pub const fn requalified_against(&self) -> &RequalificationBinding {
+        &self.requalified_against
+    }
 }
 
 /// Requalifies one frozen plan against live state and derives the capability
@@ -322,6 +363,7 @@ fn derive_advertisement(
             target_identity: None,
             state,
             requalified_against,
+            live_requalification_seal: LiveRequalificationSeal,
         });
     };
 
@@ -337,6 +379,7 @@ fn derive_advertisement(
         target_identity: Some(target_identity),
         state,
         requalified_against,
+        live_requalification_seal: LiveRequalificationSeal,
     })
 }
 
@@ -530,6 +573,7 @@ fn live_binding(
 pub fn validate_advertisement(
     advertisement: &ManagedCapabilityAdvertisement,
 ) -> Result<(), InstallationError> {
+    let _live_requalification_seal = advertisement.live_requalification_seal;
     handle(&advertisement.family_id, "advertisement.family_id")?;
     if let Some(target_identity) = &advertisement.target_identity {
         handle(target_identity, "advertisement.target_identity")?;
