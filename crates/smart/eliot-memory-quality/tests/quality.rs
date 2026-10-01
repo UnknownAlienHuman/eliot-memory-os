@@ -469,6 +469,13 @@ fn truncated_coverage_is_inconclusive_with_frontier() {
     batch_value.coverage.truncated = true;
     batch_value.coverage.frontier = vec!["resume-1".to_owned()];
     batch_value.coverage.revalidation_required = true;
+    // The deferred resume frontier is accounted volume in its own right, so a
+    // known denominator counts it alongside the projected record: 1 projected
+    // (`mem-1`) + 0 omitted + 1 deferred (`resume-1`) = 2. The `total: 2` is
+    // stated here as an independent expected count over the two handles named
+    // above, never derived from `records.len()`, so this fixture does not
+    // restate the batch helper and prove nothing.
+    batch_value.coverage.denominator = DenominatorState::Known { total: 2 };
     let applicable = set_for(&batch_value, &[], &[], None);
     let candidate = QualityRequest {
         batch: batch_value,
@@ -514,6 +521,22 @@ fn batch_omissions_are_carried_with_identities() {
 fn undeclared_volume_is_inconclusive_not_silent() {
     let batch_value = batch(vec![record("mem-1")]);
     let mut lossy = batch_value;
+    // A known total of 3 over one projected record leaves two units of volume
+    // that no record, omission or frontier names. That remainder must never be
+    // carried silently, and under the exact disjoint three-way accounting it
+    // cannot be carried at all: the batch is refused before the quality crate
+    // is reached, because an unexplained positive remainder is not evidence of
+    // completeness. The fixture therefore names the two units as deferred
+    // resume volume (`resume-1`, `resume-2`), which is the sanctioned way to
+    // declare them.
+    //
+    // The property under test is unchanged and still proven end to end: the
+    // unprojected volume surfaces as `unaccounted_volume == 2` (total 3 minus
+    // 1 assessed minus 0 omitted) and the assessment is Inconclusive, never
+    // Complete. Only the now-illegal way of expressing the remainder changed.
+    lossy.coverage.truncated = true;
+    lossy.coverage.frontier = vec!["resume-1".to_owned(), "resume-2".to_owned()];
+    lossy.coverage.revalidation_required = true;
     lossy.coverage.denominator = DenominatorState::Known { total: 3 };
     let applicable = set_for(&lossy, &[], &[], None);
     let candidate = QualityRequest {
