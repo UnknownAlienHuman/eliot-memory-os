@@ -127,6 +127,39 @@ const NOTIFICATION_STATE_RESPONSE_KIND: &str = "notification_state";
 #[cfg(windows)]
 const NOTIFICATION_STATE_PAGE_RESPONSE_KIND: &str = "notification_state_page";
 
+/// Recovery owner recorded on every canonical write reservation this
+/// composition stages (issue #1925, I5.7 `recovery owner`).
+///
+/// The owner is the identity the startup reconciliation pass reports each
+/// unresolved reservation under, and the only owner that may dispose of it. It
+/// names this composition's own canonical write route — the same
+/// `kernel-composition` owner the rest of this crate's ORS lifecycle records
+/// (`bins/eliot-kernel/src/lib.rs:5264`, `shutdown_drain.rs:1884`) — so a
+/// reservation staged by the live write route and a reservation found by the
+/// startup recovery owner name one owner, never two.
+#[cfg(windows)]
+const RESERVED_WRITE_RECOVERY_OWNER: &str = "kernel-composition";
+
+/// Cleanup horizon recorded on every canonical write reservation this
+/// composition stages (issue #1925, I5.2).
+///
+/// `I5.2` bounds this value's MEANING, not its length: "`expires_at` is a
+/// cleanup horizon only after a terminal reconciliation/disposition;
+/// unresolved operations, unknown external effects and active checkpoints
+/// cannot expire automatically." ORS is the structural owner of that rule and
+/// refuses a nonterminal expiry outright (`OrsError::UnsafeExpiry` in
+/// `RedbRecoveryStore::expire`), so the recorded number can never drop an
+/// unresolved reservation whatever it is.
+///
+/// No named document supplies a duration for it, and inventing one would be a
+/// new timeout with no owner behind it, so this composition records the
+/// encoding of "no automatic horizon": the largest representable ordered time.
+/// The created/known pair beside it is a real observation, and a composition
+/// that later has an owner-measured post-terminal retention deadline passes
+/// that value to `gateway_seed` instead of this constant.
+#[cfg(windows)]
+const RESERVED_WRITE_CLEANUP_HORIZON_MS: i64 = i64::MAX;
+
 /// Response `kind` of the ORS process-stream recovery view (issue #269, I14.26).
 ///
 /// Availability and the exact gap set, and nothing else: no stream bytes and no
@@ -9231,114 +9264,139 @@ impl KernelComposition {
             ));
         }
         let gateway = self.retained_store_gateway()?;
-        // Reserved-write route boundary (issue #1925, I5.2/I5.5/I5.6; owner
-        // audit comment 5856193606).
+        // Reserved-write producer (issue #1925, I5.2/I5.5/I5.6/I5.7; owner audit
+        // comment 5856193606).
         //
-        // The audit named three defects and all three are STILL OPEN. This
-        // comment records that state; it is not a claim that any of them closed.
+        // The canonical write below is the I5.6 step-13 operation. It now runs
+        // the reserved path end to end on this live route: the observed
+        // canonical ordering heads become [`gateway_seed`]'s head evidence, the
+        // seed becomes the ORS `RecoveryPayloadEnvelope` staged beside the
+        // admission reservation, and `apply_reserved` performs
+        // `reserve -> eligible -> [admission lease] -> project -> send once ->
+        // reconcile -> finalize` over the exact admitted operation identity.
+        // `gateway_seed` and `apply_reserved` are each called here directly, and
+        // `ReservationSeed { .. }` is still constructed nowhere else.
         //
-        // - `KernelStoreGateway::apply_reserved` has no production caller.
-        // - `store_write_reservation::gateway_seed` has no caller at all. It is
-        //   a real function that seals the admitted transition's canonical
-        //   bytes, so the `RecoveryPayload::Encrypted` claim it makes would be
-        //   true, but nothing calls it. `ReservationSeed { .. }` is constructed
-        //   in exactly one production place, inside `gateway_seed` itself, so no
-        //   envelope is produced on any route. "Reachable through
-        //   `KernelComposition::platform`" is reachability, not a caller.
-        // - therefore the live canonical write below reaches no recovery
-        //   seed/reservation envelope.
+        // There is deliberately NO fallback to ordinary `apply`. `I5.2`: "if ORS
+        // cannot durably stage the complete opaque operation, `accepted_pending`
+        // is forbidden", and this route never reports `ACCEPTED_PENDING` on
+        // either arm — it returns the canonical `WriteReceipt` or a refusal. So
+        // when the durable reservation cannot be made, the request is refused
+        // through the route's existing typed pre-call staging refusal
+        // (`store_staging_refusal_response`, the same response the campaign
+        // source reservation above already uses on this route), carrying the
+        // exact owner refusal text and the exact admitted operation identity,
+        // with no stage receipt, no poll handle, and no unreserved retry. A
+        // silently downgraded write is exactly the defect the audit names.
         //
-        // The reservation cannot be staged on this route even with a caller
-        // written today, for four independent code facts, each verified by a
-        // searched negative rather than an owner decision:
+        // The operation identity is never rebuilt at any step. The seed derives
+        // its reservation id from `transition.identity.operation_id`, the
+        // envelope keys on that same id, the write binding ORS indexes carries
+        // the admitted `idempotency_key` and `write_intent_id`, and the
+        // startup recovery owner above (`store_recovery_operation` ->
+        // `KernelStoreGateway::reconcile_staged_writes`) enumerates that same
+        // envelope, revalidates it by its OWN recorded digest through
+        // `verify_staged_envelope`, and reconciles it by operation identity
+        // into either the canonical receipt or a durable Recovery Problem.
+        // The exact-replay read-back above already answers a committed receipt
+        // for the same operation id, idempotency key, canonical request hash
+        // and fence, so a replay of a reserved write lands on the same record.
         //
-        // 1. Store-side execution generation. `KernelStoreGateway::apply_reserved`
-        //    ends in the Store's `ReservedWrite` wire operation. On the store
-        //    side `SurrealStoreAdapter::apply_reserved_write`
-        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:780`)
-        //    takes the `execution_handle()` `None` arm at `:785` and returns
-        //    `StoreError::UnknownOperation` before any provider I/O. The two
-        //    methods that can install a generation,
-        //    `SurrealStoreAdapter::install_concurrent_execution`
-        //    (`crates/storage/eliot-store-surreal-adapter/src/lib.rs:269`) and
-        //    `install_serial_execution` (`:296`), have no non-test caller
-        //    anywhere in the workspace; the only production construction path,
-        //    `StoreComposition::new` (`bins/eliot-store-surreal/src/lib.rs`),
-        //    builds the adapter there and never installs one. Routing live
-        //    writes through `apply_reserved` today would therefore refuse
-        //    every production canonical write.
-        // 2. Store-side capability advertisement. `CAPABILITY_RESERVED_WRITE`
-        //    (`crates/storage/eliot-store-api/src/wire.rs:49`) is mapped to the
-        //    `ReservedWrite` operation at `wire.rs:353`, but is absent from the
-        //    advertised `CAPABILITIES` array at `wire.rs:85`, so the handshake
-        //    never admits the capability this wire would select. The Kernel
-        //    consumes that same static array on its own side: the session
-        //    hello it sends declares
-        //    `allowed_capabilities: CAPABILITIES`
-        //    (`crates/kernel/eliot-kernel-service/src/store_client.rs:1290`),
-        //    so a `ReservedWrite` request this Kernel submits would sit outside
-        //    the admitted set for the session even against a fully installed
-        //    Store generation. The honest dynamic advertisement already exists
-        //    on the adapter
-        //    (`SurrealStoreAdapter::reserved_write_capability`,
-        //    `crates/storage/eliot-store-surreal-adapter/src/lib.rs:324`) and
-        //    correctly returns `None` until a concurrent generation owns the
-        //    adapter, but it has no non-test caller, so the Kernel can never
-        //    learn a reserved-write Store is present.
-        // 3. No production source for the observed ordering-head digest.
-        //    `ReservationSeed::heads` requires
-        //    `ObservedHead::expected_head_digest`
-        //    (`crates/kernel/eliot-kernel-service/src/store_write_reservation.rs:351`),
-        //    documented there as the digest of the exact observed canonical head
-        //    bytes, and it is forwarded verbatim to ORS as
-        //    `ExpectedOrderingHead::head_sha256` at `:804`. The only store-side
-        //    ordering-head read, `eliot_store_api::OrderingHead`
-        //    (`crates/storage/eliot-store-api/src/lib.rs:4082`), carries
-        //    `scope`/`sequence`/`state_fence` and no head hash, so no
-        //    production caller can supply that value honestly.
-        // 4. ORS canonical-evidence binding. `reserve_for_transition` reaches
-        //    `RedbRecoveryStore::stage_and_reserve`, whose
-        //    `self.evidence.verify_ordering_heads(&request.scopes)?`
-        //    (`crates/kernel/eliot-ors/src/store.rs:28006`) fails closed while the
-        //    bound provider is `RejectUnboundEvidence` (`store.rs:2777`, whose
-        //    `verify_ordering_heads` at `store.rs:2780` returns
-        //    `OrsError::CanonicalEvidence` at `store.rs:2784`). This composition
-        //    opens its production ORS with `RedbRecoveryStore::open`
-        //    (`bins/eliot-kernel/src/composition_bootstrap.rs:197`, `:247`,
-        //    `:355`), whose production default binds that rejecting provider at
-        //    `store.rs:21803`; the only `open_with_evidence` (`store.rs:21813`)
-        //    call site is the `new_with_adapters` path at
-        //    `composition_bootstrap.rs:997`/`:1007`, which production composition
-        //    never takes. So even a correct seed would be refused by ORS before it
-        //    could reserve. No production `CanonicalEvidenceProvider`
-        //    implementation exists: the only ones are `eliot_ors` test support
-        //    and test files.
+        // Prerequisites this delivery does NOT close, each a searched negative in
+        // an owner outside this issue's `## Scope and owner` ("Kernel / ORS
+        // `redb` owner"). They are recorded so the refusals above are read as
+        // what they are and no reader mistakes this for a working end-to-end
+        // write; none of them is worked around here, and there is no
+        // configuration switch, second route or `attach_*` probe that
+        // manufactures a call:
         //
-        // Facts 1-2 and 4 live in the storage/store-bridge and ORS owners, which
-        // is what this issue's `## Scope and owner` ("Kernel / ORS `redb` owner")
-        // excludes. Fact 3 is the write-side half of the Kernel's own gap and is
-        // not closed by this delivery either. Nothing here works around any of the
-        // four, and there is no configuration switch, second route or
-        // `attach_*` probe that manufactures one call.
+        // 1. Store-side execution generation.
+        //    `SurrealStoreAdapter::apply_reserved_write`
+        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:931`)
+        //    returns `StoreError::UnknownOperation` when
+        //    `execution_handle()` is `None`, and neither
+        //    `install_concurrent_execution` nor `install_serial_execution`
+        //    (`crates/storage/eliot-store-surreal-adapter/src/lib.rs:285`,
+        //    `:312`) has a non-test caller in the workspace.
+        // 2. Store-side capability advertisement.
+        //    `CAPABILITY_RESERVED_WRITE` is deliberately absent from the
+        //    advertised `CAPABILITIES` array
+        //    (`crates/storage/eliot-store-api/src/wire.rs:85`), and
+        //    `validate_request_frame_with_log`
+        //    (`bins/eliot-store-surreal/src/lib.rs:1876`) refuses any request
+        //    whose capability the session does not admit. The honest dynamic
+        //    advertisement (`SurrealStoreAdapter::reserved_write_capability`,
+        //    `crates/storage/eliot-store-surreal-adapter/src/lib.rs:340`) also
+        //    has no non-test caller.
+        // 3. ORS canonical-evidence binding. `stage_and_reserve` calls
+        //    `self.evidence.verify_ordering_heads`
+        //    (`crates/kernel/eliot-ors/src/store.rs:34159`) and this
+        //    composition opens production ORS with `RedbRecoveryStore::open`,
+        //    which binds `RejectUnboundEvidence` and therefore fails closed.
+        //    No production `CanonicalEvidenceProvider` implementation exists.
         //
-        // `store.apply` is also a wait-for-commit request: `StoreApplyOperation`
-        // carries no `response_mode` and the route returns the canonical
-        // `WriteReceipt`, so it never observes or claims `ACCEPTED_PENDING`
-        // (I5.5). I5.2 forbids `accepted_pending` outright when ORS cannot
-        // durably stage the complete opaque operation, and a live write that
-        // could not stage must not report it. This is not a silent fallback for
-        // `accept_after_stage`: there is no `accept_after_stage` request on this
-        // wire to fall back from. The startup recovery owner
-        // (`store_recovery_operation` -> `KernelStoreGateway::reconcile_staged_writes`)
-        // enumerates, revalidates by the envelope's recorded hash, and reconciles
-        // by operation identity into either the canonical receipt or a durable
-        // Recovery Problem whenever ORS does hold one.
+        // A fifth blocker WAS in this branch's scope and is closed here: no
+        // production code constructed a `RecoveryWriteBinding`, and both
+        // `ReservationRequest::validate` and `persist_new_reservation`
+        // (`crates/kernel/eliot-ors/src/reservation_model.rs:57`,
+        //    `crates/kernel/eliot-ors/src/store.rs:28980`) fail closed without
+        // one, so the staged envelope could never have been a recoverable
+        // canonical write. `reserve_for_transition` now binds the admitted
+        // write identity to every envelope it stages.
+        let reservation_operation_id = operation.transition.identity.operation_id.clone();
+        let observed_heads = match gateway
+            .observe_reserved_write_heads(&operation.transition)
+            .await
+        {
+            Ok(heads) => heads,
+            Err(error) => {
+                return Ok(Self::store_staging_refusal_response(
+                    "write_receipt",
+                    reservation_operation_id.as_str(),
+                    &error,
+                ));
+            }
+        };
+        // Owner times come from the request's own admitted clock observation
+        // plus the crate-wide Kernel clock, never from a second fresh read at
+        // this call site.
+        let observed_at_ms = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
+        let created_at_ms = operation
+            .context
+            .clock
+            .valid_time_ms
+            .unwrap_or(observed_at_ms);
+        let known_at_ms = operation
+            .context
+            .clock
+            .known_time_ms
+            .unwrap_or(created_at_ms)
+            .max(created_at_ms);
+        let reservation_seed = match eliot_kernel_service::gateway_seed(
+            self.platform(),
+            &operation.transition,
+            RESERVED_WRITE_RECOVERY_OWNER,
+            created_at_ms,
+            known_at_ms,
+            RESERVED_WRITE_CLEANUP_HORIZON_MS,
+            &observed_heads,
+        ) {
+            Ok(seed) => seed,
+            Err(error) => {
+                return Ok(Self::store_staging_refusal_response(
+                    "write_receipt",
+                    reservation_operation_id.as_str(),
+                    &error.to_string(),
+                ));
+            }
+        };
         match gateway
-            .apply(
+            .apply_reserved(
                 &operation.context,
                 operation.transition,
                 operation.expected_revision_heads,
                 operation.expected_ordering_heads,
+                reservation_seed,
             )
             .await
         {
@@ -9376,11 +9434,22 @@ impl KernelComposition {
                     journal_issue,
                 ))
             }
-            Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
+            // The reserved path's every refusal arm — no ORS, a refused
+            // canonical-evidence binding, a stale writer epoch, a determinate
+            // Store refusal after a proven-no-effect release, an unknown
+            // outcome, or a commit whose reservation cannot execute — is
+            // reported as the refused durable staging attempt it is, with the
+            // exact owner text and the exact admitted operation identity. There
+            // is no unreserved `apply` arm to fall back to on any of them.
+            Err(error) => Ok(Self::store_staging_refusal_response(
+                "write_receipt",
+                reservation_operation_id.as_str(),
+                &error,
+            )),
         }
     }
 
-    /// Resolves an already-committed `Apply` receipt for this exact operation
+    /// Resolves an already-committed canonical receipt for this exact operation
     /// identity.
     ///
     /// A committed receipt is an exact, read-only replay result, so it is

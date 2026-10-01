@@ -116,7 +116,7 @@ use crate::commit_recovery::{
 };
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
-    CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
+    CompositionReservation, ObservedHead, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
     finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
@@ -1430,6 +1430,102 @@ impl KernelStoreGateway {
             &self.paused_scopes,
             self.commit_ors.as_deref(),
         )
+    }
+
+    /// Observes the exact canonical ordering heads for one admitted
+    /// transition's declared scopes, as the head evidence a
+    /// [`ReservationSeed`] carries.
+    ///
+    /// The head digest is taken over the exact canonical bytes of the head this
+    /// Kernel just read from the Store, which is precisely what
+    /// [`ObservedHead::expected_head_digest`] documents. Nothing here
+    /// recomputes a stored digest, allocates a sequence, or mints an identity,
+    /// and `reserve_for_transition` independently re-derives the same
+    /// scope/sequence coverage against the admitted
+    /// `OrderingHeadExpectation` set, so this list is evidence and never the
+    /// authority.
+    ///
+    /// The observation fails closed rather than papering over a gap:
+    ///
+    /// ```text
+    /// the durable `canonical_store` route no longer names this generation
+    ///   -> `require_active_store_generation`
+    /// the admitted transition declares no ordering scope
+    ///   -> refusal (an empty set cannot cover any expectation set)
+    /// the Store's own head is invalid, or is not at the admitted `StateFence`
+    ///   -> `OrderingHead::validate` plus the exact fence equality
+    /// the observed set does not exactly cover the declared scopes
+    ///   -> refusal (a missing or extra head is never defaulted)
+    /// ```
+    ///
+    /// `revision_head` stays absent on every entry: the Store contract's
+    /// `OrderingHead` carries scope, sequence and fence only, so there is no
+    /// owner revision-head observation for an ordering scope and none is
+    /// claimed. `reconcile_receipt` records the matching
+    /// `committed_revision_head: None`, so the reservation and its
+    /// reconciliation describe the same observation.
+    pub async fn observe_reserved_write_heads(
+        &self,
+        transition: &PreparedTransition,
+    ) -> Result<Vec<ObservedHead>, String> {
+        self.require_active_store_generation()
+            .map_err(|error| error.to_string())?;
+        let operation_id = transition.identity.operation_id.as_str();
+        let refused = |detail: String| {
+            format!("reserved write observation for operation {operation_id} refused: {detail}")
+        };
+        if transition.ordering_scopes.is_empty() {
+            return Err(refused(
+                "the admitted transition declares no ordering scope".to_owned(),
+            ));
+        }
+        let observed = self
+            .store
+            .ordering_heads(transition.ordering_scopes.clone())
+            .await
+            .map_err(|error| {
+                refused(format!(
+                    "the canonical ordering heads could not be observed: {error}"
+                ))
+            })?;
+        let mut heads: Vec<ObservedHead> = Vec::with_capacity(observed.len());
+        for head in &observed {
+            head.validate().map_err(|error| {
+                refused(format!("the observed ordering head is invalid: {error}"))
+            })?;
+            if head.state_fence != transition.state_fence {
+                return Err(refused(format!(
+                    "the observed ordering head for scope {} is not at the admitted state fence",
+                    head.scope.as_str()
+                )));
+            }
+            let bytes = canonical_json_bytes(head).map_err(|error| {
+                refused(format!(
+                    "the observed ordering head does not encode: {error}"
+                ))
+            })?;
+            heads.push(ObservedHead {
+                scope: head.scope.as_str().to_owned(),
+                expected_sequence: head.sequence,
+                expected_head_digest: sha256_hex(&bytes),
+                revision_head: None,
+            });
+        }
+        let mut observed_scopes: Vec<&str> =
+            heads.iter().map(|head| head.scope.as_str()).collect();
+        observed_scopes.sort_unstable();
+        let mut declared: Vec<&str> = transition
+            .ordering_scopes
+            .iter()
+            .map(|scope| scope.as_str())
+            .collect();
+        declared.sort_unstable();
+        if observed_scopes != declared {
+            return Err(refused(
+                "the observed ordering head set must exactly cover the admitted scopes".to_owned(),
+            ));
+        }
+        Ok(heads)
     }
 
     /// Applies one already prepared transition through a durable ORS
