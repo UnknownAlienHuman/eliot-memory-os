@@ -224,6 +224,17 @@ where
     /// behind a blocked read. T9-05 coordinator verification is not consumed
     /// by this contour.
     pub async fn serve_stdio(&mut self) -> Result<(), NativeWorkerError> {
+        let mut output = io::stdout().lock();
+        self.serve_stdio_with_output(&mut output).await
+    }
+
+    /// Serves the same bounded stdio input loop to an explicitly selected
+    /// response writer. This keeps protocol bytes on a dedicated channel when
+    /// the caller's stdout is also owned by a test harness or supervisor.
+    pub async fn serve_stdio_with_output<Output: Write>(
+        &mut self,
+        output: &mut Output,
+    ) -> Result<(), NativeWorkerError> {
         let (sender, receiver) =
             std::sync::mpsc::sync_channel::<Result<Option<WorkerFrame>, NativeWorkerError>>(64);
         std::thread::spawn(move || {
@@ -245,14 +256,18 @@ where
             let Some(frame) = frame else {
                 return Ok(());
             };
-            if self.serve_frame(frame).await? {
+            if self.serve_frame_to(frame, output).await? {
                 return Ok(());
             }
         }
     }
 
     /// Handles one frame and writes its response, returning true on shutdown.
-    async fn serve_frame(&mut self, frame: WorkerFrame) -> Result<bool, NativeWorkerError> {
+    async fn serve_frame_to<Output: Write>(
+        &mut self,
+        frame: WorkerFrame,
+        output: &mut Output,
+    ) -> Result<bool, NativeWorkerError> {
         let shutdown = matches!(
             &frame.body,
             eliot_native_worker_core::WorkerFrameBody::Shutdown
@@ -261,7 +276,7 @@ where
         let events = self.handle(frame).await?;
         let response_wire =
             encode_worker_response_frame(response_context, &WorkerResponse { events })?;
-        write_frame(&response_wire)?;
+        write_frame_to(&response_wire, output)?;
         Ok(shutdown)
     }
 
@@ -2442,11 +2457,6 @@ fn encode_worker_response_frame(
         trace_context: request.trace_context,
     };
     Ok(encode_frame(&frame, TransportLimits::default())?)
-}
-
-fn write_frame(wire: &[u8]) -> Result<(), NativeWorkerError> {
-    let mut output = io::stdout().lock();
-    write_frame_to(wire, &mut output)
 }
 
 fn read_frame() -> Result<Option<WorkerFrame>, NativeWorkerError> {

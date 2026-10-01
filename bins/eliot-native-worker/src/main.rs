@@ -1327,11 +1327,30 @@ mod tests {
         out
     }
 
-    fn decode_response(bytes: &[u8]) -> eliot_native_worker::WorkerResponse {
-        let (prefix, body) = bytes.split_at(4);
-        let length = u32::from_le_bytes(prefix.try_into().expect("prefix")) as usize;
-        assert_eq!(length, body.len());
-        serde_json::from_slice(body).expect("response")
+    struct DecodedWorkerResponse {
+        connection_id: String,
+        request_id: RequestId,
+        trace_context: BTreeMap<String, String>,
+        response: eliot_native_worker::WorkerResponse,
+    }
+
+    fn decode_response(bytes: &[u8]) -> DecodedWorkerResponse {
+        let frame = eliot_protocol::JsonCodec::new()
+            .decode(bytes)
+            .expect("shared EBP response frame");
+        assert_eq!(frame.kind, eliot_protocol::FrameKind::Response);
+        assert_eq!(frame.message_type, eliot_protocol::MessageType::Result);
+        let request_id = frame.request_id.expect("response keeps request identity");
+        let eliot_protocol::ProtocolPayload::Json(payload) = frame.payload else {
+            panic!("native worker response uses the shared JSON payload");
+        };
+        let response = serde_json::from_value(payload).expect("typed worker response payload");
+        DecodedWorkerResponse {
+            connection_id: frame.connection_id,
+            request_id,
+            trace_context: frame.trace_context,
+            response,
+        }
     }
 
     type SliceDWorker = NativeWorker<
@@ -1460,9 +1479,13 @@ mod tests {
             .unwrap_or_else(|error| panic!("bounded frame must serve, got {error:?}"));
         assert!(!shutdown);
         let response = decode_response(&writer);
-        assert!(!response.events.is_empty());
+        assert_eq!(response.connection_id, "connection-claim-1");
+        assert_eq!(response.request_id.as_str(), "health-1");
+        assert_eq!(response.trace_context["trace_id"], "trace-health-1");
+        assert!(!response.response.events.is_empty());
         assert!(
             response
+                .response
                 .events
                 .iter()
                 .all(|event| event.stream_id == "claim-1/gen-1")
@@ -1879,9 +1902,13 @@ mod tests {
         assert_eq!(serve_actions.len(), 1);
         assert_eq!(serve_actions[0].operation, "serve_stdio");
         let response = decode_response(&writer);
-        assert!(!response.events.is_empty());
+        assert_eq!(response.connection_id, "connection-claim-1");
+        assert_eq!(response.request_id.as_str(), "health-1");
+        assert_eq!(response.trace_context["trace_id"], "trace-health-1");
+        assert!(!response.response.events.is_empty());
         assert!(
             response
+                .response
                 .events
                 .iter()
                 .all(|event| event.stream_id == "claim-1/gen-1")
@@ -2347,9 +2374,16 @@ mod tests {
         assert_eq!(serve_actions[0].operation, "serve_stdio");
         assert!(serve_actions[0].verifier.starts_with("unknown:"));
         let response = decode_response(&writer);
-        assert!(!response.events.is_empty());
+        assert_eq!(response.connection_id, hello_connection);
+        assert_eq!(response.request_id.as_str(), "health-kernel-drive-1");
+        assert_eq!(
+            response.trace_context["trace_id"],
+            "trace-kernel-drive-1"
+        );
+        assert!(!response.response.events.is_empty());
         assert!(
             response
+                .response
                 .events
                 .iter()
                 .all(|event| event.stream_id == "claim-kernel-drive-1/gen-1")
