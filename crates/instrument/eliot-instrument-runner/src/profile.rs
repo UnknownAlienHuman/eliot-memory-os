@@ -620,14 +620,28 @@ pub struct RegisteredStageCommand {
 impl RegisteredStageCommand {
     /// Records one selector and exact argv after shape validation.
     pub fn new(executable: String, argv: Vec<String>) -> Result<Self, ProfileError> {
-        validate_text(&executable, "stage_command.executable")?;
-        if argv.is_empty() {
+        let command = Self { executable, argv };
+        command.validate_shape()?;
+        Ok(command)
+    }
+
+    /// Revalidates commands that entered through serde or another catalogue
+    /// decoder. It checks shape only and never normalizes the admitted bytes.
+    fn validate_shape(&self) -> Result<(), ProfileError> {
+        validate_text(&self.executable, "stage_command.executable")?;
+        if self.executable.len() > 4_096
+            || self.argv.is_empty()
+            || self.argv.len() > 64
+        {
             return Err(ProfileError::InvalidText { field: "stage_command.argv" });
         }
-        for argument in &argv {
+        for argument in &self.argv {
             validate_text(argument, "stage_command.argv")?;
+            if argument.len() > 4_096 {
+                return Err(ProfileError::InvalidText { field: "stage_command.argv" });
+            }
         }
-        Ok(Self { executable, argv })
+        Ok(())
     }
 }
 
@@ -1172,7 +1186,17 @@ pub fn compiler_profile() -> Result<InstrumentProfile, ProfileError> {
                 Vec::new(),
                 true,
                 true,
-            )?,
+            )?
+            .with_command(RegisteredStageCommand::new(
+                "cargo".to_owned(),
+                vec![
+                    "metadata".to_owned(),
+                    "--locked".to_owned(),
+                    "--no-deps".to_owned(),
+                    "--format-version".to_owned(),
+                    "1".to_owned(),
+                ],
+            )?),
             StageDecl::new(
                 "rustc-build".to_owned(),
                 ContractId::new(RUSTC_INSTRUMENT)?,
@@ -1509,14 +1533,15 @@ impl InstrumentRegistry {
                         kind: stage.kind,
                     });
                 }
-                if stage.command.as_ref().is_some_and(|command| {
-                    command.executable != spec.executable || command.argv.is_empty()
-                }) {
-                    return Err(ProfileError::SpecCommandMismatch {
-                        profile: profile.name.clone(),
-                        stage: stage.stage_id.clone(),
-                        spec: stage.spec.as_str().to_owned(),
-                    });
+                if let Some(command) = &stage.command {
+                    command.validate_shape()?;
+                    if command.executable != spec.executable {
+                        return Err(ProfileError::SpecCommandMismatch {
+                            profile: profile.name.clone(),
+                            stage: stage.stage_id.clone(),
+                            spec: stage.spec.as_str().to_owned(),
+                        });
+                    }
                 }
             }
             let key = (profile.name.clone(), profile.revision);

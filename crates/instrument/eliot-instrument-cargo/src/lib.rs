@@ -72,6 +72,9 @@ pub enum CargoAdapterError {
     /// The stream is not a valid Cargo `--message-format=json` message stream.
     #[error("Cargo emitted a malformed message stream")]
     MalformedMessage,
+    /// The document is not a complete usable Cargo metadata version 1 result.
+    #[error("Cargo emitted malformed or incomplete metadata")]
+    MalformedMetadata,
     /// A diagnostic counter overflowed its bounded type.
     #[error("Cargo diagnostic counter overflowed")]
     CounterOverflow,
@@ -328,6 +331,140 @@ pub struct CargoReport {
     pub artifacts: Vec<CargoArtifactRecord>,
     /// Terminal `build-finished` success flag, when the stream reported one.
     pub build_finished: Option<bool>,
+}
+
+/// Validated projection of one `cargo metadata --format-version 1` document.
+///
+/// Only the fields needed to prove a usable workspace/package denominator are
+/// retained. Unknown Cargo metadata fields are ignored for forward-compatible
+/// schema evolution; required identity and package/target fields are strict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoMetadataReport {
+    /// Cargo metadata wire version; currently exactly `1`.
+    pub metadata_version: u32,
+    /// Workspace packages and the targets Cargo actually declares for them.
+    pub packages: Vec<CargoMetadataPackage>,
+    /// Package IDs Cargo reports as workspace members.
+    pub workspace_members: Vec<String>,
+    /// Cargo-reported canonical workspace root.
+    pub workspace_root: String,
+    /// Cargo-reported target directory.
+    pub target_directory: String,
+}
+
+/// One Cargo metadata workspace package.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoMetadataPackage {
+    /// Exact Cargo package ID.
+    pub id: String,
+    /// Package name.
+    pub name: String,
+    /// Package semantic version string.
+    pub version: String,
+    /// Manifest path reported by Cargo.
+    pub manifest_path: String,
+    /// Declared package targets.
+    pub targets: Vec<CargoMetadataTarget>,
+}
+
+/// One target declared by a Cargo metadata package.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CargoMetadataTarget {
+    /// Target name.
+    pub name: String,
+    /// Cargo target kinds, such as `lib`, `bin`, or `test`.
+    pub kinds: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataWire {
+    version: u32,
+    packages: Vec<CargoMetadataPackageWire>,
+    workspace_members: Vec<String>,
+    workspace_root: String,
+    target_directory: String,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataPackageWire {
+    id: String,
+    name: String,
+    version: String,
+    manifest_path: String,
+    targets: Vec<CargoMetadataTargetWire>,
+}
+
+#[derive(Deserialize)]
+struct CargoMetadataTargetWire {
+    name: String,
+    kind: Vec<String>,
+}
+
+/// Parses the bounded JSON document emitted by `cargo metadata --format-version 1`.
+///
+/// The parser retains Cargo's own package IDs and target declarations and
+/// verifies that every workspace-member identity resolves to exactly one
+/// package in the document. It does not infer packages from paths or names.
+///
+/// # Errors
+///
+/// Returns [`CargoAdapterError::OutputTooLarge`] or
+/// [`CargoAdapterError::MalformedMetadata`] for oversized or structurally
+/// incomplete metadata.
+pub fn parse_metadata_json(bytes: &[u8]) -> Result<CargoMetadataReport, CargoAdapterError> {
+    if bytes.len() > MAX_CARGO_OUTPUT_BYTES {
+        return Err(CargoAdapterError::OutputTooLarge);
+    }
+    let wire: CargoMetadataWire =
+        serde_json::from_slice(bytes).map_err(|_| CargoAdapterError::MalformedMetadata)?;
+    if wire.version != 1
+        || wire.workspace_root.is_empty()
+        || wire.target_directory.is_empty()
+        || wire.packages.is_empty()
+        || wire.workspace_members.is_empty()
+    {
+        return Err(CargoAdapterError::MalformedMetadata);
+    }
+    let mut package_ids = std::collections::BTreeSet::new();
+    let mut packages = Vec::with_capacity(wire.packages.len());
+    for package in wire.packages {
+        if package.id.is_empty()
+            || package.name.is_empty()
+            || package.version.is_empty()
+            || package.manifest_path.is_empty()
+            || package.targets.is_empty()
+            || !package_ids.insert(package.id.clone())
+        {
+            return Err(CargoAdapterError::MalformedMetadata);
+        }
+        let mut targets = Vec::with_capacity(package.targets.len());
+        for target in package.targets {
+            if target.name.is_empty() || target.kind.is_empty() || target.kind.iter().any(String::is_empty) {
+                return Err(CargoAdapterError::MalformedMetadata);
+            }
+            targets.push(CargoMetadataTarget { name: target.name, kinds: target.kind });
+        }
+        packages.push(CargoMetadataPackage {
+            id: package.id,
+            name: package.name,
+            version: package.version,
+            manifest_path: package.manifest_path,
+            targets,
+        });
+    }
+    let mut member_ids = std::collections::BTreeSet::new();
+    if wire.workspace_members.iter().any(|member| {
+        member.is_empty() || !member_ids.insert(member.clone()) || !package_ids.contains(member)
+    }) {
+        return Err(CargoAdapterError::MalformedMetadata);
+    }
+    Ok(CargoMetadataReport {
+        metadata_version: wire.version,
+        packages,
+        workspace_members: wire.workspace_members,
+        workspace_root: wire.workspace_root,
+        target_directory: wire.target_directory,
+    })
 }
 
 impl CargoReport {

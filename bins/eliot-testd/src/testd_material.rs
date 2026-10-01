@@ -578,7 +578,7 @@ fn validate_admission(
             "testd admits only registered probe or productive nextest profiles".to_owned(),
         ));
     }
-    let productive_executor = eliot_testd_core::is_productive_testd_profile(&admission.profile);
+    let productive_executor = eliot_testd_core::is_testd_executor_profile(&admission.profile);
     if productive_executor && admission.stage_request.is_none()
     {
         return Err(TestdMaterialError::Contract(
@@ -689,7 +689,7 @@ fn validate_blob_stream_material(
     admission: &TestdMaterialAdmission,
     stream: Option<&TestdMaterialBlobStreamGrant>,
 ) -> Result<(), TestdMaterialError> {
-    if eliot_testd_core::is_productive_testd_profile(&admission.profile) {
+    if eliot_testd_core::is_testd_executor_profile(&admission.profile) {
         let stream = stream.ok_or_else(|| {
             TestdMaterialError::Contract(
                 "productive testd material is missing its Kernel-issued Blob stream grant"
