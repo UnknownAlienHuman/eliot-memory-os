@@ -1893,11 +1893,16 @@ impl ReplayLedger {
     }
 }
 
-/// Cancellation state is explicit and reapable; it never revives a fenced work item.
+/// Cancellation state is explicit and reapable; the first terminal wins and
+/// never revives a fenced work item. `Cancelled` records an explicit
+/// `Cancel`; `Expired` records a deadline expiry. Entries persist until
+/// `reap`/`reap_bound`, so the recorded disposition survives retries and
+/// reconnects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CancellationState {
     Active,
     Cancelled,
+    Expired,
     Reaped,
 }
 
@@ -1939,16 +1944,57 @@ impl CancellationRegistry {
     }
     pub fn reap(&mut self, id: &str) -> Result<(), TransportError> {
         match self.entries.get_mut(id) {
-            Some(state @ CancellationState::Cancelled) => {
+            Some(state @ (CancellationState::Cancelled | CancellationState::Expired)) => {
                 *state = CancellationState::Reaped;
                 Ok(())
             }
             _ => Err(TransportError::UnknownRequest),
         }
     }
+    /// Idempotent application point for an incoming lifecycle `Cancel` frame
+    /// keyed by its `RequestIdentity.cancellation_id` (lifecycle dispatcher
+    /// caller). Unlike [`Self::cancel`], a retried `Cancel` observes the
+    /// recorded terminal as [`CancellationDisposition::Duplicate`] instead of
+    /// an error, and an unregistered identity reports
+    /// [`CancellationDisposition::Unknown`] without minting state, so the
+    /// disposition is stable across retries and reconnects.
+    pub fn cancel_stable(&mut self, id: &str) -> CancellationDisposition {
+        match self.entries.get_mut(id) {
+            Some(state @ CancellationState::Active) => {
+                *state = CancellationState::Cancelled;
+                CancellationDisposition::New
+            }
+            Some(_) => CancellationDisposition::Duplicate,
+            None => CancellationDisposition::Unknown,
+        }
+    }
+    /// Records a deadline expiry for a registered identity as the terminal
+    /// [`CancellationState::Expired`] outcome (deadline watcher caller). The
+    /// first terminal wins: an explicitly cancelled or already expired entry
+    /// keeps its recorded state and reports
+    /// [`CancellationDisposition::Duplicate`], so a deadline-expired request
+    /// stays distinguishable from an explicit cancellation across retries.
+    pub fn expire(&mut self, id: &str) -> CancellationDisposition {
+        match self.entries.get_mut(id) {
+            Some(state @ CancellationState::Active) => {
+                *state = CancellationState::Expired;
+                CancellationDisposition::New
+            }
+            Some(_) => CancellationDisposition::Duplicate,
+            None => CancellationDisposition::Unknown,
+        }
+    }
     #[must_use]
     pub fn state(&self, id: &str) -> Option<CancellationState> {
         self.entries.get(id).copied()
+    }
+    /// Non-mutating observer for a bound entry's recorded disposition
+    /// (lifecycle dispatcher caller). Observing never advances state, so
+    /// retries and reconnects read back the same terminal recorded by
+    /// `cancel_bound`/`expire_bound` until an explicit `reap_bound`.
+    #[must_use]
+    pub fn state_bound(&self, identity: &BoundIdentity) -> Option<CancellationState> {
+        self.bound_entries.get(identity).map(|(_, state)| *state)
     }
 
     fn capacity(&self) -> usize {
@@ -2001,16 +2047,41 @@ impl CancellationRegistry {
                 *state = CancellationState::Cancelled;
                 CancellationDisposition::New
             }
-            Some((_, CancellationState::Cancelled | CancellationState::Reaped)) => {
-                CancellationDisposition::Duplicate
+            Some((
+                _,
+                CancellationState::Cancelled
+                | CancellationState::Expired
+                | CancellationState::Reaped,
+            )) => CancellationDisposition::Duplicate,
+            None => CancellationDisposition::Unknown,
+        }
+    }
+
+    /// Records a deadline expiry for a bound identity as the terminal
+    /// [`CancellationState::Expired`] outcome (deadline watcher caller). The
+    /// first terminal wins: an explicitly cancelled or already expired entry
+    /// keeps its recorded state and reports
+    /// [`CancellationDisposition::Duplicate`], so a deadline-expired request
+    /// stays distinguishable from an explicit cancellation across retries.
+    pub fn expire_bound(&mut self, identity: &BoundIdentity) -> CancellationDisposition {
+        match self.bound_entries.get_mut(identity) {
+            Some((_, state @ CancellationState::Active)) => {
+                *state = CancellationState::Expired;
+                CancellationDisposition::New
             }
+            Some((
+                _,
+                CancellationState::Cancelled
+                | CancellationState::Expired
+                | CancellationState::Reaped,
+            )) => CancellationDisposition::Duplicate,
             None => CancellationDisposition::Unknown,
         }
     }
 
     pub fn reap_bound(&mut self, identity: &BoundIdentity) -> CancellationDisposition {
         match self.bound_entries.get_mut(identity) {
-            Some((_, state @ CancellationState::Cancelled)) => {
+            Some((_, state @ (CancellationState::Cancelled | CancellationState::Expired))) => {
                 *state = CancellationState::Reaped;
                 CancellationDisposition::New
             }
