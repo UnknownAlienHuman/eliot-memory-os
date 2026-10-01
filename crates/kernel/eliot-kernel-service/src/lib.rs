@@ -461,3 +461,62 @@ pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), Kern
     }
     Ok(())
 }
+
+/// Issue #1885 (I1.9): service-boundary query joining one effect replay
+/// attempt to its exact unexpired operation lease.
+///
+/// Effect-capable generations may resume only exact already-authorized
+/// operations covered by an unexpired operation lease; every invalid or
+/// unavailable authorization state runs in shadow/no-effect diagnostics only.
+/// This is the one query the effect-capable restart/replay paths
+/// (`dispatch_launch`, `process_execution`, the native-worker lifecycle
+/// routes and the Dreamer dispatch paths) run before dispatching an effect:
+/// it resolves the lease by the attempt's own operation identity through
+/// [`eliot_ors::OperationalRecoveryStore::load_effect_operation_lease_for_operation`],
+/// loads the bound execution manifest, and verifies the triple through the
+/// owning [`eliot_ors::authorize_effect_replay`] verifier. The record itself
+/// stays owned by `eliot-ors`; this join defines no lease type, no alias and
+/// no conversion, so a supervision obligation can never be mistaken for
+/// effect authority here.
+///
+/// Every binding the issue requires (manifest identity/hash, Authority Epoch,
+/// exact operation identity and effect receipt, allowed scope, expiry,
+/// admitting Catalog/Policy revision, revocation/delivery acknowledgement)
+/// is checked by the owners' own `validate()` and verifier; this join
+/// invents none and defaults none. An admitted decision carries the sealed
+/// [`eliot_ors::ActiveEffectOperationLease`], the only value a dispatch path
+/// may treat as effect authority. Every other outcome carries only the
+/// shadow/no-effect diagnostic context plus the durable reconciliation item,
+/// which the caller must persist rather than discard; it is incapable of
+/// producing an external effect or a canonical write admission.
+///
+/// Store failures surface as the owner's typed [`eliot_ors::OrsError`]; they
+/// are unavailable authorization state, so the caller treats them like any
+/// other non-admission and stays in shadow diagnostics.
+pub fn query_effect_replay_authority(
+    store: &eliot_ors::RedbRecoveryStore,
+    request: &eliot_ors::EffectReplayRequest,
+) -> Result<eliot_ors::EffectReplayDecision, eliot_ors::OrsError> {
+    request.validate()?;
+    let lease = store.load_effect_operation_lease_for_operation(&request.operation_id)?;
+    let Some(lease) = lease else {
+        return Ok(eliot_ors::deny_unleased_effect_replay(
+            &request.operation_id,
+            &request.manifest_module_id,
+            request.manifest_generation,
+            Some(request.bound_manifest_sha256.clone()),
+            request.observed_at_ms,
+        ));
+    };
+    let manifest = store.load_kernel_execution_manifest(
+        &request.manifest_module_id,
+        request.manifest_generation.value(),
+    )?;
+    let Some(manifest) = manifest else {
+        return Ok(eliot_ors::deny_effect_replay_without_manifest(
+            &lease,
+            request.observed_at_ms,
+        ));
+    };
+    eliot_ors::authorize_effect_replay(Some(&lease), Some(&manifest), request)
+}
