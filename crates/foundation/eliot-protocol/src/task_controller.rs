@@ -95,7 +95,7 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
-    /// Bind an observed explicit workspace to the retained task's WorkScope.
+    /// Bind an observed explicit workspace to the retained task's `WorkScope`.
     /// The daemon validates this action through the authenticated initial
     /// owner-admission path; the caller supplies no owner receipt or binding.
     BindScope,
@@ -179,18 +179,7 @@ pub struct TaskControllerInvocation {
 }
 
 impl TaskControllerInvocation {
-    /// Validates the transport envelope and bounded JSON object fields.
-    /// Semantic field/identity validation remains with the daemon owners.
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID
-            || self.wire_version != TASK_CONTROLLER_INVOCATION_WIRE_VERSION
-        {
-            return Err(ProtocolError::InvalidField {
-                field: "task_controller_invocation.wire",
-                reason: "unsupported Task Controller invocation",
-            });
-        }
-        structured_object(&self.task_input, "task_controller_invocation.task_input")?;
+    fn validate_action_specific_fields(&self) -> Result<(), ProtocolError> {
         match self.action {
             TaskControllerAction::BindScope => {
                 if self.task_id.is_some()
@@ -257,6 +246,22 @@ impl TaskControllerInvocation {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Validates the transport envelope and bounded JSON object fields.
+    /// Semantic field/identity validation remains with the daemon owners.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID
+            || self.wire_version != TASK_CONTROLLER_INVOCATION_WIRE_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.wire",
+                reason: "unsupported Task Controller invocation",
+            });
+        }
+        structured_object(&self.task_input, "task_controller_invocation.task_input")?;
+        self.validate_action_specific_fields()?;
         if let Some(selector) = &self.prior_delivery_selector {
             structured_object(
                 selector,

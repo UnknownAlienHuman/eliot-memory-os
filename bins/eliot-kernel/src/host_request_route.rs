@@ -65,6 +65,7 @@ use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
+    HostRequestKernelRequestIdentity,
     HostRequestKind as OrsHostRequestKind, HostRequestRecord, HostRequestRetainedLineage,
     HostRequestRetainedResultClass, HostRequestRetainedSourceRevision, HostRequestState,
     OpaqueLabel, OperationIdentity, OrsError, RedbRecoveryStore,
@@ -76,6 +77,7 @@ use eliot_protocol::{
     HOST_REQUEST_INVOKE_READ_WIRE_ID, HOST_REQUEST_PAYLOAD_SCHEMA_ID,
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HostRequestAdmissionReceipt, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
+    RequestIdentity,
     WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
     WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
     WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
@@ -1513,6 +1515,7 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
+        request_identity: &RequestIdentity,
     ) -> Result<(HostRequestAdmissionReceipt, HostRequestRecord), TransportError> {
         if envelope.kind != HostRequestKind::Invocation {
             return Err(TransportError::SessionFenced);
@@ -1540,6 +1543,19 @@ impl KernelComposition {
                 envelope,
                 task_relative_tool,
             )?;
+        let identity = host_request_kernel_identity_binding(envelope, request_identity)?;
+        self.generation_gateway
+            .ors
+            .bind_host_request_kernel_identity(
+                &record.operation_id,
+                &record.request_digest,
+                &identity,
+            )
+            .map_err(|error| match error {
+                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
+                _ => TransportError::SessionFenced,
+            })?
+            .ok_or(TransportError::SessionFenced)?;
         // Queue each admitted shape in its Kernel-owned lane. Query and Skill
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
@@ -6015,6 +6031,7 @@ pub(crate) fn requested_host_request_record(
         contract_version: ORS_CONTRACT_VERSION,
         send_claim_protocol_version: 0,
         transport_channel_binding_sha256: None,
+        kernel_request_identity: None,
         operation_id: OperationIdentity::new(host_request_operation_id(envelope))
             .map_err(|_| TransportError::SessionFenced)?,
         kind: match envelope.kind {
@@ -6052,6 +6069,37 @@ pub(crate) fn requested_host_request_record(
         result_evidence: None,
         result_lineage: None,
         commit_order: 0,
+    })
+}
+
+fn host_request_kernel_identity_binding(
+    envelope: &HostRequestEnvelope,
+    identity: &RequestIdentity,
+) -> Result<HostRequestKernelRequestIdentity, TransportError> {
+    identity
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    if identity.request.metadata.request_id.as_str() != envelope.identity.request_id
+        || identity.request.metadata.session_id.as_ref().map(|id| id.as_str())
+            != envelope.identity.session_id.as_deref()
+        || identity.request.metadata.task_id.as_ref().map(|id| id.as_str())
+            != envelope.identity.task_id.as_deref()
+        || identity.request.state_fence != envelope.state_fence
+        || identity.request.metadata.state_fence != envelope.state_fence
+        || identity.idempotency_key != envelope.identity.idempotency_key
+        || identity.cancellation_id != envelope.identity.cancellation_id
+        || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let value = serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?;
+    let bytes = eliot_contracts::canonical_json_bytes(&value)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let canonical_json = String::from_utf8(bytes).map_err(|_| TransportError::SessionFenced)?;
+    let sha256 = eliot_contracts::sha256_hex(canonical_json.as_bytes());
+    Ok(HostRequestKernelRequestIdentity {
+        canonical_json,
+        sha256,
     })
 }
 
@@ -6247,6 +6295,7 @@ impl KernelComposition {
             operation,
             &envelope,
             &payload,
+            identity,
             frame.protocol_version,
         )
     }
@@ -6258,6 +6307,7 @@ impl KernelComposition {
         operation: &str,
         envelope: &HostRequestEnvelope,
         payload: &serde_json::Value,
+        request_identity: &RequestIdentity,
         protocol_version: eliot_protocol::ProtocolVersion,
     ) -> Result<KernelFrameAction, TransportError> {
         let outcome = (|| -> Result<serde_json::Value, TransportError> {
@@ -6296,7 +6346,8 @@ impl KernelComposition {
                 }
                 AGENT_HOST_REQUEST_INVOKE_READ_OPERATION => {
                     let tool = host_request_tool_from_payload(payload)?;
-                    let (receipt, record) = self.invoke_read_host_request(envelope, &tool)?;
+                    let (receipt, record) =
+                        self.invoke_read_host_request(envelope, &tool, request_identity)?;
                     // The durable record carries the result pair when the
                     // operation already received its bounded answer, so the
                     // admitted shape is the result-bearing response: no second
@@ -8219,6 +8270,7 @@ fn watchdog_export_projection_record(
         contract_version: ORS_CONTRACT_VERSION,
         send_claim_protocol_version: 0,
         transport_channel_binding_sha256: None,
+        kernel_request_identity: None,
         operation_id: operation_id.clone(),
         kind: OrsHostRequestKind::Reconciliation,
         // The request identity is the derived export reconciliation key: one
@@ -8465,6 +8517,7 @@ fn watchdog_intent_projection_record(
         contract_version: ORS_CONTRACT_VERSION,
         send_claim_protocol_version: 0,
         transport_channel_binding_sha256: None,
+        kernel_request_identity: None,
         operation_id: operation_id.clone(),
         kind: OrsHostRequestKind::Reconciliation,
         // The request identity is the derived reconciliation key: one spool

@@ -8228,6 +8228,12 @@ pub struct HostRequestRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_channel_binding_sha256: Option<String>,
+    /// Exact authenticated Kernel request identity retained before a
+    /// Task Controller claim is exposed to the daemon. Legacy rows omit this
+    /// pair and remain unusable for task-free `BindScope` admission.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_request_identity: Option<HostRequestKernelRequestIdentity>,
     pub operation_id: OperationIdentity,
     pub kind: HostRequestKind,
     pub request_id: OpaqueLabel,
@@ -8357,6 +8363,37 @@ pub struct HostRequestRecord {
     pub commit_order: u64,
 }
 
+/// Canonical authenticated Kernel request identity retained with a Host
+/// request row. This is owner metadata, never caller-supplied payload content.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestKernelRequestIdentity {
+    /// Canonical serialized `RequestIdentity` supplied by the authenticated
+    /// Kernel frame and preserved byte-for-byte for restart recovery.
+    pub canonical_json: String,
+    /// SHA-256 of the exact canonical bytes.
+    pub sha256: String,
+}
+
+impl HostRequestKernelRequestIdentity {
+    /// Validates bounded canonical JSON bytes and their exact digest.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        validate_digest(&self.sha256, "host_request_kernel_identity_sha256")?;
+        validate_bounded_canonical_json(
+            &self.canonical_json,
+            MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES,
+            "host_request_kernel_identity_json",
+        )?;
+        if sha256_hex(self.canonical_json.as_bytes()) != self.sha256 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_kernel_identity_sha256",
+                reason: "digest does not match exact canonical identity bytes",
+            });
+        }
+        Ok(())
+    }
+}
+
 impl HostRequestRecord {
     /// Returns the durable key binding one operation to one exact request.
     pub fn record_key(&self) -> String {
@@ -8422,6 +8459,71 @@ impl HostRequestRecord {
         }
         validate_text(self.capability_ref.as_str(), "host_request_capability_ref")?;
         validate_digest(&self.fence_digest, "host_request_fence_digest")?;
+        if let Some(identity) = &self.kernel_request_identity {
+            identity.validate()?;
+            let value: Value = serde_json::from_str(&identity.canonical_json).map_err(|_| {
+                OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must decode as a JSON object",
+                }
+            })?;
+            let metadata = value
+                .get("request")
+                .and_then(|request| request.get("metadata"))
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain request metadata",
+                })?;
+            let request_id = metadata
+                .get("request_id")
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a request id",
+                })?;
+            let idempotency_key = value
+                .get("idempotency_key")
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain an idempotency key",
+                })?;
+            let cancellation_id = value
+                .get("cancellation_id")
+                .and_then(Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a cancellation id",
+                })?;
+            let deadline = value
+                .get("deadline_unix_ms")
+                .and_then(Value::as_u64)
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain a positive deadline",
+                })?;
+            let state_fence = value
+                .get("request")
+                .and_then(|request| request.get("state_fence"))
+                .ok_or(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "must contain the request state fence",
+                })?;
+            if request_id != self.request_id.as_str()
+                || idempotency_key != self.idempotency_key.as_str()
+                || cancellation_id != self.cancellation_id.as_str()
+                || deadline != self.deadline_unix_ms
+                || sha256_hex(
+                    &canonical_json_bytes(state_fence)
+                        .map_err(|error| OrsError::Encoding(error.to_string()))?,
+                ) != self.fence_digest
+            {
+                return Err(OrsError::InvalidField {
+                    field: "host_request_kernel_identity_json",
+                    reason: "request identity does not match its admitted Host row",
+                });
+            }
+        }
         // `EpochId` is always validated; only generation retains a scalar check.
         if self.generation == 0 {
             return Err(OrsError::InvalidField {

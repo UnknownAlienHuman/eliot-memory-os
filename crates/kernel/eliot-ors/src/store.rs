@@ -10827,7 +10827,7 @@ impl RedbRecoveryStore {
             return Ok(None);
         };
         existing.validate()?;
-        if existing.operation_id != *operation_id || existing.request_digest != request_digest {
+        if &existing.operation_id != operation_id || existing.request_digest != request_digest {
             return Err(OrsError::HostRequestIdentityConflict {
                 operation_id: operation_id.as_str().to_owned(),
                 request_digest: request_digest.to_owned(),
@@ -11846,6 +11846,68 @@ impl RedbRecoveryStore {
         }
         let mut next = existing.clone();
         next.payload_body = Some(body.clone());
+        next.validate()?;
+        let payload = encode(&next)?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Persists the exact front-door `RequestIdentity` before a Task
+    /// Controller claim is exposed. An exact replay returns the retained
+    /// identity; a changed or late identity conflicts and never replaces it.
+    pub fn bind_host_request_kernel_identity(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        identity: &crate::HostRequestKernelRequestIdentity,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        identity.validate()?;
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        };
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        existing.validate()?;
+        if existing.operation_id != *operation_id || existing.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if let Some(retained) = &existing.kernel_request_identity {
+            if retained == identity {
+                return Ok(Some(existing));
+            }
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        if !matches!(
+            existing.state,
+            crate::HostRequestState::Requested | crate::HostRequestState::Admitted
+        ) || existing.attempt.is_some()
+            || existing.result_digest.is_some()
+            || existing.result_response.is_some()
+        {
+            return Err(OrsError::InvalidTransition);
+        }
+        let mut next = existing;
+        next.kernel_request_identity = Some(identity.clone());
         next.validate()?;
         let payload = encode(&next)?;
         {
@@ -37694,6 +37756,7 @@ mod host_request_result_tests {
             contract_version: crate::CONTRACT_VERSION,
             send_claim_protocol_version: 0,
             transport_channel_binding_sha256: None,
+            kernel_request_identity: None,
             operation_id: OperationIdentity::new(operation.to_owned()).expect("valid operation"),
             kind: HostRequestKind::Invocation,
             request_id: label("req-1"),

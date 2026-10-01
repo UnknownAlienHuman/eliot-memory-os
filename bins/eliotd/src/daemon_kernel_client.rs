@@ -50,7 +50,6 @@ use eliot_contracts::{
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
-use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_ors::OperationIdentity;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
@@ -510,60 +509,6 @@ fn canonical_kernel_request_digest(
     Ok(sha256_hex(&bytes))
 }
 
-fn derive_task_controller_request_identity(
-    invocation: &TaskControllerInvocation,
-    envelope: &HostRequestEnvelope,
-) -> Result<RequestIdentity, String> {
-    let recipe: LearningStateViewRecipe =
-        serde_json::from_value(invocation.learning_state_view_recipe.clone())
-            .map_err(|error| format!("Task Controller learning recipe does not decode: {error}"))?;
-    recipe
-        .validate()
-        .map_err(|error| format!("Task Controller learning recipe is invalid: {error}"))?;
-    if recipe.binding.task_id != invocation.task_id
-        || recipe.binding.scope.as_str()
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .unwrap_or_default()
-        || recipe.binding.state_fence != envelope.state_fence
-        || recipe.binding.request_id.as_str() != envelope.identity.request_id.as_str()
-    {
-        return Err(
-            "Task Controller invocation is not bound to the admitted recipe/envelope".to_owned(),
-        );
-    }
-    let session_id = envelope
-        .identity
-        .session_id
-        .clone()
-        .map(|value| SessionId::new(value).map_err(|error| error.to_string()))
-        .transpose()?;
-    let metadata = RequestMetadata {
-        request_id: recipe.binding.request_id.clone(),
-        session_id,
-        task_id: Some(recipe.binding.task_id.clone()),
-        product_id: recipe.binding.product_id.clone(),
-        source_id: recipe.binding.source.owner.clone(),
-        state_fence: envelope.state_fence.clone(),
-        clock: ClockReading::default(),
-    };
-    let identity = RequestIdentity {
-        request: RequestBinding {
-            metadata,
-            state_fence: envelope.state_fence.clone(),
-        },
-        idempotency_key: envelope.identity.idempotency_key.clone(),
-        deadline_unix_ms: envelope.identity.deadline_unix_ms,
-        cancellation_id: envelope.identity.cancellation_id.clone(),
-    };
-    identity
-        .validate()
-        .map_err(|error| format!("derived Task Controller identity is invalid: {error}"))?;
-    Ok(identity)
-}
-
 /// Parses one unwrapped Task Controller poll answer into its exact admitted
 /// invocation and Kernel-issued attempt.
 pub fn parse_task_controller_claimed_pair(
@@ -594,11 +539,8 @@ pub fn parse_task_controller_claimed_pair(
         .validate()
         .map_err(|error| format!("Kernel Task Controller envelope is invalid: {error}"))?;
     let tool = decode("tool")?;
-    let request_identity: RequestIdentity = match pair.get("identity") {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?,
-        None => derive_task_controller_request_identity(&invocation, &envelope)?,
-    };
+    let request_identity: RequestIdentity = serde_json::from_value(decode("identity")?)
+        .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?;
     request_identity
         .validate()
         .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
@@ -616,21 +558,37 @@ pub fn parse_task_controller_claimed_pair(
         .cloned()
         .and_then(|arguments| serde_json::from_value::<TaskControllerInvocation>(arguments).ok());
     let expected_operation = host_request_operation_id(&envelope);
+    let task_free_bind = invocation.action == eliot_protocol::TaskControllerAction::BindScope;
+    let identity_task_matches = if task_free_bind {
+        invocation.task_id.is_none()
+            && envelope.identity.task_id.is_none()
+            && request_identity.request.metadata.task_id.is_none()
+    } else {
+        invocation.task_id.as_ref().map(|task_id| task_id.as_str())
+            == envelope.identity.task_id.as_deref()
+            && request_identity.request.metadata.task_id.as_ref() == invocation.task_id.as_ref()
+    };
+    let identity_scope_matches = if task_free_bind {
+        invocation.work_scope_id.is_none() && envelope.identity.work_scope_id.is_none()
+    } else {
+        invocation.work_scope_id == envelope.identity.work_scope_id
+    };
     if envelope.kind != eliot_protocol::HostRequestKind::Invocation
         || envelope.identity.capability != "eliot.task-controller"
         || envelope.identity.payload_schema_id != "eliot.task-controller.invoke.v1"
         || tool_name != Some("eliot.task-controller")
         || tool_invocation.as_ref() != Some(&invocation)
-        || invocation.task_id.as_str() != envelope.identity.task_id.as_deref().unwrap_or_default()
-        || invocation.work_scope_id
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .unwrap_or_default()
+        || !identity_task_matches
+        || !identity_scope_matches
+        || request_identity.request.metadata.request_id.as_str()
+            != envelope.identity.request_id.as_str()
+        || request_identity.request.metadata.session_id.as_ref().map(|id| id.as_str())
+            != envelope.identity.session_id.as_deref()
+        || request_identity.idempotency_key != envelope.identity.idempotency_key
+        || request_identity.cancellation_id != envelope.identity.cancellation_id
+        || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
         || request_identity.request.state_fence != envelope.state_fence
         || request_identity.request.metadata.state_fence != envelope.state_fence
-        || request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
         || attempt.task_id != invocation.task_id

@@ -4110,13 +4110,14 @@ impl KernelComposition {
                     }
                     self.claim_task_controller_pair(session)
                         .map(|pair| match pair {
-                            Some((envelope, tool, invocation, attempt)) => serde_json::json!({
+                            Some((envelope, tool, invocation, attempt, identity)) => serde_json::json!({
                                 "status": "known",
                                 "value": {
                                     "pair": {
                                         "invocation": invocation,
                                         "envelope": envelope,
                                         "tool": tool,
+                                        "identity": identity,
                                         "operation_id": attempt.operation_id,
                                         "attempt": attempt,
                                     }

@@ -376,12 +376,13 @@ impl KernelComposition {
         &self,
         session: &Session,
     ) -> Result<
-        Option<(
-            HostRequestEnvelope,
-            serde_json::Value,
-            TaskControllerInvocation,
-            TaskControllerAttempt,
-        )>,
+            Option<(
+                HostRequestEnvelope,
+                serde_json::Value,
+                TaskControllerInvocation,
+                TaskControllerAttempt,
+                eliot_protocol::RequestIdentity,
+            )>,
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;
@@ -406,6 +407,27 @@ impl KernelComposition {
                     continue;
                 }
                 let invocation = task_controller_admission(envelope, tool)?;
+                let durable = self
+                    .generation_gateway
+                    .ors
+                    .load_host_request(&candidate.operation_id, &envelope.envelope_sha256)
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                let identity_binding = durable
+                    .kernel_request_identity
+                    .as_ref()
+                    .ok_or(TransportError::SessionFenced)?;
+                let request_identity: eliot_protocol::RequestIdentity =
+                    serde_json::from_str(&identity_binding.canonical_json)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                request_identity
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                if super::host_request_kernel_identity_binding(envelope, &request_identity)?
+                    != *identity_binding
+                {
+                    return Err(TransportError::SessionFenced);
+                }
                 if !self.application_binding_live_for_claim(
                     envelope,
                     &admission_owner,
@@ -467,7 +489,13 @@ impl KernelComposition {
                 attempt
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
-                return Ok(Some((envelope.clone(), tool.clone(), invocation, attempt)));
+                return Ok(Some((
+                    envelope.clone(),
+                    tool.clone(),
+                    invocation,
+                    attempt,
+                    request_identity,
+                )));
             }
         }
         Ok(None)
