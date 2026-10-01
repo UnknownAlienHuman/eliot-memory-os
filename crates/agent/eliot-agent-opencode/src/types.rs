@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, path::Path};
 use eliot_agent_api::{
     AdmittedRouteReceipt, AgentAttempt, AgentAttemptId, AssistantDeltaObservation, AttemptState,
     CONTRACT_VERSION, CancellationState, ClockReading, ContractError, ErrorObservation,
-    EventCursor, EventId, ExecutionOutcome, HOST_EVENT_CONTRACT_VERSION,
+    EventCursor, EventId, ExecutionOutcome, ExecutionUnitObservation, HOST_EVENT_CONTRACT_VERSION,
     HOST_EVENT_DIGEST_ALGORITHM, HOST_EVENT_RAW_BYTES_DIGEST_ALGORITHM,
     HostEventDeliveryDisposition, HostEventNormalizationReceipt, HostEventPrivacyClass,
     LowercaseSha256, NativeSession, NormalizationCoverage, NormalizedHostEventEnvelope,
@@ -13,7 +13,7 @@ use eliot_agent_api::{
     RouteObservationState, SessionLifecycleObservation, SessionLifecycleTransition,
     UnsupportedDisposition, UnsupportedEventObservation, UnsupportedEventReason, UsageReceipt,
     WarningObservation, contains_restricted_source_token, route_divergence_fields,
-    route_fingerprint_digest_for,
+    route_fingerprint_digest_for, stable_event_id_for,
 };
 use eliot_contracts::{
     ResourceGeneration, StateFence, canonical_json_bytes, parse_versioned_sha256_digest, sha256_hex,
@@ -2148,6 +2148,243 @@ pub fn normalize_opencode_event(
     )
 }
 
+/// Restricted-source handle prefix addressing the immutable seal-observation
+/// source record. The per-execution suffix is appended by
+/// [`seal_observation_boundary`], so two executions never share one handle.
+pub const SEAL_OBSERVATION_SOURCE_HANDLE: &str = "restricted-opencode:seal-observation";
+
+/// Bounded cause field for a seal whose run retained no terminal wire event, so
+/// the #371 owner has no validated stream position to bound the route
+/// observation (issue #2902 item 7). Absence of the owner record is reported as
+/// its own typed cause rather than filled with a locally composed cursor and a
+/// synthetic sequence.
+pub const SEAL_OBSERVATION_SOURCE_EVIDENCE: &str = "seal-observation-source-event";
+
+/// The #371 event/cursor position of one seal-time route observation (issue
+/// #2902 item 7).
+///
+/// The boundary is not minted by the adapter: it is the `cursor`/`sequence`
+/// pair of a real [`NormalizedHostEventEnvelope`] that the #371 owner
+/// ([`normalize_opencode_event`]) built and validated for the exact bound
+/// execution unit, read back out of that validated record by
+/// [`SealObservationBoundary::from_owner_envelope`]. A locally formatted string
+/// plus a hardcoded `1` is not a cursor any owner can validate — nothing ties it
+/// to a stream position, so a replayed or reordered event could present the same
+/// value. Removing that synthesis leaves exactly one authority for this boundary.
+///
+/// Exact replay is replay-stable by construction: the same terminal wire event
+/// under the same lineage derives the same owner `event_id` and carries the
+/// same `cursor`/`sequence`, so
+/// [`NormalizedHostEventEnvelope::check_replay_against`] classifies a re-seal as
+/// an idempotent replay. A retry, resume, or fork is a different execution unit
+/// (a new #361 binding, per [`ProviderExecutionBinding`]), so its boundary can
+/// never reset under a colliding message text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SealObservationBoundary {
+    /// Resume cursor from the #371 owner envelope for this stream position.
+    pub cursor: EventCursor,
+    /// Monotonic nonzero sequence from the same #371 owner envelope.
+    pub sequence: u64,
+    /// Owner-minted event identity for the normalized terminal observation.
+    /// Carried so the boundary is traceable to the exact owner record rather
+    /// than to a positional string.
+    pub event_id: EventId,
+    /// Restricted handle addressing the immutable raw source record behind the
+    /// observation. The qualified digest of that source is the owner
+    /// normalization receipt's `input_digest`, already bound into the event
+    /// identity, so the handle is the only bounded reference the sealed
+    /// disposition needs.
+    pub source_handle: RestrictedRawSourceHandle,
+}
+
+impl SealObservationBoundary {
+    /// Builds the seal-time observation boundary from the #371 owner's own
+    /// normalized terminal envelope (issue #2902 item 7).
+    ///
+    /// The cursor and sequence are read from the validated owner envelope,
+    /// never composed here: there is no second format string and no second
+    /// sequence source. The envelope is additionally re-validated against the
+    /// exact #361 binding and #369 admission through the owner's existing
+    /// [`NormalizedHostEventEnvelope::validate_for_lineage`], so a boundary can
+    /// only be produced from an owner-accepted event of this execution unit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenCodeObservationConversionError::Contract`] when the
+    /// envelope is not a valid execution-unit observation under this binding
+    /// and admission — including a session-lifecycle payload, a foreign
+    /// binding, or a lineage/sequence disagreement.
+    pub fn from_owner_envelope(
+        envelope: &NormalizedHostEventEnvelope,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+    ) -> Result<Self, OpenCodeObservationConversionError> {
+        envelope
+            .validate_for_lineage(binding, admission)
+            .map_err(OpenCodeObservationConversionError::Contract)?;
+        if envelope.sequence == 0 {
+            return Err(OpenCodeObservationConversionError::Contract(
+                ContractError::ZeroLimit {
+                    field: "sequence",
+                },
+            ));
+        }
+        Ok(Self {
+            cursor: envelope.cursor.clone(),
+            sequence: envelope.sequence,
+            event_id: envelope.event_id.clone(),
+            source_handle: envelope.raw_source.handle.clone(),
+        })
+    }
+}
+
+/// Resolves the #371 owner boundary for one sealed run (issue #2902 item 7).
+///
+/// `Ok(None)` means the run retained no terminal wire event and therefore has
+/// no real position in its own stream. `Err` carries the exact owner-typed
+/// cause when the terminal event could not be normalized into a valid
+/// execution-unit observation. The sequence is the observed one-based position
+/// of the terminal event among the run's own retained ordered events, so it is
+/// a real stream position and never a constant.
+///
+/// The terminal event is selected through the same [`classify_opencode_event`]
+/// the owner normalizer itself uses, so the selection cannot drift from the
+/// payload the owner seals: a run whose last retained event is not the
+/// `ProviderTerminalObserved` terminal has no boundary here rather than a
+/// boundary over some other event.
+pub fn seal_observation_boundary(
+    admitted: &AdmittedOpenCodeAttempt,
+    events: &[OpenCodeEvent],
+    observed_at: ClockReading,
+) -> Result<Option<SealObservationBoundary>, OpenCodeObservationConversionError> {
+    // Classification is lineage-branch sensitive only (session versus
+    // execution-unit); it reads no cursor or sequence, so one probe lineage
+    // selects the terminal event and the real lineage is built afterwards for
+    // the observed position.
+    let probe = ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+        ExecutionUnitObservation {
+            binding: admitted.binding().clone(),
+            cursor: seal_observation_cursor(admitted, 1)?,
+            sequence: 1,
+        },
+    ));
+    let terminal_position = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            matches!(
+                classify_opencode_event(event, &probe).0,
+                NormalizedHostEventPayload::ProviderTerminalObserved(_)
+            )
+        })
+        .map(|(index, _)| index + 1)
+        .next_back();
+    // A one-based observed position. An absent terminal leaves the run with no
+    // boundary; a position the owner cannot represent is reported as its own
+    // bounded cause rather than silently truncated to a valid sequence.
+    let (Some(terminal_position), Some(sequence)) = (
+        terminal_position,
+        terminal_position.and_then(|position| u64::try_from(position).ok()),
+    ) else {
+        return Ok(None);
+    };
+    let terminal = events.get(terminal_position - 1).ok_or(
+        OpenCodeObservationConversionError::InvalidInput(
+            SEAL_OBSERVATION_SOURCE_EVIDENCE.to_owned(),
+        ),
+    )?;
+    // The immutable source is the canonical JSON bytes of the one terminal
+    // wire event. The #371 owner digests exactly these bytes, so the qualified
+    // digest below is the same value the owner binds into its receipt — the
+    // identity derivation and the owner record cannot diverge.
+    let raw_source_bytes = canonical_json_bytes(terminal)
+        .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?;
+    let handle =
+        RestrictedRawSourceHandle::new(format!(
+            "{SEAL_OBSERVATION_SOURCE_HANDLE}/{}",
+            admitted.attempt().id.as_str()
+        ))
+        .map_err(OpenCodeObservationConversionError::Contract)?;
+    let source_digest = QualifiedSourceDigest {
+        algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
+        digest: serde_json::from_value(Value::String(sha256_hex(&raw_source_bytes))).map_err(
+            |error| OpenCodeObservationConversionError::Serialization(error.to_string()),
+        )?,
+    };
+    // The cursor is the execution-unit position token the #361 binding
+    // correlates (never a binding creator, per
+    // [`ExecutionUnitObservation`]), bound to the exact admitted unit and the
+    // observed position. `event_id` is the #371 owner's own derivation over
+    // that same lineage, position, typed payload, and qualified source digest,
+    // so it is recomputable by any consumer from the envelope rather than
+    // copied from a string this module composed. There is no
+    // `opencode:{sequence}` format and no hardcoded sequence on this path.
+    let cursor = seal_observation_cursor(admitted, sequence)?;
+    let lineage = ProviderObservationLineage::ExecutionUnitObservation(Box::new(
+        ExecutionUnitObservation {
+            binding: admitted.binding().clone(),
+            cursor: cursor.clone(),
+            sequence,
+        },
+    ));
+    // Derive the identity from the payload the classifier actually produces for
+    // this event under this lineage, not from an assumed terminal shape: a
+    // guessed payload would mint an `event_id` the envelope cannot reproduce.
+    let (payload, _, _) = classify_opencode_event(terminal, &lineage);
+    let event_id = stable_event_id_for(
+        OPENCODE_NORMALIZER_IDENTITY,
+        OPENCODE_NORMALIZER_VERSION,
+        &lineage,
+        sequence,
+        &payload,
+        &source_digest,
+    )
+    .map_err(OpenCodeObservationConversionError::Contract)?;
+    let (envelope, _receipt) = normalize_opencode_event(OpenCodeHostEventInput {
+        event: terminal,
+        event_id,
+        cursor,
+        sequence,
+        predecessors: Vec::new(),
+        lineage,
+        raw_source_bytes: &raw_source_bytes,
+        raw_source_handle: handle,
+        observed_at,
+        delivery: HostEventDeliveryDisposition::BestEffortOrdered,
+        admission: Some(admitted.admission()),
+    })?;
+    SealObservationBoundary::from_owner_envelope(
+        &envelope,
+        admitted.binding(),
+        admitted.admission(),
+    )
+    .map(Some)
+}
+
+/// Execution-unit position token for the seal observation, bound to the exact
+/// admitted unit and the observed stream position.
+///
+/// It is a correlation token, never authority: [`ExecutionUnitObservation`]
+/// states that the cursor never creates a binding and only correlates to the
+/// binding carried beside it. It is a pure function of the admitted attempt
+/// identity and the observed position, so the same execution re-sealing the
+/// same position reproduces it exactly (idempotent replay), while a retry,
+/// resume, or fork — a different #361 binding and therefore a different
+/// attempt — can never collide with it.
+fn seal_observation_cursor(
+    admitted: &AdmittedOpenCodeAttempt,
+    sequence: u64,
+) -> Result<EventCursor, OpenCodeObservationConversionError> {
+    EventCursor::new(format!(
+        "{}:{}:{}",
+        admitted.binding().attempt_id.as_str(),
+        admitted.binding().execution_unit.unit_id.as_str(),
+        sequence
+    ))
+    .map_err(OpenCodeObservationConversionError::Contract)
+}
+
 /// Classify `session.status` wire events by their inner status kind.
 fn classify_session_status_event(event: &OpenCodeEvent) -> ClassifiedOpenCodeEvent {
     let warnings = Vec::new();
@@ -2787,14 +3024,15 @@ pub enum SealedRouteDisposition {
     },
     /// The route observation is unprocessable after provider work may have
     /// dispatched (`Serialization`/`InvalidInput` conversion cause, or no
-    /// observed terminal wall time exists to bound an `Observed` receipt).
-    /// Carries the last observation boundary that would have applied, the
-    /// exact typed cause, whatever wire evidence digest survived, and the
-    /// passive reconciliation handle — per #369 A18/A20 this seals unknown,
-    /// never retried, cancelled, or completed here.
+    /// observed terminal wall time / terminal wire event exists to bound an
+    /// `Observed` receipt). Carries the last #371 owner boundary that would
+    /// have applied — `None` exactly when the owner has no validated position
+    /// for this unit, never a locally formatted placeholder — the exact typed
+    /// cause, whatever wire evidence digest survived, and the passive
+    /// reconciliation handle — per #369 A18/A20 this seals unknown, never
+    /// retried, cancelled, or completed here.
     UnknownOutcome {
-        last_cursor: EventCursor,
-        last_sequence: u64,
+        boundary: Option<SealObservationBoundary>,
         cause: OpenCodeObservationConversionError,
         wire_evidence_digest: Option<LowercaseSha256>,
         wire_evidence_ref: Option<String>,
@@ -3020,14 +3258,16 @@ impl SealedRouteDisposition {
                 Some(Value::String(receipt.event_cursor.as_str().to_owned())),
                 Some(Value::from(receipt.event_sequence)),
             ),
-            Self::UnknownOutcome {
-                last_cursor,
-                last_sequence,
-                ..
-            } => (
-                Some(Value::String(last_cursor.as_str().to_owned())),
-                Some(Value::from(*last_sequence)),
-            ),
+            // Only the #371 owner's boundary is published. An unknown outcome
+            // with no owner-validated position publishes absence, never a
+            // placeholder the adapter composed (issue #2902 item 7).
+            Self::UnknownOutcome { boundary, .. } => match boundary {
+                Some(boundary) => (
+                    Some(Value::String(boundary.cursor.as_str().to_owned())),
+                    Some(Value::from(boundary.sequence)),
+                ),
+                None => (None, None),
+            },
             Self::RejectedConflict { .. } | Self::LegacyUnverified { .. } => (None, None),
         };
         (recovery_ref, observation_cursor, observation_sequence)

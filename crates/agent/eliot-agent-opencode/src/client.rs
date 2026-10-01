@@ -5,13 +5,12 @@ use crate::{
     LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
     OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
     OpenCodeObservationConversionError, OpenCodeWireRouteReceipt, PhysicalObservationBody,
-    ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus,
-    SealedRouteDisposition, Session, SessionDiff, SessionStatus, SessionStatusMap, SseConnection,
-    SseDecodeError, SseDecoder, SseEvent, SseLimits, UnknownFields, UsageAvailability,
-    UsageTelemetry, bound_session_identity, committed_message_id, wire_receipt_evidence,
-    wire_route_locator,
+    SEAL_OBSERVATION_SOURCE_EVIDENCE, SealedRouteDisposition, Session, SessionDiff, SessionStatus,
+    SessionStatusMap, SseConnection, SseDecodeError, SseDecoder, SseEvent, SseLimits,
+    UnknownFields, UsageAvailability, UsageTelemetry, bound_session_identity, committed_message_id,
+    seal_observation_boundary, wire_receipt_evidence, wire_route_locator,
 };
-use eliot_agent_api::{EventCursor, ExecutionOutcome};
+use eliot_agent_api::ExecutionOutcome;
 use eliot_contracts::{ClockReading, ResourceGeneration, StateFence};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1635,19 +1634,6 @@ impl OpenCodeClient {
     }
 }
 
-/// Seal-time observation sequence (issue #2902 item 7): exactly one seal
-/// observation exists per admitted attempt/message pair, so the sequence is
-/// constant. Uniqueness across retry/resume/fork comes from the cursor, which
-/// binds the exact attempt identity — a new turn (including resume/fork) is a
-/// new agent attempt with its own cursor (per the #361 binding cardinality),
-/// so no second execution can reset this sequence under a colliding message
-/// text. Exact replay (same attempt, same message) returns the same
-/// cursor/sequence and reconciles idempotently through
-/// [`PhysicalRouteObservationReceipt::validate_replay_against`].
-/// Stream-level resume cursors remain the #371 event owner and are never
-/// minted here.
-const SEAL_OBSERVATION_SEQUENCE: u64 = 1;
-
 /// Computes the typed seal-time route-observation disposition for one
 /// admitted run (issue #2902).
 ///
@@ -1661,7 +1647,7 @@ const SEAL_OBSERVATION_SEQUENCE: u64 = 1;
 /// reconciled assistant completion timestamp (`observed_completed_at_ms` in
 /// the run extra); when absent the run observed no terminal wall time, so no
 /// `Observed` receipt can be minted honestly and the disposition seals
-/// `UnknownOutcome` with the last boundary and the reconciliation handle.
+/// `UnknownOutcome` with the exact cause and the reconciliation handle.
 ///
 /// Before conversion, the wire session identity is joined to the exact
 /// execution owner (issue #2902 item 4): an `Observed` wire receipt whose
@@ -1670,19 +1656,17 @@ const SEAL_OBSERVATION_SEQUENCE: u64 = 1;
 /// provider/model/endpoint/version match. Workspace, directory, and endpoint
 /// values stay non-authoritative evidence (endpoint loopback shape is still
 /// enforced by wire validation); they never join as identity.
+///
+/// The observation boundary itself is the #371 owner's value (issue #2902 item
+/// 7): [`seal_observation_boundary`] selects the run's own terminal wire event
+/// and normalizes it through the closed v7 owner, returning that validated
+/// envelope's cursor/sequence. This module formats no cursor and holds no
+/// sequence constant, so a retry/resume/fork cannot reset the boundary under a
+/// colliding message text and a replayed event cannot re-present it.
 fn seal_route_disposition(
     admitted: &AdmittedOpenCodeAttempt,
     run: &NoAuthorityRunResult,
-    message_id: &str,
 ) -> Result<SealedRouteDisposition, AdmittedAttemptError> {
-    let event_cursor = EventCursor::new(format!(
-        "opencode-sealed/{}/{}",
-        admitted.attempt().id.as_str(),
-        message_id
-    ))
-    .map_err(|_| AdmittedAttemptError::SealRejected {
-        reason: "seal observation cursor is not a valid event cursor",
-    })?;
     if run.actual_route.is_observed() {
         let bound_session = bound_session_identity(admitted.binding());
         let session_agrees = match (
@@ -1713,8 +1697,7 @@ fn seal_route_disposition(
     let Some(terminal_ms) = terminal_ms else {
         let (wire_evidence_digest, wire_evidence_ref) = wire_receipt_evidence(&run.actual_route);
         return Ok(SealedRouteDisposition::UnknownOutcome {
-            last_cursor: event_cursor,
-            last_sequence: SEAL_OBSERVATION_SEQUENCE,
+            boundary: None,
             cause: OpenCodeObservationConversionError::InvalidInput(
                 "observed_completed_at_ms".to_owned(),
             ),
@@ -1729,6 +1712,38 @@ fn seal_route_disposition(
         transaction_sequence: None,
         monotonic_ns: None,
     };
+    // The boundary is resolved through the #371 owner before canonical
+    // conversion, so the receipt and every later consumer read the owner's
+    // cursor/sequence. A run that retained no terminal event has no real
+    // position in its own stream and therefore no owner boundary: it seals
+    // `UnknownOutcome` with the exact cause rather than minting one.
+    let boundary = match seal_observation_boundary(admitted, &run.events, terminal) {
+        Ok(Some(boundary)) => boundary,
+        Ok(None) => {
+            let (wire_evidence_digest, wire_evidence_ref) =
+                wire_receipt_evidence(&run.actual_route);
+            return Ok(SealedRouteDisposition::UnknownOutcome {
+                boundary: None,
+                cause: OpenCodeObservationConversionError::InvalidInput(
+                    SEAL_OBSERVATION_SOURCE_EVIDENCE.to_owned(),
+                ),
+                wire_evidence_digest,
+                wire_evidence_ref,
+                reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
+            });
+        }
+        Err(cause) => {
+            let (wire_evidence_digest, wire_evidence_ref) =
+                wire_receipt_evidence(&run.actual_route);
+            return Ok(SealedRouteDisposition::UnknownOutcome {
+                boundary: None,
+                cause,
+                wire_evidence_digest,
+                wire_evidence_ref,
+                reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
+            });
+        }
+    };
     match admitted.observe_physical_route(
         &run.actual_route,
         PhysicalObservationBody {
@@ -1737,8 +1752,8 @@ fn seal_route_disposition(
             first_byte: ClockReading::default(),
             first_semantic: ClockReading::default(),
             terminal,
-            event_cursor: event_cursor.clone(),
-            event_sequence: SEAL_OBSERVATION_SEQUENCE,
+            event_cursor: boundary.cursor.clone(),
+            event_sequence: boundary.sequence,
             cancellation: None,
         },
     ) {
@@ -1762,8 +1777,7 @@ fn seal_route_disposition(
                 OpenCodeObservationConversionError::Serialization(_)
                 | OpenCodeObservationConversionError::InvalidInput(_) => {
                     Ok(SealedRouteDisposition::UnknownOutcome {
-                        last_cursor: event_cursor,
-                        last_sequence: SEAL_OBSERVATION_SEQUENCE,
+                        boundary: Some(boundary),
                         cause,
                         wire_evidence_digest,
                         wire_evidence_ref,
@@ -1847,7 +1861,7 @@ fn seal_admitted_outcome(
     // conflict does not erase the retained provider output: the candidate
     // still seals below, but under a digest-bound conflict disposition rather
     // than an indistinguishable stronger success.
-    let route = seal_route_disposition(admitted, &run, message_id)?;
+    let route = seal_route_disposition(admitted, &run)?;
     // The disposition summary rides the run extra before sealing, so the
     // candidate `result_digest` binds the final route disposition, its
     // evidence/recovery references, and the #2645 staging columns: a consumer
