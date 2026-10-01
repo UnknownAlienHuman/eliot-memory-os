@@ -563,6 +563,16 @@ fn validate_admission(
             "productive testd material is missing its durable stage identity".to_owned(),
         ));
     }
+    if admission.profile == eliot_testd_core::TESTD_PRODUCTIVE_PROFILE
+        && admission
+            .stage_request
+            .as_ref()
+            .is_some_and(|stage| stage.provider_freshness.is_none())
+    {
+        return Err(TestdMaterialError::Contract(
+            "productive testd material is missing its provider freshness issuer record".to_owned(),
+        ));
+    }
     validate_wire_digest(
         &admission.profile_binding_digest,
         "testd_material.profile_binding_digest",
