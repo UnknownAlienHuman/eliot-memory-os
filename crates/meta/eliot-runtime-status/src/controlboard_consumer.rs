@@ -1105,7 +1105,7 @@ fn render_provenance_ref(
         counterparty: counterparty.to_owned(),
         direction: direction.to_owned(),
         attribution: attribution_label(attribution).to_owned(),
-        receipt_ref: receipt_ref.clone(),
+        receipt_ref: receipt_ref.cloned(),
     }
 }
 

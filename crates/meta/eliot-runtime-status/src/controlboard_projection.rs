@@ -889,7 +889,9 @@ pub fn read_review_detail(
     review_id: &str,
 ) -> Result<ControlBoardReviewDetail, ControlBoardReviewDetailError> {
     bound_subject(review_id, "review_detail.review_id")?;
-    let view = board.view(request).map_err(|error| map_detail_read_error(&error))?;
+    let view = board
+        .view(request)
+        .map_err(|error| map_detail_read_error(&error))?;
     let review = view
         .reviews
         .iter()
@@ -955,7 +957,9 @@ pub fn read_review_batch_status(
     board: &mut ControlBoard,
     request: &ReadRequest,
 ) -> Result<ControlBoardReviewBatchStatus, ControlBoardReviewDetailError> {
-    let view = board.view(request).map_err(|error| map_detail_read_error(&error))?;
+    let view = board
+        .view(request)
+        .map_err(|error| map_detail_read_error(&error))?;
     let revision = view.revision.get();
     let mut items = Vec::with_capacity(view.reviews.len());
     let mut outstanding_ids = Vec::new();
@@ -1012,7 +1016,9 @@ pub fn read_code_provenance(
     code_id: &str,
 ) -> Result<ControlBoardCodeProvenance, ControlBoardReviewDetailError> {
     bound_subject(code_id, "code_provenance.code_id")?;
-    let view = board.view(request).map_err(|error| map_detail_read_error(&error))?;
+    let view = board
+        .view(request)
+        .map_err(|error| map_detail_read_error(&error))?;
     let revision = view.revision.get();
     let refs = provenance_refs_for(&view, code_id, "code_provenance.refs")?;
     let gaps = if refs.is_empty() {
