@@ -634,9 +634,13 @@ impl PooledSession {
     ) -> Result<RpcResults, AdapterError> {
         let (statement, bindings, prefix_len) = json_codec::encode_bindings(statement, bindings)?;
         let params = json!([statement, Value::Object(bindings)]);
-        let value = match ceiling {
-            Some(ceiling) => self.session().request_bounded(operation, "query", params, ceiling).await?,
-            None => self.session().request(operation, "query", params).await?,
+        let value = if let Some(ceiling) = ceiling {
+            self.session()
+                .request_bounded(operation, "query", params, ceiling)
+                .await?
+        } else {
+            self.session().request(operation, "query", params).await?
+        };
         };
         let mut results = RpcResults::from_value(&value)?;
         if results.values_len() < prefix_len {
