@@ -6032,7 +6032,8 @@ impl TestdStore {
             .into_iter()
             .filter(|candidate| {
                 !is_testd_executor_profile(&candidate.invocation.profile)
-                    || candidate.verifier_dispatch.is_some()
+                    || (candidate.verifier_dispatch.is_some()
+                        && candidate.blob_process_stream_grant.is_some())
             })
             .filter(|candidate| {
                 // A background job may not consume the capacity reserved for

@@ -1052,6 +1052,26 @@ impl KernelBlobStreamCallSequence {
         )
         .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
         let operation_sha256 = request.operation_sha256.clone();
+        if let Some(existing) = self
+            .store
+            .resolve_blob_process_stream_call_at_token_head(
+                &self.job_id,
+                &self.capability.reference,
+            )
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+        {
+            drop(tokens);
+            // A current token with an existing call row has already been
+            // consumed or reserved. Recover only that exact retained result;
+            // never bind the token to this newly constructed semantic body.
+            return self.reconcile_exact(
+                BlobProcessStreamCallToken {
+                    reference: existing.token_ref,
+                    ordinal: existing.ordinal,
+                },
+                &existing.operation_sha256,
+            );
+        }
         let call_state = self
             .store
             .reserve_blob_process_stream_call(
@@ -1062,16 +1082,22 @@ impl KernelBlobStreamCallSequence {
                 &operation_sha256,
             )
             .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
-        if matches!(call_state, TestdBlobProcessStreamReserve::Reserved) {
-            self.store
-                .mark_blob_process_stream_call_dispatched(
-                    &self.job_id,
-                    &self.capability.reference,
-                    &token.reference,
-                    token.ordinal,
-                    &operation_sha256,
-                )
-                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        match call_state {
+            TestdBlobProcessStreamReserve::Reserved => {
+                self.store
+                    .mark_blob_process_stream_call_dispatched(
+                        &self.job_id,
+                        &self.capability.reference,
+                        &token.reference,
+                        token.ordinal,
+                        &operation_sha256,
+                    )
+                    .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+            }
+            TestdBlobProcessStreamReserve::Replay(_) => {
+                drop(tokens);
+                return self.reconcile_exact(token, &operation_sha256);
+            }
         }
         let response = self.client.exchange(
             self.capability.clone(),
@@ -1080,14 +1106,12 @@ impl KernelBlobStreamCallSequence {
             &self.job_id,
         )?;
         let compact_outcome = match &response.outcome {
-            BlobProcessStreamKernelOutcome::Completed { .. } => {
+            BlobProcessStreamKernelOutcome::Completed { response_ref, .. } => {
                 let response_bytes = canonical_json_bytes(&response)
                     .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
                 TestdBlobProcessStreamCallOutcome::Completed {
                     response_sha256: sha256_hex(&response_bytes),
-                    // This is the real retained ORS call-result reference
-                    // echoed in its authenticated token receipt.
-                    response_ref: Some(response.call_token.reference.clone()),
+                    response_ref: Some(response_ref.clone()),
                 }
             }
             BlobProcessStreamKernelOutcome::NotStarted { .. } => {
@@ -1124,6 +1148,142 @@ impl KernelBlobStreamCallSequence {
                     &token.reference,
                     token.ordinal,
                     &operation_sha256,
+                    compact_outcome,
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        }
+        Ok(response)
+    }
+
+    /// Observes the retained Kernel result for this exact previously consumed
+    /// call. This method never sends the original Store operation.
+    pub fn reconcile(
+        &self,
+        token: BlobProcessStreamCallToken,
+        operation_sha256: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let request = eliot_blob_api::wire::BlobProcessStreamKernelReconcileRequest {
+            wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID.to_owned(),
+            wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION,
+            capability: self.capability.clone(),
+            call_token: token,
+            operation_sha256: operation_sha256.to_owned(),
+        };
+        request
+            .validate()
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let response = self
+            .client
+            .lock()
+            .map_err(|_| TestdIpcError::Transport("Kernel client lock poisoned".to_owned()))?
+            .blob_process_stream_reconcile(request.clone())
+            .map_err(|error| match error {
+                KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
+                    job_id: self.job_id.clone(),
+                    request_digest: operation_sha256.to_owned(),
+                },
+                other => TestdIpcError::Transport(other.to_string()),
+            })?;
+        response
+            .validate_for_reconcile(&request)
+            .map_err(|_| TestdIpcError::UnknownOutcome {
+                job_id: self.job_id.clone(),
+                request_digest: operation_sha256.to_owned(),
+            })?;
+        Ok(response)
+    }
+
+    /// Reconciles the exact call attached to the durable current token head.
+    /// No semantic operation is constructed or dispatched on this path.
+    pub fn reconcile_current_call(
+        &self,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _tokens = self
+            .tokens
+            .lock()
+            .map_err(|_| TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned()))?;
+        let record = self
+            .store
+            .resolve_blob_process_stream_call_at_token_head(
+                &self.job_id,
+                &self.capability.reference,
+            )
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?
+            .ok_or_else(|| {
+                TestdIpcError::Transport(
+                    "the durable current Blob token has no consumed call to reconcile".to_owned(),
+                )
+            })?;
+        drop(_tokens);
+        self.reconcile_exact(
+            BlobProcessStreamCallToken {
+                reference: record.token_ref,
+                ordinal: record.ordinal,
+            },
+            &record.operation_sha256,
+        )
+    }
+
+    fn reconcile_exact(
+        &self,
+        token: BlobProcessStreamCallToken,
+        operation_sha256: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let response = self
+            .client
+            .reconcile(
+                self.capability.clone(),
+                token.clone(),
+                operation_sha256,
+            )?;
+        let compact_outcome = match &response.outcome {
+            BlobProcessStreamKernelOutcome::Completed { response_ref, .. } => {
+                let response_bytes = canonical_json_bytes(&response)
+                    .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+                TestdBlobProcessStreamCallOutcome::Completed {
+                    response_sha256: sha256_hex(&response_bytes),
+                    response_ref: Some(response_ref.clone()),
+                }
+            }
+            BlobProcessStreamKernelOutcome::NotStarted { .. } => {
+                TestdBlobProcessStreamCallOutcome::NotStarted
+            }
+            BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+                TestdBlobProcessStreamCallOutcome::Unknown
+            }
+            BlobProcessStreamKernelOutcome::Unknown { .. } => {
+                TestdBlobProcessStreamCallOutcome::Unknown
+            }
+        };
+        if let Some(next_token) = response.next_call_token.as_ref() {
+            self.store
+                .complete_blob_process_stream_call_and_advance(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    operation_sha256,
+                    compact_outcome,
+                    TestdBlobProcessStreamTokenRef {
+                        reference: next_token.reference.clone(),
+                        ordinal: next_token.ordinal,
+                    },
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+            let mut tokens = self
+                .tokens
+                .lock()
+                .map_err(|_| TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned()))?;
+            tokens.clear();
+            tokens.push_back(next_token.clone());
+        } else {
+            self.store
+                .complete_blob_process_stream_call(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    operation_sha256,
                     compact_outcome,
                 )
                 .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
@@ -1313,15 +1473,8 @@ impl KernelProcessStreamSinkClient {
         outcome: ProcessStreamSinkUnknownOutcome,
     ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
         outcome.validate_against_session(&session)?;
-        let operation = BlobProcessStreamKernelOperationRequest::SinkReconcile {
-            binding: self.binding_for_session(&session)?,
-            body: Box::new(serde_json::to_value(&outcome).map_err(|_| sink_invalid())?),
-            deadline_ms: self
-                .calls
-                .deadline_for_budget(2_000)
-                .map_err(map_sink_ipc_error)?,
-        };
-        let response = self.calls.exchange(operation).map_err(map_sink_ipc_error)?;
+        let response = self.calls.reconcile_current_call()
+            .map_err(map_sink_ipc_error)?;
         let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
         let ProcessStreamSinkWireResponse::Readback { body } = owner else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);

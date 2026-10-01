@@ -144,6 +144,103 @@ pub trait VerifiedStreamReplayPort: Send + Sync {
     ) -> Result<eliot_instrument_runner::ProfileReplayReceipt, String>;
 }
 
+/// Builds a fresh parser/evaluator context from the authenticated owner facts
+/// that accompanied this exact stored-byte readback. No launch-time registry
+/// object or scalar stage projection is reused as current authority.
+pub struct KernelReadbackVerifiedReplay;
+
+impl VerifiedStreamReplayPort for KernelReadbackVerifiedReplay {
+    fn replay_stream(
+        &self,
+        stage: &eliot_testd_core::InstrumentStageRequest,
+        source: &TestdStreamEvidenceBinding,
+        bytes: &EphemeralSourceBytes,
+        observations: &TestdReplayObservedInputs,
+        terminal: Option<&ExitStatus>,
+        started_at: ClockReading,
+        finished_at: ClockReading,
+    ) -> Result<eliot_instrument_runner::ProfileReplayReceipt, String> {
+        let owner = bytes.replay_owner_readback();
+        owner
+            .validate()
+            .map_err(|error| format!("fresh owner readback failed canonical validation: {error}"))?;
+        let owner_facts: eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts =
+            serde_json::from_str(&owner.owner_facts_json)
+                .map_err(|error| format!("fresh Kernel owner facts are not typed JSON: {error}"))?;
+        owner_facts
+            .validate()
+            .map_err(|error| format!("fresh Kernel owner facts were refused: {error}"))?;
+        let owner_grant = observations
+            .blob_process_stream_grant
+            .as_ref()
+            .ok_or_else(|| "productive job has no durable Blob owner grant".to_owned())?;
+        let job_currentness = eliot_contracts::canonical_json_bytes(&(
+            &stage.provider_freshness,
+            &stage.provider_catalog_lifecycle,
+            &observations.tools,
+            &observations.submitted_environment,
+        ))
+        .map_err(|error| format!("job currentness tuple is not canonical: {error}"))?;
+        let process_binding_sha256 = sha256_hex(
+            &eliot_contracts::canonical_json_bytes(&source.binding)
+                .map_err(|error| format!("process binding is not canonical: {error}"))?,
+        );
+        let fence_sha256 = sha256_hex(
+            &eliot_contracts::canonical_json_bytes(source.binding.state_fence())
+                .map_err(|error| format!("process fence is not canonical: {error}"))?,
+        );
+        if owner.owner_facts_sha256 != owner_grant.owner_facts_sha256
+            || owner.work_scope_binding_sha256 != owner_grant.work_scope_snapshot_sha256
+            || owner.module_catalog_owner_readback_sha256
+                != owner_grant.module_catalog_owner_readback_sha256
+            || owner.generation_admission_sha256 != owner_grant.generation_admission_sha256
+            || owner_facts.currentness_sha256 != owner_grant.owner_currentness_sha256
+            || owner_facts.policy_sha256 != owner_grant.policy_sha256
+            || process_binding_sha256 != owner_grant.process_binding_sha256
+            || fence_sha256 != owner_grant.fence_sha256
+            || sha256_hex(&job_currentness) != owner_grant.job_currentness_sha256
+        {
+            return Err("fresh owner PULL no longer matches the immutable launch grant".to_owned());
+        }
+        let expected_fence = source.binding.state_fence();
+        let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry(
+            stage.registry_generation,
+        )
+        .map_err(|error| format!("current closed TestD profile registry refused: {error}"))?;
+        let replay = eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
+            profile_registry,
+            expected_fence,
+            owner.module_catalog_owner_readback_json.as_bytes(),
+            &owner.module_catalog_owner_readback_sha256,
+            owner.generation_admission_json.as_bytes(),
+            &owner.generation_admission_sha256,
+            owner_facts.work_scope_binding_json.as_bytes(),
+            &owner_facts.work_scope_binding_sha256,
+        )
+        .map_err(|error| format!("fresh owner/catalog replay context refused: {error}"))?;
+        let replay_observations = eliot_instrument_runner::ReplayObservedInputs {
+            source: observations.source.clone(),
+            tools: observations.tools.clone(),
+            environment: observations.environment.clone(),
+            cargo_lock_sha256: observations.cargo_lock_sha256.clone(),
+            lane_fingerprint_digest: observations.lane_fingerprint_digest.clone(),
+            normative_pair_receipt: observations.normative_pair_receipt.clone(),
+            required_test_ids: observations.required_test_ids.clone(),
+        };
+        replay
+            .replay_stream(
+                stage,
+                source,
+                bytes,
+                terminal,
+                started_at,
+                finished_at,
+                &replay_observations,
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Actual replay-time observations supplied by the productive TestD worker.
 /// Registry/profile freshness values are intentionally absent; the replay
 /// owner combines these measured inputs with its authenticated catalog and
@@ -172,6 +269,9 @@ pub struct TestdReplayObservedInputs {
     /// Exact admitted lane fingerprint digest, rederived from the durable
     /// work envelope and paired with the fresh before/after Git observation.
     pub lane_fingerprint_digest: String,
+    /// Exact immutable owner projection persisted on the claimed job. Fresh
+    /// readback values are compared to it before context construction.
+    pub blob_process_stream_grant: Option<eliot_testd_core::TestdBlobProcessStreamGrant>,
 }
 
 impl<'a, E: ?Sized> GovernedContour<'a, E> {
@@ -913,7 +1013,6 @@ fn build_replay_observed_inputs(
             reason: "the admitted Cargo.lock is empty at replay time",
         });
     }
-    const MAX_NORMATIVE_PAIR_RECEIPT_BYTES: usize = 16 * 1024;
     let normative_pair_receipt = std::fs::read(
         Path::new(&job.target_roots.source_root).join("docs/normative-pair.toml"),
     )
@@ -922,7 +1021,8 @@ fn build_replay_observed_inputs(
         reason: "the exact normative-pair receipt cannot be reread before replay",
     })?;
     if normative_pair_receipt.is_empty()
-        || normative_pair_receipt.len() > MAX_NORMATIVE_PAIR_RECEIPT_BYTES
+        || normative_pair_receipt.len()
+            > eliot_bootstrap::normative::MAX_NORMATIVE_PAIR_RECEIPT_BYTES
     {
         return Err(TestdError::Invalid {
             field: "provider_currentness.normative_pair",
@@ -947,6 +1047,11 @@ fn build_replay_observed_inputs(
         .fingerprint
         .digest()
         .map_err(|_| TestdError::InvalidBinding)?;
+    let blob_process_stream_grant = Some(
+        job.blob_process_stream_grant
+            .clone()
+            .ok_or(TestdError::InvalidBinding)?,
+    );
     Ok(TestdReplayObservedInputs {
         source: source.clone(),
         tools,
@@ -956,6 +1061,7 @@ fn build_replay_observed_inputs(
         normative_pair_receipt,
         required_test_ids,
         lane_fingerprint_digest,
+        blob_process_stream_grant,
     })
 }
 
