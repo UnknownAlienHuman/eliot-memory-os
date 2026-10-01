@@ -9027,6 +9027,23 @@ impl HostComposition {
                     .to_owned(),
             ));
         }
+        // I7.2 durable envelope (issue #1875): the relaunched Kernel is a new
+        // authenticated pipe, so the restart is not complete until the durable
+        // reactive outbox is reconciled and re-driven against it. Reconcile
+        // first so attempted-but-unknown entries settle before never-sent
+        // entries replay with their stored identity; a failed pass leaves the
+        // restart unacknowledged for manual recovery instead of reporting
+        // receipt over a dropped stream.
+        self.reconcile_reactive_context_after_restart()
+            .map_err(|error| {
+                HostError::RecoveryRequired(format!(
+                    "reactive restart reconciliation failed: {error}"
+                ))
+            })?;
+        self.replay_reactive_context_after_reconnect()
+            .map_err(|error| {
+                HostError::RecoveryRequired(format!("reactive reconnect replay failed: {error}"))
+            })?;
         let ready_digest = PlatformHandle::new(sha256_json(&ready_receipt)?)
             .map_err(|error| HostError::Platform(error.to_string()))?;
         let activation_digest = PlatformHandle::new(sha256_json(&activation_receipt)?)
