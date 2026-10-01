@@ -5069,6 +5069,18 @@ pub const OPENCODE_BOOTSTRAP_TTL_MS: u64 = 5_000;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenCodeProcessBinding {
+    /// Exact process ID observed by the Broker when the introduction is minted.
+    pub process_id: u32,
+    /// Exact Windows process start instant for `process_id`.
+    pub process_start_time_100ns: u64,
+    /// Exact image path observed for the bound process.
+    pub image_path: String,
+    /// Exact admitted installation adapter artifact digest.
+    pub adapter_artifact_digest: String,
+    /// Exact admitted adapter capability descriptor digest.
+    pub adapter_descriptor_digest: String,
+    /// Exact protected User Broker installation profile digest.
+    pub installation_profile_digest: String,
     /// Lowercase SHA-256 hex of the exact approved `OpenCode` executable.
     pub executable_digest: String,
     /// Broker-minted launch nonce binding this introduction to one launch.
@@ -5079,6 +5091,22 @@ pub struct OpenCodeProcessBinding {
 
 impl OpenCodeProcessBinding {
     fn validate(&self) -> Result<(), BrokerError> {
+        if self.process_id == 0 || self.process_start_time_100ns == 0 {
+            return Err(BrokerError::InvalidField("introduction.process_binding.identity"));
+        }
+        text(&self.image_path, "introduction.process_binding.image_path")?;
+        hex_digest(
+            &self.adapter_artifact_digest,
+            "introduction.process_binding.adapter_artifact_digest",
+        )?;
+        hex_digest(
+            &self.adapter_descriptor_digest,
+            "introduction.process_binding.adapter_descriptor_digest",
+        )?;
+        hex_digest(
+            &self.installation_profile_digest,
+            "introduction.process_binding.installation_profile_digest",
+        )?;
         hex_digest(
             &self.executable_digest,
             "introduction.process_binding.executable_digest",
@@ -5184,6 +5212,12 @@ pub struct OpenCodeSessionFacts {
     pub bridge_generation: Generation,
     pub launch_nonce: String,
     pub executable_digest: String,
+    pub process_id: u32,
+    pub process_start_time_100ns: u64,
+    pub image_path: String,
+    pub adapter_artifact_digest: String,
+    pub adapter_descriptor_digest: String,
+    pub installation_profile_digest: String,
 }
 
 fn validate_opencode_endpoint(value: &str) -> Result<(), BrokerError> {
@@ -5244,6 +5278,12 @@ struct OpenCodeIntroductionDigest<'a> {
     expires_at: u64,
     revocation_id: &'a str,
     executable_digest: &'a str,
+    process_id: u32,
+    process_start_time_100ns: u64,
+    image_path: &'a str,
+    adapter_artifact_digest: &'a str,
+    adapter_descriptor_digest: &'a str,
+    installation_profile_digest: &'a str,
     launch_nonce: &'a str,
     parent_broker_process_id: &'a str,
 }
@@ -5270,6 +5310,12 @@ impl OpenCodeBridgeIntroduction {
             expires_at: params.expires_at,
             revocation_id: params.revocation_id.as_str(),
             executable_digest: params.process_binding.executable_digest.as_str(),
+            process_id: params.process_binding.process_id,
+            process_start_time_100ns: params.process_binding.process_start_time_100ns,
+            image_path: params.process_binding.image_path.as_str(),
+            adapter_artifact_digest: params.process_binding.adapter_artifact_digest.as_str(),
+            adapter_descriptor_digest: params.process_binding.adapter_descriptor_digest.as_str(),
+            installation_profile_digest: params.process_binding.installation_profile_digest.as_str(),
             launch_nonce: params.process_binding.launch_nonce.as_str(),
             parent_broker_process_id: params.process_binding.parent_broker_process_id.as_str(),
         })
@@ -5466,6 +5512,13 @@ impl OpenCodeBridgeIntroduction {
             || self.bridge_generation != observed.bridge_generation
             || self.process_binding.launch_nonce != observed.launch_nonce
             || self.process_binding.executable_digest != observed.executable_digest
+            || self.process_binding.process_id != observed.process_id
+            || self.process_binding.process_start_time_100ns
+                != observed.process_start_time_100ns
+            || self.process_binding.image_path != observed.image_path
+            || self.process_binding.adapter_artifact_digest != observed.adapter_artifact_digest
+            || self.process_binding.adapter_descriptor_digest != observed.adapter_descriptor_digest
+            || self.process_binding.installation_profile_digest != observed.installation_profile_digest
         {
             return Err(BrokerError::StaleRegistrationIdentity);
         }
@@ -6933,6 +6986,82 @@ mod tests {
             NonZeroU64::new(sequence).expect("non-zero test sequence"),
         )
         .expect("valid test epoch")
+    }
+
+    fn issue_1935_opencode_process_binding() -> OpenCodeProcessBinding {
+        OpenCodeProcessBinding {
+            process_id: 4120,
+            process_start_time_100ns: 8_811_209,
+            image_path: r"C:\Users\owner\AppData\Local\Programs\OpenCode\opencode.exe".to_owned(),
+            adapter_artifact_digest: "a".repeat(64),
+            adapter_descriptor_digest: "b".repeat(64),
+            installation_profile_digest: "c".repeat(64),
+            executable_digest: "d".repeat(64),
+            launch_nonce: "broker-launch-42".to_owned(),
+            parent_broker_process_id: "4000".to_owned(),
+        }
+    }
+
+    #[test]
+    fn issue_1935_signed_adapter_introduction_binds_original_process_and_descriptor() {
+        let params = OpenCodeIntroductionParams {
+            installation_id: "installation-1".to_owned(),
+            windows_sid: "S-1-5-21-1-2-3-1001".to_owned(),
+            interactive_session_id: "session-1".to_owned(),
+            broker_generation: Generation::new(1).expect("generation"),
+            bridge_generation: Generation::new(1).expect("generation"),
+            endpoint: "http://127.0.0.1:49152".to_owned(),
+            server_identity: "e".repeat(64),
+            bootstrap_channel: None,
+            credential: SecretRef::new("opencode-bridge", "generation-1")
+                .expect("secret reference"),
+            credential_expires_at: 2_000,
+            allowed_capabilities: OPENCODE_BRIDGE_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            authority_epoch: test_epoch(7),
+            fence_id: "fence-1".to_owned(),
+            issued_at: 1_000,
+            expires_at: 3_000,
+            revocation_id: "revocation-1".to_owned(),
+            process_binding: issue_1935_opencode_process_binding(),
+        };
+        let introduction = OpenCodeBridgeIntroduction::mint(params).expect("introduction");
+        introduction.validate(1_500).expect("valid introduction");
+        let mut observed = OpenCodeSessionFacts {
+            installation_id: introduction.installation_id.clone(),
+            windows_sid: introduction.windows_sid.clone(),
+            interactive_session_id: introduction.interactive_session_id.clone(),
+            broker_generation: introduction.broker_generation,
+            bridge_generation: introduction.bridge_generation,
+            launch_nonce: introduction.process_binding.launch_nonce.clone(),
+            executable_digest: introduction.process_binding.executable_digest.clone(),
+            process_id: introduction.process_binding.process_id,
+            process_start_time_100ns: introduction.process_binding.process_start_time_100ns,
+            image_path: introduction.process_binding.image_path.clone(),
+            adapter_artifact_digest: introduction.process_binding.adapter_artifact_digest.clone(),
+            adapter_descriptor_digest: introduction.process_binding.adapter_descriptor_digest.clone(),
+            installation_profile_digest: introduction.process_binding.installation_profile_digest.clone(),
+        };
+        introduction
+            .probe_current_session(&observed)
+            .expect("exact admitted source tuple");
+        observed.adapter_descriptor_digest = "9".repeat(64);
+        assert_eq!(
+            introduction.probe_current_session(&observed),
+            Err(BrokerError::StaleRegistrationIdentity)
+        );
+    }
+
+    #[test]
+    fn issue_1935_signed_adapter_introduction_refuses_unobserved_process_identity() {
+        let mut binding = issue_1935_opencode_process_binding();
+        binding.process_start_time_100ns = 0;
+        assert_eq!(
+            binding.validate(),
+            Err(BrokerError::InvalidField("introduction.process_binding.identity"))
+        );
     }
 
     impl FakeAuthority {

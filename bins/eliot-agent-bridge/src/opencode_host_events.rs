@@ -39,8 +39,9 @@ use eliot_agent_opencode::{
     ActionGate, ActionGateDecision, ActionGateError, ActionGateRequest, CredentialResolver,
     EffectDecisionRecord, HOST_EVENTS_PAYLOAD_TYPE, HostEventAdmission, HostEventAdmissionError,
     HostEventAdmissionFailure, HostEventAdmissionReceipt, HostEventDelivery, HostEventGap,
-    HostEventKind, HostEventPorts, HostEventSubmission, HostEventsBindError, HostEventsListener,
-    HostEventsShutdown, IntroductionStore, LoopbackEndpoint,
+    HostEventKind, HostEventPeerObservationError, HostEventPeerObserver,
+    HostEventPeerProcessIdentity, HostEventPorts, HostEventSubmission, HostEventsBindError,
+    HostEventsListener, HostEventsShutdown, IntroductionStore, LoopbackEndpoint,
 };
 use eliot_contracts::{EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorActionGateRefusal, GovernorActionGateRequest, decide_pre_effect};
@@ -222,6 +223,12 @@ impl IntroductionStore for BridgeIntroductionStore {
             bridge_generation: Generation::default(),
             launch_nonce: String::new(),
             executable_digest: String::new(),
+            process_id: 0,
+            process_start_time_100ns: 0,
+            image_path: String::new(),
+            adapter_artifact_digest: String::new(),
+            adapter_descriptor_digest: String::new(),
+            installation_profile_digest: String::new(),
         })
     }
 
@@ -730,6 +737,33 @@ where
     }
 }
 
+/// Native accepted-socket peer adapter. The client process identity comes
+/// from the exact established client-side TCP row plus a before/after Windows
+/// process-identity join; HTTP body, headers, environment and JS fingerprints
+/// cannot populate it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowsHostEventPeerObserver;
+
+impl HostEventPeerObserver for WindowsHostEventPeerObserver {
+    fn observe(
+        &mut self,
+        client_local_endpoint: std::net::SocketAddr,
+        server_local_endpoint: std::net::SocketAddr,
+    ) -> Result<HostEventPeerProcessIdentity, HostEventPeerObservationError> {
+        let observation = eliot_platform_windows::observe_loopback_tcp_connection_process_peer(
+            client_local_endpoint,
+            server_local_endpoint,
+        )
+        .map_err(|_| HostEventPeerObservationError::Unavailable)?;
+        let process = observation.process();
+        Ok(HostEventPeerProcessIdentity {
+            process_id: process.process_id,
+            process_start_time_100ns: process.start_time_100ns,
+            image_path: process.image_path.clone(),
+        })
+    }
+}
+
 /// Startup disposition of the supervised `/v1/host-events` service.
 ///
 /// The service is admitted only from [`HostEventsStartup::Introduced`]: an
@@ -844,10 +878,12 @@ where
         .build()
         .map_err(HostEventsServiceError::Runtime)?;
     let mut ports = assemble_ports(runner, store, current_profile, resolve_credential);
-    Ok(runtime.block_on(listener.serve_until(
+    let mut peer_observer = WindowsHostEventPeerObserver;
+    Ok(runtime.block_on(listener.serve_until_with_peer_observer(
         &mut ports,
         bound_generation,
         stop,
         active_generation,
+        &mut peer_observer,
     )))
 }

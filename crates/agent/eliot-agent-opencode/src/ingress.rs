@@ -570,6 +570,32 @@ pub trait CredentialResolver: Send {
     fn resolve(&self, handle: &SecretRef) -> Result<SecretString, Self::Error>;
 }
 
+/// OS-owned identity of the process that owns one accepted loopback TCP
+/// connection. Request bodies and headers cannot construct this value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostEventPeerProcessIdentity {
+    pub process_id: u32,
+    pub process_start_time_100ns: u64,
+    pub image_path: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostEventPeerObservationError {
+    /// The OS owner row or exact process identity could not be proven.
+    Unavailable,
+}
+
+/// Platform adapter for joining accepted socket endpoints to an OS process
+/// identity. Implementations must fail closed on ambiguous or racing owner
+/// observations.
+pub trait HostEventPeerObserver {
+    fn observe(
+        &mut self,
+        client_local_endpoint: std::net::SocketAddr,
+        peer_endpoint: std::net::SocketAddr,
+    ) -> Result<HostEventPeerProcessIdentity, HostEventPeerObservationError>;
+}
+
 /// Normalized host-event submission to the durable event owner.
 ///
 /// Request-derived facts only: event identity, sequence, task/host hints,
@@ -1488,12 +1514,64 @@ where
     I: IntroductionStore,
     C: CredentialResolver,
 {
+    handle_host_event_inner(head, body, bound_port, None, ports)
+}
+
+/// Production admission entry that requires an OS-observed accepted-socket
+/// peer identity and compares it to the exact PID/start/image tuple bound by
+/// the current Broker introduction.
+pub fn handle_host_event_from_process<A, G, I, C>(
+    head: &ParsedHostEventHead,
+    body: &[u8],
+    bound_port: u16,
+    peer: &HostEventPeerProcessIdentity,
+    ports: &mut HostEventPorts<A, G, I, C>,
+) -> HttpOutcome
+where
+    A: HostEventAdmission,
+    G: ActionGate,
+    I: IntroductionStore,
+    C: CredentialResolver,
+{
+    handle_host_event_inner(head, body, bound_port, Some(peer), ports)
+}
+
+fn peer_matches_process_binding(
+    peer: &HostEventPeerProcessIdentity,
+    binding: &eliot_user_broker_core::OpenCodeProcessBinding,
+) -> bool {
+    peer.process_id == binding.process_id
+        && peer.process_start_time_100ns == binding.process_start_time_100ns
+        && peer.image_path == binding.image_path
+}
+
+fn handle_host_event_inner<A, G, I, C>(
+    head: &ParsedHostEventHead,
+    body: &[u8],
+    bound_port: u16,
+    peer: Option<&HostEventPeerProcessIdentity>,
+    ports: &mut HostEventPorts<A, G, I, C>,
+) -> HttpOutcome
+where
+    A: HostEventAdmission,
+    G: ActionGate,
+    I: IntroductionStore,
+    C: CredentialResolver,
+{
     let joined = match join_introduction(head, bound_port, &ports.introductions, &ports.credentials)
     {
         Ok(joined) => joined,
         Err(reject) => return HttpOutcome::rejected(reject, None),
     };
     let introduction = joined.introduction;
+    if let Some(peer) = peer {
+        if !peer_matches_process_binding(peer, &introduction.process_binding) {
+            return HttpOutcome::rejected(
+                HostEventReject::new(401, DISPOSITION_DENIED, REASON_AUTHENTICATION_REQUIRED),
+                None,
+            );
+        }
+    }
     let credential = joined.credential;
     let now_ms = joined.now_ms;
 
@@ -1558,6 +1636,48 @@ where
             HostEventReject::new(400, DISPOSITION_INVALID_REQUEST, REASON_INVALID_ARGUMENT),
             Some(event_id),
         ),
+    }
+}
+
+#[cfg(test)]
+mod issue_1935_native_peer_tests {
+    use super::{HostEventPeerProcessIdentity, peer_matches_process_binding};
+    use eliot_user_broker_core::OpenCodeProcessBinding;
+
+    fn binding() -> OpenCodeProcessBinding {
+        OpenCodeProcessBinding {
+            process_id: 4120,
+            process_start_time_100ns: 8_811_209,
+            image_path: r"C:\Users\owner\AppData\Local\Programs\OpenCode\opencode.exe".to_owned(),
+            adapter_artifact_digest: "a".repeat(64),
+            adapter_descriptor_digest: "b".repeat(64),
+            installation_profile_digest: "c".repeat(64),
+            executable_digest: "d".repeat(64),
+            launch_nonce: "broker-launch-42".to_owned(),
+            parent_broker_process_id: "4000".to_owned(),
+        }
+    }
+
+    #[test]
+    fn issue_1935_native_callback_accepts_exact_socket_process_binding() {
+        let binding = binding();
+        let peer = HostEventPeerProcessIdentity {
+            process_id: binding.process_id,
+            process_start_time_100ns: binding.process_start_time_100ns,
+            image_path: binding.image_path.clone(),
+        };
+        assert!(peer_matches_process_binding(&peer, &binding));
+    }
+
+    #[test]
+    fn issue_1935_native_callback_refuses_recycled_or_foreign_socket_process() {
+        let binding = binding();
+        let peer = HostEventPeerProcessIdentity {
+            process_id: binding.process_id,
+            process_start_time_100ns: binding.process_start_time_100ns + 1,
+            image_path: binding.image_path.clone(),
+        };
+        assert!(!peer_matches_process_binding(&peer, &binding));
     }
 }
 
@@ -2259,8 +2379,53 @@ impl HostEventsListener {
         &self,
         ports: &mut HostEventPorts<A, G, I, C>,
         bound_generation: u64,
+        stop: tokio::sync::watch::Receiver<bool>,
+        active_generation: tokio::sync::watch::Receiver<u64>,
+    ) -> HostEventsShutdown
+    where
+        A: HostEventAdmission,
+        G: ActionGate,
+        I: IntroductionStore,
+        C: CredentialResolver,
+    {
+        self.serve_inner(ports, bound_generation, stop, active_generation, None)
+            .await
+    }
+
+    /// Serves only requests whose accepted socket was joined to a native
+    /// process identity by `peer_observer`.
+    pub async fn serve_until_with_peer_observer<A, G, I, C, O>(
+        &self,
+        ports: &mut HostEventPorts<A, G, I, C>,
+        bound_generation: u64,
+        stop: tokio::sync::watch::Receiver<bool>,
+        active_generation: tokio::sync::watch::Receiver<u64>,
+        peer_observer: &mut O,
+    ) -> HostEventsShutdown
+    where
+        A: HostEventAdmission,
+        G: ActionGate,
+        I: IntroductionStore,
+        C: CredentialResolver,
+        O: HostEventPeerObserver,
+    {
+        self.serve_inner(
+            ports,
+            bound_generation,
+            stop,
+            active_generation,
+            Some(peer_observer),
+        )
+        .await
+    }
+
+    async fn serve_inner<A, G, I, C>(
+        &self,
+        ports: &mut HostEventPorts<A, G, I, C>,
+        bound_generation: u64,
         mut stop: tokio::sync::watch::Receiver<bool>,
         mut active_generation: tokio::sync::watch::Receiver<u64>,
+        mut peer_observer: Option<&mut dyn HostEventPeerObserver>,
     ) -> HostEventsShutdown
     where
         A: HostEventAdmission,
@@ -2299,7 +2464,22 @@ impl HostEventsListener {
                 accepted = self.listener.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
-                            handle_connection(stream, self.port, ports).await;
+                            let peer_identity = if let Some(observer) = peer_observer.as_deref_mut() {
+                                let endpoints = stream.local_addr().ok().zip(stream.peer_addr().ok());
+                                let Some((local, peer)) = endpoints else {
+                                    continue;
+                                };
+                                // The accepted server socket sees its own
+                                // endpoint as `local` and the connecting
+                                // client's endpoint as `peer`.
+                                match observer.observe(peer, local) {
+                                    Ok(identity) => Some(identity),
+                                    Err(HostEventPeerObservationError::Unavailable) => continue,
+                                }
+                            } else {
+                                None
+                            };
+                            handle_connection(stream, self.port, peer_identity.as_ref(), ports).await;
                         }
                         Err(_) => {
                             tokio::task::yield_now().await;
@@ -2354,6 +2534,7 @@ fn find_head_end(buffer: &[u8]) -> Option<usize> {
 async fn handle_connection<A, G, I, C>(
     stream: tokio::net::TcpStream,
     expected_port: u16,
+    peer_identity: Option<&HostEventPeerProcessIdentity>,
     ports: &mut HostEventPorts<A, G, I, C>,
 ) where
     A: HostEventAdmission,
@@ -2430,6 +2611,9 @@ async fn handle_connection<A, G, I, C>(
             _ => return,
         }
     }
-    let outcome = handle_host_event(&head, &body, expected_port, ports);
+    let outcome = match peer_identity {
+        Some(peer) => handle_host_event_from_process(&head, &body, expected_port, peer, ports),
+        None => handle_host_event(&head, &body, expected_port, ports),
+    };
     write_outcome(&mut writer, &outcome).await;
 }

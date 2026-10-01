@@ -41,8 +41,9 @@ use eliot_user_broker_core::{
     CutoverReceipt, DurableRegistrationPort, HeartbeatReceipt, HeartbeatRequest,
     IssuedOperationIdentity, IssuedOperationIdentityLedger, LaunchGrant, LaunchRequest,
     LostOperation, OperatorArtifact, OperatorEndpoint, OperatorHandoffRequest,
-    OperatorNativeResourceSelectionInput, PortError, ProcessEffectLineage, ProcessPort,
-    ProcessStartOutcome, RegistrationReceipt, RegistrationStatus, RequiredProvider, UserBroker,
+    OpenCodeProcessBinding, OperatorNativeResourceSelectionInput, PortError,
+    ProcessEffectLineage, ProcessPort, ProcessStartOutcome, RegistrationReceipt,
+    RegistrationStatus, RequiredProvider, UserBroker,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1648,6 +1649,70 @@ impl BrokerComposition {
     #[must_use]
     pub fn admitted_opencode_runtime_observation(&self) -> &OpenCodeRuntimeObservation {
         &self.opencode_runtime_observation
+    }
+
+    /// Produces the exact process portion of an OpenCode introduction only
+    /// when one uniquely observed OpenCode process is a direct child of this
+    /// live Broker generation and is joined to the admitted adapter/profile.
+    /// This does not mint an introduction or credential; those require the
+    /// separate bridge endpoint, Kernel epoch/fence, and secret owners.
+    pub fn admitted_opencode_process_binding(
+        &mut self,
+    ) -> Result<OpenCodeProcessBinding, CompositionError> {
+        let _ = self.heartbeat()?;
+        let broker_process_id = self
+            .process_binding
+            .as_ref()
+            .ok_or_else(|| CompositionError::Launch("broker process binding is absent".to_owned()))?
+            .identity
+            .process_id;
+        let registration = self.broker.registration().ok_or_else(|| {
+            CompositionError::Launch("OpenCode process binding requires active registration".to_owned())
+        })?;
+        if registration.status != RegistrationStatus::Active {
+            return Err(CompositionError::Launch(
+                "OpenCode process binding requires active registration".to_owned(),
+            ));
+        }
+        let launch_nonce = self
+            .launch_binding
+            .as_ref()
+            .map(|binding| binding.registration.launch_nonce.clone())
+            .ok_or_else(|| CompositionError::Launch("protected launch binding is absent".to_owned()))?;
+        let rows = match &self.opencode_runtime_observation {
+            OpenCodeRuntimeObservation::Available(rows) => rows,
+            OpenCodeRuntimeObservation::AdapterUnavailable => {
+                return Err(CompositionError::Launch("OpenCode adapter is unavailable".to_owned()));
+            }
+            OpenCodeRuntimeObservation::Unavailable => {
+                return Err(CompositionError::Launch("OpenCode process observation is unavailable".to_owned()));
+            }
+        };
+        let candidates: Vec<_> = rows.iter().filter(|row| row.launched_by_broker).collect();
+        let [row] = candidates.as_slice() else {
+            return Err(CompositionError::Launch(
+                "one direct Broker-launched OpenCode process is required".to_owned(),
+            ));
+        };
+        let adapter = self
+            .opencode_profile
+            .as_ref()
+            .and_then(|profile| profile.profile.opencode_adapter.as_ref())
+            .ok_or_else(|| CompositionError::Launch("admitted OpenCode adapter is unavailable".to_owned()))?;
+        let profile = self.opencode_profile.as_ref().ok_or_else(|| {
+            CompositionError::Launch("admitted OpenCode profile is unavailable".to_owned())
+        })?;
+        Ok(OpenCodeProcessBinding {
+            process_id: row.process.process_id,
+            process_start_time_100ns: row.process.start_time_100ns,
+            image_path: row.process.image_path.clone(),
+            adapter_artifact_digest: adapter.artifact_digest.as_str().to_owned(),
+            adapter_descriptor_digest: adapter.descriptor_digest.as_str().to_owned(),
+            installation_profile_digest: profile.profile.profile_sha256.as_str().to_owned(),
+            executable_digest: row.executable_sha256.clone(),
+            launch_nonce,
+            parent_broker_process_id: broker_process_id.to_string(),
+        })
     }
 
     /// Performs broker self-authentication from the retained stable

@@ -10,7 +10,8 @@ mod tcp_listener_owner_models;
 #[cfg(windows)]
 use tcp_listener_owner_models::OwnerTable;
 pub use tcp_listener_owner_models::{
-    TcpConnectionPeerOwnerObservation, TcpListenerOwnerError, TcpListenerOwnerObservation,
+    TcpConnectionPeerOwnerObservation, TcpConnectionPeerProcessObservation,
+    TcpListenerOwnerError, TcpListenerOwnerObservation,
 };
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -74,6 +75,148 @@ pub fn observe_loopback_tcp_connection_peer_owner(
         peer_endpoint,
         process_id,
     ))
+}
+
+/// Observes the PID owning the client-side established row for one exact
+/// loopback socket pair. For a server-accepted socket, pass `peer_addr()` as
+/// `client_local_endpoint` and `local_addr()` as `server_local_endpoint`.
+#[cfg(windows)]
+pub fn observe_loopback_tcp_connection_client_owner(
+    client_local_endpoint: SocketAddr,
+    server_local_endpoint: SocketAddr,
+) -> Result<TcpConnectionPeerOwnerObservation, TcpListenerOwnerError> {
+    validate_endpoint(client_local_endpoint)?;
+    validate_endpoint(server_local_endpoint)?;
+    let process_id = match (client_local_endpoint, server_local_endpoint) {
+        (SocketAddr::V4(client), SocketAddr::V4(server)) => {
+            query_ipv4_connection_client_owner(client, server)?
+        }
+        (SocketAddr::V6(client), SocketAddr::V6(server)) => {
+            query_ipv6_connection_client_owner(client, server)?
+        }
+        _ => return Err(TcpListenerOwnerError::InvalidEndpoint),
+    };
+    Ok(TcpConnectionPeerOwnerObservation::new(
+        client_local_endpoint,
+        server_local_endpoint,
+        process_id,
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn observe_loopback_tcp_connection_client_owner(
+    client_local_endpoint: SocketAddr,
+    server_local_endpoint: SocketAddr,
+) -> Result<TcpConnectionPeerOwnerObservation, TcpListenerOwnerError> {
+    validate_endpoint(client_local_endpoint)?;
+    validate_endpoint(server_local_endpoint)?;
+    Err(TcpListenerOwnerError::UnsupportedPlatform)
+}
+
+/// Joins the exact established loopback socket pair to one process identity.
+///
+/// The owner PID and complete PID/start/image identity are re-read on both
+/// sides of the join; any change fails closed. This proves which process owns
+/// the accepted connection, not that a particular plugin module was loaded.
+#[cfg(windows)]
+pub fn observe_loopback_tcp_connection_process_peer(
+    client_local_endpoint: SocketAddr,
+    peer_endpoint: SocketAddr,
+) -> Result<TcpConnectionPeerProcessObservation, TcpListenerOwnerError> {
+    let before = observe_loopback_tcp_connection_client_owner(
+        client_local_endpoint,
+        peer_endpoint,
+    )?;
+    let process_before = super::process_identity::inspect_process_identity(before.process_id())
+        .map_err(|_| TcpListenerOwnerError::PeerChanged)?;
+    let after = observe_loopback_tcp_connection_client_owner(
+        client_local_endpoint,
+        peer_endpoint,
+    )?;
+    let process_after = super::process_identity::inspect_process_identity(after.process_id())
+        .map_err(|_| TcpListenerOwnerError::PeerChanged)?;
+    if before != after || process_before != process_after {
+        return Err(TcpListenerOwnerError::PeerChanged);
+    }
+    Ok(TcpConnectionPeerProcessObservation::new(
+        before,
+        process_before,
+    ))
+}
+
+#[cfg(windows)]
+fn query_ipv4_connection_client_owner(
+    client_local: std::net::SocketAddrV4,
+    server_local: std::net::SocketAddrV4,
+) -> Result<u32, TcpListenerOwnerError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_CONNECTIONS,
+    };
+    let table = query_owner_table(2, TCP_TABLE_OWNER_PID_CONNECTIONS)?;
+    let rows = decode_rows::<MIB_TCPROW_OWNER_PID>(
+        &table.words,
+        table.byte_len,
+        std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table),
+    )?;
+    let mut matches = Vec::new();
+    for row in rows {
+        use windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_ESTAB;
+        if row.dwState != u32::try_from(MIB_TCP_STATE_ESTAB).unwrap_or(5) {
+            continue;
+        }
+        if decode_port(row.dwLocalPort)? == client_local.port()
+            && decode_port(row.dwRemotePort)? == server_local.port()
+            && Ipv4Addr::from(u32::from_be(row.dwLocalAddr)) == *client_local.ip()
+            && Ipv4Addr::from(u32::from_be(row.dwRemoteAddr)) == *server_local.ip()
+        {
+            matches.push(row.dwOwningPid);
+        }
+    }
+    unique_process_id(&matches)
+}
+
+#[cfg(windows)]
+fn query_ipv6_connection_client_owner(
+    client_local: std::net::SocketAddrV6,
+    server_local: std::net::SocketAddrV6,
+) -> Result<u32, TcpListenerOwnerError> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCP_STATE_ESTAB,
+        TCP_TABLE_OWNER_PID_CONNECTIONS,
+    };
+    let table = query_owner_table(23, TCP_TABLE_OWNER_PID_CONNECTIONS)?;
+    let rows = decode_rows::<MIB_TCP6ROW_OWNER_PID>(
+        &table.words,
+        table.byte_len,
+        std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
+    )?;
+    let mut matches = Vec::new();
+    for row in rows {
+        if row.dwState != u32::try_from(MIB_TCP_STATE_ESTAB).unwrap_or(5)
+            || row.dwLocalScopeId != 0
+            || row.dwRemoteScopeId != 0
+        {
+            continue;
+        }
+        if decode_port(row.dwLocalPort)? == client_local.port()
+            && decode_port(row.dwRemotePort)? == server_local.port()
+            && Ipv6Addr::from(row.ucLocalAddr) == *client_local.ip()
+            && Ipv6Addr::from(row.ucRemoteAddr) == *server_local.ip()
+        {
+            matches.push(row.dwOwningPid);
+        }
+    }
+    unique_process_id(&matches)
+}
+
+#[cfg(not(windows))]
+pub fn observe_loopback_tcp_connection_process_peer(
+    client_local_endpoint: SocketAddr,
+    peer_endpoint: SocketAddr,
+) -> Result<TcpConnectionPeerProcessObservation, TcpListenerOwnerError> {
+    validate_endpoint(client_local_endpoint)?;
+    validate_endpoint(peer_endpoint)?;
+    Err(TcpListenerOwnerError::UnsupportedPlatform)
 }
 
 /// Off-Windows builds retain the typed API but never claim ownership.

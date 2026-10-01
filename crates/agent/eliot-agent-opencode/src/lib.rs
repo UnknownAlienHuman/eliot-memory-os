@@ -44,6 +44,7 @@ pub use ingress::{
     HOST_EVENTS_PAYLOAD_TYPE, HOST_EVENTS_PRODUCER_ID, HOST_EVENTS_RESPONSE_VERSION,
     HOST_EVENTS_STREAM_ID, HostEventAdmission, HostEventAdmissionError, HostEventAdmissionFailure,
     HostEventAdmissionReceipt, HostEventDelivery, HostEventGap, HostEventKind, HostEventPorts,
+    HostEventPeerObservationError, HostEventPeerObserver, HostEventPeerProcessIdentity,
     HostEventReject, HostEventResponseFields, HostEventSubmission, HostEventsBindError,
     HostEventsListener, HostEventsShutdown, HttpOutcome, IntroductionStore, MAX_BEARER_BYTES,
     MAX_EVENT_ID_BYTES, MAX_HOST_EVENT_BODY_BYTES, MAX_HOST_EVENT_HEAD_BYTES,
@@ -55,7 +56,8 @@ pub use ingress::{
     REASON_PROTOCOL_INCOMPATIBLE, REASON_ROUTE_UNAVAILABLE, REASON_SCOPE_CONFLICT,
     REASON_STALE_AUTHORITY_EPOCH, REASON_STALE_STATE_FENCE, REASON_STORAGE_BACKPRESSURE,
     UnconfiguredActionGate, authority_epoch_text, classify_decision_replay, effect_request_hash,
-    encode_host_event_response, handle_host_event, parse_http_head, response_commitment,
+    encode_host_event_response, handle_host_event, handle_host_event_from_process,
+    parse_http_head, response_commitment,
     response_commitment_message, verify_response_commitment,
 };
 pub use pilot::{

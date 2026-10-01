@@ -14,6 +14,8 @@
 use std::fmt;
 use std::net::SocketAddr;
 
+use crate::ProcessIdentity;
+
 #[cfg(windows)]
 pub(super) struct OwnerTable {
     pub(super) words: Vec<usize>,
@@ -55,6 +57,36 @@ pub struct TcpConnectionPeerOwnerObservation {
     client_local_endpoint: SocketAddr,
     peer_endpoint: SocketAddr,
     process_id: u32,
+}
+
+/// Established loopback connection peer PID joined to an exact process
+/// identity observed before and after the TCP owner-table recheck.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TcpConnectionPeerProcessObservation {
+    connection: TcpConnectionPeerOwnerObservation,
+    process: ProcessIdentity,
+}
+
+impl TcpConnectionPeerProcessObservation {
+    pub(super) const fn new(
+        connection: TcpConnectionPeerOwnerObservation,
+        process: ProcessIdentity,
+    ) -> Self {
+        Self {
+            connection,
+            process,
+        }
+    }
+
+    #[must_use]
+    pub const fn connection(&self) -> &TcpConnectionPeerOwnerObservation {
+        &self.connection
+    }
+
+    #[must_use]
+    pub const fn process(&self) -> &ProcessIdentity {
+        &self.process
+    }
 }
 
 impl TcpConnectionPeerOwnerObservation {
@@ -110,6 +142,9 @@ pub enum TcpListenerOwnerError {
     UnsupportedPlatform,
     /// Another Win32 status prevented a trustworthy classification.
     Windows { code: u32 },
+    /// Peer PID or complete process identity changed while the exact socket
+    /// pair was being joined.
+    PeerChanged,
 }
 
 impl fmt::Display for TcpListenerOwnerError {
@@ -135,6 +170,7 @@ impl fmt::Display for TcpListenerOwnerError {
                     "TCP listener owner observation failed with Win32 status {code}"
                 )
             }
+            Self::PeerChanged => formatter.write_str("TCP peer process identity changed during observation"),
         }
     }
 }
