@@ -1296,6 +1296,21 @@ pub enum ProcessStreamSinkWireResponse {
     NotStarted,
     /// The exact original command outcome remains unknown.
     Unknown,
+    /// The owner rejected the request before an effect could begin.
+    Unavailable {
+        /// Closed pre-effect refusal category.
+        reason: ProcessStreamSinkUnavailableReason,
+    },
+}
+
+/// Closed process-stream sink refusal category. It carries no provider prose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProcessStreamSinkUnavailableReason {
+    ProviderUnavailable,
+    AdmissionFenced,
+    RequestRejected,
+    Capacity,
 }
 
 /// Closed outcome of a source readback/reconciliation request.
