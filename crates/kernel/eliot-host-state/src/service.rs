@@ -4,14 +4,13 @@ use eliot_platform::PlatformHandle;
 
 use crate::{
     AppendReceipt, EpochRetirementObservation, EpochRetirementQuery, EpochRetirementQueryError,
-    HostProcessIncarnationRegistration,
-    HostInstallationEpoch, HostState, HostStateJournal, HostStateRecord, JournalAppendObserver,
-    JournalBackend, JournalError, PreparedAppend, ReactiveContextEnqueueReceipt,
-    ReactiveContextOperationQuery, ReactiveContextPrepareRequest, ReactiveContextPrepareResult,
-    ReactiveContextPreparedEnqueue, ReactiveContextQueueError, ReactiveContextQueuePort,
-    ReactiveContextQueueQuery, ReactiveContextQueueSnapshot, ReactiveContextReconcileOutcome,
-    ReactiveContextReconcileRequest, ReactiveContextTransition, ReactiveContextTransitionReceipt,
-    ReconcileOutcome, RedbJournalBackend,
+    HostInstallationEpoch, HostProcessIncarnationRegistration, HostState, HostStateJournal,
+    HostStateRecord, JournalAppendObserver, JournalBackend, JournalError, PreparedAppend,
+    ReactiveContextEnqueueReceipt, ReactiveContextOperationQuery, ReactiveContextPrepareRequest,
+    ReactiveContextPrepareResult, ReactiveContextPreparedEnqueue, ReactiveContextQueueError,
+    ReactiveContextQueuePort, ReactiveContextQueueQuery, ReactiveContextQueueSnapshot,
+    ReactiveContextReconcileOutcome, ReactiveContextReconcileRequest, ReactiveContextTransition,
+    ReactiveContextTransitionReceipt, ReconcileOutcome, RedbJournalBackend,
 };
 
 /// Production-facing service boundary for the Host operational journal.

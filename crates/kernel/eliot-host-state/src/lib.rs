@@ -33,10 +33,10 @@ pub use eliot_contracts::{EpochId, EpochLineageId, EpochTransition};
 pub use error::{BackendError, JournalError, ReconcileOutcome};
 pub use journal::{
     AppendDisposition, AppendReceipt, EpochRetirementObservation, EpochRetirementQuery,
-    EpochRetirementQueryError, HostProcessIncarnationRegistration, HostStateJournal,
-    JOURNAL_MAGIC, JOURNAL_VERSION,
-    JournalAppendObserver, WakeCancellationBatchObservation, WakeCancellationBatchQuery,
-    WakeCancellationBatchQueryError, readonly_project_host_state, record_checksum,
+    EpochRetirementQueryError, HostProcessIncarnationRegistration, HostStateJournal, JOURNAL_MAGIC,
+    JOURNAL_VERSION, JournalAppendObserver, WakeCancellationBatchObservation,
+    WakeCancellationBatchQuery, WakeCancellationBatchQueryError, readonly_project_host_state,
+    record_checksum,
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
 pub use model::{
@@ -45,16 +45,15 @@ pub use model::{
     DependencyLifecycleBudget, DependencyRecord, DependencyResourceBudget, DependencyState,
     DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord, EpochEvidence,
     EpochRetirementRecord, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
-    HostObservationRecord, HostState, HostStateProjection, HostStateRecord, IdempotencyIdentity,
-    HostProcessIncarnationRecord,
-    ImmutableProcessManifest, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
-    KernelRecord, LifecycleTimestamps, ManagedDependencyRecord, ModuleBuildProvenanceRecord,
-    NonceState, OneTimeNonceState, PREDECESSOR_RETIREMENT_RELATION_CONTRACT,
-    PredecessorRetirementRelation, PriorKernelDisposition, PriorKernelSource,
-    ReadinessApprovedContour, ReadinessEvidence, RecordFence, RecoveryLineageEvidence,
-    RecoveryLineageReason, ServiceSafetyClass, StoreRebindRecord, StoreRebindState,
-    WakeCancellationBatchEntry, WakeCancellationBatchRecord, WakeDisposition, WakeRecord,
-    host_owner_epoch_digest,
+    HostObservationRecord, HostProcessIncarnationRecord, HostState, HostStateProjection,
+    HostStateRecord, IdempotencyIdentity, ImmutableProcessManifest, JournalManifest,
+    KernelJobBinding, KernelReadinessObservationRecord, KernelRecord, LifecycleTimestamps,
+    ManagedDependencyRecord, ModuleBuildProvenanceRecord, NonceState, OneTimeNonceState,
+    PREDECESSOR_RETIREMENT_RELATION_CONTRACT, PredecessorRetirementRelation,
+    PriorKernelDisposition, PriorKernelSource, ReadinessApprovedContour, ReadinessEvidence,
+    RecordFence, RecoveryLineageEvidence, RecoveryLineageReason, ServiceSafetyClass,
+    StoreRebindRecord, StoreRebindState, WakeCancellationBatchEntry, WakeCancellationBatchRecord,
+    WakeDisposition, WakeRecord, host_owner_epoch_digest,
 };
 pub use model_preferences::{
     MAX_MODEL_PREFERENCE_DOCUMENT_BYTES, MODEL_PREFERENCE_ENVELOPE_VERSION,
