@@ -10,9 +10,10 @@
 //! strict draft decode and never reach the service.
 
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
-use eliot_governor::{CompositionError, FinishAttemptError};
+use eliot_governor::{CompositionError, FinishAttemptError, KernelTransitionPort};
 use eliot_protocol::{AgentResponseDisposition, FinishResultBody};
 use eliot_receipts::ProofCeiling;
+use eliot_store_api::{TransitionClass, WriteReceiptStatus};
 use serde::Serialize;
 use serde_json::json;
 
@@ -213,16 +214,88 @@ pub async fn serve_finish_claim(
     if arguments.get(LEGACY_FINISH_PROOF_MEMBER).is_some() {
         return rejected_legacy_finish_proof(&claimed);
     }
+    let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
+        .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
+
+    // Exact retries are historical receipt reads. Refresh the persisted Finish
+    // projection and match the original attempt before current task, plan,
+    // attachment, or acceptance guards can turn a committed decision into a
+    // stale-task refusal. A changed draft under the same admitted identity is
+    // rejected by the owner receipt's original attempt digest.
+    let historical = {
+        let mut guard = composition.lock().await;
+        if let Err(error) = guard.refresh_testd_terminal_owner() {
+            return rejected_finish_result_with_detail(
+                &claimed,
+                &error.to_string(),
+                (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+            );
+        }
+        guard.historical_finish_receipt(
+            &claimed.request_identity,
+            &claimed.operation_id,
+            &draft,
+            &claimed.attempt,
+        )
+    };
+    let historical = match historical {
+        Ok(receipt) => receipt,
+        Err(error) => return rejected_finish_result(&claimed, &error),
+    };
+    if let Some(receipt) = historical {
+        let write_receipt = match kernel.receipt(claimed.operation_id.clone()).await {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => {
+                return rejected_finish_result_with_detail(
+                    &claimed,
+                    "retained Finish decision has no canonical receipt for its original operation",
+                    (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+                );
+            }
+            Err(error) => {
+                return rejected_finish_result_with_detail(
+                    &claimed,
+                    &format!("original Finish operation receipt read failed: {error}"),
+                    (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+                );
+            }
+        };
+        if let Err(error) = write_receipt.validate() {
+            return rejected_finish_result_with_detail(
+                &claimed,
+                &format!("original Finish operation receipt is invalid: {error}"),
+                (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+            );
+        }
+        if write_receipt.operation_id != claimed.operation_id
+            || write_receipt.idempotency_key != claimed.request_identity.idempotency_key
+            || write_receipt.state_fence != claimed.envelope.state_fence
+            || write_receipt.transition_class != TransitionClass::RecoverySchema
+            || write_receipt.status != WriteReceiptStatus::Committed
+        {
+            return rejected_finish_result_with_detail(
+                &claimed,
+                "canonical receipt does not bind the original committed Finish operation",
+                (AgentResponseDisposition::RecoveryRequired, "RECOVERY_REQUIRED"),
+            );
+        }
+        let content = serde_json::to_value(&receipt)
+            .map_err(|error| format!("finish decision projection failed: {error}"))?;
+        let response = finish_response_json(
+            &claimed,
+            "CANDIDATE",
+            &content,
+            ProofCeiling::ScopedVerification,
+        )?;
+        return finish_result_body(&claimed, response);
+    }
+
     // Issue #1782 (I11.11 line 42, I14.24 line 23): "Any request to continue
     // Material work before that disposition returns
     // `EXTERNAL_ATTACH_RECONCILIATION_REQUIRED`", and "deny proof/finish and
-    // further Material work until reconciliation". The gate runs before strict
-    // draft decoding and before any evidence is prepared or exchanged, so an
-    // unreconciled attach of an already-running external agent can neither
-    // reach the Governor Finish owner nor produce a decision receipt. The
-    // refusal is the submitted typed result body the lane already uses, so the
-    // claimed candidate is consumed instead of stalling the queue, and it
-    // carries the stable I7.20 route/integration reason code verbatim.
+    // further Material work until reconciliation". Historical committed
+    // readback above is allowed; a genuinely new Finish remains subject to the
+    // current attachment guard before evidence preparation.
     let attach_refusal = {
         let guard = composition.lock().await;
         guard
@@ -242,8 +315,6 @@ pub async fn serve_finish_claim(
             ),
         );
     }
-    let draft: eliot_governor::FinishAttemptDraft = serde_json::from_value(arguments)
-        .map_err(|error| format!("admitted finish draft does not decode: {error}"))?;
 
     // Issue #1741, I7.9: rehydrate the contract owner's acceptance-item
     // enumeration for this exact task id BEFORE any evidence is prepared. The

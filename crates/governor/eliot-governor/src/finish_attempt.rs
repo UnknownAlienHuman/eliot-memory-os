@@ -132,6 +132,72 @@ impl<'a, P: ?Sized> GovernorFinishAttempt<'a, P> {
             finish_owner_revision,
         }
     }
+
+    /// Returns the retained receipt for an exact original Finish attempt,
+    /// without consulting current task state or deriving a new decision.
+    ///
+    /// The receipt is only a candidate for historical replay here. The caller
+    /// must still read the exact canonical operation receipt from Kernel and
+    /// validate its operation, idempotency key, fence, and committed status
+    /// before returning the historical decision to the host.
+    pub(crate) fn historical_finish_receipt(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        draft: &FinishAttemptDraft,
+        kernel_attempt: &eliot_protocol::FinishAttempt,
+    ) -> Result<Option<FinishDecisionReceipt>, FinishAttemptError> {
+        validate_identity(identity)?;
+        draft.validate().map_err(FinishError::from)?;
+        kernel_attempt
+            .validate()
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+
+        let task_id = TaskId::new(draft.task_id.clone())
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        let semantic_fence = &kernel_attempt.semantic_state_fence;
+        if kernel_attempt.operation_id != operation_id.as_str()
+            || kernel_attempt.task_id != task_id.as_str()
+            || kernel_attempt.task_revision != draft.expected_task_revision
+            || kernel_attempt.session_id
+                != identity
+                    .request
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .map_or("", eliot_contracts::SessionId::as_str)
+            || identity.request.metadata.task_id.as_ref() != Some(&task_id)
+            || semantic_fence.authority_epoch != identity.request.metadata.state_fence.authority_epoch
+            || semantic_fence.resource_generation
+                != identity.request.metadata.state_fence.resource_generation
+            || semantic_fence.task_revision.map(eliot_contracts::TaskRevision::value)
+                != Some(draft.expected_task_revision)
+        {
+            return Err(FinishError::IdentityConflict.into());
+        }
+
+        let attempt = FinishAttempt {
+            attempt_id: identity.idempotency_key.clone(),
+            state_fence: identity.request.metadata.state_fence.clone(),
+            closure_intent: closure_intent(draft.requested_outcome),
+            draft: draft.clone(),
+            completion_proof: None,
+        };
+        let Some(receipt) = self.finish.receipt(&attempt.attempt_id) else {
+            return Ok(None);
+        };
+        receipt.validate()?;
+        if receipt.attempt_digest != attempt.digest()?
+            || receipt.attempt_id != identity.idempotency_key
+            || receipt.task_id != task_id.as_str()
+            || receipt.task_revision != draft.expected_task_revision
+            || receipt.requested_outcome != draft.requested_outcome
+            || receipt.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(FinishError::IdentityConflict.into());
+        }
+        Ok(Some(receipt.clone()))
+    }
 }
 
 /// Pure output of one canonical finish-evidence derivation. The snapshot is
@@ -473,6 +539,9 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical verifier execution fact is stale for the current task/plan".to_owned(),
             )));
         }
+        verifier_fact
+            .revalidate_retained_testd_bytes(fence, plan)
+            .map_err(FinishAttemptError::Composition)?;
         let verifier_run_ref = verifier_fact.verification_run.run_id.to_string();
         Ok((verifier_fact, verifier_run_ref))
     }
@@ -555,6 +624,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         fence: &StateFence,
         plan: &CanonicalPlanBinding,
+        nominated_artifact_refs: &[String],
         nominated_observation_refs: &[String],
         contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
@@ -577,12 +647,52 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         // an executed verifier outcome.
         let (verifier_fact, verifier_run_ref) =
             self.read_current_verifier_fact(task_id, task, plan, fence)?;
+        for reference in nominated_artifact_refs {
+            let Some(artifact) = verifier_fact
+                .raw_artifact_bindings
+                .iter()
+                .find(|artifact| artifact.handle == *reference)
+            else {
+                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                    format!(
+                        "caller-nominated artifact {reference:?} has no exact binding in the current task/plan/fence-bound TestD receipt"
+                    ),
+                )));
+            };
+            if artifact.truncated {
+                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                    format!(
+                        "caller-nominated artifact {reference:?} is truncated in the original TestD receipt"
+                    ),
+                )));
+            }
+        }
         // This fact has already been rehydrated and validated against the
         // current task, plan, fence, and durable terminal TestD receipt. A
         // failed or partial verifier is still an executed run; its outcome is
         // represented per required test below, not mislabeled as stale.
 
         let coordination = self.read_current_finish_projection(task_id, fence)?;
+        for reference in &coordination.artifact_refs {
+            let Some(artifact) = verifier_fact
+                .raw_artifact_bindings
+                .iter()
+                .find(|artifact| artifact.handle == *reference)
+            else {
+                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                    format!(
+                        "coordination artifact {reference:?} has no verified stored-byte binding in the current task/plan/fence-bound TestD receipt"
+                    ),
+                )));
+            };
+            if artifact.truncated {
+                return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                    format!(
+                        "coordination artifact {reference:?} is truncated in the original TestD receipt"
+                    ),
+                )));
+            }
+        }
 
         let mut observation_refs = BTreeSet::new();
         // The task-and-plan-bound observation receipts are joined here so their
@@ -1418,6 +1528,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             task,
             &fence,
             &plan,
+            &draft.artifact_refs,
             &draft.observation_refs,
             contract_acceptance_set,
         )?;
