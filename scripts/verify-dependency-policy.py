@@ -5288,8 +5288,19 @@ _NO_SUPPORT_CLAIM = (
 _SCANNER_POLICY_FINDING_CODES = ("DEP-004", "DEP-005", "DEP-006")
 
 
-def _artifact_envelope(artifact: str, schema: str, receipt: dict) -> dict:
-    """Stamp a run artifact with the receipt identity it derives from."""
+def _artifact_envelope(
+    artifact: str,
+    schema: str,
+    receipt: dict,
+    release_binding: dict | None = None,
+) -> dict:
+    """Stamp a run artifact with the receipt identity it derives from.
+
+    `release_binding` carries the exact release hashes this artifact is bound to
+    when the caller supplied them. An artifact with no supplied release hashes
+    records `not_bound` with the reason; it never asserts a binding it did not
+    receive.
+    """
 
     canonical = json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return {
@@ -5301,8 +5312,71 @@ def _artifact_envelope(artifact: str, schema: str, receipt: dict) -> dict:
         "source_sha": receipt.get("source_sha"),
         "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "receipt_digest": hashlib.sha256(canonical).hexdigest(),
+        "release_binding": (
+            {"status": "bound", "hashes": dict(sorted(release_binding.items()))}
+            if isinstance(release_binding, dict) and release_binding
+            else {
+                "status": "not_bound",
+                "reason": "no release hashes were supplied for this run artifact",
+            }
+        ),
         "support_claim": _NO_SUPPORT_CLAIM,
     }
+
+
+def verify_release_hash_bindings(
+    root: Path,
+    recorded: dict[str, object],
+) -> tuple[dict[str, str], list[Finding]]:
+    """Recompute every recorded release hash and refuse the run on divergence.
+
+    `recorded` maps a repository-relative path to the SHA-256 the release
+    recorded for it. Each entry is read through the same contained,
+    no-follow identity fence every other policy input uses, the digest is
+    recomputed over those exact bytes, and the recomputed digest is compared
+    against the recorded value. A path that cannot be read, or any digest that
+    does not reproduce, is a DEP-009 finding: the run cannot then claim a
+    binding, so the caller fails closed rather than recording a hash it did not
+    verify.
+    """
+
+    findings: list[Finding] = []
+    verified: dict[str, str] = {}
+    for raw_path, raw_digest in sorted(recorded.items()):
+        expected = raw_digest if isinstance(raw_digest, str) else ""
+        if not _HEX64.fullmatch(expected or ""):
+            findings.append(
+                Finding(
+                    "DEP-009",
+                    str(raw_path),
+                    0,
+                    "recorded release hash is missing or malformed, so the artifact binding cannot be verified",
+                )
+            )
+            continue
+        _, relative, payload, _ = _read_validated_repo_bytes(
+            root,
+            raw_path,
+            "release-hash-bound release artifact",
+            findings,
+            "DEP-009",
+        )
+        if payload is None or relative is None:
+            continue
+        actual = hashlib.sha256(payload).hexdigest()
+        if actual != expected.lower():
+            findings.append(
+                Finding(
+                    "DEP-009",
+                    relative,
+                    0,
+                    "recomputed release hash does not match the recorded hash: "
+                    f"recorded={expected.lower()} recomputed={actual}",
+                )
+            )
+            continue
+        verified[relative] = actual
+    return verified, findings
 
 
 def _inventory_disposition(inventory: dict, ecosystem: str, name: str) -> dict | None:
@@ -5331,7 +5405,11 @@ def _inventory_disposition(inventory: dict, ecosystem: str, name: str) -> dict |
     return None
 
 
-def build_sbom_artifact(receipt: dict, manifest_data: dict) -> dict:
+def build_sbom_artifact(
+    receipt: dict,
+    manifest_data: dict,
+    release_binding: dict[str, str] | None = None,
+) -> dict:
     """Build the SBOM run artifact from receipt denominator evidence (issue #1229 W7).
 
     The artifact enumerates observed locked components across Rust, NuGet,
@@ -5469,7 +5547,7 @@ def build_sbom_artifact(receipt: dict, manifest_data: dict) -> dict:
     for component in components:
         key = str(component.get("ecosystem", "unknown"))
         by_ecosystem[key] = by_ecosystem.get(key, 0) + 1
-    artifact = _artifact_envelope("sbom", "eliot.dependency-policy-sbom.v1", receipt)
+    artifact = _artifact_envelope("sbom", "eliot.dependency-policy-sbom.v1", receipt, release_binding)
     artifact.update(
         {
             "denominator_status": denominator.get("status"),
@@ -5490,6 +5568,7 @@ def build_license_report_artifact(
     receipt: dict,
     manifest_data: dict,
     deny_license_allow: list[str] | None,
+    release_binding: dict[str, str] | None = None,
 ) -> dict:
     """Build the license run artifact from policy and scanner evidence (issue #1229 W7)."""
 
@@ -5520,7 +5599,7 @@ def build_license_report_artifact(
         license_reason = "executed licenses gate reported no errors"
     externals = manifest_data.get("external_executables", {})
     externals = externals if isinstance(externals, dict) else {}
-    artifact = _artifact_envelope("license-report", "eliot.dependency-policy-licenses.v1", receipt)
+    artifact = _artifact_envelope("license-report", "eliot.dependency-policy-licenses.v1", receipt, release_binding)
     artifact.update(
         {
             "license_status": license_status,
@@ -5554,7 +5633,11 @@ def build_license_report_artifact(
     return artifact
 
 
-def build_advisory_report_artifact(receipt: dict, manifest_data: dict) -> dict:
+def build_advisory_report_artifact(
+    receipt: dict,
+    manifest_data: dict,
+    release_binding: dict[str, str] | None = None,
+) -> dict:
     """Build the advisory run artifact from snapshot and exception evidence (issue #1229 W7)."""
 
     receipt = receipt if isinstance(receipt, dict) else {}
@@ -5587,7 +5670,7 @@ def build_advisory_report_artifact(receipt: dict, manifest_data: dict) -> dict:
     surreal = surreal if isinstance(surreal, dict) else {}
     external_evidence = receipt.get("external_executable_evidence", {})
     external_evidence = external_evidence if isinstance(external_evidence, dict) else {}
-    artifact = _artifact_envelope("advisory-report", "eliot.dependency-policy-advisories.v1", receipt)
+    artifact = _artifact_envelope("advisory-report", "eliot.dependency-policy-advisories.v1", receipt, release_binding)
     artifact.update(
         {
             "rust_advisory_snapshot": snapshot,
@@ -6399,6 +6482,41 @@ def run_self_tests() -> int:
     if not all("no runtime" in str(report.get("support_claim", "")) for report in (sbom, licenses_report, advisory_report)):
         print("SELF_TEST_FAILURE: expected explicit no-support stamp on run artifacts", file=sys.stderr)
         return 1
+    # Without supplied release hashes every artifact records not_bound rather
+    # than implying a binding it never received.
+    if any(report.get("release_binding", {}).get("status") != "not_bound" for report in (sbom, licenses_report, advisory_report)):
+        print("SELF_TEST_FAILURE: expected not_bound release_binding without supplied release hashes", file=sys.stderr)
+        return 1
+
+    # Case 12b: a supplied release hash binds only when it reproduces from bytes.
+    with tempfile.TemporaryDirectory() as tmp:
+        release_root = Path(tmp)
+        release_artifact = release_root / "payload.bin"
+        release_artifact.write_bytes(b"release-payload-bytes")
+        recorded = {
+            "payload.bin": hashlib.sha256(b"release-payload-bytes").hexdigest(),
+            "divergent.bin": hashlib.sha256(b"other-bytes").hexdigest(),
+        }
+        (release_root / "divergent.bin").write_bytes(b"actual-bytes")
+        verified, binding_findings = verify_release_hash_bindings(release_root, recorded)
+        if verified != {"payload.bin": recorded["payload.bin"]} or not any(
+            f.path == "divergent.bin" and f.code == "DEP-009" for f in binding_findings
+        ):
+            print(
+                f"SELF_TEST_FAILURE: expected only the reproducing release hash to bind, got {verified} / {binding_findings}",
+                file=sys.stderr,
+            )
+            return 1
+        bound_sbom = build_sbom_artifact(artifact_receipt, manifest_fixture, verified)
+        if bound_sbom.get("release_binding", {}).get("hashes") != {"payload.bin": recorded["payload.bin"]}:
+            print("SELF_TEST_FAILURE: expected the SBOM to carry the exact verified release hash", file=sys.stderr)
+            return 1
+        divergent_only, divergent_findings = verify_release_hash_bindings(
+            release_root, {"divergent.bin": recorded["divergent.bin"]}
+        )
+        if divergent_only or not any(f.code == "DEP-009" for f in divergent_findings):
+            print("SELF_TEST_FAILURE: expected a DEP-009 finding for a non-reproducing release hash", file=sys.stderr)
+            return 1
 
     # Case 13: lock drift probe rejects an escaping lockfile path without running cargo
     with tempfile.TemporaryDirectory() as tmp:
@@ -6427,6 +6545,14 @@ def main() -> int:
     parser.add_argument("--sbom-out", help="Write SBOM run artifact to JSON output file")
     parser.add_argument("--license-report-out", help="Write license run artifact to JSON output file")
     parser.add_argument("--advisory-report-out", help="Write advisory run artifact to JSON output file")
+    parser.add_argument(
+        "--release-hashes",
+        help=(
+            "JSON file mapping repository-relative release artifact paths to the "
+            "release hash recorded for each; every digest is recomputed from the "
+            "artifact bytes and compared, and any divergence fails the run closed"
+        ),
+    )
     parser.add_argument("--selected-release-policy-receipt-out", help="Build a non-runtime receipt for the exact locked release candidate")
     parser.add_argument("--selected-artifact-path", help="Repository-relative artifact path selected by the release consumer")
     parser.add_argument("--selected-artifact-sha256", help="SHA-256 selected by the release consumer")
@@ -6477,6 +6603,38 @@ def main() -> int:
 
     findings, status, receipt, manifest_data, _ = verify_all(root, args.profile)
 
+    # Issue #1923 W7: bind the run artifacts to the exact release hashes before
+    # anything is written. The recorded hashes arrive from the release owner;
+    # each is recomputed here over the artifact's own bytes and compared, so a
+    # recorded hash is never merely copied into an artifact. A divergence is a
+    # finding and the run fails closed, so the artifacts can never record a
+    # binding the code did not produce.
+    release_binding: dict[str, str] = {}
+    if args.release_hashes:
+        try:
+            recorded = json.loads(Path(args.release_hashes).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(f"DEPENDENCY_POLICY_RELEASE_HASHES_UNREADABLE: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(recorded, dict) or not recorded:
+            print(
+                "DEPENDENCY_POLICY_RELEASE_HASHES_MALFORMED: --release-hashes must be a "
+                "non-empty JSON object mapping artifact paths to recorded SHA-256 values",
+                file=sys.stderr,
+            )
+            return 1
+        release_binding, release_findings = verify_release_hash_bindings(root, recorded)
+        findings.extend(release_findings)
+        if release_findings:
+            print(
+                f"DEPENDENCY_POLICY_RELEASE_HASH_MISMATCH: {len(release_findings)} recorded "
+                "release hash(es) did not reproduce from the artifact bytes",
+                file=sys.stderr,
+            )
+            for finding in release_findings:
+                print(f"  [{finding.code}] {finding.path}:{finding.line}: {finding.detail}")
+            return 1
+
     if args.json_out:
         out_p = Path(args.json_out)
         out_p.parent.mkdir(parents=True, exist_ok=True)
@@ -6497,18 +6655,22 @@ def main() -> int:
 
     try:
         if args.sbom_out:
-            _write_json_artifact(args.sbom_out, build_sbom_artifact(receipt, manifest_data), "SBOM")
+            _write_json_artifact(
+                args.sbom_out,
+                build_sbom_artifact(receipt, manifest_data, release_binding),
+                "SBOM",
+            )
         if args.license_report_out:
             deny_allow, _ = _read_deny_license_allowlist(root)
             _write_json_artifact(
                 args.license_report_out,
-                build_license_report_artifact(receipt, manifest_data, deny_allow),
+                build_license_report_artifact(receipt, manifest_data, deny_allow, release_binding),
                 "LICENSE_REPORT",
             )
         if args.advisory_report_out:
             _write_json_artifact(
                 args.advisory_report_out,
-                build_advisory_report_artifact(receipt, manifest_data),
+                build_advisory_report_artifact(receipt, manifest_data, release_binding),
                 "ADVISORY_REPORT",
             )
     except OSError as exc:
