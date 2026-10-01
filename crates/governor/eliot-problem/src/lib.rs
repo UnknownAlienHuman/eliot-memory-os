@@ -3353,6 +3353,7 @@ pub fn contract_identity() -> Result<eliot_contracts::ContractIdentity, ProblemE
         &serde_json::json!({
             "signal": schemars::schema_for!(Signal),
             "problem": schemars::schema_for!(Problem),
+            "diagnostic_brief": schemars::schema_for!(DiagnosticBrief),
             "problem_class": schemars::schema_for!(ProblemClass),
             "problem_hypothesis": schemars::schema_for!(ProblemHypothesis),
             "repair_record": schemars::schema_for!(RepairRecord),

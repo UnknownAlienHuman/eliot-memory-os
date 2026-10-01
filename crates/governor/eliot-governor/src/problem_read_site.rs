@@ -239,6 +239,18 @@ pub fn read_committed_problem(
             reason: format!("committed head does not compile an I13.11 brief: {error}"),
         }
     })?;
+    // The brief is validated at the boundary it crosses, not only inside the
+    // compiler. `compile` re-runs the *record's* `validate`, so it can be
+    // correct by construction; what this check adds is that the thing actually
+    // handed to a Controller or operator is itself a well-formed brief, checked
+    // as a brief, on the way out. A brief that would not survive its own
+    // validation is refused here rather than served and discovered downstream.
+    diagnostic_brief.validate().map_err(|error| {
+        ProblemReadbackError::TransitionUndecodable {
+            page_position: u64::try_from(timeline.len()).unwrap_or(u64::MAX),
+            reason: format!("compiled I13.11 brief failed its own validation: {error}"),
+        }
+    })?;
     Ok(Some(ProblemReadback {
         head,
         timeline,
