@@ -233,9 +233,32 @@ fn validate_nominated_artifact_bytes(
 /// selector is admitted only when it names the exact current owner run. The
 /// caller list never supplies or narrows the verifier denominator.
 fn validate_nominated_verifier_run_refs(
+    fact: &CanonicalVerifierExecutionFact,
     current_run_ref: &str,
+    task_id: &TaskId,
+    task_revision: u64,
+    plan: &CanonicalPlanBinding,
+    fence: &StateFence,
     references: &[String],
 ) -> Result<(), FinishAttemptError> {
+    // The selector is only meaningful after the selected owner record has
+    // itself been checked. Bind its run identity and result to this exact
+    // task/plan/fence before comparing caller-supplied handles.
+    fact.validate(fence)?;
+    if fact.task_id != task_id.as_str()
+        || fact.task_revision != task_revision
+        || fact.plan != *plan
+        || fact.state_fence != *fence
+        || fact.verification_run.run_id.to_string() != current_run_ref
+        || fact.terminal_binding.evidence.run_id.to_string() != current_run_ref
+        || fact.terminal_binding.evidence.execution != fact.verification_run.execution
+        || fact.terminal_binding.evidence.outcome != fact.verification_run.outcome
+    {
+        return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+            "current verifier run identity or result is not bound to the exact task, plan, and State Fence"
+                .to_owned(),
+        )));
+    }
     if let Some(reference) = references
         .iter()
         .find(|reference| reference.as_str() != current_run_ref)
@@ -696,7 +719,15 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let (verifier_fact, verifier_run_ref) =
             self.read_current_verifier_fact(task_id, task, plan, fence)?;
         validate_nominated_artifact_bytes(&verifier_fact, nominated_refs.0)?;
-        validate_nominated_verifier_run_refs(&verifier_run_ref, nominated_refs.2)?;
+        validate_nominated_verifier_run_refs(
+            &verifier_fact,
+            &verifier_run_ref,
+            task_id,
+            task.revision,
+            plan,
+            fence,
+            nominated_refs.2,
+        )?;
         // This fact has already been rehydrated and validated against the
         // current task, plan, fence, and durable terminal TestD receipt. A
         // failed or partial verifier is still an executed run; its outcome is
