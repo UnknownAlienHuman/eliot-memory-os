@@ -66,6 +66,7 @@ use eliot_runtime::{Runtime, RuntimeConfig};
 
 mod bridge_contract;
 mod cli_contract;
+pub mod exposure_history;
 mod kernel_activation_client;
 mod kernel_host_request_client;
 /// Issue #2899: the live stdio -> host-event -> Agent Bridge correlation. It
