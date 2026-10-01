@@ -4053,20 +4053,28 @@ async fn run_owner_feed_sync(
 }
 
 /// Reports the durable grant-closure second phases that are still pending
-/// (#686).
+/// (#686) and tenders every owner-admitted resume handoff.
 ///
 /// This is the production driver for
 /// [`eliotd::authority_revocation_ingress`]. It is deliberately separate from
-/// the owner-feed restore above and runs after it, so the closure read can
+/// the owner-feed restore above and runs after it on every pass — including
+/// the first pass after a restart — so the closure read can
 /// never delay, reorder, or fail a restore that is already proven correct: a
 /// degraded ingress pass only emits a bounded diagnostic on this stream's
 /// existing failure guard and the next tick retries it, exactly like the
 /// owner-feed pass itself. The ingress never gates readiness and never fails
 /// the daemon.
 ///
-/// Pending second phases are a real durable obligation that nothing in the
-/// shipped daemon can currently finish, so they are reported with the exact
-/// missing owner named rather than left implied by an absence.
+/// Restart contract (issue #2100 item 7): this driver scans the whole bounded
+/// candidate denominator through the owner re-admission path before any
+/// affected descendant or introduction can regain effect authority downstream
+/// of the restored feed. An exhausted denominator stays
+/// pending/recovery-required — an owner-refused row is never reported as
+/// complete — and only an owner-admitted row carries authority forward to the
+/// Governor second-phase-only resume entry.
+///
+/// Pending second phases are a real durable obligation, so they are reported
+/// with the exact remaining gap named rather than left implied by an absence.
 async fn report_authority_revocation_ingress(
     kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
@@ -4082,6 +4090,8 @@ async fn report_authority_revocation_ingress(
     };
     match report {
         Ok(report) => {
+            let admitted = report.admitted_revocations().len();
+            let refused = report.refused_second_phase();
             for pending in report.pending_second_phase() {
                 tracing::warn!(
                     target: "eliotd::diagnostics",
@@ -4098,6 +4108,16 @@ async fn report_authority_revocation_ingress(
                     grant_graph_revision = report.revision(),
                     candidates_examined = report.candidates_examined(),
                     committed_closures = report.committed_closures(),
+                    admitted_second_phase = admitted,
+                    refused_second_phase = refused,
+                    admission = if pending.admission.is_admitted() {
+                        "admitted"
+                    } else {
+                        "refused"
+                    },
+                    admission_reason = pending.admission.refusal_reason().unwrap_or(
+                        "owner re-admitted the exact committed operation",
+                    ),
                     resume_blocked = pending.resume_blocked,
                 );
             }

@@ -10,11 +10,23 @@
 //! # What this module is
 //!
 //! One production pass that reads, over the authenticated front door, the
-//! durable closure receipts the Kernel's P-07 owner committed, and reports
-//! exactly which of them are still missing their canonical second phase. It
-//! is driven from the daemon's polled owner-feed pass
-//! (`daemon_runtime::run_owner_feed_sync`) and it never gates readiness and
+//! durable closure receipts the Kernel's P-07 owner committed, hands every
+//! bounded still-pending second phase to the maintenance-request owner for
+//! re-admission of the exact operation, and reports exactly which of them are
+//! still missing their canonical second phase. It is driven from the daemon's
+//! polled owner-feed pass
+//! (`daemon_runtime::run_owner_feed_sync`) — which runs from startup, after
+//! restore, on every tick — and it never gates readiness and
 //! never fails the daemon.
+//!
+//! Restart contract (issue #2100 item 7): every owner-feed pass, including the
+//! first pass after a restart, scans the whole bounded candidate denominator
+//! and routes every pending closure through the owner re-admission path
+//! before this pass reports. An over-bound denominator fails the pass closed
+//! instead of truncating, and an owner-refused closure stays
+//! pending/recovery-required — never complete — so no pass ever presents an
+//! empty or settled result that effect admission could mistake for a finished
+//! saga.
 //!
 //! Every value it reports is the owner's own committed bytes, served verbatim
 //! by `eliot_kernel_service::serve_grant_closure_receipt` and re-decoded under
@@ -28,43 +40,42 @@
 //! Two independent, measured facts block that, and both are properties of the
 //! shipped tree rather than of this composition root:
 //!
-//! 1. **No admitted revocation decision exists in `eliotd`.** A
-//!    [`eliot_authority::GrantRevocationRequest`] needs a target grant, its
-//!    snapshot, and its `AuthorityBinding`. The daemon holds none of them as a
-//!    decision: `git grep -nw GrantRevocationRequest -- bins/eliotd` resolves
-//!    to `kernel_authority_client.rs:170` (the `P07AuthorityPort::revoke_grant`
-//!    method that *receives* one) and `kernel_authority_client.rs:795` (inside
-//!    `mod tests`). `KernelAuthorityClient::revoke_grant` is itself callerless
-//!    in this crate, so the daemon never asks the Kernel to revoke anything.
-//!    The owner feed does not help: it RESTORES the graph from already-applied
-//!    history, so every grant the durable evidence has revoked is already
-//!    `GrantStatus::Revoked` in the recovered snapshot and there is nothing
-//!    live left to revoke.
-//! 2. **The one thing the daemon CAN derive is unreachable through that
-//!    method.** A committed first phase whose second phase never completed is
-//!    exactly the case `apply_admitted_authority_revocation` exists to resume,
-//!    but that method re-strikes the Kernel-first `revoke_grant`, and the
-//!    Kernel correctly refuses it: `admitted_grant_hydrations` retains out
-//!    every `non_admissible` grant
+//! 1. **No fresh revocation decision exists in `eliotd`, and none is
+//!    fabricated here.** A [`eliot_authority::GrantRevocationRequest`] needs a
+//!    target grant, its snapshot, and its `AuthorityBinding`. The daemon holds
+//!    none of them as a fresh decision, and #1692 still holds the
+//!    maintenance-request ingress at `explicit_request = false` because no
+//!    authenticated Human UI/CLI ingress exists. What the maintenance-request
+//!    owner CAN do — and now does, through
+//!    [`AdmittedMaintenanceRevocation::readmit_pending_closure`] — is re-admit
+//!    the exact operation the owners already committed, rebuilt field for
+//!    field from the Kernel owner's committed closure bytes plus the live
+//!    admitted fence. Nothing is derived from the restored graph and nothing
+//!    from a diagnostic row: a diagnostic tick alone stays non-authoritative.
+//! 2. **The admitted handoff is still unreachable through that method.** A
+//!    committed first phase whose second phase never completed is exactly the
+//!    case `apply_admitted_authority_revocation` exists to resume, but that
+//!    method re-strikes the Kernel-first `revoke_grant`, and the Kernel
+//!    correctly refuses it: `admitted_grant_hydrations` retains out every
+//!    `non_admissible` grant
 //!    (`crates/kernel/eliot-kernel-core/src/governor_closure_source.rs`), and
 //!    `admit_p07_target_against_current_grant_graph` answers `NotAdmitted` for
 //!    any target outside that set
 //!    (`bins/eliot-kernel/src/daemon_request_dispatch.rs`). The second-phase
-//!    resume the pass below reports therefore needs a public second-phase-only
+//!    resume the pass below tenders therefore needs a public second-phase-only
 //!    entry in `eliot-governor`, which does not exist:
 //!    `GovernorComposition::reconcile_canonical_revocation` and
-//!    `GovernorComposition::link_closure_second_phase` are both private.
+//!    `GovernorComposition::link_closure_second_phase` are both private. The
+//!    admitted value this pass tenders is typed and documented for that entry
+//!    alone; presenting it to the fresh Kernel-first saga is forbidden.
 //!
-//! The exact missing owner is named in
-//! [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]: the authenticated Human/Policy
-//! maintenance-request ingress that `maintenance_trigger_evaluator.rs` already
-//! holds fail-closed at `explicit_request = false` (issue #1692), and whose
-//! `GRANT_DISCLOSURE_CLOSURE` family is already registered with the effect
-//! "grant closure publication and disclosure revocation" in
-//! `maintenance_family_catalog.rs`. That owner must admit the revocation
-//! decision naming the target grant, its snapshot and its `AuthorityBinding`;
-//! only then can a daemon pass build a `GrantRevocationRequest` that is not a
-//! fabrication.
+//! The exact remaining gap is named in
+//! [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]: `eliot-governor` must expose the
+//! public second-phase-only resume accepting the owner-admitted value. The
+//! maintenance-request half of that contract — the owner that re-admits the
+//! exact operation — now exists in
+//! [`crate::maintenance_trigger_evaluator::AdmittedMaintenanceRevocation`];
+//! only the Governor drive is still missing.
 //!
 //! Forbidden boundary: no ORS access (the Kernel owns ORS in its own
 //! process), no second grant graph, no fabricated request, identity or
@@ -82,6 +93,7 @@ use eliot_store_api::REVOCATION_HISTORY_MAX_RECORDS;
 
 use super::DaemonComposition;
 use super::daemon_kernel_client::DaemonKernelClient;
+use super::maintenance_trigger_evaluator::AdmittedMaintenanceRevocation;
 
 /// Daemon->Kernel front-door read of one committed closure receipt.
 const GRANT_CLOSURE_RECEIPT_OPERATION: &str = "grant_closure_receipt";
@@ -98,20 +110,24 @@ const GRANT_CLOSURE_RECEIPT_REFUSAL_KIND: &str = "grant_closure_receipt_refused"
 /// `owner_feed.rs` (`RECEIPT_NOT_FOUND_REASON`).
 const RECEIPT_NOT_FOUND_REASON: &str = "receipt not found";
 
-/// The exact owner and entry that must exist before any daemon pass can drive
-/// the canonical second phase of a grant revocation, reported on every pending
-/// record this pass finds.
+/// The exact remaining gap before any daemon pass can drive the canonical
+/// second phase of a grant revocation, reported on every pending record this
+/// pass finds.
+///
+/// The authenticated Human/Policy maintenance-request owner now re-admits the
+/// exact committed operation for each pending closure
+/// ([`AdmittedMaintenanceRevocation`]), so the obligation is held by an owner
+/// instead of merely diagnosed. What is still missing is the Governor drive:
+/// `eliot-governor` must expose a public second-phase-only resume accepting
+/// that admitted value.
 ///
 /// Naming it here rather than leaving the pass silent is the point: a pending
-/// canonical second phase is real, actionable, durable state, and today
-/// nothing in the shipped daemon can finish it. Reporting it without naming
-/// the blocker would present an unfinished obligation as a handled one.
-pub const AUTHORITY_REVOCATION_RESUME_BLOCKED: &str = "no admitted owner drives the canonical second phase: the authenticated \
-     Human/Policy maintenance-request ingress held at explicit_request=false \
-     in bins/eliotd/src/maintenance_trigger_evaluator.rs (#1692) must admit the \
-     revocation decision naming the target grant, its snapshot and its \
-     AuthorityBinding; eliot-governor must additionally expose a public \
-     second-phase-only resume, because \
+/// canonical second phase is real, actionable, durable state. Reporting it
+/// without naming the blocker would present an unfinished obligation as a
+/// handled one.
+pub const AUTHORITY_REVOCATION_RESUME_BLOCKED: &str = "no Governor entry drives the canonical second phase: eliot-governor \
+     must expose a public second-phase-only resume accepting the owner-admitted \
+     AdmittedMaintenanceRevocation, because \
      GovernorComposition::apply_admitted_authority_revocation re-strikes the \
      Kernel-first revoke_grant that the Kernel refuses with NotAdmitted for a \
      grant its own owner already fences, and its \
@@ -157,8 +173,12 @@ impl AuthorityRevocationIngressPlan {
 /// linked yet.
 ///
 /// Every field is the owner's own committed value served by the Kernel. The
-/// `resume_blocked` marker is this module's honest statement that the durable
-/// obligation is real and currently undrivable, not that it was discharged.
+/// `resume_blocked` marker is this module's honest statement of the remaining
+/// Governor drive gap, not a claim that the obligation was discharged. The
+/// `admission` field records what the maintenance-request owner did with the
+/// obligation: only a [`PendingRevocationAdmission::Admitted`] row carries
+/// owner authority; a refused row is a non-authoritative diagnostic of a still
+/// pending obligation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingCanonicalSecondPhase {
     /// Target grant the committed closure fenced.
@@ -175,11 +195,64 @@ pub struct PendingCanonicalSecondPhase {
     /// `PendingActivation` while its Kernel/ORS closure is already `Revoked`
     /// is the sharpest form of the reconciliation gap, and one that reads
     /// `Revoked` shows the fence propagated into this projection while the
-    /// canonical second phase still did not.
+    /// canonical second phase still did not. Diagnostic only: it never
+    /// enters the owner admission.
     pub recovered_status: GrantStatus,
     /// Why this pass cannot finish the second phase. Always
     /// [`AUTHORITY_REVOCATION_RESUME_BLOCKED`].
     pub resume_blocked: &'static str,
+    /// What the maintenance-request owner did with this obligation.
+    pub admission: PendingRevocationAdmission,
+}
+
+/// What the maintenance-request owner did with one pending second phase.
+///
+/// The pass hands every bounded pending closure to the owner; the owner
+/// re-admits the exact operation or refuses it with a closed reason. Only
+/// [`PendingRevocationAdmission::Admitted`] carries authority forward to the
+/// Governor second-phase-only resume entry. A
+/// [`PendingRevocationAdmission::Refused`] row stays
+/// pending/recovery-required: it is a diagnostic tick, never an admission and
+/// never a completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingRevocationAdmission {
+    /// The owner re-admitted the exact committed operation. This is the
+    /// authoritative handoff the Governor second-phase-only resume entry
+    /// consumes. Boxed so the refused rows do not pay for an obligation they
+    /// do not hold (`clippy::large_enum_variant`).
+    Admitted(Box<AdmittedMaintenanceRevocation>),
+    /// The owner refused to re-admit the committed bytes. The closure stays
+    /// pending; the reason is fixed diagnostic text.
+    Refused {
+        /// Closed owner refusal reason. Fixed text, never authority.
+        reason: &'static str,
+    },
+}
+
+impl PendingRevocationAdmission {
+    /// Returns true exactly when the owner re-admitted the operation.
+    #[must_use]
+    pub const fn is_admitted(&self) -> bool {
+        matches!(self, Self::Admitted(_))
+    }
+
+    /// Returns the admitted handoff, if the owner re-admitted this obligation.
+    #[must_use]
+    pub fn admitted(&self) -> Option<&AdmittedMaintenanceRevocation> {
+        match self {
+            Self::Admitted(admitted) => Some(admitted.as_ref()),
+            Self::Refused { .. } => None,
+        }
+    }
+
+    /// Returns the closed owner refusal reason, if the owner refused.
+    #[must_use]
+    pub const fn refusal_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Admitted(_) => None,
+            Self::Refused { reason } => Some(*reason),
+        }
+    }
 }
 
 /// What one ingress pass proved about the durable closure state.
@@ -215,6 +288,33 @@ impl AuthorityRevocationIngressReport {
     #[must_use]
     pub fn pending_second_phase(&self) -> &[PendingCanonicalSecondPhase] {
         &self.pending_second_phase
+    }
+
+    /// Returns the owner-admitted resume handoffs tendered by this pass, in
+    /// candidate order.
+    ///
+    /// These are the authoritative obligations: each one is an exact
+    /// re-admitted operation the Governor second-phase-only resume entry
+    /// consumes. Diagnostic-only rows (owner-refused) are excluded; they stay
+    /// pending/recovery-required and are visible through
+    /// [`Self::pending_second_phase`] instead.
+    #[must_use]
+    pub fn admitted_revocations(&self) -> Vec<&AdmittedMaintenanceRevocation> {
+        self.pending_second_phase
+            .iter()
+            .filter_map(|row| row.admission.admitted())
+            .collect()
+    }
+
+    /// Returns how many pending closures the owner refused to re-admit on
+    /// this pass. Refused rows stay pending/recovery-required, never
+    /// complete.
+    #[must_use]
+    pub fn refused_second_phase(&self) -> usize {
+        self.pending_second_phase
+            .iter()
+            .filter(|row| !row.admission.is_admitted())
+            .count()
     }
 }
 
@@ -268,20 +368,27 @@ pub fn capture_authority_revocation_ingress_plan(
 }
 
 /// Runs one authority-revocation ingress pass over the authenticated Kernel
-/// transport and reports the durable second phases that are still pending.
+/// transport, hands every bounded still-pending second phase to the
+/// maintenance-request owner for re-admission, and reports the durable second
+/// phases that are still pending.
 ///
-/// The pass is a pure read of owner-committed state. It never strikes a fence,
-/// never commits a canonical envelope, never links a second phase, and never
-/// presents a revocation request: this daemon holds no admitted revocation
-/// decision (see the module documentation and
-/// [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]). What it does do is make the
-/// unfinished canonical obligation visible and bounded instead of leaving it
-/// implied by an absence.
+/// The pass reads only owner-committed state. It never strikes a fence, never
+/// commits a canonical envelope, never links a second phase, and never
+/// presents a revocation request to a fresh saga: the one revocation value it
+/// builds is the owner's own re-admission of the exact committed operation,
+/// tendered for the Governor second-phase-only resume entry alone (see the
+/// module documentation and [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]). A
+/// diagnostic tick alone stays non-authoritative: only a
+/// [`PendingRevocationAdmission::Admitted`] row carries authority forward,
+/// and an owner-refused row stays pending/recovery-required.
 ///
 /// Refusals fail the pass closed and are never degraded to an empty report: a
 /// refusal other than `receipt not found` means the durable state could not be
 /// established, and an absent closure is reported as "no first phase ran",
-/// which is a fact about the owner, not an empty success.
+/// which is a fact about the owner, not an empty success. An over-bound
+/// candidate denominator likewise fails the pass in
+/// [`capture_authority_revocation_ingress_plan`] rather than scanning a
+/// truncated set as if it were complete.
 ///
 /// A plan captured under a superseded Kernel generation refuses before any
 /// transport is touched, so a stale read can never be reported as current.
@@ -308,6 +415,19 @@ pub async fn scan_authority_revocation_ingress(
         };
         committed_closures += 1;
         if closure.state == GrantClosureState::Revoked && closure.canonical_receipt.is_none() {
+            // Hand the obligation to the maintenance-request owner: it
+            // re-admits the exact committed operation from the Kernel owner's
+            // bytes plus the live admitted fence this pass is bound to, or
+            // refuses it with a closed reason. The recovered status beside it
+            // stays diagnostic-only and never enters the admission.
+            let admission =
+                AdmittedMaintenanceRevocation::readmit_pending_closure(&plan.state_fence, &closure);
+            let admission = match admission {
+                Ok(admitted) => PendingRevocationAdmission::Admitted(Box::new(admitted)),
+                Err(error) => PendingRevocationAdmission::Refused {
+                    reason: error.refusal_reason(),
+                },
+            };
             pending_second_phase.push(PendingCanonicalSecondPhase {
                 grant_id: closure.declaration.target_grant_id,
                 closure_operation_id: closure.operation_id,
@@ -315,6 +435,7 @@ pub async fn scan_authority_revocation_ingress(
                 snapshot_id: closure.authority_receipt.snapshot_id,
                 recovered_status: candidate.status,
                 resume_blocked: AUTHORITY_REVOCATION_RESUME_BLOCKED,
+                admission,
             });
         }
     }
