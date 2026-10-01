@@ -549,6 +549,7 @@ use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, RuntimeReserve, ShutdownOutcome};
+use eliot_runtime::RuntimePermit;
 #[cfg(test)]
 pub use eliot_runtime_contracts::SupervisionLeasePredecessorIdentity;
 #[cfg(windows)]
@@ -687,6 +688,9 @@ pub struct KernelComposition {
     /// Resource generation that owns the shared RuntimeReserve instance used
     /// by both ordinary task admission and authenticated headroom IPC.
     runtime_owner_generation: ResourceGeneration,
+    /// Native non-clone permits issued by the authenticated Orientation
+    /// headroom owner. Dropping this table releases every retained permit.
+    orientation_headroom_permits: Mutex<BTreeMap<String, OrientationHeadroomPermitEntry>>,
     platform: Arc<WindowsPlatform>,
     ipc: IpcImplementation,
     generation_gateway: OrsGenerationCoordinator,
@@ -927,6 +931,16 @@ pub struct KernelComposition {
     /// Process-local only, never canonical state: the brief carries
     /// references, never rolling log content (I16.7).
     pub(crate) diagnostic_brief: Mutex<Option<diagnostic_brief::DiagnosticBrief>>,
+}
+
+/// One opaque, Kernel-retained capacity permit and the exact authenticated
+/// closure that acquired it. The wire only carries the owner-minted binding;
+/// the non-clone permit never leaves the Kernel.
+pub(crate) struct OrientationHeadroomPermitEntry {
+    pub(crate) connection_id: String,
+    pub(crate) closure: eliot_protocol::OrientationHeadroomOwnerClosureV1,
+    pub(crate) binding: eliot_runtime_contracts::CapacityPermitBinding,
+    pub(crate) permit: RuntimePermit,
 }
 
 impl KernelComposition {

@@ -1484,6 +1484,7 @@ fn is_daemon_operation(operation: &str) -> bool {
         | STORAGE_REPLACEMENT_RESUME_OPERATION
         | STORAGE_REPLACEMENT_ROLLBACK_OPERATION
             | DAEMON_STARTUP_EVIDENCE_OPERATION
+            | eliot_protocol::ORIENTATION_HEADROOM_OWNER_OPERATION
             // Issue #1779: the authenticated `UserAutomation` runtime route.
             // The marker is the closed daemon operation name the retained
             // `UserAutomation` admission path already serves, so this entry

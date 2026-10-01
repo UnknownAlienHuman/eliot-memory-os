@@ -2156,6 +2156,7 @@ impl KernelComposition {
             work_root,
             runtime,
             runtime_owner_generation: generation,
+            orientation_headroom_permits: Mutex::new(BTreeMap::new()),
             platform,
             ipc,
             generation_gateway,

@@ -54,6 +54,13 @@ use eliot_protocol::{
     LocalReadExecutionEvidence, RequestIdentity, TaskControllerResultBody,
     host_request_operation_id,
 };
+use eliot_protocol::{
+    ORIENTATION_HEADROOM_OWNER_OPERATION, OrientationHeadroomOwnerAction,
+    OrientationHeadroomOwnerReadbackV1, OrientationHeadroomOwnerRequestV1,
+};
+use eliot_runtime_contracts::{
+    CapacityBottleneck, CapacityClass, CapacityPermitBinding, RequestedOperationClass,
+};
 #[cfg(windows)]
 use eliot_protocol::{MaintenanceTriggerIntakeReceipt, MaintenanceTriggerRecord, ProtocolError};
 use eliot_runtime_contracts::GenerationCutoverState;
@@ -1409,6 +1416,212 @@ enum P07LifecycleTarget<'a> {
 }
 
 impl KernelComposition {
+    /// Executes one authenticated native Orientation headroom owner action.
+    ///
+    /// The retained `RuntimePermit` is never serialized. This first owner
+    /// slice serves only the two runtime dimensions that the shared ordinary
+    /// `RuntimeReserve` actually enforces; every other bottleneck is explicitly
+    /// refused until its original enforcement owner is connected here.
+    fn orientation_headroom_owner_operation(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+        request_identity: Option<&RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        let request: OrientationHeadroomOwnerRequestV1 =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        request
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let closure = &request.closure;
+        let source = &closure.capacity_request;
+        let runtime_generation_ref = format!("kernel-runtime-generation-{}", self.runtime_owner_generation.value());
+        if session.module_generation.module_id.as_str() != ACTIVE_DAEMON_CALLER
+            || identity.request.state_fence != session.module_generation.state_fence
+            || closure.state_fence != session.module_generation.state_fence
+            || closure.work_scope.state_fence != session.module_generation.state_fence
+            || closure.work_scope.product_id != identity.request.metadata.product_id
+            || closure.work_scope.resource_generation != self.runtime_owner_generation
+            || closure.task_id.as_str()
+                != identity.request.metadata.task_id.as_ref().map(|task| task.as_str()).unwrap_or("")
+            || closure.operation_id.as_str() != identity.request.metadata.request_id.as_str()
+            || identity.deadline_unix_ms != closure.deadline_ms
+            || source.requesting_generation_ref != self.runtime_owner_generation
+            || source.requesting_owner_ref != ACTIVE_DAEMON_CALLER
+            || !source.authority_epoch_ref.is_same_authority(&session.authority_epoch)
+            || !session
+                .module_generation
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&session.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        #[cfg(windows)]
+        self.require_current_daemon_session(session)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now_ms = unix_ms();
+        if request.action != OrientationHeadroomOwnerAction::Release
+            && (now_ms == 0 || now_ms >= closure.deadline_ms)
+        {
+            return Ok(serde_json::json!({
+                "status": "unknown",
+                "value": null,
+                "recovery": { "code": "DEADLINE_EXPIRED" }
+            }));
+        }
+        let mut retained = self
+            .orientation_headroom_permits
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        retained.retain(|_, entry| entry.closure.deadline_ms > now_ms);
+        let prior = request.permit.as_ref();
+        let binding = match request.action {
+            OrientationHeadroomOwnerAction::Acquire => {
+                if let Some(existing) = retained.values().find(|entry| {
+                    entry.connection_id == session.connection_id
+                        && entry.closure == request.closure
+                }) {
+                    existing.binding.clone()
+                } else {
+                    let reserve = self
+                        .runtime
+                        .capacity_reserve()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let quantity = source.requested_limit.quantity.get();
+                    if source.operation.capacity_class() != CapacityClass::NormalWorkload
+                        || quantity != 1
+                        || source.requested_limit.unit != source.requested_bottleneck.unit()
+                    {
+                        return Ok(serde_json::json!({
+                            "status": "unknown",
+                            "value": null,
+                            "recovery": { "code": "UNSUPPORTED_OWNER_DIMENSION_OR_REQUEST" }
+                        }));
+                    }
+                    let class = match source.operation {
+                        RequestedOperationClass::Normal(class) => class,
+                        _ => {
+                            return Ok(serde_json::json!({
+                                "status": "unknown",
+                                "value": null,
+                                "recovery": { "code": "UNSUPPORTED_OPERATION_CLASS" }
+                            }));
+                        }
+                    };
+                    let permit = match source.requested_bottleneck {
+                        CapacityBottleneck::KernelRunnableControlSlots => reserve
+                            .try_acquire_normal_runnable_slot(class, ACTIVE_DAEMON_CALLER, source.operation_id.as_str()),
+                        CapacityBottleneck::CpuControlTaskSlots => reserve
+                            .try_acquire_normal_cpu_task(class, ACTIVE_DAEMON_CALLER, source.operation_id.as_str()),
+                        _ => {
+                            return Ok(serde_json::json!({
+                                "status": "unknown",
+                                "value": null,
+                                "recovery": { "code": "UNSUPPORTED_OWNER_DIMENSION" }
+                            }));
+                        }
+                    }
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    if now_ms == 0 || now_ms >= closure.deadline_ms {
+                        drop(permit);
+                        return Ok(serde_json::json!({
+                            "status": "unknown",
+                            "value": null,
+                            "recovery": { "code": "DEADLINE_EXPIRED" }
+                        }));
+                    }
+                    let nonce = eliot_platform_windows::fresh_activation_nonce_material()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    let mut owner_evidence_refs = vec![
+                        format!("kernel-runtime-generation:{}", self.runtime_owner_generation.value()),
+                        format!("orientation-request:{}", closure.source_request_digest),
+                    ];
+                    owner_evidence_refs.sort();
+                    let binding = CapacityPermitBinding {
+                        permit_id: nonce.as_str().to_owned(),
+                        operation_id: source.operation_id.clone(),
+                        capacity_class: source.operation.capacity_class(),
+                        operation: source.operation,
+                        bottleneck: source.requested_bottleneck,
+                        granted_limit: source.requested_limit,
+                        capacity_owner_ref: "Kernel runtime/control scheduler owner".to_owned(),
+                        capacity_owner_generation_ref: self.runtime_owner_generation,
+                        requesting_owner_ref: source.requesting_owner_ref.clone(),
+                        requesting_generation_ref: source.requesting_generation_ref,
+                        authority_epoch_ref: source.authority_epoch_ref.clone(),
+                        profile_id: source.profile_id.clone(),
+                        profile_revision: source.profile_revision.clone(),
+                        issued_at_ms: now_ms,
+                        expires_at_ms: closure.deadline_ms,
+                        owner_evidence_refs,
+                    };
+                    binding
+                        .validate()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    retained.insert(
+                        binding.permit_id.clone(),
+                        OrientationHeadroomPermitEntry {
+                            connection_id: session.connection_id.clone(),
+                            closure: request.closure.clone(),
+                            binding: binding.clone(),
+                            permit,
+                        },
+                    );
+                    binding
+                }
+            }
+            OrientationHeadroomOwnerAction::Revalidate
+            | OrientationHeadroomOwnerAction::Release => {
+                let prior = prior.ok_or(TransportError::SessionFenced)?;
+                let entry = retained
+                    .get(&prior.permit_id)
+                    .ok_or(TransportError::SessionFenced)?;
+                if &entry.binding != prior
+                    || entry.connection_id != session.connection_id
+                    || entry.closure != request.closure
+                    || entry.permit.amount() != prior.granted_limit.quantity.get()
+                    || entry.permit.operation_id() != prior.operation_id
+                    || entry.permit.owner() != ACTIVE_DAEMON_CALLER
+                    || entry.permit.owner_generation_ref() != runtime_generation_ref
+                    || entry.permit.bottleneck() != prior.bottleneck
+                    || entry.permit.authority_epoch_ref()
+                        != serde_json::to_string(&session.authority_epoch)
+                            .map_err(|_| TransportError::SessionFenced)?
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let binding = entry.binding.clone();
+                if request.action == OrientationHeadroomOwnerAction::Release {
+                    retained.remove(&prior.permit_id);
+                }
+                binding
+            }
+        };
+        let observed_at_unix_ms = unix_ms();
+        let readback = OrientationHeadroomOwnerReadbackV1 {
+            wire_version: eliot_protocol::ORIENTATION_HEADROOM_OWNER_WIRE_VERSION,
+            action: request.action,
+            source_request_digest: closure.source_request_digest.clone(),
+            permit: binding,
+            observed_authority_epoch: session.authority_epoch.clone(),
+            observed_owner_generation: self.runtime_owner_generation,
+            observed_at_unix_ms,
+        };
+        readback
+            .validate_against(&request)
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(serde_json::json!({
+            "status": "known",
+            "value": readback,
+            "recovery": null,
+        }))
+    }
+
     /// Locks the retained P-07 owner bound by the Governor feed. An unbound
     /// composition withholds unsupported authority instead of routing to a
     /// no-authority port: the production path never selects
@@ -3259,6 +3472,9 @@ impl KernelComposition {
         #[cfg(windows)]
         self.require_current_daemon_session(session)?;
         let result = match operation {
+            ORIENTATION_HEADROOM_OWNER_OPERATION => {
+                self.orientation_headroom_owner_operation(session, payload, request_identity)
+            }
             #[cfg(windows)]
             scan_disclosure_route::OPERATION => {
                 self.scan_disclosure_owner_operation(session, payload)
