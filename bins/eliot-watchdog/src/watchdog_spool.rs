@@ -2246,6 +2246,41 @@ impl WatchdogSpool {
         high_water: u64,
         limits: WatchdogSpoolExportLimits,
     ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
+        self.export_batch_impl(predecessor, high_water, limits, true)
+    }
+
+    /// Builds the owner-generated window the fenced intent route reconciles.
+    ///
+    /// The envelope is the same immutable window [`Self::export_batch`]
+    /// builds — predecessor, full covered range, high-water, identity,
+    /// digest, freshness — bound to the intent contour's own sink identity.
+    /// The stored cursor may already be bound to the sibling export contour:
+    /// this window enforces the stored sequence and lineage but not the
+    /// stored sink binding, because it never advances the cursor and never
+    /// compacts. Exactly-once stays with the per-record submit-once receipt
+    /// the caller persists from the fenced route's acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] under the same conditions as
+    /// [`Self::export_batch`], except a stored sink binding owned by the
+    /// sibling export contour is not a failure.
+    pub(crate) fn export_batch_for_intent_window(
+        &self,
+        predecessor: &WatchdogSpoolCursor,
+        high_water: u64,
+        limits: WatchdogSpoolExportLimits,
+    ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
+        self.export_batch_impl(predecessor, high_water, limits, false)
+    }
+
+    fn export_batch_impl(
+        &self,
+        predecessor: &WatchdogSpoolCursor,
+        high_water: u64,
+        limits: WatchdogSpoolExportLimits,
+        enforce_sink_binding: bool,
+    ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
         tracing::debug!(
             event = "watchdog.spool_export_attempted",
             observation = "attempted",
@@ -2253,7 +2288,12 @@ impl WatchdogSpool {
         );
         limits.validate()?;
         validate_cursor(predecessor, high_water)?;
-        let window = self.read_export_window_snapshot(predecessor, high_water, &limits)?;
+        let window = self.read_export_window_snapshot(
+            predecessor,
+            high_water,
+            &limits,
+            enforce_sink_binding,
+        )?;
         if predecessor.acknowledged_sequence == high_water {
             let batch = build_empty_export_batch(predecessor, high_water)?;
             validate_batch(&batch, high_water)?;
@@ -2482,6 +2522,7 @@ impl WatchdogSpool {
         predecessor: &WatchdogSpoolCursor,
         high_water: u64,
         limits: &WatchdogSpoolExportLimits,
+        enforce_sink_binding: bool,
     ) -> Result<ExportWindow, SpoolError> {
         let read = self
             .database
@@ -2511,7 +2552,16 @@ impl WatchdogSpool {
         if high_water > live_high_water {
             return Err(WatchdogSpoolReconciliationError::InvalidCursor.into());
         }
-        check_export_predecessor(&stored, predecessor)?;
+        // The intent reconciliation window never advances the shared cursor,
+        // so it enforces the stored sequence and lineage but tolerates a
+        // cursor the sibling export contour already bound to its own sink.
+        // The export window keeps the sink binding because its
+        // acknowledgement moves the cursor.
+        if enforce_sink_binding {
+            check_export_predecessor(&stored, predecessor)?;
+        } else {
+            check_window_sequence_binding(&stored, predecessor)?;
+        }
         if predecessor.acknowledged_sequence == high_water {
             return Ok(ExportWindow::Ready(Vec::new()));
         }
@@ -3099,7 +3149,15 @@ fn export_payload_kind(payload: &WatchdogSpoolPayload) -> WatchdogSpoolPayloadKi
 /// An unbound stored cursor accepts any shape-valid predecessor and binds it
 /// in memory; a bound cursor requires the exact acknowledged sequence plus
 /// identical owner identities, including the cursor revision.
-fn check_export_predecessor(
+/// Sequence and lineage binding shared by the export and intent windows.
+///
+/// Both contours read the same stored cursor progress, so both enforce the
+/// schema, the acknowledged sequence, and the owner lineage. Only the sink
+/// binding differs: the export contour advances the shared cursor and stays
+/// bound to the sink that owns it, while the intent contour never advances
+/// the cursor and must tolerate a cursor the sibling export contour bound.
+/// See [`check_export_predecessor`].
+fn check_window_sequence_binding(
     stored: &WatchdogSpoolCursor,
     predecessor: &WatchdogSpoolCursor,
 ) -> Result<(), WatchdogSpoolReconciliationError> {
@@ -3123,7 +3181,18 @@ fn check_export_predecessor(
     if predecessor.watchdog_epoch != stored.watchdog_epoch {
         return Err(WatchdogSpoolReconciliationError::EpochMismatch);
     }
-    if predecessor.sink_id != stored.sink_id {
+    Ok(())
+}
+
+fn check_export_predecessor(
+    stored: &WatchdogSpoolCursor,
+    predecessor: &WatchdogSpoolCursor,
+) -> Result<(), WatchdogSpoolReconciliationError> {
+    // Full binding for the cursor-advancing export window: the shared
+    // sequence and lineage binding plus the stored sink binding, so only
+    // the sink that owns the bound cursor may advance it.
+    check_window_sequence_binding(stored, predecessor)?;
+    if !is_unbound_export_cursor(stored) && predecessor.sink_id != stored.sink_id {
         return Err(WatchdogSpoolReconciliationError::SinkMismatch);
     }
     Ok(())

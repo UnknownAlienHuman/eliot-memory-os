@@ -616,6 +616,47 @@ impl IndependentKernelSensor {
         sink_id: &str,
         limits: WatchdogSpoolExportLimits,
     ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
+        let (predecessor, high_water) = self.export_window_predecessor(sink_id)?;
+        self.spool.export_batch(&predecessor, high_water, limits)
+    }
+
+    /// Exports the owner-generated window the fenced intent route reconciles.
+    ///
+    /// Identities are built exactly as in
+    /// [`Self::export_spool_batch_with_raws`]: the installation id and
+    /// watchdog generation come from the retained binding, the watchdog
+    /// epoch from the epoch retained at sensor construction, and only the
+    /// sink id arrives as a parameter. Unlike the export window, this read
+    /// tolerates a stored cursor the sibling export contour already bound
+    /// to its own sink: the intent window never advances the cursor, so
+    /// the stored sink binding must not fence it. There is no semantic
+    /// interpretation here and no canonical store write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// [`Self::export_spool_batch_with_raws`].
+    pub fn export_intent_window_batch(
+        &self,
+        sink_id: &str,
+        limits: WatchdogSpoolExportLimits,
+    ) -> Result<WatchdogSpoolExportBatch, SpoolError> {
+        let (predecessor, high_water) = self.export_window_predecessor(sink_id)?;
+        self.spool
+            .export_batch_for_intent_window(&predecessor, high_water, limits)
+            .map(|(batch, _raw_entry_bytes)| batch)
+    }
+
+    /// Builds the caller-bound predecessor cursor and live high-water one
+    /// export window is read from.
+    ///
+    /// Shared by the export and intent windows so both contours bind the
+    /// same owner-issued installation, generation, and epoch. Only the
+    /// sink id differs per contour.
+    fn export_window_predecessor(
+        &self,
+        sink_id: &str,
+    ) -> Result<(eliot_watchdog_core::WatchdogSpoolCursor, u64), SpoolError> {
         let installation_id = self.installation_id.clone();
         let watchdog_generation = self.watchdog_generation;
         let watchdog_epoch = self
@@ -644,7 +685,7 @@ impl IndependentKernelSensor {
             sink_id: sink_id.to_owned(),
         };
         let high_water = self.spool.high_water_sequence()?;
-        self.spool.export_batch(&predecessor, high_water, limits)
+        Ok((predecessor, high_water))
     }
 
     /// Applies an exact authenticated sink acknowledgement to the export
