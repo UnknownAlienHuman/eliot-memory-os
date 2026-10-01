@@ -6919,42 +6919,18 @@ impl InquiryGovernance {
             &observation.evidence_set_id,
             &obligations,
         )?;
-        let research_debts = research_debts(
+        let FrozenDebtProjection {
+            research_debts,
+            research_gate_records,
+            research_debt_registrations,
+            freeze,
+        } = frozen_debt_projection(
             &observation,
             &profile,
             &portfolio,
             &coverage_receipt,
             &precision,
             &admissibility,
-        )?;
-        // I21.12 / Appendix G: the gates are compiled from the debts this run
-        // registered, right here, so the activation is a derivation of the
-        // observed obligation rather than a configuration a caller switched on.
-        let research_gate_records = research_gate_records(
-            &observation,
-            &profile,
-            &coverage_receipt,
-            &portfolio,
-            &precision,
-            &research_debts,
-        )?;
-        // I21.12's "Debts are registered in the Problem Registry (I13.9)": the
-        // handoff intent is proposed here, from the gates just compiled, so the
-        // debt -> Problem -> gate relationship is one derivation rather than
-        // three parallel lists a reader has to reconcile.
-        let research_debt_registrations = research_debt_registrations(
-            &observation,
-            &profile,
-            &research_debts,
-            &research_gate_records,
-        )?;
-        let freeze = evidence_freeze(
-            &observation,
-            &profile,
-            &portfolio,
-            &coverage_receipt,
-            &admissibility,
-            &research_debts,
         )?;
         // The per-claim audit now has a production producer. `claim_audit_for_run`
         // derives the audited claims from the admitted material this record already
@@ -7951,13 +7927,9 @@ impl std::fmt::Display for InquiryGovernance {
              lane_delivered_handles={} lane_discipline={} \
              terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
              claim_audits={} claim_coverage={} \
-             debts={} debt_kinds={} {} \
-             research_gates={} research_gate_current={} research_gate_statuses={} \
-             research_gate_families={} \
-             debt_registrations={} debt_registration_pending={} \
-             debt_registration_obligation_ids={} \
              {} \
-             debt_registration_owner_receipt=none",
+             {} \
+             source_admission_owner_receipt=none",
             self.inquiry_id,
             self.evidence_set_id,
             self.profile.profile_id,
@@ -8019,27 +7991,7 @@ impl std::fmt::Display for InquiryGovernance {
                 map: &self.claim_coverage,
                 unaccounted: &self.claim_coverage_unaccounted,
             },
-            self.research_debts.len(),
-            debt_kinds_wire(&self.research_debts),
-            DebtRestrictionProjection {
-                restriction: &terminal.debt_restriction,
-            },
-            self.research_gate_records.len(),
-            self.current_research_gates().len(),
-            gate_statuses_wire(&self.research_gate_records),
-            gate_families_wire(&self.research_gate_records),
-            self.research_debt_registrations.len(),
-            self.research_debt_registrations
-                .iter()
-                .filter(|registration| registration.is_pending())
-                .count(),
-            member_list_wire(
-                &self
-                    .research_debt_registrations
-                    .iter()
-                    .map(|registration| registration.obligation_id.as_str())
-                    .collect::<Vec<&str>>(),
-            ),
+            ResearchDebtProjection { record: self },
             TerminalDispositionProjection {
                 terminal,
                 source_admission_requests: &self.source_admission_requests,
@@ -10315,6 +10267,108 @@ fn commit_freeze_through_source_admission(
     Ok((requests, retained_revisions))
 }
 
+/// The frozen evidence revision together with the I21.12 obligations bound to it.
+///
+/// These four values are one unit rather than four independent `let` bindings,
+/// and the reason is a real relationship rather than tidiness: the freeze
+/// publishes the registered debt identities in its own
+/// `open_research_debts` roster, the Appendix G gates are compiled only from the
+/// debts that are currently open, and the Problem-registration handoff intents
+/// are proposed only from those gates. A reader that could see one of the four
+/// without the others could not tell whether the freeze carried the obligations
+/// it claims, and carrying them in one value is what makes that question
+/// answerable from the record itself.
+///
+/// Owned rather than borrowed because every field moves into
+/// [`InquiryGovernance`] exactly once, at the record assembly.
+struct FrozenDebtProjection {
+    /// The I21.12 debts this run registered.
+    research_debts: Vec<ResearchDebt>,
+    /// The narrow Appendix G gates the currently open debts oblige.
+    research_gate_records: Vec<ResearchGateRecord>,
+    /// The replay-safe Problem-registry handoff intents for those gates.
+    research_debt_registrations: Vec<ResearchDebtRegistrationRequest>,
+    /// The frozen evidence revision the debts are bound into.
+    freeze: EvidenceFreeze,
+}
+
+/// Derives the frozen evidence revision and everything I21.12 hangs off it.
+///
+/// The four steps stay in this order and stay in one function, because the order
+/// is the guarantee rather than a convention:
+///
+/// 1. the debts are registered from the observed residue of this run;
+/// 2. the Appendix G gates are compiled from those debts, so an activation is a
+///    derivation of an observed obligation and never a configuration a caller
+///    switched on;
+/// 3. the Problem-registration handoff intents are proposed from those gates, so
+///    the debt -> Problem -> gate relationship is ONE derivation rather than
+///    three parallel lists a reader has to reconcile;
+/// 4. the evidence freeze is built last, carrying the registered debt identities
+///    into `open_research_debts`.
+///
+/// The single caller is [`InquiryGovernance::record`], so this is not a helper
+/// anybody may call instead of the real path: it IS the real path.
+///
+/// # Errors
+///
+/// Returns every refusal of the four steps it sequences, unchanged: a debt that
+/// carries no accountable owner or no competent artifact, a gate that cannot name
+/// an affected decision, a registration whose gate is not the gate this debt
+/// revision activated, and an evidence freeze whose own binding does not re-prove.
+fn frozen_debt_projection(
+    observation: &InquiryObservation,
+    profile: &InquiryProtocolProfile,
+    portfolio: &SourcePortfolio,
+    coverage_receipt: &CoverageReceipt,
+    precision: &EvidenceSetPrecision,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<FrozenDebtProjection, InquiryError> {
+    let research_debts = research_debts(
+        observation,
+        profile,
+        portfolio,
+        coverage_receipt,
+        precision,
+        admissibility,
+    )?;
+    // I21.12 / Appendix G: the gates are compiled from the debts this run
+    // registered, right here, so the activation is a derivation of the
+    // observed obligation rather than a configuration a caller switched on.
+    let research_gate_records = research_gate_records(
+        observation,
+        profile,
+        coverage_receipt,
+        portfolio,
+        precision,
+        &research_debts,
+    )?;
+    // I21.12's "Debts are registered in the Problem Registry (I13.9)": the
+    // handoff intent is proposed here, from the gates just compiled, so the
+    // debt -> Problem -> gate relationship is one derivation rather than
+    // three parallel lists a reader has to reconcile.
+    let research_debt_registrations = research_debt_registrations(
+        observation,
+        profile,
+        &research_debts,
+        &research_gate_records,
+    )?;
+    let freeze = evidence_freeze(
+        observation,
+        profile,
+        portfolio,
+        coverage_receipt,
+        admissibility,
+        &research_debts,
+    )?;
+    Ok(FrozenDebtProjection {
+        research_debts,
+        research_gate_records,
+        research_debt_registrations,
+        freeze,
+    })
+}
+
 /// The admitted source records of one run, keyed by handle.
 ///
 /// The same records the portfolio assembled and the freeze enumerated, carried
@@ -11063,30 +11117,82 @@ fn str_members(members: &[String]) -> Vec<&str> {
     members.iter().map(String::as_str).collect()
 }
 
-/// The `debt_restricted=` and `debt_restriction_refused=` values on the receipt
-/// line.
+/// The whole I21.12 research-debt projection on the receipt line.
 ///
-/// I21.12 makes a debt a typed object that states what it blocks, so the line
-/// publishes the restriction boolean beside the closed wire names of the
-/// dispositions the debts actually refuse. Rendering both from one owner means
-/// the boolean and the list cannot disagree about which debt kinds are present.
-struct DebtRestrictionProjection<'a> {
-    /// The restriction the registered debts imply.
-    restriction: &'a ResearchDebtRestriction,
+/// One projection rather than six inline format arguments, for the same reason the
+/// narrower restriction-only projection it replaces existed and one better reason
+/// on top of it: the four values it publishes describe ONE obligation — the
+/// registered debt, the restriction that debt places on the claim, the Appendix G
+/// gate the debt activated and the Problem-registry registration that gate still
+/// owes. Rendering them apart let a reader compare a count of debts against a list
+/// of gate statuses without any of them naming the debt they belonged to.
+///
+/// What each value is, kept from the projections this one replaces:
+///
+/// - `debts`/`debt_kinds`: I21.12 makes a debt a typed object that states what it
+///   blocks, so the kind reaches the boundary as a closed wire name rather than
+///   only as a count.
+/// - `debt_restricted`/`debt_restriction_refused`: the restriction boolean beside
+///   the closed wire names of the dispositions the debts actually refuse.
+///   Rendering both from one owner means the boolean and the list cannot disagree
+///   about which debt kinds are present.
+/// - `research_gate_current`: the count of gates that may appear in current
+///   required context, read through
+///   [`ResearchGateStatus::appears_in_current_context`] rather than assumed.
+/// - `debt_registration_pending` and `debt_registration_obligation_ids`: which
+///   obligations this record proposes registering and how many of those proposals
+///   are still uncommitted.
+/// - `debt_registration_owner_receipt=none`: the Problem Registry's commit
+///   receipt is the registry's, `crates/research/AGENTS.md` gives this subtree no
+///   canonical-store write authority, and a line implying a receipt would be a
+///   false proof claim under A0.3 — the same reason the sibling
+///   `source_admission_owner_receipt=none` is spelled.
+///
+/// Only identities, closed wire names and counts are rendered: no debt summary,
+/// no owner prose, no provider material, no credential.
+struct ResearchDebtProjection<'a> {
+    /// The record whose registered debts, restriction, gates and registrations
+    /// are rendered here.
+    record: &'a InquiryGovernance,
 }
 
-impl std::fmt::Display for DebtRestrictionProjection<'_> {
+impl std::fmt::Display for ResearchDebtProjection<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let record = self.record;
+        let restriction = &record.terminal.debt_restriction;
+        let pending = record
+            .research_debt_registrations
+            .iter()
+            .filter(|registration| registration.is_pending())
+            .count();
         write!(
             formatter,
-            "debt_restricted={} debt_restriction_refused={}",
-            bool_text(self.restriction.restricted),
-            self.restriction
+            "debts={} debt_kinds={} debt_restricted={} debt_restriction_refused={} \
+             research_gates={} research_gate_current={} research_gate_statuses={} \
+             research_gate_families={} debt_registrations={} debt_registration_pending={} \
+             debt_registration_obligation_ids={} debt_registration_owner_receipt=none",
+            record.research_debts.len(),
+            debt_kinds_wire(&record.research_debts),
+            bool_text(restriction.restricted),
+            restriction
                 .refused_dispositions
                 .iter()
                 .map(|disposition| disposition_wire(*disposition))
                 .collect::<Vec<&str>>()
                 .join(","),
+            record.research_gate_records.len(),
+            record.current_research_gates().len(),
+            gate_statuses_wire(&record.research_gate_records),
+            gate_families_wire(&record.research_gate_records),
+            record.research_debt_registrations.len(),
+            pending,
+            member_list_wire(
+                &record
+                    .research_debt_registrations
+                    .iter()
+                    .map(|registration| registration.obligation_id.as_str())
+                    .collect::<Vec<&str>>(),
+            ),
         )
     }
 }
