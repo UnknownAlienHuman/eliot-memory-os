@@ -10939,12 +10939,20 @@ where
     /// `Activating` with the exact pending suffix needs no reconciliation and
     /// yields no indexes.  `RollbackRequired` with the retained intent yields
     /// the unsettled start indexes only after an authoritative port readback
-    /// observes every one of them `Absent`; the reset to `Pending` itself
-    /// happens later inside the single intent-clearing CAS, so a failed
-    /// readback persists nothing and keeps the intent.  Any present service,
-    /// any residual unknown, or any contour outside the timeout shape refuses
-    /// with recovery/forward-repair rather than quarantining or dropping the
-    /// intent.  This never executes an effect: reconciliation is read-only.
+    /// observes every one of them `Absent`, plus the transaction-owned
+    /// converged `Watchdog` index (audit 5899500978) only after an
+    /// authoritative port readback proves the live service is still that
+    /// exact transaction-owned runtime (`Matching` with the exact durable
+    /// external identity and process lineage) or cleanly stopped (`Absent`
+    /// with no runtime lineage); the reset to `Pending` itself happens later
+    /// inside the single intent-clearing CAS for the unsettled starts only,
+    /// while the owned Watchdog start keeps its lineage, so a failed readback
+    /// persists nothing and keeps the intent.  Any present service on an
+    /// unsettled start, any foreign or substituted Watchdog identity or
+    /// lineage, any residual unknown, or any contour outside the timeout
+    /// shape refuses with recovery/forward-repair rather than quarantining or
+    /// dropping the intent.  This never executes an effect: reconciliation is
+    /// read-only.
     ///
     /// The readback is issued on the `Rollback` leg because that is the only
     /// leg for which the sealed port admits a stopped service as `Absent`.  An
@@ -10953,11 +10961,14 @@ where
     /// named service on its `RegisterService` effect; see
     /// `InstallationTransaction::recorded_service_registration_identity`.
     /// A present or differently-identified service therefore mismatches and
-    /// refuses; the reconciliation can never adopt an unknown process.
+    /// refuses; the reconciliation can never adopt an unknown process.  The
+    /// owned Watchdog request is instead bound to its own durable `Applied`
+    /// external identity, so a restarted foreign runtime mismatches and
+    /// refuses rather than being adopted.
     pub(crate) fn reconcile_timeout_starts_for_owner_rollback(
         &mut self,
         transaction: &InstallationTransaction,
-    ) -> Result<Vec<usize>, InstallationError> {
+    ) -> Result<(Vec<usize>, Option<usize>), InstallationError> {
         transaction.validate()?;
         if transaction.activation_projection_intent().is_none() {
             return Err(InstallationError::IllegalTransition {
@@ -10966,7 +10977,7 @@ where
             });
         }
         if transaction.stage() == InstallationStage::Activating {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let candidates = transaction.recoverable_timeout_start_indexes()?;
         for index in &candidates {
@@ -11024,7 +11035,108 @@ where
                 }
             }
         }
-        Ok(candidates)
+        let owned_watchdog = transaction.recoverable_timeout_applied_watchdog_index()?;
+        if let Some(index) = owned_watchdog {
+            self.reconcile_owned_watchdog_start_for_owner_rollback(transaction, index)?;
+        }
+        Ok((candidates, owned_watchdog))
+    }
+
+    /// Recovery-only authoritative readback for the transaction-owned
+    /// converged `Watchdog` start, called from
+    /// `reconcile_timeout_starts_for_owner_rollback` before the Host registry
+    /// abort (audit 5899500978).
+    ///
+    /// The durable `Applied`/`CreatedByTransaction` Watchdog start keeps its
+    /// exact issued-call proof and process lineage; this readback proves the
+    /// live service is still that exact transaction-owned runtime.  A
+    /// `Matching` readback owned by this transaction (exact durable external
+    /// identity and exact durable process lineage) or a clean `Absent` with
+    /// no runtime lineage is accepted: the existing reverse exact-effect
+    /// rollback loop afterwards stops/reconciles/deletes only that
+    /// transaction-owned identity.  A foreign or substituted identity or
+    /// lineage, a non-transaction disposition, a residual in-progress
+    /// lineage, or a residual unknown refuses with the intent kept, exactly
+    /// like the unsettled-start arms above.  This never executes an effect:
+    /// reconciliation is read-only, and the request carries the durable
+    /// `Applied` external identity so a restarted foreign runtime mismatches
+    /// rather than being adopted.
+    fn reconcile_owned_watchdog_start_for_owner_rollback(
+        &mut self,
+        transaction: &InstallationTransaction,
+        index: usize,
+    ) -> Result<(), InstallationError> {
+        let InstallerEffectPlan::StartService {
+            role: InstallerServiceRole::Watchdog,
+            ..
+        } = &transaction.installer_effects[index]
+        else {
+            return Err(InstallationError::IdentityConflict);
+        };
+        let durable_identity = match &transaction.effect_progress[index].state {
+            InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                external_identity,
+                ..
+            } => external_identity.clone(),
+            _ => return Err(InstallationError::IdentityConflict),
+        };
+        let durable_lineage = transaction.effect_progress[index]
+            .service_start_proof
+            .as_ref()
+            .and_then(|proof| proof.process_lineage.clone())
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "transaction-created watchdog start requires provider process lineage"
+                        .to_owned(),
+                )
+            })?;
+        let request = effect_request(
+            transaction,
+            index,
+            1,
+            InstallationEffectAction::Rollback,
+            Some(durable_identity.clone()),
+        )?;
+        let observed = match self.port.reconcile(&request) {
+            PortOutcome::Known(observed) => {
+                observed.validate()?;
+                observed.validate_for_effect(&transaction.installer_effects[index])?;
+                observed
+            }
+            other => {
+                return Err(InstallationError::IncompleteObservation(format!(
+                    "watchdog start reconciliation stays unknown for effect {}: {}",
+                    transaction.effect_progress[index].effect_id.as_str(),
+                    port_pending(other).as_str(),
+                )));
+            }
+        };
+        match observed {
+            InstallationEffectObservation::Matching {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                external_identity,
+                service_runtime_lineage: Some(runtime_lineage),
+                ..
+            } if external_identity == durable_identity && runtime_lineage == durable_lineage => {}
+            InstallationEffectObservation::Matching { .. } => {
+                return Err(InstallationError::IdentityConflict);
+            }
+            InstallationEffectObservation::Absent {
+                service_runtime_lineage: None,
+                ..
+            } => {}
+            InstallationEffectObservation::Absent { .. } => {
+                return Err(InstallationError::IncompleteObservation(format!(
+                    "watchdog start reconciliation observed a runtime lineage for effect {}",
+                    transaction.effect_progress[index].effect_id.as_str(),
+                )));
+            }
+            InstallationEffectObservation::Mismatch { .. } => {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+        Ok(())
     }
 
     fn persist_quarantined(
@@ -11295,13 +11407,18 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
     /// Two pre-no-return first-install contours are admitted.  `Activating`
     /// with the exact pending service-start/credential/Phase-B suffix needs no
     /// reconciliation.  `RollbackRequired` is admitted only for the
-    /// service-start timeout contour the bounded-start drive persists, and only
-    /// after an authoritative readback proves every unsettled service start
-    /// `Absent`; a present service, a residual unknown, an observed runtime
-    /// lineage, or an applied credential/Phase-B effect keeps the intent and
-    /// refuses for forward repair.  Past the no-return boundary, after a
-    /// committed activation, or on a non-first install, the existing refusal is
-    /// unchanged and is decided before any readback.
+    /// service-start timeout contour the bounded-start drive persists, where
+    /// the `Host` start is the unsettled timeout/unresolved start and the
+    /// ordered earlier `Watchdog` start is either likewise unsettled or the
+    /// transaction-owned converged start, and only after an authoritative
+    /// readback proves every unsettled service start `Absent` and the
+    /// converged Watchdog start still transaction-owned; a present service on
+    /// an unsettled start, a foreign or substituted Watchdog identity or
+    /// lineage, a residual unknown, an observed runtime lineage outside the
+    /// owned Watchdog start, or an applied credential/Phase-B effect keeps
+    /// the intent and refuses for forward repair.  Past the no-return
+    /// boundary, after a committed activation, or on a non-first install, the
+    /// existing refusal is unchanged and is decided before any readback.
     ///
     /// The intent is cleared only after the exact owner acknowledgement, inside
     /// the single transaction-store `compare_and_save`.  A CAS conflict, a
@@ -11365,9 +11482,11 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
         // Only the two pre-no-return contours reach the registry.  Recovery-only
         // reconciliation for the service-start timeout contour: `Activating`
         // needs none, while a timeout-persisted `RollbackRequired` must prove
-        // every unsettled start `Absent` through an authoritative readback
-        // before the owner abort below.  Any other stage refuses here; any
-        // present service or residual unknown refuses with the intent kept.
+        // every unsettled start `Absent` and the converged Watchdog start
+        // still transaction-owned through an authoritative readback before the
+        // owner abort below.  Any other stage refuses here; any present
+        // service on an unsettled start, any foreign Watchdog ownership, or
+        // any residual unknown refuses with the intent kept.
         // The ordinary `rollback` seam is unchanged and still rejects an
         // intent outright.
         if transaction.stage() != InstallationStage::Activating
@@ -11378,14 +11497,17 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
                 to: InstallationStage::RolledBack,
             });
         }
-        let reconciled_absent = self
+        let (reconciled_absent, reconciled_owned_watchdog) = self
             .inner
             .reconcile_timeout_starts_for_owner_rollback(&transaction)?;
-        // This is the pre-no-return contour: service starts, credential, and
-        // Phase-B effects are still pending and carry no runtime receipt.  The
-        // `Activating` shape is re-checked here before touching the registry;
-        // the timeout shape was already proven by the reconciliation above and
-        // is re-proven inside the intent-clearing CAS below.
+        // This is the pre-no-return contour: the unsettled service starts,
+        // credential, and Phase-B effects are still pending and carry no
+        // runtime receipt; the one permitted converged Watchdog start keeps
+        // its transaction-owned proof and lineage for the exact-effect
+        // rollback below.  The `Activating` shape is re-checked here before
+        // touching the registry; the timeout shape was already proven by the
+        // reconciliation above and is re-proven inside the intent-clearing
+        // CAS below.
         if transaction.stage() == InstallationStage::Activating {
             transaction.require_signed_pending_activation_effects()?;
         }
@@ -11412,7 +11534,11 @@ impl WindowsInstallationCoordinator<RedbInstallationTransactionStore> {
             }
         };
         let mut cleared = transaction;
-        cleared.prepare_pre_no_return_rollback(abort_evidence, &reconciled_absent)?;
+        cleared.prepare_pre_no_return_rollback(
+            abort_evidence,
+            &reconciled_absent,
+            reconciled_owned_watchdog,
+        )?;
         <RedbInstallationTransactionStore as transaction_store_private::Sealed>::compare_and_save(
             self.inner.store_mut(),
             expected_transaction,

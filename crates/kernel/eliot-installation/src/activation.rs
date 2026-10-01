@@ -242,12 +242,14 @@ impl InstallationActivationApproval {
     /// credential/Phase-B suffix to be applied either.  The admitted evidence
     /// is the transaction's own rule, unchanged: the durable activation
     /// projection intent is retained, every effect before Host bootstrap is
-    /// durably `Applied`, the ordered `Watchdog` then `Host` starts are
-    /// `Pending`, unconverged `IntentCommitted`, or timeout `Unknown` with no
-    /// observed process lineage, and the credential/Phase-B suffix is still
-    /// `Pending` with no receipts.  Every other stage, a missing intent, and
-    /// any observed lineage or applied suffix effect are refused, so this never
-    /// widens the activation contour and never admits an approval
+    /// durably `Applied`, the `Host` start is `Pending`, unconverged
+    /// `IntentCommitted`, or timeout `Unknown` with no observed process
+    /// lineage, the ordered earlier `Watchdog` start is either likewise
+    /// unsettled or the transaction-owned converged start, and the
+    /// credential/Phase-B suffix is still `Pending` with no receipts.
+    /// Every other stage, a missing intent, and any observed lineage outside
+    /// the owned Watchdog start or applied suffix effect are refused, so this
+    /// never widens the activation contour and never admits an approval
     /// reconstructed from process state.
     fn require_owner_recovery_contour(
         transaction: &InstallationTransaction,

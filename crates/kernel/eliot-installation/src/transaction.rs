@@ -940,13 +940,20 @@ impl InstallationTransaction {
     /// This admits exactly the contour the bounded-start drive persists on a
     /// first-install service-start timeout: stage `RollbackRequired` with the
     /// intent retained, every pre-bootstrap effect durably `Applied`, the
-    /// ordered `Watchdog` then `Host` starts each `Pending`, unconverged
-    /// `IntentCommitted`, or timeout `Unknown`, and the credential/Phase-B
-    /// suffix still `Pending` with no receipts.  Any observed service process
-    /// lineage, any non-timeout `Unknown`, or any applied credential/Phase-B
-    /// effect refuses: the transaction stays recovery/quarantine-requiring and
-    /// the intent is kept.  The returned indexes are ascending and non-empty;
-    /// a forged `RollbackRequired` shape with nothing to reconcile is refused
+    /// `Host` start `Pending`, unconverged `IntentCommitted`, or timeout
+    /// `Unknown`, and the credential/Phase-B suffix still `Pending` with no
+    /// receipts.  The ordered earlier `Watchdog` start is either likewise
+    /// unsettled or the transaction-owned converged start (`Applied` as
+    /// `CreatedByTransaction` with its exact issued-call proof, process
+    /// lineage, and recorded registration identity, audit 5899500978); the
+    /// converged Watchdog start is not unsettled and is reported separately
+    /// through `recoverable_timeout_applied_watchdog_index` so its lineage is
+    /// kept for the exact-effect rollback loop.  Any observed service process
+    /// lineage outside that exact transaction-owned Watchdog start, any
+    /// non-timeout `Unknown`, or any applied credential/Phase-B effect
+    /// refuses: the transaction stays recovery/quarantine-requiring and the
+    /// intent is kept.  The returned indexes are ascending and non-empty; a
+    /// forged `RollbackRequired` shape with nothing to reconcile is refused
     /// here rather than mistaken for the pre-drive contour.
     pub(crate) fn recoverable_timeout_start_indexes(
         &self,
@@ -981,7 +988,7 @@ impl InstallationTransaction {
                 ));
             }
         }
-        let (unsettled, cursor) = self.recoverable_timeout_start_run(first_start)?;
+        let (unsettled, _, cursor) = self.recoverable_timeout_start_run(first_start)?;
         let suffix = &self.installer_effects[cursor..];
         if suffix.len() != 2
             || !matches!(
@@ -1024,17 +1031,129 @@ impl InstallationTransaction {
         Ok(unsettled)
     }
 
+    /// Names the transaction-owned converged `Watchdog` start a timeout
+    /// recovery must keep (audit 5899500978), or `None` when the ordered
+    /// `Watchdog` start is unsettled rather than converged.
+    ///
+    /// This admits exactly the same contour as
+    /// `recoverable_timeout_start_indexes`: stage `RollbackRequired` with the
+    /// intent retained, every pre-bootstrap effect durably `Applied`, and the
+    /// credential/Phase-B suffix still `Pending` with no receipts.  The
+    /// returned index, when present, is the ordered first start `Applied` as
+    /// `CreatedByTransaction` with its exact issued-call proof, provider
+    /// process lineage, and recorded registration identity; the `Host` start
+    /// remains the unsettled timeout/unresolved start named by
+    /// `recoverable_timeout_start_indexes`.  Any converged or
+    /// lineage-carrying `Host` start, any foreign/mismatched Watchdog
+    /// ownership, and any applied credential/Phase-B effect refuse here
+    /// rather than being mistaken for the transaction-owned contour.
+    pub(crate) fn recoverable_timeout_applied_watchdog_index(
+        &self,
+    ) -> Result<Option<usize>, InstallationError> {
+        self.validate()?;
+        if self.stage != InstallationStage::RollbackRequired {
+            return Err(InstallationError::IncompleteObservation(format!(
+                "timeout recovery requires the RollbackRequired boundary, observed {:?}",
+                self.stage
+            )));
+        }
+        if self.activation_projection_intent.is_none() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let first_start = self
+            .installer_effects
+            .iter()
+            .position(|effect| matches!(effect, InstallerEffectPlan::StartService { .. }))
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "timeout recovery requires Watchdog then Host service starts".to_owned(),
+                )
+            })?;
+        let (_, applied_watchdog, _) = self.recoverable_timeout_start_run(first_start)?;
+        Ok(applied_watchdog)
+    }
+
+    /// Validates the one permitted converged start for timeout recovery: the
+    /// ordered first (`Watchdog`) start `Applied` as `CreatedByTransaction`
+    /// (audit 5899500978).
+    ///
+    /// Only the `Watchdog` role at the ordered first start position with
+    /// transaction-created ownership is admitted, and only with its exact
+    /// issued-call proof, provider process lineage, and recorded registration
+    /// identity.  A converged `Host` start, a converged start at any other
+    /// position, a non-transaction disposition, a missing proof or lineage, or
+    /// a missing registration identity refuses: the transaction stays
+    /// recovery/quarantine-requiring and the intent is kept.  The live
+    /// ownership itself is proven separately by the coordinator's
+    /// authoritative readback; this validates only the durable shape.
+    fn validate_applied_watchdog_for_timeout_recovery(
+        &self,
+        first_start: usize,
+        cursor: usize,
+        role: InstallerServiceRole,
+        progress: &InstallationEffectProgress,
+    ) -> Result<(), InstallationError> {
+        if role != InstallerServiceRole::Watchdog || cursor != first_start {
+            return Err(InstallationError::IncompleteObservation(
+                "timeout recovery refuses a converged service start".to_owned(),
+            ));
+        }
+        if !matches!(
+            progress.state,
+            InstallationEffectProgressState::Applied {
+                disposition: InstallationEffectDisposition::CreatedByTransaction,
+                ..
+            }
+        ) {
+            return Err(InstallationError::IncompleteObservation(
+                "timeout recovery refuses a converged service start".to_owned(),
+            ));
+        }
+        let proof = progress.service_start_proof.as_ref().ok_or_else(|| {
+            InstallationError::IncompleteObservation(
+                "transaction-created watchdog start requires the exact issued-call proof"
+                    .to_owned(),
+            )
+        })?;
+        sha256_handle(
+            &proof.intent_digest,
+            "effect_progress.service_start_proof.intent_digest",
+        )?;
+        proof
+            .process_lineage
+            .as_ref()
+            .ok_or_else(|| {
+                InstallationError::IncompleteObservation(
+                    "transaction-created watchdog start requires provider process lineage"
+                        .to_owned(),
+                )
+            })?
+            .validate()?;
+        self.recorded_service_registration_identity(InstallerServiceRole::Watchdog)?;
+        Ok(())
+    }
+
     /// Scans the ordered `Watchdog` then `Host` service-start run for timeout
-    /// recovery, returning the unsettled indexes needing readback and the
-    /// cursor where the credential/Phase-B suffix begins.  Every unsettled
-    /// start is a timeout `Unknown` or an unconverged `IntentCommitted` with
-    /// no observed process lineage; anything else refuses.
+    /// recovery, returning the unsettled indexes needing readback, the
+    /// transaction-owned converged `Watchdog` index when present, and the
+    /// cursor where the credential/Phase-B suffix begins.
+    ///
+    /// Every unsettled start is a timeout `Unknown` or an unconverged
+    /// `IntentCommitted` with no observed process lineage; anything else on an
+    /// unsettled start refuses.  The one permitted converged start is the
+    /// ordered first (`Watchdog`) start validated by
+    /// `validate_applied_watchdog_for_timeout_recovery`; it is reported
+    /// through the applied watchdog index rather than the unsettled set so
+    /// its lineage is kept for the exact-effect rollback loop.  A converged
+    /// or lineage-carrying `Host` start, any non-timeout `Unknown`, and any
+    /// terminal no-effect outcome refuse.
     fn recoverable_timeout_start_run(
         &self,
         first_start: usize,
-    ) -> Result<(Vec<usize>, usize), InstallationError> {
+    ) -> Result<(Vec<usize>, Option<usize>, usize), InstallationError> {
         let mut start_roles = Vec::new();
         let mut unsettled = Vec::new();
+        let mut applied_watchdog: Option<usize> = None;
         let mut cursor = first_start;
         while cursor < self.installer_effects.len() {
             let InstallerEffectPlan::StartService { role, .. } = &self.installer_effects[cursor]
@@ -1042,15 +1161,6 @@ impl InstallationTransaction {
                 break;
             };
             let progress = &self.effect_progress[cursor];
-            if progress
-                .service_start_proof
-                .as_ref()
-                .is_some_and(|proof| proof.process_lineage.is_some())
-            {
-                return Err(InstallationError::IncompleteObservation(
-                    "timeout recovery refuses an observed service start lineage".to_owned(),
-                ));
-            }
             match &progress.state {
                 InstallationEffectProgressState::Pending => {
                     if progress.service_start_proof.is_some()
@@ -1062,11 +1172,29 @@ impl InstallationTransaction {
                     }
                 }
                 InstallationEffectProgressState::IntentCommitted { .. } => {
+                    if progress
+                        .service_start_proof
+                        .as_ref()
+                        .is_some_and(|proof| proof.process_lineage.is_some())
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "timeout recovery refuses an observed service start lineage".to_owned(),
+                        ));
+                    }
                     unsettled.push(cursor);
                 }
                 InstallationEffectProgressState::Unknown { pending_ref }
                     if pending_ref.as_str() == SERVICE_START_TIMEOUT_PENDING_REF =>
                 {
+                    if progress
+                        .service_start_proof
+                        .as_ref()
+                        .is_some_and(|proof| proof.process_lineage.is_some())
+                    {
+                        return Err(InstallationError::IncompleteObservation(
+                            "timeout recovery refuses an observed service start lineage".to_owned(),
+                        ));
+                    }
                     unsettled.push(cursor);
                 }
                 InstallationEffectProgressState::Unknown { .. } => {
@@ -1075,9 +1203,16 @@ impl InstallationTransaction {
                     ));
                 }
                 InstallationEffectProgressState::Applied { .. } => {
-                    return Err(InstallationError::IncompleteObservation(
-                        "timeout recovery refuses a converged service start".to_owned(),
-                    ));
+                    self.validate_applied_watchdog_for_timeout_recovery(
+                        first_start,
+                        cursor,
+                        *role,
+                        progress,
+                    )?;
+                    if applied_watchdog.is_some() {
+                        return Err(InstallationError::IdentityConflict);
+                    }
+                    applied_watchdog = Some(cursor);
                 }
                 InstallationEffectProgressState::NoEffectAborted { .. } => {
                     return Err(InstallationError::IncompleteObservation(
@@ -1094,7 +1229,7 @@ impl InstallationTransaction {
                 "timeout recovery requires Watchdog then Host service starts".to_owned(),
             ));
         }
-        Ok((unsettled, cursor))
+        Ok((unsettled, applied_watchdog, cursor))
     }
 
     /// Returns the durably recorded external identity of the service
@@ -2530,20 +2665,28 @@ impl InstallationTransaction {
     ///
     /// Two pre-no-return contours are admitted.  `Activating` with the exact
     /// pending service-start/credential/Phase-B suffix requires no
-    /// reconciliation (`reconciled_absent` must be empty).  `RollbackRequired`
-    /// is admitted only for the service-start timeout shape persisted by the
-    /// coordinator's bounded-start drive: every non-`Pending` start is a
-    /// timeout `Unknown` or an unconverged `IntentCommitted` with no observed
-    /// process lineage, and `reconciled_absent` must name exactly those
-    /// indexes after the coordinator's readback observed each one `Absent`.
+    /// reconciliation (`reconciled_absent` must be empty and no owned Watchdog
+    /// start may be present).  `RollbackRequired` is admitted only for the
+    /// service-start timeout shape persisted by the coordinator's
+    /// bounded-start drive: the `Host` start is a timeout `Unknown` or an
+    /// unconverged `IntentCommitted` with no observed process lineage, the
+    /// ordered earlier `Watchdog` start is either likewise unsettled or the
+    /// transaction-owned converged start, and `reconciled_absent` must name
+    /// exactly the unsettled indexes after the coordinator's readback
+    /// observed each one `Absent` while `reconciled_owned_watchdog` must name
+    /// exactly the coordinator-readback-owned converged Watchdog start.
     /// The reconciled starts return to `Pending` in this same transition so
-    /// the existing exact-effect rollback loop below can run; any other
-    /// `Unknown`, any observed lineage, or any applied credential/Phase-B
-    /// effect keeps the intent and refuses.
+    /// the existing exact-effect rollback loop below can run; the converged
+    /// Watchdog start is deliberately left `Applied` with its exact
+    /// issued-call proof and process lineage so that same loop
+    /// stops/reconciles/deletes only that transaction-owned identity.  Any
+    /// other `Unknown`, any lineage outside the owned Watchdog start, or any
+    /// applied credential/Phase-B effect keeps the intent and refuses.
     pub(crate) fn prepare_pre_no_return_rollback(
         &mut self,
         abort_evidence: PlatformHandle,
         reconciled_absent: &[usize],
+        reconciled_owned_watchdog: Option<usize>,
     ) -> Result<(), InstallationError> {
         if self.activation_projection_intent.is_none() {
             return Err(InstallationError::IdentityConflict);
@@ -2559,15 +2702,16 @@ impl InstallationTransaction {
                 "activation-intent rollback is restricted to a first installation".to_owned(),
             ));
         }
-        match self.stage {
+        let owned_watchdog = match self.stage {
             InstallationStage::Activating => {
-                if !reconciled_absent.is_empty() {
+                if !reconciled_absent.is_empty() || reconciled_owned_watchdog.is_some() {
                     return Err(InstallationError::IdentityConflict);
                 }
                 // This contour proves that both SCM starts and the credential/Phase-B
                 // suffix remain pending: no service is running/committed and no
                 // credential or Phase-B receipt is available to roll back here.
                 self.require_signed_pending_activation_effects()?;
+                None
             }
             InstallationStage::RollbackRequired => {
                 let expected = self.recoverable_timeout_start_indexes()?;
@@ -2575,6 +2719,10 @@ impl InstallationTransaction {
                 reconciled.sort_unstable();
                 reconciled.dedup();
                 if reconciled.len() != reconciled_absent.len() || reconciled != expected {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                let expected_owned = self.recoverable_timeout_applied_watchdog_index()?;
+                if reconciled_owned_watchdog != expected_owned {
                     return Err(InstallationError::IdentityConflict);
                 }
                 for index in reconciled {
@@ -2586,6 +2734,12 @@ impl InstallationTransaction {
                     progress.service_start_deadline_ms = None;
                     progress.service_start_proof = None;
                 }
+                // The transaction-owned converged Watchdog start keeps its
+                // `Applied` state with its exact issued-call proof and process
+                // lineage: the reverse exact-effect rollback loop below owns
+                // stopping/reconciling/deleting that transaction-owned
+                // identity, and must never observe it as a pending start.
+                expected_owned
             }
             stage => {
                 return Err(InstallationError::IllegalTransition {
@@ -2593,18 +2747,8 @@ impl InstallationTransaction {
                     to: InstallationStage::RollbackRequired,
                 });
             }
-        }
-        if self.effect_progress.iter().any(|progress| {
-            progress
-                .service_start_proof
-                .as_ref()
-                .is_some_and(|proof| proof.process_lineage.is_some())
-        }) {
-            return Err(InstallationError::IncompleteObservation(
-                "pre-no-return activation rollback refuses an observed service start lineage"
-                    .to_owned(),
-            ));
-        }
+        };
+        self.validate_permitted_timeout_recovery_lineage(owned_watchdog)?;
         handle(&abort_evidence, "activation_projection.abort_evidence")?;
         self.completed_stage_refs.push(abort_evidence.clone());
         self.pending_external_changes = vec![abort_evidence];
@@ -2618,6 +2762,55 @@ impl InstallationTransaction {
                     reason: "overflow".to_owned(),
                 })?;
         self.validate()
+    }
+
+    /// Validates permitted role-specific service-start lineage for the
+    /// pre-no-return rollback (audit 5899500978).
+    ///
+    /// The only retained process lineage permitted here is the exact
+    /// transaction-owned converged `Watchdog` start: the `Watchdog` role at
+    /// the `owned_watchdog` index, still `Applied` as `CreatedByTransaction`.
+    /// Any lineage on the `Host` start, on any other effect, or on a
+    /// non-transaction-owned Watchdog start refuses with the intent kept.
+    /// `None` admits no lineage anywhere, which is the `Activating` contour.
+    fn validate_permitted_timeout_recovery_lineage(
+        &self,
+        owned_watchdog: Option<usize>,
+    ) -> Result<(), InstallationError> {
+        for (index, (effect, progress)) in
+            self.installer_effects.iter().zip(&self.effect_progress).enumerate()
+        {
+            let lineage = progress
+                .service_start_proof
+                .as_ref()
+                .and_then(|proof| proof.process_lineage.as_ref());
+            if lineage.is_none() {
+                continue;
+            }
+            let permitted = match (owned_watchdog, effect) {
+                (
+                    Some(owned),
+                    InstallerEffectPlan::StartService {
+                        role: InstallerServiceRole::Watchdog,
+                        ..
+                    },
+                ) if owned == index => matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
+                    }
+                ),
+                _ => false,
+            };
+            if !permitted {
+                return Err(InstallationError::IncompleteObservation(
+                    "pre-no-return activation rollback refuses an observed service start lineage"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
     /// Quarantines a signed projection mismatch without rolling back any
     /// external effect or changing another actor's transaction.
