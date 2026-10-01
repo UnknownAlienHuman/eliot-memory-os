@@ -568,7 +568,10 @@ pub fn reseal_context_view(
         .canonical_payload_digest()
         .expect("resealed admitted payload digest");
     quality.output.rendered_digest.clone_from(&rendered_digest);
-    quality.output.omission_handles.clone_from(&admitted.economy.displaced);
+    quality
+        .output
+        .omission_handles
+        .clone_from(&admitted.economy.displaced);
     // The source snapshots this packet's delivered atoms were read from. The
     // list is derived from the projection being delivered rather than copied
     // from the seed card, so it is a real observation list and it stays a
