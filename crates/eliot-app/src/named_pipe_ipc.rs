@@ -304,8 +304,11 @@ pub(crate) async fn run_stdio_client(
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = serde_json::from_str(&line)
-            .with_context(|| format!("parse MCP JSON-RPC line: {line}"))?;
+        // The raw line is gated once, here, by the shared duplicate-rejecting
+        // parser. `expects_response`, `method`, and the relayed document all
+        // read that one validated value, so a duplicated `id` or `method` can
+        // no longer steer routing ahead of `McpDaemon::handle_line`.
+        let request: Value = crate::mcp_stdio::parse_raw_mcp_request(&line)?;
         let expects_response = request.get("id").is_some();
         let method = request.get("method").and_then(Value::as_str).unwrap_or("");
         let mut correlation = McpInvocationCorrelation::receive(&request, method);
@@ -674,7 +677,8 @@ pub(crate) async fn run_cognitive_stdio_client(capability_path: &Path) -> Result
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = serde_json::from_str(&line).context("parse cognitive MCP request")?;
+        let request: Value = crate::mcp_stdio::parse_raw_mcp_request(&line)
+            .context("parse cognitive MCP request")?;
         let expects_response = request.get("id").is_some();
         let response = if let Ok(response) =
             relay_request(&mut connection, &request, expects_response).await

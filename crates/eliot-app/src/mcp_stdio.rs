@@ -1661,6 +1661,27 @@ struct McpMemoryRuntime {
     projection_task: tokio::task::JoinHandle<Result<(), eliot_engine::EngineError>>,
 }
 
+/// Bounded recursive duplicate-rejecting parse of one raw MCP request frame.
+///
+/// This is the single raw-ingress gate for every MCP contour: the named-pipe
+/// server loop, `McpDaemon::handle_line`, and both stdio client loops in
+/// `named_pipe_ipc.rs` all decode the request line through it, so `id`,
+/// `method`, `params`, the tool `name`, and `arguments` are never read from a
+/// document whose duplicate members were already collapsed to last-wins by
+/// `serde_json::Map`. Once this has proved the complete document duplicate-free,
+/// its `Value` may be handed to schema validation and typed `from_value`
+/// without re-reading the bytes under weaker guarantees.
+///
+/// The ceiling is the same `MAX_FRAME_BYTES` the framing reader already applies
+/// to a line, so this gate cannot admit a frame the transport refused and the
+/// transport cannot pass a frame this gate never measured. For an accepted
+/// document the returned value is exactly what `serde_json::from_str` would
+/// produce, so every downstream route and decoder is unchanged.
+pub(crate) fn parse_raw_mcp_request(line: &str) -> Result<Value> {
+    eliot_types::strict_json_value(line.as_bytes(), named_pipe_ipc::MAX_FRAME_BYTES)
+        .with_context(|| "parse authenticated MCP request frame")
+}
+
 pub(crate) struct McpDaemon {
     host_governor_authority: Mutex<()>,
     projection: CognitiveProjectionCoordinatorHandle,
@@ -2130,8 +2151,7 @@ impl McpDaemon {
         line: &str,
     ) -> Result<Option<String>> {
         let profile = McpAccessProfile::parse(profile_name)?;
-        let request: Value =
-            serde_json::from_str(line).with_context(|| "parse authenticated named-pipe request")?;
+        let request: Value = parse_raw_mcp_request(line)?;
         let refreshed_scope = self.authoritative_host_scope(
             profile_name,
             session_id,
