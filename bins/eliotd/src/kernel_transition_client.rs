@@ -47,21 +47,6 @@ struct OwnerSelectionContext<'a> {
 /// distinct from the initiating principal/session, so this check never
 /// requires the request source to be the daemon identity and never rewrites
 /// it.
-fn check_identity_binding(
-    identity: &RequestIdentity,
-    transition: &PreparedTransition,
-    expected_revision_heads: &[RevisionHeadExpectation],
-    expected_ordering_heads: &[OrderingHeadExpectation],
-) -> Result<(), KernelPortError> {
-    check_identity_binding_with_selection(
-        identity,
-        transition,
-        expected_revision_heads,
-        expected_ordering_heads,
-        None,
-    )
-}
-
 fn check_identity_binding_with_selection(
     identity: &RequestIdentity,
     transition: &PreparedTransition,
@@ -426,9 +411,9 @@ fn closed_typed_value(
     })
 }
 
-fn require_write_receipt<'a>(
-    future: KernelPortFuture<'a, PreparedWriteOutcome>,
-) -> KernelPortFuture<'a, WriteReceipt> {
+fn require_write_receipt(
+    future: KernelPortFuture<'_, PreparedWriteOutcome>,
+) -> KernelPortFuture<'_, WriteReceipt> {
     Box::pin(async move {
         match future.await? {
             PreparedWriteOutcome::Receipt(receipt) => Ok(*receipt),
@@ -854,7 +839,8 @@ mod tests {
         .expect("admission hash");
         // Exact admitted terms pass with the initiating source preserved:
         // the adapter never rewrites it to the daemon transport peer.
-        check_identity_binding(&identity, &transition, &[], &heads).expect("exact binding");
+        check_identity_binding_with_selection(&identity, &transition, &[], &heads, None)
+            .expect("exact binding");
         assert_eq!(identity.request.metadata.source_id.as_str(), "agent-bridge");
         // A substituted fence binding fails closed before any transport,
         // even though the substituted identity is internally consistent.
@@ -863,19 +849,25 @@ mod tests {
         substituted.request.metadata.state_fence = other.clone();
         substituted.request.state_fence = other.clone();
         assert!(matches!(
-            check_identity_binding(&substituted, &transition, &[], &[]),
+            check_identity_binding_with_selection(&substituted, &transition, &[], &[], None),
             Err(KernelPortError::Contract(_))
         ));
         // A substituted idempotency key fails the same way.
         let mut rekeyed = identity.clone();
         rekeyed.idempotency_key = "idem-substituted".to_owned();
         assert!(matches!(
-            check_identity_binding(&rekeyed, &transition, &[], &[]),
+            check_identity_binding_with_selection(&rekeyed, &transition, &[], &[], None),
             Err(KernelPortError::Contract(_))
         ));
         // A head bound to another fence fails as well.
         assert!(matches!(
-            check_identity_binding(&identity, &transition, &[], &[ordering_head(&other)]),
+            check_identity_binding_with_selection(
+                &identity,
+                &transition,
+                &[],
+                &[ordering_head(&other)],
+                None,
+            ),
             Err(KernelPortError::Contract(_))
         ));
     }
@@ -894,12 +886,13 @@ mod tests {
             &CanonicalRequestView::from_apply(&identity.request.metadata, &transition, &[], &heads),
         )
         .expect("admission hash");
-        check_identity_binding(&identity, &transition, &[], &heads).expect("admitted plan");
+        check_identity_binding_with_selection(&identity, &transition, &[], &heads, None)
+            .expect("admitted plan");
         // Widened effect ceiling after staging is rejected.
         let mut widened = transition.clone();
         widened.requested_effect_ceiling = EffectClass::ReversibleMutation;
         assert!(matches!(
-            check_identity_binding(&identity, &widened, &[], &heads),
+            check_identity_binding_with_selection(&identity, &widened, &[], &heads, None),
             Err(KernelPortError::Contract(_))
         ));
         // Mutated named-operation parameters after staging are rejected.
@@ -909,14 +902,14 @@ mod tests {
             serde_json::json!("observation-substituted"),
         );
         assert!(matches!(
-            check_identity_binding(&identity, &reparam, &[], &heads),
+            check_identity_binding_with_selection(&identity, &reparam, &[], &heads, None),
             Err(KernelPortError::Contract(_))
         ));
         // Mutated admission digest after staging is rejected.
         let mut redigest = transition.clone();
         redigest.admission_contract_set_digest = "d".repeat(64);
         assert!(matches!(
-            check_identity_binding(&identity, &redigest, &[], &heads),
+            check_identity_binding_with_selection(&identity, &redigest, &[], &heads, None),
             Err(KernelPortError::Contract(_))
         ));
         // Unsupported operation manifest is refused as visible recovery work.
@@ -931,7 +924,13 @@ mod tests {
                 &heads,
             ))
             .expect("recomputed hash");
-        let error = match check_identity_binding(&identity, &unsupported, &[], &heads) {
+        let error = match check_identity_binding_with_selection(
+            &identity,
+            &unsupported,
+            &[],
+            &heads,
+            None,
+        ) {
             Err(error) => error,
             Ok(()) => unreachable!("unsupported manifest must fail"),
         };
