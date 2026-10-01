@@ -45,6 +45,54 @@ pub struct CurrentWorkScopeSourceReceipt {
     pub canonical_source_receipt_sha256: String,
 }
 
+/// Exact current Config-owned S-04 policy and full residency template.
+/// Revisions/digests identify the Policy owner envelope; the JSON members are
+/// canonical projections of its admitted typed value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentBlobPolicyResidency {
+    pub policy_json: String,
+    pub policy_sha256: String,
+    pub residency_json: String,
+    pub residency_sha256: String,
+    pub policy_owner_revision: u64,
+    pub policy_owner_digest: String,
+}
+
+/// Reads and decodes the current Human-admitted Config value for this exact
+/// WorkScope. A policy setting for another scope, owner, or StateFence is not
+/// transferable to this process stream.
+pub fn read_current_blob_policy_residency(
+    composition: &DaemonComposition,
+    state_fence: &eliot_contracts::StateFence,
+    work_scope_ref: &str,
+) -> Result<CurrentBlobPolicyResidency, String> {
+    let owner = composition
+        .current_testd_blob_policy_owner_readback(state_fence)?
+        .ok_or_else(|| "current Policy owner is unavailable".to_owned())?;
+    if owner.state_fence() != state_fence || owner.snapshot().scope_id != work_scope_ref {
+        return Err("current Policy owner is outside this WorkScope or StateFence".to_owned());
+    }
+    let selected = owner
+        .snapshot()
+        .blob_process_policy()
+        .map_err(|error| format!("current Config Blob policy is invalid: {error}"))?
+        .ok_or_else(|| "current Config has no admitted Blob process policy".to_owned())?;
+    let policy_bytes = canonical_json_bytes(&selected.policy)
+        .map_err(|error| format!("canonical Blob policy encoding failed: {error}"))?;
+    let residency_bytes = canonical_json_bytes(&selected.residency)
+        .map_err(|error| format!("canonical Blob residency encoding failed: {error}"))?;
+    Ok(CurrentBlobPolicyResidency {
+        policy_sha256: sha256_hex(&policy_bytes),
+        policy_json: String::from_utf8(policy_bytes)
+            .map_err(|error| format!("Blob policy UTF-8 encoding failed: {error}"))?,
+        residency_sha256: sha256_hex(&residency_bytes),
+        residency_json: String::from_utf8(residency_bytes)
+            .map_err(|error| format!("Blob residency UTF-8 encoding failed: {error}"))?,
+        policy_owner_revision: owner.revision(),
+        policy_owner_digest: owner.canonical_digest().to_owned(),
+    })
+}
+
 /// Packages the exact owner-read WorkScope and selected admitted source record
 /// in canonical form. The source reference remains the original owner value;
 /// the JSON digest commits only the canonical transport projection, not a new
@@ -171,6 +219,27 @@ fn unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn unavailable_blob_owner_facts(
+    request: &BlobProcessStreamOwnerFactsPullRequest,
+    reason: BlobProcessStreamOwnerFactsUnavailableReason,
+) -> Result<BlobProcessStreamOwnerFactsPullResponse, String> {
+    let response = BlobProcessStreamOwnerFactsPullResponse {
+        wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
+        wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+        pull_ref: request.pull_ref.clone(),
+        job_id: request.job_id.clone(),
+        invocation_id: request.invocation_id.clone(),
+        process_binding_sha256: request.process_binding_sha256.clone(),
+        outer_request_sha256: request.outer_request_sha256.clone(),
+        observed_state_fence: request.state_fence.clone(),
+        outcome: BlobProcessStreamOwnerFactsPullOutcome::Unavailable { reason },
+    };
+    response
+        .validate_for_request(request)
+        .map_err(|error| format!("invalid blob owner-facts response: {error}"))?;
+    Ok(response)
+}
+
 /// Produces a closed owner answer for one Kernel-retained pull.
 ///
 /// A positive result requires process-source admission that binds the
@@ -214,6 +283,18 @@ pub fn resolve_blob_owner_facts(
                             BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
                         }
                         Some(_) => {
+                            if read_current_blob_policy_residency(
+                                composition,
+                                &request.state_fence,
+                                snapshot.binding.scope.scope_ref.as_str(),
+                            )
+                            .is_err()
+                            {
+                                return unavailable_blob_owner_facts(
+                                    request,
+                                    BlobProcessStreamOwnerFactsUnavailableReason::PolicyUnavailable,
+                                );
+                            }
                             // request.source_id is minted for this output
                             // stream, not selected from the governing source
                             // document set. It needs a separate durable
@@ -226,22 +307,5 @@ pub fn resolve_blob_owner_facts(
             }
         }
     };
-    let response = BlobProcessStreamOwnerFactsPullResponse {
-        wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
-        wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
-        pull_ref: request.pull_ref.clone(),
-        job_id: request.job_id.clone(),
-        invocation_id: request.invocation_id.clone(),
-        process_binding_sha256: request.process_binding_sha256.clone(),
-        outer_request_sha256: request.outer_request_sha256.clone(),
-        // This echoes the exact requested owner-facts fence. The refusal reason
-        // carries any stale/missing disposition; no current owner fact is
-        // asserted when the read could not be completed at this fence.
-        observed_state_fence: request.state_fence.clone(),
-        outcome: BlobProcessStreamOwnerFactsPullOutcome::Unavailable { reason },
-    };
-    response
-        .validate_for_request(request)
-        .map_err(|error| format!("invalid blob owner-facts response: {error}"))?;
-    Ok(response)
+    unavailable_blob_owner_facts(request, reason)
 }
