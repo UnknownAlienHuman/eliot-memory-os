@@ -281,16 +281,22 @@ function New-GovernorRetirementTrustRootRecord([string]$Repo, [object]$Ref, [obj
     return $record
 }
 
-function Resolve-GovernorRetirementTrustRoot([object]$Input) {
-    # The single seam every consumer resolves. `$Input` is
+function Resolve-GovernorRetirementTrustRoot([object]$TrustRootRequest) {
+    # The single seam every consumer resolves. `$TrustRootRequest` is
     # [pscustomobject]@{ TrustRootRef = '<explicit owner-pinned git ref>' }
     # supplied by the release builder or the finalizer from their own explicit
     # parameter. There is no second source of the root: the candidate commit is
     # not a fallback, the tracked anchor file is not a fallback, and no
     # environment variable or directory search can substitute one.
+    #
+    # The parameter MUST NOT be named `$Input`. `$Input` is a PowerShell
+    # automatic variable (the pipeline enumerator), so a parameter of that name
+    # is silently NOT bound by the caller: every call site below passed a real
+    # owner-pinned ref and still observed `state = ABSENT` with an empty
+    # `trust_root_ref`, which is a dead trust-root seam rather than a refusal.
     $supplied = $null
-    if ($null -ne $Input) {
-        $supplied = ConvertTo-GovernorApprovalString (Get-GovernorApprovalField $Input 'TrustRootRef')
+    if ($null -ne $TrustRootRequest) {
+        $supplied = ConvertTo-GovernorApprovalString (Get-GovernorApprovalField $TrustRootRequest 'TrustRootRef')
     }
     if ([string]::IsNullOrWhiteSpace($supplied)) {
         return [pscustomobject]@{
@@ -307,7 +313,7 @@ function Resolve-GovernorRetirementTrustRoot([object]$Input) {
             root = $null
         }
     }
-    $repo = [string](Get-GovernorApprovalField $Input 'Repo')
+    $repo = [string](Get-GovernorApprovalField $TrustRootRequest 'Repo')
     if ([string]::IsNullOrWhiteSpace($repo)) {
         throw 'the retirement trust root requires the repository root of candidate C'
     }

@@ -89,7 +89,14 @@ function Assert-GovernorRetirementApprovalReadback(
     if ($disposition -cnotlike 'retired*') {
         throw "a detached retirement approval was supplied but RELEASE.json does not claim the retired governor disposition (changed decision under the same candidate conflicts): $disposition"
     }
-    $binding = Resolve-GovernorRetirementApprovalBinding $repo $SourceCommit $context.approval_input.body $context.trust_policy $context.issuer
+    # The EXECUTED issuer readback and the authenticated detached owner receipt
+    # the context just produced are threaded into the binding. Dropping them
+    # (the previous `$null`, `$null`) let `Test-GovernorRetirementApprovalShape`
+    # reach `kind = Retired` through a `$null`-tolerant read, so a signing host
+    # without the owner-pinned trust root could admit an approval whose
+    # `issuer_readback_ref` was never executed on this path. The readback is now
+    # required here too; it is not re-derived from the bundle.
+    $binding = Resolve-GovernorRetirementApprovalBinding $repo $SourceCommit $context.approval_input.body $context.trust_policy $context.issuer $context.issuer_readback $context.receipt_verification
     if ([string]$binding.kind -cne 'Retired') {
         throw "the detached owner approval does not verify for candidate ${SourceCommit}: $([string]$binding.reason)"
     }
@@ -109,7 +116,11 @@ function Assert-GovernorRetirementApprovalReadback(
     if ([string]$bundleTrust.trust_state -cne 'SUPPLIED') {
         throw "the signed bundle cannot re-verify its detached retirement approval offline: $([string]$bundleTrust.reason)"
     }
-    $offlineBinding = Resolve-GovernorRetirementApprovalBinding $repo $SourceCommit $bundleTrust.approval_body $context.trust_policy $context.issuer
+    # The offline arm re-verifies the approval carried INSIDE the bundle. It is
+    # the same contract on the same executed readback and the same authenticated
+    # receipt, so a bundle whose bytes differ from the approval the owner signed
+    # is refused instead of being admitted through the `$null`-tolerant read.
+    $offlineBinding = Resolve-GovernorRetirementApprovalBinding $repo $SourceCommit $bundleTrust.approval_body $context.trust_policy $context.issuer $context.issuer_readback $context.receipt_verification
     if ([string]$offlineBinding.kind -cne 'Retired') {
         throw "the approval carried by the signed bundle does not verify: $([string]$offlineBinding.reason)"
     }

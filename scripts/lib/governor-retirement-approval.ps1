@@ -327,10 +327,36 @@ function Sort-GovernorApprovalConsumers([object]$Consumers) {
     return @($sorted)
 }
 
-function Get-GovernorApprovalSha256([string]$Canonical) {
+function Get-GovernorApprovalSha256([object]$Canonical) {
+    # Two digest domains, deliberately distinct and never interchangeable:
+    #
+    #   [byte[]]  the SHA-256 of the exact file bytes. Detached owner receipts,
+    #              owner-decision records, the trust policy and the closure
+    #              verifier are bound by their content digest, and the owner
+    #              computes that digest with ordinary tooling (`Get-FileHash`,
+    #              `sha256sum`, `openssl dgst`). Hashing the byte array's
+    #              STRING form instead made every such pin unverifiable, so an
+    #              owner-pinned pin could never be satisfied by an owner who
+    #              computed the real content digest.
+    #   [string]  the SHA-256 of the UTF-8 canonical preimage (all the
+    #              `*_sha256` canonical digests: approval content, request,
+    #              owner decision, trust policy, trust root, anchor).
+    #
+    # Passing a byte array previously fell into the [string] branch and hashed
+    # the decimal text "72 101 108 ..." instead of the content. String digests
+    # are unchanged by this branch; only the byte branch is corrected.
+    if ($Canonical -is [byte[]]) {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return (($sha.ComputeHash([byte[]]$Canonical) | ForEach-Object { $_.ToString('x2') }) -join '')
+        }
+        finally {
+            $sha.Dispose()
+        }
+    }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return (($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Canonical)) | ForEach-Object { $_.ToString('x2') }) -join '')
+        return (($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$Canonical)) | ForEach-Object { $_.ToString('x2') }) -join '')
     }
     finally {
         $sha.Dispose()
