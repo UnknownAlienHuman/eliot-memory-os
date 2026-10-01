@@ -5706,7 +5706,9 @@ async fn observe_host_workspace(
             Ok(source_closure) => Some(source_closure),
             Err(eliot_workscope::WorkScopeError::SourceClosureUnavailable) => None,
             Err(error) => {
-                return Err(format!("Observe retained WorkScope source closure: {error}"));
+                return Err(format!(
+                    "Observe retained WorkScope source closure: {error}"
+                ));
             }
         }
     };
@@ -5748,7 +5750,9 @@ fn require_same_observe_owner_binding(
         .canonical_value()
         .map_err(|error| format!("retained Observe owner binding: {error}"))?;
     if current_value != retained_value {
-        return Err(format!("Observe owners changed {boundary} Host scope observation"));
+        return Err(format!(
+            "Observe owners changed {boundary} Host scope observation"
+        ));
     }
     Ok(())
 }
