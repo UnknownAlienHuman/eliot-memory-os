@@ -583,9 +583,8 @@ pub(crate) enum PinnedZoneStatus {
 /// occurrence lookup refuses it with [`ZoneTableError::SubMinuteOffset`].
 /// Nothing in this status rounds an offset or reaches instant arithmetic.
 pub(crate) fn pinned_zone_status(zone: &str) -> PinnedZoneStatus {
-    let table = match pinned_table() {
-        Ok(table) => table,
-        Err(_) => return PinnedZoneStatus::IntegrityFailure,
+    let Ok(table) = pinned_table() else {
+        return PinnedZoneStatus::IntegrityFailure;
     };
     match table.timeline(zone) {
         Ok(_) => PinnedZoneStatus::Present,
