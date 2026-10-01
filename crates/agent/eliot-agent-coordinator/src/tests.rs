@@ -1373,15 +1373,14 @@ fn descendant_closure_matches_runtime_before_parent_complete_candidate() -> Test
     let child_context = ExecutionContext::from(&child);
     let child_lane = child.admitted_lanes[0].clone();
     coordinator.start_attempt(child_context.clone(), child_lane.attempt_id.clone())?;
-    let child_binding = bind_result_fixture(&mut coordinator, &child_context, &child_lane, "child")?;
+    let child_binding =
+        bind_result_fixture(&mut coordinator, &child_context, &child_lane, "child")?;
     let mut child_result =
         result_submission("child", &child_lane, ResultDisposition::CandidateSucceeded)?;
     use_result_binding(&mut child_result, &child_binding)?;
-    coordinator.submit_result(
-        child_context,
-        child_result,
-    )?;
-    let parent_binding = bind_result_fixture(&mut coordinator, &parent_context, &parent_lane, "parent")?;
+    coordinator.submit_result(child_context, child_result)?;
+    let parent_binding =
+        bind_result_fixture(&mut coordinator, &parent_context, &parent_lane, "parent")?;
     let mut parent_result = result_submission(
         "parent",
         &parent_lane,
@@ -2002,10 +2001,7 @@ fn coordinator_case_20_parent_closure_is_candidate_only_and_requires_descendant_
         ResultDisposition::CandidateSucceeded,
     )?;
     use_result_binding(&mut child_result, &child_binding)?;
-    coordinator.submit_result(
-        child_context,
-        child_result,
-    )?;
+    coordinator.submit_result(child_context, child_result)?;
     // Parent candidate success without descendant closure must fail.
     let parent_binding =
         bind_result_fixture(&mut coordinator, &parent_context, &parent_lane, "parent-20")?;
@@ -2964,11 +2960,7 @@ fn s5_per_effect_attempt_mismatch_rejects() -> TestResult {
     // so only the S5 per-effect attempt linkage can fail.
     let mut coordinator = coordinator(
         config(2, 2),
-        &[
-            "proof-admission-s5c",
-            "proof-bind-s5c",
-            "proof-result-s5c",
-        ],
+        &["proof-admission-s5c", "proof-bind-s5c", "proof-result-s5c"],
     )?;
     let admitted = plan_and_admit(
         &mut coordinator,
@@ -3014,11 +3006,7 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
     // admission owner named, never silently upgraded.
     let mut legacy = coordinator(
         config(2, 2),
-        &[
-            "proof-admission-s5d",
-            "proof-bind-s5d",
-            "proof-result-s5d",
-        ],
+        &["proof-admission-s5d", "proof-bind-s5d", "proof-result-s5d"],
     )?;
     let candidate = legacy.plan(request(
         "s5d",
