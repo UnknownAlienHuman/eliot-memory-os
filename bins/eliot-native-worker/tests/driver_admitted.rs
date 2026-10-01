@@ -58,6 +58,7 @@ use eliot_process::{
     ResourceLimits, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
+use eliot_protocol::{Frame, FrameKind, JsonCodec, MessageType, ProtocolPayload};
 
 // ---------------------------------------------------------------------------
 // Clearly-marked Kernel-transport doubles (live Kernel unavailable).
@@ -689,7 +690,7 @@ fn hello() -> WorkerHello {
         request_id: load(RequestId::new("start-claim-1")),
         trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
         deadline_unix_ms: 5_000,
-        artifact_manifest_digest: "facet-manifest-7".to_owned(),
+        artifact_manifest_digest: load(eliot_contracts::native_worker_resource_facet_ref_v1()),
         launch_nonce: "launch-nonce-claim-1".to_owned(),
         worker_generation: 1,
         authority_epoch: epoch(),
@@ -817,10 +818,8 @@ fn claim_request(
     registration: &NativeWorkerRegistration,
     claim: &NativeWorkerClaim,
 ) -> ClaimAdmissionRequest {
-    load(serde_json::from_value(serde_json::json!({
-        "registration": registration,
-        "claim": claim,
-    })))
+    ClaimAdmissionRequest::new(registration.clone(), claim.clone())
+        .unwrap_or_else(|error| panic!("owner-shaped claim carrier must validate: {error:?}"))
 }
 
 fn readiness_for(claim: &NativeWorkerClaim) -> eliot_native_worker_core::ReadinessSubmission {
@@ -867,20 +866,20 @@ fn health_frame() -> WorkerFrame {
 }
 
 fn encode_frame(frame: &WorkerFrame) -> Vec<u8> {
-    let body = serde_json::to_vec(frame).expect("frame");
-    let mut out = u32::try_from(body.len())
-        .expect("len")
-        .to_le_bytes()
-        .to_vec();
-    out.extend_from_slice(&body);
-    out
+    let ebp_frame = frame.to_ebp_frame().expect("native frame maps to EBP");
+    JsonCodec::new()
+        .encode(&ebp_frame)
+        .expect("valid EBP frame encodes")
 }
 
 fn decode_response(bytes: &[u8]) -> eliot_native_worker::WorkerResponse {
-    let (prefix, body) = bytes.split_at(4);
-    let length = u32::from_le_bytes(prefix.try_into().expect("prefix")) as usize;
-    assert_eq!(length, body.len());
-    serde_json::from_slice(body).expect("response")
+    let frame: Frame = JsonCodec::new().decode(bytes).expect("valid EBP response");
+    assert_eq!(frame.kind, FrameKind::Response);
+    assert_eq!(frame.message_type, MessageType::Result);
+    let ProtocolPayload::Json(payload) = frame.payload else {
+        panic!("native worker response uses the shared JSON result payload");
+    };
+    serde_json::from_value(payload).expect("typed worker response")
 }
 
 type DriverWorker = NativeWorker<
