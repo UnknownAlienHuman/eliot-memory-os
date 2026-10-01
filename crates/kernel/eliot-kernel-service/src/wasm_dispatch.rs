@@ -2351,6 +2351,9 @@ pub fn publish_wasm_dispatch_bundle(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STAGE_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     fn test_epoch() -> EpochId {
         serde_json::from_value(serde_json::json!({
@@ -2587,9 +2590,18 @@ mod tests {
     }
 
     fn stage_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(name);
-        std::fs::create_dir_all(&dir).expect("stage dir writable");
-        dir
+        loop {
+            let sequence = NEXT_STAGE_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("stage dir writable: {error}"),
+            }
+        }
     }
 
     /// Byte binding fails before any join registers or any file stages:
@@ -2625,6 +2637,7 @@ mod tests {
             Err(WasmDispatchError::InvalidMaterial(_))
         ));
         assert!(joins.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A digest-bound claim stages three files and registers exactly one
