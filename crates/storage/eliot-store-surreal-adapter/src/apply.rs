@@ -43,7 +43,7 @@ mod health_probe;
 mod read_boundary;
 mod receipt_reconciliation;
 mod recovery;
-mod schema_contract;
+pub(crate) mod schema_contract;
 pub(crate) mod surreal_automation;
 pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_capability_evidence;
