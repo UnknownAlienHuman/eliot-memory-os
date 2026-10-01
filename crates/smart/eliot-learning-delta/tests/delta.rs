@@ -409,6 +409,86 @@ fn bind_slot_source_contract(
     recipe.seal()
 }
 
+/// Re-derive everything that binds to a mutated slot projection.
+///
+/// `seal_content_addressed` re-seals the view's own digest and content-addressed
+/// id, but it deliberately does not reach the two other records that carry a
+/// digest of a slot: the resolved source reference's
+/// `slot_projection_digests` entry and the recipe's `expected_reference` copy.
+/// `CampaignLearningStateView::validate_slot_projections` compares
+/// `SlotProjection::canonical_digest()` against the resolved reference, so a
+/// fixture that changes a slot disposition without re-deriving that entry is
+/// refused with `DigestMismatch { field: "view.slot_projection_digest" }`
+/// before the delta product is ever consulted. The completeness state is a
+/// second derived value: `validate_against` requires the recorded
+/// `completeness` to equal `derived_completeness`, so a fixture that sets it by
+/// hand after mutating a disposition is refused with `IncompleteCoverage`.
+fn reseal_slot_projection(
+    view: &mut eliot_learning_contracts::CampaignLearningStateView,
+    recipe: &mut LearningStateViewRecipe,
+    slot_id: &eliot_learning_contracts::SlotId,
+) {
+    let derived = view
+        .slots
+        .iter()
+        .find(|slot| &slot.slot_id == slot_id)
+        .expect("mutated slot is present")
+        .canonical_digest()
+        .expect("slot canonical digest");
+    let spec = recipe
+        .slots
+        .iter()
+        .find(|spec| &spec.slot_id == slot_id)
+        .expect("mutated slot is declared")
+        .clone();
+    for requirement in &mut recipe.source_requirements {
+        if requirement.role != spec.source_role {
+            continue;
+        }
+        let Some(reference) = requirement.expected_reference.as_mut() else {
+            continue;
+        };
+        match reference
+            .slot_projection_digests
+            .iter_mut()
+            .find(|entry| &entry.slot_id == slot_id)
+        {
+            Some(entry) => entry.digest.clone_from(&derived),
+            None => reference
+                .slot_projection_digests
+                .push(CampaignSlotProjectionDigest {
+                    slot_id: slot_id.clone(),
+                    digest: derived.clone(),
+                }),
+        }
+    }
+    for resolution in &mut view.provenance.source_resolutions {
+        if resolution.role != spec.source_role {
+            continue;
+        }
+        let Some(reference) = resolution.reference.as_mut() else {
+            continue;
+        };
+        match reference
+            .slot_projection_digests
+            .iter_mut()
+            .find(|entry| &entry.slot_id == slot_id)
+        {
+            Some(entry) => entry.digest.clone_from(&derived),
+            None => reference
+                .slot_projection_digests
+                .push(CampaignSlotProjectionDigest {
+                    slot_id: slot_id.clone(),
+                    digest: derived.clone(),
+                }),
+        }
+    }
+    recipe.seal().expect("recipe reseal");
+    view.recipe_digest.clone_from(&recipe.canonical_digest);
+    view.completeness = view.derived_completeness(recipe);
+    view.seal_content_addressed().expect("view reseal");
+}
+
 fn recipe_and_view(
     tag: &str,
 ) -> (
@@ -1643,6 +1723,13 @@ fn omission_fixture(
     } else {
         view.omissions = vec![slot_b];
     }
+    // Naming slot-b on the resume frontier is itself a partial observation, so
+    // the derived completeness becomes `Partial` here, while the omission branch
+    // leaves it at the seed's `CompleteForDeclaredRecipe`.
+    // `validate_against` requires the recorded `completeness` to equal
+    // `derived_completeness`, so the fixture must re-derive it after the edit
+    // rather than carrying the seed value across a change that moves it.
+    view.completeness = view.derived_completeness(&input.recipe);
     view.seal_content_addressed().expect("view seal");
     (view, input, context, policy(SemanticOutcome::Benefit))
 }
@@ -2314,10 +2401,16 @@ fn exact_before_value_with_stale_missing_and_conflicted_base() {
         Err(LearningDeltaError::BeforeValueUnavailable { field: "selector" })
     );
     for disposition in [SlotDisposition::Stale, SlotDisposition::Conflicted] {
-        let (_, mut view, input, context) = base_input("c08-disposition");
+        let (mut recipe, mut view, mut input, context) = base_input("c08-disposition");
         view.slots[0].disposition = disposition;
-        view.completeness = Completeness::Partial;
-        view.seal_content_addressed().expect("view seal");
+        // A disposition change moves the slot's canonical digest and its derived
+        // completeness, so both are re-derived here; see `reseal_slot_projection`.
+        // The assertion below is about the delta product refusing a stale or
+        // conflicted before-value, which is only reachable once the fixture is
+        // internally consistent enough to pass the view contract at all.
+        let slot_id = eliot_learning_contracts::SlotId::from_artifact(aid("slot-a"));
+        reseal_slot_projection(&mut view, &mut recipe, &slot_id);
+        input.recipe = recipe;
         assert_eq!(
             derive_attempt_learning_outcome(
                 &view,
