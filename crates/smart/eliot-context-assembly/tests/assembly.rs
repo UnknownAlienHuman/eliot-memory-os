@@ -7,8 +7,8 @@ use eliot_context_assembly::{
 };
 use eliot_context_contracts::*;
 use eliot_contracts::{
-    ArtifactId, DecisionId, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration, StateFence,
-    TaskId, TaskRevision, sha256_hex,
+    ArtifactId, DecisionId, EpochId, EpochLineageId, PolicyRevision, ResourceGeneration,
+    StateFence, TaskId, TaskRevision, sha256_hex,
 };
 use eliot_evidence::{Assertability, EpistemicStatus};
 use eliot_receipts::{ProofCeiling, ProtectedReserves, WorkScopeId};
