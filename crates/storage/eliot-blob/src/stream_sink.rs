@@ -73,14 +73,14 @@ use eliot_blob_api::{
 };
 use eliot_process::{
     PROCESS_STREAM_SINK_SCHEMA_VERSION, DurableProcessStreamSource, DurableStreamLocatorKind,
-    ProcessStreamEvidence,
-    ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest,
-    ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient,
-    ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture,
-    ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback, ProcessStreamSinkSession,
-    ProcessStreamSinkSessionView, ProcessStreamSinkState, ProcessStreamSinkTerminal,
-    ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkUnknownOutcome, StreamEvidenceGap,
-    StreamPersistenceStatus, StreamPreviewRepresentation, StreamTransportStatus,
+    ProcessStreamEvidence, ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
+    ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
+    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
+    ProcessStreamSinkSession, ProcessStreamSinkSessionView, ProcessStreamSinkState,
+    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamSinkUnknownOutcome, StreamEvidenceGap, StreamPersistenceStatus,
+    StreamPreviewRepresentation, StreamTransportStatus,
 };
 use eliot_receipts::EffectClass;
 use sha2::{Digest, Sha256};
@@ -444,10 +444,11 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             final_sequence: reservation.next_sequence,
             final_offset: reservation.next_offset,
         };
-        let bytes = serde_json::to_vec(&wire).map_err(|error| ProcessStreamSinkError::Serialization {
-            field: "finalize_uncertainty",
-            reason: error.to_string(),
-        })?;
+        let bytes = serde_json::to_vec(&wire)
+            .map_err(|error| ProcessStreamSinkError::Serialization {
+                field: "finalize_uncertainty",
+                reason: error.to_string(),
+            })?;
         ProcessStreamSinkUnknownOutcome::new(
             session.session_id().clone(),
             session.terminal_id().clone(),
@@ -770,7 +771,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
     /// Reads the retained object back and proves it is the very object the
     /// ready receipt commits to. A zero-byte complete source verifies as a
     /// real immutable object with the same exact rules.
-    async fn verify_readback(&self, ready: &BlobReadyReceipt) -> Result<(), ProcessStreamSinkError> {
+    async fn verify_readback(
+        &self,
+        ready: &BlobReadyReceipt,
+    ) -> Result<(), ProcessStreamSinkError> {
         let chunk = self
             .store
             .read(BlobReadRequest {
@@ -990,15 +994,19 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         _hold: FinalizeHold<'_, C>,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
         let ready = match ticket.step {
-            PublishStep::Readback { ready } => ready,
+            PublishStep::Readback { ready } => *ready,
             PublishStep::Stage { staged } => {
                 self.stage_once(&ticket.identity, ticket.incarnation, &staged)
                     .await?
             }
         };
         self.verify_readback(&ready).await?;
-        let evidence =
-            Self::complete_source(&ticket.session, &ticket.request, &ticket.admitted_sha256, &ready)?;
+        let evidence = Self::complete_source(
+            &ticket.session,
+            &ticket.request,
+            &ticket.admitted_sha256,
+            &ready,
+        )?;
         let terminal = ProcessStreamSinkTerminal::from_finalize(
             ticket.session,
             ticket.request,
