@@ -779,6 +779,13 @@ pub(crate) fn build_admitted_provider_capability(
 /// route-local privacy evidence are also bound into the canonical staffing
 /// receipt enforced against the compiled candidate.
 ///
+/// Issue #2567 AUD3: this planning-only function calls no port — neither
+/// [`PeerChannelPort`] nor [`SwarmControlPort`] — so it performs no peer or
+/// swarm behavior and fabricates none. Wider-shape refusal lives at the
+/// effecting entries: [`AgentFabric::define_and_plan`] refuses through the
+/// swarm binding report before any record, and [`AgentFabric::enter_swarm`]
+/// refuses through the per-call binding pre-check before touching the owner.
+///
 /// # Errors
 ///
 /// Returns [`FabricError::Contract`] carrying the staffing-policy rejection
@@ -2471,18 +2478,14 @@ impl AgentFabric {
     /// Definition is the first step of the chain an admitted Task-Controller
     /// production operation must drive ([`Self::define_and_plan`] →
     /// [`Self::stage_reservation`] → [`Self::commit_admission`] →
-    /// [`Self::activate`] → [`Self::dispatch`]). That operation is not wired
-    /// into `eliotd`: no `DaemonComposition` method or daemon poll step calls
-    /// this method, so on the current base no production operation reaches
-    /// definition, admission, activation and dispatch through this fabric.
-    ///
-    /// BLOCKED-BY scope `bins/eliotd/src/lib.rs::DaemonComposition` (and
-    /// `bins/eliotd/src/campaign_task_controller.rs` /
-    /// `bins/eliotd/src/daemon_runtime.rs` for the request producer): an
-    /// admitted Task-Controller operation must be defined that carries the
-    /// frozen `StaffingPlanRequest` plus the owner reservation, admission and
-    /// activation authorities through these five steps. The step methods exist
-    /// and are exercised; only the admitted production caller is absent.
+    /// [`Self::activate`] → [`Self::dispatch`]). That operation is the solo
+    /// poll path: `crate::solo_agent_driver::drive_admitted_material_async`
+    /// (reached from `solo_poll_queue_async`) calls this method after
+    /// `guard_solo_plan` admits only the solo shape (one lane, fanout one),
+    /// so the swarm-scope refusal below never fires on the solo slice while
+    /// wider plans still refuse typed while the B-SWARM owner is unbound.
+    /// The Task Controller intake producer upstream of the solo queue remains
+    /// the open leg, not this five-step chain.
     ///
     /// # Errors
     ///
