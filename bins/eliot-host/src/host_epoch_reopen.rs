@@ -125,9 +125,8 @@ fn require_prior_kernel_released_for_new_epoch(replayed: &HostState) -> Result<(
             "new Host installation epoch requires a known prior-Kernel disposition; unknown observations stop activation but remain queryable".to_owned(),
         ));
     }
-    let kernel = match replayed.kernel.as_ref() {
-        None => return Ok(()),
-        Some(kernel) => kernel,
+    let Some(kernel) = replayed.kernel.as_ref() else {
+        return Ok(());
     };
     match &kernel.prior_kernel_disposition {
         PriorKernelDisposition::NoPriorKernel | PriorKernelDisposition::Terminated(_) => {}
