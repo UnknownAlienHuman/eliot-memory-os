@@ -1,4 +1,4 @@
-//! Operator-adjacent live read path over the `read_controlboard_contour` projection.
+//! Operator-adjacent read path over the `read_controlboard_contour` projection.
 //!
 //! Issue #1213 follow-through: this module binds the
 //! [`read_controlboard_contour`](super::read_controlboard_contour) projection to
@@ -15,6 +15,62 @@
 //!   one function — `read_controlboard_contour` — which itself performs only
 //!   `ControlBoard::view`. No command construction, port access, or submit path
 //!   is in scope.
+//!
+//! Reachability (measured, not aspirational): [`read_controlboard_status`] has
+//! NO production caller. Its only call site is [`render_controlboard_status`]
+//! inside this module; the crate root re-exports it; `controlboard_transport`
+//! doc-links it. Nothing outside this crate invokes it, and every route that
+//! could invoke it refuses or cannot name it first:
+//!
+//! * Crate graph — BLOCKER CLOSED. `eliot-controlboard` is declared by exactly
+//!   two crates, `eliotd` and this one; `eliot-runtime-status` is declared by
+//!   `eliot-kernel`, `eliot`, `eliot-live-canary` and now `eliotd`. `eliotd`
+//!   previously declared neither, so the only crate able to name both the board
+//!   and this function was this one, which contains no `ControlBoard` producer.
+//!   `bins/eliotd/Cargo.toml` now declares `eliot-runtime-status.workspace`,
+//!   so `eliotd` can name both. The edge names no authority and admits nothing;
+//!   it removes the structural blocker only.
+//! * Missing producer for the read's own inputs — OPEN. The composition owner
+//!   is `eliotd::DaemonComposition::controlboard` (`bins/eliotd/src/lib.rs`),
+//!   which builds a real board over a real Governor projection snapshot, and
+//!   `eliotd::controlboard_read_intent` builds a real `ReadRequest` from
+//!   Kernel-issued values. But this function additionally requires
+//!   `ControlBoardProjectionBindings` carrying the owner's full five-domain
+//!   `DomainCoverage` set and its `CapabilitySupportRow` set, which
+//!   `validate_domain_coverage` refuses unless every `EvidenceDomain::ALL` row
+//!   is present at one `evaluated_at_ms`, plus a non-empty frozen
+//!   `ControlBoardExpectedSet`. `eliotd` declares no owner record today, and
+//!   `ControlBoardGovernorSnapshot` carries none. A denominator derived from the
+//!   observed view would make `Missing` and `missing_count` vacuous, so the
+//!   denominator and the I0.5 owner records are a separate owner act, not a
+//!   wiring one.
+//! * CLI surface. `bins/eliot/src/controlboard_status.rs` is the decode side and
+//!   refuses earlier and unconditionally: `eliot controlboard status` binds no
+//!   admitted request identity, so `KernelClient::transact_json`
+//!   (`crates/surfaces/eliot-cli/src/lib.rs`) fails closed with
+//!   `MissingRequestIdentity` before any byte is sent. It could not call this
+//!   function regardless: `bins/eliot` declares no `eliot-controlboard` edge.
+//! * Daemon owner. `eliotd::serve_controlboard_view` is the one production seam
+//!   that performs this same `ControlBoard::view`, and it sits behind
+//!   `check_local_read_admission`, whose closed tool match
+//!   (`bins/eliot-kernel/src/host_request_route.rs`) admits `eliot.packet`,
+//!   `eliot.query` and the `skill.*` lifecycle tools and refuses every other
+//!   name — `controlboard.read` reaches the refusal arm, so no such pair is ever
+//!   enqueued. Independently, no producer presents a host request naming
+//!   `controlboard.read`: the closed `ADMITTED_TOOL_NAMES`
+//!   (`crates/surfaces/eliot-mcp/src/contract.rs`) and the Operator's closed
+//!   `AdmittedTools` (`apps/Eliot.Operator/Protocol/OperatorIntent.cs`) do not
+//!   carry it. Admitting the capability without a consumer that satisfies the
+//!   reconciled board contract would serve a raw view the CLI decode refuses,
+//!   so the admission arm and the reconciled read land together or not at all.
+//!
+//! Every guarantee below is therefore a contract over the exact bytes this
+//! module produces, not a claim that a running process produces them today. The
+//! three owner acts that remain are outside this crate: the owning composition
+//! declares the I0.5 owner records and the frozen board denominator; the
+//! `eliot-kernel` lane admits a `controlboard.read` pair and the host-request
+//! lane presents one. No guarantee stated here is conditional on that wiring,
+//! and none is relaxed by this note.
 //!
 //! Denominator: [`ControlBoardExpectedSet`] is frozen at construction (sorted,
 //! deduplicated, immutable). [`render_controlboard_status`] emits exactly one

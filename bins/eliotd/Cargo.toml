@@ -131,6 +131,21 @@ eliot-receipts.workspace = true
 # carries only the read-only wire view. `eliot-reports` depends on no owner.
 eliot-reports.workspace = true
 eliot-runtime-contracts.workspace = true
+# Issue #1213: this is the dependency edge the control-board status read was
+# missing. `eliot-runtime-status` owns the read-only `ControlBoard` contour,
+# consumer and EBP/1 transport, and `eliotd` is the only production composition
+# owner of a real `eliot_controlboard::ControlBoard`
+# (`DaemonComposition::controlboard`). Before this edge the two crates could not
+# see each other: `eliot-controlboard` was declared only by `eliotd` and
+# `eliot-runtime-status`, and `eliot-runtime-status` only by `eliot-kernel`,
+# `eliot` and `eliot-live-canary`, so the sole crate able to name BOTH the board
+# and `read_controlboard_status` was `eliot-runtime-status` itself, which has no
+# `ControlBoard` producer. This edge removes that structural blocker; it names
+# no authority and admits no `controlboard.read` pair on its own.
+# Layer check: `eliot-runtime-status` and its closure are in no
+# `forbidden_exact`/`forbidden_prefix` set of `config/architecture-boundaries.toml`
+# for this runtime root, so the edge is admissible without a boundaries change.
+eliot-runtime-status.workspace = true
 eliot-security-contracts.workspace = true
 eliot-skill.workspace = true
 eliot-store-api.workspace = true

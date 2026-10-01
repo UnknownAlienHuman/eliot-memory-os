@@ -3626,6 +3626,7 @@ dependencies = [
  "eliot-receipts",
  "eliot-reports",
  "eliot-runtime-contracts",
+ "eliot-runtime-status",
  "eliot-security-contracts",
  "eliot-self-quality",
  "eliot-skill",

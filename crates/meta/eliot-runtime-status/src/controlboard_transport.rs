@@ -1,12 +1,25 @@
 //! Producer-side transport for the reconciled `ControlBoard` board.
 //!
 //! Issue #1213 transport follow-through: [`RenderedControlBoard`] is produced
-//! in-process by [`read_controlboard_status`](super::read_controlboard_status)
-//! but Operator/CLI surfaces live across the process boundary. This module is
-//! the exact producer/surface handshake that carries one reconciled board over
-//! the existing `eliot-ipc` EBP/1 transport from the runtime-status-owning
-//! process. It owns no pipe, process, authentication, admission, or lifecycle
-//! state; it only frames, versions, and validates one board message.
+//! in-process by `read_controlboard_status` in the sibling `controlboard_consumer`
+//! module, and this module is the exact producer/surface handshake that carries
+//! one reconciled board over the existing `eliot-ipc` EBP/1 transport from the
+//! runtime-status-owning process. It owns no pipe, process, authentication,
+//! admission, or lifecycle state; it only frames, versions, and validates one
+//! board message.
+//!
+//! Reachability (measured): this producer handshake has no production caller
+//! either. Nothing invokes `build_controlboard_frame`, `encode_controlboard_response`
+//! or `decode_controlboard_response` outside this crate's own tests. The
+//! dependency blocker is closed — `bins/eliotd` now declares this crate and can
+//! name every type here — but the daemon's board read still serves a raw
+//! `ControlBoardView` result body rather than a reconciled board, the
+//! composition declares no I0.5 owner records or frozen denominator, and the
+//! serving `controlboard.status` operation has no admitted producer.
+//! `controlboard_consumer`'s module documentation records the full refusal chain
+//! and names the three owner acts. The handshake guarantees below are contracts
+//! over the exact bytes exchanged once that wiring lands; no guarantee is
+//! relaxed by this note.
 //!
 //! Handshake (shared with the surface owner; both sides enforce every line):
 //!
