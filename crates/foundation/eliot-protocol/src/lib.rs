@@ -10,7 +10,10 @@
 
 use std::{collections::BTreeMap, fmt, io::Read};
 
-use crate::activation_resolution::AgentActivationResolutionDisposition;
+use crate::{
+    AgentActivationBindScopeEvidence,
+    activation_resolution::AgentActivationResolutionDisposition,
+};
 use eliot_agent_contracts::LivePeerMessage;
 use eliot_contracts::{
     ArtifactId, ContractError, ContractIdentity, ContractVersion, EpochId, RequestId,
@@ -3115,6 +3118,11 @@ pub struct OpenAgentBridgeActivationResponse {
     pub request_sha256: String,
     /// Typed activation outcome, including additive canonical denials.
     pub disposition: OpenAgentBridgeActivationDisposition,
+    /// Owner-produced pre-scope proof returned only with the exact
+    /// `ScopeSelectionRequired` denial. It may authorize BIND_SCOPE only and
+    /// never represents an authenticated Session or Resolved binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_scope_evidence: Option<AgentActivationBindScopeEvidence>,
     /// Lowercase SHA-256 over every response field except this field.
     pub response_sha256: String,
 }
@@ -3148,6 +3156,7 @@ impl OpenAgentBridgeActivationResponse {
                 directive_kind,
                 detail,
             },
+            bind_scope_evidence: None,
             response_sha256: String::new(),
         }
         .with_computed_digest()
@@ -3155,6 +3164,31 @@ impl OpenAgentBridgeActivationResponse {
             response.validate_request(request)?;
             Ok(response)
         })
+    }
+
+    /// Adds the exact owner proof needed to submit an explicit initial
+    /// BIND_SCOPE request. The denial remains non-authenticated and its
+    /// response digest covers the proof.
+    pub fn with_bind_scope_evidence(
+        mut self,
+        evidence: AgentActivationBindScopeEvidence,
+    ) -> Result<Self, ProtocolError> {
+        evidence.validate()?;
+        if !matches!(
+            &self.disposition,
+            OpenAgentBridgeActivationDisposition::CanonicalDenied {
+                detail: AgentActivationResolutionDisposition::ScopeSelectionRequired { .. },
+                ..
+            }
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_bridge_activation_response.bind_scope_evidence",
+                reason: "pre-scope proof is permitted only with ScopeSelectionRequired",
+            });
+        }
+        self.bind_scope_evidence = Some(evidence);
+        self.response_sha256.clear();
+        self.with_computed_digest()
     }
 
     /// Returns canonical bytes covered by `response_sha256`.
@@ -3189,6 +3223,21 @@ impl OpenAgentBridgeActivationResponse {
             "agent_bridge_activation_response.request_sha256",
         )?;
         self.disposition.validate()?;
+        if let Some(evidence) = &self.bind_scope_evidence {
+            evidence.validate()?;
+            if !matches!(
+                &self.disposition,
+                OpenAgentBridgeActivationDisposition::CanonicalDenied {
+                    detail: AgentActivationResolutionDisposition::ScopeSelectionRequired { .. },
+                    ..
+                }
+            ) {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_bridge_activation_response.bind_scope_evidence",
+                    reason: "pre-scope proof is permitted only with ScopeSelectionRequired",
+                });
+            }
+        }
         lowercase_sha256(
             &self.response_sha256,
             "agent_bridge_activation_response.response_sha256",
