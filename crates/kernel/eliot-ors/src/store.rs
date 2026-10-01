@@ -16232,9 +16232,7 @@ impl RedbRecoveryStore {
         if row.authority_lineage != lineage || row.principal != principal {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
-        if row.owner_version == BRIDGE_STREAM_OWNER_VERSION
-            && row.installation_id != installation
-        {
+        if row.owner_version == BRIDGE_STREAM_OWNER_VERSION && row.installation_id != installation {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
         let live_grant = row.creating_connection == connection

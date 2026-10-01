@@ -7213,14 +7213,7 @@ impl KernelComposition {
         &self,
         presenter: &serde_json::Value,
         reconciliation: &serde_json::Value,
-        batch_namespaces: &[(
-            String,
-            String,
-            u64,
-            u64,
-            u64,
-            Option<(String, String, u64)>,
-        )],
+        batch_namespaces: &[(String, String, u64, u64, u64, Option<(String, String, u64)>)],
     ) -> Result<Vec<serde_json::Value>, TransportError> {
         // Continuity presented for this request's consumed entries, keyed
         // by stream: the post-ack maintenance re-resolve must prove the
@@ -7230,7 +7223,9 @@ impl KernelComposition {
             batch_namespaces
                 .iter()
                 .filter_map(|(_, stream_id, _, _, _, continuity)| {
-                    continuity.as_ref().map(|triple| (stream_id.as_str(), triple))
+                    continuity
+                        .as_ref()
+                        .map(|triple| (stream_id.as_str(), triple))
                 })
                 .collect();
         let batch_streams: std::collections::BTreeSet<&str> = batch_namespaces
