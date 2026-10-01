@@ -159,6 +159,16 @@ fn operational_input(
 
 /// A committed authority snapshot: the ORS-owned row that makes this store
 /// exportable at all, and the source of the fixture's ordering high-water.
+///
+/// Each call with a NEW `record_id` appends one further `OPERATIONAL_HISTORY`
+/// row at its own operation order, so calling it twice gives the exported
+/// snapshot TWO members rather than one. That matters for the duplicate case:
+/// `mutate_operational` (`store.rs:30313`) treats a second record for an
+/// existing subject as a lifecycle transition, admits it because the prior row
+/// is `Active` and the epoch edge is equal, and persists a second history row
+/// keyed by the new order — the export reads `OPERATIONAL_HISTORY`, so both rows
+/// become page entries under `RowFamilyKind::OperationalHistory` with distinct
+/// record ids, and `expected_member_roster` reports both.
 fn commit_authority(
     store: &RedbRecoveryStore,
     record_id: &str,
@@ -374,6 +384,13 @@ fn empty_member_set_still_produces_known_zero() -> TestResult {
 /// different fault with a different handling. It is not a boundary error at all; it
 /// is refused as a verdict on a receipt that still carries the per-member outcomes,
 /// because that vector is what the caller needs to route reconciliation.
+///
+/// The source here commits TWO authority rows, so the archive declares TWO
+/// members. That is load-bearing for the second half: with a ONE-member roster,
+/// dropping the duplicated outcome leaves the roster FULLY covered and `Satisfied`
+/// is the truthful verdict. A duplicate and a missing member are only
+/// distinguishable when the roster is big enough for one to be missing while the
+/// duplicate is still the sole fault in the other half.
 #[test]
 fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
     let source_path = database_path("duplicate-source");
@@ -382,20 +399,33 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
     cleanup(&destination_path);
     let source_store = open_bound(&source_path, SOURCE_INSTALLATION)?;
     let destination = open_bound(&destination_path, DESTINATION_INSTALLATION)?;
-    let high_water = commit_authority(&source_store, "953-w3k1-duplicate-authority")?;
+    commit_authority(&source_store, "953-w3k1-duplicate-authority-a")?;
+    // The SECOND commit, so the export's frozen high-water covers both rows.
+    let high_water = commit_authority(&source_store, "953-w3k1-duplicate-authority-b")?;
 
     let Exported { snapshot, import } = export_snapshot(&source_store, &destination, high_water)?;
     let expected = snapshot.expected_member_roster()?;
     assert!(
-        !expected.is_empty(),
-        "the duplicate case needs a member to duplicate an outcome for"
+        expected.len() >= 2,
+        "the duplicate case needs at least TWO declared members, or dropping the \
+         duplicate cannot leave anything untriaged; this one declared {expected:?}"
     );
+    // Two DISTINCT record ids, measured rather than assumed: the outcome
+    // vocabulary is record-id keyed, so two members sharing one id would be a
+    // different (and separately refused) fault than the one under test here.
     let duplicated_id = expected[0].1.clone();
+    let other_id = expected[1].1.clone();
+    assert_ne!(
+        duplicated_id, other_id,
+        "the two declared members must carry distinct record ids: {expected:?}"
+    );
 
-    // The SAME record id, twice: one outcome duplicated, exactly the shape the
-    // audit says the old set comparison collapsed instead of rejecting.
+    // The SAME record id, twice, PLUS a complete coverage of the other member:
+    // every OTHER obligation is satisfied, so the duplicate is the only fault
+    // here and the typed refusal cannot be an artifact of incomplete coverage.
     let outcomes = vec![
         (duplicated_id.clone(), PerEntryOutcome::Imported),
+        (other_id.clone(), PerEntryOutcome::Imported),
         (
             duplicated_id.clone(),
             PerEntryOutcome::Rejected {
@@ -423,13 +453,18 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
         "a duplicate outcome id must be refused with a TYPED error"
     );
 
-    // And it is the DUPLICATE refusal, not the coverage one. Dropping the second
-    // outcome leaves the same member untriaged, which is INCOMPLETE COVERAGE, not
-    // a contradiction: it is refused as a verdict on a receipt the caller can read
+    // And it is the DUPLICATE refusal, not the coverage one. An EMPTY outcome
+    // vector leaves every member untriaged, which is INCOMPLETE COVERAGE, not a
+    // contradiction: it is refused as a verdict on a receipt the caller can read
     // (so the per-member outcomes survive for routing), and never as this typed
     // error. The two faults are therefore distinguishable by RESULT type, not only
     // by variant.
-    let subset = vec![(duplicated_id.clone(), PerEntryOutcome::Imported)];
+    //
+    // The vector must be EMPTY rather than a one-element subset. Keeping the
+    // single member would leave coverage COMPLETE, so `Satisfied` would be the
+    // correct verdict and this assertion would be demanding a refusal the owner
+    // has no reason to give.
+    let subset: Vec<(String, PerEntryOutcome)> = Vec::new();
     let incomplete = destination.reconcile_backup_import(&import, &snapshot, &subset, NOW_MS)?;
     assert!(
         matches!(
