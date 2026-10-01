@@ -1624,13 +1624,13 @@ use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGener
 use eliot_host_service::{HostDurableJobAdapter, HostWakeIntentAdapter};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
-    EpochTransition, HostInstallationEpoch, HostObservationRecord,
-    HostProcessIncarnationRecord, HostProcessIncarnationRegistration, HostState,
-    HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
-    KernelJobBinding, KernelRecord, ModuleBuildProvenanceRecord, NonceState, OneTimeNonceState,
-    PriorKernelDisposition, ProductionHostStateJournal, ReconcileOutcome, RecordFence,
-    RecoveryLineageEvidence, RedbJournalBackend, StoreRebindRecord, StoreRebindState,
-    host_owner_epoch_digest, record_checksum,
+    EpochTransition, HostInstallationEpoch, HostObservationRecord, HostProcessIncarnationRecord,
+    HostProcessIncarnationRegistration, HostState, HostStateJournalService, HostStateRecord,
+    IdempotencyIdentity, JournalBackend, JournalError, KernelJobBinding, KernelRecord,
+    ModuleBuildProvenanceRecord, NonceState, OneTimeNonceState, PriorKernelDisposition,
+    ProductionHostStateJournal, ReconcileOutcome, RecordFence, RecoveryLineageEvidence,
+    RedbJournalBackend, StoreRebindRecord, StoreRebindState, host_owner_epoch_digest,
+    record_checksum,
 };
 use eliot_installation::{
     ActivationCommitFence, ActivePhaseBRebindIntent, ActivePhaseBRebindReceipt,
@@ -9182,10 +9182,14 @@ impl HostComposition {
             ));
         }
         let process_incarnation = self.register_current_host_process_birth();
-        if let Err(error) = handle.update_context(self.crash_runtime_context(
-            true,
-            process_incarnation.as_ref().map(|registration| registration.record()),
-        )) {
+        if let Err(error) = handle.update_context(
+            self.crash_runtime_context(
+                true,
+                process_incarnation
+                    .as_ref()
+                    .map(|registration| registration.record()),
+            ),
+        ) {
             handle.invalidate_runtime_context();
             return Err(error);
         }
@@ -9225,9 +9229,7 @@ impl HostComposition {
     /// observes the live native Host and the exact committed owner record,
     /// receipt, and operation projection all agree.
     #[cfg(windows)]
-    fn register_current_host_process_birth(
-        &self,
-    ) -> Option<HostProcessIncarnationRegistration> {
+    fn register_current_host_process_birth(&self) -> Option<HostProcessIncarnationRegistration> {
         let process_id = std::process::id();
         let first = observe_named_pipe_peer_process(process_id).ok()?;
         let first_identity = first.identity().clone();
@@ -9273,9 +9275,7 @@ impl HostComposition {
     }
 
     #[cfg(not(windows))]
-    fn register_current_host_process_birth(
-        &self,
-    ) -> Option<HostProcessIncarnationRegistration> {
+    fn register_current_host_process_birth(&self) -> Option<HostProcessIncarnationRegistration> {
         None
     }
 
@@ -9328,18 +9328,16 @@ impl HostComposition {
         } else {
             None
         };
-        let mut context = CrashRuntimeContext::from_observations(
-            CrashRuntimeContextObservations {
-                module_generation_ref,
-                process_generation_ref,
-                state_fence,
-                active_trace_ref: None,
-                work_scope_ref: None,
-                audit_head: None,
-                evidence_handles: Vec::new(),
-                journal_head,
-            },
-        );
+        let mut context = CrashRuntimeContext::from_observations(CrashRuntimeContextObservations {
+            module_generation_ref,
+            process_generation_ref,
+            state_fence,
+            active_trace_ref: None,
+            work_scope_ref: None,
+            audit_head: None,
+            evidence_handles: Vec::new(),
+            journal_head,
+        });
         context.journal_head_gap = journal_head_gap;
         context
     }
@@ -9348,10 +9346,14 @@ impl HostComposition {
         if let Some(handle) = self.crash_reporter.as_ref() {
             let process_incarnation = self.register_current_host_process_birth();
             if handle
-                .update_context(self.crash_runtime_context(
-                    journal_head_current,
-                    process_incarnation.as_ref().map(|registration| registration.record()),
-                ))
+                .update_context(
+                    self.crash_runtime_context(
+                        journal_head_current,
+                        process_incarnation
+                            .as_ref()
+                            .map(|registration| registration.record()),
+                    ),
+                )
                 .is_err()
             {
                 tracing::warn!(

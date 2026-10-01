@@ -3000,7 +3000,8 @@ impl HostProcessIncarnationRecord {
             || self.operation.idempotency_key.as_str() != expected_key
         {
             return Err(JournalError::Invalid(
-                "Host process incarnation operation identity differs from its original birth".into(),
+                "Host process incarnation operation identity differs from its original birth"
+                    .into(),
             ));
         }
         Ok(())

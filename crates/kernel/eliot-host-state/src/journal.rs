@@ -11,13 +11,12 @@ use thiserror::Error;
 use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, PreparedAppend};
 use crate::model::{
     AppliedOperation, BackupPreparationState, CutoverIntentState, DrainState,
-    EliotActivationRecord, EpochEvidence, EpochRetirementRecord, HostInstallationEpoch, HostState,
-    HostProcessIncarnationRecord, HostStateRecord, IdempotencyIdentity,
-    PredecessorRetirementRelation, RecordFence,
-    RecoveryLineageReason, WakeCancellationBatchProjection, activation_transition,
-    backup_preparation_transition, dependency_transition, drain_transition,
-    epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition,
-    wake_transition,
+    EliotActivationRecord, EpochEvidence, EpochRetirementRecord, HostInstallationEpoch,
+    HostProcessIncarnationRecord, HostState, HostStateRecord, IdempotencyIdentity,
+    PredecessorRetirementRelation, RecordFence, RecoveryLineageReason,
+    WakeCancellationBatchProjection, activation_transition, backup_preparation_transition,
+    dependency_transition, drain_transition, epoch_transition_is_direct_child_of,
+    kernel_transition, store_rebind_transition, wake_transition,
 };
 use crate::reactive_context::{
     ReactiveContextEnqueueReceipt, ReactiveContextJournalAction, ReactiveContextOperationQuery,
@@ -1616,8 +1615,7 @@ impl<B: JournalBackend> HostStateJournal<B> {
     pub fn append(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
         if matches!(
             &record,
-            HostStateRecord::ReadinessObservation(_)
-                | HostStateRecord::HostProcessIncarnation(_)
+            HostStateRecord::ReadinessObservation(_) | HostStateRecord::HostProcessIncarnation(_)
         ) {
             return Err(JournalError::Invalid(
                 "journal owner records require their exact owner-specific admission API".into(),
