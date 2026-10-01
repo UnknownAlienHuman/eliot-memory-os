@@ -26,12 +26,12 @@
 //   crates/kernel/eliot-kernel-core/src/module/notification_state.rs
 //   crates/foundation/eliot-receipts/src/lib.rs
 //   crates/kernel/eliot-platform/src/handle_nonce.rs
-// contract_source_sha256: 27b22c07a5a96d62d02ba8b0bb2406ce30a866a1df24a8e6312a28ee61290aba
-// constants_source_sha256: 653507ac2d8e509d78a588cc15bf6f7d621dbab20e4dec032d654a91146568d0
+// contract_source_sha256: 05a66cb14a5d6c6d234f4937c2d3d7083d222a4e1d8bd55de49d66774a57589a
+// constants_source_sha256: 5d94e74673c59c2c0a8e95b4af90ce57c2b2b8d231cffc88ab4d58da4f7cd123
 // dispositions_source_sha256: c4e647fdf7f44d2ad6a194259323bf75c220b4b2bf4f00f40ffbb258cf0c2817
 // refusals_source_sha256: 2f2fd3ce7bbf507d067887e936c06089a7b21fb2576271524c55374010a2ade6
-// grammar_source_sha256: c101eff7f636b3adc2441df5c5a27c140f3b4c833ce1c8b27c4b432e9255923b
-// user_automation_result_schema_sha256: c71ee40384dba3eaebac57d4c92c9e7406a342d6901e532ee362c163e8f7cf1c
+// grammar_source_sha256: 807aef1eb0499bc32a70e6eb0cdb59b672b78683819fe2791f6b545d2215ffe1
+// user_automation_result_schema_sha256: f6447beefa281b252674c6ca18adc39d9f5fe12c1cbd122969776e33ab6375fe
 //
 // Stated boundary of this mirror. The Operator validates the bounded wire
 // shape, the exact supported contract version and the self-consistency of the
@@ -88,6 +88,8 @@ public static class OperatorScheduleContract
         "MIN_CIVIL_YEAR\tu32\t1",
         "MAX_CIVIL_YEAR\tu32\t9999",
         "USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION\t&str\t\"eliot.user-automation.preflight.v1\"",
+        "USER_AUTOMATION_NORMALIZATION_OPERATION_KIND\t&str\t\"user-automation.schedule.normalize\"",
+        "USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND\t&str\t\"user-automation.schedule.migrate-legacy\"",
         "PINNED_ZONE_DATABASE_RELEASE\t&str\t\"2026c\"",
         "USER_AUTOMATION_RESULT_WIRE_ID\t&str\t\"eliot.kernel.user-automation.operator-result\"",
         "USER_AUTOMATION_RESULT_WIRE_VERSION\tu16\t1",
@@ -109,8 +111,8 @@ public static class OperatorScheduleContract
         "parse_occurrence\t53ee26d8c5f5363416264b0d56eb527d744dd78129c530eeb6624e95e8349b0f",
         "parse_civil_wall_clock\t5578d2b151cd928f77ced97ed589e5ab4879d7cd11e0be0f1389f973a75a0984",
         "parse_utc_offset\t355b42de90101091999ed58b7faac560e01ba9199b36fe9e1a5026cc9f410de5",
-        "parse_utc_instant\t8de99cbd0be7aa84e6c816e79c8abbb96616bac23898542e30bf66aaeee5c83d",
-        "parse_civil_instant\t9dd14d5ffaa03a0ad49d733624974f6c161b3a2e0066b6d78c9c04eb1d0bd5b5",
+        "parse_utc_instant\t5117fa36c2e8c06a4781bbedac11b562ffd848e19832e3728b3a5841f651db04",
+        "parse_civil_instant\t6e67b74f47067a8f7036aa13a4d4d916668a05b2d1af52debea2836f34d7d371",
         "parse_occurrence_disposition\t72aad363a0c7ecaa05acf18e3b662b1b5d674e9afc79db61f28cc11f381d0814",
         "parse_transition_window\t7f912ddc488a1ff1a0a14de076fced04f61a4032508317538f49a9c1b216c69a",
         "require_declared_disposition\teeeec5751b869b8742c579923ba839300c7a199cfc9288fb8296bcf9948ce9e2",
@@ -171,6 +173,12 @@ public static class OperatorScheduleContract
     /// <summary>`USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION	&str	"eliot.user-automation.preflight.v1"`</summary>
     public const string USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION = "eliot.user-automation.preflight.v1";
 
+    /// <summary>`USER_AUTOMATION_NORMALIZATION_OPERATION_KIND	&str	"user-automation.schedule.normalize"`</summary>
+    public const string USER_AUTOMATION_NORMALIZATION_OPERATION_KIND = "user-automation.schedule.normalize";
+
+    /// <summary>`USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND	&str	"user-automation.schedule.migrate-legacy"`</summary>
+    public const string USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND = "user-automation.schedule.migrate-legacy";
+
     /// <summary>`PINNED_ZONE_DATABASE_RELEASE	&str	"2026c"`</summary>
     public const string PINNED_ZONE_DATABASE_RELEASE = "2026c";
 
@@ -203,7 +211,7 @@ public static class OperatorScheduleContract
     /// The C# decoder source pins this value separately; changing only the
     /// generated artefact cannot widen the decoder.
     /// </summary>
-    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "c71ee40384dba3eaebac57d4c92c9e7406a342d6901e532ee362c163e8f7cf1c";
+    public const string USER_AUTOMATION_RESULT_SCHEMA_SHA256 = "f6447beefa281b252674c6ca18adc39d9f5fe12c1cbd122969776e33ab6375fe";
 
     /// <summary>Generated public members of `UserAutomationOperatorResultEnvelope`.</summary>
     public static readonly string[] USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS =
@@ -222,6 +230,21 @@ public static class OperatorScheduleContract
     [
         "operation_id",
         "idempotency_key",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationOperatorContextValue`.</summary>
+    public static readonly string[] USER_AUTOMATION_CONTEXT_VALUE_MEMBERS =
+    [
+        "outcome",
+        "state_fence",
+    ];
+
+    /// <summary>Generated public members of `UserAutomationNormalizedScheduleValue`.</summary>
+    public static readonly string[] USER_AUTOMATION_NORMALIZED_SCHEDULE_VALUE_MEMBERS =
+    [
+        "outcome",
+        "revision",
+        "normalization_receipt_envelope",
     ];
 
     /// <summary>Generated public members of `UserAutomationOperatorTransitionValue`.</summary>
@@ -949,6 +972,79 @@ public static class OperatorScheduleContract
         "QUEUE_ONE",
         "COALESCED_LATEST",
         "RECONCILIATION_REQUIRED",
+    ];
+
+    /// <summary>Serde discriminator field of `UserAutomationOperation`.</summary>
+    public const string USER_AUTOMATION_OPERATION_DISCRIMINATOR = "kind";
+
+    /// <summary>Generated serialized kinds of `UserAutomationOperation`.</summary>
+    public static readonly string[] USER_AUTOMATION_OPERATION_KINDS =
+    [
+        "create",
+        "get_context",
+        "normalize_schedule",
+        "migrate_legacy_schedule",
+        "list",
+        "status",
+        "history",
+        "pause",
+        "resume",
+        "edit",
+        "run_now",
+        "remove",
+        "inspect_last_failure",
+        "decide_improvement_brief",
+    ];
+
+    /// <summary>Generated JSON members of `UserAutomationOperation::Create`.</summary>
+    public static readonly string[] USER_AUTOMATION_CREATE_OPERATION_MEMBERS =
+    [
+        "revision",
+        "normalization_receipt_envelope",
+    ];
+
+    /// <summary>Generated JSON members of `UserAutomationOperation::Edit`.</summary>
+    public static readonly string[] USER_AUTOMATION_EDIT_OPERATION_MEMBERS =
+    [
+        "previous_revision",
+        "revision",
+        "normalization_receipt_envelope",
+    ];
+
+    /// <summary>Generated JSON members of `UserAutomationOperation::NormalizeSchedule`.</summary>
+    public static readonly string[] USER_AUTOMATION_NORMALIZE_SCHEDULE_OPERATION_MEMBERS =
+    [
+        "revision",
+        "occurrence_count",
+    ];
+
+    /// <summary>Generated JSON members of `UserAutomationOperation::MigrateLegacySchedule`.</summary>
+    public static readonly string[] USER_AUTOMATION_MIGRATE_LEGACY_SCHEDULE_OPERATION_MEMBERS =
+    [
+        "previous_revision",
+        "revision",
+        "occurrence_count",
+    ];
+
+    /// <summary>Generated JSON members of `UserAutomationOperation::GetContext`.</summary>
+    public static readonly string[] USER_AUTOMATION_GET_CONTEXT_OPERATION_MEMBERS =
+    [
+    ];
+
+    /// <summary>
+    /// Explicit literal outcomes accepted by the Rust result value deserializer.
+    /// </summary>
+    public static readonly string[] USER_AUTOMATION_RESULT_VALUE_OUTCOMES =
+    [
+        "context",
+        "schedule_normalized",
+        "legacy_schedule_migrated",
+        "not_retained",
+        "unavailable",
+        "unknown_outcome",
+        "outcome_settled",
+        "rejected",
+        "identity_conflict",
     ];
 
     /// <summary>
