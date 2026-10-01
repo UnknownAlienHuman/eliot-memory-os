@@ -280,7 +280,29 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("783/11", "#783", "crates/eliot-app/src/mcp_stdio.rs", "combined_ul_tokens"),
     ("783/12", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "serialized_bytes: measurement.byte_len"),
     ("783/13", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units: measurement.stu_estimate"),
-    ("783/14", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "serialized_bytes: measurement.byte_len"),
+    # 783/14 is the legacy memory `token_units` wire the migration ADDED beside
+    # the current plan, published at memory.rs:144 through
+    # `legacy_memory_token_units_wire` (declared at memory.rs:783).
+    #
+    # The bare `token_units` token is used rather than the JSON key
+    # `legacy_token_units_measurements` because the anchor must survive comment
+    # and string-literal masking: the masker blanks the key's quoted body, so
+    # only the identifier text that remains on the line after masking is the
+    # callee path `legacy_memory_token_units_wire`. Measured masked
+    # occurrences are 144 (the publishing site), 783 (the declaration), 793
+    # (its per-record value constructor) and 1007 (783/13's `token_units`
+    # field). The anchor is the bare token `token_units`, which matches the
+    # same identifier embedded in those three callee-path lines, so the FIRST
+    # masked occurrence is 144 -- the publishing site, not 783 and not 783/13's
+    # 1007. Verified with the module's own `_mask_rust` + `_locate_signal`
+    # against the current tree: span 144-144, 86 span bytes, inside
+    # `fn dispatch_memory_distillation_preview`, production scope.
+    #
+    # The row stays the `bare_measurement_field_or_conversion` class its field
+    # name earns, and the key is a wire key, never a second measurement owner:
+    # the value it carries is produced by the closed legacy decoder, never by
+    # the canonical owner.
+    ("783/14", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units"),
     ("783/15", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "estimated_tokens,"),
     ("783/16", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "details.section_tokens"),
     ("783/17", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "runtime.ledger.cost_or_token_units"),
@@ -446,7 +468,8 @@ CONSUMER_WRITE_EDGES: dict[str, tuple[str, ...]] = {
         "serialized-after: " + INTEGRATION_OWNER + " regenerates the inventory once #704/#783/#878/#880 have merged",
     ),
     "#783": (
-        "single-writer: crates/eliot-app/src/mcp_stdio.rs, crates/eliot-app/src/mcp_stdio/{memory,dispatch,task_handlers,operator,skill}.rs and crates/eliot-app/src/commands/data_and_memory.rs are the #783 app seam",
+        "single-writer: crates/eliot-app/src/mcp_stdio.rs, crates/eliot-app/src/mcp_stdio/{autonomy,memory,dispatch,task_handlers,operator,skill}.rs, crates/eliot-app/src/commands/data_and_memory.rs and the crates/eliot-app/Cargo.toml measurement dependency edge are the #783 app seam",
+        "the crate writes every path the #783 denominator rows pin (783/15-22 include autonomy.rs) and the single manifest edge that granted the canonical measurement owner dependency; no other #783-owned path is writable",
         "parallel-with: #878 and #880, on disjoint engine paths; no shared mutable source path between the three",
         "blocked-for-others: " + _OWNED_TOML_EDGE,
         "serialized-after: #704 algorithm merge, then " + INTEGRATION_OWNER + " regeneration",
@@ -2922,6 +2945,25 @@ def run_self_tests() -> int:
     assert len(set(CLASSIFICATIONS)) == len(CLASSIFICATIONS), "classifications must be unique"
     assert len(BASELINE_CASES) == EXPECTED_BASELINE_COUNT, "baseline must hold 31 cases"
     assert len(DENOMINATOR_CASES) == EXPECTED_DENOMINATOR_COUNT, "denominator count drifted"
+    # Every seam-row anchor must still name real code in THIS tree. A row whose
+    # anchor is the pre-migration string of a line that has since been rewritten
+    # resolves to no occurrence at all, and `_locate_signal` already fails closed
+    # with SIGNAL_ABSENT on the production path. Pinning the real resolution here
+    # additionally proves each anchor is DISTINCT: two rows resolving to the same
+    # file and line means one row is no longer anchored to its own call site.
+    seam_cache = _load_files(
+        Path(__file__).resolve().parent.parent,
+        tuple(sorted({path for _r, _o, path, _s in CONSUMER_SEAM_CASES})),
+    )
+    refs_by_site: dict[str, list[str]] = {}
+    for case_ref, _owner, path, signal in CONSUMER_SEAM_CASES:
+        record = seam_cache[path]
+        start, end = _locate_signal(record, path, signal)
+        assert end >= start, case_ref
+        assert _span_bytes(record, start, end) > 0, case_ref
+        refs_by_site.setdefault(f"{path}:{start}", []).append(case_ref)
+    for site, refs in sorted(refs_by_site.items()):
+        assert len(refs) == 1, f"seam rows {sorted(refs)} share one anchor at {site}"
     measured: dict[str, int] = {}
     writable_paths: dict[str, str] = {}
     for _ref, owner, _path, _sig in DENOMINATOR_CASES:
