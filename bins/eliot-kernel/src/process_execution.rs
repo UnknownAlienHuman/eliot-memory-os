@@ -412,7 +412,9 @@ impl KernelGovernedProcessEffectPort {
     /// ([`change_monitor::observe_filesystem_notification`]): the retained
     /// previous digest against actual Git-substrate plus content re-read
     /// evidence the adapter collects itself, admitted through the existing
-    /// ingest-plus-confirm path. The adapter takes the real hinted source —
+    /// ingest-plus-confirm path as a poll-reconciled transition (audit
+    /// 5910747803 defect 2: inferred, never labeled an OS notification).
+    /// The adapter takes the real hinted source —
     /// the lease-owned file the capture reads just proved moved, named
     /// relative to the lease-owned working directory — never a synthesized
     /// OS event: a source that cannot be named under that root has no valid
@@ -440,6 +442,7 @@ impl KernelGovernedProcessEffectPort {
             workspace_root,
             &notification,
             Some(before_digest),
+            change_monitor::HintOrigin::PollReconcile,
         )
     }
 
@@ -528,21 +531,33 @@ impl KernelGovernedProcessEffectPort {
     /// resource unblocked. Returns the admitted hint identity plus whether
     /// the caller must skip the target (`true`: the hint was refused and
     /// the caller must continue ingest for the next target).
+    ///
+    /// Correlation (I10.21 W3): the hint carries the producing lane's
+    /// claimed Session, `ActionLease`, tool operation, attempt receipt, and
+    /// State-Fence generation — the claimant's identity for this re-check,
+    /// never proof of who wrote the bytes. The fence is the binding's
+    /// admission fence, which capture clones as the capture fence.
     fn admit_host_event_hint(
-        operation: &str,
+        binding: &GovernedProcessEffectBinding,
+        attempt_receipt: &str,
         target_digest: &str,
         resource: &str,
         lane_path: &str,
-        owner_module: &str,
         before_digest: &str,
     ) -> Result<(String, bool), GovernedProcessEffectPortError> {
-        let hint_id = change_monitor::host_hint_id(operation, target_digest);
+        let operation = binding.operation_id.as_str().to_owned();
+        let hint_id = change_monitor::host_hint_id(&operation, target_digest);
         let hint = change_monitor::KernelChangeHint {
             hint_id: hint_id.clone(),
             resource: resource.to_owned(),
             path: lane_path.to_owned(),
             origin: change_monitor::HintOrigin::HostEvent,
-            origin_ref: Some(owner_module.to_owned()),
+            origin_ref: Some(binding.owner.module_id().to_owned()),
+            session: Some(binding.session_id.as_str().to_owned()),
+            action_lease: Some(binding.action_lease_ref.as_str().to_owned()),
+            operation: Some(operation.clone()),
+            attempt_receipt: Some(attempt_receipt.to_owned()),
+            fence_generation: Some(binding.state_fence.generation().get()),
         };
         match change_monitor::ingest_hint(hint) {
             Ok(_) => Ok((hint_id, false)),
@@ -552,7 +567,7 @@ impl KernelGovernedProcessEffectPort {
             Err(_) => {
                 let outcome = match change_monitor::note_unresolved_transition(
                     resource,
-                    operation,
+                    operation.as_str(),
                     Some(before_digest.to_owned()),
                 ) {
                     Ok(_) => "unresolved",
@@ -801,6 +816,12 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         if mutated && change_monitor::persist_ledger_sidecar().is_err() {
             observe_process("kernel.process.effect_observed", "persist_failed");
         }
+        // I10.21 W4 durability: the shared Governor projection travels
+        // beside the sidecar, so the owner the Governor seam hydrates
+        // survives a Kernel restart exactly like the ledger does.
+        if mutated && change_monitor::persist_observation_transfer().is_err() {
+            observe_process("kernel.process.effect_observed", "transfer_persist_failed");
+        }
         Ok(GovernedProcessEffectBaseline {
             binding: binding.clone(),
             targets,
@@ -920,11 +941,11 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             };
             let target_digest = base.target_digest.as_str();
             let (hint_id, skip_target) = Self::admit_host_event_hint(
-                &operation,
+                &baseline.binding,
+                baseline.effect_digest.as_str(),
                 target_digest,
                 &base.resource,
                 &base.lane_path,
-                baseline.binding.owner.module_id(),
                 &base.before_digest,
             )?;
             if skip_target {
@@ -1010,6 +1031,11 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
         // instead of silent.
         if admitted_any && change_monitor::persist_ledger_sidecar().is_err() {
             observe_process("kernel.process.effect_observed", "persist_failed");
+        }
+        // I10.21 W4 durability: the shared Governor projection travels
+        // beside the sidecar (see the capture leg above).
+        if admitted_any && change_monitor::persist_observation_transfer().is_err() {
+            observe_process("kernel.process.effect_observed", "transfer_persist_failed");
         }
         Ok(())
     }
