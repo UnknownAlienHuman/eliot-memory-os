@@ -472,8 +472,17 @@ bounds = { wall_ms = 60000, idle_ms = 10000, output_bytes = 1048576, line_bytes 
     # WORK_UNIT_CASE: 852/23
     def test_exact_integration_owner_can_claim_root_paths(self):
         d_int = make_desc(837, "D-WU-FINAL", 42, source_roots=("Cargo.toml",))
-        cat = ch.materialize_catalogue([make_row(d_int)], (d_int.issue,))
+        profile = ch.IntegrationOwnerProfile(
+            owners=(ch.IntegrationOwnerEntry(d_int.issue, d_int.unit),))
+        cat = ch.materialize_catalogue([make_row(d_int)], (d_int.issue,), integration_owners=profile)
         self.assertEqual(len(cat.rows), 1)
+
+        # Exact means issue-bound: the same spelling for an unlisted issue is
+        # still an ordinary leaf and cannot claim restricted roots.
+        d_other = make_desc(999, "D-WU-FINAL", 42, source_roots=("Cargo.toml",))
+        with self.assertRaises(ch.CohortError) as ctx:
+            ch.materialize_catalogue([make_row(d_other)], (d_other.issue,), integration_owners=profile)
+        self.assertEqual(ctx.exception.problem, ch.CohortProblem.SHARED_ROOT_CLAIM_REJECTED)
 
     # WORK_UNIT_CASE: 852/24
     def test_arbitrary_command_url_env_rejected_through_runner(self):
