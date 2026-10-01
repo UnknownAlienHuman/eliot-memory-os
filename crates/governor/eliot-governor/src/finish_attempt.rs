@@ -556,7 +556,7 @@ fn hydrate_transfer_governed(
 
 /// Builds the Governor projection row for one transferred governed
 /// original: the exact operation/diff identity plus the before/after
-/// revisions the ledger hashed, correlated to Session, ActionLease, tool
+/// revisions the ledger hashed, correlated to Session, `ActionLease`, tool
 /// operation, attempt receipt, and diff handle (I10.21 W3/W5).
 fn governed_transfer_observation(
     fence: &StateFence,
