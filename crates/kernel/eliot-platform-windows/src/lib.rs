@@ -2934,6 +2934,24 @@ impl WindowsPlatform {
             .map_err(|error| PortError::Provider(provider_from_io(&error)))
     }
 
+    /// Enumerates exact process identities whose executable basename matches
+    /// `basename`. The ToolHelp snapshot supplies candidate PIDs only; every
+    /// returned identity is then opened and independently observed for its
+    /// current start time and image path. This is candidate discovery, not an
+    /// ownership or installation-admission claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed adapter error when the process snapshot or any matching
+    /// live identity cannot be proved. Callers must preserve that result as
+    /// unavailable rather than treating a partial enumeration as complete.
+    pub fn process_identities_named(
+        &self,
+        basename: &str,
+    ) -> Result<Vec<ProcessIdentity>, WindowsAdapterError> {
+        process_identities_named(basename)
+    }
+
     /// Registers one validated ELIOT own-process service through SCM.
     ///
     /// This P-02-specific API deliberately does not reinterpret P-01's smaller
@@ -3195,6 +3213,37 @@ pub fn process_basename_matches(observed: &str, expected: &str) -> bool {
 /// Returns an adapter error for an invalid basename, an unavailable process
 /// snapshot, or an unsupported platform.
 pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterError> {
+    Ok(!process_ids_named(basename)?.is_empty())
+}
+
+/// Returns exact live process identities for every process whose executable
+/// basename matches `basename`. The ToolHelp snapshot nominates PIDs only;
+/// process start time and image path are re-observed through the process
+/// identity owner. A racing exit or an unqueryable matching process fails the
+/// whole enumeration, so the caller never mistakes a partial list for a
+/// complete denominator.
+///
+/// # Errors
+///
+/// Returns an adapter error for an invalid basename, unavailable process
+/// snapshot, an unprovable matching process identity, or unsupported platform.
+pub fn process_identities_named(
+    basename: &str,
+) -> Result<Vec<ProcessIdentity>, WindowsAdapterError> {
+    process_ids_named(basename)?
+        .into_iter()
+        .map(|process_id| {
+            let identity = inspect_process_identity(process_id)
+                .map_err(|error| windows_adapter_from_io(&error))?;
+            if !process_basename_matches(&identity.image_path, basename) {
+                return Err(WindowsAdapterError::Failed);
+            }
+            Ok(identity)
+        })
+        .collect()
+}
+
+fn process_ids_named(basename: &str) -> Result<Vec<u32>, WindowsAdapterError> {
     if basename.is_empty()
         || std::path::Path::new(basename)
             .file_name()
@@ -3224,7 +3273,7 @@ pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterE
                 .map_err(|_| WindowsAdapterError::Failed)?,
             ..Default::default()
         };
-        let mut matched = false;
+        let mut process_ids = Vec::new();
         // SAFETY: Process32FirstW receives the live snapshot handle and a writable PROCESSENTRY32W with
         // dwSize set; entry buffer pinned and outlives the call; snapshot stays open; return selects the
         // enumeration path.
@@ -3239,8 +3288,7 @@ pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterE
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..length]);
                 if process_basename_matches(&name, basename) {
-                    matched = true;
-                    break;
+                    process_ids.push(entry.th32ProcessID);
                 }
                 // SAFETY: GetLastError captures the thread-local Win32 error immediately after the failing call on
                 // this thread; no intervening Win32 call between failure and capture; code value only, no pointer
@@ -3263,8 +3311,8 @@ pub fn any_running_process_named(basename: &str) -> Result<bool, WindowsAdapterE
         // a successful CreateMutexW/CreateToolhelp32Snapshot/OpenProcessToken; return checked for
         // OwnershipUncertain; no double close and no use after close.
         unsafe { CloseHandle(snapshot) };
-        if matched || terminal_error == ERROR_NO_MORE_FILES {
-            Ok(matched)
+        if terminal_error == ERROR_NO_MORE_FILES {
+            Ok(process_ids)
         } else {
             let error_code = i32::try_from(terminal_error).unwrap_or(i32::MAX);
             let error = std::io::Error::from_raw_os_error(error_code);

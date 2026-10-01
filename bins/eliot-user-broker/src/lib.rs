@@ -1250,6 +1250,38 @@ pub struct BrokerReadiness<'a> {
     pub generation_job: Option<&'a str>,
 }
 
+/// Native OS observation of an OpenCode process joined to the exact adapter
+/// bytes admitted from the retained Host installation profile. This record is
+/// candidate source evidence only: it does not assert the plugin is loaded or
+/// that callbacks came from this process. Those claims require a later
+/// authenticated callback-to-process join.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenCodeRuntimeProcessObservation {
+    /// Kernel-observed process id, start instant, and image path.
+    pub process: ProcessIdentity,
+    /// SHA-256 of the current executable file read through a no-follow handle.
+    pub executable_sha256: String,
+    /// Exact signed-installation-admitted plugin bytes digest.
+    pub adapter_artifact_sha256: String,
+    /// Exact signed-installation-admitted descriptor digest.
+    pub adapter_descriptor_sha256: String,
+    /// Installation profile digest that admitted the adapter pair.
+    pub installation_profile_sha256: String,
+}
+
+/// Availability of one Broker-owned native OpenCode process census.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OpenCodeRuntimeObservation {
+    /// No installed adapter was admitted into this Broker generation.
+    AdapterUnavailable,
+    /// The complete native process census was read successfully. An empty
+    /// list is an observed absence at the capture instant.
+    Available(Vec<OpenCodeRuntimeProcessObservation>),
+    /// A native process or executable identity could not be proven. The
+    /// Broker keeps the source unavailable rather than using a partial list.
+    Unavailable,
+}
+
 pub struct BrokerComposition {
     broker: UserBroker,
     snapshot: PathBuf,
@@ -1260,6 +1292,10 @@ pub struct BrokerComposition {
     /// and descriptor file leases it admitted. Absence keeps OpenCode
     /// integration unavailable.
     opencode_profile: Option<AdmittedInstallationProfile>,
+    /// Latest Broker-owned native census. It is refreshed from the OS when
+    /// the Broker renews its live registration; an unavailable scan never
+    /// reuses a prior process list as current evidence.
+    opencode_runtime_observation: OpenCodeRuntimeObservation,
     /// The live process identity this broker admitted itself as. Re-observed
     /// on every authenticated operation; see [`Self::verify_launch_lease`].
     process_binding: Option<BrokerProcessBinding>,
@@ -1551,6 +1587,7 @@ impl BrokerComposition {
             launch_binding,
             launch_lease,
             opencode_profile,
+            opencode_runtime_observation: OpenCodeRuntimeObservation::AdapterUnavailable,
             process_binding: Some(process_binding),
             #[cfg(windows)]
             generation_job,
@@ -1599,6 +1636,14 @@ impl BrokerComposition {
             .as_ref()
     }
 
+    /// Returns the latest process census produced by the Broker's native
+    /// process owner, joined to the exact admitted plugin/descriptor tuple.
+    /// An unavailable result carries no prior census forward as current.
+    #[must_use]
+    pub fn admitted_opencode_runtime_observation(&self) -> &OpenCodeRuntimeObservation {
+        &self.opencode_runtime_observation
+    }
+
     /// Performs broker self-authentication from the retained stable
     /// installation declaration, then registers or refreshes the recovered
     /// lease. Every Kernel transaction mints its own exact operation
@@ -1606,6 +1651,7 @@ impl BrokerComposition {
     /// caller-provided registration tuple is accepted by this boundary.
     pub fn self_register(&mut self) -> Result<(), CompositionError> {
         self.verify_launch_lease()?;
+        self.refresh_opencode_runtime_observation();
         let binding = self.launch_binding.clone().ok_or_else(|| {
             CompositionError::Launch("protected launch configuration is not composed".to_owned())
         })?;
@@ -1657,6 +1703,7 @@ impl BrokerComposition {
     /// through a fresh protected launch binding.
     pub fn heartbeat(&mut self) -> Result<HeartbeatReceipt, CompositionError> {
         self.verify_launch_lease()?;
+        self.refresh_opencode_runtime_observation();
         let registration_digest = self
             .registration_digest
             .clone()
@@ -1692,6 +1739,15 @@ impl BrokerComposition {
         self.sync_registration_binding(&registration)?;
         self.registration_digest = Some(receipt.registration_digest.clone());
         Ok(receipt)
+    }
+
+    fn refresh_opencode_runtime_observation(&mut self) {
+        self.opencode_runtime_observation = match self.opencode_profile.as_ref() {
+            None => OpenCodeRuntimeObservation::AdapterUnavailable,
+            Some(profile) => protected_launch_config::observe_opencode_runtime(profile)
+                .map(OpenCodeRuntimeObservation::Available)
+                .unwrap_or(OpenCodeRuntimeObservation::Unavailable),
+        };
     }
 
     /// Closes the authenticated registration before the broker process exits.

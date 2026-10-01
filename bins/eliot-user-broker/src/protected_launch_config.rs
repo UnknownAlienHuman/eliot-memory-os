@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::io::Read;
 
 use eliot_installation::UserBrokerInstallationProfile;
 use eliot_platform_windows::{ProtectedPathLease, WindowsPlatform};
@@ -88,6 +89,107 @@ pub(super) struct AdmittedInstallationProfile {
     pub(super) profile: UserBrokerInstallationProfile,
     pub(super) _lease: ProtectedPathLease,
     pub(super) _adapter_leases: Vec<ProtectedPathLease>,
+}
+
+/// Re-observes OpenCode processes through the native process owner and joins
+/// each exact PID/start/image tuple to the immutable adapter pair already
+/// admitted into this profile. The result is candidate evidence; callback
+/// admission still needs an OS-observed peer join at the listener.
+pub(super) fn observe_opencode_runtime(
+    admitted: &AdmittedInstallationProfile,
+) -> Result<Vec<crate::OpenCodeRuntimeProcessObservation>, CompositionError> {
+    let Some(adapter) = admitted.profile.opencode_adapter.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let processes = eliot_platform_windows::process_identities_named("opencode.exe")
+        .map_err(|error| CompositionError::Launch(error.to_string()))?;
+    processes
+        .into_iter()
+        .map(|process| {
+            let executable_sha256 = observe_process_image_sha256(&process)?;
+            // The live process identity is re-read directly by the native
+            // process owner after hashing the exact image file.
+            let live = eliot_platform_windows::process_identities_named("opencode.exe")
+                .map_err(|error| CompositionError::Launch(error.to_string()))?;
+            if !live.iter().any(|candidate| candidate == &process) {
+                return Err(CompositionError::Launch(
+                    "OpenCode process identity changed during runtime observation".to_owned(),
+                ));
+            }
+            Ok(crate::OpenCodeRuntimeProcessObservation {
+                process,
+                executable_sha256,
+                adapter_artifact_sha256: adapter.artifact_digest.as_str().to_owned(),
+                adapter_descriptor_sha256: adapter.descriptor_digest.as_str().to_owned(),
+                installation_profile_sha256: admitted.profile.profile_sha256.as_str().to_owned(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn observe_process_image_sha256(
+    process: &eliot_platform_windows::ProcessIdentity,
+) -> Result<String, CompositionError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    const MAX_OPENCODE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+    let path = std::path::Path::new(&process.image_path);
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut file = options
+        .open(path)
+        .map_err(|error| CompositionError::Launch(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| CompositionError::Launch(error.to_string()))?;
+    if !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.len() > MAX_OPENCODE_IMAGE_BYTES
+    {
+        return Err(CompositionError::Launch(
+            "OpenCode executable image is not a bounded regular file".to_owned(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| CompositionError::Launch(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .filter(|length| *length <= MAX_OPENCODE_IMAGE_BYTES)
+            .ok_or_else(|| {
+                CompositionError::Launch("OpenCode executable image exceeded its bound".to_owned())
+            })?;
+        digest.update(&chunk[..read]);
+    }
+    if total != metadata.len() {
+        return Err(CompositionError::Launch(
+            "OpenCode executable image length changed during observation".to_owned(),
+        ));
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(not(windows))]
+fn observe_process_image_sha256(
+    _process: &eliot_platform_windows::ProcessIdentity,
+) -> Result<String, CompositionError> {
+    Err(CompositionError::Launch(
+        "native OpenCode process observation is unavailable on this platform".to_owned(),
+    ))
 }
 
 /// The live process identity this broker is admitted as.
