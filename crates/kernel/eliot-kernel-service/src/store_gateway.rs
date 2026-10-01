@@ -10655,6 +10655,7 @@ mod tests {
             NamedMutationRequest, OperationIdentity, OperationManifestDigest, OrderingScopeId,
             ScopeId, SecurityContext, TransitionClass, bind_issue18_digests,
             canonical_request_hash, operation_manifest_set_digest,
+            supported_admission_contract_set_digest,
         };
 
         const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -10690,7 +10691,8 @@ mod tests {
             ],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .unwrap_or_else(|_| unreachable!()),
             operation_manifest_digest: set_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
@@ -11104,9 +11106,15 @@ mod named_read_gateway_tests {
             _limits: TransportLimits,
         ) -> Result<DeliveryOutcome, crate::StoreClientError> {
             if frame.kind == FrameKind::Control {
-                let hello = ServerHello {
-                    selected_protocol: ProtocolVersion::CURRENT,
-                    session_principal_binding: "loopback-store-session".to_owned(),
+            let hello = ServerHello {
+                selected_protocol: ProtocolVersion::CURRENT,
+                // Mirror the authenticated bootstrap identity; capability
+                // grants below come from the finite Store API catalogue.
+                session_principal_binding: format!(
+                        "sid={};session={}",
+                        self.requirement.expected_peer_sid.as_str(),
+                        self.requirement.expected_peer_session_id
+                    ),
                     allowed_capabilities: CAPABILITIES
                         .iter()
                         .map(|value| (*value).to_owned())
@@ -11529,7 +11537,8 @@ mod live_surreal_evidence_pack_e2e {
             ordering_scopes: vec![OrderingScopeId::new(scope.as_str()).expect("ordering scope")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: set_digest.as_str().to_owned(),
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .expect("admission contract set computes"),
             operation_manifest_digest: set_digest,
             // Issue-#18 digests are derived, never defaulted; no semantic
             // source is bound here (`[]`).

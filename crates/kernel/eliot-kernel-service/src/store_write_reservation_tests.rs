@@ -92,7 +92,8 @@ use eliot_store_api::{
     OperationIdentity, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, Resubmission,
     RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreError, TransitionClass,
-    WriteReceipt, WriteReceiptStatus, canonical_request_hash,
+    WriteReceipt, WriteReceiptStatus, canonical_request_hash, generated_operation_manifests,
+    operation_manifest_set_digest, supported_admission_contract_set_digest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -133,8 +134,6 @@ struct ReservationFixture {
     expires_at_ms: i64,
     transition_class: String,
     requested_effect_ceiling: String,
-    operation_manifest_digest: String,
-    manifest_prefix: String,
     revision_key: String,
     revision_key_prefix: String,
     expected_revision: u64,
@@ -145,7 +144,6 @@ struct ReservationFixture {
     payload_prefix: String,
     parent_receipt_prefix: String,
     canonical_request_hash_placeholder: String,
-    admission_contract_set_digest: String,
     operation_kind: String,
     observation_subject: String,
     authority_id: String,
@@ -164,15 +162,9 @@ fn fixture_992() -> ReservationFixture {
         serde_json::from_str(include_str!("../tests/data/store_write_reservation.json"))
             .expect("992 frozen fixture parses");
     assert_fixture_contract_shape(&fixture.contract);
-    // Suite-level manifest/revision identities live in the same namespace as
-    // the per-tag values derived from the prefixes below: a cross-field
-    // consistency check, never a repeated domain literal.
-    assert!(
-        fixture
-            .operation_manifest_digest
-            .starts_with(&fixture.manifest_prefix),
-        "992 suite manifest shares the fixture manifest namespace"
-    );
+    // The operation catalogue and admission contract set are the current
+    // authorities for these identities; the frozen JSON contains no copied
+    // catalogue digest that can drift from the generated producer.
     assert!(
         fixture
             .revision_key
@@ -323,12 +315,8 @@ fn transition_for_with(
         &fixture.canonical_request_hash_placeholder,
         "pre-seal hash placeholder",
     );
-    assert_hex64(&fixture.admission_contract_set_digest, "admission digest");
-    let manifest = format!("{}{tag}", fixture.manifest_prefix);
-    assert!(
-        manifest.starts_with(&fixture.manifest_prefix),
-        "992 manifest digest carries the fixture-provided prefix"
-    );
+    let operation_manifests = generated_operation_manifests().unwrap();
+    let operation_manifest_digest = operation_manifest_set_digest(&operation_manifests).unwrap();
     let scope_id = format!("{}{tag}", fixture.scope_prefix);
     assert!(
         scope_id.starts_with(&fixture.scope_prefix),
@@ -364,8 +352,8 @@ fn transition_for_with(
             .collect(),
         transition_class,
         requested_effect_ceiling,
-        admission_contract_set_digest: fixture.admission_contract_set_digest.clone(),
-        operation_manifest_digest: OperationManifestDigest::new(manifest).unwrap(),
+        admission_contract_set_digest: supported_admission_contract_set_digest().unwrap(),
+        operation_manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).
         admission_digest: String::new(),
