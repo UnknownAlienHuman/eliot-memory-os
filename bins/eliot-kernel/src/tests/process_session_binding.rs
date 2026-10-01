@@ -12,6 +12,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_lines)]
 
 use super::*;
+use crate::process_execution::authorize_process_owner_in_context;
 use eliot_contracts::{EpochId, EpochLineageId};
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload};
 use eliot_runtime_contracts::HealthVector;
@@ -614,7 +615,8 @@ fn process_owner_authorization_stays_exact() {
         Generation::new(1).expect("generation"),
     )
     .expect("owner");
-    authorize_process_owner(&owner, &owner).expect("exact owner authorizes");
+    let context = crate::kernel_diagnostics::operation_context(None, None, None, None);
+    authorize_process_owner_in_context(&owner, &owner, &context).expect("exact owner authorizes");
     let foreign = ProcessOwnerBinding::new(
         BROKER_MODULE,
         "b".repeat(64),
@@ -623,7 +625,7 @@ fn process_owner_authorization_stays_exact() {
     )
     .expect("foreign owner");
     assert!(matches!(
-        authorize_process_owner(&owner, &foreign),
+        authorize_process_owner_in_context(&owner, &foreign, &context),
         Err(ProcessExecutionError::Contract(
             eliot_process::ContractError::DispatchBindingMismatch
         ))
