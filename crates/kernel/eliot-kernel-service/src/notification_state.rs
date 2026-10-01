@@ -42,6 +42,10 @@ use thiserror::Error;
 
 use crate::{KernelService, KernelServiceError, KernelServiceState, validate_text};
 
+/// Closed leg name of the notification-state commit, so its declared write
+/// intent can never collide with another leg committing the same scope (#1925).
+const NOTIFICATION_STATE_WRITE_INTENT_LEG: &str = "notification-state";
+
 /// Authenticated notification session bound from live Kernel state.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedNotificationSession {
@@ -635,6 +639,18 @@ fn build_notification_transition(
     })?;
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: this leg's stable intent is the owner-issued notification
+        // scope the transition addresses, declared through the OWNER's single
+        // derivation rather than a local spelling.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            NOTIFICATION_STATE_WRITE_INTENT_LEG,
+            scope.as_str(),
+        )
+        .ok_or(NotificationServiceError::InvalidField {
+            field: "notification.write_intent_id",
+            reason: "the notification scope declares no stable write intent",
+        })?,
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: request.operation.clone(),
         state_fence: request.state_fence.clone(),
         scope_id: scope,

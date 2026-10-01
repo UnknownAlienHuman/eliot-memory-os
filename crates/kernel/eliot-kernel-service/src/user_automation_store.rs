@@ -780,6 +780,10 @@ fn canonical_payload_digest(payload: &Value) -> Result<String, StoreError> {
     Ok(sha256_hex(&bytes))
 }
 
+/// Closed leg name of the user-automation state commit, so its declared write
+/// intent can never collide with another leg committing the same scope (#1925).
+const USER_AUTOMATION_WRITE_INTENT_LEG: &str = "user-automation-state";
+
 /// Closed automation-state query kinds carried to the store read.
 const QUERY_LIST: &str = "list";
 /// Closed automation-state query kinds carried to the store read.
@@ -2203,6 +2207,19 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         let automation_id = automation_scope(&request.intent.operation)?;
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
+            // #1925: this leg's stable intent is the owner-issued automation
+            // scope the transition addresses, declared through the OWNER's
+            // single derivation rather than a local spelling so this leg and
+            // the Governor's legs cannot disagree.
+            write_intent_id: eliot_store_api::admission_write_intent(
+                USER_AUTOMATION_WRITE_INTENT_LEG,
+                &automation_id,
+            )
+            .ok_or(StoreError::InvalidField {
+                field: "write_intent_id",
+                reason: "the automation scope declares no stable user-automation write intent",
+            })?,
+            write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
             identity: request.identity.clone(),
             state_fence: request.context.state_fence.clone(),
             scope_id: ScopeId::new(USER_AUTOMATION_SCOPE)?,

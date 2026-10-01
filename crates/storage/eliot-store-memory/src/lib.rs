@@ -7181,7 +7181,8 @@ mod tests {
     /// to the hashed request input without re-pinning), and #1925 adds the
     /// two write-intent identity members on top. Replace BOTH copies with the
     /// one value the shared owner function emits over the current fixture.
-    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str = "REPIN-REQUIRED-1925-NOT-A-DIGEST";
+    const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
+        "f6a5fb17f7fcb06b4d89650c6a2abef1db7eba620d42c4278732b684ebdec75b";
 
     #[test]
     fn governor_envelope_store_view_and_receipt_share_one_golden_digest() -> Result<(), StoreError>

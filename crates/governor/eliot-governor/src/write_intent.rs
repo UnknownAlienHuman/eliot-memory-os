@@ -35,26 +35,16 @@
 #![forbid(unsafe_code)]
 
 use eliot_canonical::write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION;
-// The workspace's ONE shared canonical encoder and digest helper. Reusing them
-// keeps this declaration on the same byte-authority as every other owner
-// digest, and adds no dependency edge to this crate.
-use eliot_contracts::{canonical_json_bytes, sha256_hex};
-
-/// Domain separator for every Governor admission-leg write intent.
-///
-/// Versioned with the derivation so a future change of spelling is a new
-/// value, never a silent reinterpretation of a retained intent.
-const ADMISSION_WRITE_INTENT_DOMAIN: &str = "eliot.governor.admission_write_intent.v1";
 
 /// Declares the stable write intent of one Governor admission leg.
 ///
-/// `leg` names the closed admission leg (for example
-/// `"capability-evidence-commit"`) and `subject` is that leg's own
-/// owner-issued, stable semantic subject: the exact committed record digest,
-/// admitted candidate digest, closure identity, or chain head. The declared
-/// value is stable across typed correction attempts of the same subject and is
-/// domain-separated per leg, so it is never conflated with the per-attempt
-/// `operation_id` or the per-correction `idempotency_key`.
+/// This is a thin delegation, not a second derivation: the `write_intent_id`
+/// member on `PreparedTransition` and the genesis exemption beside it are
+/// owned by `eliot-store-api`, which is the only one of these boundary
+/// crates the Kernel's own automation/notification/reactive/lifecycle legs
+/// depend on, so the declaration of an intent belongs there. Those legs call
+/// the SAME owner function; a Governor-local copy would be a second scheme
+/// producing two different values for one leg.
 ///
 /// # Errors
 ///
@@ -64,14 +54,7 @@ const ADMISSION_WRITE_INTENT_DOMAIN: &str = "eliot.governor.admission_write_inte
 /// placeholder would make a missing owner value silently acceptable.
 #[must_use]
 pub fn admission_write_intent(leg: &str, subject: &str) -> Option<String> {
-    if !is_declared_text(leg) || !is_declared_text(subject) {
-        return None;
-    }
-    let shape = (ADMISSION_WRITE_INTENT_DOMAIN, leg, subject);
-    // `canonical_json_bytes` cannot fail for this tuple of owned strings, so
-    // the digest is total; a caller never sees a partially declared intent.
-    let bytes = canonical_json_bytes(&shape).ok()?;
-    Some(format!("governor-intent-{}", sha256_hex(&bytes)))
+    eliot_store_api::admission_write_intent(leg, subject)
 }
 
 /// The write-envelope protocol revision these internal legs are admitted under.
@@ -80,10 +63,6 @@ pub fn admission_write_intent(leg: &str, subject: &str) -> Option<String> {
 /// version literal of its own: `eliot-canonical` owns the exact supported
 /// revision and refuses any other.
 pub const GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION: u32 = WRITE_ENVELOPE_PROTOCOL_VERSION;
-
-fn is_declared_text(value: &str) -> bool {
-    !value.trim().is_empty() && !value.chars().any(char::is_control)
-}
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
