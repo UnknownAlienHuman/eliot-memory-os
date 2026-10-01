@@ -4214,6 +4214,31 @@ impl PolicyOwner {
         &self.snapshot
     }
 
+    /// Projects Bridge privacy terms only from this recovered, current Policy
+    /// owner. The returned digest is the exact Kernel named-read payload
+    /// digest retained by [`Self::recover`], not a caller-provided reference.
+    pub fn bridge_event_privacy_projection(
+        &self,
+        context: &eliot_config::ApplicabilityContext,
+    ) -> Result<eliot_config::BridgeEventPrivacyProjection, CompositionError> {
+        if context.state_fence != self.state_fence
+            || context.active_revision.value() != self.revision
+        {
+            return Err(CompositionError::Recovery(
+                "Bridge privacy projection context is stale for the recovered Policy owner"
+                    .to_owned(),
+            ));
+        }
+        eliot_config::bridge_event_privacy::project_bridge_event_privacy(
+            &self.snapshot,
+            context,
+            &self.canonical_digest,
+        )
+        .map_err(|error| {
+            CompositionError::Recovery(format!("Bridge privacy terms unavailable: {error}"))
+        })
+    }
+
     /// Recomputes the snapshot digest from the live retained snapshot.
     ///
     /// The mirror comparison at publish time uses this live recomputation

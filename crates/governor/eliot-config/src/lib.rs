@@ -16,6 +16,7 @@ use thiserror::Error;
 
 pub mod first_run;
 pub mod quiet_hours;
+pub mod bridge_event_privacy;
 
 pub use initial_snapshot::{
     Ed25519InitialSnapshotSigner, INITIAL_SNAPSHOT_PUBLIC_KEY_BYTES, INITIAL_SNAPSHOT_SCHEMA,
