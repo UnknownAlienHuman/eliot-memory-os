@@ -585,8 +585,7 @@ impl CanonicalWriteEnvelope {
     /// unrepresentable `0`.
     fn write_intent_identity_valid(&self) -> Result<(), CanonicalError> {
         write_envelope::validate_write_intent_id(&self.write_intent_id)?;
-        if self.write_envelope_protocol_version != write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION
-        {
+        if self.write_envelope_protocol_version != write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION {
             return Err(CanonicalError::InvalidField {
                 field: "write_envelope_protocol_version",
                 reason: "unsupported write envelope version",
@@ -1661,8 +1660,14 @@ mod tests {
             write_envelope::WRITE_ENVELOPE_PROTOCOL_VERSION
         );
         // The carry is not a re-derivation of either neighbouring identity.
-        assert_ne!(transition.write_intent_id, transition.identity.operation_id.as_str());
-        assert_ne!(transition.write_intent_id, transition.identity.idempotency_key);
+        assert_ne!(
+            transition.write_intent_id,
+            transition.identity.operation_id.as_str()
+        );
+        assert_ne!(
+            transition.write_intent_id,
+            transition.identity.idempotency_key
+        );
     }
 
     /// #1925: a submission whose envelope carries a different write intent
