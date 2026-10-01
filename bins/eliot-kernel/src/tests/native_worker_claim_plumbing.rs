@@ -395,7 +395,7 @@ fn admitted_receipt(
     response: &NativeWorkerClaimResponse,
 ) -> eliot_kernel_service::NativeWorkerClaimReceipt {
     match response {
-        NativeWorkerClaimResponse::Admitted(receipt) => receipt.clone(),
+        NativeWorkerClaimResponse::Admitted(receipt) => receipt.as_ref().clone(),
         other => panic!("expected Admitted, got {other:?}"),
     }
 }
@@ -474,7 +474,7 @@ fn typed_cross_binding_and_fail_closed_gates() {
     }
     .with_computed_digest()
     .expect("receipt digest");
-    let admitted = NativeWorkerClaimResponse::Admitted(receipt);
+    let admitted = NativeWorkerClaimResponse::Admitted(Box::new(receipt));
     let x2 = admitted
         .require_canonical_activation()
         .expect_err("X2 must fail closed");
@@ -727,7 +727,7 @@ fn claim_join_mints_no_process_request_or_permit() {
     }
     .with_computed_digest()
     .expect("receipt digest");
-    let response = NativeWorkerClaimResponse::Admitted(receipt);
+    let response = NativeWorkerClaimResponse::Admitted(Box::new(receipt));
     assert!(response.require_canonical_activation().is_err());
 }
 
