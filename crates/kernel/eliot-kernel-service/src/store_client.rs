@@ -35,6 +35,9 @@ use tokio::sync::Mutex;
 
 use crate::{HostStoreBootstrapRequirement, STORE_MODULE_IDENTITY};
 
+#[path = "store_blob_client.rs"]
+mod store_blob_client;
+
 #[path = "store_backup_client.rs"]
 mod store_backup_client;
 #[path = "store_exchange.rs"]
