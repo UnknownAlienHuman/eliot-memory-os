@@ -143,8 +143,9 @@ impl BlobProcessStreamFrameResponse {
         if encoded_len > BLOB_PROCESS_STREAM_MAX_FRAME_BYTES {
             return Err(WireValidationError::InvalidField("frame"));
         }
-        if let BlobProcessStreamOperationResponse::SourceReadback { response } = &self.operation {
-            response.validate()?;
+        match &self.operation {
+            BlobProcessStreamOperationResponse::Sink { response } => response.validate()?,
+            BlobProcessStreamOperationResponse::SourceReadback { response } => response.validate()?,
         }
         Ok(())
     }
@@ -471,6 +472,8 @@ pub enum BlobProcessStreamOwnerFactsPullPurpose {
     OpenAdmission,
     /// Fresh Store-open owner context chained after the Pending write receipt.
     StoreOpen,
+    /// Attach an owner-issued finalized Blob receipt to the Pending source row.
+    ReadyAttach,
     /// Fresh current owner/catalog/source admission read for replay bytes.
     SourceReadback,
 }
@@ -562,6 +565,46 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     /// SHA-256 of the exact committed write receipt bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_admission_write_receipt_sha256: Option<String>,
+    /// Exact distinct operation identity for the Pending-to-Ready CAS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_operation_id: Option<String>,
+    /// Exact owner-issued BlobReadyReceipt returned by the Blob stage owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_ready_receipt_json: Option<String>,
+    /// SHA-256 of the exact BlobReadyReceipt JSON bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_ready_receipt_sha256: Option<String>,
+    /// Exact whole-source plaintext SHA-256 committed by the Blob owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_source_sha256: Option<String>,
+    /// Exact whole-source plaintext byte length committed by the Blob owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_source_byte_length: Option<u64>,
+    /// Exact owner-issued ready receipt reference selected for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_receipt_ref: Option<String>,
+    /// Exact Store open binding recovered from the Kernel's durable call log
+    /// for SourceReadback. It is a lookup selector, never source proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_binding: Option<ProcessStreamSinkBindingRef>,
+    /// Exact stdout/stderr source selected for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_kind: Option<ProcessStreamKind>,
+    /// Immutable locator kind selected for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_locator_kind: Option<DurableStreamLocatorKind>,
+    /// Exact immutable locator selected for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_locator: Option<String>,
+    /// Exact admitted policy tuple for SourceReadback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_policy: Option<ProcessStreamPolicyBinding>,
+    /// Exact serialized policy bytes retained with the source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_policy_json: Option<String>,
+    /// SHA-256 of the exact serialized policy bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_stream_policy_sha256: Option<String>,
     /// Authenticated outer request fence.
     pub state_fence: StateFence,
     /// Absolute Unix-millisecond deadline.
@@ -595,7 +638,20 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                     && self.source_admission_json.is_none()
                     && self.source_admission_sha256.is_none()
                     && self.source_admission_write_receipt_json.is_none()
-                    && self.source_admission_write_receipt_sha256.is_none() => {}
+                    && self.source_admission_write_receipt_sha256.is_none()
+                    && self.ready_operation_id.is_none()
+                    && self.blob_ready_receipt_json.is_none()
+                    && self.blob_ready_receipt_sha256.is_none()
+                    && self.whole_source_sha256.is_none()
+                    && self.whole_source_byte_length.is_none()
+                    && self.ready_receipt_ref.is_none()
+                    && self.process_stream_binding.is_none()
+                    && self.process_stream_kind.is_none()
+                    && self.process_stream_locator_kind.is_none()
+                    && self.process_stream_locator.is_none()
+                    && self.process_stream_policy.is_none()
+                    && self.process_stream_policy_json.is_none()
+                    && self.process_stream_policy_sha256.is_none() => {}
             BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission
                 if self.source_admission_operation_id.is_some()
                     && self.open_request_json.is_some()
@@ -605,7 +661,20 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                     && self.source_admission_json.is_none()
                     && self.source_admission_sha256.is_none()
                     && self.source_admission_write_receipt_json.is_none()
-                    && self.source_admission_write_receipt_sha256.is_none() =>
+                    && self.source_admission_write_receipt_sha256.is_none()
+                    && self.ready_operation_id.is_none()
+                    && self.blob_ready_receipt_json.is_none()
+                    && self.blob_ready_receipt_sha256.is_none()
+                    && self.whole_source_sha256.is_none()
+                    && self.whole_source_byte_length.is_none()
+                    && self.ready_receipt_ref.is_none()
+                    && self.process_stream_binding.is_none()
+                    && self.process_stream_kind.is_none()
+                    && self.process_stream_locator_kind.is_none()
+                    && self.process_stream_locator.is_none()
+                    && self.process_stream_policy.is_none()
+                    && self.process_stream_policy_json.is_none()
+                    && self.process_stream_policy_sha256.is_none() =>
             {
                 validate_text(
                     "source_admission_operation_id",
@@ -624,24 +693,74 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             }
             BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
                 if self.source_admission_operation_id.is_some()
-                    && self.source_admission_json.is_some()
-                    && self.source_admission_sha256.is_some()
+                    && self.source_admission_json.is_none()
+                    && self.source_admission_sha256.is_none()
                     && self.open_request_json.is_none()
                     && self.open_request_sha256.is_none()
                     && self.owner_update_identity_json.is_none()
                     && self.owner_update_identity_sha256.is_none()
                     && self.source_admission_write_receipt_json.is_none()
-                    && self.source_admission_write_receipt_sha256.is_none() =>
+                    && self.source_admission_write_receipt_sha256.is_none()
+                    && self.ready_operation_id.is_none()
+                    && self.blob_ready_receipt_json.is_none()
+                    && self.blob_ready_receipt_sha256.is_none()
+                    && self.whole_source_sha256.is_some()
+                    && self.whole_source_byte_length.is_some()
+                    && self.ready_receipt_ref.is_some()
+                    && self.process_stream_binding.is_some()
+                    && self.process_stream_kind.is_some()
+                    && self.process_stream_locator_kind.is_some()
+                    && self.process_stream_locator.is_some()
+                    && self.process_stream_policy.is_some()
+                    && self.process_stream_policy_json.is_some()
+                    && self.process_stream_policy_sha256.is_some() =>
             {
                 validate_text(
                     "source_admission_operation_id",
                     self.source_admission_operation_id.as_deref().unwrap_or_default(),
                 )?;
-                validate_canonical_owner_json(
-                    "source_admission_json",
-                    self.source_admission_json.as_deref().unwrap_or_default(),
-                    self.source_admission_sha256.as_deref().unwrap_or_default(),
+                self.process_stream_binding
+                    .as_ref()
+                    .ok_or(WireValidationError::InvalidField("process_stream_binding"))?
+                    .validate()?;
+                validate_text(
+                    "process_stream_locator",
+                    self.process_stream_locator.as_deref().unwrap_or_default(),
                 )?;
+                validate_text(
+                    "ready_receipt_ref",
+                    self.ready_receipt_ref.as_deref().unwrap_or_default(),
+                )?;
+                validate_digest(
+                    "whole_source_sha256",
+                    self.whole_source_sha256.as_deref().unwrap_or_default(),
+                )?;
+                let policy_json = self
+                    .process_stream_policy_json
+                    .as_deref()
+                    .unwrap_or_default();
+                let policy = self
+                    .process_stream_policy
+                    .as_ref()
+                    .ok_or(WireValidationError::InvalidField("process_stream_policy"))?;
+                let policy_sha256 = self
+                    .process_stream_policy_sha256
+                    .as_deref()
+                    .unwrap_or_default();
+                if serde_json::to_string(policy).ok().as_deref() != Some(policy_json)
+                    || sha256_hex(policy_json.as_bytes()) != policy_sha256
+                {
+                    return Err(WireValidationError::InvalidField("process_stream_policy"));
+                }
+                for (field, value) in [
+                    ("policy_ref", policy.policy_ref.as_str()),
+                    ("privacy_ref", policy.privacy_ref.as_str()),
+                    ("visibility_ref", policy.visibility_ref.as_str()),
+                    ("retention_ref", policy.retention_ref.as_str()),
+                    ("redaction_ref", policy.redaction_ref.as_str()),
+                ] {
+                    validate_text(field, value)?;
+                }
             }
             BlobProcessStreamOwnerFactsPullPurpose::StoreOpen
                 if self.source_admission_operation_id.is_some()
@@ -652,7 +771,20 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                     && self.source_admission_write_receipt_json.is_some()
                     && self.source_admission_write_receipt_sha256.is_some()
                     && self.owner_update_identity_json.is_none()
-                    && self.owner_update_identity_sha256.is_none() =>
+                    && self.owner_update_identity_sha256.is_none()
+                    && self.ready_operation_id.is_none()
+                    && self.blob_ready_receipt_json.is_none()
+                    && self.blob_ready_receipt_sha256.is_none()
+                    && self.whole_source_sha256.is_none()
+                    && self.whole_source_byte_length.is_none()
+                    && self.ready_receipt_ref.is_none()
+                    && self.process_stream_binding.is_none()
+                    && self.process_stream_kind.is_none()
+                    && self.process_stream_locator_kind.is_none()
+                    && self.process_stream_locator.is_none()
+                    && self.process_stream_policy.is_none()
+                    && self.process_stream_policy_json.is_none()
+                    && self.process_stream_policy_sha256.is_none() =>
             {
                 validate_text(
                     "source_admission_operation_id",
@@ -676,6 +808,67 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                     self.source_admission_write_receipt_sha256
                         .as_deref()
                         .unwrap_or_default(),
+                )?;
+            }
+            BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach
+                if self.source_admission_operation_id.is_some()
+                    && self.source_admission_json.is_some()
+                    && self.source_admission_sha256.is_some()
+                    && self.source_admission_write_receipt_json.is_some()
+                    && self.source_admission_write_receipt_sha256.is_some()
+                    && self.ready_operation_id.is_some()
+                    && self.owner_update_identity_json.is_some()
+                    && self.owner_update_identity_sha256.is_some()
+                    && self.blob_ready_receipt_json.is_some()
+                    && self.blob_ready_receipt_sha256.is_some()
+                    && self.whole_source_sha256.is_some()
+                    && self.whole_source_byte_length.is_some()
+                    && self.ready_receipt_ref.is_none()
+                    && self.open_request_json.is_none()
+                    && self.open_request_sha256.is_none()
+                    && self.process_stream_binding.is_none()
+                    && self.process_stream_kind.is_none()
+                    && self.process_stream_locator_kind.is_none()
+                    && self.process_stream_locator.is_none()
+                    && self.process_stream_policy.is_none()
+                    && self.process_stream_policy_json.is_none()
+                    && self.process_stream_policy_sha256.is_none() =>
+            {
+                validate_text(
+                    "source_admission_operation_id",
+                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_text(
+                    "ready_operation_id",
+                    self.ready_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_json",
+                    self.source_admission_json.as_deref().unwrap_or_default(),
+                    self.source_admission_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_write_receipt",
+                    self.source_admission_write_receipt_json
+                        .as_deref()
+                        .unwrap_or_default(),
+                    self.source_admission_write_receipt_sha256
+                        .as_deref()
+                        .unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "owner_update_identity_json",
+                    self.owner_update_identity_json.as_deref().unwrap_or_default(),
+                    self.owner_update_identity_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "blob_ready_receipt",
+                    self.blob_ready_receipt_json.as_deref().unwrap_or_default(),
+                    self.blob_ready_receipt_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_digest(
+                    "whole_source_sha256",
+                    self.whole_source_sha256.as_deref().unwrap_or_default(),
                 )?;
             }
             _ => return Err(WireValidationError::InvalidField("pull_purpose_fields")),
@@ -1073,6 +1266,9 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 BlobProcessStreamOwnerFactsPullPurpose::StoreOpen => {
                     has_admission && has_write_receipt
                 }
+                BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach => {
+                    has_admission && has_write_receipt
+                }
                 BlobProcessStreamOwnerFactsPullPurpose::SourceReadback => {
                     has_admission && !has_write_receipt
                 }
@@ -1119,6 +1315,14 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 || owner_facts.authority_binding_sha256 != request.kernel_authority_binding_sha256
             {
                 return Err(WireValidationError::InvalidField("owner_authority_binding"));
+            }
+            if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
+                && request
+                    .process_stream_policy_json
+                    .as_deref()
+                    .is_some_and(|policy_json| policy_json != owner_facts.policy_json)
+            {
+                return Err(WireValidationError::InvalidField("source_readback_policy"));
             }
         }
         if matches!(
@@ -1819,6 +2023,13 @@ pub enum ProcessStreamSinkWireResponse {
     Finalized {
         /// Closed terminal projection JSON.
         body: Box<serde_json::Value>,
+        /// Exact owner-issued BlobReadyReceipt JSON for CompleteSource.
+        /// These fields are absent for other terminal states.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob_ready_receipt_json: Option<String>,
+        /// SHA-256 of the exact BlobReadyReceipt JSON bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blob_ready_receipt_sha256: Option<String>,
     },
     /// Abort returned owner-validated terminal evidence JSON.
     Aborted {
@@ -1839,6 +2050,36 @@ pub enum ProcessStreamSinkWireResponse {
         /// Closed pre-effect refusal category.
         reason: ProcessStreamSinkUnavailableReason,
     },
+}
+
+impl ProcessStreamSinkWireResponse {
+    /// Validates owner-generated operation evidence before Kernel retains it.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        match self {
+            Self::Opened { binding } => binding.validate(),
+            Self::AppendDisposition { body }
+            | Self::Finalized { body, .. }
+            | Self::Aborted { body }
+            | Self::Readback { body } => {
+                validate_body(body)?;
+                if let Self::Finalized {
+                    blob_ready_receipt_json,
+                    blob_ready_receipt_sha256,
+                    ..
+                } = self
+                {
+                    validate_optional_canonical_owner_json_pair(
+                        "blob_ready_receipt",
+                        blob_ready_receipt_json.as_ref(),
+                        blob_ready_receipt_sha256.as_ref(),
+                    )?;
+                }
+                Ok(())
+            }
+            Self::NotStarted | Self::Unknown => Ok(()),
+            Self::Unavailable { .. } => Ok(()),
+        }
+    }
 }
 
 /// Closed process-stream sink refusal category. It carries no provider prose.
