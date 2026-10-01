@@ -1294,21 +1294,21 @@ fn evidence_pack_payload(
 /// authority-carrying record fails closed at deserialization/validation,
 /// never as a silent empty.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct AuthorityRecordRow {
-    operation_index: usize,
-    version: u16,
-    encoding: String,
-    digest_hex: String,
-    byte_len: usize,
-    bytes_utf8: String,
+pub(super) struct AuthorityRecordRow {
+    pub(super) operation_index: usize,
+    pub(super) version: u16,
+    pub(super) encoding: String,
+    pub(super) digest_hex: String,
+    pub(super) byte_len: usize,
+    pub(super) bytes_utf8: String,
 }
 
 /// One receipt row of the closed T11.3 authority SELECT.
 #[derive(Clone, Debug, Deserialize)]
-struct AuthorityReceiptRow {
-    commit_sequence: Option<u64>,
-    named_operation_count: Option<usize>,
-    payload_authority: Option<Vec<AuthorityRecordRow>>,
+pub(super) struct AuthorityReceiptRow {
+    pub(super) commit_sequence: Option<u64>,
+    pub(super) named_operation_count: Option<usize>,
+    pub(super) payload_authority: Option<Vec<AuthorityRecordRow>>,
     /// Joined by the immutable commit marker, never by the caller's scope.
     #[serde(skip)]
     receipt: Option<WriteReceipt>,
@@ -1431,7 +1431,7 @@ pub(super) async fn finish_task_owner_assertion(
 /// The writer bound the exact bytes to version/encoding/digest/length; any
 /// durable mismatch fails closed here instead of serving a lossy projection.
 /// Returns the decoded admitted parameters on success.
-fn validate_authority_record(
+pub(super) fn validate_authority_record(
     row: &AuthorityReceiptRow,
     record: &AuthorityRecordRow,
 ) -> Result<BTreeMap<String, Value>, StoreError> {
@@ -1475,6 +1475,60 @@ fn validate_authority_record(
     .validate()?;
     let _ = record_operation_count(row, record)?;
     Ok(parameters)
+}
+
+/// Validates and returns every exact original named-operation parameter for
+/// one requested immutable receipt. Recovery uses the same closed-operation
+/// validator as the existing authority read, while preserving each stored
+/// byte string for consumers that must bind their response to that original
+/// operation rather than to a later mutable owner head.
+pub(super) fn recovery_receipt_authority(
+    receipt: &WriteReceipt,
+    commit_sequence: u64,
+    named_operation_count: usize,
+    records: Vec<AuthorityRecordRow>,
+) -> Result<eliot_store_api::RecoveryReceiptAuthority, StoreError> {
+    receipt.validate()?;
+    if receipt.status != WriteReceiptStatus::Committed
+        || receipt.transition_class != eliot_store_api::TransitionClass::RecoverySchema
+        || commit_sequence == 0
+        || receipt.committed_at.as_deref()
+            != Some(format!("commit-sequence-{commit_sequence:016}").as_str())
+        || named_operation_count == 0
+        || records.len() != named_operation_count
+    {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let row = AuthorityReceiptRow {
+        commit_sequence: Some(commit_sequence),
+        named_operation_count: Some(named_operation_count),
+        payload_authority: Some(records.clone()),
+        receipt: Some(receipt.clone()),
+    };
+    let mut ordered = records;
+    ordered.sort_by_key(|record| record.operation_index);
+    let mut exact_parameters = Vec::with_capacity(ordered.len());
+    for (expected_index, record) in ordered.iter().enumerate() {
+        if record.operation_index != expected_index {
+            return Err(StoreError::InvalidReceipt);
+        }
+        let parameters = validate_authority_record(&row, record)?;
+        let _operation = infer_authority_operation(receipt.transition_class, &parameters)?;
+        exact_parameters.push(eliot_store_api::RecoveryReceiptAuthorityRecord {
+            operation_index: expected_index,
+            parameters: ExactJsonBytes::parse(
+                PayloadSource::NamedOperationParameter,
+                record.bytes_utf8.as_bytes(),
+            )?,
+        });
+    }
+    Ok(eliot_store_api::RecoveryReceiptAuthority {
+        operation_id: receipt.operation_id.clone(),
+        state_fence: receipt.state_fence.clone(),
+        commit_sequence,
+        named_operation_count,
+        records: exact_parameters,
+    })
 }
 
 fn record_operation_count(

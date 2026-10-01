@@ -533,7 +533,7 @@ async fn serve_connection(
                 }
             }
             #[cfg(windows)]
-            KernelFrameAction::FinishReplay { .. } => {
+            KernelFrameAction::FinishReplay(_) => {
                 // The correlated async replay is only served by the activated
                 // agent-bridge loop with its retained owner connection.
                 session.fence();
@@ -630,7 +630,7 @@ async fn serve_user_broker_connection(
             | KernelFrameAction::Dreamer { .. }
             | KernelFrameAction::Research { .. }
             | KernelFrameAction::Backup { .. }
-            | KernelFrameAction::FinishReplay { .. } => break Err(TransportError::SessionFenced),
+            | KernelFrameAction::FinishReplay(_) => break Err(TransportError::SessionFenced),
         }
     };
     session.fence();
@@ -865,28 +865,9 @@ async fn serve_admitted_bridge_host_requests(
                     return Err(error);
                 }
             }
-            KernelFrameAction::FinishReplay {
-                request_id,
-                protocol_version,
-                envelope,
-                tool,
-                admission_receipt,
-                record,
-                reconnect_envelope,
-                logical_key,
-            } => {
+            KernelFrameAction::FinishReplay(replay) => {
                 let reply = match kernel
-                    .finish_replay_reply(
-                        &connection_id,
-                        request_id,
-                        protocol_version,
-                        envelope,
-                        tool,
-                        admission_receipt,
-                        record,
-                        reconnect_envelope,
-                        logical_key,
-                    )
+                    .finish_replay_reply(&connection_id, *replay)
                     .await
                 {
                     Ok(reply) => reply,
@@ -913,7 +894,7 @@ async fn serve_admitted_bridge_host_requests(
             | KernelFrameAction::Research { .. }
             | KernelFrameAction::Dreamer { .. }
             | KernelFrameAction::Backup { .. }
-            | KernelFrameAction::FinishReplay { .. } => {
+            | KernelFrameAction::FinishReplay(_) => {
                 // Bridge transports never carry process, daemon, Doctor,
                 // testd, research-provider, Dreamer, or isolated-restore
                 // authority: the Doctor

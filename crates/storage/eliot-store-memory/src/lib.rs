@@ -418,12 +418,15 @@ impl MemoryStore {
         // one receipt, recoverable replay without duplicate work. Any other
         // class is a no-op in this hook.
         dispatch_apply_erasure(&mut state, &transition)?;
+        let receipt_authority =
+            memory_receipt_authority(&transition, &receipt, plan.commit_sequence)?;
         Ok(commit_transaction(
             &mut state,
             transition,
             operation_key,
             plan,
             receipt,
+            receipt_authority,
         ))
     }
 }
@@ -4127,12 +4130,47 @@ fn transaction_receipt(
     Ok(receipt)
 }
 
+fn memory_receipt_authority(
+    transition: &PreparedTransition,
+    receipt: &WriteReceipt,
+    commit_sequence: u64,
+) -> Result<eliot_store_api::RecoveryReceiptAuthority, StoreError> {
+    if transition.named_operations.is_empty() || commit_sequence == 0 {
+        return Err(StoreError::InvalidReceipt);
+    }
+    let named_operation_count = transition.named_operations.len();
+    let records = transition
+        .named_operations
+        .iter()
+        .enumerate()
+        .map(|(operation_index, operation)| {
+            let bytes = canonical_json_bytes(&operation.parameters)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?;
+            Ok(eliot_store_api::RecoveryReceiptAuthorityRecord {
+                operation_index,
+                parameters: eliot_store_api::ExactJsonBytes::parse(
+                    eliot_store_api::PayloadSource::NamedOperationParameter,
+                    &bytes,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(eliot_store_api::RecoveryReceiptAuthority {
+        operation_id: receipt.operation_id.clone(),
+        state_fence: receipt.state_fence.clone(),
+        commit_sequence,
+        named_operation_count,
+        records,
+    })
+}
+
 fn commit_transaction(
     state: &mut MemoryState,
     transition: PreparedTransition,
     operation_key: String,
     plan: TransactionPlan,
     receipt: WriteReceipt,
+    receipt_authority: eliot_store_api::RecoveryReceiptAuthority,
 ) -> WriteReceipt {
     for head in plan.next_revision_heads {
         state
@@ -4183,6 +4221,9 @@ fn commit_transaction(
     state
         .receipts_by_operation
         .insert(operation_key, receipt.clone());
+    state
+        .receipt_authorities
+        .insert(receipt.operation_id.as_str().to_owned(), receipt_authority);
     receipt
 }
 
@@ -5122,10 +5163,35 @@ impl MemoryStore {
             Vec::new()
         };
         let receipts = if request.include_receipts {
-            state.receipts_by_operation.values().cloned().collect()
+            if request.receipt_authority_operation_ids.is_empty() {
+                state.receipts_by_operation.values().cloned().collect()
+            } else {
+                request
+                    .receipt_authority_operation_ids
+                    .iter()
+                    .map(|operation_id| {
+                        state
+                            .receipts_by_operation
+                            .get(operation_id.as_str())
+                            .cloned()
+                            .ok_or(StoreError::InvalidReceipt)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
         } else {
             Vec::new()
         };
+        let receipt_authorities = request
+            .receipt_authority_operation_ids
+            .iter()
+            .map(|operation_id| {
+                state
+                    .receipt_authorities
+                    .get(operation_id.as_str())
+                    .cloned()
+                    .ok_or(StoreError::InvalidReceipt)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let canonical_scope = ScopeRevisionView {
             scope_id: ScopeId::new("store")?,
             revision_heads: state.revision_heads.values().cloned().collect(),
@@ -5140,6 +5206,7 @@ impl MemoryStore {
             owner_records,
             job_records,
             receipts,
+            receipt_authorities,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -5591,6 +5658,7 @@ struct MemoryState {
     revision_heads: BTreeMap<String, RevisionHead>,
     ordering_heads: BTreeMap<String, OrderingHead>,
     receipts_by_operation: BTreeMap<String, WriteReceipt>,
+    receipt_authorities: BTreeMap<String, eliot_store_api::RecoveryReceiptAuthority>,
     receipts_by_idempotency: BTreeMap<String, (String, String)>,
     projections: BTreeMap<String, ProjectionPublicationRecord>,
     outbox: BTreeMap<String, OutboxIntent>,
@@ -5697,6 +5765,7 @@ impl PartialEq for MemoryState {
             && self.revision_heads == other.revision_heads
             && self.ordering_heads == other.ordering_heads
             && self.receipts_by_operation == other.receipts_by_operation
+            && self.receipt_authorities == other.receipt_authorities
             && self.receipts_by_idempotency == other.receipts_by_idempotency
             && self.projections == other.projections
             && self.outbox == other.outbox
@@ -5738,6 +5807,7 @@ impl Default for MemoryState {
             revision_heads: BTreeMap::new(),
             ordering_heads: BTreeMap::new(),
             receipts_by_operation: BTreeMap::new(),
+            receipt_authorities: BTreeMap::new(),
             receipts_by_idempotency: BTreeMap::new(),
             projections: BTreeMap::new(),
             outbox: BTreeMap::new(),
@@ -5776,6 +5846,7 @@ impl MemoryState {
             && self.revision_heads.is_empty()
             && self.ordering_heads.is_empty()
             && self.receipts_by_operation.is_empty()
+            && self.receipt_authorities.is_empty()
             && self.receipts_by_idempotency.is_empty()
             && self.projections.is_empty()
             && self.outbox.is_empty()
@@ -6120,6 +6191,7 @@ mod tests {
             records,
             include_receipts,
             include_jobs,
+            receipt_authority_operation_ids: Vec::new(),
         }
     }
 

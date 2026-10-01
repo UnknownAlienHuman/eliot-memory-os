@@ -6660,6 +6660,7 @@ impl KernelComposition {
             records,
             include_receipts: false,
             include_jobs: true,
+            receipt_authority_operation_ids: Vec::new(),
         };
         let gateway = self.retained_store_gateway().map_err(|_| {
             UserAutomationRuntimeError::Unavailable(

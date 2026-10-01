@@ -262,7 +262,7 @@ fn actual_route_name(action: &KernelFrameAction) -> &'static str {
         KernelFrameAction::Backup { .. } => "backup_restore_admitted",
         KernelFrameAction::Research { .. } => "research_provider_admitted",
         #[cfg(windows)]
-        KernelFrameAction::FinishReplay { .. } => "finish_result_replay_pending",
+        KernelFrameAction::FinishReplay(_) => "finish_result_replay_pending",
         KernelFrameAction::Fence(_) => "fenced_reply",
     }
 }

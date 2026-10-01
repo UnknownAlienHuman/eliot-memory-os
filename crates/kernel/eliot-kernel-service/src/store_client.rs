@@ -366,6 +366,38 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         {
             return Err(StoreError::IdentityConflict);
         }
+        if !request.receipt_authority_operation_ids.is_empty() {
+            let expected = request
+                .receipt_authority_operation_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let returned = snapshot
+                .receipts
+                .iter()
+                .map(|receipt| receipt.operation_id.clone())
+                .collect::<BTreeSet<_>>();
+            if snapshot.receipts.len() != request.receipt_authority_operation_ids.len()
+                || returned != expected
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+        }
+        let requested_authority_ids = request
+            .receipt_authority_operation_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let returned_authority_ids = snapshot
+            .receipt_authorities
+            .iter()
+            .map(|authority| authority.operation_id.clone())
+            .collect::<BTreeSet<_>>();
+        if snapshot.receipt_authorities.len() != request.receipt_authority_operation_ids.len()
+            || returned_authority_ids != requested_authority_ids
+        {
+            return Err(StoreError::IdentityConflict);
+        }
         if !request.include_jobs && !snapshot.job_records.is_empty() {
             return Err(StoreError::InvalidField {
                 field: "recovery.job_records",
@@ -376,6 +408,14 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             return Err(StoreError::InvalidField {
                 field: "recovery.receipts",
                 reason: "receipts were not requested",
+            });
+        }
+        if request.receipt_authority_operation_ids.is_empty()
+            && !snapshot.receipt_authorities.is_empty()
+        {
+            return Err(StoreError::InvalidField {
+                field: "recovery.receipt_authorities",
+                reason: "receipt authority was not requested",
             });
         }
         Ok(())
@@ -1553,6 +1593,7 @@ mod tests {
             records,
             include_receipts,
             include_jobs,
+            receipt_authority_operation_ids: Vec::new(),
         }
     }
 
@@ -1575,6 +1616,7 @@ mod tests {
             owner_records,
             job_records,
             receipts,
+            receipt_authorities: Vec::new(),
         };
         snapshot.validate().expect("recovery snapshot");
         snapshot

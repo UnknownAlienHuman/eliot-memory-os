@@ -1977,6 +1977,15 @@ fn validate_transition(
 }
 
 /// Reads one bounded recovery snapshot from one coherent provider transaction.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryReceiptAuthorityRow {
+    body: WriteReceipt,
+    commit_sequence: u64,
+    named_operation_count: usize,
+    payload_authority: Option<Vec<read_boundary::AuthorityRecordRow>>,
+}
+
 pub(crate) async fn recovery(
     adapter: &SurrealStoreAdapter,
     request: StoreRecoveryRequest,
@@ -2035,6 +2044,34 @@ pub(crate) async fn recovery(
     } else {
         Vec::new()
     };
+    let receipt_authorities = if request.receipt_authority_operation_ids.is_empty() {
+        Vec::new()
+    } else {
+        let rows = response.take::<Vec<RecoveryReceiptAuthorityRow>>(index)?;
+        index += 1;
+        let mut authorities = Vec::with_capacity(rows.len());
+        for row in rows {
+            if !request
+                .receipt_authority_operation_ids
+                .contains(&row.body.operation_id)
+            {
+                return Err(AdapterError::Store(StoreError::IdentityConflict));
+            }
+            let records = row.payload_authority.ok_or_else(|| {
+                AdapterError::Store(StoreError::InvalidReceipt)
+            })?;
+            authorities.push(
+                read_boundary::recovery_receipt_authority(
+                    &row.body,
+                    row.commit_sequence,
+                    row.named_operation_count,
+                    records,
+                )
+                .map_err(AdapterError::Store)?,
+            );
+        }
+        authorities
+    };
     let revision_heads = response.take::<Vec<RevisionHead>>(index)?;
     index += 1;
     let ordering_heads = response.take::<Vec<OrderingHead>>(index)?;
@@ -2045,12 +2082,14 @@ pub(crate) async fn recovery(
             owner_records,
             job_records,
             receipts,
+            receipt_authorities,
             revision_heads,
             ordering_heads,
         },
         &adapter.config.expected_schema_generation,
         &request.state_fence,
         &request.records,
+        &request.receipt_authority_operation_ids,
     )
 }
 
@@ -3561,6 +3600,7 @@ mod concurrent_allocation_tests {
                     records: Vec::new(),
                     include_receipts: true,
                     include_jobs: false,
+                    receipt_authority_operation_ids: Vec::new(),
                 })
                 .await
                 .expect("recovery snapshot");
@@ -3656,6 +3696,7 @@ mod concurrent_allocation_tests {
                     records: Vec::new(),
                     include_receipts: true,
                     include_jobs: false,
+                    receipt_authority_operation_ids: Vec::new(),
                 })
                 .await
                 .expect("recovery snapshot");
@@ -3707,6 +3748,7 @@ mod concurrent_allocation_tests {
                     records: Vec::new(),
                     include_receipts: true,
                     include_jobs: false,
+                    receipt_authority_operation_ids: Vec::new(),
                 })
                 .await
                 .expect("recovery snapshot");
