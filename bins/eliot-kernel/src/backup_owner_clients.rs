@@ -21,6 +21,14 @@
 //! backup dispatch ............ eliot-host register_backup_dispatch
 //! ```
 //!
+//! The per-owner accepted tables above are *recognition* sets: they say which
+//! method names reach an owner's registration. They are not capability
+//! grants. Each table entry is additionally gated by the owner's
+//! authenticated [`BackupRole`] projection at effect time, and an entry whose
+//! role does not carry it refuses there — see [`OwnerRole::protocol_role`]
+//! for the Host `ReconcileRestore` case, which is recognized and then
+//! refused, and which is deliberately not resolved by widening the role.
+//!
 //! The only cross-crate backup dependency here is the already-available
 //! [`eliot_protocol::backup`] vocabulary (`BackupOperationKind`,
 //! `BackupRole`, `BackupStage`, the role/attester projections, the
@@ -96,6 +104,15 @@ pub const WATCHDOG_BACKUP_PEER: &str = "watchdog-backup-owner";
 /// Mirrors the Host accepted registration (`PrepareIsolatedRestore`,
 /// `AdmitCutover`, `RestoreStatus`, `ReconcileRestore`). Anything else refuses
 /// pre-effect with [`OwnerClientError::UnsupportedOperation`].
+///
+/// This table is a recognition/registration set, NOT a capability grant.
+/// `ReconcileRestore` is recognized here and refused at effect time by
+/// [`check_role_permits_effect`], because the installation authority — the
+/// Host channel's authenticated role — does not carry it and the Host is not
+/// an admitted attester for the `Reconciled` stage. The reconcile read
+/// itself stays reachable under `RestoreStatus`, which that role does carry;
+/// see [`OwnerRole::protocol_role`] for the full evidence and the ASSUMPTION
+/// that decides this.
 pub const HOST_SUPPORTED_OPS: &[BackupOperationKind] = &[
     BackupOperationKind::PrepareIsolatedRestore,
     BackupOperationKind::AdmitCutover,
@@ -405,6 +422,74 @@ impl OwnerRole {
     /// The projection is deliberately not widened: an operation the mapped
     /// role does not carry is refused at effect time even when the owner's
     /// local accepted table lists it.
+    ///
+    /// # Why the Host table's `ReconcileRestore` row does not become a role
+    /// capability
+    ///
+    /// ASSUMPTION: `BackupRole::InstallationAuthority` keeps the projection
+    /// `{PrepareIsolatedRestore, AdmitCutover, RestoreStatus}` and is NOT
+    /// widened with `ReconcileRestore`; the Host's `ReconcileRestore` row is
+    /// the same redundant-but-refused shape as the Watchdog's
+    /// `VerifyArchive`/`RestoreStatus` rows, not the AUD5 liveness hole.
+    /// A0.4 decides "what is currently permitted" from Authority FIRST and
+    /// from actual integration capability second, and A0.3 makes hidden
+    /// creation or expansion of authority a fail-closed Hard Boundary, so a
+    /// consumer that wants a contour its role does not carry narrows its own
+    /// registered set and never widens the role to match itself.
+    ///
+    /// Three independent facts make the widening both unnecessary and
+    /// actively destructive, and all three are the Host's own statements
+    /// rather than an inference from symmetry with the Watchdog:
+    ///
+    /// 1. No capability is lost. The Host resolves BOTH `RestoreStatus` and
+    ///    `ReconcileRestore` to the single `BackupDispatchTarget::Reconcile`
+    ///    owner method (`HostComposition::backup_dispatch_target`), and the
+    ///    installation authority DOES carry `RestoreStatus`. The reconcile
+    ///    read therefore stays reachable on this channel under the one
+    ///    spelling the role grants; `ReconcileRestore` is a second name for
+    ///    a contour already served, not a contour only it can reach.
+    /// 2. The Host disclaims the reconciled-stage authority in its own
+    ///    source. `HostComposition::dispatch_backup_owner_operation`
+    ///    deliberately answers this contour `Admitted` and never
+    ///    `Completed`, stating that the Host "is no attested backup role for
+    ///    the reconciled stage", issues no backup `ReceiptId`, and retains no
+    ///    archive identity or `#954` `StateFence` for it. Widening the role
+    ///    would grant exactly the attestation authority the Host says it
+    ///    does not hold and must not fabricate.
+    /// 3. The protocol's own attester projection agrees, and it makes the
+    ///    widening boot-breaking. `attesting_roles(Reconciled)` admits
+    ///    `StoreOwner | OrsOwner | SpoolOwner` and excludes
+    ///    `InstallationAuthority`. `ReconcileRestore` is precisely the
+    ///    operation whose establishing stage is `Reconciled`, so once the
+    ///    role carried it, `check_owner_role_admission(OwnerRole::Host)`
+    ///    would find the operation permitted, resolve
+    ///    `operation_for_phase(Reconciled) == ReconcileRestore`, observe
+    ///    that the installation authority is not an admitted attester for
+    ///    that stage, and return `PhaseNotAttestedByOwner { Reconciled }`
+    ///    from `check_binding` — failing `HostBackupOwnerClient::production`,
+    ///    then `BackupOwnerClients::bind_production`, then the composition
+    ///    bootstrap itself. The role projection and the attester projection
+    ///    are one coupled authority claim; moving this operation across that
+    ///    seam is a new authority decision for its owning issue, not a
+    ///    local constant.
+    ///
+    /// The effect is therefore the already-documented one: the accepted
+    /// table is a recognition/registration set and the role projection is
+    /// the authority gate, so `ReconcileRestore` is recognized on the Host
+    /// channel and refused by `check_role_permits_effect` before any effect.
+    /// Membership is not a capability claim, and the refusal is never
+    /// weakened to make a call succeed.
+    ///
+    /// Resolving the remaining membership incoherence — `is_supported`
+    /// answering `true` for a row `admit_effect` refuses — means dropping
+    /// the row from `HOST_SUPPORTED_OPS`, which is a change to the
+    /// registered set rather than to the projection. It is deliberately not
+    /// taken here: it requires the closed per-owner registration fixture
+    /// `tests/data/backup-owner-wire/accepted-owner-method-table.json` to
+    /// move with it, and that fixture is bound by
+    /// `wire_01_registration_table_matches_closed_owner_tables` in
+    /// `bins/eliot-kernel/tests/backup_owner_wire.rs`. Editing that
+    /// assertion is out of scope for this change.
     #[must_use]
     pub const fn protocol_role(self) -> BackupRole {
         match self {
@@ -720,6 +805,15 @@ impl HostBackupOwnerClient {
     /// role matrix are both necessary conditions, so the Host can never
     /// exercise an operation the installation authority does not carry, and
     /// a non-attesting role can never produce an effect admission at all.
+    ///
+    /// `ReconcileRestore` is the concrete case: it is inside
+    /// [`HOST_SUPPORTED_OPS`] and therefore passes the membership check, then
+    /// refuses here with [`OwnerClientError::CapabilityDenied`] because the
+    /// installation authority does not carry it. That refusal is the correct
+    /// outcome, not a gap to be closed by widening the role; the same
+    /// reconcile read is admitted under `RestoreStatus`, which the role does
+    /// carry. [`OwnerRole::protocol_role`] carries the evidence and the
+    /// ASSUMPTION.
     pub fn admit_effect(op: BackupOperationKind) -> Result<EffectAdmission, OwnerClientError> {
         if !Self::is_supported(op) {
             return Err(OwnerClientError::UnsupportedOperation { op: op.as_str() });
