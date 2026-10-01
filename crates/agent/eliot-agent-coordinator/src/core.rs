@@ -2255,12 +2255,15 @@ impl AgentCoordinator {
     ///
     /// Issue #1683 W3, select then revalidate then reserve: the drive's
     /// select-then-start pair is only sound because `start_attempt` revalidates
-    /// the owner-issued admission receipt and re-checks the route's capacity
-    /// reservation at the boundary between them, before any state moves. A
+    /// the owner-issued admission receipt, binds the reservation to that
+    /// admission's owner-issued lane (or reassignment receipt), and re-checks
+    /// the route's capacity reservation at the boundary between them, before
+    /// any state moves. A
     /// selection is therefore never spent on the snapshot it was taken from: a
-    /// stale receipt is refused by its owner, and a route whose live capacity
-    /// view moved is `StaleCapacity` / `Backpressure`. See [`Self::start_attempt`]
-    /// for both checks.
+    /// stale receipt is refused by its owner, a reservation that no longer
+    /// matches its admission is an identity conflict, and a route whose live
+    /// capacity view moved is `StaleCapacity` / `Backpressure`. See
+    /// [`Self::start_attempt`] for all three checks.
     ///
     /// Bounded, and the bound is derived rather than chosen here: the drive
     /// starts at most one attempt per currently non-terminal admitted attempt,
@@ -2491,9 +2494,9 @@ impl AgentCoordinator {
     /// boundary immediately before the reservation it spends (issue #1683 W3,
     /// I14.8).
     ///
-    /// A pull decides on a projection read; this transition consumes it. Two
+    /// A pull decides on a projection read; this transition consumes it. Three
     /// owner checks run here that neither existed at this boundary before, and
-    /// both run before any mutation:
+    /// all three run before any mutation:
     ///
     /// - **Revalidate.** The owner-issued [`ProviderAdmissionReceipt`] that
     ///   admitted this item is re-presented to the sealed provider verifier under
@@ -2507,6 +2510,16 @@ impl AgentCoordinator {
     ///   refusal (`CoordinatorError::StaleProviderBinding`, `StaleCapacity`,
     ///   `StaleFence`, `StaleController`, `RouteEvidence`,
     ///   `ProviderVerification`); none is flattened.
+    /// - **Bind the reservation to that admission** through
+    ///   [`Self::validate_reservation_admission`]. The verifier leg above proves
+    ///   the ADMISSION; this leg proves the reservation being spent is the one
+    ///   that admission authorizes — its work unit, role, route, budget,
+    ///   work class, lease, worker, priority, mutation scope and externally
+    ///   issued `admitted_route` decision all equal the owner-issued lane for
+    ///   this exact attempt (or, for a reassigned attempt, the durable
+    ///   `CoordinatorEvent::Reassigned` receipt plus its predecessor lane).
+    ///   Without it the only thing re-checked at this boundary was local
+    ///   configuration, i.e. a reservation compared against its own inputs.
     /// - **Reserve.** The item's stored capacity claim is re-validated at this
     ///   boundary through [`Self::validate_route_capacity`] — the same owner-side
     ///   validator `admit` and `reassign` use, not a second scheme — so the
@@ -2532,8 +2545,22 @@ impl AgentCoordinator {
     ///
     /// Nothing is minted, re-derived or synthesized: the receipt, the proof
     /// reference and the canonical bytes are all read from the coordinator's own
-    /// stored admission, and the capacity claim from the item's own stored
-    /// record.
+    /// stored admission, the admission lane and reassignment receipt from that
+    /// same stored admission and the durable event log, and the capacity claim
+    /// from the item's own stored record.
+    ///
+    /// What this transition still cannot do, stated rather than implied: it
+    /// revalidates and reserves against the coordinator's OWN admission, and no
+    /// production issuer of [`ProviderAdmissionReceipt`] exists in this tree —
+    /// every construction site is a test fixture. The genuinely owner-issued
+    /// admission RESERVATION is Kernel's
+    /// `eliot_ors::verify_admission_reservation_launch_prerequisite`, reached
+    /// only from
+    /// `bins/eliot-kernel/src/native_worker_lifecycle_route.rs::coordinate_admission_reservation_saga`
+    /// on the native-worker claim protocol. Neither this crate nor that route
+    /// produces a `ProviderAdmissionReceipt`, so a start here is a reservation
+    /// against an admission some owner must still have issued; closing that is
+    /// the #1678 admission saga, not a coordinator-local change.
     ///
     /// What this deliberately does **not** do is re-evaluate the per-class
     /// profile ceilings (`max_concurrency`, `max_bytes`, WIP partitions). Those
@@ -2587,10 +2614,24 @@ impl AgentCoordinator {
             &receipt.g11_admission_receipt_ref,
             &canonical(&receipt)?,
         )?;
-        // Issue #1683 W3, reserve: re-check the item's stored capacity claim
-        // against the current live capacity view and the route's reservation as
-        // it stands now, through the same validator admission and reassignment
-        // use.
+        // Issue #1683 W3, reserve, half one: re-bind this item's stored
+        // reservation to the OWNER-ISSUED admission evidence the sealed
+        // verifier just approved above, before the capacity leg runs.
+        //
+        // Until this check the reservation was compared against the
+        // coordinator's own immutable `CoordinatorConfig` and nothing else,
+        // which is a reservation compared against its own inputs: nothing at
+        // the start boundary tied the item's route, budget, lease, worker,
+        // work class or externally-issued route decision to the admission that
+        // authorizes it. I14.6 step 1 names exactly this revalidation
+        // ("AgentCoordinator revalidates dependencies, State Fence, recipe,
+        // route evidence and policy"), and the owner-issued evidence it
+        // compares against is the stored receipt, not local configuration.
+        self.validate_reservation_admission(&current, &receipt)?;
+        // Issue #1683 W3, reserve, half two: re-check the item's stored capacity
+        // claim against the current live capacity view and the route's
+        // reservation as it stands now, through the same validator admission and
+        // reassignment use.
         //
         // `requested` is 0, not 1, and the distinction is load-bearing. The
         // record was inserted by `admit` and is already non-terminal, so it is
@@ -4140,6 +4181,156 @@ impl AgentCoordinator {
             return Err(CoordinatorError::StaleController);
         }
         Ok(receipt.clone())
+    }
+
+    /// Re-binds one reserved attempt to the owner-issued admission evidence
+    /// that authorizes it, at the moment the reservation is spent (issue #1683
+    /// W3, I14.6 step 1).
+    ///
+    /// The reservation is the `AttemptRecord`'s own route / budget / lease /
+    /// worker / work-class / externally-issued route decision. Before this
+    /// method, nothing compared those against the owner-issued
+    /// [`ProviderAdmissionReceipt`] whose sealed verifier proof the same
+    /// transition had just demanded: the capacity leg compares the record
+    /// against the coordinator's own immutable `CoordinatorConfig`, so a
+    /// reservation could be spent on the strength of local configuration alone.
+    /// This is the binding that makes the reservation an admission-backed one.
+    ///
+    /// Two lineages reach this method, because both create an `Admitted` record
+    /// a pull can select:
+    ///
+    /// - **Admitted directly.** The owner-issued lane for this exact
+    ///   `attempt_id` inside the stored receipt is the evidence. Every leg the
+    ///   owner issued is compared, including the externally-issued
+    ///   `admitted_route` decision, which must still be the stored one.
+    /// - **Reassigned** ([`Self::reassign`]). The reassignment owner moved the
+    ///   lease, worker, route and budget onto a new attempt identity that the
+    ///   admission receipt cannot name, so the evidence is the durable
+    ///   `CoordinatorEvent::Reassigned` receipt in this coordinator's own event
+    ///   log — the same owner-issued artifact the sealed verifier approved when
+    ///   it was written, and re-derived on restore by
+    ///   `replay_snapshot_events`. Its predecessor lane in the admission
+    ///   receipt carries the legs the reassignment is documented NOT to move,
+    ///   and the reassignment receipt itself must carry exactly the ones it
+    ///   did move. An attempt with neither lineage is refused, never started.
+    ///
+    /// Stated precisely, because it is weaker than a cross-writer gate: within
+    /// one coordinator instance `admit` and `reassign` are the only writers of
+    /// `attempts` and both build each record from the very evidence read here,
+    /// so these comparisons are an invariant re-assertion against OWNER-ISSUED
+    /// evidence rather than a fresh independent read of a live owner. What
+    /// they are not is a comparison against this coordinator's own
+    /// configuration, which is what the capacity leg below does and what this
+    /// leg exists to stop standing in for an admission.
+    ///
+    /// Nothing is minted, re-derived or synthesized: the lane and the
+    /// reassignment receipt are read from the stored admission and the durable
+    /// event log.
+    fn validate_reservation_admission(
+        &self,
+        record: &AttemptRecord,
+        receipt: &ProviderAdmissionReceipt,
+    ) -> Result<(), CoordinatorError> {
+        // The work/recipe/plan/fence legs the admission owner issued once, on
+        // the admission itself rather than on any lane.
+        if record.launch_request_id != receipt.launch_request_id
+            || record.recipe_id != receipt.recipe_id
+            || record.recipe_revision != receipt.recipe_revision
+            || record.task_id != receipt.task_id
+            || record.task_revision != receipt.task_revision
+            || record.plan_revision != receipt.plan_revision
+            || record.state_fence != receipt.state_fence
+        {
+            return Err(CoordinatorError::IdentityConflict("admitted_reservation"));
+        }
+        let Some(lane) = receipt
+            .admitted_lanes
+            .iter()
+            .find(|lane| lane.attempt_id == record.attempt_id)
+        else {
+            let reassignment = self.reassignment_for(&record.attempt_id)?;
+            let predecessor = self
+                .attempts
+                .get(&reassignment.old_attempt_id)
+                .ok_or(CoordinatorError::UnknownAttempt)?;
+            let lane = receipt
+                .admitted_lanes
+                .iter()
+                .find(|lane| lane.attempt_id == reassignment.old_attempt_id)
+                .ok_or(CoordinatorError::IdentityConflict("admitted_lane"))?;
+            Self::validate_reserved_lane(record, lane, true)?;
+            if record.lease_id != reassignment.new_lease_id
+                || record.worker_id != reassignment.new_worker_id
+                || record.route != reassignment.route
+                || record.budget != reassignment.budget
+            {
+                return Err(CoordinatorError::IdentityConflict("admitted_reservation"));
+            }
+            // A reassignment never widens an attempt's own authority: the
+            // predecessor it replaces is the only other record the same
+            // admission may have created, so the two must still describe one
+            // work unit under one fence.
+            if predecessor.work_unit_id != record.work_unit_id
+                || predecessor.state_fence != record.state_fence
+            {
+                return Err(CoordinatorError::IdentityConflict("admitted_reservation"));
+            }
+            return Ok(());
+        };
+        Self::validate_reserved_lane(record, lane, false)
+    }
+
+    /// Compares the owner-issued legs of one admitted lane against a reserved
+    /// record. `reassigned` records carry a new attempt identity, so the
+    /// externally-issued `admitted_route` decision of the predecessor lane is
+    /// bound to the OLD attempt and cannot transfer; it is compared only for a
+    /// record the admission issued under its own identity.
+    fn validate_reserved_lane(
+        record: &AttemptRecord,
+        lane: &crate::AdmittedLaneReceipt,
+        reassigned: bool,
+    ) -> Result<(), CoordinatorError> {
+        if record.work_unit_id != lane.work_unit_id
+            || record.role_id != lane.role_id
+            || record.role_revision != lane.role_revision
+            || record.work_class != lane.work_class
+            || record.route != lane.route
+            || record.budget != lane.budget
+            || record.priority != lane.priority
+            || record.mutation_scope != lane.mutation_scope
+        {
+            return Err(CoordinatorError::IdentityConflict("admitted_lane"));
+        }
+        if !reassigned && record.admitted_route != lane.admitted_route {
+            return Err(CoordinatorError::IdentityConflict("admitted_route"));
+        }
+        Ok(())
+    }
+
+    /// The owner-issued reassignment receipt that produced `attempt_id`, read
+    /// from this coordinator's durable event log.
+    ///
+    /// The log is the durable owner here, not the in-memory `reassignments`
+    /// index: that index retains only the coordinator's own small
+    /// `ReassignmentReceipt` echo, while the event carries the full
+    /// owner-issued [`ProviderReassignmentReceipt`] the sealed verifier
+    /// approved. A restore re-derives the same event, so the lineage a reserve
+    /// reads survives a restart.
+    fn reassignment_for(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<&ProviderReassignmentReceipt, CoordinatorError> {
+        self.events
+            .iter()
+            .find_map(|event| match event {
+                CoordinatorEvent::Reassigned { receipt, .. }
+                    if receipt.new_attempt_id == *attempt_id =>
+                {
+                    Some(receipt.as_ref())
+                }
+                _ => None,
+            })
+            .ok_or(CoordinatorError::IdentityConflict("reassignment"))
     }
 
     fn active_attempt_count(&self) -> usize {
