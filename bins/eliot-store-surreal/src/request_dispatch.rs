@@ -464,14 +464,12 @@ fn mutation_failure_context(request: &Request) -> Option<StoreFailureIdentityCon
             request.operation_id.clone(),
             request.idempotency_key.clone(),
         )),
-        Request::WriteWorkScopeOwner { context, request } => {
-            Some(StoreFailureIdentityContext {
-                request_id: Some(context.request_id.clone()),
-                idempotency_key_ref_or_digest: Some(request.canonical_request_hash.clone()),
-                state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
-                ..StoreFailureIdentityContext::default()
-            })
-        }
+        Request::WriteWorkScopeOwner { context, request } => Some(StoreFailureIdentityContext {
+            request_id: Some(context.request_id.clone()),
+            idempotency_key_ref_or_digest: Some(request.canonical_request_hash.clone()),
+            state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
+            ..StoreFailureIdentityContext::default()
+        }),
         Request::DreamerJob { context, request } => Some(failure_context_for_operation(
             context,
             request.request_identity.operation.operation_id.clone(),

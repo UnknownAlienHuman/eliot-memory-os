@@ -764,10 +764,7 @@ impl StoreWorkScopeOwnerRequest {
         if self.state_fence != context.state_fence {
             return Err(StoreError::FenceMismatch);
         }
-        validate_digest(
-            &self.protected_snapshot_digest,
-            "protected_snapshot_digest",
-        )?;
+        validate_digest(&self.protected_snapshot_digest, "protected_snapshot_digest")?;
         validate_digest(&self.canonical_request_hash, "canonical_request_hash")?;
         if self.expected_owner_revision == 0 {
             return Err(StoreError::InvalidField {
@@ -775,13 +772,13 @@ impl StoreWorkScopeOwnerRequest {
                 reason: "must match the retained non-zero WorkScope owner revision",
             });
         }
-        let next_revision = self
-            .expected_owner_revision
-            .checked_add(1)
-            .ok_or(StoreError::InvalidField {
-                field: "expected_owner_revision",
-                reason: "revision overflow",
-            })?;
+        let next_revision =
+            self.expected_owner_revision
+                .checked_add(1)
+                .ok_or(StoreError::InvalidField {
+                    field: "expected_owner_revision",
+                    reason: "revision overflow",
+                })?;
         self.owner_record.validate_for_fence(&self.state_fence)?;
         if self.owner_record.namespace != "owner"
             || self.owner_record.key != "work_scope"
