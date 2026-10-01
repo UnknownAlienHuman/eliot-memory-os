@@ -562,8 +562,10 @@ fn require_exact_admitted_pair(
                 && source.assurance.competence == CompetenceLevel::Unknown
                 && source.assurance.independence == IndependenceLevel::Unknown
                 && source.assurance.instruction_taint == InstructionTaint::DataOnly
-                && source.assurance.allowed_epistemic_use == [EpistemicUse::Observation]
-                && source.assurance.allowed_effects == [EffectCeiling::NoExternalEffect]
+                && source.assurance.allowed_epistemic_use.len() == 1
+                && source.assurance.allowed_epistemic_use[0] == EpistemicUse::Observation
+                && source.assurance.allowed_effects.len() == 1
+                && source.assurance.allowed_effects[0] == EffectCeiling::NoExternalEffect
                 && source.assurance.quarantine == QuarantineState::ReviewRequired
         }).count() == 1
     };
