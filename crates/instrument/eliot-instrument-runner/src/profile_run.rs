@@ -1132,7 +1132,14 @@ impl StageOrchestrator {
         if grant.spec_digest != stage.spec_digest
             || grant.parser.as_str() != stage.parser.as_str()
             || grant.parser_generation != stage.parser_generation
-            || grant.arguments != stage.argument_template
+            // The grant seals the PROCESS argv, so at use it is compared
+            // against the admitted stage's declared verification command —
+            // the same field `AdmittedStage::admit` sealed it from. Comparing
+            // it to `argument_template` instead re-introduced the same
+            // divergence at this seam: the grant would be refused for not
+            // matching the caller's bounded contribution rather than for not
+            // matching the command it actually authorises.
+            || grant.arguments != stage.verification_command
         {
             return Some(
                 "stage admission refused: grant differs from the admitted stage".to_owned(),

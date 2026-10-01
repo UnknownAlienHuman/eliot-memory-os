@@ -2428,7 +2428,22 @@ impl AdmittedStage {
                 .as_ref()
                 .map(SupplyChainReceipt::digest)
                 .unwrap_or_default(),
-            arguments: request.arguments.clone(),
+            // The grant seals the argv the PROCESS REQUEST carries: the admitted
+            // spec's declared verification command, which is validated non-empty
+            // at spec construction and bound into the spec digest, the registry
+            // digest, and this compiled stage. `request.arguments` is a
+            // different fact — the bounded contribution a CALLER may make, which
+            // the fixed `argument_template` check above already refused unless it
+            // matched — and it is not the argv any process request is sealed
+            // with. Sealing the caller's contribution here meant the grant could
+            // not name the command it authorised, so every external stage failed
+            // closed at launch with "process receipt does not preserve the bound
+            // request" even though its request was the admitted one. Argument
+            // authority is unchanged and still fail-closed: the check
+            // immediately above refuses any request whose arguments leave the
+            // admitted fixed template, so no caller reaches this grant with argv
+            // the admitted spec did not declare.
+            arguments: self.verification_command.clone(),
             environment_class: self.environment_class.clone(),
             scope_class: ADMITTED_SCOPE_CLASS.to_owned(),
             credential_policy: self.credential_policy.clone(),
