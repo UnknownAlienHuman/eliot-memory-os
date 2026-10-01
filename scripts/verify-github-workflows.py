@@ -5,11 +5,19 @@ Enforces that:
 1. Triggers follow a closed per-workflow policy (accepted issue #3004): every
    workflow is workflow_dispatch-only except the one automatic compile-only
    merge check (workflow_dispatch, main-scoped pull_request and push). That
-   exception is a property of the workflow's own `on:` block and compile-only
-   profile invocation, not of its filename, and exactly one workflow may claim
-   it, so a copy of the accepted workflow under any other name, an extra
-   automatic event, a wrong branch, a missing PR transition, or an automatic
-   workflow that no longer runs the compile-only profile are all rejected.
+   exception is a property of the workflow's own content alone: its `on:` block
+   AND a compile-only profile invocation on a code line, never a substring
+   anywhere in the file and never its filename, so a copy of the accepted
+   workflow under any other name, an extra automatic event, a wrong branch, a
+   missing PR transition, an automatic workflow whose profile invocation
+   survives only inside a YAML comment or a checker's quoted prose, and any
+   second claimant are all rejected. GWF-006 backstops the same grant from the
+   other side: only the workflow that is that accepted content may invoke the
+   compile-only profile, and only a workflow that reads the workflow oracle in
+   its own code may merely name the marker. The check is also required to
+   exist: with zero automatic workflows the per-workflow policy would have
+   nothing to judge, so a repository that deleted the automatic triggers is a
+   finding rather than a vacuous pass (AGENTS.md, WORKFLOW.md).
    pull_request_target, schedules, releases, merge queue and every other
    automatic trigger are rejected on every workflow.
 2. Every third-party Action is verified by immutable identity (issue #1225 step
@@ -147,8 +155,15 @@ CI_ALLOWED_EVENTS = DEFAULT_ALLOWED_EVENTS | CI_AUTOMATIC_EVENTS
 # keeps the GitHub default, which covers them).
 CI_MAIN_BRANCHES = ["main"]
 CI_REQUIRED_PR_TYPES = {"opened", "synchronize", "reopened", "ready_for_review"}
-# Compile-only workflow/profile class marker (issue #3004 item 8).
+# Compile-only workflow/profile class marker (issue #3004 item 8). The grant and
+# the GWF-006 backstop both require it on a code line, so a mention in prose or a
+# comment is never an invocation.
 COMPILE_ONLY_PROFILE_MARKER = "-Profile MergeCompile"
+# The one closed workflow directory. A workflow whose executed code reaches for
+# a file in it is the repository policy checker, so it may name the marker above
+# while searching another workflow's bytes for the wiring it asserts; that
+# exemption is content-derived, not a filename.
+WORKFLOW_ORACLE_DIR = ".github/workflows"
 
 # Operator harness execution identity (issue #1225 N_step5). A non-compile-only
 # workflow that builds Eliot.Operator must EXECUTE the Eliot.Operator.Tests
@@ -733,6 +748,42 @@ def event_scalar_list(content: str, event: str, key: str) -> list[str] | None:
     return values
 
 
+def invokes_compile_only_profile(content: str) -> bool:
+    """True when a code line of the workflow invokes the compile-only profile.
+
+    The marker has to be executed, not quoted or annotated: quoted literals and
+    `#` comments are prose and are deleted before matching
+    (`workflow_code_line`), the same technique the restore-lock and
+    privilege rules already use. A YAML comment saying the profile is invoked,
+    a `run-summary` string, or a checker's own `'-Profile MergeCompile'` literal
+    that inspects another workflow therefore never satisfies this predicate, so
+    the accepted exception cannot be granted by mentioning the profile anywhere
+    in the file.
+    """
+    return any(
+        COMPILE_ONLY_PROFILE_MARKER in workflow_code_line(line)
+        for line in content.splitlines()
+    )
+
+
+def names_workflow_oracle(content: str) -> bool:
+    """True when a line of the workflow names the closed workflow directory.
+
+    A workflow that reaches for `.github/workflows/...` in its own executed code
+    is the repository's own policy checker: it opens those workflow files by path,
+    so the compile-only marker inside it is a string it searches for in another
+    file, never a command it runs. Only a `#` comment is excluded, because a
+    comment is not executed at all, and the quoted path literal is exactly how
+    the checker spells the read. This is the only mention exemption, and it is a
+    property of the bytes rather than of a filename, so a renamed workflow does
+    not inherit it and a workflow that never looks at the workflow oracle does
+    not reach it.
+    """
+    return any(
+        WORKFLOW_ORACLE_DIR in _strip_comment(line) for line in content.splitlines()
+    )
+
+
 def is_accepted_automatic_workflow(content: str, events: set[str]) -> bool:
     """True when the workflow's own content is the accepted #3004 exception.
 
@@ -740,16 +791,17 @@ def is_accepted_automatic_workflow(content: str, events: set[str]) -> bool:
     the accepted automatic compile-only merge check only when its declared event
     set is exactly the accepted one, its automatic events target only
     `CI_MAIN_BRANCHES`, its pull_request activity covers every
-    `CI_REQUIRED_PR_TYPES` transition, and it actually invokes the compile-only
-    profile. Anything broader or narrower is refused: an extra automatic event,
-    a wrong branch, a missing PR transition, and a workflow that keeps the
-    automatic triggers while no longer running the compile-only merge check all
-    fail here, so the exception cannot be inherited by editing the filename or
-    by copying the accepted content anywhere.
+    `CI_REQUIRED_PR_TYPES` transition, and it invokes the compile-only profile on
+    a code line (`invokes_compile_only_profile`). Anything broader or narrower
+    is refused: an extra automatic event, a wrong branch, a missing PR
+    transition, and a workflow that keeps the automatic triggers while no longer
+    running the compile-only merge check all fail here, so the exception cannot
+    be inherited by editing the filename, by copying the accepted content
+    anywhere, or by keeping the profile's name in a comment or in quoted prose.
     """
     if events != CI_ALLOWED_EVENTS:
         return False
-    if COMPILE_ONLY_PROFILE_MARKER not in content:
+    if not invokes_compile_only_profile(content):
         return False
     for automatic_event in CI_AUTOMATIC_EVENTS:
         if event_scalar_list(content, automatic_event, "branches") != CI_MAIN_BRANCHES:
@@ -832,48 +884,62 @@ def check_workflows(root: Path) -> list[Finding]:
         findings.append(Finding("GWF-000", ".github/workflows", 0, "no workflow files found"))
         return findings
 
-    # Read every workflow's own trigger section first: the automatic exception
-    # is a repository-level property, so a workflow may only claim it after every
-    # other claimant is known. Reading here also keeps an unreadable file
-    # reported once, as GWF-000 below, instead of silently as "no triggers".
+    # Read every workflow's own bytes and trigger section first: the automatic
+    # exception is a repository-level property, so a workflow may only claim it
+    # after every other claimant is known. Reading here also keeps an unreadable
+    # file reported once, as GWF-000 below, instead of silently as "no triggers".
     events_by_path: dict[Path, set[str]] = {}
+    content_by_path: dict[Path, str] = {}
+    unreadable: dict[Path, str] = {}
     for wf_path in workflow_files:
         try:
-            events_by_path[wf_path] = parse_workflow_events(wf_path.read_text(encoding="utf-8"))
-        except OSError:
-            events_by_path[wf_path] = set()
+            content_by_path[wf_path] = wf_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            content_by_path[wf_path] = ""
+            unreadable[wf_path] = str(exc)
+        events_by_path[wf_path] = parse_workflow_events(content_by_path[wf_path])
     automatic_claims = [
         wf_path
         for wf_path in workflow_files
         if events_by_path[wf_path] - DEFAULT_ALLOWED_EVENTS
     ]
+    # #3004 accepts exactly one automatic workflow, and it is the accepted one
+    # only when its own content is that check. A second claimant, a claimant
+    # whose automatic scope drifted, and a claimant that no longer invokes the
+    # compile-only profile on a code line all leave the accepted claim absent, so
+    # the trigger grant below and the GWF-006 backstop read the same derived
+    # claim and neither can be reached by a filename.
+    accepted_automatic_claim = (
+        automatic_claims[0]
+        if len(automatic_claims) == 1
+        and is_accepted_automatic_workflow(
+            content_by_path[automatic_claims[0]], events_by_path[automatic_claims[0]]
+        )
+        else None
+    )
 
     for wf_path in workflow_files:
         rel_path = str(wf_path.relative_to(root)).replace("\\", "/")
-        try:
-            content = wf_path.read_text(encoding="utf-8")
-        except Exception as exc:
-            findings.append(Finding("GWF-000", rel_path, 0, f"cannot read file: {exc}"))
+        if wf_path in unreadable:
+            findings.append(Finding("GWF-000", rel_path, 0, f"cannot read file: {unreadable[wf_path]}"))
             continue
 
+        content = content_by_path[wf_path]
         lines = content.splitlines()
 
         # 1. Event trigger check: closed per-workflow policy (issue #3004).
         # Default is workflow_dispatch-only. The automatic exception is a
-        # property of the workflow's own content (is_accepted_automatic_workflow),
-        # and #3004 accepts exactly one automatic workflow, so a second claimant
-        # is unauthorized whatever it is called. A byte-identical copy of the
-        # accepted workflow under a different name therefore fails here, and so
-        # does an accepted workflow whose automatic scope drifted wider.
+        # property of the workflow's own content (is_accepted_automatic_workflow,
+        # resolved once above), and #3004 accepts exactly one automatic workflow,
+        # so a second claimant is unauthorized whatever it is called. A
+        # byte-identical copy of the accepted workflow under a different name
+        # therefore fails here, and so does an accepted workflow whose automatic
+        # scope drifted wider or whose compile-only invocation is only prose.
         events = events_by_path[wf_path]
         automatic_events = sorted(events - DEFAULT_ALLOWED_EVENTS)
         if not events:
             findings.append(Finding("GWF-001", rel_path, 1, "missing 'on:' event trigger section"))
-        elif automatic_events and not (
-            len(automatic_claims) == 1
-            and automatic_claims[0] == wf_path
-            and is_accepted_automatic_workflow(content, events)
-        ):
+        elif automatic_events and accepted_automatic_claim != wf_path:
             findings.append(
                 Finding(
                     "GWF-001",
@@ -969,19 +1035,40 @@ def check_workflows(root: Path) -> list[Finding]:
             for line in lines
         )
         has_operator_test = operator_harness_executed(content)
-        # Closed compile-only class: ci.yml is the single workflow that may
-        # invoke the MergeCompile profile. repository-policy.yml names the
-        # profile only inside its own checker prose (not an invocation) and
-        # is exempt; any other file carrying the marker is rejected.
-        invokes_mergecompile = COMPILE_ONLY_PROFILE_MARKER in content
-        is_compile_only = wf_path.name == "ci.yml" and invokes_mergecompile
-        if invokes_mergecompile and wf_path.name not in ("ci.yml", "repository-policy.yml"):
+        # Closed compile-only class, backstopping the trigger grant from the
+        # other side (issue #3004 item 8). The class is the accepted automatic
+        # check derived from content, so the invocation is judged on a code line
+        # and only the workflow that is that check may make it: a marker in a
+        # comment, a run-summary string, or quoted prose is not an invocation.
+        # A workflow that only NAMES the marker is not in the class at all, and
+        # is tolerated only when its own code reaches for the workflow oracle,
+        # which is the repository policy checker searching another file for the
+        # wiring it asserts. That exemption is content-derived, so no filename
+        # carries it.
+        invokes_mergecompile = invokes_compile_only_profile(content)
+        is_compile_only = accepted_automatic_claim == wf_path
+        if invokes_mergecompile and not is_compile_only:
             findings.append(
                 Finding(
                     "GWF-006",
                     rel_path,
                     1,
-                    f"only ci.yml may invoke {COMPILE_ONLY_PROFILE_MARKER}",
+                    f"only the accepted automatic compile-only merge check may invoke "
+                    f"{COMPILE_ONLY_PROFILE_MARKER} on a code line",
+                )
+            )
+        if (
+            COMPILE_ONLY_PROFILE_MARKER in content
+            and not invokes_mergecompile
+            and not names_workflow_oracle(content)
+        ):
+            findings.append(
+                Finding(
+                    "GWF-006",
+                    rel_path,
+                    1,
+                    f"names {COMPILE_ONLY_PROFILE_MARKER} without invoking it on a code line; "
+                    f"only a workflow whose executed code reads {WORKFLOW_ORACLE_DIR} may name it",
                 )
             )
         if is_compile_only:
@@ -1109,6 +1196,46 @@ def check_workflows(root: Path) -> list[Finding]:
                     )
 
     return findings
+
+
+def check_required_automatic_check(root: Path) -> list[Finding]:
+    """The automatic compile-only merge check is required, so its absence fails.
+
+    `AGENTS.md` and `WORKFLOW.md` both name `.github/workflows/ci.yml` as the
+    sole automatic compile-only merge check, and #3004 accepts exactly one
+    automatic workflow. The per-workflow trigger policy is judged against that
+    one workflow, so a repository with no automatic workflow at all has nothing
+    left to judge and would pass vacuously: deleting the automatic triggers, or
+    removing the workflow, would otherwise satisfy the verifier by removing the
+    only thing it could check. Presence is therefore asserted with the same
+    content predicate the grant uses (`is_accepted_automatic_workflow`), so a
+    workflow that merely names the compile-only profile in a comment, in quoted
+    prose, or under a borrowed filename never counts as the required check.
+
+    A repository with no workflow file at all is already reported as GWF-000 by
+    `check_workflows`, and is not repeated here.
+    """
+    workflow_files = iter_workflow_files(root)
+    if not workflow_files:
+        return []
+    for wf_path in workflow_files:
+        try:
+            content = wf_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if is_accepted_automatic_workflow(content, parse_workflow_events(content)):
+            return []
+    return [
+        Finding(
+            "GWF-001",
+            ".github/workflows",
+            0,
+            "the required automatic compile-only merge check is absent: exactly one workflow "
+            f"must declare {sorted(CI_ALLOWED_EVENTS)} with branches {CI_MAIN_BRANCHES}, "
+            f"pull_request types covering {sorted(CI_REQUIRED_PR_TYPES)}, and invoke "
+            f"{COMPILE_ONLY_PROFILE_MARKER} on a code line (AGENTS.md, WORKFLOW.md, issue #3004)",
+        )
+    ]
 
 
 # Issue #1923 (I18.44): the dimensions a restored cargo cache is trusted across.
@@ -1955,6 +2082,7 @@ def check_fail_closed_privilege(root: Path) -> list[Finding]:
 def verify_all(root: Path) -> list[Finding]:
     findings: list[Finding] = []
     findings.extend(check_workflows(root))
+    findings.extend(check_required_automatic_check(root))
     findings.extend(check_fail_closed_privilege(root))
     findings.extend(check_action_pin_divergence(root))
     findings.extend(check_cache_key_fingerprints(root))
@@ -2092,6 +2220,21 @@ def run_self_tests() -> int:
         "    types: [opened, synchronize, reopened, ready_for_review]\n  push:\n    branches: [main]\n"
     )
     ci_prefix = "name: Automatic PR Merge Compile Gate\n" + ci_triggers + "permissions:\n  contents: read\n"
+    # The accepted automatic compile-only merge check body: the accepted trigger
+    # scope plus a real code-line invocation of the profile. This is the only
+    # shape that can hold the grant, so a case that drops the invocation, or
+    # moves it into a comment, is a negative case.
+    ci_invoking_body = (
+        "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n"
+        "      - run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile\n"
+    )
+    verify_ps1_stub = (
+        "# stub profile owner\n"
+        "dotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode\n"
+        "dotnet restore tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj --locked-mode\n"
+        "dotnet build apps/Eliot.Operator/Eliot.Operator.csproj\n"
+        "dotnet build tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj\n"
+    )
     # Action-identity fixtures (issue #1225 step 2). `gate_yaml` wraps a
     # `uses:` body in an otherwise conforming manual-dispatch workflow so a
     # rejection can only come from the action rule under test.
@@ -2168,7 +2311,7 @@ def run_self_tests() -> int:
         ("operator_adjacent_exit_zero_rejected", "test.yml", operator_case(" --no-restore\n        exit 0"), "GWF-006"),
         ("operator_redirect_accepted", "test.yml", operator_case(" --no-restore 2>&1"), None),
         ("operator_guarded_exit_zero_accepted", "test.yml", operator_case(" --no-restore\n        if [ $? -ne 0 ]; then exit 1; fi"), None),
-        ("ci_exception_accepted", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", None),
+        ("ci_exception_accepted", "ci.yml", ci_prefix + ci_invoking_body, None, {"scripts/verify.ps1": verify_ps1_stub}),
         ("ci_pr_target_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request_target:\n    branches: [main]\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
         ("ci_unscoped_push_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n  push:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
         ("other_workflow_push_rejected", "policy.yml", "name: Manual Policy Gate\non:\n  workflow_dispatch:\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo never\n", "GWF-001"),
@@ -2177,11 +2320,33 @@ def run_self_tests() -> int:
         # the compile-only merge check is gone is no longer the workflow #3004
         # accepted, so the trigger grant must fail on the content, not the name.
         ("ci_automatic_scope_without_compile_only_profile_rejected", "ci.yml", "name: Automatic PR Merge Compile Gate\non:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n    types: [opened, synchronize, reopened, ready_for_review]\n  push:\n    branches: [main]\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/build.ps1\n", "GWF-001"),
+        # The marker survives, but only inside a YAML comment: a comment is
+        # prose, so the accepted trigger scope no longer carries a code-line
+        # invocation and the grant must fail. The same bytes with the invocation
+        # restored are `ci_exception_accepted`, above.
+        ("ci_automatic_scope_marker_in_comment_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", "GWF-001"),
+        # The marker survives only as a quoted argument to a print builtin, which
+        # is prose as well. This is the shape a workflow reaches by asserting the
+        # profile's wiring rather than by running it.
+        ("ci_automatic_scope_marker_in_quoted_prose_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo \"no compile-only profile invocation here: -Profile MergeCompile\"\n", "GWF-001"),
         ("mergecompile_dotnet_run_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile\n      - run: dotnet test tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj\n", "GWF-006"),
-        ("mergecompile_claim_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests\"\n", "GWF-006"),
-        ("mergecompile_clean_accepted", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n", None, {"scripts/verify.ps1": "# stub profile owner\ndotnet restore apps/Eliot.Operator/Eliot.Operator.csproj --locked-mode\ndotnet restore tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj --locked-mode\ndotnet build apps/Eliot.Operator/Eliot.Operator.csproj\ndotnet build tests/Eliot.Operator.Tests/Eliot.Operator.Tests.csproj\n"}),
+        # The compile-only class keeps its execution claim ban: with a real
+        # invocation the workflow is in the class, and the claim is still banned.
+        ("mergecompile_claim_rejected", "ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile\n      - run: echo \"Operator tests: executed Eliot.Operator.Tests\"\n", "GWF-006", {"scripts/verify.ps1": verify_ps1_stub}),
+        ("mergecompile_clean_accepted", "ci.yml", ci_prefix + ci_invoking_body, None, {"scripts/verify.ps1": verify_ps1_stub}),
         ("mergecompile_elsewhere_rejected", "extra.yml", "name: Manual Extra Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile\n", "GWF-006"),
-        ("policy_checker_exempt", "repository-policy.yml", "name: Manual Repository Policy Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"asserts -Profile MergeCompile wiring\"\n", None),
+        # A workflow that only NAMES the marker is not in the compile-only class,
+        # and may do so only when its own executed code reaches for the workflow
+        # oracle, which is how the repository policy checker opens ci.yml to
+        # assert its wiring. This is the content property that replaced the
+        # filename exemption, so it is asserted both ways and spelled the way the
+        # real checker spells it: a quoted path literal read from disk.
+        ("policy_checker_names_workflow_oracle_accepted", "repository-policy.yml", "name: Manual Repository Policy Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: python -c \"import pathlib; print(pathlib.Path('.github/workflows/ci.yml').read_text())\"\n      - run: echo \"asserts -Profile MergeCompile wiring\"\n", None),
+        ("policy_checker_without_oracle_read_rejected", "repository-policy.yml", "name: Manual Repository Policy Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"asserts -Profile MergeCompile wiring\"\n", "GWF-006"),
+        # The same mention inside a YAML comment, with the oracle named only in a
+        # comment too: a comment is not executed, so it cannot open ci.yml and
+        # cannot buy the mention exemption either.
+        ("marker_in_comment_without_oracle_read_rejected", "extra.yml", "name: Manual Extra Gate\non:\n  workflow_dispatch:\npermissions:\n  contents: read\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      # inspects .github/workflows/ci.yml but never invokes -Profile MergeCompile\n      - run: echo nothing\n", "GWF-006"),
         # --- Action identity (issue #1225 step 2) ---
         # An unapproved owner fails even with a syntactically perfect 40-hex
         # SHA: a valid pin is not on its own an approved identity.
@@ -2229,6 +2394,60 @@ def run_self_tests() -> int:
             elif expected_code not in codes:
                 print(f"SELF_TEST_FAILURE in {name}: expected finding {expected_code}, got {codes}", file=sys.stderr)
                 return 1
+
+    # The required automatic compile-only merge check must exist (AGENTS.md,
+    # WORKFLOW.md, issue #3004). Every tree below is judged per workflow and is
+    # clean by construction, so only the repository-level presence assertion can
+    # separate them: a tree of manual workflows has no required check, and
+    # neither does a tree whose sole claimant kept the accepted trigger scope
+    # while losing the code-line invocation.
+    required_check_cases = [
+        ("required_check_absent_when_all_manual_rejected",
+         [("manual.yml", gate_yaml.format(body="- run: echo manual"))], True),
+        ("required_check_absent_when_invocation_lost_rejected",
+         [("ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      # invokes -Profile MergeCompile through the shared profile owner\n      - run: echo merge-compile-check\n")], True),
+        ("required_check_absent_when_marker_only_in_prose_rejected",
+         [("ci.yml", ci_prefix + "jobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - run: echo \"asserts -Profile MergeCompile wiring\"\n")], True),
+        ("required_check_present_accepted",
+         [("ci.yml", ci_prefix + ci_invoking_body)], False),
+    ]
+    for name, workflows, expect_finding in required_check_cases:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            wf_dir = tmp_root / ".github" / "workflows"
+            wf_dir.mkdir(parents=True)
+            for filename, wf_yaml in workflows:
+                (wf_dir / filename).write_text(wf_yaml, encoding="utf-8")
+            findings = check_required_automatic_check(tmp_root)
+            found = any(f.code == "GWF-001" for f in findings)
+            if found != expect_finding:
+                print(
+                    f"SELF_TEST_FAILURE in {name}: expected required-check finding "
+                    f"{expect_finding}, got {findings}",
+                    file=sys.stderr,
+                )
+                return 1
+
+    # The presence assertion is only worth anything if the repository-level
+    # verification actually runs it, so the wiring into verify_all is asserted
+    # too: a manual-only tree reports the absent required check there.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        wf_dir = tmp_root / ".github" / "workflows"
+        wf_dir.mkdir(parents=True)
+        (wf_dir / "manual.yml").write_text(
+            gate_yaml.format(body="- run: echo manual"), encoding="utf-8"
+        )
+        if not any(
+            "required automatic compile-only merge check is absent" in f.detail
+            for f in verify_all(tmp_root)
+        ):
+            print(
+                "SELF_TEST_FAILURE in required_check_included_in_verify_all: "
+                "verify_all did not report the absent required check",
+                file=sys.stderr,
+            )
+            return 1
 
     # Cross-workflow pin divergence (issue #1225 step 2): the same action at two
     # different SHAs is a finding, and one SHA everywhere is clean. Each pair of
