@@ -331,7 +331,11 @@ impl KernelComposition {
                     continue;
                 }
                 campaign_packet_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                if !self.application_binding_live_for_claim(
+                    envelope,
+                    &admission_owner,
+                    Some(true),
+                )? {
                     continue;
                 }
                 if !candidate.campaign_packet_attempt.is_owned_by(session) {
@@ -402,7 +406,11 @@ impl KernelComposition {
                     continue;
                 }
                 let invocation = task_controller_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                if !self.application_binding_live_for_claim(
+                    envelope,
+                    &admission_owner,
+                    Some(invocation.action != eliot_protocol::TaskControllerAction::BindScope),
+                )? {
                     continue;
                 }
                 if !candidate.task_controller_attempt.is_owned_by(session) {
@@ -595,7 +603,11 @@ impl KernelComposition {
                     continue;
                 }
                 finish_admission(envelope, tool)?;
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
+                if !self.application_binding_live_for_claim(
+                    envelope,
+                    &admission_owner,
+                    Some(true),
+                )? {
                     continue;
                 }
                 if !candidate.finish_attempt.is_owned_by(session) {
