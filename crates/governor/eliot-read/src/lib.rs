@@ -2220,10 +2220,44 @@ fn classify_payload_coverage(
     if !declares_store_coverage_statement(operation) {
         return Ok(());
     }
+    prove_page_state_fence(payload, bound_fence)?;
+    let page: ExperienceRangePage = serde_json::from_value(payload.clone())
+        .map_err(|_| ReadError::Outcome(ReadOutcome::Unknown))?;
+    if page.matched_total != page.records.len() {
+        return Err(ReadError::Outcome(ReadOutcome::Unknown));
+    }
+    if page.truncated {
+        return Err(ReadError::Outcome(ReadOutcome::Partial));
+    }
+    Ok(())
+}
+
+/// Proves a bounded range page states the read's exact bound fence.
+///
+/// This is the one fence-before-coverage rule of this owner, extracted from
+/// [`classify_payload_coverage`] so a consumer that is handed an owner-minted
+/// page by an edge which performed the read itself can prove the same fact
+/// instead of restating the rule. It is the whole rule and it is unchanged: a
+/// page whose own fence statement ([`EXPERIENCE_PAGE_STATE_FENCE`]) is absent,
+/// unreadable, or bound to another fence is [`ReadError::CoverageFenceUnproven`]
+/// — not `Unknown`, because the source did answer, and not `Partial`, because
+/// nothing in it claims rows exist past the bound.
+///
+/// Nothing else is checked here. `matched_total`, `truncated` and the record
+/// set belong to [`classify_payload_coverage`], which decides what a proven
+/// page still may not be published as; a caller that needs that verdict calls
+/// it through the read owner rather than re-deriving it. Callers must invoke
+/// this BEFORE reading any coverage member of the page, because the ordering is
+/// the guarantee: a truncation flag on a page projected under another fence
+/// describes that other fence's rows.
+pub fn prove_page_state_fence(
+    payload: &Value,
+    bound_fence: &StateFence,
+) -> Result<(), ReadError> {
     // The page's own fence member, read through the Store's exported key
-    // constant rather than a spelling restated here. It is read before the
-    // page is decoded so that a page which states no readable fence keeps
-    // that exact fact instead of collapsing into the decode-failure answer.
+    // constant rather than a spelling restated here. It is read before any
+    // other member so that a page which states no readable fence keeps that
+    // exact fact instead of collapsing into another member's failure answer.
     let page_fence = payload
         .get(EXPERIENCE_PAGE_STATE_FENCE)
         .cloned()
@@ -2232,14 +2266,6 @@ fn classify_payload_coverage(
         serde_json::from_value(page_fence).map_err(|_| ReadError::CoverageFenceUnproven)?;
     if page_fence != *bound_fence {
         return Err(ReadError::CoverageFenceUnproven);
-    }
-    let page: ExperienceRangePage = serde_json::from_value(payload.clone())
-        .map_err(|_| ReadError::Outcome(ReadOutcome::Unknown))?;
-    if page.matched_total != page.records.len() {
-        return Err(ReadError::Outcome(ReadOutcome::Unknown));
-    }
-    if page.truncated {
-        return Err(ReadError::Outcome(ReadOutcome::Partial));
     }
     Ok(())
 }
