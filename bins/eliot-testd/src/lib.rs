@@ -493,6 +493,17 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     })?;
     validate_running_lease(&current, lease, now)?;
     current.target_roots.validate()?;
+    // Issue #1897 (AUD4): the consuming start is the execution path, so the
+    // envelope's COMPLETE admission gate runs here, on the row the store just
+    // reloaded. `requalify` alone only proved the tuple was well-formed and
+    // that the retained lease record names this job; it let a persisted
+    // empty-claim/empty-lease productive job start. `admit` refuses an empty
+    // claim set, a claim with no held lease, and a held lease with no claim, so
+    // no process starts for a work item that has not declared and been granted
+    // what it will touch.
+    if let Some(envelope) = current.work_envelope.as_ref() {
+        envelope.admit().map_err(|_| TestdError::InvalidBinding)?;
+    }
     if let (Some(layout), Some(envelope)) = (
         current.target_layout.as_ref(),
         current.work_envelope.as_ref(),

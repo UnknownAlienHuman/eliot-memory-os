@@ -2121,6 +2121,13 @@ impl Default for JobSubmissionMetadata {
 
 impl JobSubmissionMetadata {
     /// A verification job with the default parallel declaration.
+    ///
+    /// This is the declaration for a job that touches no shared mutable runtime
+    /// resource. It is deliberately NOT the declaration of a job that runs a
+    /// test suite: I2.22 requires a test group that touches mutable fixture
+    /// state to declare that state, and a parallel declaration here is how an
+    /// empty lease set reaches a productive run. Such a route declares its real
+    /// claims through [`JobSubmissionMetadata::declared`] instead.
     #[must_use]
     pub const fn verification() -> Self {
         Self {
@@ -4460,15 +4467,20 @@ impl TestdStore {
             job.work_envelope.as_ref(),
             job.fixture_namespace.as_deref(),
         )?;
-        // Issue #1897 (W1/W5): requalify the retained envelope with its owner
-        // before this attempt starts. The row just read is the durable
-        // authority — this method never re-derives a tuple from the current
-        // ambient environment — and the retained lease record is checked against
-        // the job that must own it, so a restart cannot execute under a lease
-        // another job holds or under a malformed tuple.
+        // Issue #1897 (AUD4): run the COMPLETE admission gate on the retained
+        // envelope before this attempt starts, not the shape-only requalify.
+        // `requalify` proved the tuple is well-formed and that the retained
+        // lease record is this job's own; it did not require the job to have
+        // declared anything at all, so a persisted empty-claim/empty-lease
+        // productive job passed it and executed. `admit` additionally refuses
+        // an empty claim set, a claim with no held lease, and a held lease with
+        // no claim behind it, so a worktree alone cannot reach a shared runtime
+        // resource and a restart cannot execute a job that never declared what
+        // it would touch. The row just read is the durable authority: nothing
+        // here is re-derived from the current ambient environment.
         if let Some(envelope) = job.work_envelope.as_ref() {
             envelope
-                .requalify()
+                .admit()
                 .map_err(|_| TestdError::InvalidBinding)?;
         }
         let request = permit.request();
