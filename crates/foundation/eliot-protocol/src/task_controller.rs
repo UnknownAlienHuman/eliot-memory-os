@@ -10,7 +10,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES, ProtocolError};
+use crate::{
+    AgentActivationBindScopeEvidence, HARD_STRUCTURED_RESPONSE_BYTES, MAX_FRAME_BYTES,
+    ProtocolError,
+};
 
 /// Stable wire identity for one admitted Task Controller invocation.
 pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str = "eliot.protocol.task-controller-invocation";
@@ -144,6 +147,12 @@ pub struct TaskControllerInvocation {
     pub wire_version: u16,
     /// Create or update operation selected by the admitted caller.
     pub action: TaskControllerAction,
+    /// Original activation-owner proof authorizing only this exact initial
+    /// WorkScope binding. Required for `BindScope`, absent for every other
+    /// action; it is checked against Kernel-retained activation state before
+    /// the invocation is claimable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_scope_evidence: Option<AgentActivationBindScopeEvidence>,
     /// Exact native task identity from the admitted request.
     pub task_id: TaskId,
     /// Exact work scope from the admitted request identity.
@@ -198,6 +207,19 @@ impl TaskControllerInvocation {
         )?;
         structured_object(&self.task_input, "task_controller_invocation.task_input")?;
         if self.action == TaskControllerAction::BindScope {
+            let evidence = self.bind_scope_evidence.as_ref().ok_or(ProtocolError::InvalidField {
+                field: "task_controller_invocation.bind_scope_evidence",
+                reason: "BIND_SCOPE requires the exact retained pre-scope owner proof",
+            })?;
+            evidence.validate()?;
+            if evidence.task_id != self.task_id.as_str()
+                || evidence.work_scope_id != self.work_scope_id
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation.bind_scope_evidence",
+                    reason: "BIND_SCOPE task and scope must match the owner proof",
+                });
+            }
             if !self.learning_state_view_recipe.is_null()
                 || !self.context_campaign_recipe_catalogue.is_null()
                 || !self.context_campaign_recipe.is_null()
@@ -211,6 +233,12 @@ impl TaskControllerInvocation {
                 });
             }
             return Ok(());
+        }
+        if self.bind_scope_evidence.is_some() {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_invocation.bind_scope_evidence",
+                reason: "pre-scope owner proof is exclusive to BIND_SCOPE",
+            });
         }
         for (value, field) in [
             (
