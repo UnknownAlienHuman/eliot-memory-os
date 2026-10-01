@@ -660,7 +660,12 @@ fn non_public_admitted_privacy_is_refused_before_measurement() {
             &value,
             &recipe(&context),
             &approved_for(&recipe(&context)),
-            quality_for(&value, &recipe(&context)),
+            // The placeholder card, not `quality_for`: the non-public candidate
+            // is refused by `validate_public_privacy` inside `admitted.validate()`
+            // (admission.rs:342), which runs at assemble.rs:540 — before the grade
+            // is read at :594. The admitted set therefore has no canonical
+            // payload digest, so no card can name this output.
+            quality(&context),
             &policy(100_000),
             |_bytes| {
                 calls += 1;
@@ -816,7 +821,11 @@ fn oversized_nested_material_is_rejected_before_rendering() {
         &value,
         &recipe(&context),
         &approved_for(&recipe(&context)),
-        quality_for(&value, &recipe(&context)),
+        // The placeholder card, not `quality_for`: the oversized representation
+        // is refused by the borrowed `bounds::admitted` preflight
+        // (bounds.rs:164, `MAX_TEXT_BYTES`) at assemble.rs:535, before
+        // `admitted.validate()` at :540 and long before the grade at :594.
+        quality(&context),
         &policy(100_000),
         |_bytes| panic!("measurement must not run after preflight rejection"),
     );
@@ -853,7 +862,11 @@ fn rendered_fields_and_quality_binding_are_retained() {
         &stale_admission,
         &recipe(&context),
         &approved_for(&recipe(&context)),
-        quality_for(&stale_admission, &recipe(&context)),
+        // The placeholder card, not `quality_for`: the drifted measurement
+        // digest is caught by `admitted.economy.measurement.digest !=
+        // admitted.canonical_payload_digest()` at assemble.rs:546, before the
+        // grade is read at :594.
+        quality(&context),
         &policy(100_000),
         |_bytes| panic!("stale admission digest must preflight before measurement"),
     );
@@ -1258,7 +1271,11 @@ fn duplicate_atom_identity_is_rejected() {
         &value,
         &recipe(&context),
         &approved_for(&recipe(&context)),
-        quality_for(&value, &recipe(&context)),
+        // The placeholder card, not `quality_for`: the repeated identity is
+        // refused by `validate_admitted_record` (`admitted.atom_id`,
+        // admission.rs:343-345) inside `admitted.validate()` at assemble.rs:540,
+        // so the set has no canonical payload digest for a card to name.
+        quality(&context),
         &policy(100_000),
         |_bytes| panic!("duplicate must fail before measurement"),
     );
@@ -1319,7 +1336,10 @@ fn nonadmitted_rendering_material_is_rejected() {
         &value,
         &recipe(&context),
         &approved_for(&recipe(&context)),
-        quality_for(&value, &recipe(&context)),
+        // The placeholder card, not `quality_for`: a record with no admission
+        // entry is refused by `admitted.validate()` at admission.rs:412-414,
+        // which runs at assemble.rs:540 — before the grade is read at :594.
+        quality(&context),
         &policy(100_000),
         |_bytes| panic!("nonadmitted material must fail before measurement"),
     );
@@ -1419,7 +1439,10 @@ fn changed_role_required_protected_state_fails() {
         &value,
         &recipe(&context),
         &approved_for(&recipe(&context)),
-        quality_for(&value, &recipe(&context)),
+        // The placeholder card, not `quality_for`: the role now disagrees with
+        // its own floor member, which `validate_admitted_record` refuses
+        // (admission.rs:353-356) inside `admitted.validate()` at assemble.rs:540.
+        quality(&context),
         &policy(100_000),
         |_bytes| panic!("changed role must fail before measurement"),
     );
@@ -1468,7 +1491,12 @@ fn splitting_merging_whole_atoms_fails() {
         &value,
         &recipe(&context),
         &approved_for(&recipe(&context)),
-        quality_for(&value, &recipe(&context)),
+        // The placeholder card, not `quality_for`: the split unit is refused as
+        // `WholeUnitRequired` by `validate_recipe_membership` at assemble.rs:549,
+        // because the admitted set and its digest are well formed here but the
+        // instance's `RoleLossRule` permits only `RepresentationKind::Whole`.
+        // The verdict precedes the grade at :594.
+        quality(&context),
         &policy(100_000),
         |_bytes| panic!("split representation must fail before measurement"),
     );
@@ -1487,7 +1515,10 @@ fn splitting_merging_whole_atoms_fails() {
         &merged,
         &recipe(&merged_context),
         &approved_for(&recipe(&merged_context)),
-        quality_for(&merged, &recipe(&merged_context)),
+        // The placeholder card, not `quality_for`: a merged summary is refused as
+        // `WholeUnitRequired` by `validate_recipe_membership` at assemble.rs:549,
+        // before the grade is read at :594.
+        quality(&merged_context),
         &policy(100_000),
         |_bytes| panic!("merged summary must fail before measurement"),
     );
@@ -1577,7 +1608,10 @@ fn no_ranking_compression_summary_implementation() {
         &summarized,
         &recipe(&summarized_context),
         &approved_for(&recipe(&summarized_context)),
-        quality_for(&summarized, &recipe(&summarized_context)),
+        // The placeholder card, not `quality_for`: the lossy summary is refused as
+        // `WholeUnitRequired` by `validate_recipe_membership` at assemble.rs:549,
+        // before the grade is read at :594.
+        quality(&summarized_context),
         &policy(100_000),
         |_bytes| panic!("summary must not rank as a substitute"),
     );
@@ -1816,7 +1850,11 @@ fn missing_changed_crosstask_expansion_handle_fails() {
         &wrong_atom,
         &recipe(&wrong_context),
         &approved_for(&recipe(&wrong_context)),
-        quality_for(&wrong_atom, &recipe(&wrong_context)),
+        // The placeholder card, not `quality_for`: the handle names a different
+        // atom than the omission it belongs to, refused as
+        // `OmissionHandleInvalid` by `OmissionRecord::validate` inside
+        // `admitted.validate()` at assemble.rs:540, before the grade at :594.
+        quality(&wrong_context),
         &policy_for(&wrong_context, 100_000),
         |_bytes| panic!("changed handle must fail before measurement"),
     );
@@ -1838,7 +1876,10 @@ fn missing_changed_crosstask_expansion_handle_fails() {
         &cross_task,
         &recipe(&cross_context),
         &approved_for(&recipe(&cross_context)),
-        quality_for(&cross_task, &recipe(&cross_context)),
+        // The placeholder card, not `quality_for`: a handle bound to another
+        // decision is refused as `OmissionHandleInvalid` inside
+        // `admitted.validate()` at assemble.rs:540, before the grade at :594.
+        quality(&cross_context),
         &policy_for(&cross_context, 100_000),
         |_bytes| panic!("cross-task handle must fail before measurement"),
     );
@@ -2213,7 +2254,11 @@ fn duplicate_rendered_occurrence_is_rejected() {
         &duplicated,
         &recipe(&duplicated_context),
         &approved_for(&recipe(&duplicated_context)),
-        quality_for(&duplicated, &recipe(&duplicated_context)),
+        // The placeholder card, not `quality_for`: the repeated record identity
+        // is refused by `validate_admitted_record` (`admitted.atom_id`,
+        // admission.rs:343-345) inside `admitted.validate()` at assemble.rs:540,
+        // so this set has no canonical payload digest to name.
+        quality(&duplicated_context),
         &policy(100_000),
         |_bytes| panic!("duplicate rendered must fail before measurement"),
     );
@@ -2236,7 +2281,11 @@ fn missing_omission_coverage_evidence_is_rejected() {
         &value,
         &omission_recipe,
         &approved_for(&omission_recipe),
-        quality_for(&value, &omission_recipe),
+        // The placeholder card, not `quality_for`: clearing the omissions leaves
+        // `omissions` short of `displaced`, refused as `EconomyMismatch` by
+        // `ContextEconomyReceipt::validate` (economy.rs:114-116) inside
+        // `admitted.validate()` at assemble.rs:540 — before the grade at :594.
+        quality(&context),
         &policy_for(&context, 100_000),
         |_bytes| panic!("missing omission record must fail"),
     );
