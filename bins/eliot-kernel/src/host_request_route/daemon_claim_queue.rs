@@ -49,16 +49,25 @@ use super::{
 /// lanes and unreconstructible pairs never match. The class derives from the
 /// accepted `admission` the enqueue path already owns, and a reworded
 /// expected delta alone is not progress.
+///
+/// Returns the retry owner's verdict — whether the attempt history held a
+/// comparable retained pair for this admitted identity — so the caller records
+/// the retry stage from observed evidence instead of leaving it unresolved.
+/// `None` means no comparable retained pair exists, which stays unknown rather
+/// than becoming "not retried".
 fn refuse_campaign_staged_repeat(
     admission: &LocalReadAdmission,
     index: &BTreeMap<String, Vec<HostRequestOperationRef>>,
     envelope: &HostRequestEnvelope,
     tool: &serde_json::Value,
-) -> Result<(), TransportError> {
+) -> Result<Option<bool>, TransportError> {
     let Some(current) = crate::tool_exposure::build_tool_call_request(envelope, tool, admission)
     else {
-        return Ok(());
+        return Ok(None);
     };
+    let compared = index.values().flatten().any(|candidate| {
+        candidate.campaign_packet_envelope.is_some() && candidate.campaign_packet_tool.is_some()
+    });
     let retained = index.values().flatten().filter_map(|candidate| {
         Some((
             candidate.campaign_packet_envelope.as_ref()?,
@@ -68,7 +77,7 @@ fn refuse_campaign_staged_repeat(
     if crate::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
         return Err(TransportError::IdentityConflict);
     }
-    Ok(())
+    Ok(compared.then_some(false))
 }
 
 /// Evicts one stale (non-live) campaign-packet candidate across scopes.
@@ -138,7 +147,9 @@ impl KernelComposition {
                 return Ok(());
             }
         }
-        refuse_campaign_staged_repeat(&admission, &index, envelope, tool)?;
+        // The returned verdict is the attempt-history owner's own evidence for
+        // the retry stage on the dispatch draft below.
+        let retry_owner = refuse_campaign_staged_repeat(&admission, &index, envelope, tool)?;
         let queued = index
             .values()
             .flatten()
@@ -183,14 +194,21 @@ impl KernelComposition {
             });
         }
         // Issue #1745 R7 persistence tail: same dispatch-owned exposure
-        // evidence as the query/skill lane, from the packet admission owner.
+        // evidence as the query/skill lane, from the packet admission owner,
+        // with expanded_or_retried bound to the attempt-history owner verdict.
         // Fresh staging only — replays return early above — so the recorded
         // original is reconciled, never duplicated. Best-effort like every
         // observation: a populate failure is terminal-visible but never
         // changes the staged admission.
-        crate::tool_exposure::observe_dispatch_exposure(envelope, tool, &admission, |draft| {
-            self.audit_observe(draft);
-        });
+        crate::tool_exposure::observe_dispatch_exposure(
+            envelope,
+            tool,
+            &admission,
+            retry_owner,
+            |draft| {
+                self.audit_observe(draft);
+            },
+        );
         Ok(())
     }
 

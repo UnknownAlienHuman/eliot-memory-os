@@ -3009,26 +3009,37 @@ impl KernelComposition {
     /// refused with the existing identity-conflict signal so it is never
     /// staged as progress. The class derives from the accepted admission
     /// and a reworded expected delta alone is not progress.
+    ///
+    /// Returns the retry owner's own verdict — whether this pair repeats a
+    /// retained attempt under its admitted identity — so the caller records
+    /// the retry stage from observed attempt-history evidence instead of
+    /// leaving it unresolved on every fresh staging. `None` means the
+    /// staging seam could not reconstruct the identity join, which stays
+    /// unknown rather than becoming "not retried".
     fn refuse_staged_local_read_repeat(
         index: &std::collections::BTreeMap<String, Vec<HostRequestOperationRef>>,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         admission: &LocalReadAdmission,
-    ) -> Result<(), TransportError> {
-        if let Some(current) =
+    ) -> Result<Option<bool>, TransportError> {
+        let Some(current) =
             super::tool_exposure::build_tool_call_request(envelope, tool, admission)
-        {
-            let retained = index.values().flatten().filter_map(|candidate| {
-                Some((
-                    candidate.local_read_envelope.as_ref()?,
-                    candidate.local_read_tool.as_ref()?,
-                ))
-            });
-            if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
-                return Err(TransportError::IdentityConflict);
-            }
+        else {
+            return Ok(None);
+        };
+        let compared = index.values().flatten().any(|candidate| {
+            candidate.local_read_envelope.is_some() && candidate.local_read_tool.is_some()
+        });
+        let retained = index.values().flatten().filter_map(|candidate| {
+            Some((
+                candidate.local_read_envelope.as_ref()?,
+                candidate.local_read_tool.as_ref()?,
+            ))
+        });
+        if super::tool_exposure::staged_repeat_without_progress(retained, &current).is_some() {
+            return Err(TransportError::IdentityConflict);
         }
-        Ok(())
+        Ok(compared.then_some(false))
     }
 
     fn enqueue_local_read_pair_under_transition(
@@ -3061,8 +3072,11 @@ impl KernelComposition {
             LocalReadReplay::Fresh => {}
         }
         // I7.24 step 5: refuse materially repeated calls with no new
-        // owner-observed evidence before staging them as progress.
-        Self::refuse_staged_local_read_repeat(&index, envelope, tool, &admission)?;
+        // owner-observed evidence before staging them as progress. The
+        // returned verdict is the attempt-history owner's own evidence for
+        // the retry stage.
+        let retry_owner =
+            Self::refuse_staged_local_read_repeat(&index, envelope, tool, &admission)?;
         let queued = index
             .values()
             .flatten()
@@ -3145,7 +3159,8 @@ impl KernelComposition {
         self.audit_observe(AuditEventDraft::queue_local_read_enqueued(envelope, queued));
         // Issue #1745 R7 persistence tail: the freshly staged pair's
         // dispatch-owned exposure evidence (eligible/selected from the
-        // admission owner above; every other stage explicitly unresolved)
+        // admission owner above; expanded_or_retried from the attempt-history
+        // owner verdict; every other stage explicitly unresolved)
         // persists through the existing observation path under the
         // operation:digest idempotency lineage. Replays never reach this
         // arm — `AlreadyStaged` returns early above and conflicting
@@ -3153,9 +3168,15 @@ impl KernelComposition {
         // without new evidence. Best-effort like every observation: a
         // populate failure is terminal-visible but never changes the staged
         // admission.
-        super::tool_exposure::observe_dispatch_exposure(envelope, tool, &admission, |draft| {
-            self.audit_observe(draft);
-        });
+        super::tool_exposure::observe_dispatch_exposure(
+            envelope,
+            tool,
+            &admission,
+            retry_owner,
+            |draft| {
+                self.audit_observe(draft);
+            },
+        );
         // I16.5 (issue #1841): the queue gauges are read from the owner's own
         // live index at admission, so a sample measures the current contour
         // rather than a total carried forward.

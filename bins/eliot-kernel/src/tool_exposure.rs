@@ -398,6 +398,16 @@ fn admission_source(admission: &LocalReadAdmission) -> String {
     }
 }
 
+/// Names the attempt-history-owner evidence behind one retry fact.
+///
+/// The reference names the kernel-owned retained attempt history under the
+/// admitted route — the same rows [`staged_repeat_without_progress`] compares —
+/// never caller tool text and never a stage inferred from the retry verdict. It
+/// is the owner source reference the supplied retry fact binds.
+fn attempt_history_source(route: &str) -> String {
+    format!("kernel-attempt-history:{route}")
+}
+
 /// Populates the dispatch-seam-owned exposure evidence for one freshly
 /// staged pair and seals it as the durable observation draft.
 ///
@@ -406,8 +416,15 @@ fn admission_source(admission: &LocalReadAdmission) -> String {
 /// and admitted through the existing admission owner
 /// ([`super::host_request_route::check_local_read_admission`]), bound to the
 /// admission source reference from [`admission_source`].
+///
+/// `expanded_or_retried` is supplied only when the caller supplies the staging
+/// seam's own attempt-history verdict: the retry owner binds it to the retained
+/// attempt coordinates it already compared. Recording the retry is not
+/// progress — the no-progress signal stays with [`staged_repeat_without_progress`]
+/// — and it is never read from a neighbouring stage.
+///
 /// Every other stage — registration, advertisement, call, transport,
-/// delivery, retry, use, terminal outcome — and the turn/run/attempt
+/// delivery, use, terminal outcome — and the turn/run/attempt
 /// identities stay explicitly `null`: unresolved unknown owned elsewhere,
 /// never `false`, never inferred from a neighbouring stage. The Tool
 /// Definition version is unobservable at this seam (the definition owner
@@ -436,6 +453,7 @@ pub(crate) fn dispatch_exposure_draft(
     envelope: &eliot_protocol::HostRequestEnvelope,
     tool: &serde_json::Value,
     admission: &LocalReadAdmission,
+    retry_owner: Option<bool>,
 ) -> Result<AuditEventDraft, eliot_receipts::ToolExposureError> {
     let name = tool
         .as_object()
@@ -449,6 +467,13 @@ pub(crate) fn dispatch_exposure_draft(
     let owner_source = admission_source(admission);
     let eligible = OwnerStageFact::supplied(true, owner_source.clone())?;
     let selected = OwnerStageFact::supplied(true, owner_source)?;
+    // The retry stage is recorded only from this seam's own attempt-history
+    // evidence and stays explicitly unresolved without it: an absent verdict
+    // is unknown coverage, never "not retried".
+    let expanded_or_retried = match retry_owner {
+        Some(observed) => OwnerStageFact::supplied(observed, attempt_history_source(&route))?,
+        None => OwnerStageFact::unresolved(),
+    };
     let operation_id = eliot_protocol::host_request_operation_id(envelope);
     let body = serde_json::json!({
         "tool_definition": name,
@@ -466,7 +491,7 @@ pub(crate) fn dispatch_exposure_draft(
         "transport_completed": null,
         "result_delivery": null,
         "delivery_source_ref": null,
-        "expanded_or_retried": null,
+        "expanded_or_retried": expanded_or_retried,
         "observably_used_in_decision_action_or_verifier": null,
         "terminal_task_or_product_outcome_ref": null,
         "exposure_history_version": EXPOSURE_HISTORY_VERSION,
@@ -478,6 +503,15 @@ pub(crate) fn dispatch_exposure_draft(
 /// Emits one dispatch-owned exposure draft through the existing observation
 /// path (issue #1745, R7 persistence tail).
 ///
+/// `retry_owner` carries the staging seam's own attempt-history verdict for this
+/// pair: whether an earlier retained attempt under the same admitted identity
+/// was observed. It is the retry owner's evidence, produced by
+/// [`staged_repeat_without_progress`] over the kernel-owned attempt history —
+/// never inferred from another stage and never a caller-supplied flag. When
+/// the caller owns no attempt-history evidence for this pair it passes `None`
+/// and `expanded_or_retried` stays explicitly unresolved unknown rather than
+/// being coerced to `false`.
+///
 /// Best-effort like every observation: a populate failure is terminal-visible
 /// but never changes the staged admission. Callers invoke this only for fresh
 /// staging; replays reconcile the recorded original upstream.
@@ -485,9 +519,10 @@ pub(crate) fn observe_dispatch_exposure(
     envelope: &eliot_protocol::HostRequestEnvelope,
     tool: &serde_json::Value,
     admission: &LocalReadAdmission,
+    retry_owner: Option<bool>,
     emit: impl FnOnce(AuditEventDraft),
 ) {
-    match dispatch_exposure_draft(envelope, tool, admission) {
+    match dispatch_exposure_draft(envelope, tool, admission, retry_owner) {
         Ok(draft) => emit(draft),
         Err(_) => crate::kernel_diagnostics::observe_terminal_error(
             crate::kernel_audit::KERNEL_AUDIT_APPEND_TERMINAL_CODE,
