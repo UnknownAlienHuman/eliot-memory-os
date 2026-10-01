@@ -61,7 +61,9 @@ use super::{
 };
 use eliot_contracts::{BridgeRecoverySelector, RequestId};
 use eliot_ipc::PeerIdentity;
-use eliot_kernel_service::{AgentBridgeAdmissionDescriptor, KernelServiceState};
+use eliot_kernel_service::{
+    AgentBridgeAdmissionDescriptor, KernelHostRequestBinder, KernelServiceState,
+};
 use eliot_observability_runtime::{ModuleIdentity, WorkClass};
 use eliot_ors::{
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, HostRequestAttempt, HostRequestEffectEvidence,
@@ -1508,7 +1510,8 @@ impl KernelComposition {
     /// compiler in `eliotd`. This entry owns
     /// admission, linkage rejection, queueing, and exact readback; the
     /// `KernelHostRequestBinder::invoke_admitted` persist/readback pair owns
-    /// the dispatch-then-store leg wherever a Governor is injected.
+    /// the dispatch-then-store leg wherever a Governor is injected, reached in
+    /// production from here via [`Self::invoke_admitted_binder_leg`].
     pub fn invoke_read_host_request(
         &self,
         envelope: &HostRequestEnvelope,
@@ -1526,7 +1529,32 @@ impl KernelComposition {
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        let (receipt, record) = self.admit_host_request_envelope_under_transition(envelope)?;
+        // Issue #77 W2: Kernel-owned bind/dispatch leg runs BEFORE the
+        // route's own admit staging. The binder's `admit_and_stage` advances
+        // `Requested -> Admitted` itself, and only the call that stages first
+        // reaches `Fresh` and therefore `build_application` — the single
+        // product construction of the Kernel-owned `RequestIdentity`
+        // (authority epoch, admitted operation identity, absolute deadline)
+        // and `EffectCeiling::CandidateOnly`. A route-first staging would
+        // reduce every fresh envelope to a replay inside `invoke_admitted`,
+        // so the Kernel-owned identity would never be minted. The leg is
+        // fail-closed: any non-dispatched disposition falls through to the
+        // existing admit-and-queue path below unchanged.
+        let binder_dispatched = self.invoke_admitted_binder_leg(envelope, tool);
+        let (receipt, mut record) = self.admit_host_request_envelope_under_transition(envelope)?;
+        // A dispatched leg stored its bounded answer through the single ORS
+        // durability owner, so reload the owner-stored record: an answered
+        // operation is never queued twice.
+        if binder_dispatched {
+            let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
+                .map_err(|_| TransportError::SessionFenced)?;
+            record = self
+                .generation_gateway
+                .ors
+                .load_host_request(&operation_id, &envelope.envelope_sha256)
+                .map_err(|_| TransportError::SessionFenced)?
+                .ok_or(TransportError::SessionFenced)?;
+        }
         // Queue each admitted shape in its Kernel-owned lane. Query and Skill
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
@@ -1632,6 +1660,47 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         }
         Ok((receipt, record))
+    }
+
+    /// Runs the Kernel-owned bind/dispatch leg for one admitted invoke-read
+    /// envelope (issue #77 W2).
+    ///
+    /// Production caller of the binder path reachable from
+    /// [`Self::dispatch_host_request_frame`] via [`Self::invoke_read_host_request`]:
+    /// re-derives the retained connection gate (descriptor plus peer receipt)
+    /// and runs [`KernelHostRequestBinder::run_admitted_read_leg`] with the
+    /// existing owner/validator ports and the single ORS durability owner.
+    /// Returns whether the owner leg dispatched and stored the bounded answer.
+    /// Never narrows admission: a non-dispatched leg (fail-closed owner gap
+    /// or pre-dispatch rejection) leaves the existing queue path unchanged
+    /// until a real Governor port is injected.
+    ///
+    /// Must run before the route's own admit staging: only the first stager
+    /// reaches `Fresh` inside `invoke_admitted` and therefore mints the
+    /// Kernel-owned `RequestIdentity` and effect ceiling.
+    fn invoke_admitted_binder_leg(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> bool {
+        let Ok((descriptor, peer_receipt)) =
+            self.host_request_connection_gate_under_transition(envelope)
+        else {
+            return false;
+        };
+        let Ok(service) = self.service.lock() else {
+            return false;
+        };
+        KernelHostRequestBinder::run_admitted_read_leg(
+            &service,
+            self.generation_gateway.ors.as_ref(),
+            &descriptor,
+            &envelope.connection_id,
+            envelope,
+            &peer_receipt,
+            tool,
+        )
+        .is_dispatched()
     }
 
     /// Answers one invocation dry-run preview without staging, receipt, or
