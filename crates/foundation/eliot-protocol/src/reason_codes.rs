@@ -545,9 +545,7 @@ pub const BRIDGE_DENIAL_PROJECTION: &[BridgeDenialProjection] = &[
 
 /// Projects a legacy transport wire through the generated denial table.
 #[must_use]
-pub fn bridge_denial_projection(
-    legacy_code: &str,
-) -> Option<&'static BridgeDenialProjection> {
+pub fn bridge_denial_projection(legacy_code: &str) -> Option<&'static BridgeDenialProjection> {
     BRIDGE_DENIAL_PROJECTION
         .iter()
         .find(|entry| entry.legacy == legacy_code)
