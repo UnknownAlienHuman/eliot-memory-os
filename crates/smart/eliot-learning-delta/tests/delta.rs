@@ -1643,8 +1643,43 @@ fn omission_fixture(
     } else {
         view.omissions = vec![slot_b];
     }
+    // An omitted optional slot leaves completeness complete; the same slot on
+    // the frontier is explicitly unknown, so the view carries the completeness
+    // its own contract derives for the placement it records.
+    view.completeness = view.derived_completeness(&input.recipe);
     view.seal_content_addressed().expect("view seal");
     (view, input, context, policy(SemanticOutcome::Benefit))
+}
+
+/// Re-bind the slot payload digests a view carries in its source manifest after
+/// the fixture mutated a payload, keeping the view's own bindings consistent.
+fn rebind_slot_digest(view: &mut eliot_learning_contracts::CampaignLearningStateView) {
+    let bound: Vec<(
+        eliot_learning_contracts::SlotId,
+        String,
+    )> = view
+        .slots
+        .iter()
+        .map(|slot| {
+            (
+                slot.slot_id.clone(),
+                slot.canonical_digest().expect("slot canonical digest"),
+            )
+        })
+        .collect();
+    for resolution in &mut view.provenance.source_resolutions {
+        let Some(reference) = resolution.reference.as_mut() else {
+            continue;
+        };
+        for projection in &mut reference.slot_projection_digests {
+            if let Some((_, digest)) = bound
+                .iter()
+                .find(|(slot_id, _)| *slot_id == projection.slot_id)
+            {
+                projection.digest = digest.clone();
+            }
+        }
+    }
 }
 
 fn two_change_input(
@@ -2314,9 +2349,13 @@ fn exact_before_value_with_stale_missing_and_conflicted_base() {
         Err(LearningDeltaError::BeforeValueUnavailable { field: "selector" })
     );
     for disposition in [SlotDisposition::Stale, SlotDisposition::Conflicted] {
-        let (_, mut view, input, context) = base_input("c08-disposition");
+        let (recipe, mut view, input, context) = base_input("c08-disposition");
         view.slots[0].disposition = disposition;
-        view.completeness = Completeness::Partial;
+        // The mutated payload keeps the view's own recipe/source binding and
+        // derived completeness intact, so the assertion under test is the
+        // before-value refusal rather than a stale-view contract error.
+        rebind_slot_digest(&mut view);
+        view.completeness = view.derived_completeness(&recipe);
         view.seal_content_addressed().expect("view seal");
         assert_eq!(
             derive_attempt_learning_outcome(
@@ -2334,7 +2373,6 @@ fn exact_before_value_with_stale_missing_and_conflicted_base() {
     let (_, mut view, input, context) = base_input("c08-invalidated");
     view.invalidated = true;
     view.invalidation_reason = Some("retired".to_owned());
-    view.completeness = Completeness::Partial;
     view.seal_content_addressed().expect("view seal");
     assert_eq!(
         derive_attempt_learning_outcome(

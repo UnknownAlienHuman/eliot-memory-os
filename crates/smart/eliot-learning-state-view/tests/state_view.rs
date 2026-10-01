@@ -578,13 +578,18 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
         Err(eliot_learning_contracts::LearningContractError::Duplicate { .. })
     ));
 
+    // An over-long declared identity is refused with a typed bound. A
+    // `Conditional` requirement may only name a slot the recipe declares, so
+    // the oversized identity is the declared slot's own id.
     let mut oversized_dependency = recipe(
-        vec![SlotRequirement::Required],
-        vec![1],
+        vec![SlotRequirement::Optional, SlotRequirement::Required],
+        vec![1, 1],
         OmissionPolicy::RequiredSlots,
     )?;
-    oversized_dependency.slots[0].requirement = SlotRequirement::Conditional {
-        depends_on: SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?),
+    let oversized_slot = SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?);
+    oversized_dependency.slots[0].slot_id = oversized_slot.clone();
+    oversized_dependency.slots[1].requirement = SlotRequirement::Conditional {
+        depends_on: oversized_slot,
     };
     oversized_dependency.seal()?;
     let oversized_projection = projection(&oversized_dependency, 0, SlotDisposition::Current)?;
@@ -595,7 +600,7 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
             &[artifact("ref")?]
         ),
         Err(eliot_learning_contracts::LearningContractError::Bound {
-            field: "slot.depends_on"
+            field: "slot.slot_id"
         })
     ));
 
@@ -2342,7 +2347,10 @@ fn no_store_clock_transcript_provider_mutation_path() -> TestResult {
         "env::",
         "Store",
         "Model",
-        "clock",
+        // The caller supplies `generated_at_ms`/`expires_at_ms`; the forbidden
+        // surface is any std clock read, so the whole `std::time` module stays
+        // banned rather than the English word "clock" the input docs must use.
+        "std::time",
         "Clock",
         "Cell<",
         "RefCell",

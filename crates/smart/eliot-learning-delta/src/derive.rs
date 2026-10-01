@@ -31,8 +31,11 @@ pub fn derive_attempt_learning_outcome(
     policy.validate()?;
     phase_preflight(state_view, input, context, optional_refiner_draft, policy)?;
     input.validate_shape(policy)?;
-    state_view.validate_against(&input.recipe)?;
+    // The exact view refusals are answered before the contract-wide view
+    // check, so an invalidated or disputed view reports the precise typed
+    // delta refusal instead of the coarser contract coverage error.
     phase_validate_view(state_view, input)?;
+    state_view.validate_against(&input.recipe)?;
     phase_validate_status(input)?;
     phase_validate_records(input, context, policy, optional_refiner_draft)?;
     phase_validate_dependencies(input)?;
