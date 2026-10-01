@@ -250,18 +250,25 @@
 //!    not enforced at all is now enforced — LOWERING either below the floor's
 //!    mandatory member count refuses with `MissingFloor` — so neither can weaken
 //!    a floor while moving the identity.
-//! 2. Both executed facts are PRESENTED BY THE EXECUTION OWNER in
-//!    [`RecipeExecutionSupport`] and cross-checked here rather than asserted here:
-//!    `ordering_revision` against the scheme this contract authorises, and
-//!    `section_unit_boundary` against [`EXECUTED_SECTION_UNIT_BOUNDARY`]. What
-//!    remains stated in this contract is the AUTHORISATION, not the executed fact,
-//!    and the two comparisons fail CLOSED when either side disagrees, so the
-//!    coupling cannot be silently wrong. One residue of the dependency direction
-//!    cannot be removed: the authorised SCHEME STRING
-//!    ([`EXECUTED_ORDERING_REVISION`]) necessarily exists in both crates, because
-//!    `eliot-context-assembly` depends on this one and cannot be read from it, and
-//!    a contract that did not name the scheme could not authorise it. That is an
-//!    authorisation the contract must own, not an executed fact it is guessing.
+//! 2. Neither ordering fact is asserted by this contract. The EXECUTION OWNER
+//!    presents both in [`RecipeExecutionSupport`] and this contract cross-checks
+//!    what it is willing to authorise against what was presented:
+//!    `ordering_revision` against [`AUTHORISED_ORDERING_SCHEME`] and
+//!    `section_unit_boundary` against [`EXECUTED_SECTION_UNIT_BOUNDARY`]. Both
+//!    comparisons fail CLOSED and refuse by member name when the owner presents
+//!    something this contract has not authorised.
+//!
+//!    [`AUTHORISED_ORDERING_SCHEME`] is deliberately NOT named as an executed
+//!    fact and deliberately not spelled like the execution owner's own
+//!    `ASSEMBLY_ORDERING_REVISION`: it is an entry in this contract's
+//!    authorisation vocabulary, and the owner is the only side that observes that
+//!    it currently applies it. #1724 renamed it from a name that read as a mirror
+//!    of the owner's constant. `eliot-context-assembly` depends on this crate and
+//!    so cannot be read from it, so the contract necessarily holds its own
+//!    spelling of the scheme it authorises; what it does not hold is a claim about
+//!    which scheme the owner runs. A contract that did not name the scheme at all
+//!    could not decide whether a presented one is authorised, so naming it is the
+//!    authorisation itself rather than a duplicate of the owner's fact.
 //! 3. `admission.admission_rule` and the protected reserves are bound by IDENTITY
 //!    and by CAPACITY CEILING respectively. I7.11 places the admission rule's own
 //!    class comparison in `eliot-context-admission`, which depends on this crate,
@@ -375,8 +382,7 @@ const EXECUTED_SECTION_UNIT_BOUNDARY: BoundaryUnitKind = BoundaryUnitKind::Unit;
 pub const EXECUTED_REPETITION_POLICY: RecipeRepetitionPolicy =
     RecipeRepetitionPolicy::DeduplicateIdentical;
 
-/// The rendered-ordering SCHEME this contract authorises the executing path to
-/// run.
+/// The rendered-ordering SCHEME this contract authorises an executing path to run.
 ///
 /// #1724 W4. [`RecipeExecutionSupport::ordering_revision`] is the executing path's
 /// own statement of the scheme it renders under, and until now nothing read it: it
@@ -391,35 +397,53 @@ pub const EXECUTED_REPETITION_POLICY: RecipeRepetitionPolicy =
 /// `Negative` first, and a policy declaring a different order changes the delivered
 /// bytes and their `output_digest`.
 ///
-/// The SCHEME is "declared role position, then provider, then atom identity", and
-/// it is the same string the assembly crate's `ASSEMBLY_ORDERING_REVISION` names.
-/// This crate must not depend on the assembly crate that depends on it, so the two
-/// spellings are separate constants kept in step by hand and the coupling is
-/// deliberately fail-closed: if the execution owner changes the scheme revision
-/// without changing this constant, every publication refuses with
-/// [`RecipeResolutionRefusal::UnsupportedSetting`] naming
-/// `recipe_support.ordering_revision` instead of quietly rendering under an order
-/// this contract has not checked. The execution owner further qualifies this scheme
-/// with the approved revision's own `policy_sha256` when it stamps a view, so two
-/// revisions with different declared orders carry different executed ordering
-/// revisions on their Views.
+/// The SCHEME is "declared role position, then provider, then atom identity".
 ///
-/// This is the ONE executed fact whose name cannot move into
-/// [`RecipeExecutionSupport`], and it is not an executed fact at all: it is the
-/// scheme this contract authorises. A contract that did not name the scheme could
-/// not decide whether a presented one is authorised, and the only ways to learn the
-/// execution owner's spelling from here are the dependency edge this crate may not
-/// take or a third crate both depend on. So the executed side
-/// ([`RecipeExecutionSupport::ordering_revision`]) was already the owner's own
-/// statement, and this side remains what this contract authorises — the two are
-/// compared rather than restated, and a mismatch refuses by name.
+/// #1724. This is an AUTHORISATION, not a restatement of the execution owner's
+/// fact, and the name now says so. It was `EXECUTED_ORDERING_REVISION`, which
+/// claimed a standing its holder does not have: `EXECUTED_` marks the constants
+/// this crate holds because the path that reads them is known and fixed
+/// ([`EXECUTED_CONTEXT_STAGE`], [`EXECUTED_REPETITION_POLICY`],
+/// [`EXECUTED_SECTION_DEGRADATION`]), so the prefix asserted that the scheme named
+/// here is the scheme some execution path currently applies. It is not. This crate
+/// cannot see the execution path — `eliot-context-assembly` depends on this one, so
+/// no dependency edge can read its constants from here — and the only observable
+/// it has is the scheme an executing path chooses to PRESENT as
+/// [`RecipeExecutionSupport::ordering_revision`]. The authorising side of a
+/// comparison and the observed side are different things, and this constant is only
+/// ever the authorising side: it is the one scheme string this contract is willing
+/// to accept, used solely to decide whether a presented scheme is authorised. Read
+/// as a claim about the owner it is not merely stale, it is unanswerable here, and
+/// the previous name asserted one anyway. `AUTHORISED_` is the honest prefix for an
+/// entry in a contract's authorisation vocabulary.
+///
+/// The two spellings of the string live in different crates and are compared, never
+/// shared. That is not drift waiting to happen but the coupling working: the
+/// execution owner reads its own `ASSEMBLY_ORDERING_REVISION` when it builds
+/// [`RecipeExecutionSupport`] (`eliot-context`), and if it changed the scheme it
+/// applies without this contract authorising that scheme, every publication refuses
+/// with [`RecipeResolutionRefusal::UnsupportedSetting`] naming
+/// `recipe_support.ordering_revision` instead of quietly rendering under an
+/// unauthorised order. The end state is the same either way; only the false claim
+/// is gone. The execution owner further qualifies the scheme with the approved
+/// revision's own `policy_sha256` when it stamps a view, so two revisions with
+/// different declared orders carry different executed ordering revisions on their
+/// Views.
 ///
 /// The same pattern applies to the section unit boundary kind, with the two
 /// statements on opposite sides: [`EXECUTED_SECTION_UNIT_BOUNDARY`] is what this
 /// contract authorises, and
 /// [`RecipeExecutionSupport::section_unit_boundary`] is what the execution owner
 /// publishes it renders under.
-pub const EXECUTED_ORDERING_REVISION: &str = "a18.declared-role-position.v1";
+///
+/// #1724. Crate-private, matching [`EXECUTED_SECTION_UNIT_BOUNDARY`], which is
+/// the same shape of entry: an authorisation this crate holds to compare a
+/// presented value against, not an exported fact. `EXECUTED_CONTEXT_STAGE`,
+/// `EXECUTED_REPETITION_POLICY` and `EXECUTED_SECTION_DEGRADATION` stay public
+/// because their holders are also the readers. Nothing outside this crate
+/// consumes either authorisation, so exporting one would invite a caller to treat
+/// it as a supported scheme.
+const AUTHORISED_ORDERING_SCHEME: &str = "a18.declared-role-position.v1";
 
 /// I12.13 `applicable_task_route_impact_and_governance_profiles`.
 ///
@@ -1598,7 +1622,7 @@ impl ContextRecipePolicy {
     /// sufficient alone:
     ///
     /// * [`RecipeExecutionSupport::ordering_revision`] must equal
-    ///   [`EXECUTED_ORDERING_REVISION`], the scheme this contract authorises. The
+    ///   [`AUTHORISED_ORDERING_SCHEME`], the scheme this contract authorises. The
     ///   revision was previously populated and validated as text and read by
     ///   nothing, so the execution identity stamped on a delivered View named a
     ///   scheme this contract never checked. It is now compared here.
@@ -1646,10 +1670,11 @@ impl ContextRecipePolicy {
         // #1724 W4. `ordering_revision` was validated as non-empty text and
         // compared with nothing, so the scheme revision stamped on a delivered
         // View's execution identity named an ordering this contract never checked.
-        // It is now the one member of `RecipeExecutionSupport` this function reads
-        // against a value derived from the policy's OWN layout scheme, and a
+        // It is now the one member of `RecipeExecutionSupport` this function reads,
+        // and it is read against the scheme this contract AUTHORISES rather than
+        // against anything the policy or the executing path itself supplied, so a
         // mismatch refuses by name.
-        if support.ordering_revision.as_str() != Self::declared_ordering_revision() {
+        if support.ordering_revision.as_str() != Self::authorised_ordering_scheme() {
             return Err(unsupported("recipe_support.ordering_revision"));
         }
         // #1724. `section_unit_boundary` is the EXECUTION OWNER's own statement of
@@ -1687,8 +1712,7 @@ impl ContextRecipePolicy {
         Ok(())
     }
 
-    /// The ordering revision this revision's declared layout requires of the
-    /// executing path, derived from the policy's own content.
+    /// The ordering scheme this contract authorises an executing path to run.
     ///
     /// #1724 W4. [`RecipeExecutionSupport::ordering_revision`] is the executing
     /// path's statement of the scheme it renders under, and it was validated as
@@ -1699,20 +1723,30 @@ impl ContextRecipePolicy {
     ///
     /// The renderer now APPLIES the declared order (eliot-context-assembly
     /// `render::render` sorts by `position`), so the order is not a hidden default
-    /// any more. What this function supplies is the SCHEME half of the binding: the
-    /// order the approved revision requires is "declared role position, then
-    /// provider, then atom identity", and that scheme string is compared against
-    /// the one the execution owner publishes, so the two cannot name different
-    /// orderings without a typed [`RecipeResolutionRefusal::UnsupportedSetting`]
-    /// naming `recipe_support.ordering_revision`.
+    /// any more. What this supplies is the SCHEME half of the binding: the order the
+    /// approved revision requires is "declared role position, then provider, then
+    /// atom identity", and that scheme is compared against the one the execution
+    /// owner publishes, so the two cannot name different orderings without a typed
+    /// [`RecipeResolutionRefusal::UnsupportedSetting`] naming
+    /// `recipe_support.ordering_revision`.
     ///
-    /// The revision carries no per-revision suffix: the execution owner qualifies
-    /// the SAME scheme with the approved revision's own `policy_sha256` when it
+    /// #1724. The previous name of this function was
+    /// `declared_ordering_revision` and its doc said the value was "derived from
+    /// the policy's own content". Neither was true: it takes no `self`, reads no
+    /// policy member, and returned one constant. A function whose name asserts a
+    /// derivation it does not perform is the same false claim as the constant's old
+    /// `EXECUTED_` prefix, one call deeper, so it is renamed to what it actually
+    /// supplies — the authorised scheme — and the derivation claim is withdrawn. It
+    /// stays a function rather than an inline constant so this binding has one
+    /// reader, and `require_executable` remains the single place that consults it.
+    ///
+    /// The scheme carries no per-revision suffix: the execution owner qualifies the
+    /// scheme it presents with the approved revision's own `policy_sha256` when it
     /// stamps a view (`executed_ordering_revision` in eliot-context-assembly), so
-    /// the identity of two revisions with different declared orders still differs
-    /// on the view while the SCHEME this contract authorises is one string.
-    fn declared_ordering_revision() -> String {
-        EXECUTED_ORDERING_REVISION.to_owned()
+    /// the identity of two revisions with different declared orders still differs on
+    /// the view while the scheme this contract authorises is one string.
+    fn authorised_ordering_scheme() -> &'static str {
+        AUTHORISED_ORDERING_SCHEME
     }
 
     fn configured_features(&self) -> Result<BTreeSet<SemanticRole>, ContextError> {
@@ -1836,11 +1870,16 @@ pub struct RecipeExecutionSupport {
     /// `layout.role_positions`.
     ///
     /// #1724 W4: read by [`ContextRecipePolicy::require_executable`], which
-    /// refuses unless it equals [`EXECUTED_ORDERING_REVISION`]. Before that it was
+    /// refuses unless it equals [`AUTHORISED_ORDERING_SCHEME`]. Before that it was
     /// validated as non-empty text and compared with nothing, so the revision
     /// stamped on a delivered execution identity was never checked against the
     /// scheme this contract authorises — a token nothing read, added for the exact
     /// purpose this check now serves.
+    ///
+    /// This member is the OBSERVED side of that comparison and the constant is the
+    /// AUTHORISED side. The execution owner builds it from the scheme it applies
+    /// rather than from the contract's spelling, so the two are independent
+    /// statements that must agree.
     pub ordering_revision: ArtifactId,
     /// Whole-unit boundary kind this path emits for one budgeted section.
     ///

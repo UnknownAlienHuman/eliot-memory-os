@@ -26,11 +26,19 @@ use crate::{ContextError, ContextInput};
 /// - the stage is the single whole-unit compile-and-render stage;
 /// - the ordering SCHEME revision is `eliot_context_assembly::ASSEMBLY_ORDERING_REVISION`,
 ///   the scheme `assemble_active_view` renders under, read from that crate rather
-///   than restated here. The specific role ORDER is no longer a member of this
-///   record because it is no longer the execution owner's to state: the renderer
-///   applies the approved revision's own `layout.role_positions`, so the order is a
-///   function of the recipe and `require_executable` cross-checks only the scheme
-///   under which the recipe's order is applied;
+///   than restated here. This member is the DECLARATION side of `require_executable`'s
+///   ordering check and the contract's own scheme spelling is the AUTHORISATION
+///   side: the two crates hold separate spellings of one scheme because
+///   `eliot-context-assembly` depends on `eliot-context-contracts` and not the
+///   reverse, so the owner presents what it applies and the contract decides
+///   whether that is a scheme it authorises. Presenting a scheme the contract does
+///   not authorise refuses as `recipe_support.ordering_revision`, so changing the
+///   scheme this owner applies is refused by name until the contract authorises it
+///   too. The specific role ORDER is no longer a member of this record because it
+///   is no longer the execution owner's to state: the renderer applies the approved
+///   revision's own `layout.role_positions`, so the order is a function of the
+///   recipe and `require_executable` cross-checks only the scheme under which the
+///   recipe's order is applied;
 /// - the repetition treatment is `EXECUTED_REPETITION_POLICY`, which is what
 ///   the renderer does today: project each admitted record once, with
 ///   `AdmittedContextSet::validate` refusing a repeated atom identity;

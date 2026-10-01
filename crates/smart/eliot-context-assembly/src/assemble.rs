@@ -12,7 +12,8 @@ use thiserror::Error;
 
 use crate::{AssemblyError, boundary, bounds, measurement, render};
 
-/// Stable ordering SCHEME for the A-15 canonical rendered payload.
+/// Stable ordering SCHEME this execution path applies to the A-15 canonical
+/// rendered payload.
 ///
 /// #1724 W4. This names the SCHEME, not the order: the approved revision's declared
 /// role position, then provider, then atom identity. Before this change the scheme
@@ -25,6 +26,19 @@ use crate::{AssemblyError, boundary, bounds, measurement, render};
 /// [`executed_ordering_revision`]. Two revisions that declare different orders
 /// therefore cannot present the same executed ordering revision, and a revision
 /// whose declared order is refused produces no view at all.
+///
+/// #1724. THIS is the owner's own statement of the scheme it applies, and it is
+/// the only place in the source that states it: the execution owner presents it as
+/// `RecipeExecutionSupport::ordering_revision` and the contract's
+/// `require_executable` decides whether that presentation is one it authorises.
+/// The contract holds its own spelling of the scheme it is willing to accept and
+/// cannot read this constant, because this crate depends on
+/// `eliot-context-contracts` and the edge does not run the other way. The two
+/// spellings are therefore COMPARED, never shared, and the comparison is the
+/// coupling: change the scheme applied here without the contract authorising it and
+/// every publication refuses with `UnsupportedSetting` naming
+/// `recipe_support.ordering_revision`. That is the intended behaviour, so the
+/// scheme is changed here and in the contract's authorisation together.
 pub const ASSEMBLY_ORDERING_REVISION: &str = "a18.declared-role-position.v1";
 
 /// Caller-owned immutable parameters for one A-18 projection.
