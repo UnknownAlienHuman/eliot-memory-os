@@ -4672,6 +4672,39 @@ impl AgentFabric {
     /// the drive reports that no work is currently admissible. This method is
     /// the caller that makes the drive live the moment that owner lands.
     ///
+    /// Issue #370 R1 measured on `main` @ `27e9a94ef`, which is why the drive
+    /// cannot be unblocked from the daemon side. `admit` is refused by the
+    /// sealed verifier before any coordinator state moves, and the refusal
+    /// cannot be satisfied by anything this crate holds:
+    ///
+    /// - **No receipt producer.** `git grep "ProviderAdmissionReceipt {"` over
+    ///   `origin/main` returns the struct definition plus four sites, all test
+    ///   fixtures (`src/tests.rs`, `src/core/admission_normalization_tests.rs`,
+    ///   `tests/coordinator.rs`). `bins/eliotd` contains no construction site,
+    ///   so this fabric has no value it could forward to `admit`.
+    /// - **The verifier needs a claim the daemon cannot hold.** Building a
+    ///   receipt that survives `admit` requires the admitted lane's
+    ///   `attempt_id` to equal the `attempt_id` on the Kernel/ORS claim row
+    ///   loaded by `DaemonKernelClient::load_provider_claim_row_async`
+    ///   (`crates/agent/eliot-agent-coordinator/src/provider_admission.rs`,
+    ///   `receipt_proof_identity`), plus a non-zero owner-issued
+    ///   `expires_at_unix_ms`, plus an externally issued `AdmittedRouteReceipt`
+    ///   per lane. Those are the #1678 admission saga's identities, not
+    ///   daemon-local strings.
+    /// - **A typed result still needs this projection.** `submit_result`
+    ///   requires an entry in the coordinator's `attempts` map, whose only
+    ///   writer is `admit`. So a typed `submit_result` producer is downstream of
+    ///   the admission owner, and cannot be supplied ahead of it without
+    ///   minting an identity that owner did not issue.
+    ///
+    /// What #370 R1 did land is that the admission proof now refuses an
+    /// UNISSUED admission outright: `provider_admission::receipt_proof_identity`
+    /// compares the receipt's own recorded `expires_at_unix_ms` against zero and
+    /// fails the `ProviderProofKind::Admission` proof closed, so a receipt with
+    /// no owner-issued time bound can no longer reach `admit` at all. The
+    /// positive leg — proving a NONZERO bound was issued against a live
+    /// admission — still requires the owner.
+    ///
     /// # Errors
     ///
     /// Returns the coordinator owner rejection unchanged, including the
