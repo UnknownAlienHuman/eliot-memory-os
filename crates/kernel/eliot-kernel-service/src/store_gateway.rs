@@ -1608,19 +1608,14 @@ impl KernelStoreGateway {
                 mark_unknown_outcome(&owner, &sealed.token).map_err(|error| error.to_string())?;
                 drop(lease);
                 Err(format!(
-                    "reserved write outcome unknown for operation {operation_id}: {}; reconciling; reconcile by exact Store receipt",
-                    fault.error()
+                    "reserved write outcome unknown for operation {operation_id}: {fault}; reconciling; reconcile by exact Store receipt"
                 ))
             }
             // The Store owner proved the mutation was not applied, so the
             // still-`Eligible` token releases cleanly and nothing orphans.
             Err(ReservedWriteSendFault::Refused(fault)) => {
-                let refusal = refuse_determinate_reserved_write(
-                    &owner,
-                    &sealed.token,
-                    fault.error(),
-                    &operation_id,
-                );
+                let refusal =
+                    refuse_determinate_reserved_write(&owner, &sealed.token, &fault, &operation_id);
                 drop(lease);
                 Err(refusal)
             }

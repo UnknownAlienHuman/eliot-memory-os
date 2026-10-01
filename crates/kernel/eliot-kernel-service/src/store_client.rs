@@ -732,12 +732,6 @@ impl ReservedWriteSendFault {
     }
 
     /// Returns the owner's typed contract fault, unchanged.
-    pub(crate) fn error(&self) -> &StoreError {
-        match self {
-            Self::Refused(error) | Self::PossibleEffect(error) => error,
-        }
-    }
-
     /// Projects the fault onto the closed transport-boundary `StoreError`.
     ///
     /// The classification never collapses into the error: the typed contract
