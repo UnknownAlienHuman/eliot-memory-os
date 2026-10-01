@@ -1091,10 +1091,6 @@ impl AuditEventDraft {
     ) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.fill_envelope(envelope);
-        let Some(frame_identity) = frame.request_identity.as_ref() else {
-            return unavailable;
-        };
-        lineage.fill_request_identity(frame_identity);
         lineage.fill_route_receipt_actual(&receipt.receipt_sha256);
         Self {
             kind: AuditEventKind::QUEUE_ENVELOPE_ADMITTED,
@@ -3113,6 +3109,10 @@ impl crate::KernelComposition {
         }
         let mut lineage = AuditLineage::empty();
         lineage.fill_envelope(envelope);
+        let Some(frame_identity) = frame.request_identity.as_ref() else {
+            return unavailable;
+        };
+        lineage.fill_request_identity(frame_identity);
         if lineage.state_fence.as_ref() != Some(&envelope.state_fence)
             || lineage.trace_id.as_deref() != Some(envelope.identity.request_id.as_str())
         {

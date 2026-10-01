@@ -1599,10 +1599,8 @@ fn validate_original_owner_evidence_for_context(
             "operation_owner_evidence.authority_epoch",
         ))?;
     if runtime_context.active_trace_ref.as_deref() != Some(trace_id)
-        || work_scope.is_some_and(|value| runtime_context.work_scope_ref.as_deref() != Some(value))
-        || module_generation.is_some_and(|value| {
-            runtime_context.module_generation_ref.as_deref() != Some(value)
-        })
+        || runtime_context.work_scope_ref.as_deref() != work_scope
+        || runtime_context.module_generation_ref.as_deref() != module_generation
         || runtime_context.state_fence.as_ref() != Some(&state_fence)
         || identity_request_id != trace_id
         || identity_fence != state_fence
