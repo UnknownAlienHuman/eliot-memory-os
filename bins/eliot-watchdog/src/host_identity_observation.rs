@@ -11,10 +11,14 @@ use eliot_platform::PlatformHandle;
 #[cfg(test)]
 use eliot_platform_windows::WindowsAdapterError;
 use eliot_platform_windows::{
-    NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease, WindowsPlatform,
-    windows_paths_equal,
+    FileIdentity, NamedPipePeerProcessBinding, ProcessIdentity, ProtectedPathLease,
+    WindowsPlatform, windows_paths_equal,
 };
 use eliot_runtime_contracts::VerifiedSupervisionLease;
+
+use crate::independent_sensor::{
+    ApprovedSensorBinding, ArtifactDigestObservation, observe_approved_artifact_digest,
+};
 
 use super::{
     ApprovedHostRegistration, GapRecoveryReason, WatchdogRuntimeBinding, WatchdogRuntimeReadback,
@@ -88,6 +92,15 @@ pub struct HostIdentityMonitor {
     /// liveness observations and never influences the observation verdict.
     /// `None` (test-constructed monitors) is reported explicitly unavailable.
     observed_generation: Option<String>,
+    /// Typed approved installation+generation binding governing sensor
+    /// samples stamped from this monitor (#1755 W2). `None` for
+    /// test-constructed monitors and for production contours built without
+    /// the registry-selected manifest; without it no bound sample is issued.
+    sensor_binding: Option<ApprovedSensorBinding>,
+    /// Cached approved-artifact digest keyed by the retained lease identity
+    /// it was read through. Re-issued only while the same lease still
+    /// verifies; any lease replacement or verification failure drops it.
+    artifact_digest: Option<(FileIdentity, ArtifactDigestObservation)>,
 }
 
 impl HostIdentityMonitor {
@@ -101,6 +114,8 @@ impl HostIdentityMonitor {
             require_image_lease: false,
             require_registration_readback: false,
             observed_generation: None,
+            sensor_binding: None,
+            artifact_digest: None,
         }
     }
 
@@ -117,6 +132,8 @@ impl HostIdentityMonitor {
             require_image_lease: true,
             require_registration_readback: true,
             observed_generation: None,
+            sensor_binding: None,
+            artifact_digest: None,
         }
     }
 
@@ -132,6 +149,8 @@ impl HostIdentityMonitor {
             require_image_lease: true,
             require_registration_readback: true,
             observed_generation: None,
+            sensor_binding: None,
+            artifact_digest: None,
         }
     }
 
@@ -175,6 +194,10 @@ impl HostIdentityMonitor {
             && let Ok(lease) = ProtectedPathLease::open_existing_absolute(expected_image)
         {
             self.expected_image_lease = Some(lease);
+            // A fresh lease unbinds any cached digest: the cached value was
+            // read through a different retained handle and must never be
+            // re-issued under this one.
+            self.artifact_digest = None;
         }
         if self.require_image_lease
             && (self.expected_image_lease.is_none()
@@ -271,6 +294,51 @@ impl HostIdentityMonitor {
         self.observe_process_identity(binding.identity().clone())
     }
 
+    /// Observes the bounded content digest of the approved Host image through
+    /// the retained no-follow lease (#1755 W2).
+    ///
+    /// The digest is bound to the approved installation and target
+    /// generation retained from the registry-selected manifest, and to the
+    /// retained lease identity it was read through: a cached digest is
+    /// re-issued only while the same lease still verifies and the binding is
+    /// unchanged, and any verification failure drops it. Without an approved
+    /// binding or lease there is no sample at all — never a digest of an
+    /// unapproved path. Bytes are hashed, never retained.
+    #[must_use]
+    pub fn observe_approved_artifact(
+        &mut self,
+        limit: u64,
+    ) -> Option<ArtifactDigestObservation> {
+        let binding = self.sensor_binding.clone()?;
+        if let Some((identity, cached)) = self.artifact_digest.clone()
+            && cached.installation() == binding.installation()
+            && cached.generation() == binding.generation()
+            && let Some(lease) = self.expected_image_lease.as_ref()
+            && lease.identity() == identity
+            && lease.verify_stable_identity().is_ok()
+            && lease.verify_path_identity().is_ok()
+        {
+            return Some(cached);
+        }
+        let lease = self.expected_image_lease.as_ref()?;
+        match observe_approved_artifact_digest(&binding, lease, limit) {
+            Ok(observation) => {
+                self.artifact_digest = Some((lease.identity(), observation.clone()));
+                Some(observation)
+            }
+            Err(error) => {
+                self.artifact_digest = None;
+                tracing::debug!(
+                    event = "watchdog.artifact_digest_probe_failed",
+                    observation = "unobserved",
+                    reason = error.to_string(),
+                    "approved artifact digest unavailable; no ArtifactDigest sample this interval"
+                );
+                None
+            }
+        }
+    }
+
     #[must_use]
     pub(super) fn observe_process_identity(
         &mut self,
@@ -330,6 +398,14 @@ pub(super) fn classify_host_error(error: WindowsAdapterError) -> HostObservation
 pub trait HostObservationSource: Send + Sync + 'static {
     fn observe(&self) -> HostObservation;
 
+    /// Observes the bounded content digest of the approved Host image
+    /// through the source's retained no-follow lease (#1755 W2). The default
+    /// is deliberately `None` for test/read-only sources without an
+    /// approved binding: no sample is better than an unbound one.
+    fn observe_approved_artifact(&self, _limit: u64) -> Option<ArtifactDigestObservation> {
+        None
+    }
+
     /// Permits a process-identity rebaseline only after the composition has
     /// verified a fresh supervision lease. The default is deliberately a
     /// no-op for test/read-only sources.
@@ -363,9 +439,28 @@ impl LiveHostObservationSource {
         // target for liveness-observation identity. The observation verdict
         // never reads this value; a lock failure only leaves the generation
         // explicitly unavailable in later records.
+        //
+        // The same retained manifest also stamps the typed sensor binding
+        // (#1755 W2) that bound artifact samples carry. A manifest whose
+        // retained values cannot bind refuses here and is traced: the
+        // artifact sensor then issues no sample rather than an unbound one.
+        let sensor_binding =
+            match ApprovedSensorBinding::from_candidate_manifest(&binding.selected_manifest) {
+                Ok(bound) => Some(bound),
+                Err(error) => {
+                    tracing::debug!(
+                        event = "watchdog.sensor_binding_refused",
+                        observation = "unbound",
+                        reason = error.to_string(),
+                        "registry-selected manifest cannot bind sensor samples; artifact observations stay unobserved"
+                    );
+                    None
+                }
+            };
         if let Ok(mut monitor) = source.monitor.lock() {
             monitor.observed_generation =
                 Some(binding.selected_manifest.generation.as_str().to_owned());
+            monitor.sensor_binding = sensor_binding;
         }
         source
     }
@@ -406,6 +501,13 @@ impl HostObservationSource for LiveHostObservationSource {
             },
             |mut monitor| monitor.observe(),
         )
+    }
+
+    fn observe_approved_artifact(&self, limit: u64) -> Option<ArtifactDigestObservation> {
+        self.monitor
+            .lock()
+            .ok()
+            .and_then(|mut monitor| monitor.observe_approved_artifact(limit))
     }
 
     fn rebaseline_after_verified_lease(&self, _lease: &VerifiedSupervisionLease) {
