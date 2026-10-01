@@ -31,6 +31,11 @@ pub const TASK_CONTROLLER_ATTEMPT_WIRE_VERSION: u16 = 1;
 pub const TASK_CONTROLLER_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.task-controller-result-body";
 /// Current Task Controller result-body wire version.
 pub const TASK_CONTROLLER_RESULT_BODY_WIRE_VERSION: u16 = 1;
+/// Stable wire identity for one authenticated Coordinate requester intent.
+pub const TASK_CONTROLLER_COORDINATE_INTENT_WIRE_ID: &str =
+    "eliot.protocol.task-controller-coordinate-intent";
+/// Current Coordinate requester-intent wire version.
+pub const TASK_CONTROLLER_COORDINATE_INTENT_WIRE_VERSION: u16 = 1;
 
 const MAX_TASK_CONTROLLER_TEXT_BYTES: usize = 512;
 const MAX_TASK_CONTROLLER_VALUE_BYTES: usize = MAX_FRAME_BYTES;
@@ -97,6 +102,98 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
+    /// Admit one explicit human-authored Coordinate intent.
+    Coordinate,
+}
+
+/// Requester-authored Coordinate intent attached to an authenticated Task
+/// Controller claim. The exact requester JSON is retained byte-for-byte;
+/// staffing intent, constraints, and owner locators are semantic input only,
+/// never owner readbacks or currentness evidence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TaskControllerCoordinateIntentV1 {
+    /// Coordinate intent wire identity.
+    pub wire_id: String,
+    /// Coordinate intent wire version.
+    pub wire_version: u16,
+    /// Stable identity assigned by the authenticated Task Controller owner.
+    pub request_id: String,
+    /// Original canonical requester JSON; these exact bytes are the source
+    /// material from which the daemon parses the delegate goal.
+    pub canonical_request_json: String,
+    /// SHA-256 of `canonical_request_json`'s exact bytes.
+    pub canonical_request_sha256: String,
+    /// Explicit human staffing intent, decoded by the daemon's native owner.
+    pub human_staffing_intent: Value,
+    /// Requested constraints; these are intent, not current owner evidence.
+    pub requested_constraints: Value,
+    /// Bounded owner locators that select rows for independent reads only.
+    pub owner_locators: Vec<Value>,
+}
+
+impl TaskControllerCoordinateIntentV1 {
+    /// Validates transport shape, exact canonical requester bytes, and bounds.
+    /// Semantic staffing and owner currentness remain with the daemon owners.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != TASK_CONTROLLER_COORDINATE_INTENT_WIRE_ID
+            || self.wire_version != TASK_CONTROLLER_COORDINATE_INTENT_WIRE_VERSION
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_coordinate_intent.wire",
+                reason: "unsupported Coordinate intent wire",
+            });
+        }
+        bounded_text(&self.request_id, "task_controller_coordinate_intent.request_id")?;
+        lowercase_sha256(
+            &self.canonical_request_sha256,
+            "task_controller_coordinate_intent.canonical_request_sha256",
+        )?;
+        if self.canonical_request_json.is_empty()
+            || self.canonical_request_json.len() > MAX_TASK_CONTROLLER_VALUE_BYTES
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_coordinate_intent.canonical_request_json",
+                reason: "request bytes must be non-empty and within the bounded JSON limit",
+            });
+        }
+        let request: Value = serde_json::from_str(&self.canonical_request_json)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if !request.is_object() {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_coordinate_intent.canonical_request_json",
+                reason: "request bytes must encode a JSON object",
+            });
+        }
+        let canonical = canonical_json_bytes(&request)
+            .map_err(|error| ProtocolError::Json(error.to_string()))?;
+        if canonical.as_slice() != self.canonical_request_json.as_bytes()
+            || eliot_contracts::sha256_hex(&canonical) != self.canonical_request_sha256
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_coordinate_intent.canonical_request_sha256",
+                reason: "digest must bind the exact original canonical requester bytes",
+            });
+        }
+        structured_object(
+            &self.human_staffing_intent,
+            "task_controller_coordinate_intent.human_staffing_intent",
+        )?;
+        structured_object(
+            &self.requested_constraints,
+            "task_controller_coordinate_intent.requested_constraints",
+        )?;
+        if self.owner_locators.len() > 32 {
+            return Err(ProtocolError::InvalidField {
+                field: "task_controller_coordinate_intent.owner_locators",
+                reason: "exceeds the bounded owner-selector count",
+            });
+        }
+        for locator in &self.owner_locators {
+            structured_object(locator, "task_controller_coordinate_intent.owner_locators")?;
+        }
+        Ok(())
+    }
 }
 
 /// Owner-native material bundle used only for a complete campaign-owner
@@ -205,6 +302,12 @@ impl TaskControllerInvocation {
             ),
         ] {
             structured_object(value, field)?;
+        }
+        if self.action == TaskControllerAction::Coordinate {
+            let intent: TaskControllerCoordinateIntentV1 =
+                serde_json::from_value(self.task_input.clone())
+                    .map_err(|error| ProtocolError::Json(error.to_string()))?;
+            intent.validate()?;
         }
         if let Some(selector) = &self.prior_delivery_selector {
             structured_object(
@@ -446,4 +549,46 @@ fn validate_operation_id(value: &str, field: &'static str) -> Result<(), Protoco
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod coordinate_intent_tests {
+    use super::*;
+
+    fn intent() -> TaskControllerCoordinateIntentV1 {
+        let request = serde_json::json!({
+            "expected_result": "report",
+            "goal": "summarize the accepted change",
+            "operation": "delegate",
+            "owned_resources": ["src/lib.rs"],
+        });
+        let canonical = canonical_json_bytes(&request).expect("canonical requester bytes");
+        TaskControllerCoordinateIntentV1 {
+            wire_id: TASK_CONTROLLER_COORDINATE_INTENT_WIRE_ID.to_owned(),
+            wire_version: TASK_CONTROLLER_COORDINATE_INTENT_WIRE_VERSION,
+            request_id: "coordinate-request-1".to_owned(),
+            canonical_request_json: String::from_utf8(canonical.clone()).expect("UTF-8"),
+            canonical_request_sha256: eliot_contracts::sha256_hex(&canonical),
+            human_staffing_intent: serde_json::json!({"mode":"solo"}),
+            requested_constraints: serde_json::json!({"max_workers":1}),
+            owner_locators: vec![serde_json::json!({"task":"task:1"})],
+        }
+    }
+
+    #[test]
+    fn coordinate_intent_accepts_exact_original_request_and_owner_selectors() {
+        intent()
+            .validate()
+            .expect("exact requester intent is bounded and well formed");
+    }
+
+    #[test]
+    fn coordinate_intent_refuses_changed_request_bytes() {
+        let mut changed = intent();
+        changed.canonical_request_json.push(' ');
+        assert!(
+            changed.validate().is_err(),
+            "changed original bytes must not retain the original digest"
+        );
+    }
 }
