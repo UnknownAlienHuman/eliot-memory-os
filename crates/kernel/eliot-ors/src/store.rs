@@ -7167,8 +7167,12 @@ impl RedbRecoveryStore {
         let mut table = write
             .open_table(SCAN_DISCLOSURE_QUARANTINE)
             .map_err(storage)?;
-        if let Some(raw) = table.get(record.quarantine_key.as_str()).map_err(storage)? {
-            let existing: crate::ScanDisclosureQuarantineRecord = decode(raw.value())?;
+        let existing_raw = table
+            .get(record.quarantine_key.as_str())
+            .map_err(storage)?
+            .map(|value| value.value().to_owned());
+        if let Some(raw) = existing_raw {
+            let existing: crate::ScanDisclosureQuarantineRecord = decode(&raw)?;
             existing.validate()?;
             validate_scan_disclosure_quarantine_installation(&existing, &store_identity)?;
             if existing.quarantine_key != record.quarantine_key || !existing.same_binding(record) {
