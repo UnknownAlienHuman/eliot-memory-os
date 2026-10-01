@@ -43,18 +43,35 @@ impl KernelHandoffReceipt {
     ///
     /// A running or unobserved prior contour produces an error instead: Host
     /// may not write a handoff receipt for a Kernel it has not terminated.
+    /// A `Terminated` contour is re-validated against its ORIGINAL evidence
+    /// here as well: without job-empty, root-reaped and history-complete
+    /// observations plus a terminal process state, the variant alone proves
+    /// neither process termination nor lock release, so no receipt is
+    /// written and the cutover stops in manual recovery.
     pub(super) fn for_disposition(
         disposition: &PriorKernelDisposition,
     ) -> Result<Option<Self>, HostError> {
         match disposition {
             PriorKernelDisposition::NoPriorKernel => Ok(None),
-            PriorKernelDisposition::Terminated(prior) => Ok(Some(Self {
-                owner_object: kernel_owner_mutex_name(
-                    &prior.host.installation,
-                    &prior.activation_identity,
-                ),
-                prior: prior.clone(),
-            })),
+            PriorKernelDisposition::Terminated(prior) => {
+                if !(prior.history_complete
+                    && prior.job_empty
+                    && prior.root_reaped
+                    && prior.process.state.is_terminal())
+                {
+                    return Err(HostError::RecoveryRequired(
+                        "Kernel handoff receipt requires fully terminated prior contour evidence"
+                            .to_owned(),
+                    ));
+                }
+                Ok(Some(Self {
+                    owner_object: kernel_owner_mutex_name(
+                        &prior.host.installation,
+                        &prior.activation_identity,
+                    ),
+                    prior: prior.clone(),
+                }))
+            }
             PriorKernelDisposition::Running(_) | PriorKernelDisposition::Unknown(_) => {
                 Err(HostError::RecoveryRequired(
                     "Kernel handoff receipt requires an exactly terminated prior contour"
