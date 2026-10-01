@@ -62,9 +62,13 @@ pub struct EffectOperationLeaseAdmission {
     pub allowed_scope: CapabilityRouteScope,
     /// Authority Epoch the lease is issued under.
     pub authority_epoch: AuthorityEpoch,
-    /// Admitting Module Catalog revision. Must be non-zero.
+    /// Admitting Module Catalog revision. Must be non-zero, and must equal
+    /// the manifest's recorded admitting Catalog revision: a lease cannot be
+    /// issued against a revision the Governor never admitted for this
+    /// manifest (I1.9 line 52).
     pub catalog_revision: u64,
-    /// Admitting Policy revision. Must be non-zero.
+    /// Admitting Policy revision. Must be non-zero, and must equal the
+    /// manifest's recorded admitting Policy revision, for the same reason.
     pub policy_revision: u64,
     /// Issue time in Unix milliseconds.
     pub issued_at_ms: i64,
@@ -123,8 +127,13 @@ impl EffectOperationLease {
     /// The module identity, generation and manifest hash are copied from
     /// `manifest`, so a lease cannot be admitted against a different manifest.
     /// Issuance is refused for a `read_rebuild` manifest, which is never effect
-    /// capable, and for a scope that is not one of the manifest's recorded
-    /// allowed scopes.
+    /// capable, for a scope that is not one of the manifest's recorded
+    /// allowed scopes, and for admitting Catalog/Policy revisions that differ
+    /// from the manifest's recorded Governor-admitted revisions, so the
+    /// Kernel side cannot mint a lease against revisions the Governor never
+    /// admitted for this manifest (I1.9 line 52). The replay verifier
+    /// independently requires the same agreement before any admission, so a
+    /// lease issued here always carries revisions the gate can accept.
     pub fn issue(
         manifest: &KernelExecutionManifest,
         admission: EffectOperationLeaseAdmission,
@@ -134,6 +143,18 @@ impl EffectOperationLease {
             return Err(OrsError::InvalidField {
                 field: "effect_operation_lease_manifest_class",
                 reason: "only an effect-capable manifest may admit an effect operation lease",
+            });
+        }
+        if admission.catalog_revision != manifest.admission.catalog_revision {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_catalog_revision",
+                reason: "must equal the manifest's recorded admitting Catalog revision",
+            });
+        }
+        if admission.policy_revision != manifest.admission.policy_revision {
+            return Err(OrsError::InvalidField {
+                field: "effect_operation_lease_policy_revision",
+                reason: "must equal the manifest's recorded admitting Policy revision",
             });
         }
         let scope_admitted = manifest
