@@ -49,8 +49,9 @@ use crate::{
 };
 use eliot_authority::{
     CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
-    GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
-    IntroductionStatus, P07AuthorityPort, P07PortError, RevocationOperationIdentity,
+    GrantRecoveryRecord, GrantStatus, IntroductionActivationRequest, IntroductionId,
+    IntroductionRevocationRequest, IntroductionStatus, P07AuthorityPort, P07PortError,
+    RevocationOperationIdentity,
     RevocationOrigin, RevocationTransitionDisposition, RevocationTransitionRequest,
     RootTransitionActivationReceipt, RootTransitionActivationRequest,
 };
@@ -87,6 +88,7 @@ use eliot_instrument_api::{
 use eliot_instrument_nextest::{
     NextestTestEvent, NextestTestStatus, catalog_test_id, parse_test_events,
 };
+use eliot_kernel_core::GrantActivationIntent;
 use eliot_maintenance::{
     AutomationDecision, AutomationTriggerDecision, MaintenanceController, MaintenanceError,
     MaintenanceFamily, MaintenanceJob, MaintenanceJobState, MaintenanceStateStore,
@@ -4874,6 +4876,14 @@ pub struct InitialScopeBindingAdmissionRequest<'a> {
     pub admission_deadline: u64,
 }
 
+struct InitialScopeGrantValidation<'a> {
+    intents: Vec<&'a GrantActivationIntent>,
+    grants: &'a [GrantRecoveryRecord],
+    graph_revision: u64,
+    fence: &'a StateFence,
+    now_ms: i64,
+}
+
 #[derive(Clone, Copy)]
 struct ObservationCaptureSessionOwnerRequest<'a> {
     authenticated_principal_ref: &'a str,
@@ -7884,77 +7894,161 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         request: InitialScopeBindingAdmissionRequest<'_>,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
-        let InitialScopeBindingAdmissionRequest {
-            now,
-            authenticated_identity,
-            task_binding,
-            work_scope_ref,
-            state_fence,
-            descriptor,
-            owner_revision,
-            retained_snapshot,
-            binding,
-            observed,
-            sources,
-            privacy,
-            source_candidates,
-            declared_precedences,
-            absence_reason_ref,
-            admission_deadline,
-        } = request;
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
         let fence = self.snapshot.state_fence();
-        if !fences_match_exact(&fence, state_fence)
-            || descriptor.state_fence != fence
-            || descriptor.privacy != *privacy
-            || descriptor.scope_ref != work_scope_ref
-            || binding.scope.scope_ref != work_scope_ref
-            || admission_deadline < now
+        if !fences_match_exact(&fence, request.state_fence)
+            || request.descriptor.state_fence != fence
+            || request.descriptor.privacy != *request.privacy
+            || request.descriptor.scope_ref != request.work_scope_ref
+            || request.binding.scope.scope_ref != request.work_scope_ref
+            || request.admission_deadline < request.now
         {
             return Err(CompositionError::ActivationStaleFence);
         }
 
-        let replay_owner =
-            self.validate_initial_scope_owner_revision(owner_revision, retained_snapshot, &fence)?;
+        let replay_owner = self.validate_initial_scope_owner_revision(
+            request.owner_revision,
+            request.retained_snapshot,
+            &fence,
+        )?;
 
         let (task_state, task_contract) = self
             .current_task_binding_state_for_initial_scope(
-                now,
-                authenticated_identity,
-                work_scope_ref,
-                state_fence,
-                task_binding,
+                request.now,
+                request.authenticated_identity,
+                request.work_scope_ref,
+                request.state_fence,
+                request.task_binding,
             )
             .await?;
-        let TaskBindingState::CurrentTaskContract {
-            task_ref,
-            task_revision,
-            acceptance_digest,
-            selection_source_ref,
-            evidence_ref,
-        } = task_state
-        else {
+        if !matches!(&task_state, TaskBindingState::CurrentTaskContract { .. }) {
             return Err(CompositionError::ActivationStaleFence);
-        };
+        }
 
         let policy_snapshot = self.current_initial_scope_policy_snapshot(&fence)?;
 
-        let (principal_ref, session_ref) = authenticated_identity;
+        let (principal_ref, _) = authenticated_identity;
         let is_policy_owner = principal_ref == policy_snapshot.policy_owner.owner_ref;
-        for authority in source_candidates
+        self.validate_initial_scope_privacy_authority(
+            request.now,
+            request.authenticated_identity,
+            request.work_scope_ref,
+            &fence,
+            request.privacy,
+            is_policy_owner,
+        )?;
+        Self::validate_initial_scope_source_admission(
+            &request,
+            task_state,
+            &task_contract,
+            &policy_snapshot.policy_owner.owner_ref,
+            &fence,
+            request.now,
+        )?;
+
+        Self::issue_or_replay_initial_scope_owner(&request, &fence, replay_owner)
+    }
+
+    fn issue_or_replay_initial_scope_owner(
+        request: &InitialScopeBindingAdmissionRequest<'_>,
+        fence: &StateFence,
+        replay_owner: Option<WorkScopeBindingOwner>,
+    ) -> Result<WorkScopeBindingOwner, CompositionError> {
+        if !request.privacy.admits(request.binding.privacy_class) {
+            return Err(CompositionError::Recovery(
+                "WorkScope privacy boundary does not admit the binding's source class"
+                    .to_owned(),
+            ));
+        }
+        let observed_binding = observed_scope_binding(
+            request.binding,
+            request.observed,
+            request.binding.privacy_class,
+            request.binding.governing_source_generation,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let admitted = admit_initial_binding(
+            request.descriptor,
+            request.owner_revision,
+            fence,
+            request.binding,
+            &observed_binding,
+            request.sources,
+            request.privacy,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let Some(retained) = replay_owner else {
+            return Ok(admitted);
+        };
+        let retained_snapshot = retained
+            .read_current(fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let admitted_snapshot = admitted
+            .read_current(fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if retained_snapshot != admitted_snapshot {
+            return Err(CompositionError::Recovery(
+                "retained WorkScope snapshot differs from the fully re-admitted original binding"
+                    .to_owned(),
+            ));
+        }
+        Ok(retained)
+    }
+
+    fn validate_initial_scope_source_admission(
+        request: &InitialScopeBindingAdmissionRequest<'_>,
+        task_state: TaskBindingState,
+        task_contract: &TaskContractAcceptanceSet,
+        policy_owner_ref: &str,
+        fence: &StateFence,
+        now: u64,
+    ) -> Result<(), CompositionError> {
+        Self::validate_initial_scope_claims(request, &task_state, task_contract, policy_owner_ref)?;
+        Self::validate_initial_scope_candidate_roots(request)?;
+        let admission_request = Self::initial_scope_source_request(
+            request,
+            task_state,
+            task_contract,
+            policy_owner_ref,
+            fence,
+        )?;
+        Self::admit_and_compare_initial_sources(
+            admission_request,
+            request.sources,
+            policy_owner_ref,
+            fence,
+            request.admission_deadline,
+            now,
+        )
+    }
+
+    fn validate_initial_scope_claims(
+        request: &InitialScopeBindingAdmissionRequest<'_>,
+        task_state: &TaskBindingState,
+        task_contract: &TaskContractAcceptanceSet,
+        policy_owner_ref: &str,
+    ) -> Result<(), CompositionError> {
+        let TaskBindingState::CurrentTaskContract { task_ref, .. } = task_state else {
+            return Err(CompositionError::ActivationStaleFence);
+        };
+        for authority in request
+            .source_candidates
             .iter()
             .filter_map(|candidate| candidate.claim.as_ref())
             .chain(
-                declared_precedences
+                request
+                    .declared_precedences
                     .iter()
                     .map(|declaration| &declaration.authority),
             )
         {
             match authority {
                 AuthorityBasis::HumanOwner { owner_ref } => {
-                    if owner_ref != &policy_snapshot.policy_owner.owner_ref || !is_policy_owner {
+                    if owner_ref != policy_owner_ref
+                        || request.authenticated_identity.0 != policy_owner_ref
+                    {
                         return Err(CompositionError::Recovery(
                             "Human source authority is not the authenticated current policy/task owner"
                                 .to_owned(),
@@ -7965,8 +8059,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     binding_ref,
                     task_ref: delegated_task_ref,
                 } => {
-                    if delegated_task_ref != &task_ref
-                        || (binding_ref != &selection_source_ref && binding_ref != &evidence_ref)
+                    let TaskBindingState::CurrentTaskContract {
+                        selection_source_ref,
+                        evidence_ref,
+                        ..
+                    } = task_state
+                    else {
+                        return Err(CompositionError::ActivationStaleFence);
+                    };
+                    if delegated_task_ref != task_ref
+                        || (binding_ref != selection_source_ref && binding_ref != evidence_ref)
                     {
                         return Err(CompositionError::Recovery(
                             "source delegation does not name the exact live selected WorkLease and task"
@@ -7984,34 +8086,32 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 }
             }
         }
+        Ok(())
+    }
 
-        self.validate_initial_scope_privacy_authority(
-            now,
-            authenticated_identity,
-            work_scope_ref,
-            &fence,
-            privacy,
-            is_policy_owner,
-        )?;
-
-        let observed_instance = observed.instances.first().ok_or_else(|| {
+    fn validate_initial_scope_candidate_roots(
+        request: &InitialScopeBindingAdmissionRequest<'_>,
+    ) -> Result<(), CompositionError> {
+        let observed_instance = request.observed.instances.first().ok_or_else(|| {
             CompositionError::Recovery(
                 "initial WorkScope binding has no independent observed instance".to_owned(),
             )
         })?;
-        if descriptor.root_identities.is_empty()
-            || !descriptor
+        if request.descriptor.root_identities.is_empty()
+            || !request
+                .descriptor
                 .root_identities
                 .contains(&observed_instance.root_identity)
-            || !observed
+            || !request
+                .observed
                 .root_identities
                 .contains(&observed_instance.root_identity)
-            || source_candidates.iter().any(|candidate| {
+            || request.source_candidates.iter().any(|candidate| {
                 !matches!(
                     &candidate.origin,
                     SourceCandidateOrigin::AuthenticatedRoot { root_identity }
                         if root_identity == &observed_instance.root_identity
-                            && descriptor.root_identities.contains(root_identity)
+                            && request.descriptor.root_identities.contains(root_identity)
                 )
             })
         {
@@ -8020,13 +8120,32 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     .to_owned(),
             ));
         }
+        Ok(())
+    }
 
-        let mut request = SourceAdmissionRequest {
-            scope_ref: binding.scope.scope_ref.clone(),
-            generation: binding.scope.generation,
-            candidates: source_candidates.to_vec(),
-            precedences: declared_precedences.to_vec(),
-            required_owner_ref: policy_snapshot.policy_owner.owner_ref.clone(),
+    fn initial_scope_source_request(
+        request: &InitialScopeBindingAdmissionRequest<'_>,
+        task_state: TaskBindingState,
+        task_contract: &TaskContractAcceptanceSet,
+        policy_owner_ref: &str,
+        fence: &StateFence,
+    ) -> Result<SourceAdmissionRequest, CompositionError> {
+        let TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+            selection_source_ref,
+            evidence_ref,
+        } = task_state
+        else {
+            return Err(CompositionError::ActivationStaleFence);
+        };
+        let mut admission_request = SourceAdmissionRequest {
+            scope_ref: request.binding.scope.scope_ref.clone(),
+            generation: request.binding.scope.generation,
+            candidates: request.source_candidates.to_vec(),
+            precedences: request.declared_precedences.to_vec(),
+            required_owner_ref: policy_owner_ref.to_owned(),
             proven_current_bindings: vec![TaskBindingState::CurrentTaskContract {
                 task_ref,
                 task_revision,
@@ -8035,34 +8154,29 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 evidence_ref,
             }],
             proven_contracts: Vec::new(),
-            absence_reason_ref: absence_reason_ref.map(str::to_owned),
+            absence_reason_ref: request.absence_reason_ref.map(str::to_owned),
             state_fence: fence.clone(),
-            expires_at: admission_deadline,
+            expires_at: request.admission_deadline,
         };
         let mut proven_contract_refs = BTreeSet::new();
-        for contract_ref in source_candidates
+        for contract_ref in request
+            .source_candidates
             .iter()
             .filter_map(|candidate| candidate.claim.as_ref())
             .chain(
-                declared_precedences
+                request
+                    .declared_precedences
                     .iter()
                     .map(|declaration| &declaration.authority),
             )
             .filter_map(|basis| match basis {
                 AuthorityBasis::ProjectContract { contract_ref } => Some(contract_ref),
-                AuthorityBasis::HumanOwner { .. } | AuthorityBasis::DelegatedTaskBinding { .. } => {
-                    None
-                }
+                AuthorityBasis::HumanOwner { .. }
+                | AuthorityBasis::DelegatedTaskBinding { .. } => None,
             })
         {
-            if contract_ref.as_str() != task_contract.task_id.as_str() {
-                return Err(CompositionError::Recovery(
-                    "project-contract source claim does not name the exact current owner-admitted TaskContract"
-                        .to_owned(),
-                ));
-            }
             if proven_contract_refs.insert(contract_ref.clone()) {
-                request = request
+                admission_request = admission_request
                     .with_proven_contract(
                         contract_ref.clone(),
                         task_contract.acceptance_digest.clone(),
@@ -8070,63 +8184,35 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                     .map_err(|error| CompositionError::Recovery(error.to_string()))?;
             }
         }
-        let source_admission = Self::admit_governing_sources_for_scope(request, now)?;
-        source_admission
+        Ok(admission_request)
+    }
+
+    fn admit_and_compare_initial_sources(
+        admission_request: SourceAdmissionRequest,
+        sources: &GoverningSourceSet,
+        policy_owner_ref: &str,
+        fence: &StateFence,
+        deadline: u64,
+        now: u64,
+    ) -> Result<(), CompositionError> {
+        let admission = Self::admit_governing_sources_for_scope(admission_request, now)?;
+        admission
             .validate()
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        source_admission
+        admission
             .require_live(now)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if source_admission.admitted != *sources
-            || source_admission.required_owner_ref != policy_snapshot.policy_owner.owner_ref
-            || source_admission.state_fence != fence
-            || source_admission.expires_at != admission_deadline
+        if admission.admitted != *sources
+            || admission.required_owner_ref != policy_owner_ref
+            || admission.state_fence != *fence
+            || admission.expires_at != deadline
         {
             return Err(CompositionError::Recovery(
                 "original governing source set differs from current owner-validated admission"
                     .to_owned(),
             ));
         }
-
-        if !privacy.admits(binding.privacy_class) {
-            return Err(CompositionError::Recovery(
-                "WorkScope privacy boundary does not admit the binding's source class".to_owned(),
-            ));
-        }
-
-        let observed_binding = observed_scope_binding(
-            binding,
-            observed,
-            binding.privacy_class,
-            binding.governing_source_generation,
-        )
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let admitted = admit_initial_binding(
-            descriptor,
-            owner_revision,
-            &fence,
-            binding,
-            &observed_binding,
-            sources,
-            privacy,
-        )
-        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        if let Some(retained) = replay_owner {
-            let retained_snapshot = retained
-                .read_current(&fence)
-                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-            let admitted_snapshot = admitted
-                .read_current(&fence)
-                .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-            if retained_snapshot != admitted_snapshot {
-                return Err(CompositionError::Recovery(
-                    "retained WorkScope snapshot differs from the fully re-admitted original binding"
-                        .to_owned(),
-                ));
-            }
-            return Ok(retained);
-        }
-        Ok(admitted)
+        Ok(())
     }
 
     fn validate_initial_scope_owner_revision(
@@ -8253,8 +8339,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 )
             })?;
         let graph_revision = self.owners.authority.grants.revision();
+        let authority_snapshot = self.owners.authority.snapshot()?;
         if owner_hydrations.state_fence != *fence
             || owner_hydrations.grant_graph_revision != graph_revision
+            || authority_snapshot.state_fence != *fence
+            || authority_snapshot.grant_graph.revision != graph_revision
         {
             return Err(CompositionError::ActivationStaleFence);
         }
@@ -8299,50 +8388,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "initial WorkScope binding time exceeds the authority clock range".to_owned(),
             )
         })?;
+        let validation = InitialScopeGrantValidation {
+            intents,
+            grants: &authority_snapshot.grant_graph.grants,
+            graph_revision,
+            fence,
+            now_ms,
+        };
         for class in &privacy.admitted_classes {
             let label = class_label(*class);
             let covered = matching_leaves.iter().any(|leaf| {
-                let mut current = Some(*leaf);
-                let mut seen = BTreeSet::new();
-                while let Some(intent) = current {
-                    if !seen.insert(intent.grant_id.as_str())
-                        || intent
-                            .mechanical_subset
-                            .verify_recorded_commitment()
-                            .is_err()
-                        || intent.mechanical_subset.binding.state_fence != *fence
-                        || intent.mechanical_subset.holder_principal != intent.holder_principal
-                        || intent.mechanical_subset.session_id != intent.session_id
-                        || intent.mechanical_subset.scope_id != intent.scope_id
-                        || intent.issued_at_ms > now_ms
-                        || !intent
-                            .expires_at_ms
-                            .is_some_and(|expires_at_ms| now_ms < expires_at_ms)
-                        || !intent
-                            .mechanical_subset
-                            .data_classes
-                            .iter()
-                            .any(|authorized| authorized == label)
-                    {
-                        return false;
-                    }
-                    let Ok(grant_id) = GrantId::new(intent.grant_id.clone()) else {
-                        return false;
-                    };
-                    if !self.owners.authority.grants.grant_is_admitted(&grant_id) {
-                        return false;
-                    }
-                    current = intent.parent_grant_id.as_deref().and_then(|parent| {
-                        intents.iter().copied().find(|candidate| {
-                            candidate.grant_id == parent
-                                && candidate.grant_graph_revision == graph_revision
-                        })
-                    });
-                    if intent.parent_grant_id.is_some() && current.is_none() {
-                        return false;
-                    }
-                }
-                true
+                self.initial_scope_grant_path_covers_class(leaf, &validation, label)
             });
             if !covered {
                 return Err(CompositionError::Recovery(format!(
@@ -8351,6 +8407,72 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             }
         }
         Ok(())
+    }
+
+    fn initial_scope_grant_path_covers_class(
+        &self,
+        leaf: &GrantActivationIntent,
+        validation: &InitialScopeGrantValidation<'_>,
+        class_label: &str,
+    ) -> bool {
+        let mut current = Some(leaf);
+        let mut seen = BTreeSet::new();
+        while let Some(intent) = current {
+            if !seen.insert(intent.grant_id.as_str())
+                || intent.mechanical_subset.verify_recorded_commitment().is_err()
+                || intent.mechanical_subset.binding.state_fence != *validation.fence
+                || intent.mechanical_subset.holder_principal != intent.holder_principal
+                || intent.mechanical_subset.session_id != intent.session_id
+                || intent.mechanical_subset.scope_id != intent.scope_id
+                || intent.issued_at_ms > validation.now_ms
+                || intent
+                    .expires_at_ms
+                    .is_none_or(|expires_at_ms| validation.now_ms >= expires_at_ms)
+                || intent
+                    .mechanical_subset
+                    .data_classes
+                    .iter()
+                    .all(|authorized| authorized != class_label)
+            {
+                return false;
+            }
+            let Some(grant) = validation
+                .grants
+                .iter()
+                .find(|grant| grant.grant_id == intent.grant_id)
+            else {
+                return false;
+            };
+            let Ok(issued_at_ms) = i64::try_from(grant.issued_at) else {
+                return false;
+            };
+            let Ok(expires_at_ms) = i64::try_from(grant.expires_at) else {
+                return false;
+            };
+            if intent.issued_at_ms != issued_at_ms
+                || intent.expires_at_ms != Some(expires_at_ms)
+                || intent.mechanical_subset.issued_at_ms != issued_at_ms
+                || intent.mechanical_subset.expires_at_ms != Some(expires_at_ms)
+            {
+                return false;
+            }
+            let Ok(grant_id) = GrantId::new(intent.grant_id.clone()) else {
+                return false;
+            };
+            if !self.owners.authority.grants.grant_is_admitted(&grant_id) {
+                return false;
+            }
+            current = intent.parent_grant_id.as_deref().and_then(|parent| {
+                validation.intents.iter().copied().find(|candidate| {
+                    candidate.grant_id == parent
+                        && candidate.grant_graph_revision == validation.graph_revision
+                })
+            });
+            if intent.parent_grant_id.is_some() && current.is_none() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Installs an admitted `WorkScope` owner as the in-memory binding
