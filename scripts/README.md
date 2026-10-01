@@ -62,6 +62,7 @@ committed as repository authority.
 | `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 | `generate_reason_codes.py` | Render the I7.20 reason-code projection (`docs/generated/reason-codes.md`) from the `eliot-protocol` Rust registry, verified against the normative I7.20 canonical set; `--check` fails on a stale projection (#1743) | Generated reason-code projection only |
+| `gen_backup_link_denominator.py` | Re-measure the #974 backup-link denominator fixture's manifest identity digests and frozen edge line anchors from committed blobs; `--check` (default) fails on a stale identity and `--write` refreshes only those measured fields, refusing to write if admission evidence or the frozen base moved | Regenerated measured manifest identity digests for the #974 backup-link denominator only; asserts no dependency, edge, boundary or implementation property |
 
 The three public documentation entrypoints are intentionally small front doors.
 Their `*_core.py` modules retain the established implementations while the front
