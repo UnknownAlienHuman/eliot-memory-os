@@ -850,6 +850,41 @@ pub struct PreparedWorkScopeSourceAdmission {
     pub receipt_work_scope_binding_sha256: String,
 }
 
+impl PreparedWorkScopeSourceAdmission {
+    /// Accepts only the exact committed receipt produced by applying this
+    /// transition with the Kernel-retained authority and Policy parent.
+    ///
+    /// This rejects a Store response that committed the mutation under a
+    /// different authority, genesis causal chain, fence, request, operation,
+    /// or WorkScope binding. The caller must run this before installing the
+    /// prepared owner or reporting the BindScope operation as complete.
+    pub fn validate_write_receipt(
+        &self,
+        receipt: &eliot_store_api::WriteReceipt,
+    ) -> Result<(), WorkScopeSourceAdmissionError> {
+        receipt
+            .validate()
+            .map_err(|_| WorkScopeSourceAdmissionError::CommittedReceiptMismatch)?;
+        let envelope = receipt
+            .envelope
+            .as_ref()
+            .ok_or(WorkScopeSourceAdmissionError::CommittedReceiptMismatch)?;
+        if receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || receipt.operation_id != self.transition.identity.operation_id
+            || receipt.idempotency_key != self.transition.identity.idempotency_key
+            || receipt.state_fence != self.transition.state_fence
+            || envelope.core.request.metadata != self.envelope.request
+            || envelope.core.operation.operation_id != self.transition.identity.operation_id
+            || envelope.core.authority != self.authority_binding
+            || envelope.core.causal != self.causal_binding
+            || envelope.core.work_scope != self.receipt_work_scope_binding
+        {
+            return Err(WorkScopeSourceAdmissionError::CommittedReceiptMismatch);
+        }
+        Ok(())
+    }
+}
+
 /// Refusal while preparing an initial WorkScope source-admission transition.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum WorkScopeSourceAdmissionError {
@@ -898,6 +933,9 @@ pub enum WorkScopeSourceAdmissionError {
     /// The canonical transition could not be constructed or validated.
     #[error("canonical WorkScope source-admission transition is invalid: {0}")]
     Transition(String),
+    /// Store committed the row without the exact authority/causal/scope bindings.
+    #[error("WorkScope write receipt differs from the admitted authority or Policy parent")]
+    CommittedReceiptMismatch,
 }
 
 /// Creates a source-admission snapshot from genuine initial-scope inputs and
