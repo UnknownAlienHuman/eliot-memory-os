@@ -251,7 +251,7 @@ pub use operator_intent::{
 };
 pub use operator_intent_execution::{
     OperatorIntentEffectDisposition, OperatorIntentEpistemic, OperatorIntentExecutionError,
-    OperatorIntentExecutionLink,
+    OperatorIntentExecutionLink, OperatorIntentExecutionOwners,
 };
 pub use operator_reconciliation::{GovernorOperatorReconciliation, operator_command_envelope};
 pub use owner_closure_feed::{
