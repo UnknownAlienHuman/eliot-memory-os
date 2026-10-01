@@ -1867,12 +1867,26 @@ mod slice_7_native_owner_tests {
     }
 
     /// Runs the genuine admitted chain up to the structured A-05 gate for one
-    /// fixture job, returning the validated receipt dispatch requires.
+    /// fixture job, returning the validated receipt dispatch requires **and**
+    /// the grounding request the pipeline ran under.
+    ///
+    /// Both are returned because `dispatch_admitted` takes
+    /// [`PipelineOrientationRecords`], which joins by reference the exact
+    /// grounding request and validated candidate this chain produced. Handing
+    /// it a rebuilt lookalike instead would let a later edit move the real
+    /// grounding stage without the Orientation carrier noticing, which is
+    /// precisely the "rebuild a lookalike" failure the owner's contract
+    /// forbids. The grounding owner consumes its request by value, so this
+    /// retains a clone exactly as production does.
+    ///
     /// Every stage genuinely invokes its owner; any refusal fails the proof.
     fn validated_for(
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
-    ) -> eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate {
+    ) -> (
+        GroundingRequest,
+        eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate,
+    ) {
         let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job) {
             Ok(inputs) => inputs,
             Err(error) => panic!("fixture model inputs must resolve, got {error:?}"),
@@ -1886,7 +1900,7 @@ mod slice_7_native_owner_tests {
             Ok(request) => request,
             Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
         };
-        let grounded = match crate::grounding_stage::ground_admitted_draft(request) {
+        let grounded = match crate::grounding_stage::ground_admitted_draft(request.clone()) {
             Ok(grounded) => grounded,
             Err(error) => panic!("fixture grounding must prove, got {error:?}"),
         };
@@ -1897,7 +1911,7 @@ mod slice_7_native_owner_tests {
                 Err(error) => panic!("fixture carrier must build, got {error:?}"),
             };
         match crate::validation_stage::validate_admitted_draft(&carrier) {
-            Ok(validated) => validated,
+            Ok(validated) => (request, validated),
             Err(error) => panic!("fixture carrier must validate, got {error:?}"),
         }
     }
@@ -1932,14 +1946,14 @@ mod slice_7_native_owner_tests {
     fn orientation_projects_packet_with_g4_preserved() {
         let admission = admission();
         let job = semantic_job(JobClass::Orientation);
-        let validated = validated_for(&admission, &job);
+        let (grounding, validated) = validated_for(&admission, &job);
         let result = dispatch_admitted(
             &admission,
             &job,
             carriers(None, None, None),
             JobClass::Orientation,
             Some(&validated),
-            None,
+            PipelineOrientationRecords::new(&grounding, &validated),
         );
         let Ok(DreamResult::Packet(packet)) = result else {
             panic!("orientation must project, got {result:?}");
@@ -2002,14 +2016,14 @@ mod slice_7_native_owner_tests {
         let admission = admission();
         let mut job = semantic_job(JobClass::Orientation);
         job.evidence_handles.clear();
-        let validated = validated_for(&admission, &job);
+        let (grounding, validated) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
             &admission,
             &job,
             carriers(None, None, None),
             JobClass::Orientation,
             Some(&validated),
-            None,
+            PipelineOrientationRecords::new(&grounding, &validated),
         );
         assert!(
             matches!(
@@ -2030,13 +2044,21 @@ mod slice_7_native_owner_tests {
     /// architecturally impossible through this seam.
     #[test]
     fn orientation_without_validated_refuses_receipt_gate() {
+        let admission = admission();
+        let job = semantic_job(JobClass::Orientation);
+        // The pipeline record is built and supplied while the `validated`
+        // receipt is deliberately withheld. That is what makes this case prove
+        // the gate ORDER: an available pipeline record does not substitute for
+        // the structured A-05 receipt, so the refusal is the receipt gate and
+        // not the arm quietly proceeding on the record alone.
+        let (grounding, validated) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
-            &admission(),
-            &semantic_job(JobClass::Orientation),
+            &admission,
+            &job,
             carriers(None, None, None),
             JobClass::Orientation,
             None,
-            None,
+            PipelineOrientationRecords::new(&grounding, &validated),
         );
         assert!(
             matches!(
@@ -2077,13 +2099,20 @@ mod slice_7_native_owner_tests {
     /// class binding before any owner work (and before the receipt gate).
     #[test]
     fn class_parameter_mismatch_refuses_at_binding() {
+        let admission = admission();
+        let job = semantic_job(JobClass::Orientation);
+        // The job is a real Orientation job, so the pipeline genuinely runs and
+        // the record is genuine. The `job_class` argument is what disagrees; the
+        // refusal must come from the binding check before that argument routes
+        // anything, which is only observable when a valid record is present.
+        let (grounding, validated) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
-            &admission(),
-            &semantic_job(JobClass::Orientation),
+            &admission,
+            &job,
             carriers(None, None, None),
             JobClass::Curation,
             None,
-            None,
+            PipelineOrientationRecords::new(&grounding, &validated),
         );
         assert!(
             matches!(
@@ -2330,7 +2359,7 @@ mod slice_7_native_owner_tests {
         ] {
             let admission = admission();
             let job = semantic_job(class);
-            let validated = validated_for(&admission, &job);
+            let (grounding, validated) = validated_for(&admission, &job);
             let refused =
                 dispatch_admitted(
                     &admission,
@@ -2338,7 +2367,7 @@ mod slice_7_native_owner_tests {
                     carriers(None, None, None),
                     class,
                     Some(&validated),
-                    None,
+                    PipelineOrientationRecords::new(&grounding, &validated),
                 );
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),

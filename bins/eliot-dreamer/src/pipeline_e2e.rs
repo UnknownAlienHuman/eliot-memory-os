@@ -44,6 +44,7 @@ use crate::controller::verify_admitted_binding;
 use crate::curation_screen_stage::{ScreenDecision, resolve_screen_inputs};
 use crate::dispatch_stage::{
     CURATION_CARRIER_REFUSAL, CurationExecutionCarrier, OwnerCarriers,
+    PipelineOrientationRecords,
     curation_test_support::{
         CountingRoutingHandler, CurationTestHarness, test_batch_for, test_port_bindings,
     },
@@ -126,7 +127,7 @@ fn job_with_handles(job_id: &str, job_class: JobClass) -> DreamJobInput {
 fn validate_through_model(
     admission: &KernelJobAdmission,
     job: &DreamJobInput,
-) -> ValidatedGroundingCandidate {
+) -> (GroundingRequest, ValidatedGroundingCandidate) {
     verify_admitted_binding(admission, job).expect("e2e binding must verify");
     match resolve_screen_inputs(admission, job).expect("e2e screen must resolve") {
         ScreenDecision::PassThrough(_) => {}
@@ -153,11 +154,15 @@ fn validate_through_model(
     let request: GroundingRequest =
         resolve_grounding_inputs(admission, job, draft).expect("e2e grounding must resolve");
     let grounded: GroundedDreamDraft =
-        ground_admitted_draft(request).expect("e2e grounding must prove");
+        ground_admitted_draft(request.clone()).expect("e2e grounding must prove");
     let _inputs = resolve_validation_inputs(admission, job).expect("e2e validation must map");
     let carrier: GroundingValidationInput =
         validation_input_for(admission, job, grounded, Some(0)).expect("e2e carrier must build");
-    validate_admitted_draft(&carrier).expect("e2e validation must accept")
+    // The grounding owner consumes its request by value, so the retained clone
+    // is the exact request this chain ran under — the same record production
+    // hands `PipelineOrientationRecords::new`.
+    let validated = validate_admitted_draft(&carrier).expect("e2e validation must accept");
+    (request, validated)
 }
 
 /// Orientation passes the full owned pipeline: genuine owner calls at every
@@ -167,7 +172,7 @@ fn validate_through_model(
 fn orientation_pipeline_threads_screen_to_packet_receipt() {
     let admission = admitted_admission("job-e2e-orientation");
     let job = job_with_handles("job-e2e-orientation", JobClass::Orientation);
-    let validated = validate_through_model(&admission, &job);
+    let (grounding, validated) = validate_through_model(&admission, &job);
     assert!(
         !validated
             .output_digest()
@@ -186,7 +191,7 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
         },
         JobClass::Orientation,
         Some(&validated),
-        None,
+        PipelineOrientationRecords::new(&grounding, &validated),
     );
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("orientation dispatch must project, got {result:?}");

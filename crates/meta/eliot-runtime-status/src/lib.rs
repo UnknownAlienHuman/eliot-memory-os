@@ -4382,7 +4382,7 @@ mod live_production_observer_tests {
                     profile_governed_roots: fixture_profile_roots(
                         Path::new(portable),
                         "gen-1",
-                        roots,
+                        &roots,
                     ),
                     portable_root: Some(PlatformHandle::new(portable.to_owned()).expect("handle")),
                     installation_epoch: eliot_installation::InstallationEpoch {
