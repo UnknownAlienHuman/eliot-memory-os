@@ -382,6 +382,7 @@ async fn submit(
         result_under_verification: None,
         outcome: None,
         applicability_history: Vec::new(),
+        admission_history: Vec::new(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -413,6 +414,7 @@ async fn submit(
         lease_history: Vec::new(),
         result_under_verification: None,
         applicability_history: Vec::new(),
+        admission_history: Vec::new(),
         last_mutation: mutation.clone(),
         last_receipt_id: Some(receipt_id.clone()),
         record_digest: "0".repeat(64),
@@ -634,6 +636,7 @@ async fn lease_exact(
         result_under_verification: None,
         outcome: None,
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -906,6 +909,7 @@ fn prepare_applicability_mutation(
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: ledger.record.outcome.clone(),
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -961,6 +965,7 @@ async fn status(
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: ledger.record.outcome.clone(),
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1308,6 +1313,7 @@ async fn op_lease_next(
         result_under_verification: None,
         outcome: None,
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: coverage,
         selection_frontier: Some(ledger.queue_key.clone()),
     };
@@ -1420,6 +1426,7 @@ async fn op_renew(
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: ledger.record.outcome.clone(),
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1532,6 +1539,7 @@ async fn op_start(
         result_under_verification: None,
         outcome: None,
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1695,6 +1703,7 @@ async fn op_checkpoint(
         result_under_verification: None,
         outcome: None,
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1811,6 +1820,7 @@ async fn op_resume(
         result_under_verification: None,
         outcome: None,
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -1923,6 +1933,7 @@ async fn op_begin_verification(
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: None,
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -2044,6 +2055,7 @@ async fn op_publish(
         result_under_verification: None,
         outcome: ledger.record.outcome.clone(),
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -2170,6 +2182,7 @@ async fn op_request_cancel(
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: None,
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
@@ -2324,6 +2337,7 @@ fn reconcile_response(
         result_under_verification: ledger.result_under_verification.clone(),
         outcome: ledger.record.outcome.clone(),
         applicability_history: ledger.applicability_history.clone(),
+        admission_history: ledger.admission_history.clone(),
         selection_coverage: Vec::new(),
         selection_frontier: None,
     };
