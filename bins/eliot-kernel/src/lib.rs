@@ -3199,10 +3199,7 @@ impl KernelComposition {
                     .to_owned(),
             ));
         }
-        let mut scm_parts = evidence
-            .scm_watchdog_observation_digest
-            .as_str()
-            .split(':');
+        let mut scm_parts = evidence.scm_watchdog_observation_digest.as_str().split(':');
         let scm_pid = scm_parts.nth(1).and_then(|value| value.parse::<u32>().ok());
         let scm_start = scm_parts.next().and_then(|value| value.parse::<u64>().ok());
         if scm_pid != Some(heartbeat_proof.scm_watchdog_pid)
@@ -3331,7 +3328,8 @@ impl KernelComposition {
         candidate_digest: &str,
         state_fence: &StateFence,
         expected_observation_digest: Option<&eliot_platform::PlatformHandle>,
-    ) -> Result<eliot_kernel_service::HostSupervisionRevocationDisposition, KernelServiceError> {
+    ) -> Result<eliot_kernel_service::HostSupervisionRevocationDisposition, KernelServiceError>
+    {
         self.startup_coordinator
             .lock()
             .map_err(|_| KernelServiceError::Platform("startup gate lock poisoned".to_owned()))?
