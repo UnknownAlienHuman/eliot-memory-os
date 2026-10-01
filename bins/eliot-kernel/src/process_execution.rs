@@ -1795,10 +1795,7 @@ pub(crate) fn blob_process_stream_call_token_ref(
 
     let seed = canonical_json_bytes(&(capability_ref, ordinal))
         .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
-    Ok(format!(
-        "blob-call-{}-{ordinal}",
-        &sha256_hex(&seed)[..32]
-    ))
+    Ok(format!("blob-call-{}-{ordinal}", &sha256_hex(&seed)[..32]))
 }
 
 #[cfg(windows)]

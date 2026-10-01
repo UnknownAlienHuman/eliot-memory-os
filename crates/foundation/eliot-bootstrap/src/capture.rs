@@ -325,12 +325,11 @@ fn read_bounded_normative_receipt(
     canonical_root: &Path,
     receipt_path: &Path,
 ) -> Result<Vec<u8>, CaptureError> {
-    let canonical_path = fs::canonicalize(receipt_path).map_err(|error| {
-        CaptureError::NormativePairReceipt {
+    let canonical_path =
+        fs::canonicalize(receipt_path).map_err(|error| CaptureError::NormativePairReceipt {
             path: receipt_path.to_owned(),
             detail: error.to_string(),
-        }
-    })?;
+        })?;
     if !canonical_path.starts_with(canonical_root) {
         return Err(CaptureError::NormativePairReceipt {
             path: canonical_path,
@@ -363,18 +362,18 @@ fn capture_normative_source_document(
     expected_source_key: &str,
 ) -> Result<NormativePairSourceDocument, CaptureError> {
     let manifest_path = safe_repository_file(canonical_root, manifest_ref)?;
-    let manifest_bytes = fs::read(&manifest_path).map_err(|error| {
-        CaptureError::NormativePairReceipt {
+    let manifest_bytes =
+        fs::read(&manifest_path).map_err(|error| CaptureError::NormativePairReceipt {
             path: manifest_path.clone(),
             detail: error.to_string(),
-        }
-    })?;
-    let manifest: ShardedNormativeManifest = serde_json::from_slice(&manifest_bytes).map_err(|error| {
-        CaptureError::NormativePairReceipt {
-            path: manifest_path.clone(),
-            detail: format!("shard manifest JSON is invalid: {error}"),
-        }
-    })?;
+        })?;
+    let manifest: ShardedNormativeManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            CaptureError::NormativePairReceipt {
+                path: manifest_path.clone(),
+                detail: format!("shard manifest JSON is invalid: {error}"),
+            }
+        })?;
     if manifest.schema_version != "eliot-doc-shards-v1"
         || manifest.source_key != expected_source_key
         || manifest.entry_path != entry_ref
@@ -502,7 +501,10 @@ fn reverse_shard_navigation_rewrites(
 }
 
 fn count_source_lines(source: &str) -> usize {
-    source.chars().filter(|character| *character == '\n').count()
+    source
+        .chars()
+        .filter(|character| *character == '\n')
+        .count()
         + usize::from(!source.ends_with('\n'))
 }
 

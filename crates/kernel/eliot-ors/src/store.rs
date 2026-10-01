@@ -6090,7 +6090,9 @@ impl RedbRecoveryStore {
         }
         let write = self.database.begin_write().map_err(storage)?;
         let won = {
-            let mut table = write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(storage)?;
             let existing = table
                 .get(dispatched.token_ref.as_str())
                 .map_err(storage)?
@@ -6160,8 +6162,12 @@ impl RedbRecoveryStore {
         crate::model::validate_text(next_token_ref, "blob_process_stream_next_token_ref")?;
         let write = self.database.begin_write().map_err(storage)?;
         let result = {
-            let mut grants = write.open_table(BLOB_PROCESS_STREAM_GRANTS).map_err(storage)?;
-            let mut calls = write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+            let mut grants = write
+                .open_table(BLOB_PROCESS_STREAM_GRANTS)
+                .map_err(storage)?;
+            let mut calls = write
+                .open_table(BLOB_PROCESS_STREAM_CALLS)
+                .map_err(storage)?;
             let existing = calls
                 .get(terminal.token_ref.as_str())
                 .map_err(storage)?

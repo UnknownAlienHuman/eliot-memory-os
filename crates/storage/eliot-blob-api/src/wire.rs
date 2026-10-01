@@ -990,7 +990,6 @@ impl BlobProcessStreamOwnerFactsPullResponse {
         }
         Ok(())
     }
-
 }
 
 impl BlobProcessStreamKernelRequest {
@@ -1140,8 +1139,7 @@ impl BlobProcessStreamKernelResponse {
             if !matches!(
                 &self.outcome,
                 BlobProcessStreamKernelOutcome::Completed { .. }
-            )
-                || self.call_token.ordinal.checked_add(1) != Some(next_call_token.ordinal)
+            ) || self.call_token.ordinal.checked_add(1) != Some(next_call_token.ordinal)
                 || next_call_token.reference == self.call_token.reference
             {
                 return Err(WireValidationError::InvalidField("next_call_token"));
@@ -1169,12 +1167,9 @@ impl BlobProcessStreamKernelResponse {
                             request.as_ref(),
                             BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
                                 | BlobProcessStreamKernelOperationRequest::SinkAbort { .. }
-                        ) || sha256_hex(
-                            &canonical_json_bytes(request)
-                                .map_err(|_| WireValidationError::InvalidField(
-                                    "original_terminal_request",
-                                ))?,
-                        ) != *original_sha256
+                        ) || sha256_hex(&canonical_json_bytes(request).map_err(|_| {
+                            WireValidationError::InvalidField("original_terminal_request")
+                        })?) != *original_sha256
                         {
                             return Err(WireValidationError::InvalidField(
                                 "original_terminal_request",
@@ -1245,9 +1240,13 @@ impl BlobProcessStreamKernelResponse {
             return Err(WireValidationError::InvalidField("reconcile_binding"));
         }
         let operation_sha256 = match &self.outcome {
-            BlobProcessStreamKernelOutcome::Completed { operation_sha256, .. }
+            BlobProcessStreamKernelOutcome::Completed {
+                operation_sha256, ..
+            }
             | BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
-            | BlobProcessStreamKernelOutcome::Unavailable { operation_sha256, .. }
+            | BlobProcessStreamKernelOutcome::Unavailable {
+                operation_sha256, ..
+            }
             | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => operation_sha256,
         };
         if operation_sha256 != &request.operation_sha256 {
@@ -1770,7 +1769,8 @@ impl ProcessStreamSourceReadbackResponse {
             module_catalog_owner_readback_sha256,
             generation_admission_json,
             generation_admission_sha256,
-        } = self else {
+        } = self
+        else {
             return Ok(());
         };
         validate_digest("whole_source_sha256", whole_source_sha256)?;

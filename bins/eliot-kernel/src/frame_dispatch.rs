@@ -259,7 +259,9 @@ fn actual_route_name(action: &KernelFrameAction) -> &'static str {
     match action {
         KernelFrameAction::Reply(_) => "reply_admitted",
         KernelFrameAction::BlobProcessStream { .. } => "blob_process_stream_admitted",
-        KernelFrameAction::BlobProcessStreamReconcile { .. } => "blob_process_stream_reconcile_admitted",
+        KernelFrameAction::BlobProcessStreamReconcile { .. } => {
+            "blob_process_stream_reconcile_admitted"
+        }
         KernelFrameAction::Daemon { .. } => "daemon_admitted",
         KernelFrameAction::Process { .. } => "process_admitted",
         KernelFrameAction::Doctor { .. } => "doctor_admitted",

@@ -937,8 +937,11 @@ fn blob_store_request_identity(
         sha256_hex,
     };
 
-    let request_id = RequestId::new(format!("blob-store-{}", &sha256_hex(token_ref.as_bytes())[..32]))
-        .map_err(|error| error.to_string())?;
+    let request_id = RequestId::new(format!(
+        "blob-store-{}",
+        &sha256_hex(token_ref.as_bytes())[..32]
+    ))
+    .map_err(|error| error.to_string())?;
     let product_id = ProductId::new(pull.product_id.clone()).map_err(|error| error.to_string())?;
     let source_id = SourceId::new(pull.source_id.clone()).map_err(|error| error.to_string())?;
     let session_id = pull
@@ -970,10 +973,7 @@ fn blob_store_request_identity(
             metadata,
             state_fence: pull.state_fence.clone(),
         },
-        idempotency_key: format!(
-            "blob-process-stream:{capability_ref}:{}",
-            token_ref
-        ),
+        idempotency_key: format!("blob-process-stream:{capability_ref}:{}", token_ref),
         deadline_unix_ms: deadline_ms,
         cancellation_id: format!("blob-process-stream-cancel:{token_ref}"),
     };
@@ -993,9 +993,8 @@ fn blob_store_sink_request(
         ProcessStreamSinkWireRequest,
     };
     use eliot_process::stream_sink::{
-        ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
-        ProcessStreamSinkFinalizeRequest, ProcessStreamSinkOpenRequest,
-        ProcessStreamSinkUnknownOutcome,
+        ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkFinalizeRequest,
+        ProcessStreamSinkOpenRequest, ProcessStreamSinkUnknownOutcome,
     };
 
     let fence = pull_request.state_fence.clone();
@@ -1008,12 +1007,13 @@ fn blob_store_sink_request(
                 .map_err(|error| format!("Kernel rejected process-stream Open body: {error}"))?;
             open.validate().map_err(|error| error.to_string())?;
             let open_json = serde_json::to_value(&open).map_err(|error| error.to_string())?;
-            let admitted_binding: serde_json::Value = serde_json::from_str(
-                &pull_request.process_binding_json,
-            )
-            .map_err(|error| format!("retained process binding is invalid: {error}"))?;
+            let admitted_binding: serde_json::Value =
+                serde_json::from_str(&pull_request.process_binding_json)
+                    .map_err(|error| format!("retained process binding is invalid: {error}"))?;
             if open_json.get("binding") != Some(&admitted_binding) {
-                return Err("Open body does not use the exact admitted ProcessExecutionBinding".to_owned());
+                return Err(
+                    "Open body does not use the exact admitted ProcessExecutionBinding".to_owned(),
+                );
             }
             ProcessStreamSinkWireRequest::Open {
                 capability: capability.clone(),
@@ -1045,8 +1045,9 @@ fn blob_store_sink_request(
             deadline_ms,
         } => {
             let finalize: ProcessStreamSinkFinalizeRequest =
-                serde_json::from_value((**body).clone())
-                    .map_err(|error| format!("Kernel rejected process-stream Finalize body: {error}"))?;
+                serde_json::from_value((**body).clone()).map_err(|error| {
+                    format!("Kernel rejected process-stream Finalize body: {error}")
+                })?;
             finalize.validate().map_err(|error| error.to_string())?;
             ProcessStreamSinkWireRequest::Finalize {
                 capability: capability.clone(),
@@ -1087,8 +1088,9 @@ fn blob_store_sink_request(
             deadline_ms,
         } => {
             let reconcile: ProcessStreamSinkUnknownOutcome =
-                serde_json::from_value((**body).clone())
-                    .map_err(|error| format!("Kernel rejected process-stream Reconcile body: {error}"))?;
+                serde_json::from_value((**body).clone()).map_err(|error| {
+                    format!("Kernel rejected process-stream Reconcile body: {error}")
+                })?;
             reconcile.validate().map_err(|error| error.to_string())?;
             ProcessStreamSinkWireRequest::Reconcile {
                 capability: capability.clone(),
@@ -1098,7 +1100,9 @@ fn blob_store_sink_request(
                 deadline_ms: *deadline_ms,
             }
         }
-        eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SourceReadback { .. } => {
+        eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SourceReadback {
+            ..
+        } => {
             return Err("source readback requires a fresh owner-facts pull and the retained original Open binding".to_owned());
         }
     };
@@ -1162,9 +1166,10 @@ impl KernelComposition {
             if pull.state != BlobProcessStreamOwnerFactsPullState::Completed {
                 return None;
             }
-            let (Some(request_json), Some(response_json)) =
-                (Some(pull.request_json.as_str()), pull.response_json.as_deref())
-            else {
+            let (Some(request_json), Some(response_json)) = (
+                Some(pull.request_json.as_str()),
+                pull.response_json.as_deref(),
+            ) else {
                 return None;
             };
             let Ok(pull_request) =
@@ -1177,9 +1182,7 @@ impl KernelComposition {
             else {
                 return None;
             };
-            if pull_response
-                .validate_for_request(&pull_request)
-                .is_err()
+            if pull_response.validate_for_request(&pull_request).is_err()
                 || pull_response.job_id != grant.job_id
                 || pull_response.invocation_id != grant.invocation_id
                 || pull_response.process_binding_sha256 != grant.process_binding_sha256
@@ -1206,10 +1209,10 @@ impl KernelComposition {
                     && grant.expires_at_unix_ms > now
                     && grant.generation == session.module_generation.generation.value()
                     && grant.authority_epoch == session.authority_epoch.sequence.get()
-                    && grant.authority_lineage_id == session.authority_epoch.lineage_id.as_str()
+                    && grant.authority_lineage_id
+                        == session.authority_epoch.lineage_id.as_str()
                     && retained_owner_facts(&grant).is_some()
-                    && grant.state_fence_sha256
-                        == sha256_hex(&current_fence_json) =>
+                    && grant.state_fence_sha256 == sha256_hex(&current_fence_json) =>
             {
                 match self.p07_ors.load_blob_process_stream_call(
                     &request.capability.reference,
@@ -1259,7 +1262,9 @@ impl KernelComposition {
                                     |response| response.outcome,
                                 ),
                             BlobProcessStreamCallState::Issued => {
-                                if let Some((pull_request, pull_response)) = retained_owner_facts(&grant) {
+                                if let Some((pull_request, pull_response)) =
+                                    retained_owner_facts(&grant)
+                                {
                                     self.dispatch_blob_process_stream_call(
                                         &request,
                                         &grant,
@@ -1370,8 +1375,8 @@ impl KernelComposition {
     ) -> Result<Frame, TransportError> {
         use eliot_blob_api::wire::{
             BLOB_PROCESS_STREAM_CAPABILITY, BlobProcessStreamKernelOutcome,
-            BlobProcessStreamKernelResponse, BlobProcessStreamOwnerFactsPullRequest,
-            BlobProcessStreamOwnerFactsPullResponse, BlobProcessStreamOwnerFactsPullOutcome,
+            BlobProcessStreamKernelResponse, BlobProcessStreamOwnerFactsPullOutcome,
+            BlobProcessStreamOwnerFactsPullRequest, BlobProcessStreamOwnerFactsPullResponse,
             BlobProcessStreamUnavailableReason as Unavailable,
         };
         use eliot_ors::{
@@ -1400,7 +1405,8 @@ impl KernelComposition {
                     && grant.expires_at_unix_ms > unix_ms()
                     && grant.generation == session.module_generation.generation.value()
                     && grant.authority_epoch == session.authority_epoch.sequence.get()
-                    && grant.authority_lineage_id == session.authority_epoch.lineage_id.as_str()
+                    && grant.authority_lineage_id
+                        == session.authority_epoch.lineage_id.as_str()
                     && grant.state_fence_sha256
                         == canonical_json_bytes(&session.module_generation.state_fence)
                             .ok()
@@ -1414,14 +1420,15 @@ impl KernelComposition {
                     .flatten()
                     .filter(|pull| pull.state == BlobProcessStreamOwnerFactsPullState::Completed)
                     .and_then(|pull| {
-                        let pull_request = serde_json::from_str::<BlobProcessStreamOwnerFactsPullRequest>(
-                            &pull.request_json,
-                        )
+                        let pull_request = serde_json::from_str::<
+                            BlobProcessStreamOwnerFactsPullRequest,
+                        >(&pull.request_json)
                         .ok()?;
-                        let pull_response = serde_json::from_str::<BlobProcessStreamOwnerFactsPullResponse>(
-                            pull.response_json.as_deref()?,
-                        )
-                        .ok()?;
+                        let pull_response =
+                            serde_json::from_str::<BlobProcessStreamOwnerFactsPullResponse>(
+                                pull.response_json.as_deref()?,
+                            )
+                            .ok()?;
                         (pull_response.validate_for_request(&pull_request).is_ok()
                             && pull_request.state_fence == session.module_generation.state_fence
                             && pull_response.job_id == grant.job_id
@@ -1457,8 +1464,10 @@ impl KernelComposition {
                                     .response_projection_json
                                     .as_deref()
                                     .and_then(|json| {
-                                        serde_json::from_str::<BlobProcessStreamKernelResponse>(json)
-                                            .ok()
+                                        serde_json::from_str::<BlobProcessStreamKernelResponse>(
+                                            json,
+                                        )
+                                        .ok()
                                     })
                                     .filter(|response| {
                                         response.validate_for_reconcile(&request).is_ok()
@@ -1556,11 +1565,11 @@ impl KernelComposition {
             BlobProcessStreamKernelOutcome, BlobProcessStreamKernelResponse,
             BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamVerifiedOwnerFacts,
         };
+        use eliot_contracts::{canonical_json_bytes, sha256_hex};
         use eliot_ors::{
             BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamCallRecord,
             BlobProcessStreamCallState,
         };
-        use eliot_contracts::{canonical_json_bytes, sha256_hex};
 
         let owner_facts_json = match &pull_response.outcome {
             BlobProcessStreamOwnerFactsPullOutcome::Available {
@@ -1575,7 +1584,9 @@ impl KernelComposition {
                 };
             }
         };
-        let owner_facts: BlobProcessStreamVerifiedOwnerFacts = match serde_json::from_str(owner_facts_json) {
+        let owner_facts: BlobProcessStreamVerifiedOwnerFacts = match serde_json::from_str(
+            owner_facts_json,
+        ) {
             Ok(facts) if facts.validate().is_ok() => facts,
             _ => {
                 return BlobProcessStreamKernelOutcome::Unavailable {
@@ -1605,13 +1616,33 @@ impl KernelComposition {
             };
         }
         let deadline_ms = match &request.operation {
-            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkOpen { deadline_ms, .. }
-            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkAppend { deadline_ms, .. }
-            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkFinalize { deadline_ms, .. }
-            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkAbort { deadline_ms, .. }
-            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkReadback { deadline_ms, .. }
-            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkReconcile { deadline_ms, .. } => *deadline_ms,
-            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SourceReadback { request } => request.deadline_ms,
+            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkOpen {
+                deadline_ms,
+                ..
+            }
+            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkAppend {
+                deadline_ms,
+                ..
+            }
+            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkFinalize {
+                deadline_ms,
+                ..
+            }
+            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkAbort {
+                deadline_ms,
+                ..
+            }
+            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkReadback {
+                deadline_ms,
+                ..
+            }
+            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkReconcile {
+                deadline_ms,
+                ..
+            } => *deadline_ms,
+            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SourceReadback {
+                request,
+            } => request.deadline_ms,
         };
         if deadline_ms == 0 || deadline_ms > grant.expires_at_unix_ms || deadline_ms <= unix_ms() {
             return BlobProcessStreamKernelOutcome::Unavailable {
@@ -1629,7 +1660,8 @@ impl KernelComposition {
             Err(_) => {
                 return BlobProcessStreamKernelOutcome::Unavailable {
                     operation_sha256: request.operation_sha256.clone(),
-                    reason: eliot_blob_api::wire::BlobProcessStreamUnavailableReason::StaleCapability,
+                    reason:
+                        eliot_blob_api::wire::BlobProcessStreamUnavailableReason::StaleCapability,
                 };
             }
         };
@@ -1660,24 +1692,32 @@ impl KernelComposition {
             Err(_) => {
                 return BlobProcessStreamKernelOutcome::Unavailable {
                     operation_sha256: request.operation_sha256.clone(),
-                    reason: eliot_blob_api::wire::BlobProcessStreamUnavailableReason::GrantUnavailable,
+                    reason:
+                        eliot_blob_api::wire::BlobProcessStreamUnavailableReason::GrantUnavailable,
                 };
             }
         };
-        let operation_projection_json = match &request.operation {
-            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkOpen { .. }
-            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
-            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkAbort { .. } => {
-                match canonical_json_bytes(&request.operation).ok().and_then(|bytes| String::from_utf8(bytes).ok()) {
+        let operation_projection_json =
+            match &request.operation {
+                eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkOpen {
+                    ..
+                }
+                | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkFinalize {
+                    ..
+                }
+                | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkAbort {
+                    ..
+                } => {
+                    match canonical_json_bytes(&request.operation).ok().and_then(|bytes| String::from_utf8(bytes).ok()) {
                     Some(json) => Some(json),
                     None => return BlobProcessStreamKernelOutcome::Unavailable {
                         operation_sha256: request.operation_sha256.clone(),
                         reason: eliot_blob_api::wire::BlobProcessStreamUnavailableReason::GrantUnavailable,
                     },
                 }
-            }
-            _ => None,
-        };
+                }
+                _ => None,
+            };
         let reserved = BlobProcessStreamCallRecord {
             contract_version: BLOB_PROCESS_STREAM_ORS_VERSION,
             capability_ref: request.capability.reference.clone(),
@@ -1693,18 +1733,27 @@ impl KernelComposition {
             response_ref: None,
             owner_receipt_ref: None,
         };
-        if self.p07_ors.reserve_blob_process_stream_call(&reserved).is_err() {
+        if self
+            .p07_ors
+            .reserve_blob_process_stream_call(&reserved)
+            .is_err()
+        {
             return BlobProcessStreamKernelOutcome::Unknown {
                 operation_sha256: request.operation_sha256.clone(),
             };
         }
         let mut dispatched = reserved.clone();
         dispatched.state = BlobProcessStreamCallState::Dispatched;
-        match self.p07_ors.claim_blob_process_stream_call_dispatch(&dispatched) {
+        match self
+            .p07_ors
+            .claim_blob_process_stream_call_dispatch(&dispatched)
+        {
             Ok(true) => {}
-            _ => return BlobProcessStreamKernelOutcome::Unknown {
-                operation_sha256: request.operation_sha256.clone(),
-            },
+            _ => {
+                return BlobProcessStreamKernelOutcome::Unknown {
+                    operation_sha256: request.operation_sha256.clone(),
+                };
+            }
         }
         let owner_response: BlobProcessStreamFrameResponse = match self
             .process_stream_exchange(store_request, store_identity)
@@ -1730,31 +1779,42 @@ impl KernelComposition {
         }
         let next_ordinal = match request.call_token.ordinal.checked_add(1) {
             Some(value) => value,
-            None => return BlobProcessStreamKernelOutcome::Unknown {
-                operation_sha256: request.operation_sha256.clone(),
-            },
+            None => {
+                return BlobProcessStreamKernelOutcome::Unknown {
+                    operation_sha256: request.operation_sha256.clone(),
+                };
+            }
         };
         let next_token_ref = match crate::process_execution::blob_process_stream_call_token_ref(
             &request.capability.reference,
             next_ordinal,
         ) {
             Ok(value) => value,
-            Err(_) => return BlobProcessStreamKernelOutcome::Unknown {
-                operation_sha256: request.operation_sha256.clone(),
-            },
+            Err(_) => {
+                return BlobProcessStreamKernelOutcome::Unknown {
+                    operation_sha256: request.operation_sha256.clone(),
+                };
+            }
         };
         let next_call_token = BlobProcessStreamCallToken {
             reference: next_token_ref.clone(),
             ordinal: next_ordinal,
         };
         let original_terminal_request = match &request.operation {
-            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
-            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkAbort { .. } => Some(Box::new(request.operation.clone())),
+            eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkFinalize {
+                ..
+            }
+            | eliot_blob_api::wire::BlobProcessStreamKernelOperationRequest::SinkAbort { .. } => {
+                Some(Box::new(request.operation.clone()))
+            }
             _ => None,
         };
-        let original_terminal_operation_sha256 = original_terminal_request.as_ref().and_then(|operation| {
-            canonical_json_bytes(operation).ok().map(|bytes| sha256_hex(&bytes))
-        });
+        let original_terminal_operation_sha256 =
+            original_terminal_request.as_ref().and_then(|operation| {
+                canonical_json_bytes(operation)
+                    .ok()
+                    .map(|bytes| sha256_hex(&bytes))
+            });
         let kernel_response = BlobProcessStreamKernelResponse {
             wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_KERNEL_WIRE_ID.to_owned(),
             wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION,
@@ -1782,9 +1842,11 @@ impl KernelComposition {
             .and_then(|bytes| String::from_utf8(bytes).ok())
         {
             Some(value) => value,
-            None => return BlobProcessStreamKernelOutcome::Unknown {
-                operation_sha256: request.operation_sha256.clone(),
-            },
+            None => {
+                return BlobProcessStreamKernelOutcome::Unknown {
+                    operation_sha256: request.operation_sha256.clone(),
+                };
+            }
         };
         let mut terminal = dispatched;
         terminal.state = BlobProcessStreamCallState::Completed;

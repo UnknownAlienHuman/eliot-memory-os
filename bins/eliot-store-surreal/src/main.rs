@@ -7,10 +7,10 @@ use eliot_observability_runtime::{
     ObservabilityConfig, RollingLogPolicy, RuntimeProfile, SpoolPolicy,
 };
 
+use eliot_contracts::{RequestId, StateFence};
 #[cfg(windows)]
 use eliot_ipc::NamedPipeServer;
 use eliot_ipc::TransportLimits;
-use eliot_contracts::{RequestId, StateFence};
 use eliot_protocol::MessageType;
 use eliot_protocol::{EncodingProfile, Frame, FrameKind, ProtocolPayload};
 use eliot_store_surreal::diagnostics::{
@@ -68,13 +68,12 @@ async fn dispatch_blob_process_stream_sink(
     request: eliot_blob_api::wire::ProcessStreamSinkWireRequest,
 ) -> eliot_blob_api::wire::ProcessStreamSinkWireResponse {
     use eliot_blob_api::wire::{
-        ProcessStreamSinkWireRequest as Request, ProcessStreamSinkWireResponse as Response,
-        ProcessStreamSinkUnavailableReason as Unavailable,
+        ProcessStreamSinkUnavailableReason as Unavailable, ProcessStreamSinkWireRequest as Request,
+        ProcessStreamSinkWireResponse as Response,
     };
     use eliot_process::stream_sink::{
-        ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
-        ProcessStreamSinkFinalizeRequest, ProcessStreamSinkOpenRequest,
-        ProcessStreamSinkUnknownOutcome,
+        ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkFinalizeRequest,
+        ProcessStreamSinkOpenRequest, ProcessStreamSinkUnknownOutcome,
     };
 
     fn reject() -> Response {
@@ -91,10 +90,7 @@ async fn dispatch_blob_process_stream_sink(
         &binding.binding_ref
     }
 
-    fn same_fence(
-        observed: &StateFence,
-        identity: &eliot_protocol::RequestIdentity,
-    ) -> bool {
+    fn same_fence(observed: &StateFence, identity: &eliot_protocol::RequestIdentity) -> bool {
         observed == &identity.request.state_fence
     }
 
@@ -356,8 +352,8 @@ async fn dispatch_blob_process_stream(
     request: eliot_blob_api::wire::BlobProcessStreamFrameRequest,
 ) -> Result<eliot_blob_api::wire::BlobProcessStreamFrameResponse, String> {
     use eliot_blob_api::wire::{
-        BlobProcessStreamFrameResponse, BlobProcessStreamOperationResponse,
-        BlobProcessStreamOperationRequest, ProcessStreamSourceReadbackResponse,
+        BlobProcessStreamFrameResponse, BlobProcessStreamOperationRequest,
+        BlobProcessStreamOperationResponse, ProcessStreamSourceReadbackResponse,
     };
 
     request.validate().map_err(|error| error.to_string())?;
@@ -378,11 +374,7 @@ async fn dispatch_blob_process_stream(
                 ProcessStreamSourceReadbackResponse::Unknown
             } else {
                 match composition
-                    .blob_source_readback(
-                        transport,
-                        identity,
-                        request.clone(),
-                    )
+                    .blob_source_readback(transport, identity, request.clone())
                     .await
                 {
                     Ok(response) => {
@@ -392,10 +384,14 @@ async fn dispatch_blob_process_stream(
                     Err(eliot_process::stream_sink::ProcessStreamSinkError::AdmissionFenced {
                         ..
                     }) => ProcessStreamSourceReadbackResponse::Unknown,
-                    Err(eliot_process::stream_sink::ProcessStreamSinkError::ProviderUnavailable)
-                    | Err(eliot_process::stream_sink::ProcessStreamSinkError::PossibleEffectUnknown {
-                        ..
-                    })
+                    Err(
+                        eliot_process::stream_sink::ProcessStreamSinkError::ProviderUnavailable,
+                    )
+                    | Err(
+                        eliot_process::stream_sink::ProcessStreamSinkError::PossibleEffectUnknown {
+                            ..
+                        },
+                    )
                     | Err(eliot_process::stream_sink::ProcessStreamSinkError::IntegrityFailure {
                         ..
                     }) => ProcessStreamSourceReadbackResponse::Unknown,
@@ -420,7 +416,7 @@ fn validate_source_readback_response(
     response: &eliot_blob_api::wire::ProcessStreamSourceReadbackResponse,
 ) -> Result<(), String> {
     use eliot_blob_api::wire::{
-        ProcessStreamSourceReadbackResponse, PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
+        PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES, ProcessStreamSourceReadbackResponse,
     };
 
     if let ProcessStreamSourceReadbackResponse::Ready {
@@ -455,7 +451,9 @@ fn validate_source_readback_response(
             || *observed_at_unix_ms == 0
             || observed_fence != &identity.request.state_fence
         {
-            return Err("Blob source-readback evidence does not match the exact request".to_owned());
+            return Err(
+                "Blob source-readback evidence does not match the exact request".to_owned(),
+            );
         }
     }
     Ok(())
@@ -1105,9 +1103,7 @@ async fn serve_handshake_loop(
                         ProtocolPayload::Json(payload) => serde_json::from_value::<
                             eliot_blob_api::wire::BlobProcessStreamFrameRequest,
                         >(payload.clone())
-                        .map_err(|error| {
-                            format!("invalid Blob process-stream request: {error}")
-                        })?,
+                        .map_err(|error| format!("invalid Blob process-stream request: {error}"))?,
                         _ => return Err("Blob process-stream request must be JSON".to_owned()),
                     };
                     match dispatch_blob_process_stream(
@@ -1131,9 +1127,7 @@ async fn serve_handshake_loop(
                                 frame.request_id.clone(),
                                 defect,
                             )
-                            .map_err(|error| {
-                                format!("invalid Blob rejection response: {error}")
-                            })?
+                            .map_err(|error| format!("invalid Blob rejection response: {error}"))?
                         }
                     }
                 }
