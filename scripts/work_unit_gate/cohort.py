@@ -368,6 +368,9 @@ def materialize_catalogue(
       integration owner from the supplied accepted profile)
     - restricted-root claims only for the exact typed integration owner
     - descriptor validation and assignment mirror consistency
+    - blocked rows carry no executable coverage: a descriptor attached to
+      a blocked row still satisfies scope validation, but its matrix cases
+      are excluded from the aggregate arithmetic
     - aggregate arithmetic validation against expected_cases
     - concurrent write-scope overlap checks among independent assigned rows
     """
@@ -435,6 +438,15 @@ def materialize_catalogue(
         elif r.disposition is c.CatalogueDisposition.PLANNED:
             if r.descriptor is not None:
                 validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
+        elif r.disposition is c.CatalogueDisposition.BLOCKED:
+            # A blocked row is disposition-only: its inventory allocation is
+            # unresolved until frozen, so it carries no executable coverage.
+            # A descriptor attached to one must still satisfy scope
+            # validation (restricted roots need the exact typed integration
+            # owner); its matrix cases are excluded from the aggregate
+            # arithmetic below.
+            if r.descriptor is not None:
+                validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
         elif r.disposition is c.CatalogueDisposition.SUPERSEDED and r.descriptor is not None:
             # A superseded historical row is a terminal record: #843 accepts no
             # implementation evidence ("Superseded source donor only") and #859
@@ -463,8 +475,14 @@ def materialize_catalogue(
                         f"concurrent mutable scope overlap between #{d1.issue.number} and #{d2.issue.number}"
                     )
 
-    # Validate aggregate case arithmetic if expected_cases supplied
-    actual_cases = sum(r.descriptor.matrix_cases for r in rows if r.descriptor is not None)
+    # Validate aggregate case arithmetic if expected_cases supplied.
+    # Blocked rows carry no executable coverage: their matrix cases never
+    # contribute to the full-catalogue arithmetic.
+    actual_cases = sum(
+        r.descriptor.matrix_cases
+        for r in rows
+        if r.descriptor is not None and r.disposition is not c.CatalogueDisposition.BLOCKED
+    )
     if expected_cases is not None and actual_cases != expected_cases:
         raise CohortError(
             CohortProblem.ARITHMETIC_MISMATCH,
