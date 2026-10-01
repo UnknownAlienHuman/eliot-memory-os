@@ -684,10 +684,10 @@ impl StoreGenesisRequest {
     }
 }
 
-/// Compare-and-set of the already-retained WorkScope owner row.
+/// Compare-and-set of the already-retained `WorkScope` owner row.
 ///
 /// This is the narrow post-genesis owner transition used to replace the
-/// installed empty WorkScope snapshot with Governor's admitted initial
+/// installed empty `WorkScope` snapshot with Governor's admitted initial
 /// binding. The record remains opaque to Store; the caller validates the
 /// typed owner snapshot before constructing this request. Store enforces the
 /// fixed owner address/schema, canonical payload bytes, exact fence and
@@ -702,9 +702,9 @@ pub struct StoreWorkScopeOwnerRequest {
     /// Store binds the presented digest into the request hash and validates
     /// its shape.
     pub protected_snapshot_digest: String,
-    /// Current durable WorkScope owner row revision observed by Kernel.
+    /// Current durable `WorkScope` owner row revision observed by Kernel.
     pub expected_owner_revision: u64,
-    /// Exact canonical WorkScope owner record to install at the next revision.
+    /// Exact canonical `WorkScope` owner record to install at the next revision.
     pub owner_record: RecoveryRecord,
     /// Digest over every request field except this digest itself.
     pub canonical_request_hash: String,
@@ -731,7 +731,7 @@ impl StoreWorkScopeOwnerRequest {
         Ok(self)
     }
 
-    /// Validates the closed initial WorkScope owner CAS against its authenticated
+    /// Validates the closed initial `WorkScope` owner CAS against its authenticated
     /// request context. The existing empty owner row must have a non-zero
     /// revision; this path never recreates genesis or accepts a guessed row.
     pub fn validate_for_context(&self, context: &RequestMeta) -> Result<(), StoreError> {
@@ -804,7 +804,7 @@ impl StoreWorkScopeOwnerRequest {
     }
 }
 
-/// Exact same-fence provider readback after a WorkScope owner CAS.
+/// Exact same-fence provider readback after a `WorkScope` owner CAS.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreWorkScopeOwnerResponse {
@@ -6727,7 +6727,7 @@ pub trait CanonicalStoreClient: Send + Sync {
         Err(StoreError::Unavailable)
     }
 
-    /// Atomically replaces only the retained WorkScope owner row under its
+    /// Atomically replaces only the retained `WorkScope` owner row under its
     /// observed revision and returns the exact same-fence durable readback.
     /// Backends without this concrete owner CAS fail closed.
     async fn write_work_scope_owner(

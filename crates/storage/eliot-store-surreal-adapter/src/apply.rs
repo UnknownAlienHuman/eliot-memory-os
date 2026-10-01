@@ -91,7 +91,7 @@ pub(crate) async fn initialize_genesis(
     Ok(receipt)
 }
 
-/// Replaces the retained WorkScope owner row only when its current revision
+/// Replaces the retained `WorkScope` owner row only when its current revision
 /// and full Store fence still equal the authenticated admission observation.
 /// The result is acknowledged only after a same-fence provider read returns
 /// the exact canonical record requested by Governor.
@@ -188,10 +188,14 @@ async fn write_work_scope_owner_direct(
     )
     .await
     .and_then(|mut response| {
-        if response.take_errors().is_empty() {
+        let errors = response.take_errors();
+        if errors.is_empty() {
             Ok(())
         } else {
-            Err(AdapterError::PartialOutcome)
+            Err(atomic_write::classify_transaction_errors(
+                &errors,
+                "work_scope.owner.cas",
+            ))
         }
     });
 
@@ -210,12 +214,8 @@ async fn write_work_scope_owner_direct(
             .map_err(AdapterError::Store)?;
         return Ok(response);
     }
-    if let Err(error) = write_result {
-        return Err(error);
-    }
-    if let Err(error) = readback {
-        return Err(error);
-    }
+    write_result?;
+    readback?;
     Err(AdapterError::Store(StoreError::IdentityConflict))
 }
 
