@@ -796,7 +796,7 @@ impl OrsReserve {
                 self.issue_evidence(dimension, request.operation.capacity_class()),
             ],
         };
-        (sequence, binding)
+        binding
     }
 
     /// Records the owner's contemporaneous partition observation for one issuance.
