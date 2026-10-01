@@ -494,7 +494,7 @@ pub(crate) fn validate_text(value: &str, field: &'static str) -> Result<(), Kern
 /// are unavailable authorization state, so the caller treats them like any
 /// other non-admission and stays in shadow diagnostics.
 pub fn query_effect_replay_authority(
-    store: &eliot_ors::OperationalRecoveryStore,
+    store: &eliot_ors::RedbRecoveryStore,
     request: &eliot_ors::EffectReplayRequest,
 ) -> Result<eliot_ors::EffectReplayDecision, eliot_ors::OrsError> {
     request.validate()?;
