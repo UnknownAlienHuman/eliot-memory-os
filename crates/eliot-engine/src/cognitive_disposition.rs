@@ -446,6 +446,12 @@ pub async fn resolve_canonical_case_dispositions(
     contract_record: &CanonicalRecord<CognitiveRunContract>,
     now: OffsetDateTime,
 ) -> Result<Vec<CanonicalCaseDisposition>, EngineError> {
+    // The contract selects the source calls, scopes the whole resolution and
+    // stamps `source_commit`/`policy_snapshot_id` into each disposition, so it
+    // is consumed as current authority here. Gating it in this one owner step
+    // covers every caller: the `eliot-app` shared-gate and status paths, the
+    // operator disposition query, and the `eliot-engine` writer gate.
+    require_current_cognitive_record(&contract_record.receipt_body)?;
     let contract = &contract_record.receipt_body;
     let mut terminals = store
         .canonical_records_by_subject_ref::<CognitiveRunTerminal>(

@@ -14,6 +14,7 @@ use eliot_types::{
     MAX_SECRET_BOUNDARY_BYTES, ProjectId, SecretBoundaryRule, SessionId, TaskId, WriteReceiptRef,
     inspect_secret_bytes,
 };
+use eliot_types::cognitive_run::require_current_cognitive_run_schema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -394,6 +395,13 @@ pub(crate) async fn run(
             .cloned()
             .context("cognitive status has no contract")?,
     )?;
+    // The contract's exact plan selects the call this runner is about to
+    // dispatch, so its declared version is owner-checked here, before any plan
+    // lookup, request validation or provider launch may treat it as current.
+    // `canonical_record_by_write_id`/`from_value` only deserialize the type, so
+    // a foreign or future layout would otherwise reach the dispatch contour.
+    require_current_cognitive_run_schema(&contract)
+        .map_err(|mismatch| anyhow::Error::new(mismatch))?;
     let call = contract
         .exact_plan
         .get(usize::from(request.call_number.saturating_sub(1)))

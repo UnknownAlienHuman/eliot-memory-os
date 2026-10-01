@@ -1785,6 +1785,11 @@ impl WriterWorker {
             .ok_or_else(|| {
                 EngineError::WriteRejected("cognitive contract disappeared".to_owned())
             })?;
+        // The sealed contract selects the exact plan this begin progresses
+        // against, so its declared version is owner-checked before its plan,
+        // run identity or gate binding may authorize the call.
+        require_current_cognitive_run_schema(&contract.receipt_body)
+            .map_err(|mismatch| EngineError::WriteRejected(mismatch.to_string()))?;
         if contract.canonical_receipt != precondition.contract_receipt
             || contract.receipt_body.run_id != precondition.run_id
         {
