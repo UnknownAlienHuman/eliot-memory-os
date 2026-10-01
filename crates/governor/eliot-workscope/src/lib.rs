@@ -3850,7 +3850,7 @@ impl WorkScopeBindingOwner {
         if existing.original_observed_scope.is_none() {
             return Err(WorkScopeError::OriginalObservationMissing);
         }
-        let original_discovery = existing
+        existing
             .bootstrap_discovery_inputs
             .as_ref()
             .ok_or(WorkScopeError::ScanReceiptMissing)?;
