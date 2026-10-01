@@ -8646,6 +8646,42 @@ impl NativeWorkerClaimState {
     }
 }
 
+/// Owner-held canonical-payload evidence for the six provider receipt kinds
+/// verified through the Kernel provider-capability owner (issue #1108, A5).
+///
+/// Each slot retains the lowercase SHA-256 over the canonical receipt bytes
+/// first recorded under one claim identity for its kind (admission,
+/// cancellation, worker fence, reassignment, result, unknown outcome); a
+/// changed payload under one identity conflicts and never overwrites the
+/// durable binding. Every slot is `None` until its kind's payload is
+/// recorded, and stays `None` in rows staged before this column: ORS
+/// compares retained digests byte-wise and never interprets receipt meaning.
+/// The Kernel-side pure verifier compares the presented
+/// `canonical_payload_sha256` for the proof kind at hand against the
+/// retained slot by content, never against a caller echo.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerClaimReceiptPayloads {
+    /// Retained canonical-payload digest of the admission receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_payload_sha256: Option<String>,
+    /// Retained canonical-payload digest of the cancellation receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_payload_sha256: Option<String>,
+    /// Retained canonical-payload digest of the worker-fence receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_fence_payload_sha256: Option<String>,
+    /// Retained canonical-payload digest of the reassignment receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reassignment_payload_sha256: Option<String>,
+    /// Retained canonical-payload digest of the result submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_payload_sha256: Option<String>,
+    /// Retained canonical-payload digest of the unknown-outcome receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_outcome_payload_sha256: Option<String>,
+}
+
 /// Durable native-worker claim intent and admission record (Wave B, issue
 /// #872).
 ///
@@ -8713,6 +8749,18 @@ pub struct NativeWorkerClaimRecord {
     /// claims; decodes as empty and never verifies.
     #[serde(default)]
     pub executable_binding_digest: String,
+    /// Owner-held canonical-payload evidence for the six provider receipt
+    /// kinds (issue #1108, A5).
+    ///
+    /// Retained per kind as receipts are recorded, never recomputed here: a
+    /// changed payload under one claim identity conflicts and never
+    /// overwrites the durable binding. Decodes as all-`None` in rows staged
+    /// before this column, which stay readable; a kind with no retained
+    /// payload carries no owner evidence yet, so the pure verifier passes
+    /// that leg until the recorder lands, while a retained digest that
+    /// disagrees with the presented payload fails closed.
+    #[serde(default)]
+    pub receipt_payloads: NativeWorkerClaimReceiptPayloads,
     /// Supported execution-unit schema version.
     pub execution_unit_schema_version: u16,
     /// Predecessor revision this claim continues from; opaque to ORS.
@@ -8771,6 +8819,7 @@ impl NativeWorkerClaimRecord {
             && self.binding_digest == other.binding_digest
             && self.request_digest == other.request_digest
             && self.executable_binding_digest == other.executable_binding_digest
+            && self.receipt_payloads == other.receipt_payloads
             && self.execution_unit_schema_version == other.execution_unit_schema_version
             && self.predecessor_revision == other.predecessor_revision
             && self.resource_envelope_digest == other.resource_envelope_digest
@@ -8819,6 +8868,39 @@ impl NativeWorkerClaimRecord {
                 &self.executable_binding_digest,
                 "native_worker_claim_executable_binding_digest",
             )?;
+        }
+        // Absent (pre-column or not-yet-recorded) payload slots decode as
+        // `None` and carry no owner evidence; a retained payload digest must
+        // be an exact digest.
+        for (digest, field) in [
+            (
+                &self.receipt_payloads.admission_payload_sha256,
+                "native_worker_claim_admission_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.cancellation_payload_sha256,
+                "native_worker_claim_cancellation_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.worker_fence_payload_sha256,
+                "native_worker_claim_worker_fence_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.reassignment_payload_sha256,
+                "native_worker_claim_reassignment_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.result_payload_sha256,
+                "native_worker_claim_result_payload_sha256",
+            ),
+            (
+                &self.receipt_payloads.unknown_outcome_payload_sha256,
+                "native_worker_claim_unknown_outcome_payload_sha256",
+            ),
+        ] {
+            if let Some(digest) = digest {
+                validate_digest(digest, field)?;
+            }
         }
         match (&self.capability_cell, &self.capability_cell_registry_digest) {
             (Some(cell), Some(registry_digest)) => {
