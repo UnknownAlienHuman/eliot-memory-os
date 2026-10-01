@@ -469,6 +469,11 @@ fn truncated_coverage_is_inconclusive_with_frontier() {
     batch_value.coverage.truncated = true;
     batch_value.coverage.frontier = vec!["resume-1".to_owned()];
     batch_value.coverage.revalidation_required = true;
+    // The frontier entry is itself accounted volume, so the known denominator is
+    // the projected record plus the deferred one. Declaring only the projected
+    // count would leave the frontier unexplained, which the exact three-way
+    // accounting refuses at the batch before the quality crate is reached.
+    batch_value.coverage.denominator = DenominatorState::Known { total: 2 };
     let applicable = set_for(&batch_value, &[], &[], None);
     let candidate = QualityRequest {
         batch: batch_value,
@@ -514,6 +519,17 @@ fn batch_omissions_are_carried_with_identities() {
 fn undeclared_volume_is_inconclusive_not_silent() {
     let batch_value = batch(vec![record("mem-1")]);
     let mut lossy = batch_value;
+    // A known total of 3 over one projected record leaves two units of volume
+    // that no record, omission or frontier names. That remainder must never be
+    // carried silently, and it cannot be carried at all: the exact disjoint
+    // three-way accounting refuses the batch outright, so the fixture declares
+    // the two units as deferred volume on the resume frontier instead. The
+    // property under test is unchanged and still proven end to end — the
+    // unprojected volume is surfaced as `unaccounted_volume` and the assessment
+    // is Inconclusive, never Complete.
+    lossy.coverage.truncated = true;
+    lossy.coverage.frontier = vec!["resume-1".to_owned(), "resume-2".to_owned()];
+    lossy.coverage.revalidation_required = true;
     lossy.coverage.denominator = DenominatorState::Known { total: 3 };
     let applicable = set_for(&lossy, &[], &[], None);
     let candidate = QualityRequest {
