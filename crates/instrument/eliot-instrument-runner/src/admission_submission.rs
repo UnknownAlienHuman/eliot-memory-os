@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 
 use eliot_store_api::{
-    NamedMutationOperation, NamedReadOperation, decode_instrument_registry_mutation,
+    NamedMutationOperation, NamedMutationRequest, NamedReadOperation,
+    decode_instrument_registry_mutation,
 };
 use serde_json::Value;
 
@@ -61,6 +62,21 @@ impl AdmissionSubmission {
             "snapshot_json".to_owned(),
             Value::String(self.snapshot_json.clone()),
         )])
+    }
+
+    /// Closed store mutation request this submission executes.
+    ///
+    /// The single named `ApplyInstrumentRegistryState` command carrying
+    /// exactly the accepted `snapshot_json` parameters: the exact request
+    /// the Governor-owned instrument-registry commit entry executes through
+    /// the canonical owner. Building it here, from the same accessors the
+    /// acceptance boundary validated, keeps the executed bytes identical to
+    /// the admitted bytes by construction.
+    pub fn mutation_request(&self) -> NamedMutationRequest {
+        NamedMutationRequest {
+            operation: self.operation(),
+            parameters: self.parameters(),
+        }
     }
 
     /// Admitted spec digest this launch was bound under.
