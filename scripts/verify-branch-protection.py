@@ -142,11 +142,51 @@ def read_rulesets(repo: str) -> list:
     return payload if isinstance(payload, list) else []
 
 
-def compare(expected: dict, protection: dict, rulesets: list, emitted: set[str]) -> list[dict]:
+def read_default_branch(repo: str) -> str:
+    """Read the repository's CURRENT default branch name.
+
+    A rule enforced on a non-default branch cannot gate the merge path that
+    matters, so a readback that never checks this would let protection on an
+    arbitrary branch satisfy MATCH for the intended default branch. Reading it
+    here binds the comparison to the branch that actually receives merges.
+    """
+    code, out = gh_api(f"repos/{repo}")
+    if code != 0:
+        raise ReadError(f"repository read failed: {out.strip() or code}")
+    try:
+        payload = json.loads(out or "{}")
+    except json.JSONDecodeError as exc:
+        raise ReadError(f"repository read returned invalid JSON: {exc}") from exc
+    branch = payload.get("default_branch")
+    if not isinstance(branch, str) or not branch.strip():
+        raise ReadError("repository read did not report a default_branch")
+    return branch.strip()
+
+
+def compare(
+    expected: dict,
+    protection: dict,
+    rulesets: list,
+    emitted: set[str],
+    default_branch: str | None = None,
+) -> list[dict]:
     """Compare observed state against the retained rule; return typed findings."""
     findings: list[dict] = []
     want_contexts = list(expected.get("required_contexts") or [])
     want_app_id = expected.get("required_check_app_id")
+
+    # The retained rule must be bound to the branch that actually receives
+    # merges. A rule enforced only on a side branch cannot gate the default
+    # merge path, so a readback that skipped this would let such a rule satisfy
+    # MATCH for the intended default branch.
+    if default_branch is not None and expected.get("branch") != default_branch:
+        findings.append({
+            "code": "BP-DEFAULT-BRANCH",
+            "detail": (
+                f"retained rule targets branch {expected.get('branch')!r} but the repository "
+                f"default branch is {default_branch!r}; enforcement is not bound to the merge path"
+            ),
+        })
 
     # The retained rule must still name a check the checked-in workflow emits,
     # or it has drifted from its emitter and no comparison can be meaningful.
@@ -259,6 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         protection = read_protection(args.repo, args.branch)
         rulesets = read_rulesets(args.repo)
+        default_branch = read_default_branch(args.repo)
         emitted = emitted_check_names(Path(args.emitter))
     except ReadError as exc:
         print(f"BP-READ-ERROR {exc}", file=sys.stderr)
@@ -275,11 +316,12 @@ def main(argv: list[str] | None = None) -> int:
             Path(args.readback_out).write_text(json.dumps(readback, indent=2) + "\n", encoding="utf-8")
         return 2
 
-    findings = compare(expected, protection, rulesets, emitted)
+    findings = compare(expected, protection, rulesets, emitted, default_branch)
     verdict = "MATCH" if not findings else "MISMATCH"
     readback = {
         "repo": args.repo,
         "branch": args.branch,
+        "default_branch": default_branch,
         "expected_rule": args.expect,
         "verdict": verdict,
         "findings": findings,

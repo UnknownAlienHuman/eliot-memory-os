@@ -42,8 +42,10 @@ reports `BP-RULE-UNBOUND` when the retained context is no longer emitted by
 `.github/workflows/ci.yml`, and `BP-APP-UNBOUND`/`BP-APP-MISMATCH` when the live
 requirement is not bound to the declared check app — a bare context can be
 satisfied by any app posting that name, which is weaker than the stated
-guarantee. The tool only ever reads protection; applying it is a separate
-governed repository setting.
+guarantee. It also reports `BP-DEFAULT-BRANCH` when the retained rule does not
+target the repository's current default branch, so enforcement cannot be read
+back as satisfying the merge path from a side branch. The tool only ever reads
+protection; applying it is a separate governed repository setting.
 
 ### `repository-policy.yml`
 
