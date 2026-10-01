@@ -807,6 +807,11 @@ impl crate::CompletionGate {
         let base_status = base.final_status;
         let mut reasons = base.reasons;
         if base_status == CompletionStatus::UnsafeToFinish {
+            if context.candidate_diff.is_none() {
+                reasons.push("missing_candidate_diff".to_owned());
+            } else if context.candidate_review.is_none() {
+                reasons.push("missing_candidate_review".to_owned());
+            }
             return candidate_completion_decision(proof, CompletionStatus::UnsafeToFinish, reasons);
         }
         let Some(candidate_diff) = context.candidate_diff else {
