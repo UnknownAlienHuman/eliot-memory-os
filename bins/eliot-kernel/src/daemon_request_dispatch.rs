@@ -1416,6 +1416,14 @@ enum P07LifecycleTarget<'a> {
 }
 
 impl KernelComposition {
+    fn prune_expired_orientation_headroom_permits(&self, now_ms: u64) -> Result<(), TransportError> {
+        self.orientation_headroom_permits
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .retain(|_, entry| entry.closure.deadline_ms > now_ms);
+        Ok(())
+    }
+
     /// Executes one authenticated native Orientation headroom owner action.
     ///
     /// The retained `RuntimePermit` is never serialized. This first owner
@@ -1491,10 +1499,13 @@ impl KernelComposition {
                 }) {
                     existing.binding.clone()
                 } else {
-                    let reserve = self
-                        .runtime
-                        .capacity_reserve()
-                        .ok_or(TransportError::SessionFenced)?;
+                    let Some(reserve) = self.runtime.capacity_reserve() else {
+                        return Ok(serde_json::json!({
+                            "status": "unknown",
+                            "value": null,
+                            "recovery": { "code": "RUNTIME_OWNER_UNAVAILABLE" }
+                        }));
+                    };
                     let quantity = source.requested_limit.quantity.get();
                     if source.operation.capacity_class() != CapacityClass::NormalWorkload
                         || quantity != 1
@@ -1516,7 +1527,7 @@ impl KernelComposition {
                             }));
                         }
                     };
-                    let permit = match source.requested_bottleneck {
+                    let permit_result = match source.requested_bottleneck {
                         CapacityBottleneck::KernelRunnableControlSlots => reserve
                             .try_acquire_normal_runnable_slot(class, ACTIVE_DAEMON_CALLER, source.operation_id.as_str()),
                         CapacityBottleneck::CpuControlTaskSlots => reserve
@@ -1528,8 +1539,17 @@ impl KernelComposition {
                                 "recovery": { "code": "UNSUPPORTED_OWNER_DIMENSION" }
                             }));
                         }
-                    }
-                    .map_err(|_| TransportError::SessionFenced)?;
+                    };
+                    let permit = match permit_result {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return Ok(serde_json::json!({
+                                "status": "unknown",
+                                "value": null,
+                                "recovery": { "code": "OWNER_CAPACITY_EXHAUSTED" }
+                            }));
+                        }
+                    };
                     if now_ms == 0 || now_ms >= closure.deadline_ms {
                         drop(permit);
                         return Ok(serde_json::json!({
@@ -1538,8 +1558,17 @@ impl KernelComposition {
                             "recovery": { "code": "DEADLINE_EXPIRED" }
                         }));
                     }
-                    let nonce = eliot_platform_windows::fresh_activation_nonce_material()
-                        .map_err(|_| TransportError::SessionFenced)?;
+                    let nonce = match eliot_platform_windows::fresh_activation_nonce_material() {
+                        Ok(nonce) => nonce,
+                        Err(_) => {
+                            drop(permit);
+                            return Ok(serde_json::json!({
+                                "status": "unknown",
+                                "value": null,
+                                "recovery": { "code": "OWNER_NONCE_UNAVAILABLE" }
+                            }));
+                        }
+                    };
                     let mut owner_evidence_refs = vec![
                         format!("kernel-runtime-generation:{}", self.runtime_owner_generation.value()),
                         format!("orientation-request:{}", closure.source_request_digest),
@@ -3422,6 +3451,7 @@ impl KernelComposition {
         request_identity: Option<&RequestIdentity>,
         subordinate_terminal_emitted: &mut bool,
     ) -> Result<Frame, TransportError> {
+        self.prune_expired_orientation_headroom_permits(unix_ms())?;
         let context = tracing::Span::current();
         #[cfg(windows)]
         if operation == USER_AUTOMATION_OPERATOR_OPERATION {
