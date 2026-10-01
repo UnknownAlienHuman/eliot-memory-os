@@ -100,8 +100,8 @@ use crate::{
     ReservationRecord, ReservationRequest, ReservationState, ReservedScope, RetryState,
     RootTransitionCommit, RootTransitionCommitProjection, ScopeTerminalReceipt, ScopeTerminalView,
     SessionBindingReceipt, SessionDetach, StageReceipt, StagedEnvelopeRecoveryCursor,
-    StagedEnvelopeRecoveryEntry, StagedEnvelopeRecoveryPage, StagedOperation,
-    StagedWriteRecoveryReport, StateFenceSnapshot, StreamRecoveryActivation,
+    StagedEnvelopeRecoveryEntry, StagedEnvelopeRecoveryPage, StagedEnvelopeReservationBinding,
+    StagedOperation, StagedWriteRecoveryReport, StateFenceSnapshot, StreamRecoveryActivation,
     StreamRecoveryReconciliationState, SupervisionLeaseCommitTicket,
     SupervisionLeasePrepareRequest, SupervisionLeaseProjection, SupervisionLeaseReceipt,
     SupervisionLeaseReceiptInput, SupervisionLeaseRecord, SupervisionLeaseSnapshot,
@@ -4105,6 +4105,15 @@ pub trait OperationalRecoveryStore: Send + Sync {
     /// page instead of assuming it. A row whose bytes do not decode is still
     /// enumerated by its key, so the owner can turn it into a durable Recovery
     /// Problem instead of losing it.
+    ///
+    /// A row whose OWNER INDEX does not resolve — no operation index row, a
+    /// dangling index row, or a reservation whose recorded operation identity is
+    /// a different operation — is also still enumerated, under a
+    /// [`StagedEnvelopeReservationBinding::Unresolved`] binding, and the pass
+    /// continues to the next row. One broken index row therefore never abandons
+    /// the other rows on the page, and the durable problem ORS can bind is
+    /// retained under the exact key the row is stored at. It is never reported
+    /// as an owned, clean record.
     fn scan_staged_envelopes(
         &self,
         cursor: StagedEnvelopeRecoveryCursor,
@@ -4136,6 +4145,23 @@ pub trait OperationalRecoveryStore: Send + Sync {
         &self,
         operation_id: &crate::OperationIdentity,
     ) -> Result<RecoveryPayloadEnvelope, OrsError>;
+    /// Re-reads the canonical terminal receipt of one staged write and checks
+    /// it against the durable Ordering Scope receipts ORS committed with it
+    /// (issue #1925, A13.6).
+    ///
+    /// This is the receipt-binding half of reconciliation, and it is deliberately
+    /// a CONTENT check: the recorded `terminal_receipt_id` is only returned once
+    /// every scope the reservation reserved carries a durable terminal receipt
+    /// bound to that exact receipt identity, scope and sequence. A reservation
+    /// with no recorded terminal receipt returns `Ok(None)`. A reservation whose
+    /// recorded receipt is absent from the durable scope receipts, or disagrees
+    /// with them, is a failed check and propagates as the store's own
+    /// [`OrsError::IntegrityProblem`] — it is never reported as "no receipt", and
+    /// the presence of the id alone never yields a receipt.
+    fn verify_staged_terminal_receipt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<OpaqueLabel>, OrsError>;
     /// Retains one caller-reported undecryptable-payload problem (missing key
     /// or decryption failure) without storing or returning payload bytes
     /// (issue #1925, I5.2).
@@ -28650,17 +28676,46 @@ impl RedbRecoveryStore {
     /// Retains one visible durable Recovery Problem for a staged operation
     /// whose envelope failed validation (issue #1925, I5.2).
     ///
-    /// The problem carries digests only — never payload bytes — and the
-    /// staged envelope and reservation rows are left untouched so the
-    /// operation remains available for reconciliation or explicit disposition.
-    /// An identical retained problem is returned unchanged; a conflicting
-    /// binding under the same identity fails without overwriting. A failure of
-    /// this write itself is never propagated on its own: its callers route it
-    /// through [`Self::staging_problem_record_failed`] so the original staging
-    /// failure survives next to it.
+    /// The problem is keyed by the staged operation identity the envelope is
+    /// stored under, which for every envelope-content failure is the token's own
+    /// operation identity. The epoch, fence, recovery owner and reservation
+    /// identity are read back from the staged operation's own durable token
+    /// rather than from caller values.
     fn retain_staging_problem(
         &self,
         token: &WriterReservationToken,
+        error: &OrsError,
+        fingerprint: Option<(String, Option<String>)>,
+    ) -> Result<RecoveryProblem, OrsError> {
+        self.retain_staging_problem_for(&token.operation_id, token, error, fingerprint)
+    }
+
+    /// The one durable staging-problem retention, keyed by the staged operation
+    /// identity the record is stored under (issue #1925, I5.2, A13.6).
+    ///
+    /// `staged_operation_id` is the key the problem is filed under, so the
+    /// operator finds the record at the identity the staged row actually carries.
+    /// It equals `context.operation_id` for every envelope-content failure. It
+    /// differs in exactly one case: the owner's own operation index resolved a
+    /// staged row to a reservation whose recorded operation identity is a
+    /// DIFFERENT operation. There, keying by `context.operation_id` would file
+    /// this row's fault under an unrelated — and otherwise healthy — operation,
+    /// so the staged row's own key is used instead. The epoch, state fence,
+    /// reservation identity and recovery owner still come from the reservation
+    /// record that was actually read, never from a recomputation.
+    ///
+    /// The problem carries digests only — never payload bytes — and the staged
+    /// envelope and reservation rows are left untouched so the operation remains
+    /// available for reconciliation or explicit disposition. An identical
+    /// retained problem is returned unchanged; a conflicting binding under the
+    /// same identity fails without overwriting. A failure of this write itself is
+    /// never propagated on its own: its callers route it through
+    /// [`Self::staging_problem_record_failed`] so the original staging failure
+    /// survives next to it.
+    fn retain_staging_problem_for(
+        &self,
+        staged_operation_id: &OperationIdentity,
+        context: &WriterReservationToken,
         error: &OrsError,
         fingerprint: Option<(String, Option<String>)>,
     ) -> Result<RecoveryProblem, OrsError> {
@@ -28671,15 +28726,15 @@ impl RedbRecoveryStore {
             RecoveryProblemKind::EnvelopeIntegrity
         };
         let problem = RecoveryProblem::new(
-            token.operation_id.clone(),
-            Some(token.reservation_id.clone()),
+            staged_operation_id.clone(),
+            Some(context.reservation_id.clone()),
             kind,
             staging_problem_detail(error)?,
             (!envelope_sha256.is_empty()).then_some(envelope_sha256),
             payload_sha256,
-            token.writer_epoch.clone(),
-            token.state_fence.clone(),
-            token.recovery_owner.clone(),
+            context.writer_epoch.clone(),
+            context.state_fence.clone(),
+            context.recovery_owner.clone(),
             current_unix_ms()?,
         )?;
         let write = self.database.begin_write().map_err(storage)?;
@@ -28722,6 +28777,140 @@ impl RedbRecoveryStore {
         Self::bump_recovery_inventory_revision(&write, RecoveryInventorySource::RecoveryProblems)?;
         write.commit().map_err(storage)?;
         Ok(problem)
+    }
+
+    /// Resolves one staged envelope row to the reservation that owns it through
+    /// the owner's own durable operation index.
+    ///
+    /// A row whose index or reservation does not resolve is a fault on THAT row
+    /// alone, so it is returned as [`StagedEnvelopeReservationLookup::Unresolved`]
+    /// and the enumeration continues with the next row. A row that cannot even be
+    /// read, or whose reservation row cannot be decoded, stays a failed check and
+    /// propagates as the store's own [`OrsError`]: that is a storage fault, not a
+    /// reportable record.
+    fn staged_envelope_reservation_binding(
+        operations: &impl ReadableTable<&'static str, &'static str>,
+        reservations: &impl ReadableTable<&'static str, &'static str>,
+        operation_id: &OperationIdentity,
+    ) -> Result<StagedEnvelopeReservationLookup, OrsError> {
+        let Some(indexed) = operations
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| value.value().to_owned())
+        else {
+            return Ok(StagedEnvelopeReservationLookup::Unresolved(
+                UnresolvedStagedEnvelope {
+                    operation_id: operation_id.clone(),
+                    reservation_id: None,
+                    original: OrsError::IntegrityProblem {
+                        record_type: "recovery_envelope",
+                        reason: "staged envelope has no operation index row".to_owned(),
+                    },
+                    token: None,
+                },
+            ));
+        };
+        let reservation_id = match OperationIdentity::new(indexed) {
+            Ok(reservation_id) => reservation_id,
+            Err(error) => {
+                return Ok(StagedEnvelopeReservationLookup::Unresolved(
+                    UnresolvedStagedEnvelope {
+                        operation_id: operation_id.clone(),
+                        reservation_id: None,
+                        original: OrsError::IntegrityProblem {
+                            record_type: "operation_index",
+                            reason: error.to_string(),
+                        },
+                        token: None,
+                    },
+                ));
+            }
+        };
+        let record = reservations
+            .get(reservation_id.as_str())
+            .map_err(storage)?
+            .map(|value| decode::<ReservationRecord>(value.value()))
+            .transpose()?;
+        let Some(record) = record else {
+            return Ok(StagedEnvelopeReservationLookup::Unresolved(
+                UnresolvedStagedEnvelope {
+                    operation_id: operation_id.clone(),
+                    reservation_id: Some(reservation_id),
+                    original: OrsError::IntegrityProblem {
+                        record_type: "operation_index",
+                        reason: "staged envelope operation index is dangling".to_owned(),
+                    },
+                    token: None,
+                },
+            ));
+        };
+        if record.token.operation_id != *operation_id {
+            return Ok(StagedEnvelopeReservationLookup::Unresolved(
+                UnresolvedStagedEnvelope {
+                    operation_id: operation_id.clone(),
+                    reservation_id: Some(reservation_id),
+                    original: OrsError::IntegrityProblem {
+                        record_type: "recovery_envelope",
+                        reason: "staged envelope key differs from its reservation's operation \
+                                 identity"
+                            .to_owned(),
+                    },
+                    token: Some(Box::new(record.token)),
+                },
+            ));
+        }
+        Ok(StagedEnvelopeReservationLookup::Resolved(
+            StagedEnvelopeReservationBinding::Resolved {
+                reservation_id,
+                reservation_state: record.state,
+            },
+        ))
+    }
+
+    /// Retains the durable Recovery Problem for one enumerated staged row whose
+    /// owner index did not resolve, and attaches it to that row's reported
+    /// entry.
+    ///
+    /// A Recovery Problem must carry the operation's authority epoch, state
+    /// fence and recovery owner, and those live on the reservation record. So a
+    /// row whose own reservation token IS readable — which is exactly the case
+    /// where the durable index resolved the row to a reservation whose recorded
+    /// operation identity is a different operation — binds the problem to the
+    /// staged row's OWN key through the one existing retention path. Where the
+    /// reservation is itself the missing or unreadable record there is nothing
+    /// durable to bind, and ORS does not invent a substitute: the entry keeps
+    /// reporting the row under its exact key with the owner's own cause, and the
+    /// pass reports that row as unresolved.
+    ///
+    /// Called after the read snapshot is released, so a Recovery Problem is never
+    /// written while a read transaction on this database is open.
+    fn retain_unresolved_staged_envelope_problem(
+        &self,
+        index: usize,
+        failure: UnresolvedStagedEnvelope,
+        records: &mut [StagedEnvelopeRecoveryEntry],
+    ) -> Result<(), OrsError> {
+        let UnresolvedStagedEnvelope {
+            operation_id,
+            reservation_id: _,
+            original,
+            token,
+        } = failure;
+        let Some(token) = token else {
+            return Ok(());
+        };
+        let retained = self
+            .retain_staging_problem_for(&operation_id, &token, &original, None)
+            .map_err(|recorder| Self::staging_problem_record_failed(&token, original, recorder))?;
+        if let Some(StagedEnvelopeRecoveryEntry {
+            reservation:
+                StagedEnvelopeReservationBinding::Unresolved { problem, .. },
+            ..
+        }) = records.get_mut(index)
+        {
+            *problem = Some(retained);
+        }
+        Ok(())
     }
 
     /// Second chance for the durable Recovery Problem write itself (issue #1713,
@@ -34686,9 +34875,8 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     /// (issue #1925, I5.2/I5.6, A1).
     ///
     /// One read snapshot resolves each row's key together with the owning
-    /// reservation's identity, lifecycle state and terminal receipt, so a page
-    /// can never mix an envelope with a reservation position read from a
-    /// different moment.
+    /// reservation's identity and lifecycle state, so a page can never mix an
+    /// envelope with a reservation position read from a different moment.
     ///
     /// The row's stored bytes are deliberately NOT read here. A corrupted or
     /// undecryptable payload must still be enumerated so the owner can retain a
@@ -34697,6 +34885,15 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
     /// Decoding, identity binding and integrity validation stay in
     /// [`Self::verify_staged_envelope`], which is the single existing gate and
     /// which never deletes a staged row.
+    ///
+    /// A row whose OWNER INDEX does not resolve is the same kind of recoverable,
+    /// reportable record (A13.6: an unknown commit outcome is resolved through
+    /// operation identity and observations), so it is enumerated under a
+    /// [`StagedEnvelopeReservationBinding::Unresolved`] binding, the durable
+    /// problem ORS can bind is retained under that row's exact key, and the pass
+    /// continues to the next row. The retained problems are written after this
+    /// read snapshot is released, so a Recovery Problem is never written while a
+    /// read transaction on this database is open.
     fn scan_staged_envelopes(
         &self,
         cursor: StagedEnvelopeRecoveryCursor,
@@ -34704,68 +34901,62 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
         if cursor.limit == 0 || cursor.limit > crate::MAX_RECOVERY_PAGE {
             return Err(OrsError::InvalidCursorLimit);
         }
-        let read = self.database.begin_read().map_err(storage)?;
-        let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
-        let operations = read.open_table(OPERATIONS).map_err(storage)?;
-        let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
-        let rows = match cursor.after_operation_id.as_ref() {
-            Some(after) => envelopes
-                .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
-                .map_err(storage)?,
-            None => envelopes.range::<&str>(..).map_err(storage)?,
-        };
         let limit = usize::from(cursor.limit);
-        let mut records = Vec::new();
+        let mut records: Vec<StagedEnvelopeRecoveryEntry> = Vec::new();
         let mut last_key: Option<OperationIdentity> = None;
         let mut continues = false;
-        for (offset, entry) in rows.take(limit + 1).enumerate() {
-            if offset == limit {
-                continues = true;
-                break;
-            }
-            let (key, _stored_bytes) = entry.map_err(storage)?;
-            let operation_id = OperationIdentity::new(key.value().to_owned())?;
-            // The owner's own operation index is the only way from an operation
-            // identity to its reservation. A staged envelope with no index row
-            // is an integrity failure, not a silently skipped record.
-            let reservation_id = {
-                let indexed = operations
-                    .get(operation_id.as_str())
-                    .map_err(storage)?
-                    .map(|value| value.value().to_owned())
-                    .ok_or_else(|| OrsError::IntegrityProblem {
-                        record_type: "recovery_envelope",
-                        reason: "staged envelope has no operation index row".to_owned(),
-                    })?;
-                OperationIdentity::new(indexed).map_err(|error| OrsError::IntegrityProblem {
-                    record_type: "operation_index",
-                    reason: error.to_string(),
-                })?
+        // Rows whose owner index did not resolve, paired with the page position
+        // their reported entry occupies so the retained problem can be attached
+        // to that exact entry once the read snapshot is gone.
+        let mut unresolved: Vec<(usize, UnresolvedStagedEnvelope)> = Vec::new();
+        {
+            let read = self.database.begin_read().map_err(storage)?;
+            let envelopes = read.open_table(ENVELOPES).map_err(storage)?;
+            let operations = read.open_table(OPERATIONS).map_err(storage)?;
+            let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+            let rows = match cursor.after_operation_id.as_ref() {
+                Some(after) => envelopes
+                    .range::<&str>((Bound::Excluded(after.as_str()), Bound::Unbounded))
+                    .map_err(storage)?,
+                None => envelopes.range::<&str>(..).map_err(storage)?,
             };
-            let record = reservations
-                .get(reservation_id.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<ReservationRecord>(value.value()))
-                .transpose()?
-                .ok_or(OrsError::IntegrityProblem {
-                    record_type: "operation_index",
-                    reason: "staged envelope operation index is dangling".to_owned(),
-                })?;
-            if record.token.operation_id != operation_id {
-                return Err(OrsError::IntegrityProblem {
-                    record_type: "recovery_envelope",
-                    reason: "staged envelope key differs from its reservation's operation \
-                             identity"
-                        .to_owned(),
-                });
+            for (offset, entry) in rows.take(limit + 1).enumerate() {
+                if offset == limit {
+                    continues = true;
+                    break;
+                }
+                let (key, _stored_bytes) = entry.map_err(storage)?;
+                let operation_id = OperationIdentity::new(key.value().to_owned())?;
+                last_key = Some(operation_id.clone());
+                match Self::staged_envelope_reservation_binding(
+                    &operations,
+                    &reservations,
+                    &operation_id,
+                )? {
+                    StagedEnvelopeReservationLookup::Resolved(reservation) => {
+                        records.push(StagedEnvelopeRecoveryEntry {
+                            operation_id,
+                            reservation,
+                        });
+                    }
+                    StagedEnvelopeReservationLookup::Unresolved(failure) => {
+                        let cause = staging_problem_detail(&failure.original)?;
+                        let reservation_id = failure.reservation_id.clone();
+                        records.push(StagedEnvelopeRecoveryEntry {
+                            operation_id,
+                            reservation: StagedEnvelopeReservationBinding::Unresolved {
+                                reservation_id,
+                                problem: None,
+                                cause,
+                            },
+                        });
+                        unresolved.push((records.len() - 1, failure));
+                    }
+                }
             }
-            last_key = Some(operation_id.clone());
-            records.push(StagedEnvelopeRecoveryEntry {
-                operation_id,
-                reservation_id,
-                reservation_state: record.state,
-                terminal_receipt_id: record.terminal_receipt_id,
-            });
+        }
+        for (index, failure) in unresolved {
+            self.retain_unresolved_staged_envelope_problem(index, failure, &mut records)?;
         }
         let next_cursor = if continues {
             Some(
@@ -34782,6 +34973,48 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             records,
             next_cursor,
         })
+    }
+
+    /// Re-reads the canonical terminal receipt of one staged write through the
+    /// store's EXISTING scope-receipt binding check.
+    ///
+    /// The check is the one store stop already runs for every durable
+    /// reservation, [`validate_write_reservation_scopes_in_read`]: for a
+    /// terminal reservation it requires each reserved scope to carry a
+    /// `SCOPE_TERMINALS` receipt bound to that exact receipt identity, scope and
+    /// sequence, and raises `IntegrityProblem` when the receipt is absent. This
+    /// is the same check, on the same read snapshot, with no second receipt
+    /// comparison written here.
+    fn verify_staged_terminal_receipt(
+        &self,
+        operation_id: &crate::OperationIdentity,
+    ) -> Result<Option<OpaqueLabel>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let operations = read.open_table(OPERATIONS).map_err(storage)?;
+        let reservation_id = operations
+            .get(operation_id.as_str())
+            .map_err(storage)?
+            .map(|value| OperationIdentity::new(value.value().to_owned()))
+            .transpose()?
+            .ok_or(OrsError::ReservationNotFound)?;
+        let reservations = read.open_table(RESERVATIONS).map_err(storage)?;
+        let record = Self::load_record(&reservations, &reservation_id)?;
+        if record.token.operation_id != *operation_id {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "recovery_envelope",
+                reason: "staged envelope key differs from its reservation's operation identity"
+                    .to_owned(),
+            });
+        }
+        let Some(terminal_receipt_id) = record.terminal_receipt_id.clone() else {
+            return Ok(None);
+        };
+        // The existing binding check reads the durable scope receipts and
+        // compares them against the reservation's own recorded terminal receipt
+        // identity; a disagreement or a missing receipt fails here rather than
+        // yielding a receipt.
+        validate_write_reservation_scopes_in_read(&read, &record, &mut ignore_census_observation)?;
+        Ok(Some(terminal_receipt_id))
     }
 
     #[expect(
@@ -37088,6 +37321,31 @@ fn reconciliation_matches(
     // every live receipt while proving nothing the scope checks do not
     // already prove (issue #2031 native cases 15/19).
     Ok(())
+}
+
+/// One staged envelope row whose owner index did not resolve to a reservation
+/// (issue #1925, A13.6).
+///
+/// It carries the exact key the staged row is enumerated under, the reservation
+/// identity the durable operation index named when it named one, the owner's own
+/// typed cause, and — only where a reservation record was actually readable —
+/// that record's token, which is the sole durable source of the authority epoch,
+/// state fence and recovery owner a [`RecoveryProblem`] must carry. `token` is
+/// `None` where the reservation is itself the missing record; ORS does not
+/// substitute an invented binding for one it cannot read.
+struct UnresolvedStagedEnvelope {
+    operation_id: OperationIdentity,
+    reservation_id: Option<OperationIdentity>,
+    original: OrsError,
+    /// Boxed so this failure stays small next to the resolved binding it shares
+    /// an enum with; the token is read once, at retention.
+    token: Option<Box<WriterReservationToken>>,
+}
+
+/// Outcome of resolving one staged envelope row to its owning reservation.
+enum StagedEnvelopeReservationLookup {
+    Resolved(StagedEnvelopeReservationBinding),
+    Unresolved(UnresolvedStagedEnvelope),
 }
 
 fn storage(error: impl std::fmt::Display) -> OrsError {

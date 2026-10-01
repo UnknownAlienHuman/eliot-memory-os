@@ -50,7 +50,6 @@ use eliot_contracts::{
     CapabilityCellRegistry, ContractDigest, ExecutionContour, ProofEntrypointRef,
     ResourceGeneration, RuntimeBundleId, SourceCrateRef, SupportStatus,
 };
-use eliot_ors::{StagedWriteReconciliation, StagedWriteRecoveryReport};
 use eliot_platform_windows::ProtectedPathLease;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -126,25 +125,6 @@ fn native_worker_cell_expectation() -> Result<CapabilityCellExpectation, Capabil
             .map_err(|_| CapabilityCellProofError::InvalidRegistry)?,
         native_worker_declared_support()?,
     ))
-}
-
-/// Reports whether one startup recovery pass left a staged write that ORS
-/// retained a durable Recovery Problem for.
-///
-/// This is a bounded read of the owner's own outcome. A record whose envelope
-/// failed validation keeps both its staged row and its durable problem, so this
-/// predicate never claims the operation was dropped, cleaned up, or decrypted —
-/// it names exactly the disposition ORS holds. `Staged` (validated, still
-/// awaiting its canonical receipt) is deliberately NOT a problem: a healthy
-/// pending stage is not a fault, and treating it as one would make this stage
-/// permanently incomplete on a store with in-flight work.
-fn staged_write_recovery_has_problem(report: &StagedWriteRecoveryReport) -> bool {
-    report.reconciliations.iter().any(|reconciliation| {
-        matches!(
-            reconciliation,
-            StagedWriteReconciliation::RecoveryProblem { .. }
-        )
-    })
 }
 
 /// Parses the declared support claim through #13's own closed vocabulary.
@@ -1984,33 +1964,34 @@ impl KernelComposition {
             // A corrupted or undecryptable payload keeps its durable Recovery
             // Problem and its staged row: nothing is deleted, retried, or
             // decrypted into plaintext here.
-            let staged_write_recovery = generation_gateway
+            //
+            // This stage is a PRECONDITION of the readiness evidence recorded
+            // below, not a label beside it. I05-06 requires ORS enumeration,
+            // receipt/store reconciliation and residual-unknown disposition
+            // before normal writer readiness after a restart, so a pass that
+            // could not prove its enumeration refuses here through the SAME
+            // mechanism the three sibling recovery passes above use: the error
+            // is propagated out of composition assembly, `record_live_evidence`
+            // below is never reached, and `kernel.composition.generation_recovered`
+            // is never emitted. A non-exhaustive scan, a retained Recovery
+            // Problem, or a staged row whose owner index did not resolve
+            // therefore never becomes a positive verdict here.
+            generation_gateway
                 .recover_staged_write_envelopes()
                 .map_err(|error| {
                     observe_entrypoint_with_detail(
                         EntrypointStage::Composition,
-                        "kernel.composition.staged_write_recovery_rejected",
+                        "kernel.composition.staged_write_recovery_incomplete",
                     );
                     KernelBuildError::Ors(error)
                 })?;
-            // What this stage may claim is exactly what the pass proved: that
-            // every staged envelope was enumerated and validated, and that none
-            // of them is under a durable Recovery Problem. It does NOT claim the
-            // staged writes committed — an envelope whose reservation is still
-            // awaiting its canonical receipt is healthy pending work, and
-            // receipt observation stays with the Store-receipt owner. A
-            // non-exhaustive scan or a retained problem is reported as
-            // incomplete here rather than folded into a clean composition.
-            let staged_write_recovery_detail = if staged_write_recovery.truncated
-                || staged_write_recovery_has_problem(&staged_write_recovery)
-            {
-                "kernel.composition.staged_write_recovery_incomplete"
-            } else {
-                "kernel.composition.staged_write_recovery_recovered"
-            };
+            // Reached only when the pass above presented an exhaustive
+            // enumeration in which every staged row either reached its canonical
+            // receipt or is healthy in-flight work awaiting one. It never claims
+            // the staged writes committed.
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
-                staged_write_recovery_detail,
+                "kernel.composition.staged_write_recovery_recovered",
             );
         }
         startup_coordinator
