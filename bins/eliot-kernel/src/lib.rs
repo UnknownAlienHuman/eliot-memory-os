@@ -1587,7 +1587,7 @@ impl KernelComposition {
         use eliot_ors::{
             BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullState,
         };
-        use eliot_receipts::CausalBinding;
+        use eliot_receipts::{AuthorityBinding, CausalBinding};
 
         if deadline_ms <= unix_ms() || deadline_ms > grant.expires_at_unix_ms {
             return Err("open-admission deadline is outside the retained capability".to_owned());
@@ -1815,6 +1815,37 @@ impl KernelComposition {
             .envelope
             .as_ref()
             .ok_or_else(|| "committed source-admission WriteReceipt lacks its canonical envelope".to_owned())?;
+        let owner_update_identity: RequestIdentity = serde_json::from_str(
+            admission_request
+                .owner_update_identity_json
+                .as_deref()
+                .ok_or_else(|| "Pending source admission lacks its original RequestIdentity".to_owned())?,
+        )
+        .map_err(|error| format!("source-admission RequestIdentity is invalid: {error}"))?;
+        owner_update_identity
+            .validate()
+            .map_err(|error| format!("source-admission RequestIdentity failed validation: {error}"))?;
+        let admitted_causal: CausalBinding = serde_json::from_str(
+            &admission_request.kernel_causal_binding_json,
+        )
+        .map_err(|error| format!("source-admission causal binding is invalid: {error}"))?;
+        let admitted_authority: AuthorityBinding = serde_json::from_str(
+            &admission_request.kernel_authority_binding_json,
+        )
+        .map_err(|error| format!("source-admission authority binding is invalid: {error}"))?;
+        let source_operation_id = admission_request
+            .source_admission_operation_id
+            .as_deref()
+            .unwrap_or_default();
+        if receipt.idempotency_key != owner_update_identity.idempotency_key
+            || receipt_envelope.core.request != owner_update_identity.request
+            || receipt_envelope.core.causal != admitted_causal
+            || receipt_envelope.core.authority != admitted_authority
+            || receipt_envelope.core.operation.operation_id.as_str() != source_operation_id
+            || receipt_envelope.core.operation.idempotency_key != owner_update_identity.idempotency_key
+        {
+            return Err("source-admission WriteReceipt differs from the original identity or owner bindings".to_owned());
+        }
         let sequence = receipt_envelope
             .core
             .causal
