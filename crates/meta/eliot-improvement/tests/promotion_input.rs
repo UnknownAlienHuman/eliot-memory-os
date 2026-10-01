@@ -317,6 +317,23 @@ fn case_01_cell_identity_separate_from_closure_and_self_quality() {
     assert!(closure_router.contains("meta.learning.closure"));
     assert!(closure_router.contains("agent_order = 37"));
     assert!(!router_declarations(closure_router).contains("promotion_input.rs"));
+    // Excluding the review paragraph from the declarative scan is only safe
+    // because the paragraph itself declares no routing edge. Assert that
+    // directly, so the exclusion cannot become a place to smuggle one.
+    let review_prose: Vec<&str> = closure_router
+        .lines()
+        .filter(|line| is_review_prose_value(line))
+        .collect();
+    assert!(
+        !review_prose.is_empty(),
+        "the router must still carry its review paragraph, or the exclusion is untested"
+    );
+    for paragraph in &review_prose {
+        assert!(
+            !review_prose_declares_an_edge(paragraph),
+            "the excluded review paragraph declares a routing edge, which the declarative scan would miss: {paragraph}"
+        );
+    }
     assert_ne!(MODULE_ID, "meta.learning.closure");
     assert_ne!(AGENT_ORDER, 37);
 }
@@ -1258,13 +1275,53 @@ fn case_28_no_runtime_assessment_promotion_effect_calls() {
 fn router_declarations(router: &str) -> String {
     router
         .lines()
-        .filter(|line| {
-            !line
-                .trim_start()
-                .starts_with("evidence_status_and_review_owner")
-        })
+        .filter(|line| !is_review_prose_value(line))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The one router key whose value is free review prose rather than a routing
+/// declaration, and the only line the declarative scan excludes.
+const REVIEW_PROSE_KEY: &str = "evidence_status_and_review_owner";
+
+/// Whether this line is the free-prose `evidence_status_and_review_owner`
+/// review paragraph rather than a routing declaration.
+///
+/// The exclusion is a WHOLE-KEY match followed by `=`, not a prefix: a prefix
+/// would also swallow a differently-named key that merely starts with the same
+/// characters, which is exactly the kind of key a routing edge could hide in.
+/// The paragraph's own value is still checked, by
+/// [`review_prose_declares_an_edge`], so excluding it from the scan does not
+/// make it a place where an edge can be declared.
+fn is_review_prose_value(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    match trimmed.strip_prefix(REVIEW_PROSE_KEY) {
+        Some(rest) => rest.trim_start().starts_with('='),
+        None => false,
+    }
+}
+
+/// Whether the excluded review paragraph itself declares a routing edge, which
+/// would make excluding it from the declarative scan a way to smuggle one past
+/// the guard.
+///
+/// A routing edge is only actionable as a STRUCTURED value, and the router's
+/// consumers read exactly these keys - `depends_on`, `consumers`,
+/// `[[donor]].path` and `[agent_task].write_scope`. So the check looks for the
+/// TOML ASSIGNMENT syntax of those keys, not for the bare words: this paragraph
+/// legitimately quotes Rust paths and symbol names as evidence, so matching
+/// `use `, `::` or a bare `depends_on` would reject honest evidence prose.
+fn review_prose_declares_an_edge(prose: &str) -> bool {
+    [
+        "depends_on =",
+        "consumers =",
+        "path =",
+        "write_scope =",
+        "[[donor]]",
+        "[agent_task]",
+    ]
+    .iter()
+    .any(|marker| prose.contains(marker))
 }
 
 /// The compiled surface of a Rust source file: every line that is not a line or
