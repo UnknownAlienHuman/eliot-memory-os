@@ -2079,9 +2079,7 @@ impl DaemonComposition {
 
     /// Borrows the single Governor-owned durable swarm attachment composition.
     #[must_use]
-    pub fn swarm_attachment_composition(
-        &self,
-    ) -> &eliot_governor::SwarmAttachmentComposition {
+    pub fn swarm_attachment_composition(&self) -> &eliot_governor::SwarmAttachmentComposition {
         self.swarm_attachment.as_ref()
     }
 
