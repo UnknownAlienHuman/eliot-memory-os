@@ -49,7 +49,7 @@ use eliot_kernel_service::{
     ProviderCapabilityExpectation, ProviderCapabilityRequest, ProviderProofKind,
     verify_provider_capability,
 };
-use eliot_ors::{OperationIdentity, RedbRecoveryStore};
+use eliot_ors::{OperationIdentity, RedbRecoveryStore, StateFenceSnapshot, epoch_lineage_for};
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
 use std::sync::{Arc, Mutex};
 
@@ -95,6 +95,16 @@ pub enum ProviderCapabilityRouteError {
     UnknownClaim(String),
     /// The presented attempt/operation disagrees with the durable row.
     BindingMismatch(String),
+    /// The admission reservation bound to this claim refuses provider effect
+    /// authority (#1678 W8).
+    ReservationBlocked {
+        /// Bounded claim identity the reservation binds.
+        claim: String,
+        /// The owner's own launch-prerequisite discriminant (`STAGED`,
+        /// `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`,
+        /// `IDENTITY_CONFLICT`, `MISSING`, or `UNREADABLE:<tag>`).
+        state: String,
+    },
 }
 
 impl std::fmt::Display for ProviderCapabilityRouteError {
@@ -111,6 +121,10 @@ impl std::fmt::Display for ProviderCapabilityRouteError {
             Self::BindingMismatch(identity) => write!(
                 f,
                 "provider capability attempt/operation mismatches claim: {identity}"
+            ),
+            Self::ReservationBlocked { claim, state } => write!(
+                f,
+                "provider capability blocked by admission reservation {claim}: {state}"
             ),
         }
     }
@@ -130,7 +144,10 @@ impl ProviderCapabilityRouteError {
         match self {
             Self::UnknownClaim(_) => TransportError::UnknownRequest,
             Self::BindingMismatch(_) => TransportError::IdentityConflict,
-            Self::Session(_) | Self::Store(_) | Self::Capability(_) => {
+            Self::Session(_)
+            | Self::Store(_)
+            | Self::Capability(_)
+            | Self::ReservationBlocked { .. } => {
                 TransportError::SessionFenced
             }
         }
@@ -417,6 +434,100 @@ impl KernelComposition {
             live_authority_epoch,
         })
     }
+
+    /// Applies the #1678 admission-reservation launch gate to one provider-capability
+    /// verification (W8).
+    ///
+    /// This is the production caller of
+    /// [`super::admission_reservation_saga::require_bound_admission_reservation_launch`]
+    /// for the provider contour. It runs BEFORE the capability owner evaluates the
+    /// presented proof, so a refused verification has evaluated no proof, minted no
+    /// receipt and granted no provider effect authority.
+    ///
+    /// What it decides (I14.6, I14.20): a verified provider capability is provider
+    /// effect authority, and only an `Active` reservation under the matching canonical
+    /// admission may hold effect authority. The claim/work binding is the owner's own:
+    /// the reservation staged for a native-worker claim binds `work_item_id = claim_id`
+    /// and `proposed_attempt_id = attempt_id`
+    /// (`native_worker_lifecycle_route::stage_claim_admission_reservation`), so the gate
+    /// resolves the reservation by that exact pair through the owner's own durable rows
+    /// rather than reconstructing or being told one.
+    ///
+    /// * no reservation binds this claim and attempt — nothing staged, so nothing is
+    ///   refused and verification proceeds exactly as before. Staging one here would be
+    ///   a second reservation scheme, so it is never done.
+    /// * exactly one reservation binds it and it is `Active` — the owner's sealed
+    ///   typestate is returned and verification proceeds.
+    /// * a reservation binds it in any other state — refused by name. `STAGED`,
+    ///   `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`, `FOREIGN_OWNER`,
+    ///   `IDENTITY_CONFLICT`, `MISSING` and an unreadable row each reach the caller as
+    ///   [`ProviderCapabilityRouteError::ReservationBlocked`] carrying the owner's own
+    ///   discriminant, never as a generic denial. An unreadable or ambiguous owner read
+    ///   blocks verification rather than being collapsed into absence (I14.21: an unknown
+    ///   commit stays unknown, never a presumed permit).
+    ///
+    /// The Authority Epoch lineage and State Fence snapshot are the caller's own current
+    /// authority (the live service epoch plus the authenticated session fence), matching
+    /// the `eliotd` seam (`daemon_process_launch::require_eliotd_launch_reservation`):
+    /// provider effect under stale authority fails here instead of spending the owner's
+    /// proof evaluation on it.
+    fn require_provider_capability_reservation(
+        &self,
+        session: &Session,
+        claim_id: &str,
+        attempt_id: &str,
+    ) -> Result<(), ProviderCapabilityRouteError> {
+        // The reservation binds the exact claim/work pair the claim route staged; a
+        // reservation is only ever resolved for the exact identities that produced it.
+        let work_item = OperationIdentity::new(claim_id).map_err(|_| {
+            ProviderCapabilityRouteError::Session("claim identity is malformed".to_owned())
+        })?;
+        let proposed_attempt = OperationIdentity::new(attempt_id).map_err(|_| {
+            ProviderCapabilityRouteError::Session("attempt identity is malformed".to_owned())
+        })?;
+        // Fresh live epoch on every call: never a construction-time copy.
+        let live_epoch = self
+            .service
+            .lock()
+            .map_err(|_| {
+                ProviderCapabilityRouteError::Store("kernel owner state is unavailable".to_owned())
+            })?
+            .authority_epoch();
+        let lineage = epoch_lineage_for(&live_epoch, None).map_err(|_| {
+            ProviderCapabilityRouteError::Store("kernel owner state is unavailable".to_owned())
+        })?;
+        // The authenticated session fence, captured with the live epoch sequence and
+        // validated by the ORS owner against that epoch, so the ORIGINAL recorded
+        // reservation fence is verified rather than recomputed here.
+        let fence_snapshot = StateFenceSnapshot::capture(
+            &session.module_generation.state_fence,
+            live_epoch.sequence.get(),
+        )
+        .and_then(|snapshot| {
+            snapshot
+                .validate_against_epoch(&live_epoch)
+                .map(|()| snapshot)
+        })
+        .map_err(|_| {
+            ProviderCapabilityRouteError::Session("capability session fence".to_owned())
+        })?;
+        let now_unix_ms = i64::try_from(unix_ms()).map_err(|_| {
+            ProviderCapabilityRouteError::Store("kernel clock is unavailable".to_owned())
+        })?;
+        super::admission_reservation_saga::require_bound_admission_reservation_launch(
+            self.generation_gateway.ors.as_ref(),
+            &work_item,
+            &proposed_attempt,
+            &lineage,
+            &fence_snapshot,
+            now_unix_ms,
+        )
+        .map(|_| ())
+        .map_err(|refusal| ProviderCapabilityRouteError::ReservationBlocked {
+            claim: bounded_identity(claim_id),
+            state: refusal.state.clone(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +662,14 @@ impl KernelComposition {
         let fence_digest = require_capability_digest(payload, "fence_digest")?;
         let context = self.provider_capability_for_session(session)?;
         context.verify_claim_binding(&claim_id, worker_generation, &fence_digest)?;
+        // #1678 W8: the admission-reservation launch gate. The durable claim row is
+        // coherent (the binding above kept every existing UnknownClaim and
+        // BindingMismatch error exactly as before); before the capability owner
+        // evaluates the presented proof, the gate requires the reservation bound to
+        // THIS claim and attempt to be the owner's sealed `Active` typestate, refusing
+        // staged/released/expired/reconciling/stale-fence/foreign-owner/
+        // identity-conflict/missing/unreadable by the owner's own discriminant.
+        self.require_provider_capability_reservation(session, &claim_id, &attempt_id)?;
         context.verify(
             proof_kind,
             &attempt_id,
