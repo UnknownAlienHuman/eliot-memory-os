@@ -897,17 +897,21 @@ mod tests {
     fn retained_launch_receipt_absent() -> ProductProofRetainedEvidence {
         ProductProofRetainedEvidence {
             raw_log_refs: vec!["raw://eliotd/1903.log".to_owned()],
-            executable: ProductProofExecutableIdentity::new(
-                "eliotd.exe",
-                Some("sha256:observed-eliotd-bytes".to_owned()),
-                false,
-            )
-            .expect("executable identity"),
-            environment: ProductProofEnvironmentIdentity::new(
-                "windows-x86_64",
-                Some("installation-1903".to_owned()),
-            )
-            .expect("environment identity"),
+            executable: Some(
+                ProductProofExecutableIdentity::new(
+                    "eliotd.exe",
+                    Some("sha256:observed-eliotd-bytes".to_owned()),
+                    false,
+                )
+                .expect("executable identity"),
+            ),
+            environment: Some(
+                ProductProofEnvironmentIdentity::new(
+                    "windows-x86_64",
+                    Some("installation-1903".to_owned()),
+                )
+                .expect("environment identity"),
+            ),
             stage_receipts: ProductProofStageReceipts {
                 installed_route: ProductProofStageReceipt::Missing {
                     required_proof: "installed Windows route pulse executed end to end".to_owned(),
@@ -986,19 +990,19 @@ mod tests {
     }
 
     /// The same passing record, except that this attempt's launch receipt is
-    /// absent. This is the accepted near-miss: it is reachable, and it is not a
-    /// `PASS`.
-    fn absent_launch_receipt_pass() -> ProductProofStatus {
-        parked()
-            .record_attempt(
-                succeeded_attempt("windows-pulse-11-run-2"),
-                VerificationOutcome::Pass,
-                "installed Windows route pulse observed end to end",
-                Vec::new(),
-                vec![runtime_evidence("pulse:windows-installed-pulse-11-run-2")],
-                retained_launch_receipt_absent(),
-            )
-            .expect("a record that presents an absent launch receipt is still a record")
+    /// absent. The owner refuses it at `ProductProofStatus::validate`, so this
+    /// helper returns the refusal rather than a record: a `PASS` claiming an
+    /// absent launch receipt is never admitted, and no presentation path
+    /// exists that could roll one up.
+    fn absent_launch_receipt_pass() -> Result<ProductProofStatus, ProductProofError> {
+        parked().record_attempt(
+            succeeded_attempt("windows-pulse-11-run-2"),
+            VerificationOutcome::Pass,
+            "installed Windows route pulse observed end to end",
+            Vec::new(),
+            vec![runtime_evidence("pulse:windows-installed-pulse-11-run-2")],
+            retained_launch_receipt_absent(),
+        )
     }
 
     /// ACCEPTANCE: a simulated absent launch receipt cannot be rolled up as
@@ -1007,47 +1011,33 @@ mod tests {
     /// This is the real record and the real rollup. The rule is not restated
     /// here: the assertion reads `ProductProofStatus::rollup` on the same
     /// record that does roll up as `Pass` once its launch receipt is observed.
+    ///
+    /// The refusal is asserted WHERE IT ACTUALLY HAPPENS, which is earlier than
+    /// a rollup: `ProductProofStatus::validate` (`:677-680`) refuses a `Pass`
+    /// whose installed-route receipt is absent, so such a record is never
+    /// constructed at all. Asserting a `Refused` rollup instead would have
+    /// tested a state that cannot exist, and would have quietly documented a
+    /// weaker product than the one that actually ships.
     #[test]
     fn absent_launch_receipt_cannot_roll_up_as_pass_1903() {
+        // Premise: with the launch receipt OBSERVED, the same attempt really
+        // does roll up as PASS. Without this the refusal below would prove
+        // nothing — the record could be un-passable for an unrelated reason.
         assert!(
             observed_launch_receipt_pass().rollup().is_pass(),
             "premise: an observed launch receipt does roll up as PASS"
         );
 
-        let refused = absent_launch_receipt_pass().rollup();
+        // The near-miss is refused at construction: no record claiming PASS on
+        // an absent launch receipt is ever admitted, so none exists to be
+        // rolled up as PASS by any presentation path.
         assert!(
-            !refused.is_pass(),
-            "an absent launch receipt can never roll up as PASS, got {refused:?}"
-        );
-        assert_eq!(
-            refused,
-            ProductProofRollup::Refused {
-                proof_id: "windows-installed-pulse-11".to_owned(),
-                outcome: VerificationOutcome::Pass,
-                reason: "installed Windows route pulse observed end to end".to_owned(),
-                authority_ref: "finish-authority-1903".to_owned(),
-                missing_evidence: vec!["installed-route launch receipt".to_owned()],
-            },
-            "the refusal retains the exact outcome, reason, authority and the required \
-             missing evidence"
-        );
-    }
-
-    /// REFUSAL: the record refuses a `PASS` outright when the launch receipt is
-    /// absent, so no publication of it exists to be read as a pass.
-    #[test]
-    fn pass_claiming_an_absent_launch_receipt_is_refused_1903() {
-        assert!(matches!(
-            parked().record_attempt(
-                succeeded_attempt("windows-pulse-11-run-2"),
-                VerificationOutcome::Pass,
-                "installed Windows route pulse observed end to end",
-                Vec::new(),
-                vec![runtime_evidence("pulse:windows-installed-pulse-11-run-2")],
-                retained_launch_receipt_absent(),
+            matches!(
+                absent_launch_receipt_pass(),
+                Err(ProductProofError::PassWithoutInstalledRoute)
             ),
-            Err(ProductProofError::PassWithoutInstalledRoute)
-        ));
+            "a Pass record with an absent launch receipt must never be constructed"
+        );
     }
 
     /// REFUSAL: a build handle cannot stand in for a live-product runtime
