@@ -94,8 +94,8 @@ use eliot_maintenance::{
 };
 use eliot_module_registry::ModuleCatalog;
 use eliot_module_registry::ModuleCatalogSnapshot;
-use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_observation::TaskSelectionEvidence;
+use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
@@ -120,24 +120,23 @@ use eliot_testd_core::{
     TestdSourceObservationRange, TestdStore, TestdTerminalCompletionEvidence, VerificationReceipt,
 };
 use eliot_workscope::{
-    AuthorityBasis, BootstrapDiscoveryInputs, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
-    ColdStartOwnerInputs,
-    ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
-    GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
-    GoverningSourceCandidate, PrecedenceDeclaration, SourceCandidateOrigin,
-    IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
+    AuthorityBasis, BootstrapDiscoveryInputs, BootstrapScanEvidence, BootstrapScanOutcome,
+    BootstrapScanner, ColdStartController, ColdStartOwnerInputs, ColdStartTrigger,
+    DiscoveryLeaseKey, DiscoveryReadLease, GenerationEvidence, GoverningSourceAdmission,
+    GoverningSourceCandidate, GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence,
+    IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
     MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
-    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
-    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
-    ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle, ScannerResolverInputs,
-    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
-    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
-    TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
-    WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
-    WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
-    WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
-    evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
-    rebind_with_receipt, observed_scope_binding,
+    PrecedenceDeclaration, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
+    ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
+    ResolutionRequest, ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle,
+    ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity,
+    ScopeKind, ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest,
+    SourceCandidateOrigin, TaskBindingInput, TaskBindingState, TaskIntakeCandidate,
+    TaskSelectionRequired, TriggerAdmission, TriggerReport, WorkScopeBindingOwner,
+    WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet, WorkScopeDescriptor,
+    WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver, WorkspaceInstanceIdentity,
+    admit_at_trigger, admit_initial_binding, check_at_trigger, evaluate_material_request,
+    issue_resolution_receipt, observed_scope_binding, produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -7325,8 +7324,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Admits the initial binding for a newly resolved scope (issue #1787,
     /// bootstrap-constructor entry).
     ///
-/// Used for a new owner or an exact retained-owner replay: the authenticated
-/// explicit binding caller supplies the original descriptor and resolved binding,
+    /// Used for a new owner or an exact retained-owner replay: the authenticated
+    /// explicit binding caller supplies the original descriptor and resolved binding,
     /// the mechanically observed resources from the independent Host probe,
     /// and the original source/privacy closure. The observed binding is
     /// derived here from the Host observation; callers cannot satisfy the
@@ -7447,7 +7446,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         for authority in source_candidates
             .iter()
             .filter_map(|candidate| candidate.claim.as_ref())
-            .chain(declared_precedences.iter().map(|declaration| &declaration.authority))
+            .chain(
+                declared_precedences
+                    .iter()
+                    .map(|declaration| &declaration.authority),
+            )
         {
             match authority {
                 AuthorityBasis::HumanOwner { owner_ref } => {
@@ -7519,28 +7522,32 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
 
         let mut request = SourceAdmissionRequest {
-                scope_ref: binding.scope.scope_ref.clone(),
-                generation: binding.scope.generation,
-                candidates: source_candidates.to_vec(),
-                precedences: declared_precedences.to_vec(),
-                required_owner_ref: policy_snapshot.policy_owner.owner_ref.clone(),
-                proven_current_bindings: vec![TaskBindingState::CurrentTaskContract {
-                    task_ref,
-                    task_revision,
-                    acceptance_digest,
-                    selection_source_ref,
-                    evidence_ref,
-                }],
-                proven_contracts: Vec::new(),
-                absence_reason_ref: absence_reason_ref.map(str::to_owned),
-                state_fence: fence.clone(),
-                expires_at: admission_deadline,
+            scope_ref: binding.scope.scope_ref.clone(),
+            generation: binding.scope.generation,
+            candidates: source_candidates.to_vec(),
+            precedences: declared_precedences.to_vec(),
+            required_owner_ref: policy_snapshot.policy_owner.owner_ref.clone(),
+            proven_current_bindings: vec![TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            }],
+            proven_contracts: Vec::new(),
+            absence_reason_ref: absence_reason_ref.map(str::to_owned),
+            state_fence: fence.clone(),
+            expires_at: admission_deadline,
         };
         let mut proven_contract_refs = BTreeSet::new();
         for contract_ref in source_candidates
             .iter()
             .filter_map(|candidate| candidate.claim.as_ref())
-            .chain(declared_precedences.iter().map(|declaration| &declaration.authority))
+            .chain(
+                declared_precedences
+                    .iter()
+                    .map(|declaration| &declaration.authority),
+            )
             .filter_map(|basis| match basis {
                 AuthorityBasis::ProjectContract { contract_ref } => Some(contract_ref),
                 AuthorityBasis::HumanOwner { .. } | AuthorityBasis::DelegatedTaskBinding { .. } => {
@@ -7581,11 +7588,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
 
-        if !privacy.admits(binding.privacy_class)
-        {
+        if !privacy.admits(binding.privacy_class) {
             return Err(CompositionError::Recovery(
-                "WorkScope privacy boundary does not admit the binding's source class"
-                    .to_owned(),
+                "WorkScope privacy boundary does not admit the binding's source class".to_owned(),
             ));
         }
 
@@ -7607,7 +7612,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let policy_owner = self.owners.policy.as_ref().ok_or_else(|| {
-            CompositionError::Recovery("initial WorkScope binding has no current Policy owner".to_owned())
+            CompositionError::Recovery(
+                "initial WorkScope binding has no current Policy owner".to_owned(),
+            )
         })?;
         let (principal_ref, session_ref) = authenticated_identity;
         let admitted = admitted
@@ -7756,9 +7763,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if !fences_match_exact(&self.snapshot.state_fence(), state_fence) {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::ActivationScopeSelectionRequired
-        })?;
+        let owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or_else(|| CompositionError::ActivationScopeSelectionRequired)?;
         let inputs = owner
             .read_current_cold_start_inputs_from_owner(
                 state_fence,
@@ -7978,7 +7987,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 let mut seen = BTreeSet::new();
                 while let Some(intent) = current {
                     if !seen.insert(intent.grant_id.as_str())
-                        || intent.mechanical_subset.verify_recorded_commitment().is_err()
+                        || intent
+                            .mechanical_subset
+                            .verify_recorded_commitment()
+                            .is_err()
                         || intent.mechanical_subset.binding.state_fence != *fence
                         || intent.mechanical_subset.holder_principal != intent.holder_principal
                         || intent.mechanical_subset.session_id != intent.session_id
@@ -8140,9 +8152,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let fence = self.snapshot.state_fence();
-        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::ActivationScopeSelectionRequired
-        })?;
+        let owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or_else(|| CompositionError::ActivationScopeSelectionRequired)?;
         let snapshot = owner
             .read_current(&fence)
             .map_err(map_activation_scope_error)?;
@@ -8210,9 +8224,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         let fence = self.snapshot.state_fence();
         let scan_store = self.bound_installation_scan_store()?;
-        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::ActivationScopeSelectionRequired
-        })?;
+        let owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or_else(|| CompositionError::ActivationScopeSelectionRequired)?;
         let snapshot = owner
             .read_current(&fence)
             .map_err(map_activation_scope_error)?;
@@ -8226,10 +8242,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 now,
             )
             .await?;
-        let retained_lease = inputs
-            .discovery_lease
-            .as_ref()
-            .ok_or(CompositionError::ScanDisclosure(WorkScopeError::DiscoveryLeaseMissing))?;
+        let retained_lease =
+            inputs
+                .discovery_lease
+                .as_ref()
+                .ok_or(CompositionError::ScanDisclosure(
+                    WorkScopeError::DiscoveryLeaseMissing,
+                ))?;
         if discovery_lease.lease_ref != retained_lease.lease_ref
             || discovery_lease.proposer_ref != retained_lease.proposer_ref
             || discovery_lease.session_ref != retained_lease.session_ref
@@ -8247,12 +8266,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 WorkScopeError::BindingReceiptMismatch,
             ));
         }
-        ColdStartController::check_discovery_with_scan(
-            trigger,
-            &discovery_lease,
-            &evidence,
-            now,
-        )
+        ColdStartController::check_discovery_with_scan(trigger, &discovery_lease, &evidence, now)
             .map_err(CompositionError::ColdStartLease)?;
         scan_binding
             .admit()
@@ -8269,12 +8283,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 WorkScopeError::ScanContourNotAdmitted,
             ));
         }
-        let replayed = eliot_workscope::ScanDisclosureStore::readback(
-            &scan_store,
-            scan_receipt,
-            scan_binding,
-        )
-        .map_err(CompositionError::ScanDisclosure)?;
+        let replayed =
+            eliot_workscope::ScanDisclosureStore::readback(&scan_store, scan_receipt, scan_binding)
+                .map_err(CompositionError::ScanDisclosure)?;
         if replayed.scan_ref != scan_receipt.receipt_ref
             || replayed.candidate_root_ref != evidence.canonical_root_ref
             || replayed.privacy_boundary_ref.as_deref()
@@ -8754,7 +8765,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let work = self.prove_unique_activation_work(now, state_fence)?;
         let task_id = self.admit_activation_lifecycle_session(now, state_fence, &work)?;
         let task = self.admit_activation_task(&task_id, state_fence)?;
-        let plan = self.owners.canonical.read_current_activation_plan(state_fence)?;
+        let plan = self
+            .owners
+            .canonical
+            .read_current_activation_plan(state_fence)?;
         if work.session.principal_id != principal_ref
             || work.session.session_id != session_ref
             || task_id.as_str() != task_ref
@@ -8776,11 +8790,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
 
         let acceptance = self
             .kernel
-            .task_contract_acceptance_set(
-                &task_id,
-                task.revision,
-                state_fence,
-            )
+            .task_contract_acceptance_set(&task_id, task.revision, state_fence)
             .await?;
         acceptance.validate()?;
         if acceptance.task_id != task_id
@@ -8973,8 +8983,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         ) {
             return Ok(());
         }
-        let (store, handle, binding) = scan_readback
-            .ok_or(WorkScopeError::ScanReceiptMissing)?;
+        let (store, handle, binding) = scan_readback.ok_or(WorkScopeError::ScanReceiptMissing)?;
         if receipt.scan_receipt_ref.as_deref() != Some(handle.record_commitment.as_str()) {
             return Err(WorkScopeError::ScanReceiptReplaced.into());
         }
@@ -9099,32 +9108,27 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         governing_source_refs: Vec<String>,
         now: u64,
     ) -> Result<BootstrapScanOutcome, CompositionError> {
-        ColdStartController::check_discovery_with_scan(
-            trigger,
-            discovery_lease,
-            evidence,
-            now,
-        )
-        .map_err(CompositionError::ColdStartLease)?;
+        ColdStartController::check_discovery_with_scan(trigger, discovery_lease, evidence, now)
+            .map_err(CompositionError::ColdStartLease)?;
         let fence = self.snapshot.state_fence();
-        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::ActivationScopeSelectionRequired
-        })?;
+        let owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or_else(|| CompositionError::ActivationScopeSelectionRequired)?;
         let original = owner
             .read_current_cold_start_inputs(&fence, discovery_lease, now)
             .map_err(CompositionError::ScanDisclosure)?;
-        let original_discovery = original
-            .bootstrap_discovery_inputs
-            .as_ref()
-            .ok_or(CompositionError::ScanDisclosure(
-                WorkScopeError::ScanReceiptMissing,
-            ))?;
-        let boundary = original
-            .privacy_boundary
-            .as_ref()
-            .ok_or(CompositionError::ScanDisclosure(
-                WorkScopeError::PrivacyBoundaryMissing,
-            ))?;
+        let original_discovery = original.bootstrap_discovery_inputs.as_ref().ok_or(
+            CompositionError::ScanDisclosure(WorkScopeError::ScanReceiptMissing),
+        )?;
+        let boundary =
+            original
+                .privacy_boundary
+                .as_ref()
+                .ok_or(CompositionError::ScanDisclosure(
+                    WorkScopeError::PrivacyBoundaryMissing,
+                ))?;
         let expected_fence_ref = sha256_hex(
             &canonical_json_bytes(&fence)
                 .map_err(|error| CompositionError::Recovery(error.to_string()))?,
@@ -9297,7 +9301,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let lease_deadline = inputs
             .discovery_lease
             .as_ref()
-            .ok_or(CompositionError::ScanDisclosure(WorkScopeError::DiscoveryLeaseMissing))?
+            .ok_or(CompositionError::ScanDisclosure(
+                WorkScopeError::DiscoveryLeaseMissing,
+            ))?
             .deadline;
         let mut matching_instances = descriptor
             .instances
@@ -9570,8 +9576,13 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let lease_bytes = String::from_utf8(lease_bytes)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        ColdStartReadinessClaim::new(key, proposed.lease_ref.clone(), proposed.deadline, lease_bytes)
-            .map_err(|error| CompositionError::Recovery(error.to_string()))
+        ColdStartReadinessClaim::new(
+            key,
+            proposed.lease_ref.clone(),
+            proposed.deadline,
+            lease_bytes,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
     fn readiness_join_from_record(
@@ -9757,9 +9768,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .await;
         match result {
             Ok((evidence, _)) => Ok(TaskBindingInput::Selected(evidence)),
-            Err(CompositionError::ActivationTaskSelectionRequired) => {
-                Ok(TaskBindingInput::NoTask)
-            }
+            Err(CompositionError::ActivationTaskSelectionRequired) => Ok(TaskBindingInput::NoTask),
             Err(error) => Err(error),
         }
     }
@@ -9902,11 +9911,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                         (principal_ref, session_ref),
                         &scope.scope_ref,
                         state_fence,
-                        (
-                            &task_ref,
-                            Some(task_revision),
-                            Some(&acceptance_digest),
-                        ),
+                        (&task_ref, Some(task_revision), Some(&acceptance_digest)),
                     )
                     .await?;
                 if evidence.selection_source_ref != selection_source_ref
@@ -10113,22 +10118,34 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 now,
             )
             .await?;
-        let scan_evidence = owner_inputs
-            .scan_evidence
-            .as_ref()
-            .ok_or(CompositionError::ScanDisclosure(WorkScopeError::ScanReceiptMissing))?;
-        let scan_binding = owner_inputs
-            .scan_binding
-            .as_ref()
-            .ok_or(CompositionError::ScanDisclosure(WorkScopeError::ScanReceiptMissing))?;
-        let scan_receipt = owner_inputs
-            .scan_receipt_handle
-            .as_ref()
-            .ok_or(CompositionError::ScanDisclosure(WorkScopeError::ScanReceiptMissing))?;
-        let discovery_lease = owner_inputs
-            .discovery_lease
-            .as_ref()
-            .ok_or(CompositionError::ScanDisclosure(WorkScopeError::DiscoveryLeaseMissing))?;
+        let scan_evidence =
+            owner_inputs
+                .scan_evidence
+                .as_ref()
+                .ok_or(CompositionError::ScanDisclosure(
+                    WorkScopeError::ScanReceiptMissing,
+                ))?;
+        let scan_binding =
+            owner_inputs
+                .scan_binding
+                .as_ref()
+                .ok_or(CompositionError::ScanDisclosure(
+                    WorkScopeError::ScanReceiptMissing,
+                ))?;
+        let scan_receipt =
+            owner_inputs
+                .scan_receipt_handle
+                .as_ref()
+                .ok_or(CompositionError::ScanDisclosure(
+                    WorkScopeError::ScanReceiptMissing,
+                ))?;
+        let discovery_lease =
+            owner_inputs
+                .discovery_lease
+                .as_ref()
+                .ok_or(CompositionError::ScanDisclosure(
+                    WorkScopeError::DiscoveryLeaseMissing,
+                ))?;
         let contour = self.cold_start_readiness_contour.as_ref().ok_or_else(|| {
             CompositionError::Recovery(
                 "cold-start readiness owner has no admitted installation contour".to_owned(),
@@ -10148,12 +10165,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let scan_disclosure = eliot_workscope::ScanDisclosureStore::readback(
-            &scan_store,
-            scan_receipt,
-            scan_binding,
-        )
-        .map_err(CompositionError::ScanDisclosure)?;
+        let scan_disclosure =
+            eliot_workscope::ScanDisclosureStore::readback(&scan_store, scan_receipt, scan_binding)
+                .map_err(CompositionError::ScanDisclosure)?;
         if scan_disclosure.scan_ref != scan_receipt.receipt_ref
             || scan_disclosure.candidate_root_ref != owner_inputs.explicit_root_identity
             || scan_disclosure.privacy_boundary_ref.as_deref()
@@ -10240,9 +10254,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         {
             return Err(CompositionError::ActivationStaleFence);
         }
-        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
-            CompositionError::ActivationScopeSelectionRequired
-        })?;
+        let owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or_else(|| CompositionError::ActivationScopeSelectionRequired)?;
         let fence_bytes = canonical_json_bytes(state_fence)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         if scan_binding.state_fence_ref.as_deref() != Some(sha256_hex(&fence_bytes).as_str()) {
@@ -10268,12 +10284,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || snapshot.binding.governing_source_generation != receipt.governing_source_generation
             || observed_scope_binding(
                 &snapshot.binding,
-                owner_inputs
-                    .original_observed_scope
-                    .as_ref()
-                    .ok_or(CompositionError::ScanDisclosure(
-                        WorkScopeError::OriginalObservationMissing,
-                    ))?,
+                owner_inputs.original_observed_scope.as_ref().ok_or(
+                    CompositionError::ScanDisclosure(WorkScopeError::OriginalObservationMissing),
+                )?,
                 snapshot.binding.privacy_class,
                 snapshot.binding.governing_source_generation,
             )
@@ -10311,11 +10324,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             descriptor: owner_inputs.descriptor,
             coverage,
             original_binding_observation: snapshot.binding,
-            original_observed_scope: owner_inputs
-                .original_observed_scope
-                .ok_or(CompositionError::ScanDisclosure(
-                    WorkScopeError::OriginalObservationMissing,
-                ))?,
+            original_observed_scope: owner_inputs.original_observed_scope.ok_or(
+                CompositionError::ScanDisclosure(WorkScopeError::OriginalObservationMissing),
+            )?,
             guard_receipt: guard,
             source_set,
             privacy,

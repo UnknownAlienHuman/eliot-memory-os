@@ -166,9 +166,9 @@ impl ColdStartReadinessRecordOwner for InstallationColdStartReadinessOwner {
     ) -> Result<ColdStartReadinessStageOutcome, OrsError> {
         claim.validate()?;
         self.validate_key(&claim.key)?;
-        let outcome = self
-            .owner
-            .claim_cold_start_readiness(&claim.key, claim.lease_deadline, now)?;
+        let outcome =
+            self.owner
+                .claim_cold_start_readiness(&claim.key, claim.lease_deadline, now)?;
         match &outcome {
             ColdStartReadinessStageOutcome::Stored { record }
             | ColdStartReadinessStageOutcome::AlreadyBound { record } => {

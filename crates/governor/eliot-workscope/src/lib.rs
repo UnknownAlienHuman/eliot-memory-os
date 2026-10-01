@@ -1562,11 +1562,10 @@ impl OnboardingReadinessReceipt {
     fn validate_scan_evidence(&self) -> Result<(), WorkScopeError> {
         match &self.scan_receipt_ref {
             Some(scan_receipt) => text(scan_receipt, "scan_receipt_ref")?,
-            None
-                if matches!(
-                    self.readiness,
-                    ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
-                ) =>
+            None if matches!(
+                self.readiness,
+                ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
+            ) =>
             {
                 return Err(WorkScopeError::ScanReceiptMissing);
             }
@@ -3632,12 +3631,8 @@ impl WorkScopeBindingOwner {
         if sources.generation != snapshot.binding.governing_source_generation {
             return Err(WorkScopeError::SourceSetMismatch);
         }
-        let receipt = ScopeBindingGuard.check(
-            &snapshot.binding,
-            &snapshot.binding,
-            sources,
-            privacy,
-        );
+        let receipt =
+            ScopeBindingGuard.check(&snapshot.binding, &snapshot.binding, sources, privacy);
         if receipt.disposition != ScopeBindingDisposition::Matched {
             return Err(WorkScopeError::BindingReceiptNotMatched);
         }
@@ -3872,12 +3867,13 @@ impl WorkScopeBindingOwner {
                 Err(WorkScopeError::BindingReceiptMismatch)
             };
         }
-        let required_revision = snapshot
-            .owner_revision
-            .checked_add(1)
-            .ok_or(WorkScopeError::InvalidCounter {
-                field: "cold_start.owner_revision",
-            })?;
+        let required_revision =
+            snapshot
+                .owner_revision
+                .checked_add(1)
+                .ok_or(WorkScopeError::InvalidCounter {
+                    field: "cold_start.owner_revision",
+                })?;
         if next_owner_revision != required_revision {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
@@ -3971,12 +3967,13 @@ impl WorkScopeBindingOwner {
             }
             return Err(WorkScopeError::ScanReceiptReplaced);
         }
-        let required_revision = snapshot
-            .owner_revision
-            .checked_add(1)
-            .ok_or(WorkScopeError::InvalidCounter {
-                field: "cold_start.owner_revision",
-            })?;
+        let required_revision =
+            snapshot
+                .owner_revision
+                .checked_add(1)
+                .ok_or(WorkScopeError::InvalidCounter {
+                    field: "cold_start.owner_revision",
+                })?;
         if next_owner_revision != required_revision {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }

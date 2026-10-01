@@ -10041,8 +10041,8 @@ impl ColdStartReadinessClaim {
         lease
             .validate()
             .map_err(|error| OrsError::Contract(error.to_string()))?;
-        let lease_bytes = canonical_json_bytes(&lease)
-            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let lease_bytes =
+            canonical_json_bytes(&lease).map_err(|error| OrsError::Encoding(error.to_string()))?;
         let lease_bytes = String::from_utf8(lease_bytes)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         Self::new(key, lease_ref, lease_deadline, lease_bytes)
@@ -10130,8 +10130,8 @@ impl ColdStartReadinessClaim {
                 reason: "lease bytes must use canonical JSON encoding",
             });
         }
-        let lease: eliot_workscope::OnboardingLease =
-            serde_json::from_value(value.clone()).map_err(|_| OrsError::InvalidField {
+        let lease: eliot_workscope::OnboardingLease = serde_json::from_value(value.clone())
+            .map_err(|_| OrsError::InvalidField {
                 field: "cold_start_lease_bytes",
                 reason: "lease bytes must be a valid OnboardingLease",
             })?;
@@ -10163,10 +10163,7 @@ impl ColdStartReadinessClaim {
             || lease.deadline != self.lease_deadline
             || lease.compiler_epoch == 0
             || self.lease_ref
-                != cold_start_readiness_record_key(
-                    &self.base_identity_digest,
-                    lease.compiler_epoch,
-                )
+                != cold_start_readiness_record_key(&self.base_identity_digest, lease.compiler_epoch)
         {
             return Err(OrsError::IntegrityProblem {
                 record_type: COLD_START_READINESS_RECORD_TYPE,
@@ -10236,12 +10233,11 @@ impl ColdStartReadinessOrsRecord {
         }
         self.claim.validate()?;
         self.validate_row_identity()?;
-        let lease: eliot_workscope::OnboardingLease =
-            serde_json::from_str(&self.claim.lease_bytes)
-                .map_err(|_| OrsError::InvalidField {
-                    field: "cold_start_lease_bytes",
-                    reason: "lease bytes must be a valid OnboardingLease",
-                })?;
+        let lease: eliot_workscope::OnboardingLease = serde_json::from_str(&self.claim.lease_bytes)
+            .map_err(|_| OrsError::InvalidField {
+                field: "cold_start_lease_bytes",
+                reason: "lease bytes must be a valid OnboardingLease",
+            })?;
         if lease.compiler_epoch != self.record_revision {
             return Err(OrsError::IntegrityProblem {
                 record_type: COLD_START_READINESS_RECORD_TYPE,
