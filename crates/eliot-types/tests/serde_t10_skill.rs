@@ -12,7 +12,6 @@ use serde_json::Value;
 fn corpus() -> Value {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join("data")
         .join("serde_t10_skill_eval.json");
     let text = std::fs::read_to_string(&path).expect("serde_t10_skill_eval.json must exist");
     serde_json::from_str(&text).expect("serde_t10_skill_eval.json must be valid JSON")
