@@ -4860,6 +4860,168 @@ async fn submit_local_read_result_idempotent(
     }
 }
 
+/// Typed refusal of [`submit_replace_preference_policy_candidate`].
+///
+/// `Invalid` and the fence-`Stale` land before any store access; `Conflict`,
+/// predecessor-`Stale`, and `Owner` surface from the settings owner before
+/// any commit, so the retained document is untouched on every refusal path.
+/// No refusal mints authority and none reports success.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubmitReplacePreferencePolicyError {
+    /// The sealed-candidate gate failed (`"sealed-candidate"`: digest
+    /// closure, capability-scope binding, or `candidate_only` ceiling) or
+    /// the command is not a `ReplacePreferencePolicy` candidate
+    /// (`"command-kind"`). No store access performed.
+    Invalid(&'static str),
+    /// The live fence moved under the candidate's pinned fence
+    /// (`"live-fence"`, checked before any store access), or the retained
+    /// predecessor moved under the candidate anchor (`"predecessor"`,
+    /// including the same-predecessor/different-replacement conflict
+    /// loser, decided atomically inside the owner transaction).
+    Stale(&'static str),
+    /// The replacement's stable identity conflicts with the retained
+    /// predecessor (`"account-scope"` / `"policy-id"`): scope and policy
+    /// ID cannot change under replacement. Detected before any commit.
+    Conflict(&'static str),
+    /// Any other settings-owner refusal, carried unchanged: unavailable
+    /// backend, corrupt/oversized/legacy store, or a structurally invalid
+    /// replacement.
+    Owner(eliot_host_state::ModelPreferenceStoreError),
+}
+
+impl std::fmt::Display for SubmitReplacePreferencePolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(detail) => write!(
+                f,
+                "replace-preference-policy submit refused: invalid {detail}"
+            ),
+            Self::Stale(detail) => {
+                write!(f, "replace-preference-policy submit refused: stale {detail}")
+            }
+            Self::Conflict(detail) => write!(
+                f,
+                "replace-preference-policy submit refused: conflicting {detail}"
+            ),
+            Self::Owner(error) => write!(
+                f,
+                "replace-preference-policy submit refused by settings owner: {error}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubmitReplacePreferencePolicyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Owner(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<eliot_host_state::ModelPreferenceStoreError> for SubmitReplacePreferencePolicyError {
+    fn from(error: eliot_host_state::ModelPreferenceStoreError) -> Self {
+        match error {
+            eliot_host_state::ModelPreferenceStoreError::Stale => Self::Stale("predecessor"),
+            eliot_host_state::ModelPreferenceStoreError::ScopeMismatch => {
+                Self::Conflict("account-scope")
+            }
+            eliot_host_state::ModelPreferenceStoreError::PolicyIdMismatch => {
+                Self::Conflict("policy-id")
+            }
+            other => Self::Owner(other),
+        }
+    }
+}
+
+/// Live submit leg for one sealed Human model-preference replacement
+/// (issue #485, audit 5872395796; production caller for CHECK
+/// R1-contract-prerequisite and CHECK R4-publication-receipt).
+///
+/// Exchange contract (fixed): the input is the sealed candidate triple
+/// (`expected_policy_id`, `expected_policy_revision`,
+/// `expected_policy_digest`) plus the full replacement policy of one
+/// authenticated `SwarmCommandKind::ReplacePreferencePolicy` candidate
+/// (`ControlBoard::swarm_command_candidate` over
+/// `OperatorAction::ReplaceSwarmPolicy`, compiled by
+/// `compile_replace_policy_candidate`); the producer is this daemon submit
+/// leg; the triple and the replacement cross end to end equal — carried
+/// verbatim, never re-derived, and no caller-supplied digest is ever
+/// retained because the owner recomputes every digest it stores; the clock
+/// is the live fence read at submit (`live_fence`, taken from the admitted
+/// Kernel fence under a short borrow at the call site, never cached); the
+/// output is the owner's `(ModelPreferenceCasOutcome,
+/// ModelPreferencePublicationReceipt)` pair for A-02/A-08 readback;
+/// refusals are typed `Stale`/`Conflict`/`Invalid`, every submit-leg
+/// refusal lands before any store access, and every owner refusal aborts
+/// before any commit.
+///
+/// Sequence (the same owner seam as the
+/// `capability_admission::publish_replace_preference_policy_candidate`
+/// publisher, reached through the settings-owner API directly because that
+/// entry point is not re-exported past the `eliotd` library boundary:
+/// sealed-candidate gate, live-fence liveness, then
+/// `eliot_host_state::ModelPreferenceStore::open`, a fresh
+/// `load_model_preferences`, anchor-pin via
+/// `PreferenceCasExpected::from_candidate_anchor`, atomic
+/// `compare_and_swap_model_preferences`, and
+/// `read_publication_receipt`). `Committed` carries the newly committed
+/// store revision with the prior revision/digest link recorded in the
+/// receipt; `Replayed` names the unchanged retained revision. On `Stale`
+/// the caller reloads, re-pins against a recompiled candidate, and
+/// retries; the atomic recheck inside the owner transaction is what makes
+/// the retry converge. A missing receipt after a successful CAS names a
+/// store that no longer retains the committed document and surfaces as
+/// unavailable instead of an invented receipt.
+///
+/// This leg mints no authority: role/capability admission for the
+/// submitting principal stays with the candidate leg (the sealed digest
+/// covers the predecessor triple and the replacement, and the
+/// `candidate_only` ceiling is rechecked here), and it performs no provider
+/// call, no catalogue refresh, and owns no settings database beyond the one
+/// configured store path it is given.
+pub fn submit_replace_preference_policy_candidate(
+    store_path: &std::path::Path,
+    candidate: &eliot_agent_coordinator::SwarmCommandCandidate,
+    live_fence: &eliot_contracts::StateFence,
+) -> Result<
+    (
+        eliot_host_state::ModelPreferenceCasOutcome,
+        eliot_host_state::ModelPreferencePublicationReceipt,
+    ),
+    SubmitReplacePreferencePolicyError,
+> {
+    candidate
+        .validate()
+        .map_err(|_| SubmitReplacePreferencePolicyError::Invalid("sealed-candidate"))?;
+    let eliot_agent_coordinator::SwarmCommandKind::ReplacePreferencePolicy {
+        expected_policy_id,
+        expected_policy_revision,
+        expected_policy_digest,
+        policy,
+    } = &candidate.kind
+    else {
+        return Err(SubmitReplacePreferencePolicyError::Invalid("command-kind"));
+    };
+    if !eliot_contracts::fences_match_exact(&candidate.view_fence, live_fence) {
+        return Err(SubmitReplacePreferencePolicyError::Stale("live-fence"));
+    }
+    let store = eliot_host_state::ModelPreferenceStore::open(store_path)?;
+    let current = store.load_model_preferences()?;
+    let expected = eliot_host_state::PreferenceCasExpected::from_candidate_anchor(
+        current.as_ref(),
+        expected_policy_id,
+        expected_policy_revision,
+        expected_policy_digest,
+    )?;
+    let outcome = store.compare_and_swap_model_preferences(&expected, policy)?;
+    let receipt = store
+        .read_publication_receipt()?
+        .ok_or(eliot_host_state::ModelPreferenceStoreError::Unavailable)?;
+    Ok((outcome, receipt))
+}
+
 /// What one settled observe poll step produced (issue #2565).
 ///
 /// `Deferred` is the honest steady state while the Governor observation
