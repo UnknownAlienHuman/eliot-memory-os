@@ -506,4 +506,56 @@ mod tests {
             "the full and acknowledgement input variants must remain represented"
         );
     }
+
+    /// A well-formed acknowledgement object carrying every known member, with
+    /// the optional `downstream_outcome_ref` absent, still decodes to a trusted
+    /// `Ack`. Refusing a foreign member must not narrow the accepted bytes of a
+    /// valid acknowledgement.
+    #[test]
+    fn memory_influence_tool_input_accepts_a_well_formed_ack_object() {
+        let raw = concat!(
+            r#"{"project_id":"p-1","write_id":"w-1","memory_handle":"h-1","#,
+            r#""influence_class":"used_for_verification"}"#,
+        );
+        match serde_json::from_str::<MemoryInfluenceToolInput>(raw) {
+            Ok(MemoryInfluenceToolInput::Ack(ack)) => {
+                assert_eq!(ack.project_id.as_deref(), Some("p-1"));
+                assert_eq!(ack.write_id.as_deref(), Some("w-1"));
+                assert_eq!(ack.memory_handle, "h-1");
+                assert_eq!(
+                    ack.influence_class,
+                    MemoryInfluenceClass::UsedForVerification
+                );
+                assert_eq!(ack.downstream_outcome_ref, None);
+            }
+            Ok(MemoryInfluenceToolInput::Full(_)) => {
+                panic!("a well-formed acknowledgement object must not decode as the full shape");
+            }
+            Err(error) => panic!("a well-formed acknowledgement object must decode: {error}"),
+        }
+    }
+
+    /// The #941 audit counterexample. This branch builds `MemoryInfluenceAckInput`
+    /// by hand, bypassing the strict `Deserialize` in `ul/injection.rs`, so the
+    /// refusal has to happen here: an unknown member must never be consumed and
+    /// discarded while a trusted `Ack` is still returned.
+    #[test]
+    fn memory_influence_tool_input_refuses_a_foreign_member_on_the_ack_shape() {
+        let raw = concat!(
+            r#"{"memory_handle":"h-1","#,
+            r#""influence_class":"used_for_verification","#,
+            r#""attacker_key":1}"#,
+        );
+        match serde_json::from_str::<MemoryInfluenceToolInput>(raw) {
+            Ok(_) => {
+                panic!("an unknown member must never decode to a trusted acknowledgement");
+            }
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("attacker_key"),
+                    "the refusal must name the erased foreign member, got: {error}"
+                );
+            }
+        }
+    }
 }
