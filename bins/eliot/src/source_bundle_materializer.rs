@@ -805,11 +805,10 @@ fn validate_release_symbol_role(
 ) -> Result<ValidatedSymbolArtifact, MaterializeError> {
     let (role, package, executable_name, reference, symbol_role) = role_binding;
     let ReleaseSymbolOwnerInputs {
-        root,
         source_commit,
-        checksum,
         symbols: runtime_symbols,
         runtime_artifacts,
+        ..
     } = *owners;
     let matching = runtime_symbols
         .iter()
