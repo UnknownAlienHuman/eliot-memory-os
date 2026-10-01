@@ -1269,6 +1269,64 @@ impl NegativeMemoryGateObservation {
     }
 }
 
+/// One captured observation admitted from an MCP `eliot.observe` call
+/// (issue #2565 W4).
+///
+/// Every identity here is derived from the Kernel-admitted request the daemon
+/// flight re-proved before building it: the logical host-request operation, the
+/// exact admitted payload digest, the session and the resolved work scope come
+/// from the admitted envelope and its minted attempt, and the observed content
+/// is the exact validated tool payload the host submitted. Nothing is a
+/// host-authored free-form claim, and the Kernel never interprets any of these
+/// fields — it only compares the presented attempt and payload linkage.
+///
+/// `task_ref` is `None` for a safe unbound capture and `Some(..)` only when the
+/// admitted envelope actually carried a task. The record keeps the capture
+/// cold in both cases: the requested effect ceiling below is `Candidate`, so
+/// neither shape acquires execution authority by being admitted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapturedObservation {
+    /// The admitted `eliot.observe` host-request operation handle.
+    pub operation_id: String,
+    /// Canonical digest over the exact admitted `ToolRequest` bytes.
+    pub payload_digest: String,
+    /// The authenticated session the Kernel admitted the request under.
+    pub session_id: String,
+    /// The work scope this capture is addressed to, as admitted.
+    pub work_scope_id: String,
+    /// The task the admitted envelope bound, when it bound one.
+    pub task_id: Option<String>,
+    /// The observing producer, named by the admitted capability.
+    pub producer: String,
+    /// The exact observed content the host submitted.
+    pub observed_content: String,
+    /// The closed capture disposition the producer claimed, compared not
+    /// trusted: an unbound capture is retained cold regardless of its value.
+    pub candidate_disposition: String,
+    /// Bounded source handle references the host named, already privacy- and
+    /// size-validated at the MCP surface.
+    pub source_handles: Vec<String>,
+}
+
+impl CapturedObservation {
+    /// The stable replay identity of this capture.
+    ///
+    /// Derived from the admitted operation and its exact payload digest, so a
+    /// replay of the same logical request converges on the same observation
+    /// while a changed payload under the same operation is a distinct,
+    /// conflicting record. Retry time never enters this identity.
+    #[must_use]
+    pub fn observation_identity(&self) -> String {
+        format!("mcp-observe:{}:{}", self.operation_id, self.payload_digest)
+    }
+
+    /// The deduplication key the journal stores this capture under.
+    #[must_use]
+    pub fn dedup_key(&self) -> String {
+        sha256_hex(self.observation_identity().as_bytes())
+    }
+}
+
 /// Builds the deterministic observation submission for one gate outcome.
 ///
 /// The event core, scope, provenance and privacy disclosure come from the
@@ -1419,6 +1477,174 @@ fn negative_memory_gate_envelope(
             outcome.record_digest.clone(),
             outcome.read_handle.clone(),
         ],
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
+                .map_err(|error| owner_refused(error.to_string()))?,
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }],
+    };
+    envelope.validate()?;
+    Ok(envelope)
+}
+
+/// Builds the deterministic observation submission for one MCP capture.
+///
+/// The event core, scope, provenance and privacy disclosure come from the
+/// admitted request's own retained identities and the exact payload the host
+/// submitted, so publishing into `eliot_system` stays a projection of source
+/// data rather than a copy of arbitrary project contents. Retry carries
+/// identical canonical bytes, so a replay converges and a changed payload under
+/// the same identity conflicts.
+fn captured_observation_submission(
+    operation_id: &OperationId,
+    idempotency_key: &str,
+    identity: &eliot_protocol::RequestIdentity,
+    capture: &CapturedObservation,
+) -> Result<ObservationSubmission, CompositionError> {
+    let fence = identity.request.metadata.state_fence.clone();
+    let generation = fence.resource_generation.value().to_string();
+    let work_scope =
+        WorkScopeId::new(GOVERNOR_SCOPE_ID).map_err(|error| owner_refused(error.to_string()))?;
+    let record = ObservationRecordEnvelope {
+        record_id: format!("mcp-observe:{}", capture.dedup_key()),
+        kind: ObservationRecordKind::Telemetry,
+        event: Some(ObservationEventCore {
+            event_id_and_time: ObservationEventIdentity {
+                event_id: format!("mcp-observe-event:{}", capture.dedup_key()),
+                clock: ClockReading::default(),
+            },
+            producer_generation_and_trace: ProducerTrace {
+                producer: capture.producer.clone(),
+                generation,
+                trace_ref: Some(capture.operation_id.clone()),
+            },
+            // An MCP `eliot.observe` capture is exactly what this kind names:
+            // an observation of a tool or route the host invoked, not a
+            // verdict, a decision, or an admitted fact.
+            kind: ObservationKind::ToolOrRoute,
+            affected_scope: ObservationScope {
+                work_scope,
+                task_ref: capture.task_id.clone(),
+                attempt_ref: Some(capture.session_id.clone()),
+                module_or_route_ref: Some("mcp-observe".to_owned()),
+            },
+            observed_delta: capture.observed_content.clone(),
+            expected_baseline: None,
+            evidence_and_raw_handles: capture.source_handles.clone(),
+            coverage_and_blind_intervals: CoverageEvidence {
+                disposition: CoverageDisposition::Complete,
+                denominator_source_ref: format!("mcp-observe-payload:{}", capture.payload_digest),
+                interval: None,
+                blind_intervals: Vec::new(),
+                observed_count: 1,
+            },
+            privacy_retention_and_disclosure: PrivacyRetentionDisclosure {
+                privacy_domain_ref: "governor-mcp-observe".to_owned(),
+                retention_policy_ref: "governor-retention".to_owned(),
+                disclosure_class: "internal".to_owned(),
+            },
+            candidate_importance: 1,
+            dedup_key: capture.dedup_key(),
+        }),
+        coverage_gap: None,
+        journal_control_event: false,
+        parent_record_id: None,
+    };
+    Ok(ObservationSubmission {
+        operation_id: operation_id.as_str().to_owned(),
+        idempotency_key: idempotency_key.to_owned(),
+        state_fence: fence,
+        record,
+        record_v2: None,
+        capture_route: CaptureRoute::CanonicalJournal,
+        durability: Durability::Durable,
+        plan: None,
+        task_selection: None,
+        evidence: None,
+    })
+}
+
+/// Builds the observation-leg envelope for one MCP capture.
+///
+/// The envelope addresses the governed self scope and binds the stable
+/// publication identity: the admitted operation, its exact payload digest, the
+/// authenticated session and the claimed capture disposition. Required proof
+/// carries the payload digest and each named source handle the capture actually
+/// holds, so no reference is invented here.
+fn captured_observation_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    observation_operation: &OperationId,
+    submission: &ObservationSubmission,
+    capture: &CapturedObservation,
+    manifest_digest: &OperationManifestDigest,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let fence = &identity.request.metadata.state_fence;
+    let request_digest = submission
+        .request_digest()
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let mut proof_refs = vec![capture.payload_digest.clone()];
+    for reference in &capture.source_handles {
+        if !proof_refs.contains(reference) {
+            proof_refs.push(reference.clone());
+        }
+    }
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("record_id", submission.record.record_id.clone()),
+        ("request_digest", request_digest),
+        ("operation_id", submission.operation_id.clone()),
+        ("idempotency_key", submission.idempotency_key.clone()),
+        ("host_request_operation_id", capture.operation_id.clone()),
+        ("payload_digest", capture.payload_digest.clone()),
+        ("session_id", capture.session_id.clone()),
+        ("task_id", capture.task_id.clone().unwrap_or_default()),
+        ("producer", capture.producer.clone()),
+        (
+            "candidate_disposition",
+            capture.candidate_disposition.clone(),
+        ),
+        (
+            "source_handle_count",
+            capture.source_handles.len().to_string(),
+        ),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: observation_operation.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: submission.idempotency_key.clone(),
+        scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
+            .map_err(|error| owner_refused(error.to_string()))?,
+        task_id: identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        // The admission-contract digest is the OWNER's, not this seam's: the envelope
+        // validator (eliot_canonical::CanonicalWriteEnvelope::validate) compares this
+        // field against `supported_admission_contract_set_digest()`, so deriving it
+        // locally would be a submission supplying its own proof. Every other
+        // envelope site in this crate uses the owner call, including the five
+        // pre-existing ones in this file.
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
+        operation_manifest_digest: manifest_digest.clone(),
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: proof_refs,
         expected_revision_heads: Vec::new(),
         expected_ordering_heads: vec![OrderingHeadExpectation {
             scope: OrderingScopeId::new(GOVERNOR_ORDERING_SCOPE)
@@ -2118,6 +2344,147 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             &manifest_digest,
         )
         .await
+    }
+
+    /// Admits one captured `eliot.observe` observation into the canonical
+    /// observation path and returns the exact store receipt (issue #2565 W4).
+    ///
+    /// This is the real observation owner entry the daemon observe flight
+    /// needs, and it adds no second engine: the Governor builds the typed
+    /// observation for the governed self scope from the admitted request's own
+    /// retained identities, the Kernel checks authority, fence and identity
+    /// through [`CanonicalAdmissionOwner::commit`], and the Store returns its
+    /// own receipt unchanged.
+    ///
+    /// The stable publication identity is derived from the admitted operation
+    /// and its exact payload digest, never from retry time, so an identical
+    /// replay reconciles the existing receipt while a changed payload under the
+    /// same identity conflicts. A lost acknowledgement reads the original
+    /// receipt back through the neutral port instead of committing again.
+    ///
+    /// The requested effect ceiling is [`EffectClass::Candidate`] for every
+    /// capture here: admitting an observation never grants execution authority,
+    /// and a safe unbound capture stays cold under exactly the same ceiling as a
+    /// task-bound one. Task-relative promotion is the Problem/epistemic owner's
+    /// decision, not this entry's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] when readiness, the request-identity shape
+    /// or exact fence agreement fails, when the journal refuses the submission,
+    /// when the same operation already carries different canonical bytes, or
+    /// when the canonical commit cannot be completed or reconciled.
+    pub async fn admit_captured_observation(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        base_operation_id: &OperationId,
+        capture: &CapturedObservation,
+    ) -> Result<WriteReceipt, CompositionError> {
+        self.validate_capture_identity_fence(identity)?;
+        let observation_operation = OperationId::new(format!(
+            "{base_operation_id}/observe-{}",
+            capture.observation_identity()
+        ))
+        .map_err(|error| owner_refused(error.to_string()))?;
+        let idempotency_key = format!(
+            "{}:mcp-observe:{}",
+            identity.idempotency_key, capture.payload_digest
+        );
+        let submission = captured_observation_submission(
+            &observation_operation,
+            &idempotency_key,
+            identity,
+            capture,
+        )?;
+        let mut scratch = self.observation.clone();
+        match scratch
+            .admit(submission.clone())
+            .map_err(|error| owner_refused(error.to_string()))?
+        {
+            ObservationAdmissionResult::Accepted { .. }
+            | ObservationAdmissionResult::Replayed { .. } => {}
+            ObservationAdmissionResult::Rejected { rejection } => {
+                if rejection.disposition == RejectionDisposition::Conflict {
+                    return Err(owner_refused(format!(
+                        "captured observation identity conflict: {}",
+                        rejection.all_contract_errors.join("; ")
+                    )));
+                }
+                return Err(owner_refused(format!(
+                    "captured observation is not admissible: {}",
+                    rejection.all_contract_errors.join("; ")
+                )));
+            }
+        }
+        let manifest_digest = production_manifest_digest()?;
+        let envelope = captured_observation_envelope(
+            identity,
+            &observation_operation,
+            &submission,
+            capture,
+            &manifest_digest,
+        )?;
+        let expected_hash = envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        if let Some(receipt) = self
+            .reconcile_capture_observation_receipt(
+                identity,
+                &observation_operation,
+                &expected_hash,
+                &manifest_digest,
+            )
+            .await?
+        {
+            return Ok(receipt);
+        }
+        self.commit_observation_leg(
+            identity,
+            &observation_operation,
+            envelope,
+            &expected_hash,
+            &manifest_digest,
+        )
+        .await
+    }
+
+    /// Reads the exact committed receipt for one admitted `eliot.observe`
+    /// capture operation (issue #2565 W5).
+    ///
+    /// This is the read/wait verb of a pending capture handle. It adds no
+    /// admission, no commit and no state: it resolves the exact operation
+    /// identity the owner's own [`Self::admit_captured_observation`] mints for
+    /// this capture — `{base_operation_id}/observe-{capture.observation_identity()}`
+    /// — and asks the existing
+    /// [`KernelTransitionPort::receipt`] route for whatever the owner actually
+    /// holds. It performs no `check_receipt` binding pass, because it is a
+    /// status read rather than an admission: the caller already proved the
+    /// capture's identities before it ever held a handle, and the receipt it
+    /// returns is passed through exactly as issued.
+    ///
+    /// `Some(receipt)` means the owner committed and issued its terminal
+    /// receipt. `None` means the owner holds no terminal receipt for this
+    /// operation — the honest "still pending" answer. A port failure is a
+    /// typed [`CompositionError`], never a disposition: an unreachable owner is
+    /// not an owner verdict, and this must never be collapsed into `None` or
+    /// into a refusal.
+    ///
+    /// This is a pure read of the owner's own canonical receipt route; it adds
+    /// no second store client, no queue, and no effect.
+    pub async fn read_captured_observation_receipt(
+        &self,
+        base_operation_id: &OperationId,
+        capture: &CapturedObservation,
+    ) -> Result<Option<WriteReceipt>, CompositionError> {
+        let observation_operation = OperationId::new(format!(
+            "{base_operation_id}/observe-{}",
+            capture.observation_identity()
+        ))
+        .map_err(|error| owner_refused(error.to_string()))?;
+        self.kernel
+            .receipt(observation_operation)
+            .await
+            .map_err(Into::into)
     }
 
     /// Commits one named Problem owner transition (issue #1759 I2).

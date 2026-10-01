@@ -238,8 +238,8 @@ pub use migration_inventory::{
     impact_entry_node, impact_node, lookup_by_package, migration_inventory_guard, resolve,
 };
 pub use observation_reconciliation::{
-    GovernorObservationReconciliation, NegativeMemoryGateObservation, NegativeMemoryGateOutcome,
-    WatchdogAdmittedEntry, WatchdogEntryAdmission, WatchdogEntryKind,
+    CapturedObservation, GovernorObservationReconciliation, NegativeMemoryGateObservation,
+    NegativeMemoryGateOutcome, WatchdogAdmittedEntry, WatchdogEntryAdmission, WatchdogEntryKind,
 };
 pub use opencode_action_gate::{
     GovernorActionGateRefusal, GovernorActionGateRequest, GovernorActionGateVerdict,
