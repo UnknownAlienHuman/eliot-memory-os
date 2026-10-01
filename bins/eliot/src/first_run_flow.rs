@@ -9,21 +9,38 @@
 //! `governor.toml` file is never adopted as authority here; `run_setup` in
 //! `main.rs` rejects a present legacy file before dispatch (canary/install
 //! paths gate independently).
+//!
+//! Persistence (W2) is CLI-owned: when `ELIOT_SETUP_STATE_PATH` names a
+//! state file, `setup apply` and `setup set` persist the canonical
+//! `Setting` payload produced by the owner (`to_settings`) there, and
+//! `setup show` / `setup set` read it back through the owner validators
+//! (`parse_role`, `parse_automation`, `decide_first_run`) plus a
+//! canonical round-trip check. The stored vocabulary only admits owner
+//! states (`UNASSIGNED`, `LOCAL_DISPLAYED`, `ECONOMY_DISPLAYED`,
+//! `PAID_EXPLICIT`), so a hand-edited file cannot smuggle in a route the
+//! owner would reject. When the variable is unset, the commands project
+//! decisions without persisting them and `setup show` reports the compiled
+//! defaults, which keeps every displayed default inspectable and
+//! reversible (W6) through the same CLI path once a state file is
+//! configured.
 
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
 use eliot_config::first_run::{
     FirstRunAutomation, FirstRunDecision, FirstRunInput, FirstRunRole, RecommendationBoard,
-    RouteSelection, apply_automation_update, apply_update, decide_first_run, describe_defaults,
-    parse_kind, parse_role, recommend_when_automation_disabled, to_settings,
+    RouteKind, RouteSelection, apply_automation_update, apply_update, decide_first_run,
+    describe_defaults, parse_kind, parse_role, recommend_when_automation_disabled, to_settings,
 };
 use eliot_config::initial_snapshot::{
     InitialSnapshotIdentity, PrivacyChoice, prepare_initial_snapshot_payload,
 };
+use eliot_config::Setting;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
-use std::collections::BTreeMap;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
 
 /// Decoded `setup apply` arguments. Every field is caller-supplied text; the
 /// owner validates it.
@@ -102,6 +119,196 @@ pub struct SetupInitialConfigArgs {
     pub automation: Option<String>,
 }
 
+/// Environment variable selecting the CLI-owned first-run setup-state file.
+///
+/// When set, `setup apply` and `setup set` persist the canonical `Setting`
+/// payload there and `setup show` / `setup set` read it back through the
+/// owner validators. When unset, commands project decisions without storing
+/// them. No path is invented: persistence only happens at the configured
+/// location.
+pub const SETUP_STATE_PATH_ENV: &str = "ELIOT_SETUP_STATE_PATH";
+
+/// Schema marker for the CLI-owned setup-state document. The document wraps
+/// the canonical `Setting` payload verbatim; any other schema is rejected.
+const SETUP_STATE_SCHEMA: &str = "eliot.first-run-decision/1";
+
+/// CLI-owned setup-state document: the canonical `Setting` persistence
+/// payload produced by [`to_settings`], verbatim.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupStateDocument {
+    schema: String,
+    settings: Vec<Setting>,
+}
+
+/// Resolves the CLI-owned setup-state path. `None` means persistence is not
+/// configured and commands project decisions without storing them.
+fn setup_state_path() -> Result<Option<PathBuf>> {
+    let Some(raw) = std::env::var_os(SETUP_STATE_PATH_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy().into_owned();
+    if raw.trim().is_empty() {
+        anyhow::bail!("{SETUP_STATE_PATH_ENV} must be non-blank");
+    }
+    Ok(Some(PathBuf::from(raw)))
+}
+
+/// Terminal receipt fragment describing where the decision lives: the
+/// configured state file when persistence is active, `projected-only`
+/// otherwise.
+fn state_receipt(state_path: &Option<PathBuf>) -> serde_json::Value {
+    match state_path {
+        Some(path) => serde_json::json!({
+            "source": "stored",
+            "path": path.display().to_string(),
+        }),
+        None => serde_json::json!({"source": "projected-only"}),
+    }
+}
+
+/// Rebuilds the typed decision from stored canonical settings, validating
+/// the ORIGINAL stored values through the owner layer.
+///
+/// Every entry must be a known canonical key (`route.<role>` or
+/// `automation.maintenance_mode`) with a `literal:<STATE>` value. Role
+/// entries re-enter through [`parse_role`] and the stored state token maps
+/// back to the selection the owner originally admitted (`PAID_EXPLICIT`
+/// records the explicit consent given at apply/set time); the assembled
+/// input is re-decided by [`decide_first_run`], and the result must
+/// re-project to the identical `Setting` payload. A hand-edited file can
+/// therefore only ever select states the owner itself admits, and any
+/// drift fails closed.
+fn decision_from_settings(settings: &[Setting]) -> Result<(FirstRunDecision, String)> {
+    let mut owner_ref: Option<&str> = None;
+    let mut seen_keys = BTreeSet::new();
+    let mut selections = BTreeMap::new();
+    let mut automation: Option<FirstRunAutomation> = None;
+    for setting in settings {
+        if setting.key.trim().is_empty()
+            || setting.value_ref.trim().is_empty()
+            || setting.owner_ref.trim().is_empty()
+        {
+            anyhow::bail!("stored setup state carries a blank setting field");
+        }
+        if !seen_keys.insert(setting.key.as_str()) {
+            anyhow::bail!("stored setup state carries duplicate key: {}", setting.key);
+        }
+        match owner_ref {
+            None => owner_ref = Some(setting.owner_ref.as_str()),
+            Some(known) if known == setting.owner_ref.as_str() => {}
+            Some(_) => anyhow::bail!("stored setup state mixes settings owners"),
+        }
+        if let Some(role_key) = setting.key.strip_prefix("route.") {
+            let role =
+                parse_role(role_key).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let state = setting.value_ref.strip_prefix("literal:").ok_or_else(|| {
+                anyhow::anyhow!("stored route value is not a literal: {}", setting.key)
+            })?;
+            match state {
+                "UNASSIGNED" => {}
+                "LOCAL_DISPLAYED" => {
+                    selections.insert(
+                        role,
+                        RouteSelection {
+                            kind: RouteKind::Local,
+                            displayed: true,
+                            explicit_consent: false,
+                        },
+                    );
+                }
+                "ECONOMY_DISPLAYED" => {
+                    selections.insert(
+                        role,
+                        RouteSelection {
+                            kind: RouteKind::Economy,
+                            displayed: true,
+                            explicit_consent: false,
+                        },
+                    );
+                }
+                "PAID_EXPLICIT" => {
+                    selections.insert(
+                        role,
+                        RouteSelection {
+                            kind: RouteKind::Paid,
+                            displayed: true,
+                            explicit_consent: true,
+                        },
+                    );
+                }
+                _ => anyhow::bail!("stored setup state carries unknown route state: {}", setting.key),
+            }
+        } else if setting.key == "automation.maintenance_mode" {
+            let mode = setting.value_ref.strip_prefix("literal:").ok_or_else(|| {
+                anyhow::anyhow!("stored automation value is not a literal: {}", setting.key)
+            })?;
+            automation = Some(parse_automation(mode)?);
+        } else {
+            anyhow::bail!("stored setup state carries unknown key: {}", setting.key);
+        }
+    }
+    let owner_ref =
+        owner_ref.ok_or_else(|| anyhow::anyhow!("stored setup state carries no settings"))?;
+    let decision = decide_first_run(&FirstRunInput {
+        selections,
+        automation,
+    })
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
+    .context("re-decide stored first-run route state")?;
+    let mut stored: BTreeMap<&str, &str> = BTreeMap::new();
+    for setting in settings {
+        stored.insert(setting.key.as_str(), setting.value_ref.as_str());
+    }
+    let mut expected: BTreeMap<&str, &str> = BTreeMap::new();
+    for setting in &to_settings(&decision, owner_ref) {
+        expected.insert(setting.key.as_str(), setting.value_ref.as_str());
+    }
+    if stored != expected {
+        anyhow::bail!("stored setup state does not match the canonical projection");
+    }
+    Ok((decision, owner_ref.to_owned()))
+}
+
+/// Loads the stored decision. `None` when no state file exists yet (a fresh
+/// setup inspects the compiled defaults); a present-but-invalid file fails
+/// closed rather than silently falling back to defaults.
+fn load_stored_decision(path: &Path) -> Result<Option<(FirstRunDecision, String)>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(anyhow::anyhow!("read stored setup state: {error}")),
+    };
+    let document: SetupStateDocument = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("stored setup state is not valid JSON: {error}"))?;
+    if document.schema != SETUP_STATE_SCHEMA {
+        anyhow::bail!("stored setup state schema is not {SETUP_STATE_SCHEMA}");
+    }
+    decision_from_settings(&document.settings).map(Some)
+}
+
+/// Persists the typed decision as the canonical `Setting` payload produced
+/// by the owner.
+fn save_stored_decision(
+    path: &Path,
+    decision: &FirstRunDecision,
+    owner_ref: &str,
+) -> Result<()> {
+    let document = serde_json::json!({
+        "schema": SETUP_STATE_SCHEMA,
+        "settings": to_settings(decision, owner_ref),
+    });
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| anyhow::anyhow!("create stored setup state dir: {error}"))?;
+    }
+    let encoded = serde_json::to_string_pretty(&document).context("encode stored setup state")?;
+    std::fs::write(path, encoded).map_err(|error| anyhow::anyhow!("write stored setup state: {error}"))?;
+    Ok(())
+}
+
 fn selection_for(
     route: Option<&str>,
     displayed: bool,
@@ -174,7 +381,10 @@ fn route_choice(
 
 /// Runs `setup apply`: decides typed per-role route state and projects it as
 /// JSON with the canonical `Setting` persistence payload. Omitted roles are
-/// `UNASSIGNED`; no paid route is selected without explicit consent.
+/// `UNASSIGNED`; no paid route is selected without explicit consent. When
+/// `ELIOT_SETUP_STATE_PATH` is configured, the canonical payload is
+/// persisted there so later `setup show` / `setup set` invocations observe
+/// it; otherwise the decision is projected without being stored.
 pub fn run_setup_apply(args: &SetupApplyArgs) -> Result<i32> {
     let owner_ref = args.owner_ref.trim();
     if owner_ref.is_empty() {
@@ -193,30 +403,43 @@ pub fn run_setup_apply(args: &SetupApplyArgs) -> Result<i32> {
         ),
         args.automation.as_deref(),
     )?;
+    let state_path = setup_state_path()?;
+    if let Some(path) = &state_path {
+        save_stored_decision(path, &decision, owner_ref)?;
+    }
     println!(
         "{}",
         serde_json::json!({
             "routes": describe_defaults(&decision),
             "has_paid_route": decision.has_paid_route(),
             "settings": to_settings(&decision, owner_ref),
+            "state": state_receipt(&state_path),
         })
     );
     Ok(0)
 }
 
-/// Runs `setup show`: inspects every compiled-safe default through the same
-/// typed path, reversibly.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "uniform fallible CLI wiring with sibling setup commands"
-)]
+/// Runs `setup show`: inspects every default through the same typed path,
+/// reversibly. With a configured state file holding an applied decision,
+/// the stored decision is shown; otherwise the compiled-safe defaults are
+/// shown. A present-but-invalid state file fails closed.
 pub fn run_setup_show() -> Result<i32> {
-    let defaults = eliot_config::first_run::FirstRunDecision::defaults();
+    let state_path = setup_state_path()?;
+    let (decision, source, owner_ref) = match &state_path {
+        Some(path) => match load_stored_decision(path)? {
+            Some((decision, owner)) => (decision, "stored", Some(owner)),
+            None => (FirstRunDecision::defaults(), "compiled-defaults", None),
+        },
+        None => (FirstRunDecision::defaults(), "compiled-defaults", None),
+    };
     println!(
         "{}",
         serde_json::json!({
-            "defaults": describe_defaults(&defaults),
-            "has_paid_route": defaults.has_paid_route(),
+            "routes": describe_defaults(&decision),
+            "has_paid_route": decision.has_paid_route(),
+            "source": source,
+            "owner_ref": owner_ref,
+            "state": state_receipt(&state_path),
         })
     );
     Ok(0)
@@ -224,7 +447,10 @@ pub fn run_setup_show() -> Result<i32> {
 
 /// Runs `setup set`: reversibly updates one role and/or the automation mode
 /// through the same typed path, projecting the updated decision with its
-/// canonical `Setting` persistence payload.
+/// canonical `Setting` persistence payload. The update applies on top of
+/// the stored decision when a state file is configured (falling back to
+/// the compiled defaults on a fresh setup), and the result is persisted
+/// back so the next `setup show` observes it.
 pub fn run_setup_set(args: &SetupSetArgs) -> Result<i32> {
     let owner_ref = args.owner_ref.trim();
     if owner_ref.is_empty() {
@@ -233,19 +459,26 @@ pub fn run_setup_set(args: &SetupSetArgs) -> Result<i32> {
     if args.route.is_none() && args.automation.is_none() {
         anyhow::bail!("setup set requires --route, --automation, or both");
     }
-    let defaults = eliot_config::first_run::FirstRunDecision::defaults();
+    let state_path = setup_state_path()?;
+    let base = match &state_path {
+        Some(path) => match load_stored_decision(path)? {
+            Some((decision, _)) => decision,
+            None => FirstRunDecision::defaults(),
+        },
+        None => FirstRunDecision::defaults(),
+    };
     let updated = match args.role.as_deref() {
         None => {
             if args.route.is_some() {
                 anyhow::bail!("setup set --route requires --role");
             }
-            defaults
+            base
         }
         Some(role_text) => {
             let role = parse_role(role_text).map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let selection =
                 selection_for(args.route.as_deref(), args.displayed, args.explicit_consent)?;
-            apply_update(&defaults, role, selection)
+            apply_update(&base, role, selection)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))
                 .context("apply first-run update")?
         }
@@ -254,12 +487,16 @@ pub fn run_setup_set(args: &SetupSetArgs) -> Result<i32> {
         None => updated,
         Some(mode) => apply_automation_update(&updated, parse_automation(mode)?),
     };
+    if let Some(path) = &state_path {
+        save_stored_decision(path, &updated, owner_ref)?;
+    }
     println!(
         "{}",
         serde_json::json!({
             "routes": describe_defaults(&updated),
             "has_paid_route": updated.has_paid_route(),
             "settings": to_settings(&updated, owner_ref),
+            "state": state_receipt(&state_path),
         })
     );
     Ok(0)
