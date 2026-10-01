@@ -91,7 +91,8 @@ pub use profile_run::{
     TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
 };
 pub use profile_replay::{
-    ProfileReplayError, ProfileReplayReceipt, VerifiedTestdReplayContext, replay_profile_stream,
+    ProfileReplayError, ProfileReplayReceipt, ReplayObservedInputs, VerifiedTestdReplayContext,
+    current_testd_provider_registry, observed_invalidation_set, replay_profile_stream,
 };
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
