@@ -57,6 +57,39 @@
 //!   while `Reserved`, and never across an await. There is no RPC in `Drop`,
 //!   no detached task, and no reset to `Open` to bypass a possible effect.
 //!
+//! Whole-stream copies (I10.8.5): the publication path stages the admitted
+//! plaintext ONCE through the one blob owner and never rematerializes it a
+//! second time for comparison. `record_locked` drops the session's staged
+//! bytes as soon as the owner receipt is recorded, and `publication_of`
+//! compares the owner's READBACK against the digest the reservation already
+//! sealed, so finalization verifies the staged object's exact length/digest
+//! without rebuilding the plaintext to hash it again.
+//!
+//! The ticket receives a clone rather than a move, deliberately: the finalize
+//! reservation retains the admitted DIGEST and never the bytes, so moving the
+//! buffer out of the session would make a publish future dropped before the
+//! owner call destroy the only copy and leave a reservation that can never be
+//! satisfied. Two full-plaintext buffers are therefore live only for the
+//! duration of one in-flight publication, and a dropped publication stays
+//! recoverable. The append-only temporary object that removes this window
+//! entirely is the #297 path named below.
+//!
+//! Publication coverage (audit `5881613195`): a terminal is always the one
+//! [`BlobStreamPublication`] the session actually proved. A gapped,
+//! policy-prohibited or failed-redaction finalize never calls the owner at
+//! all, so no raw byte is staged to preserve coverage. A policy-prohibited or
+//! failed-redaction terminal is additionally forbidden from carrying any
+//! inline preview by the shared terminal-evidence invariant, so a raw
+//! pre-policy preview can never reach the durable record.
+//!
+//! Owner boundary still open elsewhere: the append-only *temporary* object
+//! required by I10.8.5 needs an `append`-shaped operation on the one blob
+//! owner (issue #297, `eliot-blob-api` + `eliot-blob` service). The bound
+//! `stage` context here is a single operation identity, so a per-chunk append
+//! cannot be expressed through it without inventing a second operation
+//! identity space. This adapter therefore stages once, at finalization, and
+//! never claims a durable per-chunk frontier.
+//!
 //! Governing fragments: I5.12 (single-owner CAS, BYTES-only durability),
 //! I10.8.5 (bounded preview, append-only temporary evidence, final
 //! BlobRef+digest), I5.27 (exact operation/session identity, no blind
@@ -84,6 +117,69 @@ use eliot_process::{
 };
 use eliot_receipts::EffectClass;
 use sha2::{Digest, Sha256};
+
+/// What the durable expansion source of one terminal actually is.
+///
+/// This is the adapter's explicit publication outcome (issue #267 W4). Every
+/// terminal carries exactly one of these, and the value is derived only from
+/// owner-issued evidence — never from a nonempty locator, a fixture, or a
+/// process-local counter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobStreamPublication {
+    /// The whole admissible representation is durable: the owner returned a
+    /// real ready receipt for the exact admitted bytes and the readback of
+    /// that very object matched its byte commitment.
+    ///
+    /// A zero-byte complete source is a real immutable object here too: its
+    /// locator hash is the empty-content digest and it still resolves through
+    /// its own ready receipt. It is never reported as "no source".
+    Complete {
+        /// Immutable locator of the published object.
+        locator: String,
+        /// Owner-issued receipt identity that resolves and verifies it.
+        ready_receipt_ref: String,
+        /// Exact durable byte length of the published object.
+        byte_length: u64,
+        /// SHA-256 over exactly the published bytes.
+        sha256: String,
+    },
+    /// No durable expansion source exists for this terminal.
+    ///
+    /// `reason` names the exact blocking cause. A policy-prohibited or
+    /// failed-redaction session always lands here and never stages raw bytes.
+    ///
+    /// This adapter does not mint a partial-durable-prefix value. A cancelled
+    /// or read-failed session carries its admitted prefix and exact coverage
+    /// in the terminal evidence itself (`StreamPersistenceStatus::
+    /// SourceUnavailable` plus the admitted digest/count and the cancellation
+    /// or read-failure gap), and this adapter stages nothing for it. Claiming
+    /// `Partial` here would require an owner-issued receipt for the prefix,
+    /// which only a publication path can produce; an unbacked prefix value
+    /// would be exactly the "locator substitutes for owner evidence" defect
+    /// the audit rejects. Retaining the admissible prefix as a real durable
+    /// object is the #297 append-only staged-object path named above.
+    Unavailable {
+        /// Exact reason the source could not be produced.
+        reason: BlobStreamUnavailableReason,
+    },
+}
+
+/// The exact blocking cause of an unavailable durable source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlobStreamUnavailableReason {
+    /// Current policy forbids durable retention or inline disclosure.
+    PolicyProhibited,
+    /// The configured redaction/transformation profile failed.
+    RedactionFailed,
+    /// The declared gaps mean the received bytes are not a complete source.
+    CoverageGap,
+    /// The provider was unavailable before any exact result.
+    PersistenceUnavailable,
+    /// The provider returned a known failure.
+    PersistenceFailed,
+    /// The provider effect may or may not have committed.
+    PersistenceUnknownOutcome,
+}
 
 /// Locator scheme for blob-published stream sources.
 ///
@@ -170,7 +266,13 @@ impl BlobStreamSinkStoreBinding {
 
 struct SinkState {
     session: Option<ProcessStreamSinkSession>,
+    /// Admitted-but-not-yet-published plaintext. It is moved out with
+    /// [`std::mem::take`] at publication time, so planning a publish never
+    /// clones it and the session holds at most one full-plaintext buffer.
     staged: Vec<u8>,
+    /// The exact publication outcome proven for this session, once a terminal
+    /// recorded it. `None` means no terminal has landed yet.
+    publication: Option<BlobStreamPublication>,
     digester: Sha256,
     admitted_chunks: Vec<AdmittedChunk>,
     next_sequence: u64,
@@ -195,9 +297,12 @@ struct AdmittedChunk {
 ///
 /// Exactly one record exists per session, so it is bounded by the session's
 /// own limits (the retained request's preview is already capped by
-/// `max_preview_bytes` and its gaps by the protocol ceiling). The staged
-/// plaintext lives in [`SinkState::staged`] and is dropped as soon as the
-/// owner's ready receipt carries the same byte commitment.
+/// `max_preview_bytes` and its gaps by the protocol ceiling). The reservation
+/// holds only counters, the admitted digest, and — once the owner returned
+/// one — the real ready receipt. The staged plaintext is *moved* out of
+/// [`SinkState::staged`] into the publish ticket and dropped as soon as the
+/// owner's ready receipt carries the same byte commitment, so the record
+/// never retains a second copy of the stream.
 struct FinalizeReservation {
     identity: ProcessStreamSinkTerminalCommandIdentity,
     incarnation: u64,
@@ -239,7 +344,8 @@ impl FinalizeReservation {
 /// What the next durable publication step must be for one reserved command.
 enum PublishStep {
     /// Hand the exact admitted bytes to the one blob owner under the bound
-    /// stage operation identity.
+    /// stage operation identity. The bytes are a clone of what the session
+    /// still retains, so a dropped publication future stays recoverable.
     Stage { staged: Vec<u8> },
     /// The owner already returned a real ready receipt; resume the readback
     /// only. `stage` must not be called again for this command.
@@ -265,6 +371,8 @@ struct WithheldTicket {
     next_offset: u64,
     admitted_sha256: String,
     state: ProcessStreamSinkState,
+    /// The exact reason no durable source exists for this terminal.
+    publication: BlobStreamPublication,
 }
 
 enum FinalizePlan {
@@ -300,6 +408,7 @@ impl SinkState {
         Self {
             session: None,
             staged: Vec::new(),
+            publication: None,
             digester: Sha256::new(),
             admitted_chunks: Vec::new(),
             next_sequence: 0,
@@ -337,6 +446,19 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             binding,
             state: Mutex::new(SinkState::new()),
         }
+    }
+
+    /// The exact publication outcome this adapter actually proved for its one
+    /// session.
+    ///
+    /// `None` means no terminal has landed yet: nothing is claimed about
+    /// durability before an owner-issued ready receipt exists. A `Complete`
+    /// value is only ever set from a real owner receipt whose readback matched
+    /// its byte commitment; a nonempty locator or a fixture terminal can never
+    /// produce one.
+    #[must_use]
+    pub fn publication(&self) -> Option<BlobStreamPublication> {
+        self.lock().publication.clone()
     }
 
     fn lock(&self) -> MutexGuard<'_, SinkState> {
@@ -620,6 +742,21 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request.gaps().to_vec(),
         )?;
         let reason = request.reason();
+        let publication = BlobStreamPublication::Unavailable {
+            reason: match reason {
+                ProcessStreamSinkAbortReason::PolicyProhibition => {
+                    BlobStreamUnavailableReason::PolicyProhibited
+                }
+                ProcessStreamSinkAbortReason::RedactionFailure => {
+                    BlobStreamUnavailableReason::RedactionFailed
+                }
+                ProcessStreamSinkAbortReason::TransportFailure
+                | ProcessStreamSinkAbortReason::Cancellation
+                | ProcessStreamSinkAbortReason::CallerShutdown => {
+                    unavailable_reason(request.gaps())
+                }
+            },
+        };
         let terminal = ProcessStreamSinkTerminal::from_abort(
             session,
             request,
@@ -629,7 +766,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             state.admitted_sha256(),
             evidence,
         )?;
-        Self::record_locked(state, identity, terminal)
+        Self::record_locked(state, identity, publication, terminal)
     }
 
     /// Builds the one exact stage request for these bytes under the bound root
@@ -834,6 +971,28 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         .map_err(ProcessStreamSinkError::from)
     }
 
+    /// The exact publication outcome proven by a real owner ready receipt.
+    ///
+    /// A zero-byte complete source still names the immutable object the owner
+    /// returned: the blob locator hash is the empty-content digest, so the
+    /// locator is present and resolvable. It is never reported as "no source".
+    fn publication_of(
+        admitted_sha256: &str,
+        ready: &BlobReadyReceipt,
+    ) -> Result<BlobStreamPublication, ProcessStreamSinkError> {
+        if ready.plaintext_sha256() != admitted_sha256 {
+            return Err(ProcessStreamSinkError::EvidenceInvariant {
+                reason: "owner receipt does not describe the admitted transport bytes".to_owned(),
+            });
+        }
+        Ok(BlobStreamPublication::Complete {
+            locator: format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash),
+            ready_receipt_ref: ready.receipt().identity.receipt_id.to_string(),
+            byte_length: ready.plaintext_length(),
+            sha256: ready.plaintext_sha256().to_owned(),
+        })
+    }
+
     fn plan_finalize(
         &self,
         session: &ProcessStreamSinkSession,
@@ -864,20 +1023,41 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                     reason: "adapter stages exact transport bytes only".to_owned(),
                 });
             }
-            Self::check_preview(&state, request.preview())?;
+            // A reservation already holds the exact admitted byte commitment
+            // it was created from, and a resumed publish has moved the staged
+            // plaintext out of the session. Re-deriving the transport prefix
+            // here would compare against an empty buffer and reject a
+            // legitimate resume, so the check runs only for a first publish.
+            if state.finalization.is_none() {
+                Self::check_preview(&state, request.preview())?;
+            }
         }
         let admitted_sha256 = state.admitted_sha256();
 
         // An existing reservation for this exact command is resumed, never
         // re-reserved: the same terminal id can never drive a second stage.
         // A reservation for a different command is a conflict, not a race.
-        if let Some(reservation) = state.finalization.as_ref() {
+        if state.finalization.is_some() {
+            // The retained fields are copied into owned locals so the shared
+            // borrow of the reservation ends before the staged plaintext is
+            // *moved* out of the session; a resumed publish therefore never
+            // clones the whole stream.
+            let reservation = state
+                .finalization
+                .as_ref()
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
             if reservation.identity != identity {
                 return Err(ProcessStreamSinkError::TerminalIdentityConflict);
             }
-            let step = match reservation.ready() {
+            let resumed_identity = reservation.identity.clone();
+            let resumed_incarnation = reservation.incarnation;
+            let resumed_next_sequence = reservation.next_sequence;
+            let resumed_next_offset = reservation.next_offset;
+            let resumed_admitted_sha256 = reservation.admitted_sha256.clone();
+            let resumed_ready = reservation.ready().cloned();
+            let step = match resumed_ready {
                 Some(ready) => PublishStep::Readback {
-                    ready: Box::new(ready.clone()),
+                    ready: Box::new(ready),
                 },
                 None => PublishStep::Stage {
                     staged: state.staged.clone(),
@@ -886,28 +1066,22 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             return Ok(FinalizePlan::Publish(Box::new(PublishTicket {
                 session: existing,
                 request: request.clone(),
-                identity: reservation.identity.clone(),
-                incarnation: reservation.incarnation,
-                next_sequence: reservation.next_sequence,
-                next_offset: reservation.next_offset,
-                admitted_sha256: reservation.admitted_sha256.clone(),
+                identity: resumed_identity,
+                incarnation: resumed_incarnation,
+                next_sequence: resumed_next_sequence,
+                next_offset: resumed_next_offset,
+                admitted_sha256: resumed_admitted_sha256,
                 step,
             })));
         }
 
-        if !publishes {
-            return Ok(Self::withheld_plan(
-                &state,
-                existing,
-                request,
-                identity,
-                admitted_sha256,
-            ));
-        }
-
-        // One reservation per session: bound to this session, this exact
-        // command digest and the one bound blob stage operation.
-        Ok(self.reserve_publish(&mut state, existing, request, identity, admitted_sha256))
+        Ok(if publishes {
+            // One reservation per session: bound to this session, this exact
+            // command digest and the one bound blob stage operation.
+            self.reserve_publish(&mut state, existing, request, identity, admitted_sha256)
+        } else {
+            Self::withheld_plan(&state, existing, request, identity, admitted_sha256)
+        })
     }
 
     /// Builds the never-published terminal plan for a non-publishing
@@ -924,15 +1098,24 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         identity: ProcessStreamSinkTerminalCommandIdentity,
         admitted_sha256: String,
     ) -> FinalizePlan {
-        let withheld = if request
+        let (withheld, reason) = if request
             .gaps()
             .contains(&StreamEvidenceGap::PolicyProhibited)
         {
-            ProcessStreamSinkState::PolicyProhibited
+            (
+                ProcessStreamSinkState::PolicyProhibited,
+                BlobStreamUnavailableReason::PolicyProhibited,
+            )
         } else if request.gaps().contains(&StreamEvidenceGap::RedactionFailed) {
-            ProcessStreamSinkState::RedactionFailed
+            (
+                ProcessStreamSinkState::RedactionFailed,
+                BlobStreamUnavailableReason::RedactionFailed,
+            )
         } else {
-            ProcessStreamSinkState::SourceUnavailable
+            (
+                ProcessStreamSinkState::SourceUnavailable,
+                unavailable_reason(request.gaps()),
+            )
         };
         FinalizePlan::Withheld(Box::new(WithheldTicket {
             session,
@@ -942,6 +1125,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             next_offset: state.next_offset,
             admitted_sha256,
             state: withheld,
+            publication: BlobStreamPublication::Unavailable { reason },
         }))
     }
 
@@ -990,6 +1174,14 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             next_sequence: state.next_sequence,
             next_offset: state.next_offset,
             admitted_sha256,
+            // The staged plaintext is handed to the ticket as the one live
+            // full-plaintext buffer. It is CLONED, not moved: the reservation
+            // below retains only the admitted digest, never the bytes, so a
+            // publish future dropped before `stage` completes would otherwise
+            // destroy the only durable copy and leave a reservation that can
+            // never be satisfied. The session keeps the bytes until
+            // `record_locked` drops them, so a dropped future stays
+            // recoverable and a retry re-derives the same terminal.
             step: PublishStep::Stage {
                 staged: state.staged.clone(),
             },
@@ -997,11 +1189,13 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
     }
 
     /// Records the terminal exactly once under the command identity, drops
-    /// the staged plaintext, and reconciles a same-identity replay to the
-    /// existing terminal instead of a second object.
+    /// the staged plaintext, records the exact publication outcome, and
+    /// reconciles a same-identity replay to the existing terminal instead of
+    /// a second object.
     fn record_locked(
         state: &mut SinkState,
         identity: ProcessStreamSinkTerminalCommandIdentity,
+        publication: BlobStreamPublication,
         terminal: ProcessStreamSinkTerminal,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
         if let Some(existing) = &state.terminal {
@@ -1021,6 +1215,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         state.terminal_command = Some(identity);
         state.finalization = None;
         state.staged = Vec::new();
+        state.publication = Some(publication);
         state.terminal = Some(terminal.clone());
         Ok(terminal)
     }
@@ -1036,11 +1231,18 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         let ready = match ticket.step {
             PublishStep::Readback { ready } => *ready,
             PublishStep::Stage { staged } => {
-                self.stage_once(&ticket.identity, ticket.incarnation, &staged)
-                    .await?
+                // `staged` is the one live full-plaintext buffer. It is handed
+                // to the owner and dropped when the call returns, so no
+                // second simultaneous copy of the stream exists at any point.
+                let ready = self
+                    .stage_once(&ticket.identity, ticket.incarnation, &staged)
+                    .await?;
+                drop(staged);
+                ready
             }
         };
         self.verify_readback(&ready).await?;
+        let publication = Self::publication_of(&ticket.admitted_sha256, &ready)?;
         let evidence = Self::complete_source(
             &ticket.session,
             &ticket.request,
@@ -1056,11 +1258,14 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             ticket.admitted_sha256,
             evidence,
         )?;
-        Self::record_locked(&mut self.lock(), ticket.identity, terminal)
+        Self::record_locked(&mut self.lock(), ticket.identity, publication, terminal)
     }
 
     /// Mints the withheld (never-published) terminal for a gapped,
     /// policy-prohibited or failed-redaction finalize.
+    ///
+    /// The recorded outcome is exactly `Unavailable { reason }`: no durable
+    /// source exists, and no raw byte was staged to manufacture coverage.
     fn withhold_reserved(
         &self,
         ticket: WithheldTicket,
@@ -1086,7 +1291,12 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             ticket.admitted_sha256,
             evidence,
         )?;
-        Self::record_locked(&mut self.lock(), ticket.identity, terminal)
+        Self::record_locked(
+            &mut self.lock(),
+            ticket.identity,
+            ticket.publication,
+            terminal,
+        )
     }
 
     async fn finalize_async(
@@ -1204,6 +1414,30 @@ impl<C: BlobStoreClient> Drop for FinalizeHold<'_, C> {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The exact provider-side reason a durable source is unavailable.
+///
+/// The declared gaps are the only input, so this can never invent a cause the
+/// caller did not declare.
+///
+/// * `PersistenceUnknownOutcome` / `PersistenceFailed` are the provider-side
+///   causes and map straight through.
+/// * `PersistenceBackpressure` means bytes were shed, so the received bytes
+///   are a shorter prefix of the process stream and never a complete source:
+///   the reason is the exact coverage gap, not a provider verdict.
+/// * Anything else (cancellation, read failure, capture unavailable, or no
+///   persistence gap at all) is a provider that produced no exact result.
+fn unavailable_reason(gaps: &[StreamEvidenceGap]) -> BlobStreamUnavailableReason {
+    if gaps.contains(&StreamEvidenceGap::PersistenceUnknownOutcome) {
+        BlobStreamUnavailableReason::PersistenceUnknownOutcome
+    } else if gaps.contains(&StreamEvidenceGap::PersistenceFailed) {
+        BlobStreamUnavailableReason::PersistenceFailed
+    } else if gaps.contains(&StreamEvidenceGap::PersistenceBackpressure) {
+        BlobStreamUnavailableReason::CoverageGap
+    } else {
+        BlobStreamUnavailableReason::PersistenceUnavailable
+    }
 }
 
 /// Whether a blob failure leaves an effect that must stay unresolved until
