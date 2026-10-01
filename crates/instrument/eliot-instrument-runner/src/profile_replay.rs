@@ -266,7 +266,7 @@ fn replay_profile_stream_admitted(
         Some(required_profile_ids),
         Some(required_provider_ids),
         required_test_ids,
-        Some(terminal),
+        terminal,
         started_at,
         finished_at,
     )
