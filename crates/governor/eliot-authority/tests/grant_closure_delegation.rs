@@ -34,22 +34,43 @@ fn test_binding() -> Result<AuthorityBinding, Box<dyn Error>> {
     })
 }
 
+/// One delegation edge of the chain, expressed the way a real graph holds it:
+/// `issuer` is the parent's `holder`, and the child's authority is a strict
+/// subset of the parent's. `GrantGraph::from_grants` runs
+/// `check_narrowing` (A0.3 "hidden creation or expansion of authority", see
+/// `docs/architecture/A00-03-hard-boundaries.md`) on every edge, so an edge
+/// whose issuer is not the parent's holder, or whose authority set equals
+/// its parent's, is refused with `AuthorityError::GrantNotNarrower` before
+/// the graph exists and `delegated_closure` is never reachable.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture grant binds every delegation identity explicitly; grouping them would hide a binding"
+)]
 fn grant(
     id: &str,
     parent: Option<&str>,
     root: &str,
+    holder: &str,
+    operations: &[&str],
+    resources: &[&str],
+    effect: EffectClass,
     binding: AuthorityBinding,
 ) -> Result<CapabilityGrant, Box<dyn Error>> {
     Ok(CapabilityGrant {
         grant_id: GrantId::new(id)?,
         parent_grant_id: parent.map(GrantId::new).transpose()?,
         authority_root_ref: root.to_owned(),
-        issuer: PrincipalRef::new("governor")?,
-        holder: PrincipalRef::new("holder-1")?,
+        issuer: match parent {
+            // A root grant is issued by the Governor that owns the root.
+            None => PrincipalRef::new("governor")?,
+            // A delegated grant is issued by whoever holds its parent.
+            Some(parent_id) => PrincipalRef::new(parent_holder(parent_id))?,
+        },
+        holder: PrincipalRef::new(holder)?,
         authority: AuthoritySet::new(
-            ["op.read".to_owned()],
-            ["res:1".to_owned()],
-            EffectClass::Read,
+            operations.iter().map(|operation| (*operation).to_owned()),
+            resources.iter().map(|resource| (*resource).to_owned()),
+            effect,
         )?,
         inherited_source_ceiling: None,
         binding,
@@ -60,30 +81,73 @@ fn grant(
     })
 }
 
+/// The holder of the named parent grant, as declared by [`chain_graph`]'s
+/// edges below. Kept in one place so the delegation chain's issuer/holder
+/// linkage cannot drift between the edge list and the closure assertions.
+fn parent_holder(parent: &str) -> &'static str {
+    match parent {
+        "grant-origin" => "holder-origin",
+        "grant-mid" => "holder-mid",
+        "grant-leaf" => "holder-leaf",
+        "grant-tip" => "holder-tip",
+        other => unreachable!("chain_graph declares no parent named {other}"),
+    }
+}
+
 fn chain_graph() -> Result<GrantGraph, Box<dyn Error>> {
     let binding = test_binding()?;
     GrantGraph::from_grants(
         [
-            grant("grant-origin", None, "root-test", binding.clone())?,
+            grant(
+                "grant-origin",
+                None,
+                "root-test",
+                "holder-origin",
+                &["op.read", "op.write"],
+                &["res:1", "res:2"],
+                EffectClass::ExternalEffect,
+                binding.clone(),
+            )?,
             grant(
                 "grant-mid",
                 Some("grant-origin"),
                 "root-test",
+                "holder-mid",
+                &["op.read", "op.write"],
+                &["res:1", "res:2"],
+                EffectClass::ReversibleMutation,
                 binding.clone(),
             )?,
             grant(
                 "grant-leaf",
                 Some("grant-mid"),
                 "root-test",
+                "holder-leaf",
+                &["op.read"],
+                &["res:1"],
+                EffectClass::Candidate,
                 binding.clone(),
             )?,
             grant(
                 "grant-tip",
                 Some("grant-leaf"),
                 "root-test",
+                "holder-tip",
+                &["op.read"],
+                &["res:1"],
+                EffectClass::Read,
                 binding.clone(),
             )?,
-            grant("grant-other", None, "root-other", binding)?,
+            grant(
+                "grant-other",
+                None,
+                "root-other",
+                "holder-other",
+                &["op.read"],
+                &["res:1"],
+                EffectClass::Read,
+                binding,
+            )?,
         ],
         7,
     )

@@ -98,29 +98,43 @@ fn restore_with_mid_evidence(fence: &StateFence, denominator: &Denominator) -> G
     let snapshot = chain(fence, denominator)
         .recovery_snapshot()
         .expect("snapshot");
-    let evidence = RevocationHistoryEvidence {
-        state_fence: fence.clone(),
-        source_revision: denominator.source_revision,
-        closures: vec![closure(
-            &denominator.mid_closure_id,
-            &denominator.authority_root,
-            &denominator.mid_grant,
-            &denominator
-                .mid_affected
-                .iter()
-                .filter(|reference| *reference != &denominator.mid_grant)
-                .cloned()
-                .collect::<Vec<_>>(),
-            denominator.source_revision,
-            fence,
-        )],
-    };
+    let evidence = mid_evidence(fence, denominator);
     GrantGraph::from_recovery_snapshot_with_revocation_history(
         &snapshot,
         Some(&evidence),
         &operation(),
     )
     .expect("current evidence restores")
+}
+
+/// The mid-origin committed closure the durable history owner declares.
+///
+/// The declared origin is `mid_grant`, so the denominator is every grant the
+/// mid origin reaches: mid, leaf, and tip. `mid_affected` already names the
+/// complete reachable membership; only the origin itself is dropped from the
+/// dependent list, because the origin is the root of the committed closure
+/// and not one of its dependents. A committed complete closure that left the
+/// tip out would be a reachable-but-unrepresented member and restore would
+/// refuse with `TargetDrift("recovery.closure_affected")` (PR #2966).
+fn mid_evidence(fence: &StateFence, denominator: &Denominator) -> RevocationHistoryEvidence {
+    let dependents: Vec<String> = denominator
+        .mid_affected
+        .iter()
+        .filter(|reference| *reference != &denominator.mid_grant)
+        .cloned()
+        .collect();
+    RevocationHistoryEvidence {
+        state_fence: fence.clone(),
+        source_revision: denominator.source_revision,
+        closures: vec![closure(
+            &denominator.mid_closure_id,
+            &denominator.authority_root,
+            &denominator.mid_grant,
+            &dependents,
+            denominator.source_revision,
+            fence,
+        )],
+    }
 }
 
 fn assert_full_lineage_retained(restored: &GrantGraphRecoverySnapshot, denominator: &Denominator) {
@@ -525,23 +539,7 @@ fn revoke_mid_tree_recovery_reports_transitive_suppression() {
     let fence = fence();
     let graph = chain(&fence, &denominator);
     let snapshot = graph.recovery_snapshot().expect("snapshot");
-    let evidence = RevocationHistoryEvidence {
-        state_fence: fence.clone(),
-        source_revision: denominator.source_revision,
-        closures: vec![closure(
-            &denominator.mid_closure_id,
-            &denominator.authority_root,
-            &denominator.mid_grant,
-            &denominator
-                .mid_affected
-                .iter()
-                .filter(|reference| *reference != &denominator.mid_grant)
-                .cloned()
-                .collect::<Vec<_>>(),
-            denominator.source_revision,
-            &fence,
-        )],
-    };
+    let evidence = mid_evidence(&fence, &denominator);
     let outcome = GrantGraph::from_recovery_snapshot_with_revocation_history(
         &snapshot,
         Some(&evidence),
@@ -566,10 +564,14 @@ fn revoke_mid_tree_recovery_reports_transitive_suppression() {
         by_id[denominator.leaf_grant.as_str()].cause,
         SuppressionCause::Direct
     );
+    // The tip is a named member of the committed mid closure, so it is
+    // suppressed directly by that membership. `SuppressionCause::Transitive`
+    // is the inheritance fallback for a dependent the committed closure did
+    // not name, which a complete committed closure cannot contain (PR #2966).
     assert_eq!(
         by_id[denominator.tip_grant.as_str()].cause,
-        SuppressionCause::Transitive(denominator.leaf_grant.clone()),
-        "the tip falls transitively through its suppressed parent"
+        SuppressionCause::Direct,
+        "the tip is named by the committed mid closure"
     );
     assert!(!by_id.contains_key(denominator.origin_grant.as_str()));
     assert!(!by_id.contains_key(denominator.unrelated_grant.as_str()));
