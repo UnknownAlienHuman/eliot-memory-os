@@ -55,7 +55,7 @@
 //! current answer — on today's tree `resolve_supply` is never called at all on
 //! any production path. The crate's own
 //! `submit_orientation_stops_at_controller_gate` proof
-//! (pipeline_e2e.rs:806) asserts exactly this: an Orientation `submit` stops at
+//! (`pipeline_e2e.rs:806`) asserts exactly this: an Orientation `submit` stops at
 //! the controller gate. The blocked disposition published downstream is reached
 //! today only from the unit-level pipeline proofs, not from `main.rs`.
 //!
