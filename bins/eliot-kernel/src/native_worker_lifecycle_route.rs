@@ -70,6 +70,7 @@ use eliot_ors::{
 };
 use eliot_process::OperationId;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
+use eliot_security_contracts::PrivacyClass;
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -782,6 +783,42 @@ fn single_shape_wire_and_executable(
         None => NATIVE_WORKER_CLAIM_WIRE_ID.to_owned(),
     };
     Ok((wire_id, wire_version, executable_binding))
+}
+
+/// Reads one harness/privacy-owner/swarm leg from presented claim JSON:
+/// absent or null decodes as `None` (the owner has not published the leg);
+/// a present leg must be shape-valid text, never invented here.
+fn optional_claim_text(
+    claim: &serde_json::Value,
+    field: &'static str,
+) -> Result<Option<String>, NativeWorkerRouteError> {
+    match claim.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => Ok(Some(native_worker_json_str(
+            claim,
+            field,
+            MAX_CLAIM_TEXT_LEN,
+        )?)),
+    }
+}
+
+/// Reads the canonical privacy-class leg from presented claim JSON: absent
+/// or null decodes as `None`; a present leg must parse as the canonical
+/// owner enum, so an unknown spelling fails closed here, never downstream.
+fn optional_claim_privacy_class(
+    claim: &serde_json::Value,
+) -> Result<Option<PrivacyClass>, NativeWorkerRouteError> {
+    match claim.get("privacy_class") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let class: PrivacyClass = serde_json::from_value(value.clone()).map_err(|_| {
+                NativeWorkerRouteError::Shape {
+                    field: "privacy_class",
+                }
+            })?;
+            Ok(Some(class))
+        }
+    }
 }
 
 fn single_shape_resources(
@@ -1903,6 +1940,12 @@ impl KernelComposition {
             authority_epoch,
             state_fence: fence,
             executable_binding,
+            // Owner-published legs project verbatim from the presented claim
+            // (or `None` when the owner has not published them); never
+            // invented, and with no registration counterpart to compare.
+            visibility: optional_claim_text(claim, "visibility")?,
+            privacy_class: optional_claim_privacy_class(claim)?,
+            swarm_id: optional_claim_text(claim, "swarm_id")?,
             binding_digest: require_digest(claim, "binding_digest")?,
             request_digest: String::new(),
         };
@@ -3524,9 +3567,10 @@ mod single_shape_proof {
             "executable_wire_version": NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
             "executable_binding_digest": owner_digest,
         });
-        // Binding digest over the shared 18-field set (same procedure both
-        // sides use; envelope-only fields are excluded, so stripping them
-        // keeps the digest).
+        // Binding digest over the shared bound-work key set (the exact key
+        // set both `compute_binding_digest` implementations cover, so the
+        // presented digest binds; envelope-only fields are excluded, so
+        // stripping them keeps the digest).
         let draft = serde_json::json!({
             "attempt_id": attempt_id,
             "authority_epoch": epoch_value,
@@ -3541,10 +3585,13 @@ mod single_shape_proof {
             "operation_id": operation_id,
             "parent_job_id": "parent-job-1",
             "predecessor_revision": "rev-1",
+            "privacy_class": null,
             "registration_id": registration_id,
             "route_class": "test-route",
             "state_fence": fence_value,
+            "swarm_id": null,
             "task_id": "task-1",
+            "visibility": null,
             "work_scope_id": "scope-1",
             "worker_generation": 1,
         });
