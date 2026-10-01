@@ -357,6 +357,9 @@ mod tests {
     use super::*;
     use crate::DispatchValidationPort;
 
+    const TEST_OWNER_NOW_MS: u64 = 150;
+    const TEST_RUNTIME_LEASE_TTL_MS: u64 = 60_000;
+
     fn must<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
         match result {
             Ok(value) => value,
@@ -401,8 +404,8 @@ mod tests {
         fn new(authority: DispatchPermitAuthority, fence: FencingToken) -> Self {
             let context = must(DispatchValidationContext::new(
                 ClockObservation {
-                    valid_time_ms: Some(150),
-                    known_time_ms: Some(150),
+                    valid_time_ms: Some(TEST_OWNER_NOW_MS as i64),
+                    known_time_ms: Some(TEST_OWNER_NOW_MS as i64),
                     transaction_sequence: None,
                     monotonic_ns: Some(1),
                 },
@@ -511,7 +514,10 @@ mod tests {
                 "task_revision": 1, "policy_revision": 1,
                 "integration_revision": null
             },
-            "state": "ACTIVE"
+            "state": "ACTIVE",
+            // I6.10 and #1918/#4198 require a bounded lease expiry alongside
+            // its exact scope, authority epoch, and state-fence binding.
+            "expires_at_ms": TEST_OWNER_NOW_MS + TEST_RUNTIME_LEASE_TTL_MS
         })));
         let work_scope = must(serde_json::from_value(json!({
             "work_scope": "wasm-p03-scope",

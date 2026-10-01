@@ -6411,8 +6411,8 @@ mod tests {
                 matches!(start_a, Err(ProcessExecutionError::UnknownOutcome)),
                 "op A must fence as typed UnknownOutcome, got {start_a:?}"
             );
-            let view_a = block_on(executor.inspect(OperationId::new("op-82-a-quarantine")?))?;
-            assert_eq!(view_a.lifecycle(), ProcessLifecycle::UnknownOutcome);
+            let operation_a = OperationId::new("op-82-a-quarantine")?;
+            assert_quarantined_unknown(&executor, operation_a.clone())?;
             // Healthy B starts on the SAME executor while A is quarantined:
             // A's fenced state must not block the independent start path.
             let sink_b = Arc::new(RecordingSink::default());
@@ -6443,8 +6443,10 @@ mod tests {
                     // join window) is an honest typed outcome for B itself,
                     // but B must still be retained — never promoted — and A
                     // must still read unknown.
-                    let view_b = block_on(executor.inspect(OperationId::new("op-82-b-healthy")?))?;
-                    assert_eq!(view_b.lifecycle(), ProcessLifecycle::UnknownOutcome);
+                    assert_quarantined_unknown(
+                        &executor,
+                        OperationId::new("op-82-b-healthy")?,
+                    )?;
                 }
                 Err(other) => {
                     return Err(format!(
@@ -6454,10 +6456,46 @@ mod tests {
                 }
             }
             // A is still fenced as unknown: the failure stayed scoped to A.
-            let view_a_again = block_on(executor.inspect(OperationId::new("op-82-a-quarantine")?))?;
-            assert_eq!(view_a_again.lifecycle(), ProcessLifecycle::UnknownOutcome);
+            assert_quarantined_unknown(&executor, operation_a)?;
             Ok(())
         }
+    }
+
+    /// Inspection of a quarantined operation preserves its original typed
+    /// unknown disposition. Depending on whether the child can still be
+    /// observed, the API may return an UnknownOutcome view or the typed error;
+    /// either way, the public quarantine projection must retain this exact ID.
+    fn assert_quarantined_unknown(
+        executor: &WindowsProcessExecutor,
+        operation_id: OperationId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match block_on(executor.inspect(operation_id.clone())) {
+            Ok(view) => assert_eq!(
+                view.lifecycle(),
+                ProcessLifecycle::UnknownOutcome,
+                "inspection must not promote quarantined operation {operation_id}"
+            ),
+            Err(ProcessExecutionError::UnknownOutcome) => {}
+            Err(other) => {
+                return Err(format!(
+                    "quarantined operation {operation_id} must remain inspectable as unknown, got {other:?}"
+                )
+                .into());
+            }
+        }
+        let summary = executor.operation_health_summary();
+        let Some(record) = summary
+            .quarantined_operations
+            .iter()
+            .find(|record| record.operation_id() == &operation_id)
+        else {
+            return Err(format!(
+                "quarantine projection lost original operation {operation_id}"
+            )
+            .into());
+        };
+        assert_eq!(record.lifecycle(), ProcessLifecycle::UnknownOutcome);
+        Ok(())
     }
 
     /// Issue #82 (watcher-spawn contour): the deadline-watcher spawn path is
