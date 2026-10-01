@@ -5224,10 +5224,12 @@ fn backup_operation(command: eliot_cli::CommandId) -> Option<&'static str> {
 ///
 /// Both projections are rendered from the same
 /// [`eliot_cli::backup::BackupOperationOutcome`], so the bounded human text
-/// and the JSON document cannot disagree. A verified outcome exits zero; an
-/// invalid one exits as a usage failure; a refused or blocked one exits as
-/// owner-admission-required. No exit status is ever a capture, verification,
-/// or restore proof.
+/// and the JSON document cannot disagree. A verified archive or a completed
+/// isolated rehearsal exits zero; an invalid one exits as a usage failure; a
+/// refused or blocked one exits as owner-admission-required. No exit status is
+/// ever a capture, verification, or restore proof, and a zero exit for a
+/// rehearsal means the rehearsal RAN — not that the destination is activated,
+/// operational, or cut over.
 #[cfg(windows)]
 fn render_backup_outcome(response: &eliot_cli::CommandResponse) -> Result<i32> {
     let eliot_cli::CommandResult::Forwarded { payload } = &response.result else {
@@ -5250,8 +5252,13 @@ fn render_backup_outcome(response: &eliot_cli::CommandResponse) -> Result<i32> {
         eliot_cli::backup::render_backup_outcome_human(&outcome)
     );
     println!("{}", serde_json::to_string(&outcome)?);
+    // A completed rehearsal is a real owner result and exits zero, exactly as a
+    // verified archive does. It is NOT a readiness or cutover signal: the
+    // rehearsal imported into an isolated destination and activated nothing, and
+    // `next_reconciliation` says so. Exit status has never been a recovery claim
+    // on this path, so adding the rehearsal state here does not widen one.
     Ok(match outcome.state.as_str() {
-        eliot_cli::backup::BACKUP_STATE_VERIFIED => 0,
+        eliot_cli::backup::BACKUP_STATE_VERIFIED | eliot_cli::backup::BACKUP_STATE_REHEARSED => 0,
         eliot_cli::backup::BACKUP_STATE_INVALID => INVALID_REQUEST_EXIT,
         _ => BACKUP_OWNER_ADMISSION_REQUIRED_EXIT,
     })
