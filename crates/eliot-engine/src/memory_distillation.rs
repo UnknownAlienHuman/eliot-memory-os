@@ -10,7 +10,7 @@ use eliot_types::{
     MemoryLifecycleState, MemoryRevision, MemoryTier, MemoryUtilityLedgerEntry,
     MemoryUtilitySignalKind, MemoryUtilitySourceRecord, MemoryVitalityScore, ProjectId,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use time::OffsetDateTime;
@@ -27,7 +27,7 @@ impl MemoryDistillationService {
         snapshot_revision: MemoryRevision,
         source_records: &[MemoryUtilitySourceRecord],
         complete: bool,
-    ) -> CanonicalMemoryUtilityLedger {
+    ) -> Result<CanonicalMemoryUtilityLedger, EngineError> {
         let mut entries = BTreeMap::<String, MemoryUtilityLedgerEntry>::new();
         for record in source_records {
             let targets = if record.target_refs.is_empty() {
@@ -52,7 +52,7 @@ impl MemoryDistillationService {
                     .maintenance_cost_units
                     .saturating_add(record.serialized_bytes.div_ceil(1024));
                 for signal in &signals {
-                    apply_utility_signal(entry, *signal, &record.payload);
+                    apply_utility_signal(entry, *signal, &record.payload)?;
                 }
                 if !record.evidence_ref.trim().is_empty() {
                     entry.evidence_refs.push(record.evidence_ref.clone());
@@ -64,13 +64,13 @@ impl MemoryDistillationService {
             entry.evidence_refs.sort();
             entry.evidence_refs.dedup();
         }
-        CanonicalMemoryUtilityLedger {
+        Ok(CanonicalMemoryUtilityLedger {
             project_id,
             snapshot_revision,
             complete,
             source_record_count: source_records.len(),
             entries,
-        }
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -545,7 +545,7 @@ fn apply_utility_signal(
     entry: &mut MemoryUtilityLedgerEntry,
     signal: MemoryUtilitySignalKind,
     payload: &Value,
-) {
+) -> Result<(), EngineError> {
     *entry.signal_counts.entry(signal).or_insert(0) += 1;
     match signal {
         MemoryUtilitySignalKind::InjectionReceipt
@@ -594,13 +594,24 @@ fn apply_utility_signal(
         }
         MemoryUtilitySignalKind::ContextTokenCost => {
             // Closed versioned adapter, not a field probe. Only a payload that
-            // declares the accepted current measurement revision and carries
-            // the canonical #704 unvalidated STU is admitted; the legacy bare
-            // `estimated_tokens` integer is no longer decoded. A malformed or
-            // unversioned payload contributes nothing rather than a minimum-one
-            // estimate, so unknown cost is never cheap.
+            // deserializes into the closed `ContextCostMeasurementPayload` -
+            // unknown fragments included - declares the accepted current
+            // measurement revision and carries the canonical #704 unvalidated
+            // STU. The legacy bare `estimated_tokens` integer is no longer
+            // decoded. A malformed or unversioned payload contributes nothing
+            // rather than a minimum-one estimate, so unknown cost is never
+            // cheap.
+            //
+            // The sum is checked, matching the byte path in `corpus_profile`:
+            // a Context cost that cannot be represented is refused as typed
+            // overflow evidence instead of saturating to `u64::MAX`, which
+            // would read as an enormous observed cost and silently cross the
+            // `> 512` demotion threshold in `deterministic_item_finding`.
             if let Some(value) = canonical_context_cost_from_payload(payload) {
-                entry.context_cost_tokens = entry.context_cost_tokens.saturating_add(value);
+                entry.context_cost_tokens = entry
+                    .context_cost_tokens
+                    .checked_add(value)
+                    .ok_or(EngineError::ContextMeasurement(ContextError::Overflow))?;
             }
         }
         MemoryUtilitySignalKind::MaintenanceCost => {}
@@ -612,6 +623,7 @@ fn apply_utility_signal(
                 entry.missing_context_regret_count.saturating_add(1);
         }
     }
+    Ok(())
 }
 
 fn deterministic_item_finding(
@@ -943,32 +955,69 @@ fn payload_string(value: &Value, key: &str) -> Option<String> {
 /// is no trial decoding, serde default or alias that invents evidence.
 const CONTEXT_COST_ADAPTER_REVISION: &str = "eliot-context-cost/v1";
 
+/// Closed, versioned measurement contract of the Context-cost payload.
+///
+/// This type *is* the accepted fragment set: the accepted revision, the
+/// canonical serializer identity, the #704 `conservative_stu` status, an
+/// explicitly null `actual_tokens`, and the STU value. `deny_unknown_fields`
+/// closes the schema, so a payload carrying an extra, mutated or unexpected
+/// fragment is refused instead of being admitted on the strength of the few
+/// fragments an ad-hoc probe happened to look for. No `default`, alias or
+/// optional field widens the accepted set: absent evidence stays absent
+/// evidence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextCostMeasurementPayload {
+    adapter_revision: String,
+    serializer_id: String,
+    measurement_status: String,
+    /// Must be present *and* explicitly null. An actual-token claim needs its
+    /// own exact route/model/tokenizer binding over these bytes, so a payload
+    /// that states no claim still has to state that it has none; the field is
+    /// not optional because omission is not the same claim as a null claim.
+    actual_tokens: Value,
+    stu_estimate: ContextCostStuEstimate,
+}
+
+/// Closed STU fragment of the Context-cost measurement contract. Nothing else
+/// may ride along with the value: a nested estimator identity, byte length or
+/// digest that this adapter cannot validate is refused, not ignored.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextCostStuEstimate {
+    value: u64,
+}
+
 /// Closed versioned adapter from a canonical #704 measurement payload to the
 /// unvalidated STU recorded in `MemoryUtilityLedgerEntry::context_cost_tokens`.
 ///
+/// The payload is deserialized into [`ContextCostMeasurementPayload`] rather
+/// than probed field by field, so unknown or unexpected fragments are refused.
 /// Admitted only when the payload declares the accepted revision, names the
 /// canonical serializer, reports the #704 `conservative_stu` status, and
-/// carries an `actual_tokens` field. Absent or mismatched evidence yields
-/// `None` (unknown), never zero, one, or a legacy bare estimate. A stale
-/// legacy `estimated_tokens` value is never decoded as current tokens.
+/// carries an `actual_tokens` field that is explicitly null. Absent, malformed
+/// or mismatched evidence yields `None` (unknown), never zero, one, or a
+/// legacy bare estimate. A stale legacy `estimated_tokens` value is never
+/// decoded as current tokens.
 fn canonical_context_cost_from_payload(payload: &Value) -> Option<u64> {
-    let measure = payload.get("measurement")?;
-    if measure.get("adapter_revision")?.as_str()? != CONTEXT_COST_ADAPTER_REVISION {
+    let measure: ContextCostMeasurementPayload =
+        serde_json::from_value(payload.get("measurement")?.clone()).ok()?;
+    if measure.adapter_revision != CONTEXT_COST_ADAPTER_REVISION {
         return None;
     }
-    if measure.get("serializer_id")?.as_str()? != "serde_json" {
+    if measure.serializer_id != "serde_json" {
         return None;
     }
-    if measure.get("measurement_status")?.as_str()? != "conservative_stu" {
+    if measure.measurement_status != "conservative_stu" {
         return None;
     }
     // An actual-token claim requires its own exact route/model/tokenizer
     // binding over these bytes. Without one it must be explicitly null, never
     // a synthesized count.
-    if !measure.get("actual_tokens").is_some_and(Value::is_null) {
+    if !measure.actual_tokens.is_null() {
         return None;
     }
-    measure.get("stu_estimate")?.get("value")?.as_u64()
+    Some(measure.stu_estimate.value)
 }
 
 /// Canonical #704 byte length that covers one measured corpus unit count.

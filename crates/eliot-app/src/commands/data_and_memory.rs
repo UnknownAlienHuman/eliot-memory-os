@@ -578,7 +578,7 @@ async fn cli_memory_distillation_projection(
         snapshot_revision,
         &mcp_stdio::canonical_utility_sources(&records)?,
         complete,
-    );
+    )?;
     Ok((records, snapshot_revision, utility_ledger))
 }
 

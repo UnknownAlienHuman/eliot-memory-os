@@ -79,7 +79,7 @@ pub(super) async fn dispatch_memory_distillation_preview(
         snapshot_revision,
         &canonical_utility_sources(&records)?,
         scan_complete,
-    );
+    )?;
     let items = canonical_distillation_items(&records)?;
     let mut plan = MemoryDistillationService::plan(MemoryDistillationInput {
         project_id,
@@ -202,7 +202,7 @@ pub(super) async fn dispatch_memory_distillation_apply(
         snapshot_revision,
         &canonical_utility_sources(&records)?,
         complete,
-    );
+    )?;
     let plan = MemoryDistillationService::plan(MemoryDistillationInput {
         project_id,
         snapshot_revision,
@@ -1206,7 +1206,7 @@ pub(super) async fn dispatch_memory_lifecycle_vitality(
         snapshot_revision,
         &canonical_utility_sources(&records)?,
         complete,
-    );
+    )?;
     let target_ref = input
         .memory_ref
         .or_else(|| ledger.entries.first().map(|entry| entry.target_ref.clone()))
@@ -1228,7 +1228,7 @@ pub(super) async fn dispatch_memory_lifecycle_gravity(
         snapshot_revision,
         &canonical_utility_sources(&records)?,
         complete,
-    );
+    )?;
     let target_ref = input
         .memory_ref
         .or_else(|| ledger.entries.first().map(|entry| entry.target_ref.clone()))

@@ -68,7 +68,8 @@ fn plan(
 }
 
 #[test]
-fn utility_ledger_uses_canonical_signals_and_ignores_writer_score() {
+fn utility_ledger_uses_canonical_signals_and_ignores_writer_score()
+-> Result<(), Box<dyn std::error::Error>> {
     let project_id = ProjectId::new_v7();
     let snapshot_revision = MemoryRevision::new(7);
     let ledger = MemoryDistillationService::derive_utility_ledger(
@@ -89,7 +90,7 @@ fn utility_ledger_uses_canonical_signals_and_ignores_writer_score() {
             serialized_bytes: 1_500,
         }],
         true,
-    );
+    )?;
 
     assert_eq!(ledger.source_record_count, 1);
     assert!(ledger.complete);
@@ -100,6 +101,7 @@ fn utility_ledger_uses_canonical_signals_and_ignores_writer_score() {
     assert_eq!(entry.false_activation_count, 0);
     assert_eq!(entry.maintenance_cost_units, 2);
     assert_eq!(entry.evidence_refs, ["receipt:1"]);
+    Ok(())
 }
 
 #[test]
