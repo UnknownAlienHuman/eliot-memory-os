@@ -19,6 +19,7 @@ use eliot_ipc::{Session, TransportError};
 use eliot_ors::{
     ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey, ColdStartReadinessStageOutcome,
     ColdStartReadinessTerminalDisposition, ScanDisclosureOrsRecord, ScanDisclosureStageOutcome,
+    ScanDisclosureReadFailure,
 };
 #[cfg(windows)]
 use eliot_store_api::{
@@ -215,28 +216,13 @@ pub(crate) enum ScanDisclosureOwnerValue {
     /// This is a typed negative owner result; callers must not interpret it
     /// as readiness or as an absent optional receipt.
     ReceiptReadFailure {
-        failure: ScanReceiptReadFailure,
+        failure: ScanDisclosureReadFailure,
     },
-}
-
-/// Closed projection of the original WorkScope scan-read causes. The source
-/// `WorkScopeError` is not serde-enabled, so these wire cases preserve its
-/// existing categories without inventing a new validation scheme.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ScanReceiptReadFailure {
-    Missing,
-    Inaccessible,
-    Corrupt,
-    Replaced,
-    Stale,
-    Invalidated,
-    UnknownCommit,
 }
 
 enum ScanDisclosureOwnerActionError {
     Transport(TransportError),
-    ReceiptRead(ScanReceiptReadFailure),
+    ReceiptRead(ScanDisclosureReadFailure),
 }
 
 impl From<TransportError> for ScanDisclosureOwnerActionError {
@@ -245,8 +231,8 @@ impl From<TransportError> for ScanDisclosureOwnerActionError {
     }
 }
 
-impl From<ScanReceiptReadFailure> for ScanDisclosureOwnerActionError {
-    fn from(failure: ScanReceiptReadFailure) -> Self {
+impl From<ScanDisclosureReadFailure> for ScanDisclosureOwnerActionError {
+    fn from(failure: ScanDisclosureReadFailure) -> Self {
         Self::ReceiptRead(failure)
     }
 }
@@ -509,7 +495,7 @@ impl KernelComposition {
             .scan_receipt_handle
             .as_ref()
             .ok_or(ScanDisclosureOwnerActionError::ReceiptRead(
-                ScanReceiptReadFailure::Missing,
+                ScanDisclosureReadFailure::Missing,
             ))?;
         let discovery = inputs
             .bootstrap_discovery_inputs
@@ -590,7 +576,7 @@ impl KernelComposition {
             .scan_receipt_handle
             .as_ref()
             .ok_or(ScanDisclosureOwnerActionError::ReceiptRead(
-                ScanReceiptReadFailure::Missing,
+                ScanDisclosureReadFailure::Missing,
             ))?;
         let discovery = inputs
             .bootstrap_discovery_inputs
@@ -2035,86 +2021,86 @@ impl KernelComposition {
         expected_scan_ref: &str,
         evidence: &BootstrapScanEvidence,
         handle: &ScanReceiptHandle,
-    ) -> Result<(), ScanReceiptReadFailure> {
+    ) -> Result<(), ScanDisclosureReadFailure> {
         handle.validate().map_err(|error| match error {
             eliot_workscope::WorkScopeError::ScanReceiptMissing => {
-                ScanReceiptReadFailure::Missing
+                ScanDisclosureReadFailure::Missing
             }
             eliot_workscope::WorkScopeError::ScanReceiptInaccessible => {
-                ScanReceiptReadFailure::Inaccessible
+                ScanDisclosureReadFailure::Inaccessible
             }
             eliot_workscope::WorkScopeError::ScanReceiptCorrupt => {
-                ScanReceiptReadFailure::Corrupt
+                ScanDisclosureReadFailure::Corrupt
             }
             eliot_workscope::WorkScopeError::ScanReceiptReplaced => {
-                ScanReceiptReadFailure::Replaced
+                ScanDisclosureReadFailure::Replaced
             }
-            eliot_workscope::WorkScopeError::ScanReceiptStale => ScanReceiptReadFailure::Stale,
+            eliot_workscope::WorkScopeError::ScanReceiptStale => ScanDisclosureReadFailure::Stale,
             eliot_workscope::WorkScopeError::ScanReceiptInvalidated => {
-                ScanReceiptReadFailure::Invalidated
+                ScanDisclosureReadFailure::Invalidated
             }
             eliot_workscope::WorkScopeError::ScanReceiptUnknownCommit => {
-                ScanReceiptReadFailure::UnknownCommit
+                ScanDisclosureReadFailure::UnknownCommit
             }
-            _ => ScanReceiptReadFailure::Corrupt,
+            _ => ScanDisclosureReadFailure::Corrupt,
         })?;
         let record = match self.p07_ors.load_scan_disclosure(&binding.operation_key()) {
             Ok(Some(record)) => record,
-            Ok(None) => return Err(ScanReceiptReadFailure::Missing),
+            Ok(None) => return Err(ScanDisclosureReadFailure::Missing),
             Err(eliot_ors::OrsError::Storage(_)) => {
-                return Err(ScanReceiptReadFailure::Inaccessible);
+                return Err(ScanDisclosureReadFailure::Inaccessible);
             }
             Err(eliot_ors::OrsError::StoreContract(error)) => {
                 return Err(match *error {
                     eliot_store_api::StoreError::Unavailable => {
-                        ScanReceiptReadFailure::Inaccessible
+                        ScanDisclosureReadFailure::Inaccessible
                     }
                     eliot_store_api::StoreError::UnknownOutcome { .. }
                     | eliot_store_api::StoreError::MissingReceiptEnvelope => {
-                        ScanReceiptReadFailure::UnknownCommit
+                        ScanDisclosureReadFailure::UnknownCommit
                     }
-                    _ => ScanReceiptReadFailure::Corrupt,
+                    _ => ScanDisclosureReadFailure::Corrupt,
                 });
             }
             Err(eliot_ors::OrsError::IntegrityProblem { .. }) => {
-                return Err(ScanReceiptReadFailure::Corrupt);
+                return Err(ScanDisclosureReadFailure::Corrupt);
             }
             Err(eliot_ors::OrsError::MigrationRequired { .. }) => {
-                return Err(ScanReceiptReadFailure::Stale);
+                return Err(ScanDisclosureReadFailure::Stale);
             }
             Err(eliot_ors::OrsError::StagingCommitOutcomeUnknown { .. }) => {
-                return Err(ScanReceiptReadFailure::UnknownCommit);
+                return Err(ScanDisclosureReadFailure::UnknownCommit);
             }
-            Err(_) => return Err(ScanReceiptReadFailure::Corrupt),
+            Err(_) => return Err(ScanDisclosureReadFailure::Corrupt),
         };
         if handle.retention != eliot_workscope::ScanReceiptRetention::Active {
-            return Err(ScanReceiptReadFailure::Invalidated);
+            return Err(ScanDisclosureReadFailure::Invalidated);
         }
         record
             .validate()
-            .map_err(|_| ScanReceiptReadFailure::Corrupt)?;
+            .map_err(|_| ScanDisclosureReadFailure::Corrupt)?;
         if record.operation_key != binding.operation_key()
             || Self::validate_record_binding(current, binding, &record).is_err()
         {
-            return Err(ScanReceiptReadFailure::Replaced);
+            return Err(ScanDisclosureReadFailure::Replaced);
         }
         match record.state {
             eliot_ors::ScanDisclosureRecordState::Prepared => {
-                return Err(ScanReceiptReadFailure::UnknownCommit);
+                return Err(ScanDisclosureReadFailure::UnknownCommit);
             }
             eliot_ors::ScanDisclosureRecordState::Retired
             | eliot_ors::ScanDisclosureRecordState::Superseded => {
-                return Err(ScanReceiptReadFailure::Invalidated);
+                return Err(ScanDisclosureReadFailure::Invalidated);
             }
             eliot_ors::ScanDisclosureRecordState::Committed => {}
         }
         if record.writer_receipt.trim().is_empty() {
-            return Err(ScanReceiptReadFailure::Corrupt);
+            return Err(ScanDisclosureReadFailure::Corrupt);
         }
         let receipt: eliot_workscope::ScanDisclosureReceipt =
             serde_json::from_str(&record.receipt_bytes)
-                .map_err(|_| ScanReceiptReadFailure::Corrupt)?;
-        receipt.validate().map_err(|_| ScanReceiptReadFailure::Corrupt)?;
+                .map_err(|_| ScanDisclosureReadFailure::Corrupt)?;
+        receipt.validate().map_err(|_| ScanDisclosureReadFailure::Corrupt)?;
         let expected_commitment = format!("{}:{}", record.operation_key, record.request_hash);
         let expected_owner = format!("installation:{}:scan-disclosure", current.installation_id);
         if record.operation_key != binding.operation_key()
@@ -2134,7 +2120,7 @@ impl KernelComposition {
             || handle.writer_receipt_ref != record.writer_receipt
             || evidence.canonical_root_ref != receipt.candidate_root_ref
         {
-            return Err(ScanReceiptReadFailure::Replaced);
+            return Err(ScanDisclosureReadFailure::Replaced);
         }
         Ok(())
     }
@@ -2239,7 +2225,7 @@ impl KernelComposition {
             && inputs.scan_receipt_handle.is_none()
         {
             return Err(ScanDisclosureOwnerActionError::ReceiptRead(
-                ScanReceiptReadFailure::Missing,
+                ScanDisclosureReadFailure::Missing,
             ));
         }
         if retained_scan_fields.iter().any(|present| *present)
