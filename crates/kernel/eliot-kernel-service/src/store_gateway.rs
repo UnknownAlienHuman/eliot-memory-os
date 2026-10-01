@@ -1296,110 +1296,17 @@ impl KernelStoreGateway {
         // lock is never held across ORS work anywhere in this module.
         self.require_active_store_generation()
             .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
-        // 1927: authenticate the caller before plan admission (I5.6 step 1),
-        // mirroring `apply_reserved_admission`.
-        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
-            return Err(StoreApplyRefusal::GatewayRefusal(
-                "transition caller is not the active daemon".to_owned(),
-            ));
-        }
-        // I5.6 step 5, authority half (1927 W3): read the live Kernel authority
-        // epoch here so `admit_prepared_transition` can compare the plan's OWN
-        // recorded `state_fence.authority_epoch` against it as a typed I5.19
-        // admission decision, instead of an epoch-stale plan being admitted here
-        // and refused later as an erased string by the lease block.
-        //
-        // The lock is taken for this one read and released immediately: the
-        // service lock is still never held across ORS or store work, and the
-        // lease block below takes it again on its own.
-        //
-        // An authority that cannot be read DENIES. A poisoned lock yields no
-        // epoch at all, and unavailable authority is never equal authority:
-        // there is no arm in which a missing epoch reads as a pass. The refusal
-        // is the same typed `GatewayRefusal` the existing lease block already
-        // uses for an unreadable Kernel service lock, so an unreadable
-        // authority is refused the way this boundary has always refused one.
-        let live_authority_epoch = {
-            let service = self.service.lock().map_err(|_| {
-                StoreApplyRefusal::GatewayRefusal("Kernel service lock poisoned".to_owned())
-            })?;
-            service.authority_epoch()
-        };
-        // I5.19: `admit_prepared_transition` is the single decision point for
-        // this route. It reports the typed `not_accepted` or
-        // `resolved_existing` decision as an `Err` and returns nothing on its
-        // accepted arm, so a refused submission can never reach the store send
-        // below and no state re-check is owed here. The accepted arm carries no
-        // `staged` value: this is the I5.6 steps 1-12 boundary, and the I5.19
-        // `staged` state asserts an ORS acceptance that happens at step 13, so
-        // there is deliberately nothing here for this route to re-inspect and
-        // nothing that could be read as one. A gate that later resolves an
-        // existing receipt must refuse inside `admit_prepared_transition` (it
-        // has no existing-receipt lookup today) rather than return that
-        // decision as a success this route would then have to re-inspect.
-        admit_prepared_transition(
+        // Admission seal: caller authentication plus the I5.6/I5.19 plan
+        // decision, taken before any lease or store send. See
+        // `Self::seal_prepared_transition_admission`.
+        self.seal_prepared_transition_admission(
             context,
             &transition,
-            &live_authority_epoch,
             &expected_revision_heads,
             &expected_ordering_heads,
         )?;
 
-        let lease = {
-            let service = self.service.lock().map_err(|_| {
-                StoreApplyRefusal::GatewayRefusal("Kernel service lock poisoned".to_owned())
-            })?;
-            if service.generation_fenced() {
-                return Err(StoreApplyRefusal::GatewayRefusal(
-                    "Kernel generation is fenced".to_owned(),
-                ));
-            }
-            if self.is_fenced() {
-                return Err(StoreApplyRefusal::GatewayRefusal(
-                    "canonical-store gateway is fenced for rebind".to_owned(),
-                ));
-            }
-            // Canonical route/epoch gate (Implements #64): route currency is
-            // the exact-tuple match between the composition-bound route epoch
-            // and live authority — never a scalar `sequence.get()` coercion.
-            // Cross-lineage same-sequence routes never authorize: the route
-            // carries its own lineage. The durable active-generation gate ran
-            // above, before this lock.
-            let live_epoch = service.authority_epoch();
-            if !self.route.authority_epoch().is_same_authority(&live_epoch)
-                || self.route.active_generation() != transition.state_fence.resource_generation
-            {
-                return Err(StoreApplyRefusal::GatewayRefusal(
-                    "canonical-store route is outside the active Kernel generation".to_owned(),
-                ));
-            }
-            let lease = service
-                .acquire_admission()
-                .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
-            // Slices A+B (#65): `apply_prepared` is normal Store work
-            // (`CANONICAL_WRITE` maps to `NORMAL_WORKLOAD`). The normal lease
-            // above holds a Slice A typed normal permit from the disjoint
-            // normal partition, so this path never consumes the protected
-            // reserve. Protected cancellation / fencing / health / drain /
-            // problem / incident / recovery stays on
-            // `acquire_protected_control` / `issue_control_receipt`.
-            // Send-window epoch RE-check, deliberately retained (1927 W3).
-            // The admission gate above already refuses a plan whose recorded
-            // authority epoch is not live, but it read the live epoch BEFORE
-            // this lease was acquired; authority can advance in between. This
-            // re-read is what still covers that interval, so it was not
-            // removed or weakened when the admission-side check was added, and
-            // it keeps the same `is_same_authority` exact-tuple rule.
-            if !lease
-                .authority_epoch()
-                .is_same_authority(&transition.state_fence.authority_epoch)
-            {
-                return Err(StoreApplyRefusal::GatewayRefusal(
-                    "canonical-store route authority epoch is stale".to_owned(),
-                ));
-            }
-            lease
-        };
+        let lease = self.acquire_bounded_send_lease(&transition)?;
         if self.is_fenced() {
             return Err(StoreApplyRefusal::GatewayRefusal(
                 "canonical-store gateway is fenced for rebind".to_owned(),
@@ -1442,6 +1349,149 @@ impl KernelStoreGateway {
         .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()));
         drop(lease);
         result
+    }
+
+    /// Seals the I5.19 admission decision for one prepared transition (1927).
+    ///
+    /// One concern, in this order: authenticate the caller, read the live
+    /// Kernel authority epoch, and hand the exact plan and expected heads to
+    /// [`admit_prepared_transition`]. [`Self::apply`] calls this before it
+    /// acquires any lease and before any store send, so every refusal produced
+    /// here is a typed I5.19 decision taken at the I5.6 steps 1-12 boundary
+    /// with no Ordering Scope sequence reserved and no external effect issued.
+    ///
+    /// This is an extraction only: the same checks run in the same order, with
+    /// the same error variants, as when they were sequenced inline in `apply`.
+    fn seal_prepared_transition_admission(
+        &self,
+        context: &RequestMetadata,
+        transition: &PreparedTransition,
+        expected_revision_heads: &[RevisionHeadExpectation],
+        expected_ordering_heads: &[OrderingHeadExpectation],
+    ) -> Result<(), StoreApplyRefusal> {
+        // 1927: authenticate the caller before plan admission (I5.6 step 1),
+        // mirroring `apply_reserved_admission`.
+        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "transition caller is not the active daemon".to_owned(),
+            ));
+        }
+        // I5.6 step 5, authority half (1927 W3): read the live Kernel authority
+        // epoch here so `admit_prepared_transition` can compare the plan's OWN
+        // recorded `state_fence.authority_epoch` against it as a typed I5.19
+        // admission decision, instead of an epoch-stale plan being admitted here
+        // and refused later as an erased string by the lease block.
+        //
+        // The lock is taken for this one read and released immediately: the
+        // service lock is still never held across ORS or store work, and the
+        // lease block below takes it again on its own.
+        //
+        // An authority that cannot be read DENIES. A poisoned lock yields no
+        // epoch at all, and unavailable authority is never equal authority:
+        // there is no arm in which a missing epoch reads as a pass. The refusal
+        // is the same typed `GatewayRefusal` the existing lease block already
+        // uses for an unreadable Kernel service lock, so an unreadable
+        // authority is refused the way this boundary has always refused one.
+        let live_authority_epoch = {
+            let service = self.service.lock().map_err(|_| {
+                StoreApplyRefusal::GatewayRefusal("Kernel service lock poisoned".to_owned())
+            })?;
+            service.authority_epoch()
+        };
+        // I5.19: `admit_prepared_transition` is the single decision point for
+        // this route. It reports the typed `not_accepted` or
+        // `resolved_existing` decision as an `Err` and returns nothing on its
+        // accepted arm, so a refused submission can never reach the store send
+        // in `apply` and no state re-check is owed there. The accepted arm
+        // carries no `staged` value: this is the I5.6 steps 1-12 boundary, and
+        // the I5.19 `staged` state asserts an ORS acceptance that happens at
+        // step 13, so there is deliberately nothing here for that route to
+        // re-inspect and nothing that could be read as one. A gate that later
+        // resolves an existing receipt must refuse inside
+        // `admit_prepared_transition` (it has no existing-receipt lookup today)
+        // rather than return that decision as a success `apply` would then have
+        // to re-inspect.
+        admit_prepared_transition(
+            context,
+            transition,
+            &live_authority_epoch,
+            expected_revision_heads,
+            expected_ordering_heads,
+        )
+    }
+
+    /// Acquires the one normal admission lease for the bounded send window.
+    ///
+    /// One concern: take the Kernel service lock, refuse a fenced generation
+    /// or a fenced gateway, prove the composition-bound route is the live
+    /// authority and active generation, draw the normal admission lease, and
+    /// re-check the plan's recorded authority epoch against the LEASE's epoch.
+    /// [`Self::apply`] calls this only after the plan has been admitted, and
+    /// holds the returned lease across exactly the one commit below it.
+    ///
+    /// The service lock is short and is never held across ORS or network work.
+    /// The durable active-generation gate runs in `apply` before this is called,
+    /// never inside the lock.
+    ///
+    /// This is an extraction only: the same checks run in the same order, with
+    /// the same error variants, as when they were sequenced inline in `apply`.
+    fn acquire_bounded_send_lease(
+        &self,
+        transition: &PreparedTransition,
+    ) -> Result<crate::AdmissionLease, StoreApplyRefusal> {
+        let service = self.service.lock().map_err(|_| {
+            StoreApplyRefusal::GatewayRefusal("Kernel service lock poisoned".to_owned())
+        })?;
+        if service.generation_fenced() {
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "Kernel generation is fenced".to_owned(),
+            ));
+        }
+        if self.is_fenced() {
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
+        }
+        // Canonical route/epoch gate (Implements #64): route currency is
+        // the exact-tuple match between the composition-bound route epoch
+        // and live authority — never a scalar `sequence.get()` coercion.
+        // Cross-lineage same-sequence routes never authorize: the route
+        // carries its own lineage. The durable active-generation gate ran
+        // in `apply`, before this lock.
+        let live_epoch = service.authority_epoch();
+        if !self.route.authority_epoch().is_same_authority(&live_epoch)
+            || self.route.active_generation() != transition.state_fence.resource_generation
+        {
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "canonical-store route is outside the active Kernel generation".to_owned(),
+            ));
+        }
+        let lease = service
+            .acquire_admission()
+            .map_err(|error| StoreApplyRefusal::GatewayRefusal(error.to_string()))?;
+        // Slices A+B (#65): `apply_prepared` is normal Store work
+        // (`CANONICAL_WRITE` maps to `NORMAL_WORKLOAD`). The normal lease
+        // above holds a Slice A typed normal permit from the disjoint
+        // normal partition, so this path never consumes the protected
+        // reserve. Protected cancellation / fencing / health / drain /
+        // problem / incident / recovery stays on
+        // `acquire_protected_control` / `issue_control_receipt`.
+        // Send-window epoch RE-check, deliberately retained (1927 W3).
+        // The admission gate already refuses a plan whose recorded
+        // authority epoch is not live, but it read the live epoch BEFORE
+        // this lease was acquired; authority can advance in between. This
+        // re-read is what still covers that interval, so it was not
+        // removed or weakened when the admission-side check was added, and
+        // it keeps the same `is_same_authority` exact-tuple rule.
+        if !lease
+            .authority_epoch()
+            .is_same_authority(&transition.state_fence.authority_epoch)
+        {
+            return Err(StoreApplyRefusal::GatewayRefusal(
+                "canonical-store route authority epoch is stale".to_owned(),
+            ));
+        }
+        Ok(lease)
     }
 
     /// Lists the currently paused ordering scopes with the idempotency key
