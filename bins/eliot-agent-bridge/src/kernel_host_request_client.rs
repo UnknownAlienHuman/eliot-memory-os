@@ -3821,11 +3821,7 @@ fn invocation_frame(
         }
         CanonicalDispatchEntry::SubmitStateGated { .. } => {
             revalidate_state_dispatch(request, envelope, facts)?;
-            host_request_frame_for_envelope(
-                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                envelope,
-                facts,
-            )
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)
         }
         CanonicalDispatchEntry::SubmitCarryingBytes => {
             host_request_user_automation_frame(request, envelope, facts)
