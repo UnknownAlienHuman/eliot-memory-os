@@ -768,6 +768,12 @@ fn assert_private_view_rejected(admitted: &AdmittedContextSet, view: &ActiveUnde
             &private_view.rendered,
         )
         .expect("private rendered bytes");
+    // The scorecard's rendered half of its output binding names the exact bytes
+    // it graded, so changing the rendered payload changes that name too.
+    // `ActiveUnderstandingView::validate` (crates/smart/eliot-context-contracts/
+    // src/view.rs:465-470) re-derives the rendered digest and refuses a card
+    // that still names the pre-mutation bytes with QualityIncomplete.
+    private_view.quality.output.rendered_digest = private_view.output_digest.clone();
     private_view
         .validate()
         .expect("coherent inert private view");

@@ -279,10 +279,10 @@ fn compile_with(
     current_state_fence: Option<&StateFence>,
 ) -> Result<CampaignLearningStateView, eliot_learning_contracts::LearningContractError> {
     let mut bound_recipe = recipe.clone();
-    // The recipe is validated here, before this helper binds projection
-    // digests and reseals it. A caller that mutated a sealed recipe without
-    // resealing must still be refused with DigestMismatch rather than having
-    // its digest silently repaired by the reseal below.
+    // The incoming recipe is validated BEFORE any binding below. A caller that
+    // mutated a sealed recipe without resealing must still be refused with
+    // DigestMismatch rather than having its digest silently repaired by the
+    // reseal at the end of this helper.
     bound_recipe.validate()?;
     for requirement in &mut bound_recipe.source_requirements {
         if let Some(reference) = requirement.expected_reference.as_mut() {
@@ -299,14 +299,34 @@ fn compile_with(
                     field: "projection.slot_id",
                 },
             )?;
-        bound_recipe
+        let reference = bound_recipe
             .source_requirements
             .iter_mut()
             .find(|requirement| requirement.role == spec.source_role)
             .expect("slot source role is declared")
             .expected_reference
             .as_mut()
-            .expect("slot source has an exact reference")
+            .expect("slot source has an exact reference");
+        // Bind at most one entry per slot identity. A caller may deliberately
+        // hand this helper the same declared slot twice, and the COMPILER is
+        // what must refuse that (`compile_slots` inserts into a per-slot map and
+        // reports Duplicate on a second delivery). `CampaignSourceRevisionRef::
+        // validate` separately requires one `slot_projection_digests` entry per
+        // slot identity (crates/smart/eliot-learning-contracts/src/state_view.rs:
+        // 347-352), so binding both deliveries here would publish a recipe that
+        // is already self-inconsistent: the recipe is written back to the caller
+        // and reused, and every LATER compile() in the same test would then fail
+        // its own recipe validation with Duplicate and never reach the assertion
+        // it was written for. The compiler still sees the raw duplicate in
+        // `projections` and still names the refusal.
+        if reference
+            .slot_projection_digests
+            .iter()
+            .any(|entry| entry.slot_id == projection.slot_id)
+        {
+            continue;
+        }
+        reference
             .slot_projection_digests
             .push(CampaignSlotProjectionDigest {
                 slot_id: projection.slot_id.clone(),
