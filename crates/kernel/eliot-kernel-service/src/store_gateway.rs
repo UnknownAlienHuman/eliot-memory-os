@@ -56,8 +56,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eliot_contracts::{
-    ArtifactId, HostCorrelationDomain, HostCorrelationProjection, OperationId, RequestMetadata,
-    ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
+    ArtifactId, EpochId, HostCorrelationDomain, HostCorrelationProjection, OperationId,
+    RequestMetadata, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
 use eliot_ipc::NamedPipeTransport;
 use eliot_kernel_core::GenerationRoute;
@@ -1303,6 +1303,28 @@ impl KernelStoreGateway {
                 "transition caller is not the active daemon".to_owned(),
             ));
         }
+        // I5.6 step 5, authority half (1927 W3): read the live Kernel authority
+        // epoch here so `admit_prepared_transition` can compare the plan's OWN
+        // recorded `state_fence.authority_epoch` against it as a typed I5.19
+        // admission decision, instead of an epoch-stale plan being admitted here
+        // and refused later as an erased string by the lease block.
+        //
+        // The lock is taken for this one read and released immediately: the
+        // service lock is still never held across ORS or store work, and the
+        // lease block below takes it again on its own.
+        //
+        // An authority that cannot be read DENIES. A poisoned lock yields no
+        // epoch at all, and unavailable authority is never equal authority:
+        // there is no arm in which a missing epoch reads as a pass. The refusal
+        // is the same typed `GatewayRefusal` the existing lease block already
+        // uses for an unreadable Kernel service lock, so an unreadable
+        // authority is refused the way this boundary has always refused one.
+        let live_authority_epoch = {
+            let service = self.service.lock().map_err(|_| {
+                StoreApplyRefusal::GatewayRefusal("Kernel service lock poisoned".to_owned())
+            })?;
+            service.authority_epoch()
+        };
         // I5.19: `admit_prepared_transition` is the single decision point for
         // this route. It reports the typed `not_accepted` or
         // `resolved_existing` decision as an `Err` and returns nothing on its
@@ -1318,6 +1340,7 @@ impl KernelStoreGateway {
         admit_prepared_transition(
             context,
             &transition,
+            &live_authority_epoch,
             &expected_revision_heads,
             &expected_ordering_heads,
         )?;
@@ -1360,6 +1383,13 @@ impl KernelStoreGateway {
             // reserve. Protected cancellation / fencing / health / drain /
             // problem / incident / recovery stays on
             // `acquire_protected_control` / `issue_control_receipt`.
+            // Send-window epoch RE-check, deliberately retained (1927 W3).
+            // The admission gate above already refuses a plan whose recorded
+            // authority epoch is not live, but it read the live epoch BEFORE
+            // this lease was acquired; authority can advance in between. This
+            // re-read is what still covers that interval, so it was not
+            // removed or weakened when the admission-side check was added, and
+            // it keeps the same `is_same_authority` exact-tuple rule.
             if !lease
                 .authority_epoch()
                 .is_same_authority(&transition.state_fence.authority_epoch)
@@ -9679,10 +9709,14 @@ fn refuse_determinate_reserved_write(
 /// Deterministic `PreparedTransition` admission before store execution (1927).
 ///
 /// Guards the unreserved `apply` entry point: identity/shape validation, fence equality, canonical
-/// request-hash recompute over the exact executable bytes, and operation
+/// request-hash recompute over the exact executable bytes, the recorded-authority-epoch check
+/// against the live Kernel authority epoch, and operation
 /// manifest support against the currently admitted catalogue. A plan whose
 /// contents, effect ceiling, named operation parameters, or admission digest
 /// changed after staging fails the hash recompute rather than executing. A
+/// plan whose recorded `required_authority_and_epoch` is not the live Kernel
+/// authority is refused HERE, as a typed I5.19 decision before any store send,
+/// rather than being admitted and refused afterwards by the send-lease gate. A
 /// plan whose recorded manifest is not in the current catalogue fails as
 /// visible recovery work: it is refused with an explicit unsupported error
 /// and is never reinterpreted, widened, or translated under new code. A
@@ -9702,7 +9736,11 @@ fn refuse_determinate_reserved_write(
 /// invented authority this gate must not create. When that catalogue lands,
 /// this is where the comparison belongs.
 ///
-/// The gate ORDER is load-bearing and unchanged: every gate below runs before
+/// The gate ORDER is load-bearing, and the epoch check was INSERTED without
+/// reordering anything around it: the four pre-existing gates keep their
+/// relative order and each keeps reporting its own cause, and the new check
+/// sits between the canonical request-hash recompute and the manifest
+/// catalogue. Every gate below runs before
 /// any store send, and this is the *unreserved* admission point, so a refusal
 /// here has reserved no Ordering Scope sequence and issued no external effect.
 /// That is what lets the refusal be a typed I5.19 `not_accepted`
@@ -9710,6 +9748,13 @@ fn refuse_determinate_reserved_write(
 /// I5.6 steps 1-12 boundary, strictly before I5.6 step 13 stages anything in
 /// ORS. The reserved-write path is a different owner with a different act and
 /// deliberately does not come through here.
+///
+/// This gate does not REPLACE the send-lease epoch re-check in
+/// [`KernelStoreGateway::apply`]. That check is a later re-read at the bounded
+/// send window, so it still covers an authority that advances between this
+/// admission and the send. The two are complementary: this one produces the
+/// typed admission decision for a plan that was already stale, the other
+/// catches a plan that became stale in the interval.
 ///
 /// The only decisions converted into the `Err` arm HERE are the two refusals,
 /// which is why the decision point is this function and not
@@ -9730,6 +9775,7 @@ fn refuse_determinate_reserved_write(
 fn admit_prepared_transition(
     context: &RequestMetadata,
     transition: &PreparedTransition,
+    live_authority_epoch: &EpochId,
     expected_revision_heads: &[RevisionHeadExpectation],
     expected_ordering_heads: &[OrderingHeadExpectation],
 ) -> Result<(), StoreApplyRefusal> {
@@ -9751,6 +9797,56 @@ fn admit_prepared_transition(
             expected_ordering_heads,
         );
         verify_canonical_request_hash(&view, &transition.identity.canonical_request_hash)?;
+        // I5.6 step 5, authority half (1927 W3) — the epoch check. It runs
+        // AFTER the hash recompute above so the plan's recorded bytes are proven
+        // authentic before any recorded field is compared against live
+        // authority, and it is the LAST check before the manifest catalogue, so
+        // the four pre-existing checks keep both their relative order and their
+        // own causes. Inserting it can only ever ADD a refusal: no plan that
+        // passed this gate before is admitted by it, and every plan it refuses
+        // was already refused further down.
+        //
+        // The value compared is the plan's OWN recorded
+        // `state_fence.authority_epoch`, read as staged. It is never recomputed
+        // from the plan and compared against itself, which would be true for
+        // every plan and would admit every epoch-stale plan.
+        //
+        // `is_same_authority` is the codebase's EXISTING exact-tuple rule
+        // (`EpochId`: `lineage_id` AND `sequence` both equal), the same one the
+        // route gate, the reservation-owner bind, the send-lease gate and the
+        // route read in this module already use for exactly this purpose. It is
+        // not a second epoch-equality rule and not a raw integer comparison: an
+        // epoch lineage REPLACEMENT carries a different `lineage_id`, so it
+        // reads as a different authority and never as its predecessor, and an
+        // equal sequence from an unrelated lineage is unrelated rather than
+        // equal. A plan recorded under a superseded authority can therefore
+        // never be admitted under its replacement.
+        //
+        // A stale epoch is a REFUSAL and nothing else: no clamp to the live
+        // epoch, no partial or downgraded admit, no retry. The plan was staged
+        // under an authority that no longer exists, so no field of it is
+        // reinterpretable under this one, and rewriting the recorded fence
+        // would be exactly the translation of an old plan under new authority
+        // that the acceptance criteria forbid.
+        //
+        // `FenceMismatch` is the existing typed variant that carries this
+        // meaning: the recorded authority is a component of `StateFence`, and a
+        // plan whose fence names an authority other than the live one is a fence
+        // mismatch. It is not a new speculative variant, and it maps to the
+        // dedicated I5.19 `FenceMismatch` reason code rather than the
+        // `InvalidRequest` code a malformed-caller-input variant would produce
+        // — which is the correct advice here, because this plan was not
+        // malformed, it was staged under a superseded authority. It is
+        // deliberately not `ManifestMismatch`, so the reserved path's
+        // unsupported-plan retention in `refuse_determinate_reserved_write`
+        // keeps its existing trigger and is not widened to fencing refusals.
+        if !transition
+            .state_fence
+            .authority_epoch
+            .is_same_authority(live_authority_epoch)
+        {
+            return Err(StoreError::FenceMismatch);
+        }
         let entries = generated_operation_manifests()?;
         transition.validate_against_catalogue(&entries)
     })();
@@ -10234,23 +10330,29 @@ mod tests {
             &CanonicalRequestView::from_apply(&context, &transition, &[], &[]),
         )
         .unwrap_or_else(|_| unreachable!());
-        admit_prepared_transition(&context, &transition, &[], &[])
+        // The live Kernel authority epoch this plan is admitted against is the
+        // same `epoch` the recorded fence above was built from: every case in
+        // this test asserts a DIFFERENT gate, so each one must reach that gate
+        // and refuse there for its own reason. Passing the matching epoch keeps
+        // the four refusals attributed to the check each one is about rather
+        // than to the new epoch check shadowing them.
+        admit_prepared_transition(&context, &transition, &epoch, &[], &[])
             .unwrap_or_else(|_| unreachable!());
 
         let mut widened = transition.clone();
         widened.requested_effect_ceiling = EffectClass::ReversibleMutation;
-        assert!(admit_prepared_transition(&context, &widened, &[], &[]).is_err());
+        assert!(admit_prepared_transition(&context, &widened, &epoch, &[], &[]).is_err());
 
         let mut reparam = transition.clone();
         reparam.named_operations[0].parameters.insert(
             "subject".to_owned(),
             serde_json::json!("observation-substituted"),
         );
-        assert!(admit_prepared_transition(&context, &reparam, &[], &[]).is_err());
+        assert!(admit_prepared_transition(&context, &reparam, &epoch, &[], &[]).is_err());
 
         let mut redigest = transition.clone();
         redigest.admission_contract_set_digest = "d".repeat(64);
-        assert!(admit_prepared_transition(&context, &redigest, &[], &[]).is_err());
+        assert!(admit_prepared_transition(&context, &redigest, &epoch, &[], &[]).is_err());
 
         let mut unsupported = transition.clone();
         unsupported.operation_manifest_digest =
@@ -10259,7 +10361,7 @@ mod tests {
             &CanonicalRequestView::from_apply(&context, &unsupported, &[], &[]),
         )
         .unwrap_or_else(|_| unreachable!());
-        let error = match admit_prepared_transition(&context, &unsupported, &[], &[]) {
+        let error = match admit_prepared_transition(&context, &unsupported, &epoch, &[], &[]) {
             Err(error) => error,
             Ok(_) => unreachable!("unsupported manifest must fail"),
         };
