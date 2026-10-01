@@ -324,7 +324,17 @@ impl EbpStoreTransport for FakeTransport {
         if frame.kind == FrameKind::Control {
             let hello = ServerHello {
                 selected_protocol: ProtocolVersion::CURRENT,
-                session_principal_binding: "fake-store-session".to_owned(),
+                // The production validator `store_client.rs::decode_server_hello`
+                // requires the exact `sid=<peer SID>;session=<session ID>` tuple
+                // projected from the requirement the client admits with, so the
+                // responder projects that same tuple rather than a retyped
+                // literal (issue #4652). Real named-pipe authentication and every
+                // other handshake guard are unchanged.
+                session_principal_binding: format!(
+                    "sid={};session={}",
+                    self.requirement.expected_peer_sid.as_str(),
+                    self.requirement.expected_peer_session_id
+                ),
                 allowed_capabilities: eliot_store_api::CAPABILITIES
                     .iter()
                     .map(|value| (*value).to_owned())

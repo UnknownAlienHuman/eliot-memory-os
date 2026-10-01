@@ -10766,7 +10766,17 @@ mod named_read_gateway_tests {
             if frame.kind == FrameKind::Control {
                 let hello = ServerHello {
                     selected_protocol: ProtocolVersion::CURRENT,
-                    session_principal_binding: "loopback-store-session".to_owned(),
+                    // The production validator `store_client.rs::decode_server_hello`
+                    // requires the exact `sid=<peer SID>;session=<session ID>` tuple
+                    // projected from the requirement the client admits with, so the
+                    // loopback peer answers with that same tuple rather than a
+                    // retyped literal (issue #4652). No other handshake guard is
+                    // changed.
+                    session_principal_binding: format!(
+                        "sid={};session={}",
+                        self.requirement.expected_peer_sid.as_str(),
+                        self.requirement.expected_peer_session_id
+                    ),
                     allowed_capabilities: CAPABILITIES
                         .iter()
                         .map(|value| (*value).to_owned())
