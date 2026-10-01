@@ -1595,6 +1595,10 @@ fn append_problem_owner_lease_statement(
         json!(eliot_store_api::sha256_hex(&payload)),
     );
     owner_record.insert("record_digest".to_owned(), json!(decoded.record_digest));
+    owner_record.insert(
+        "owner_lease_grant".to_owned(),
+        decoded.owner_lease_grant.clone(),
+    );
     owner_record.insert("lease_id".to_owned(), json!(lease_id));
     owner_record.insert("lease_commitment".to_owned(), json!(lease_commitment));
     owner_record.insert("ownership_epoch".to_owned(), json!(ownership_epoch));
@@ -1625,6 +1629,10 @@ fn append_problem_owner_lease_statement(
     bindings.insert(
         "problem_owner_expected_record_digest".to_owned(),
         json!(decoded.expected_current_record_digest),
+    );
+    bindings.insert(
+        "problem_owner_expected_lease_grant".to_owned(),
+        decoded.owner_lease_grant.clone(),
     );
     let current_lease = decoded
         .expected_current_lease_identity
