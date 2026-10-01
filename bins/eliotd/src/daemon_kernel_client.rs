@@ -38,6 +38,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use eliot_agent_coordinator::OwnerLoadedClaimRow;
+use eliot_blob_api::wire::{
+    BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+    BlobProcessStreamOwnerFactsPullRequest, BlobProcessStreamOwnerFactsPullResponse,
+};
 #[cfg(windows)]
 use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
@@ -3237,6 +3241,10 @@ pub(super) const TESTD_OWNER_BIND_DISPATCH_OPERATION: &str =
 pub(super) const TESTD_OWNER_PENDING_TERMINALS_OPERATION: &str =
     "eliot.kernel.testd-owner-pending-terminals";
 pub(super) const TESTD_OWNER_ACK_TERMINAL_OPERATION: &str = "eliot.kernel.testd-owner-ack-terminal";
+pub(super) const TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION: &str =
+    "testd_blob_owner_facts_pending";
+pub(super) const TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION: &str =
+    "testd_blob_owner_facts_complete";
 pub(super) const TESTD_OWNER_WIRE_VERSION: u16 = 1;
 /// Bound for one owner poll. Matches the Kernel owner limit exactly; a wider
 /// poll is refused before any transport is touched.
@@ -3315,6 +3323,34 @@ pub(super) struct TestdOwnerAckTerminalResponse {
     pub receipt: WriteReceipt,
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct TestdBlobOwnerFactsPendingRequest {
+    wire_id: String,
+    wire_revision: u16,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct TestdBlobOwnerFactsCompleteRequest {
+    wire_id: String,
+    wire_revision: u16,
+    response: BlobProcessStreamOwnerFactsPullResponse,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestdBlobOwnerFactsPendingResponse {
+    request: Option<BlobProcessStreamOwnerFactsPullRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestdBlobOwnerFactsCompleteResponse {
+    pull_ref: String,
+    response_sha256: String,
+}
+
 fn testd_owner_limit(limit: u16) -> Result<u16, KernelPortError> {
     if limit == 0 || limit > 64 {
         return Err(KernelPortError::Contract(
@@ -3390,6 +3426,71 @@ fn testd_owner_ack_request_digest(
 }
 
 impl DaemonKernelClient {
+    /// Polls one exact Kernel-owned durable blob owner-facts pull through this
+    /// already authenticated daemon session. The Kernel owns correlation and
+    /// durability; this client only decodes the typed request.
+    pub async fn next_testd_blob_owner_facts_request_async(
+        &self,
+    ) -> Result<Option<BlobProcessStreamOwnerFactsPullRequest>, KernelPortError> {
+        let request = TestdBlobOwnerFactsPendingRequest {
+            wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
+            wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+        };
+        let value = self
+            .transact_async(
+                TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_blob_owner_facts_pending")?;
+        let response: TestdBlobOwnerFactsPendingResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if let Some(pull) = &response.request {
+            pull.validate()
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        }
+        Ok(response.request)
+    }
+
+    /// Completes the Kernel-owned pull with the daemon's exact typed owner
+    /// response. Kernel revalidates durable correlation and fence before
+    /// recording completion.
+    pub async fn complete_testd_blob_owner_facts_request_async(
+        &self,
+        pull: &BlobProcessStreamOwnerFactsPullRequest,
+        response: BlobProcessStreamOwnerFactsPullResponse,
+    ) -> Result<(), KernelPortError> {
+        response
+            .validate_for_request(pull)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        let response_sha256 = sha256_hex(
+            &canonical_json_bytes(&response)
+                .map_err(|error| KernelPortError::Contract(error.to_string()))?,
+        );
+        let request = TestdBlobOwnerFactsCompleteRequest {
+            wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
+            wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+            response,
+        };
+        let value = self
+            .transact_async(
+                TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION,
+                serde_json::json!({ "request": request }),
+            )
+            .await
+            .map_err(kernel_port_error)?;
+        let value = super::kind_value(&value, "testd_blob_owner_facts_complete")?;
+        let ack: TestdBlobOwnerFactsCompleteResponse = serde_json::from_value(value)
+            .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+        if ack.pull_ref != pull.pull_ref || ack.response_sha256 != response_sha256 {
+            return Err(KernelPortError::Contract(
+                "Kernel owner-facts completion does not bind the exact pull and response".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Polls the Kernel-owned pending verifier dispatches. The response
     /// carries the full durable job plus the exact admitted frame identity;
     /// the daemon computes the canonical plan binding from its Governor

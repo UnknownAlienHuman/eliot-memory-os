@@ -1237,6 +1237,12 @@ impl BlobProcessStreamSourceBinding {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamReadbackRequest {
+    /// Exact Store-retained sink session identity from the admitted Open.
+    pub session_id: String,
+    /// Exact Store-retained terminal identity from the admitted Open.
+    pub terminal_id: String,
+    /// Digest of the original admitted Open request.
+    pub open_request_sha256: String,
     /// Owner-issued process binding and policy used when the source was staged.
     pub process_source_binding: BlobProcessStreamSourceBinding,
     /// BLAKE3 identity parsed from the exact Blob locator.
@@ -1253,8 +1259,10 @@ pub struct BlobProcessStreamReadbackRequest {
 
 impl BlobProcessStreamReadbackRequest {
     pub fn validate(&self) -> Result<(), BlobError> {
+        valid_text(&self.session_id, "session_id")?;
+        valid_text(&self.terminal_id, "terminal_id")?;
+        canonical_sha256(&self.open_request_sha256, "open_request_sha256")?;
         self.process_source_binding.validate()?;
-        self.expected_content_hash.validate()?;
         canonical_sha256(&self.expected_plaintext_sha256, "expected_plaintext_sha256")?;
         valid_text(&self.ready_receipt_id, "ready_receipt_id")?;
         if self.expected_plaintext_length > BLOB_MAX_PLAINTEXT_BYTES
@@ -1379,7 +1387,6 @@ impl BlobStageRecoveryRequest {
         }
         self.policy.validate_for_residency(&self.residency)?;
         self.process_source_binding.validate()?;
-        self.expected_content_hash.validate()?;
         canonical_sha256(&self.expected_plaintext_sha256, "expected_plaintext_sha256")?;
         if self.expected_plaintext_length > BLOB_MAX_PLAINTEXT_BYTES {
             return Err(BlobError::InvalidField {
@@ -3896,6 +3903,24 @@ pub trait BlobStoreClient: Send + Sync {
             ))
         })
     }
+    /// Reads an exact previously committed process source under fresh current
+    /// read authority. The Blob owner recovers the original full locator,
+    /// metadata digest, and ready receipt from its durable intent; callers
+    /// provide only the independently authenticated current context and root
+    /// lease, never a synthetic locator or regenerated original operation.
+    fn read_process_stream_source_authorized_context(
+        &self,
+        _request: BlobProcessStreamReadbackRequest,
+        _current_context: BlobReceiptContext,
+        _current_root_lease: BlobRootLease,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose authorized process-source lookup by current context"
+                    .to_owned(),
+            ))
+        })
+    }
     /// Submits bytes only after the same owner has durably reserved and
     /// reconciled the exact process finalization identity.
     fn stage_with_recovery(
@@ -3954,6 +3979,19 @@ where
         current_read: BlobReadRequest,
     ) -> BlobFuture<'_, BlobReadChunk> {
         (**self).read_process_stream_source_authorized(request, current_read)
+    }
+
+    fn read_process_stream_source_authorized_context(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        (**self).read_process_stream_source_authorized_context(
+            request,
+            current_context,
+            current_root_lease,
+        )
     }
 
     fn stage_with_recovery(
