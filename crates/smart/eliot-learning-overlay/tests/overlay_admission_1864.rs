@@ -786,7 +786,9 @@ fn unnamed_parent_task_revision_refused_at_local_admission() {
         }
     }
     parentless.recipe_digest = recipe.canonical_digest.clone();
-    parentless.seal_content_addressed().expect("parentless view reseal");
+    parentless
+        .seal_content_addressed()
+        .expect("parentless view reseal");
     assert!(parentless.binding.state_fence.task_revision.is_none());
 
     // The candidate follows the view: same parentless binding, same base view
@@ -796,7 +798,9 @@ fn unnamed_parent_task_revision_refused_at_local_admission() {
     let mut parentless_candidate = candidate.clone();
     parentless_candidate.binding = parentless.binding.clone();
     parentless_candidate.base_view_digest = parentless.canonical_digest.clone();
-    parentless_candidate.seal().expect("parentless candidate reseal");
+    parentless_candidate
+        .seal()
+        .expect("parentless candidate reseal");
 
     assert!(matches!(
         admit_local(&parentless_candidate, &parentless, &deltas, 1_000),
