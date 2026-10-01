@@ -104,6 +104,7 @@ use eliot_store_api::{
     StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
     admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
     generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
+    verify_ordering_scope_binding,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1571,8 +1572,13 @@ impl KernelStoreGateway {
                 // Deterministic refusal: the Store owner proves no effect, so
                 // the still-`Eligible` token releases cleanly and nothing
                 // orphans.
-                let refusal =
-                    refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
+                let refusal = refuse_determinate_reserved_write(
+                    &owner,
+                    &sealed.token,
+                    &error,
+                    &operation_id,
+                    &transition,
+                );
                 drop(lease);
                 Err(refusal)
             }
@@ -9631,15 +9637,29 @@ fn validate_route(
 /// unsupported behavior from a backend without reserved capability, never a
 /// reason to fall back to unreserved `Apply`.
 ///
-/// A `ManifestMismatch` is the one determinate refusal I05-06 treats as a
+/// A `ManifestMismatch` is one of the two refusals I05-06 treats as a
 /// PRESERVED plan rather than a discarded one: the plan's recorded operation
 /// manifest is outside current admissible support, so this build refuses to
-/// execute it and must not reinterpret it under newer code. The reserved order
-/// is still released, but the staged plan is first recorded as a visible
-/// durable Recovery Problem keyed by its own operation identity, so it enters
-/// visible recovery instead of vanishing with the release. Recording precedes
-/// the release because the retention reads the staged operation's own epoch,
-/// fence, recovery owner and reservation identity.
+/// execute it and must not reinterpret it under newer code.
+///
+/// The second is a plan whose RECORDED protocol revision this build does not
+/// implement. That case is decided here BY CONTENT against the recorded value,
+/// not by reading the refusal text: `transition.contract_version` is compared
+/// with this build's own live `eliot_store_api::CONTRACT_VERSION`, so the plan
+/// is preserved exactly when its recorded revision is one this build cannot
+/// admit, whichever typed refusal the send happened to surface first. Deciding
+/// it from the recorded value rather than from the error is what keeps the
+/// refusal from depending on which check happened to run first: a plan staged
+/// under an older store-api revision fails `PreparedTransition::validate` at the
+/// very first statement, BEFORE the manifest comparison ever runs, so a
+/// manifest-only trigger would release the reservation and drop a plan that
+/// this build can never execute and that I05-06 requires to stay staged.
+///
+/// The reserved order is still released, but the staged plan is first recorded
+/// as a visible durable Recovery Problem keyed by its own operation identity,
+/// so it enters visible recovery instead of vanishing with the release.
+/// Recording precedes the release because the retention reads the staged
+/// operation's own epoch, fence, recovery owner and reservation identity.
 ///
 /// A failure to record never discards the refusal itself: the original cause is
 /// reported and the retention failure is appended, so the caller still learns
@@ -9650,19 +9670,29 @@ fn refuse_determinate_reserved_write(
     token: &WriterReservationToken,
     error: &StoreError,
     operation_id: &str,
+    transition: &PreparedTransition,
 ) -> String {
-    if matches!(error, StoreError::ManifestMismatch) {
-        let retained = retain_unsupported_prepared_plan(
-            owner,
-            token,
-            "prepared transition outside current operation-manifest support",
-        );
+    // Read the plan's OWN RECORDED revision, not a value re-derived from it and
+    // not the refusal's rendered text: this is the receiving build deciding by
+    // content whether it supports the protocol the plan was recorded under.
+    let recorded_protocol_unsupported =
+        transition.contract_version != eliot_store_api::CONTRACT_VERSION;
+    let manifest_unsupported = matches!(error, StoreError::ManifestMismatch);
+    if recorded_protocol_unsupported || manifest_unsupported {
+        let detail = if recorded_protocol_unsupported && manifest_unsupported {
+            "prepared transition records a protocol revision and an operation manifest outside \
+             current Kernel support"
+        } else if recorded_protocol_unsupported {
+            "prepared transition records a protocol revision outside current Kernel support"
+        } else {
+            "prepared transition outside current operation-manifest support"
+        };
+        let retained = retain_unsupported_prepared_plan(owner, token, detail);
         if let Err(retained) = retained {
             let _ = cancel_before_send(owner, token);
             return format!(
-                "reserved write refused for operation {operation_id}: the staged prepared \
-                 transition is outside current operation-manifest support and could not be \
-                 retained as visible recovery work ({retained}); cause: {error}"
+                "reserved write refused for operation {operation_id}: the staged {detail} could \
+                 not be retained as visible recovery work ({retained}); cause: {error}"
             );
         }
     }
@@ -9678,14 +9708,20 @@ fn refuse_determinate_reserved_write(
 
 /// Deterministic `PreparedTransition` admission before store execution (1927).
 ///
-/// Guards the unreserved `apply` entry point: identity/shape validation, fence equality, canonical
-/// request-hash recompute over the exact executable bytes, and operation
-/// manifest support against the currently admitted catalogue. A plan whose
+/// Guards the unreserved `apply` entry point: identity/shape validation, fence
+/// equality, the Ordering-Scope binding, canonical request-hash recompute over
+/// the exact executable bytes, and operation manifest support against the
+/// currently admitted catalogue. A plan whose
 /// contents, effect ceiling, named operation parameters, or admission digest
-/// changed after staging fails the hash recompute rather than executing. A
-/// plan whose recorded manifest is not in the current catalogue fails as
-/// visible recovery work: it is refused with an explicit unsupported error
-/// and is never reinterpreted, widened, or translated under new code. A
+/// changed after staging fails the hash recompute rather than executing; a plan
+/// whose declared Ordering Scope set was changed fails the scope binding. A
+/// plan whose recorded manifest is not in the current catalogue is refused here
+/// with an explicit typed unsupported error and is never reinterpreted,
+/// widened, or translated under new code. This route stages nothing of its own,
+/// so nothing enters visible recovery HERE: the refusal is returned to the
+/// caller as a typed admission decision, and the staged-plan retention that
+/// keeps such a plan visible belongs to the reserved-write path
+/// (`refuse_determinate_reserved_write`). A
 /// staged transition therefore survives daemon replacement only when the
 /// replacement Kernel explicitly supports its recorded protocol revision and
 /// operation manifest. The protocol half is decided by CONTENT against this
@@ -9701,6 +9737,58 @@ fn refuse_determinate_reserved_write(
 /// (`ImplementationSupport = TARGET`). Inventing one here would be exactly the
 /// invented authority this gate must not create. When that catalogue lands,
 /// this is where the comparison belongs.
+///
+/// # The checks, one clause each
+///
+/// I05-06 requires the Kernel to verify "identity, authority, fence, ordering,
+/// plan hash, admission/operation-manifest digests, `transition_class`, effect
+/// ceiling, required proof/approval handles, allowed named operations and
+/// compatibility before staging". Each of those is named here, so no clause is
+/// claimed by a check that does not perform it:
+///
+/// * **identity** — [`PreparedTransition::validate`] runs
+///   `OperationIdentity::validate`, and the canonical request-hash recompute
+///   below hashes `operation_id` and `idempotency_key` against the RECORDED
+///   `identity.canonical_request_hash`.
+/// * **authority / epoch** — NOT decided here. `PreparedTransition::validate`
+///   validates the fence shape, and the fence equality below compares the
+///   plan's `state_fence` to the caller's, which carries the epoch, but whether
+///   the recorded epoch is the LIVE Kernel authority epoch is decided after this
+///   gate by [`KernelStoreGateway::apply`], which compares the route and lease
+///   epochs to `transition.state_fence.authority_epoch`. That refusal is a
+///   `GatewayRefusal`, not a typed admission decision, so an epoch-stale plan is
+///   admitted here and refused there. This is recorded rather than claimed.
+/// * **fence** — the equality above, typed `FenceMismatch`, over the whole
+///   `StateFence` (epoch, generation, task, policy and integration revisions).
+/// * **ordering** — `verify_ordering_scope_binding` below, newly enforced on
+///   this route at this decision point (issue #1927 W3). See the comment at the
+///   call: `ordering_scopes` is outside the canonical request hash, so this is
+///   the only gate here that can see a post-staging scope-set edit.
+/// * **plan hash / admission digest / contract-set digest (hash-bound)** —
+///   `PreparedTransition::validate` recomputes `mutation_plan_digest` and
+///   `admission_digest` from the carried content against their RECORDED values;
+///   `admission_contract_set_digest` is validated as a digest and is covered by
+///   the canonical request hash, but has no live counterpart to compare to (see
+///   above).
+/// * **recorded protocol revision** — `PreparedTransition::validate` calls
+///   `validate_recovery_contract_version` as its FIRST statement, which compares
+///   the plan's RECORDED `contract_version` BY CONTENT against this build's own
+///   live `eliot_store_api::CONTRACT_VERSION` and refuses any other value before
+///   any plan content is interpreted. This is a comparison against a value this
+///   build defines, never a digest recomputed from the plan and compared with
+///   itself.
+/// * **class, effect ceiling, proof/approval handles, allowed named operations,
+///   compatibility** — `PreparedTransition::validate` rejects a ceiling above
+///   the class maximum, an erasure plan without approval handles, an erasure
+///   plan that bundles commands, and any command whose own transition class
+///   differs from the plan's; `validate_against_catalogue` then rejects a class
+///   or ceiling the current manifest does not admit, a command with no mutation
+///   entry in the current catalogue, and any parameter set outside the entry's
+///   approved shape.
+/// * **manifest** — `validate_against_catalogue` against the generated
+///   manifests read HERE, so the recorded `operation_manifest_digest` is bound
+///   by content to this build's own table and a plan outside it is refused with
+///   the typed `ManifestMismatch` rather than executed under new code.
 ///
 /// The gate ORDER is load-bearing and unchanged: every gate below runs before
 /// any store send, and this is the *unreserved* admission point, so a refusal
@@ -9739,6 +9827,31 @@ fn admit_prepared_transition(
         if transition.state_fence != context.state_fence {
             return Err(StoreError::FenceMismatch);
         }
+        // I5.6 `ordering_scopes` (issue #1927 W3): the plan DECLARES its
+        // Ordering Scopes and the request carries the Ordering Heads those
+        // scopes are compare-and-swapped against. `ordering_scopes` is
+        // deliberately NOT a member of `CanonicalRequestView`
+        // (`crates/storage/eliot-store-api/src/request_hash.rs:148`), so a
+        // post-staging edit of the declared scope set leaves the canonical
+        // request hash — and therefore the identity, the class, the effect
+        // ceiling and every other field below — byte-identical, and the
+        // recompute immediately below cannot see it. This is the only gate on
+        // this route that compares the two, so it runs here, at the admission
+        // DECISION, rather than leaving it to the downstream send path
+        // (`crates/kernel/eliot-kernel-service/src/store_client.rs:632`), which
+        // runs only after this gate has already reported the plan admitted.
+        //
+        // The comparison is between the plan's own RECORDED scope set and the
+        // heads presented with it: neither is recomputed from the other and
+        // neither is derived here, so this cannot be a value compared with
+        // itself. The refusal is the typed `TransitionDigestMismatch` that
+        // `verify_ordering_scope_binding` already builds, whose two digests are
+        // over the two distinct scope sets, so this check is named separately
+        // from the canonical-request-hash check below rather than folded into
+        // it. A leg that presents no ordering head at all (empty
+        // `expected_ordering_heads`) has nothing to contradict and is
+        // unchecked here, exactly as that function already documents.
+        verify_ordering_scope_binding(transition, expected_ordering_heads)?;
         // RECHECK-63 slice B: recompute the canonical request hash from the
         // exact values about to be executed (context + transition + expected
         // heads) and reject divergence before any store work. The view is
