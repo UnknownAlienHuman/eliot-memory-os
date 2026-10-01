@@ -533,7 +533,6 @@ pub struct StartupCoordinator {
     /// process-local clock value is omitted from serialized status: a restored
     /// coordinator has no matching monotonic clock origin and must not regain
     /// supervision authority from a cached observation.
-    #[serde(skip)]
     current_supervision_deadline: Option<Instant>,
     /// The observation the current one superseded or contradicted. It is kept
     /// as the immediately superseded fact and never gates anything.
@@ -1097,8 +1096,7 @@ impl StartupCoordinator {
         }
         if Instant::now() >= local_deadline {
             return Err(
-                "the original Watchdog heartbeat window expired before Kernel admission"
-                    .to_owned(),
+                "the original Watchdog heartbeat window expired before Kernel admission".to_owned(),
             );
         }
         crate::verify_scm_watchdog_observation_shape(&incarnation).map_err(str::to_owned)?;
