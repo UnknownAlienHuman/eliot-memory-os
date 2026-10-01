@@ -372,8 +372,7 @@ impl MemoryStore {
         // operation dispatcher mutates in-memory state. Genesis-compatible
         // transitions have no named operation to index and need no such
         // authority record.
-        let receipt_authority =
-            memory_receipt_authority(&transition, plan.commit_sequence)?;
+        let receipt_authority = memory_receipt_authority(&transition, plan.commit_sequence)?;
         // Issue #1780: admitted notification-state legs execute here, before
         // the receipt is built, so the receipt's outbox references include
         // the appended notification outbox intents. State, receipt, and
@@ -1008,7 +1007,6 @@ fn dispatch_apply_reactive_state(
     if transition.transition_class != TransitionClass::ReactiveState {
         return Err(StoreError::TransitionClassExceeded);
     }
-    let operation_key = transition.identity.operation_id.to_string();
     let mut reactive_index = 0_usize;
     for command in &transition.named_operations {
         let decoded = match command.operation {
@@ -1082,25 +1080,7 @@ fn dispatch_apply_reactive_state(
                     .map_err(|error| StoreError::Serialization(error.to_string()))?
             }
         };
-        let payload_digest = sha256_hex(
-            &canonical_json_bytes(&row_json)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?,
-        );
-        let sequence = plan.next_outbox_sequence;
-        plan.next_outbox_sequence =
-            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
-        let outbox = OutboxIntent {
-            outbox_id: OutboxId::new(format!("outbox-{operation_key}-reactive-{reactive_index}"))?,
-            operation_id: transition.identity.operation_id.clone(),
-            sequence,
-            payload_digest,
-            state_fence: transition.state_fence.clone(),
-            arrival_fence: format!("arrival-{operation_key}"),
-            claim_fence: None,
-            state: OutboxState::Arrived,
-        };
-        outbox.validate()?;
-        plan.outbox_records.push(outbox);
+        append_state_outbox(transition, plan, "reactive", reactive_index, &row_json)?;
         reactive_index = reactive_index.saturating_add(1);
     }
     Ok(())
@@ -1195,6 +1175,38 @@ fn dispatch_apply_instrument_registry_state(
 /// contain `\x1f` per the wire contract.
 fn automation_revision_key(automation_id: &str, revision: &str) -> String {
     format!("{automation_id}\x1f{revision}")
+}
+
+fn append_state_outbox(
+    transition: &PreparedTransition,
+    plan: &mut TransactionPlan,
+    operation_kind: &str,
+    operation_index: usize,
+    row_json: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let operation_key = transition.identity.operation_id.to_string();
+    let payload_digest = sha256_hex(
+        &canonical_json_bytes(row_json)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?,
+    );
+    let sequence = plan.next_outbox_sequence;
+    plan.next_outbox_sequence =
+        checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
+    let outbox = OutboxIntent {
+        outbox_id: OutboxId::new(format!(
+            "outbox-{operation_key}-{operation_kind}-{operation_index}"
+        ))?,
+        operation_id: transition.identity.operation_id.clone(),
+        sequence,
+        payload_digest,
+        state_fence: transition.state_fence.clone(),
+        arrival_fence: format!("arrival-{operation_key}"),
+        claim_fence: None,
+        state: OutboxState::Arrived,
+    };
+    outbox.validate()?;
+    plan.outbox_records.push(outbox);
+    Ok(())
 }
 
 /// Executes admitted automation legs on already-locked state
@@ -1680,7 +1692,6 @@ fn dispatch_apply_experience_state(
     if transition.transition_class != TransitionClass::CaptureCandidate {
         return Err(StoreError::TransitionClassExceeded);
     }
-    let operation_key = transition.identity.operation_id.to_string();
     let mut experience_index = 0_usize;
     for command in &transition.named_operations {
         let decoded = match command.operation {
@@ -1752,27 +1763,7 @@ fn dispatch_apply_experience_state(
                 }
             }
         }
-        let payload_digest = sha256_hex(
-            &canonical_json_bytes(&row_json)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?,
-        );
-        let sequence = plan.next_outbox_sequence;
-        plan.next_outbox_sequence =
-            checked_increment(sequence, "outbox.sequence", "sequence overflow")?;
-        let outbox = OutboxIntent {
-            outbox_id: OutboxId::new(format!(
-                "outbox-{operation_key}-experience-{experience_index}"
-            ))?,
-            operation_id: transition.identity.operation_id.clone(),
-            sequence,
-            payload_digest,
-            state_fence: transition.state_fence.clone(),
-            arrival_fence: format!("arrival-{operation_key}"),
-            claim_fence: None,
-            state: OutboxState::Arrived,
-        };
-        outbox.validate()?;
-        plan.outbox_records.push(outbox);
+        append_state_outbox(transition, plan, "experience", experience_index, &row_json)?;
         experience_index = experience_index.saturating_add(1);
     }
     Ok(())

@@ -548,7 +548,10 @@ impl StoreRecoveryRequest {
             return Err(StoreError::PayloadTooLarge);
         }
         for operation_id in &self.receipt_authority_operation_ids {
-            validate_text(operation_id.as_str(), "recovery.receipt_authority.operation_id")?;
+            validate_text(
+                operation_id.as_str(),
+                "recovery.receipt_authority.operation_id",
+            )?;
         }
         unique(
             self.receipt_authority_operation_ids.iter().cloned(),

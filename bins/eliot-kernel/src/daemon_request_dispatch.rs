@@ -4175,7 +4175,7 @@ impl KernelComposition {
                 // owns the single designated terminal for this operation.
                 observe_daemon_request("kernel.daemon_cancel_requested", "attempt");
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
-                if self.finish_receipt_before_cancellation(&envelope).await? {
+                if Box::pin(self.finish_receipt_before_cancellation(&envelope)).await? {
                     // The canonical receipt is immutable and the retained
                     // attempt is already durable in ORS. Applying the
                     // existing cancellation transition therefore preserves

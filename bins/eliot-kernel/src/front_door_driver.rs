@@ -866,10 +866,7 @@ async fn serve_admitted_bridge_host_requests(
                 }
             }
             KernelFrameAction::FinishReplay(replay) => {
-                let reply = match kernel
-                    .finish_replay_reply(&connection_id, *replay)
-                    .await
-                {
+                let reply = match kernel.finish_replay_reply(&connection_id, *replay).await {
                     Ok(reply) => reply,
                     Err(error) => {
                         kernel.revoke_agent_bridge(&connection_id);

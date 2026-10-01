@@ -99,8 +99,8 @@ impl KernelComposition {
         envelope: &HostRequestEnvelope,
         operation_id: &str,
     ) -> Result<Option<(WriteReceipt, serde_json::Value)>, TransportError> {
-        let operation = OperationId::new(operation_id.to_owned())
-            .map_err(|_| TransportError::SessionFenced)?;
+        let operation =
+            OperationId::new(operation_id.to_owned()).map_err(|_| TransportError::SessionFenced)?;
         let observed = gateway
             .receipt(&envelope.state_fence, operation.clone())
             .await
@@ -216,11 +216,7 @@ impl KernelComposition {
                     &envelope,
                     &owner_after,
                 ) && finish_response_matches_committed_decision(
-                    response,
-                    &envelope,
-                    &tool,
-                    &receipt,
-                    &decision,
+                    response, &envelope, &tool, &receipt, &decision,
                 ) => {}
             None if finish_refusal_response_matches(response, &operation_id, &envelope) => {}
             _ => return Err(TransportError::IdentityConflict),
@@ -996,12 +992,7 @@ impl KernelComposition {
                     return Err(TransportError::IdentityConflict);
                 }
                 if !self.bind_claimed_finish_attempt(
-                    candidate,
-                    &operation,
-                    &stored,
-                    session,
-                    now,
-                    &envelope,
+                    candidate, &operation, &stored, session, now, &envelope,
                 )? {
                     continue;
                 }
@@ -1027,13 +1018,17 @@ impl KernelComposition {
             // not mint a new effect capability; submit still requires receipt.
             if !matches!(
                 stored.state,
-                HostRequestState::Routed | HostRequestState::Unknown | HostRequestState::Reconciling
+                HostRequestState::Routed
+                    | HostRequestState::Unknown
+                    | HostRequestState::Reconciling
             ) {
                 return Ok(false);
             }
-            let Some(prior) = stored.attempt.as_ref().filter(|attempt| {
-                attempt.phase == eliot_ors::HostRequestAttemptPhase::Claimed
-            }) else {
+            let Some(prior) = stored
+                .attempt
+                .as_ref()
+                .filter(|attempt| attempt.phase == eliot_ors::HostRequestAttemptPhase::Claimed)
+            else {
                 return Ok(false);
             };
             candidate.finish_attempt = LocalReadAttemptState {
@@ -1053,7 +1048,8 @@ impl KernelComposition {
             stored,
             &queue_attempt,
             session,
-        )? else {
+        )?
+        else {
             return Ok(false);
         };
         candidate.finish_attempt = LocalReadAttemptState {
@@ -1221,11 +1217,7 @@ impl KernelComposition {
         let (envelope, _, _) = self.finish_queued_pair(body)?;
         let gateway = self.retained_store_gateway()?;
         let historical = self
-            .read_finish_decision_authority(
-                &gateway,
-                &envelope,
-                &body.operation_id,
-            )
+            .read_finish_decision_authority(&gateway, &envelope, &body.operation_id)
             .await?;
         self.submit_finish_result(session, body, historical.as_ref())
     }
@@ -1515,11 +1507,7 @@ impl KernelComposition {
         }
         let gateway = self.retained_store_gateway()?;
         let historical = self
-            .read_finish_decision_authority(
-                &gateway,
-                &envelope_before,
-                parent_operation.as_str(),
-            )
+            .read_finish_decision_authority(&gateway, &envelope_before, parent_operation.as_str())
             .await?;
 
         let parent_after = self
@@ -1561,7 +1549,8 @@ impl KernelComposition {
             &parent_operation,
             &envelope_after,
             &owner,
-        ) || !finish_decision_matches_owner(&decision, &envelope_after, &owner) {
+        ) || !finish_decision_matches_owner(&decision, &envelope_after, &owner)
+        {
             return Err(TransportError::IdentityConflict);
         }
         Ok(true)
@@ -1684,7 +1673,8 @@ fn validate_finish_reconnect_request(
         && !owner.principal_id.trim().is_empty()
         && reconnect_envelope.identity.session_id.as_deref() == Some(owner.session_id.as_str())
         && reconnect_envelope.identity.task_id.as_deref() == Some(owner.task_id.as_str())
-        && reconnect_envelope.identity.work_scope_id.as_deref() == Some(owner.work_scope_id.as_str())
+        && reconnect_envelope.identity.work_scope_id.as_deref()
+            == Some(owner.work_scope_id.as_str())
         && HostRequestAdmissionReceipt::issue(original)
             .map_err(|_| TransportError::SessionFenced)?
             == *admission_receipt;
@@ -1764,15 +1754,17 @@ fn finish_authority_from_snapshot(
                 .get("receipt_json")
                 .and_then(serde_json::Value::as_str)
                 .ok_or(TransportError::IdentityConflict)?;
-            let retained_decisions: serde_json::Value = serde_json::from_str(raw)
-                .map_err(|_| TransportError::IdentityConflict)?;
+            let retained_decisions: serde_json::Value =
+                serde_json::from_str(raw).map_err(|_| TransportError::IdentityConflict)?;
             let retained_decisions = retained_decisions
                 .as_array()
                 .ok_or(TransportError::IdentityConflict)?;
             let current_attempt = retained_decisions
                 .iter()
                 .filter(|decision| {
-                    decision.get("attempt_id").and_then(serde_json::Value::as_str)
+                    decision
+                        .get("attempt_id")
+                        .and_then(serde_json::Value::as_str)
                         == Some(envelope.identity.idempotency_key.as_str())
                 })
                 .collect::<Vec<_>>();
@@ -1784,7 +1776,9 @@ fn finish_authority_from_snapshot(
                 .get("task_revision")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|revision| revision.parse::<u64>().ok())
-                != decision.get("task_revision").and_then(serde_json::Value::as_u64)
+                != decision
+                    .get("task_revision")
+                    .and_then(serde_json::Value::as_u64)
                 || !finish_decision_projection_shape(decision)
             {
                 return Err(TransportError::IdentityConflict);
@@ -1914,11 +1908,9 @@ fn finish_result_matches_committed_authority(
                     decision,
                 )
         }
-        None => finish_refusal_response_matches(
-            &body.response,
-            &body.attempt.operation_id,
-            envelope,
-        ),
+        None => {
+            finish_refusal_response_matches(&body.response, &body.attempt.operation_id, envelope)
+        }
     }
 }
 
@@ -1938,7 +1930,9 @@ fn finish_response_matches_committed_decision(
         .and_then(serde_json::Value::as_u64);
     let requested_outcome = arguments.get("requested_outcome");
     let decision_task_id = decision.get("task_id").and_then(serde_json::Value::as_str);
-    let decision_revision = decision.get("task_revision").and_then(serde_json::Value::as_u64);
+    let decision_revision = decision
+        .get("task_revision")
+        .and_then(serde_json::Value::as_u64);
     let decision_fence = decision.get("state_fence");
     let decision_outcome = decision.get("requested_outcome");
     let Ok(expected_fence) = serde_json::to_value(&envelope.state_fence) else {
@@ -1948,7 +1942,9 @@ fn finish_response_matches_committed_decision(
         || task_id.is_none()
         || task_revision.is_none()
         || requested_outcome.is_none()
-        || decision.get("attempt_id").and_then(serde_json::Value::as_str)
+        || decision
+            .get("attempt_id")
+            .and_then(serde_json::Value::as_str)
             != Some(envelope.identity.idempotency_key.as_str())
         || decision_task_id != task_id
         || decision_revision != task_revision
@@ -1996,15 +1992,17 @@ fn finish_response_matches_committed_decision(
 
 fn finish_result_digest_matches(response: &serde_json::Value, digest: &str) -> bool {
     eliot_contracts::canonical_json_bytes(response)
-        .map(|bytes| eliot_contracts::sha256_hex(&bytes) == digest)
-        .unwrap_or(false)
+        .is_ok_and(|bytes| eliot_contracts::sha256_hex(&bytes) == digest)
 }
 
 fn finish_decision_projection_shape(decision: &serde_json::Value) -> bool {
     let Some(receipt) = decision.as_object() else {
         return false;
     };
-    let Some(derived) = receipt.get("decision").and_then(serde_json::Value::as_object) else {
+    let Some(derived) = receipt
+        .get("decision")
+        .and_then(serde_json::Value::as_object)
+    else {
         return false;
     };
     let Some(proof) = derived.get("proof").and_then(serde_json::Value::as_object) else {
@@ -2013,32 +2011,32 @@ fn finish_decision_projection_shape(decision: &serde_json::Value) -> bool {
     exact_projection_fields(
         receipt,
         &[
-        "decision_id",
-        "attempt_id",
-        "task_id",
-        "task_revision",
-        "state_fence",
-        "finish_authority_ref",
-        "closure_authority_ref",
-        "requested_outcome",
-        "decision",
-        "lifecycle_action",
-        "unresolved_descendant_refs",
-        "attempt_digest",
-        "receipt_digest",
+            "decision_id",
+            "attempt_id",
+            "task_id",
+            "task_revision",
+            "state_fence",
+            "finish_authority_ref",
+            "closure_authority_ref",
+            "requested_outcome",
+            "decision",
+            "lifecycle_action",
+            "unresolved_descendant_refs",
+            "attempt_digest",
+            "receipt_digest",
         ],
     ) && exact_projection_fields(derived, &["outcome", "proof", "next_allowed_action"])
         && exact_projection_fields(
             proof,
             &[
-        "task_id",
-        "task_revision",
-        "per_acceptance_coverage",
-        "artifact_and_verifier_bindings",
-        "checks_not_executed_or_stale",
-        "unresolved_effects_and_unknowns",
-        "proof_ceiling",
-        "derivation_digest",
+                "task_id",
+                "task_revision",
+                "per_acceptance_coverage",
+                "artifact_and_verifier_bindings",
+                "checks_not_executed_or_stale",
+                "unresolved_effects_and_unknowns",
+                "proof_ceiling",
+                "derivation_digest",
             ],
         )
         && finish_receipt_fields_valid(receipt)
@@ -2055,22 +2053,28 @@ fn exact_projection_fields(
 
 fn finish_receipt_fields_valid(receipt: &serde_json::Map<String, serde_json::Value>) -> bool {
     [
-            "decision_id",
-            "attempt_id",
-            "task_id",
-            "finish_authority_ref",
-            "lifecycle_action",
-            "attempt_digest",
-            "receipt_digest",
-        ]
-        .iter()
-        .all(|key| receipt.get(*key).is_some_and(serde_json::Value::is_string))
+        "decision_id",
+        "attempt_id",
+        "task_id",
+        "finish_authority_ref",
+        "lifecycle_action",
+        "attempt_digest",
+        "receipt_digest",
+    ]
+    .iter()
+    .all(|key| receipt.get(*key).is_some_and(serde_json::Value::is_string))
         && receipt
             .get("task_revision")
             .is_some_and(serde_json::Value::is_u64)
-        && receipt.get("state_fence").is_some_and(serde_json::Value::is_object)
-        && receipt.get("requested_outcome").is_some_and(serde_json::Value::is_string)
-        && receipt.get("decision").is_some_and(serde_json::Value::is_object)
+        && receipt
+            .get("state_fence")
+            .is_some_and(serde_json::Value::is_object)
+        && receipt
+            .get("requested_outcome")
+            .is_some_and(serde_json::Value::is_string)
+        && receipt
+            .get("decision")
+            .is_some_and(serde_json::Value::is_object)
         && receipt
             .get("unresolved_descendant_refs")
             .and_then(serde_json::Value::as_array)
@@ -2081,7 +2085,9 @@ fn finish_receipt_fields_valid(receipt: &serde_json::Map<String, serde_json::Val
 }
 
 fn finish_derived_fields_valid(derived: &serde_json::Map<String, serde_json::Value>) -> bool {
-    derived.get("outcome").is_some_and(serde_json::Value::is_string)
+    derived
+        .get("outcome")
+        .is_some_and(serde_json::Value::is_string)
         && derived
             .get("next_allowed_action")
             .is_some_and(serde_json::Value::is_string)
@@ -2089,8 +2095,8 @@ fn finish_derived_fields_valid(derived: &serde_json::Map<String, serde_json::Val
 
 fn finish_proof_fields_valid(proof: &serde_json::Map<String, serde_json::Value>) -> bool {
     ["task_id", "derivation_digest"]
-            .iter()
-            .all(|key| proof.get(*key).is_some_and(serde_json::Value::is_string))
+        .iter()
+        .all(|key| proof.get(*key).is_some_and(serde_json::Value::is_string))
         && proof
             .get("task_revision")
             .is_some_and(serde_json::Value::is_u64)
@@ -2123,11 +2129,15 @@ fn finish_decision_matches_owner(
     let Ok(expected_fence) = serde_json::to_value(&envelope.state_fence) else {
         return false;
     };
-    decision.get("attempt_id").and_then(serde_json::Value::as_str)
+    decision
+        .get("attempt_id")
+        .and_then(serde_json::Value::as_str)
         == Some(envelope.identity.idempotency_key.as_str())
         && decision.get("task_id").and_then(serde_json::Value::as_str)
             == Some(owner.task_id.as_str())
-        && decision.get("task_revision").and_then(serde_json::Value::as_u64)
+        && decision
+            .get("task_revision")
+            .and_then(serde_json::Value::as_u64)
             == Some(owner.task_revision.value())
         && decision.get("state_fence") == Some(&expected_fence)
         && decision
@@ -2157,7 +2167,10 @@ fn finish_refusal_response_matches(
     .map(|bytes| eliot_contracts::sha256_hex(&bytes)) else {
         return false;
     };
-    let Some(content) = response.get("content").and_then(serde_json::Value::as_object) else {
+    let Some(content) = response
+        .get("content")
+        .and_then(serde_json::Value::as_object)
+    else {
         return false;
     };
     response.get("request_id") == Some(&serde_json::json!(envelope.identity.request_id))
@@ -2168,14 +2181,27 @@ fn finish_refusal_response_matches(
         && response.get("canonical_tool_name") == Some(&serde_json::json!("eliot.finish"))
         && response.get("artifacts") == Some(&serde_json::json!([]))
         && response.get("proof_ceiling") == Some(&serde_json::json!("OBSERVATION"))
-        && response.get("resource").is_some_and(serde_json::Value::is_null)
+        && response
+            .get("resource")
+            .is_some_and(serde_json::Value::is_null)
         && response.get("job").is_some_and(serde_json::Value::is_null)
-        && response.as_object().is_some_and(|object| object.len() == 10)
+        && response
+            .as_object()
+            .is_some_and(|object| object.len() == 10)
         && content.len() == 4
         && content.get("status") == Some(&serde_json::json!("rejected"))
-        && content.get("reason").and_then(serde_json::Value::as_str).is_some()
-        && content.get("disposition").and_then(serde_json::Value::as_str).is_some()
-        && content.get("reason_code").and_then(serde_json::Value::as_str).is_some()
+        && content
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && content
+            .get("disposition")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && content
+            .get("reason_code")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
         && operation_id == host_request_operation_id(envelope)
 }
 

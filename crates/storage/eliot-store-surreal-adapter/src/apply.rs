@@ -109,7 +109,8 @@ use receipt_reconciliation::{
     read_receipt_by_operation,
 };
 use recovery::{
-    RecoverySnapshotInput, build_recovery_bindings, build_recovery_snapshot, build_recovery_sql,
+    RecoveryReceiptAuthorityRow, RecoverySnapshotInput, build_recovery_bindings,
+    build_recovery_snapshot, build_recovery_sql, decode_recovery_receipt_authorities,
 };
 #[cfg(test)]
 use schema_contract::SchemaMigrationIdentity;
@@ -1977,15 +1978,6 @@ fn validate_transition(
 }
 
 /// Reads one bounded recovery snapshot from one coherent provider transaction.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryReceiptAuthorityRow {
-    body: WriteReceipt,
-    commit_sequence: u64,
-    named_operation_count: usize,
-    payload_authority: Option<Vec<read_boundary::AuthorityRecordRow>>,
-}
-
 pub(crate) async fn recovery(
     adapter: &SurrealStoreAdapter,
     request: StoreRecoveryRequest,
@@ -2049,28 +2041,7 @@ pub(crate) async fn recovery(
     } else {
         let rows = response.take::<Vec<RecoveryReceiptAuthorityRow>>(index)?;
         index += 1;
-        let mut authorities = Vec::with_capacity(rows.len());
-        for row in rows {
-            if !request
-                .receipt_authority_operation_ids
-                .contains(&row.body.operation_id)
-            {
-                return Err(AdapterError::Store(StoreError::IdentityConflict));
-            }
-            let records = row.payload_authority.ok_or_else(|| {
-                AdapterError::Store(StoreError::InvalidReceipt)
-            })?;
-            authorities.push(
-                read_boundary::recovery_receipt_authority(
-                    &row.body,
-                    row.commit_sequence,
-                    row.named_operation_count,
-                    records,
-                )
-                .map_err(AdapterError::Store)?,
-            );
-        }
-        authorities
+        decode_recovery_receipt_authorities(rows, &request.receipt_authority_operation_ids)?
     };
     let revision_heads = response.take::<Vec<RevisionHead>>(index)?;
     index += 1;

@@ -666,26 +666,26 @@ impl KernelComposition {
         self.admit_host_request_envelope_under_transition(envelope)
     }
 
-fn is_completed_finish_replay(
-    expired: bool,
-    envelope: &HostRequestEnvelope,
-    existing: Option<&HostRequestRecord>,
-    requested: &HostRequestRecord,
-) -> bool {
-    expired
-        && envelope.kind == HostRequestKind::Invocation
-        && envelope.identity.capability == "eliot.finish"
-        && existing.is_some_and(|record| {
-            matches!(
-                record.state,
-                HostRequestState::ResultReceived | HostRequestState::Terminal
-            ) && record.result_digest.is_some()
-                && record.result_response.is_some()
-                && record.same_binding(requested)
-        })
-}
+    fn is_completed_finish_replay(
+        expired: bool,
+        envelope: &HostRequestEnvelope,
+        existing: Option<&HostRequestRecord>,
+        requested: &HostRequestRecord,
+    ) -> bool {
+        expired
+            && envelope.kind == HostRequestKind::Invocation
+            && envelope.identity.capability == "eliot.finish"
+            && existing.is_some_and(|record| {
+                matches!(
+                    record.state,
+                    HostRequestState::ResultReceived | HostRequestState::Terminal
+                ) && record.result_digest.is_some()
+                    && record.result_response.is_some()
+                    && record.same_binding(requested)
+            })
+    }
 
-fn validate_host_request_admission(
+    fn validate_host_request_admission(
         envelope: &HostRequestEnvelope,
     ) -> Result<(), TransportError> {
         envelope
@@ -1702,13 +1702,13 @@ fn validate_host_request_admission(
             self.audit_observe(AuditEventDraft::capability_probe(envelope));
             if let Some(lane) = routed_lane {
                 self.audit_observe(AuditEventDraft::route_invoke_read_routed(
-                    envelope, &receipt, lane,
+                    envelope, receipt, lane,
                 ));
                 self.audit_observe(AuditEventDraft::capability_lane_discovered(
-                    envelope, &receipt, lane,
+                    envelope, receipt, lane,
                 ));
                 self.audit_observe(AuditEventDraft::capability_admission(
-                    envelope, &receipt, lane,
+                    envelope, receipt, lane,
                 ));
             } else if let Some(reason) = mismatch_reason {
                 // Issue #1839: durable audit evidence for the rejected
@@ -6693,14 +6693,14 @@ impl KernelComposition {
                 }
                 return Ok(KernelFrameAction::FinishReplay(Box::new(
                     crate::FinishReplayAction {
-                    request_id,
-                    protocol_version,
-                    envelope: envelope.clone(),
-                    tool,
-                    admission_receipt,
-                    record,
-                    reconnect_envelope: None,
-                    logical_key: None,
+                        request_id,
+                        protocol_version,
+                        envelope: envelope.clone(),
+                        tool,
+                        admission_receipt,
+                        record,
+                        reconnect_envelope: None,
+                        logical_key: None,
                     },
                 )));
             }
@@ -6775,14 +6775,14 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         Ok(Some(KernelFrameAction::FinishReplay(Box::new(
             crate::FinishReplayAction {
-            request_id,
-            protocol_version,
-            envelope: retained.envelope,
-            tool: retained.tool,
-            admission_receipt,
-            record,
-            reconnect_envelope: Some(reconnect_envelope.clone()),
-            logical_key,
+                request_id,
+                protocol_version,
+                envelope: retained.envelope,
+                tool: retained.tool,
+                admission_receipt,
+                record,
+                reconnect_envelope: Some(reconnect_envelope.clone()),
+                logical_key,
             },
         ))))
     }

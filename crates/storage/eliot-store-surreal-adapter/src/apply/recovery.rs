@@ -12,9 +12,9 @@ use crate::plan;
 use crate::plan::validate_revision_heads;
 use crate::schema;
 use eliot_store_api::{
-    CONTRACT_VERSION, OrderingHead, RecoveryRecord, RecoveryRecordKey, RevisionHead, ScopeId,
-    ScopeRevisionView, StateFence, StoreError, StoreRecoveryRequest, StoreRecoverySnapshot,
-    WriteReceipt,
+    CONTRACT_VERSION, OperationId, OrderingHead, RecoveryRecord, RecoveryRecordKey, RevisionHead,
+    ScopeId, ScopeRevisionView, StateFence, StoreError, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt,
 };
 
 use super::schema_contract::{
@@ -30,6 +30,40 @@ pub(super) struct RecoverySnapshotInput {
     pub(super) receipt_authorities: Vec<eliot_store_api::RecoveryReceiptAuthority>,
     pub(super) revision_heads: Vec<RevisionHead>,
     pub(super) ordering_heads: Vec<OrderingHead>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RecoveryReceiptAuthorityRow {
+    body: WriteReceipt,
+    commit_sequence: u64,
+    named_operation_count: usize,
+    payload_authority: Option<Vec<super::read_boundary::AuthorityRecordRow>>,
+}
+
+pub(super) fn decode_recovery_receipt_authorities(
+    rows: Vec<RecoveryReceiptAuthorityRow>,
+    requested_operation_ids: &[OperationId],
+) -> Result<Vec<eliot_store_api::RecoveryReceiptAuthority>, AdapterError> {
+    let mut authorities = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !requested_operation_ids.contains(&row.body.operation_id) {
+            return Err(AdapterError::Store(StoreError::IdentityConflict));
+        }
+        let records = row
+            .payload_authority
+            .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+        authorities.push(
+            super::read_boundary::recovery_receipt_authority(
+                &row.body,
+                row.commit_sequence,
+                row.named_operation_count,
+                records,
+            )
+            .map_err(AdapterError::Store)?,
+        );
+    }
+    Ok(authorities)
 }
 
 pub(super) fn build_recovery_sql(request: &StoreRecoveryRequest) -> String {
@@ -68,11 +102,13 @@ pub(super) fn build_recovery_bindings(request: &StoreRecoveryRequest) -> Map<Str
     if !request.receipt_authority_operation_ids.is_empty() {
         bindings.insert(
             "recovery_authority_operation_ids".to_owned(),
-            json!(request
-                .receipt_authority_operation_ids
-                .iter()
-                .map(eliot_store_api::OperationId::as_str)
-                .collect::<Vec<_>>()),
+            json!(
+                request
+                    .receipt_authority_operation_ids
+                    .iter()
+                    .map(eliot_store_api::OperationId::as_str)
+                    .collect::<Vec<_>>()
+            ),
         );
     }
     bindings
