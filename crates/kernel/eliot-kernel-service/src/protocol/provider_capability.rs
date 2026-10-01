@@ -33,13 +33,19 @@
 //! owner digest by value (`native_worker_claim.rs`) and the T9-03 replay
 //! transport carries its authority by value (`native_worker_replay.rs`).
 //!
-//! Residual: ORS carries no `executable_binding_digest` column on the claim
-//! row (no write migration in this slice), so the executable digest is
-//! presented per call and compared for equality against the durable binding
-//! material loaded from Kernel/ORS — never trusted by value — mirroring the
-//! T9-02 presented-expectation pattern (`revoked` stays false until a
-//! Governor revocation feed exists; withdrawal is observed only as
-//! digest/revision disagreement).
+//! Residual: the durable claim row retains the owner-verified
+//! `executable_binding_digest` since #4554, so the executable digest is
+//! presented per call and compared for equality against the retained row —
+//! never trusted by value — mirroring the T9-02 presented-expectation
+//! pattern (`revoked` stays false until a Governor revocation feed exists;
+//! withdrawal is observed only as digest/revision disagreement). The row
+//! now also carries the per-receipt-kind canonical-payload column
+//! (`NativeWorkerClaimReceiptPayloads`, issue #1108 A5), compared by content
+//! by [`verify_provider_capability`]; recording payloads into the row as
+//! receipts are produced (store advance plus daemon producers) is the named
+//! follow-up, until which unrecorded kinds pass that leg with the
+//! coordinator per-kind replay checks and daemon durable envelopes as the
+//! content-equality backstop.
 
 use eliot_contracts::EpochId;
 use schemars::JsonSchema;
@@ -254,7 +260,8 @@ pub enum ProviderCapabilityError {
     /// generation needs a new admission, never a local repair.
     #[error("stale claiming-worker generation")]
     StaleGeneration,
-    /// Presented binding or executable digest disagrees with durable material.
+    /// Presented binding, executable, or canonical-payload digest disagrees
+    /// with durable material.
     #[error("binding digest mismatch")]
     DigestMismatch,
     /// Current records show the binding withdrawn or superseded.
@@ -279,11 +286,21 @@ pub enum ProviderCapabilityError {
 /// presented-expectation pattern. The presented binding and executable
 /// digests are compared for equality against the loaded durable material —
 /// recomputed at claim admission via the claim binding digest, never trusted
-/// by value here. Epoch agreement always goes through `is_same_authority`,
-/// never through a raw sequence comparison. A stale binding — foreign
-/// attempt/operation, advanced epoch, changed route/capacity revision,
-/// changed digest, or withdrawn authority — is refused; it needs a new
-/// admission, never a local repair.
+/// by value here. The presented canonical-payload digest is compared for
+/// equality against the loaded owner-retained per-kind payload digest for
+/// `request.proof_kind` (selected by the caller from the loaded row's
+/// per-receipt payload column, never the presented value echoed back): a
+/// retained digest that disagrees with the presented payload fails closed,
+/// so a changed payload under one identity conflicts. A row that retains no
+/// payload for the kind yet (staged before the column, or the kind not yet
+/// recorded) carries no owner evidence on this leg, so the leg passes and
+/// enforcement engages per kind as the recorder lands; rowlessness itself
+/// still fails closed before this function runs (`UnknownClaim` at the
+/// route, `StaleProviderBinding` at the coordinator gate). Epoch agreement
+/// always goes through `is_same_authority`, never through a raw sequence
+/// comparison. A stale binding — foreign attempt/operation, advanced epoch,
+/// changed route/capacity revision, changed digest, or withdrawn
+/// authority — is refused; it needs a new admission, never a local repair.
 ///
 /// # Errors
 ///
@@ -292,10 +309,11 @@ pub enum ProviderCapabilityError {
 /// revocation, exact attempt match, exact operation match, epoch currency
 /// (expectation epoch versus the live `live_epoch` parameter), route
 /// revision, capacity revision, binding/executable digest equality,
-/// worker-generation equality, then fence-digest equality.
+/// worker-generation equality, fence-digest equality, then canonical-payload
+/// content equality against the retained per-kind evidence.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the owner check is one flat tuple: presented request, current expectation, six loaded durable row fields, and the live epoch; grouping them would invent a second contract beside the wire request"
+    reason = "the owner check is one flat tuple: presented request, current expectation, seven loaded durable row fields, and the live epoch; grouping them would invent a second contract beside the wire request"
 )]
 pub fn verify_provider_capability(
     request: &ProviderCapabilityRequest,
@@ -306,6 +324,7 @@ pub fn verify_provider_capability(
     loaded_claim_executable_digest: &str,
     loaded_claim_worker_generation: u64,
     loaded_claim_fence_digest: &str,
+    loaded_canonical_payload_sha256: &str,
     live_epoch: &EpochId,
 ) -> Result<(), ProviderCapabilityError> {
     request.validate()?;
@@ -362,6 +381,23 @@ pub fn verify_provider_capability(
     if request.fence_digest != loaded_claim_fence_digest {
         return Err(ProviderCapabilityError::DigestMismatch);
     }
+    // Canonical-payload content equality against the owner-retained per-kind
+    // evidence: the presented digest (already shape-checked as digest form
+    // above, and computed by the caller over the ORIGINAL receipt bytes,
+    // never recomputed here) must equal the retained digest for this proof
+    // kind. A retained digest that disagrees fails closed as a changed
+    // payload under one identity. No retained payload yet (pre-column row
+    // or kind not yet recorded) carries no owner evidence, so this leg
+    // passes and enforcement engages per kind as the recorder lands; a
+    // malformed retained value is incoherent and never verifies.
+    if !loaded_canonical_payload_sha256.is_empty() {
+        if !is_lowercase_sha256(loaded_canonical_payload_sha256) {
+            return Err(ProviderCapabilityError::MalformedRequest);
+        }
+        if request.canonical_payload_sha256 != loaded_canonical_payload_sha256 {
+            return Err(ProviderCapabilityError::DigestMismatch);
+        }
+    }
     Ok(())
 }
 
@@ -391,6 +427,7 @@ mod provider_capability_tests {
         executable_digest: String,
         worker_generation: u64,
         fence_digest: String,
+        payload_digest: String,
         live_epoch: EpochId,
     }
 
@@ -422,6 +459,7 @@ mod provider_capability_tests {
             executable_digest: "e".repeat(64),
             worker_generation: 1,
             fence_digest: "f".repeat(64),
+            payload_digest: "c".repeat(64),
             live_epoch: test_epoch(1),
         }
     }
@@ -436,6 +474,7 @@ mod provider_capability_tests {
             fixture.executable_digest.as_str(),
             fixture.worker_generation,
             fixture.fence_digest.as_str(),
+            fixture.payload_digest.as_str(),
             &fixture.live_epoch,
         )
     }
