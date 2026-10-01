@@ -143,7 +143,10 @@ pub(crate) fn readiness_failure_kind(error: &HostError) -> ReadinessFailureKind 
         // rejected, so this stays a rejected probe.
         | HostError::OriginCollisionUnproven(_)
         | HostError::StoreEndpointOwnerUnreadable(_)
-        | HostError::OwnerLeaseRecovery(_) => ReadinessFailureKind::ProbeRejected,
+        | HostError::OwnerLeaseRecovery(_)
+        | HostError::KernelSupervisionRevocationSuperseded(_) => {
+            ReadinessFailureKind::ProbeRejected
+        }
     }
 }
 
