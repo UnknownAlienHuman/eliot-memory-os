@@ -1,7 +1,7 @@
 //! Governor-owned disclosure decisions for exact Agent Bridge host-event bytes.
 //!
-//! The owner snapshot is assembled only from the live WorkScope and Policy
-//! owners plus an admitted attach receipt. Callers may submit event bytes and
+//! The owner snapshot is assembled only from the live `WorkScope` and `Policy`
+//! owners plus an admitted `attach receipt`. Callers may submit event bytes and
 //! a typed normalization class, but cannot submit an `Allow` decision.
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -23,7 +23,7 @@ pub const BRIDGE_EVENT_PRIVACY_OWNER_SCHEMA_VERSION: u16 = 1;
 
 /// Classification emitted by the host-event normalizer.
 ///
-/// This enum is intentionally independent of WorkScope's `PrivacyClass`.
+/// This enum is intentionally independent of `WorkScope`'s `PrivacyClass`.
 /// The owner retention rule supplies the explicit mapping used at the attach
 /// boundary; no mapping is inferred from a scope-wide class.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -368,6 +368,34 @@ impl BridgeEventPrivacyRecipient {
     }
 }
 
+/// Builds the validated dependency closure the owner decision is computed over.
+fn closure_for_decision(
+    owner: &BridgeEventPrivacyOwnerSnapshot,
+    source_hash: &str,
+) -> Result<DisclosureDependencyClosure, BridgeEventPrivacyError> {
+    let closure_ref = format!("bridge-event-closure:{source_hash}");
+    let closure = DisclosureDependencyClosure {
+        closure_id: closure_ref,
+        subject_ref: format!("sha256:{source_hash}"),
+        direct_domain_refs: owner
+            .domain_rules
+            .iter()
+            .map(|rule| rule.domain.clone())
+            .collect(),
+        inherited_closure_refs: owner.closure.inherited_closure_refs.clone(),
+        derivation_or_transformation_refs: owner.closure.derivation_or_transformation_refs.clone(),
+        completeness: owner.closure.completeness,
+        declassification_receipt_refs: owner.closure.declassification_receipt_refs.clone(),
+        policy_snapshot_id: owner.policy_snapshot_id.clone(),
+        state_fence: owner.policy_state_fence.clone(),
+        revision: owner.policy_revision,
+    };
+    closure
+        .validate()
+        .map_err(|error| BridgeEventPrivacyError::Disclosure(error.to_string()))?;
+    Ok(closure)
+}
+
 /// Computes the owner decision against exact event bytes and the owner
 /// snapshot's source classification, domain closure, retention and recipient.
 /// The returned evidence is deterministic; a consumer must compare it against
@@ -392,26 +420,8 @@ pub fn decide_bridge_event_disclosure(
             .ok_or(BridgeEventPrivacyError::InvalidOwner(
                 "missing source class rule",
             ))?;
+    let closure = closure_for_decision(owner, &source_hash)?;
     let closure_ref = format!("bridge-event-closure:{source_hash}");
-    let closure = DisclosureDependencyClosure {
-        closure_id: closure_ref.clone(),
-        subject_ref: format!("sha256:{source_hash}"),
-        direct_domain_refs: owner
-            .domain_rules
-            .iter()
-            .map(|rule| rule.domain.clone())
-            .collect(),
-        inherited_closure_refs: owner.closure.inherited_closure_refs.clone(),
-        derivation_or_transformation_refs: owner.closure.derivation_or_transformation_refs.clone(),
-        completeness: owner.closure.completeness,
-        declassification_receipt_refs: owner.closure.declassification_receipt_refs.clone(),
-        policy_snapshot_id: owner.policy_snapshot_id.clone(),
-        state_fence: owner.policy_state_fence.clone(),
-        revision: owner.policy_revision,
-    };
-    closure
-        .validate()
-        .map_err(|error| BridgeEventPrivacyError::Disclosure(error.to_string()))?;
 
     let source_class_admitted = owner
         .privacy_boundary
