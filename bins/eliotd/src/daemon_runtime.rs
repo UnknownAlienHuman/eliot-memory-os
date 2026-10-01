@@ -3420,24 +3420,30 @@ fn resolve_valid_ticket(
                 ticket.ticket_id
             )
         })?;
-    let mut cold_start_discovery =
-        if result.resolved_binding().is_some() && ticket.workspace_selector.is_some() {
-            Some(
-                eliotd::task_binding_admission::observe_cold_start_discovery(
-                    &ticket,
-                    &ticket.state_fence,
-                    now.max(1),
-                )
-                .map_err(|error| {
-                    format!(
-                        "daemon activation discovery ticket {}: {error}",
-                        ticket.ticket_id
-                    )
-                })?,
+    let mut cold_start_discovery = if let Some(binding) = result
+        .resolved_binding()
+        .filter(|_| ticket.workspace_selector.is_some())
+    {
+        Some(
+            eliotd::task_binding_admission::observe_cold_start_discovery(
+                &ticket,
+                &binding.principal_id,
+                &binding.session_id,
+                &ticket.state_fence,
+                unix_ms(SystemTime::now())
+                    .map_err(|error| format!("activation discovery clock: {error}"))?
+                    .max(1),
             )
-        } else {
-            None
-        };
+            .map_err(|error| {
+                format!(
+                    "daemon activation discovery ticket {}: {error}",
+                    ticket.ticket_id
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     let result = if let Some(observed) = cold_start_discovery.as_mut() {
         DaemonComposition::attach_cold_start_question(result, observed, None).map_err(|error| {
             format!(
