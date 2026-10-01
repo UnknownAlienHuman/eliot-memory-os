@@ -54,13 +54,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
     AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionDisposition, AgentActivationResolutionResult,
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
-    AgentActivationResultReconcile, host_request_operation_id,
+    AgentActivationResultReconcile, HostRequestEnvelope, host_request_operation_id,
 };
 use eliot_runtime_contracts::DaemonProgressChannel;
 use eliot_store_api::{StoreHealth, StoreHealthStatus};
@@ -83,8 +84,9 @@ use eliotd::{
     DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
     LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
-    PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
-    forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
+    ObserveSubmitOutcome, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME,
+    TaskControllerSubmitOutcome, forward_admitted_local_read, serve_admitted_observe,
+    terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -5047,33 +5049,38 @@ async fn run_observe_poll(
     };
     // The `Observation` suboperation executes through the single observation
     // owner; the other four still have no connected owner admission and defer
-    // exactly as before. The capture runs OUTSIDE any composition lock: the
-    // readiness-checked borrow is taken, the canonical commit is awaited with
-    // it dropped, and the borrow is retaken only to read the live fence.
+    // exactly as before. The observation owner borrows the composition, so the
+    // capture runs inside that borrow's scope; every other leg below runs with
+    // no guard held.
     if eliotd::observe_suboperation_executes(deferral.suboperation) {
-        let owner = {
+        // The commit is one bounded owner call under the borrow, mirroring how
+        // the Kernel-backed read client is built per operation.
+        let capture = {
             let guard = composition.lock().await;
-            guard
+            let owner = guard
                 .observation_reconciliation()
-                .map_err(|error| format!("daemon observe owner borrow: {error}"))?
+                .map_err(|error| format!("daemon observe owner borrow: {error}"))?;
+            eliotd::capture_admitted_observation(&owner, &envelope, &tool, &attempt)
+                .await
+                .map_err(|error| format!("daemon observe capture: {error}"))?
         };
-        let capture = eliotd::capture_admitted_observation(&owner, &envelope, &tool, &attempt)
-            .await
-            .map_err(|error| format!("daemon observe capture: {error}"))?;
-        drop(owner);
         // A terminal non-committed receipt is a refusal, not a capture: the
         // observation was not admitted, so the pair defers rather than
         // reporting an effect that never happened.
         if capture.receipt.status != eliot_store_api::WriteReceiptStatus::Committed {
-            let outcome =
-                match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, &attempt)
-                    .await?
-                {
-                    ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
-                    ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,
-                    ObserveDeferOutcome::Expired => ObservePollOutcome::Expired,
-                    ObserveDeferOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
-                };
+            let outcome = match defer_observe_pair_idempotent(
+                kernel,
+                &operation_id,
+                &request_digest,
+                &attempt,
+            )
+            .await?
+            {
+                ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
+                ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,
+                ObserveDeferOutcome::Expired => ObservePollOutcome::Expired,
+                ObserveDeferOutcome::StaleAttempt => ObservePollOutcome::StaleAttempt,
+            };
             return Ok(step(outcome));
         }
         tracing::info!(
@@ -5095,7 +5102,8 @@ async fn run_observe_poll(
         return Ok(step(outcome));
     }
     let outcome =
-        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, &attempt).await?
+        match defer_observe_pair_idempotent(kernel, &operation_id, &request_digest, &attempt)
+            .await?
         {
             ObserveDeferOutcome::Deferred => ObservePollOutcome::Deferred,
             ObserveDeferOutcome::Settled => ObservePollOutcome::Settled,

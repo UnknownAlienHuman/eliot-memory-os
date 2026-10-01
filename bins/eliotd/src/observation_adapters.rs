@@ -1054,7 +1054,11 @@ mod tests {
             operation_id: eliot_protocol::host_request_operation_id(envelope),
             attempt_id: "attempt-observe-2565-1".to_owned(),
             fencing_generation: 1,
-            session_id: envelope.identity.session_id.clone().expect("admitted session"),
+            session_id: envelope
+                .identity
+                .session_id
+                .clone()
+                .expect("admitted session"),
             authority_epoch: envelope.state_fence.authority_epoch.clone(),
             scope_id: "governor".to_owned(),
             facet_method: "eliot.observe".to_owned(),
@@ -1068,17 +1072,7 @@ mod tests {
     /// can count the canonical transitions that actually executed.
     fn observe_governor(
         kernel: Arc<GenesisKernel>,
-    ) -> (
-        eliot_governor::GovernorComposition<
-            'static,
-            Arc<GenesisKernel>,
-            eliot_governor::KernelServiceRecovery,
-            eliot_governor::RecoveryOwner,
-            eliot_governor::KernelGenerationExpectation,
-            eliot_governor::GenesisOwnerRecordSet,
-        >,
-        Arc<GenesisKernel>,
-    ) {
+    ) -> (GovernorComposition<GenesisKernel>, Arc<GenesisKernel>) {
         let expected = KernelGenerationExpectation::from_snapshot(&kernel.snapshot)
             .expect("observe expectation");
         let handle = Arc::clone(&kernel);
@@ -1141,9 +1135,10 @@ mod tests {
         });
         let envelope = observe_envelope(&fence, &observation_tool, Some("task-observe-2565"));
         let attempt = observe_attempt(&envelope);
-        let capture = crate::capture_admitted_observation(&forwarder, &envelope, &observation_tool, &attempt)
-            .await
-            .expect("the observation suboperation captures through the owner");
+        let capture =
+            crate::capture_admitted_observation(&forwarder, &envelope, &observation_tool, &attempt)
+                .await
+                .expect("the observation suboperation captures through the owner");
         assert_eq!(
             capture.receipt.status,
             WriteReceiptStatus::Committed,
@@ -1159,9 +1154,10 @@ mod tests {
 
         // The lost-result recovery path: an exact replay of the same retained
         // pair reconciles the SAME receipt rather than capturing a second time.
-        let replayed = crate::capture_admitted_observation(&forwarder, &envelope, &observation_tool, &attempt)
-            .await
-            .expect("an exact replay reconciles the original receipt");
+        let replayed =
+            crate::capture_admitted_observation(&forwarder, &envelope, &observation_tool, &attempt)
+                .await
+                .expect("an exact replay reconciles the original receipt");
         assert_eq!(
             replayed.receipt, capture.receipt,
             "a lost host result must recover the SAME receipt"

@@ -217,9 +217,7 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
     pub fn state_fence(&self) -> StateFence {
         self.canonical.state_fence().clone()
     }
-}
 
-impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
     /// Borrows the single Governor owner triple. No per-caller journal,
     /// problem map, or canonical owner is created; scratch clones in
     /// [`Self::admit_doctor_verification`] never publish authority. The
@@ -2447,12 +2445,11 @@ fn capture_submission_envelope(
     let request_digest = submission
         .request_digest()
         .map_err(|error| owner_refused(error.to_string()))?;
-    let work_scope = submission.record.event.as_ref().map(|core| {
-        core.affected_scope
-            .work_scope
-            .as_str()
-            .to_owned()
-    });
+    let work_scope = submission
+        .record
+        .event
+        .as_ref()
+        .map(|core| core.affected_scope.work_scope.as_str().to_owned());
     let mut parameters = BTreeMap::new();
     for (name, value) in [
         ("record_id", submission.record.record_id.clone()),

@@ -444,11 +444,12 @@ fn observe_capture_submission(
         "{}/observe-observation",
         provenance.operation_id
     ))
-    .map_err(|error| format!("daemon observe capture operation is not a contract value: {error}"))?;
+    .map_err(|error| {
+        format!("daemon observe capture operation is not a contract value: {error}")
+    })?;
     let idempotency_key = format!(
         "{}:observe:observation:{}",
-        envelope.identity.idempotency_key,
-        provenance.payload_digest
+        envelope.identity.idempotency_key, provenance.payload_digest
     );
     let clock = eliot_contracts::ClockReading {
         valid_time_ms: i64::try_from(observed_at_unix_ms).ok(),
@@ -460,17 +461,10 @@ fn observe_capture_submission(
     let record_id = format!("observe:{}", provenance.payload_digest);
     let event_id = format!("observe-event:{}", provenance.payload_digest);
     let core = ObservationEventCore {
-        event_id_and_time: ObservationEventIdentity {
-            event_id,
-            clock,
-        },
+        event_id_and_time: ObservationEventIdentity { event_id, clock },
         producer_generation_and_trace: ProducerTrace {
             producer: OBSERVE_PRODUCER.to_owned(),
-            generation: envelope
-                .state_fence
-                .resource_generation
-                .value()
-                .to_string(),
+            generation: envelope.state_fence.resource_generation.value().to_string(),
             trace_ref: Some(provenance.operation_id.clone()),
         },
         kind: ObservationKind::AgentFeedback,
