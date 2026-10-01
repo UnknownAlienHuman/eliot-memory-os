@@ -5244,6 +5244,53 @@ impl KernelComposition {
         }
     }
 
+    /// Retains the possible effect of one failed observe result persistence.
+    ///
+    /// The daemon reached this point only after holding the live
+    /// (`attempt_id`, generation, owner) triple for this operation, so the
+    /// Governor/Store transition it performed may already have taken effect
+    /// even though the host-result write did not land. A persistence failure
+    /// is therefore never evidence that nothing happened.
+    ///
+    /// Two independent fences close the blind-redispatch window, and neither
+    /// mints anything:
+    ///
+    /// - The durable row advances to [`HostRequestState::Unknown`] through the
+    ///   existing ORS advance path. `claim_observe_pair` only serves `Admitted`
+    ///   or `Routed` rows, so after this advance the operation is unservable
+    ///   from the queue and can only move forward to `Reconciling` or
+    ///   `ResultReceived` through reconciliation evidence. `PossiblyEffected`
+    ///   is unreachable from `Routed` (it is `Submitted`-only), so `Unknown`
+    ///   is the legal target for this state.
+    /// - The queue pair is retired, which is what stops the same live owner
+    ///   from being handed the identical pair on the next poll.
+    ///
+    /// The reconciliation reference is the ORIGINAL attempt identity already
+    /// durable on the row (`attempt_id`, generation, owner session, fence
+    /// digest) plus the `result_native_raw_appended` audit record emitted
+    /// before persistence, which carries the submitted result digest. Both are
+    /// recorded values read back unchanged; nothing here recomputes a digest or
+    /// compares a payload against itself, and no receipt is invented for a
+    /// write that did not happen.
+    ///
+    /// The advance is best-effort by construction: a store error must not
+    /// replace the original refusal with a different one, so its outcome is
+    /// contained here and the caller's own transport error still reports the
+    /// real cause. The in-memory retirement always runs.
+    fn retain_observe_possible_effect(
+        &self,
+        operation_id: &OperationIdentity,
+        request_digest: &str,
+    ) {
+        let _ = self.generation_gateway.ors.advance_host_request(
+            operation_id,
+            request_digest,
+            HostRequestState::Unknown,
+            None,
+        );
+        self.retire_observe_pair_under_transition(operation_id.as_str(), request_digest);
+    }
+
     /// Submits one daemon-produced observe result for its waiting host request.
     ///
     /// Mirrors [`Self::submit_local_read_result`] over the observe queue:
@@ -5506,22 +5553,37 @@ impl KernelComposition {
         // Issue #1853 W2: the executor-observed evidence is persisted with the
         // completion, in the same owner transaction.
         let retained = retained_result_provenance(body)?;
-        let persisted = self
-            .generation_gateway
-            .ors
-            .persist_host_request_result(
-                &operation_id,
-                &body.request_sha256,
-                &body.result_digest,
-                &body.response,
-                retained.effect_evidence.as_ref(),
-                retained.result_lineage.as_ref(),
-            )
-            .map_err(|error| match error {
-                OrsError::HostRequestIdentityConflict { .. } => TransportError::IdentityConflict,
-                _ => TransportError::SessionFenced,
-            })?
-            .ok_or(TransportError::UnknownRequest)?;
+        // Issue #2565 AUD14: a result-persistence failure on this leg happens
+        // AFTER the daemon performed the semantic transition, so the operation
+        // may already have taken effect. Returning the bare safe refusal below
+        // would leave the durable row `Routed` and the queue pair live, and the
+        // next poll would re-serve the identical effectful pair to the same live
+        // owner — a blind re-execution with the possible outcome recorded
+        // nowhere. Retain the possible effect first: the durable row leaves the
+        // executable set and the pair is retired, so the refusal below now
+        // reports an operation that genuinely cannot be safely retried.
+        //
+        // `HostRequestIdentityConflict` stays a conflict rather than a possible
+        // effect: it means a different body is already retained under this
+        // identity, so the operation is closed, not unknown.
+        let persisted = match self.generation_gateway.ors.persist_host_request_result(
+            &operation_id,
+            &body.request_sha256,
+            &body.result_digest,
+            &body.response,
+            retained.effect_evidence.as_ref(),
+            retained.result_lineage.as_ref(),
+        ) {
+            Ok(Some(record)) => record,
+            Ok(None) => return Err(TransportError::UnknownRequest),
+            Err(OrsError::HostRequestIdentityConflict { .. }) => {
+                return Err(TransportError::IdentityConflict);
+            }
+            Err(_) => {
+                self.retain_observe_possible_effect(&operation_id, &body.request_sha256);
+                return Err(TransportError::SessionFenced);
+            }
+        };
         // Issue #1837: durable audit evidence for the daemon result leg
         // and the Kernel binding.
         self.audit_observe(AuditEventDraft::result_daemon_submitted(
