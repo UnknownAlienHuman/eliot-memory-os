@@ -230,10 +230,13 @@ pub struct AuthenticatedKernelJobPort<'a> {
     /// Owner channel for the mandatory Orientation carrier. `Some` in
     /// production: `connect` wires
     /// [`KernelStagedOwnerRecordSource`](crate::orientation_supply_source::KernelStagedOwnerRecordSource),
-    /// which reads the Kernel-staged owner record and reports the members that
-    /// record does not publish. The carrier stays refused on that measured
-    /// absence rather than synthesizing canonical state; the channel itself is
-    /// replaceable through
+    /// which reports the mandatory members the Kernel-staged owner record does
+    /// not publish. On the current tree that reports total absence, and it is
+    /// in any case reached only from the unit-level pipeline proofs: `submit`
+    /// consults it at lib.rs:791, after `resolve_cycle_inputs` and
+    /// `resolve_bundle_request`, both of which refuse unconditionally. The
+    /// carrier stays refused rather than synthesizing canonical state; the
+    /// channel itself is replaceable through
     /// [`AuthenticatedKernelJobPort::with_orientation_source`].
     orientation_source: Option<&'a dyn OrientationSupplySource>,
 }
