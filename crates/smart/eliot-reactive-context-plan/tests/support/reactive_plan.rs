@@ -551,9 +551,37 @@ pub fn reseal_context_view(
         model_id: measurement.model_id.clone(),
         measurement_status: measurement.status,
     };
+    // A scorecard grades ONE exact output, and `ActiveUnderstandingView::
+    // validate` compares the card's own admitted and rendered digests against
+    // the digests this packet's owner recomputes. The seed card still names the
+    // packet the fixture started from, so resealing the measurement and the
+    // economy receipt above is not enough: as soon as a fixture-only change
+    // alters the admitted records, the assembled view is refused with
+    // `QualityIncomplete` naming a card that grades bytes this packet does not
+    // carry. Rebind the card to the packet this view now holds, through the
+    // same owner digests the validator compares against, and let the validator
+    // remain the only thing that decides whether the card is honest. The recipe
+    // and fence digests need no resealing: the clone carries them and they are
+    // the same two values handed to `assemble` below.
+    let mut quality = active_seed.quality.clone();
+    quality.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("resealed admitted payload digest");
+    quality.output.rendered_digest.clone_from(&rendered_digest);
+    quality.output.omission_handles = admitted.economy.displaced.clone();
+    // The source snapshots this packet's delivered atoms were read from. The
+    // list is derived from the projection being delivered rather than copied
+    // from the seed card, so it is a real observation list and it stays a
+    // subset of what the view actually carries.
+    quality.output.evidence_revisions = rendered
+        .iter()
+        .map(|atom| atom.source_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let active = eliot_context_contracts::ActiveUnderstandingView::assemble(
         &admitted,
-        active_seed.quality.clone(),
+        quality,
         measurement,
         execution,
         rendered_digest,
