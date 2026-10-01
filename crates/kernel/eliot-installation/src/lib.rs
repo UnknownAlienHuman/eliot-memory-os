@@ -593,6 +593,82 @@ fn runtime_sha256_handle(value: &PlatformHandle, field: &str) -> Result<(), Inst
     sha256_handle(value, field)
 }
 
+fn validate_admitted_symbol_binding(
+    binding: &AdmittedSymbolBinding,
+    expected_role: SymbolExecutableRole,
+    executable_digest: &PlatformHandle,
+    generation: &PlatformHandle,
+    field: &str,
+) -> Result<(), InstallationError> {
+    let invalid = |reason: &str| InstallationError::InvalidField {
+        field: field.to_owned(),
+        reason: reason.to_owned(),
+    };
+    if binding.role != expected_role {
+        return Err(invalid("symbol role does not match the executable owner"));
+    }
+    runtime_sha256_handle(
+        &binding.executable_sha256,
+        &format!("{field}.executable_sha256"),
+    )?;
+    if binding.executable_sha256 != *executable_digest {
+        return Err(invalid(
+            "symbol record executable digest differs from the admitted image digest",
+        ));
+    }
+    handle(
+        &binding.build_fingerprint,
+        &format!("{field}.build_fingerprint"),
+    )?;
+    if binding.build_fingerprint.as_str().len() != 40
+        || !binding
+            .build_fingerprint
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invalid(
+            "build fingerprint must preserve the release source_commit format",
+        ));
+    }
+    if binding.build_profile.as_str() != "release" {
+        return Err(invalid(
+            "build profile must match the existing Windows release profile",
+        ));
+    }
+    let expected_ref = match expected_role {
+        SymbolExecutableRole::Host => "symbols/host/eliot-host.pdb",
+        SymbolExecutableRole::Kernel => "symbols/kernel/eliot-kernel.pdb",
+    };
+    if binding.symbol_artifact_ref.as_str() != expected_ref {
+        return Err(invalid("symbol artifact reference is not canonical"));
+    }
+    handle(
+        &binding.symbol_artifact_ref,
+        &format!("{field}.symbol_artifact_ref"),
+    )?;
+    runtime_sha256_handle(
+        &binding.symbol_artifact_sha256,
+        &format!("{field}.symbol_artifact_sha256"),
+    )?;
+    handle(
+        &binding.retention_reference,
+        &format!("{field}.retention_reference"),
+    )?;
+    if binding.retention_reference.as_str() != "SHA256SUMS.json" {
+        return Err(invalid(
+            "retention reference must preserve the validated release checksum manifest",
+        ));
+    }
+    handle(&binding.retention_id, &format!("{field}.retention_id"))?;
+    if binding.retention_id != *generation {
+        return Err(invalid(
+            "retention identity must equal the installer-admitted candidate generation",
+        ));
+    }
+    Ok(())
+}
+
 /// Returns the canonical bytes covered by a profile's self digest.
 ///
 /// `digest_key` is the JSON member stripped before hashing and `field` is the
@@ -1203,6 +1279,43 @@ impl SupervisionAuthorityBinding {
     }
 }
 
+/// Executable role whose release symbols were admitted with this generation.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolExecutableRole {
+    /// The Host image admitted by the installation manifest.
+    Host,
+    /// The Kernel image admitted by the installation manifest.
+    Kernel,
+}
+
+/// Immutable release symbol metadata admitted with an exact executable.
+///
+/// This is a typed projection of the symbol entry in the existing release
+/// artifact receipt. The reference is informational at crash time: consumers
+/// must not resolve an ambient PDB path or infer symbols from a sibling file.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedSymbolBinding {
+    /// The executable role this record describes.
+    pub role: SymbolExecutableRole,
+    /// Exact SHA-256 already admitted for the executable image.
+    pub executable_sha256: PlatformHandle,
+    /// Original pinned source commit used as the release build fingerprint.
+    pub build_fingerprint: PlatformHandle,
+    /// Cargo profile recorded by the existing release artifact manifest.
+    pub build_profile: PlatformHandle,
+    /// Canonical release-bundle-relative PDB reference.
+    pub symbol_artifact_ref: PlatformHandle,
+    /// SHA-256 of the exact retained PDB bytes.
+    pub symbol_artifact_sha256: PlatformHandle,
+    /// Original release retention manifest reference; separate from the
+    /// installed candidate-generation retention identity.
+    pub retention_reference: PlatformHandle,
+    /// Exact installer-admitted candidate generation retaining this binding.
+    pub retention_id: PlatformHandle,
+}
+
 /// Immutable, digest-bound process launch inputs owned by Host.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1255,6 +1368,10 @@ pub struct RuntimeLaunchDescriptor {
     pub kernel_work_root: PlatformHandle,
     /// SHA-256 digest of the approved Kernel image.
     pub kernel_artifact_digest: PlatformHandle,
+    /// Release-admitted Kernel symbol identity, absent on explicitly legacy
+    /// inputs whose generation predates the symbol-bearing release receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_symbol_binding: Option<AdmittedSymbolBinding>,
     /// Explicit installation-approved `eliotd.exe` path.
     pub eliotd_executable_path: PlatformHandle,
     /// SHA-256 digest of the approved `eliotd.exe` image.
@@ -1315,6 +1432,10 @@ pub struct RuntimeLaunchDescriptor {
     pub host_executable_path: PlatformHandle,
     /// SHA-256 digest of the Host image.
     pub host_artifact_digest: PlatformHandle,
+    /// Release-admitted Host symbol identity, absent on explicitly legacy
+    /// inputs whose generation predates the symbol-bearing release receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_symbol_binding: Option<AdmittedSymbolBinding>,
     /// Canonical SCM Watchdog image and its approved digest.
     pub watchdog_executable_path: PlatformHandle,
     /// SHA-256 digest of the Watchdog image.
@@ -1344,6 +1465,20 @@ pub struct RuntimeLaunchDescriptor {
 }
 
 impl RuntimeLaunchDescriptor {
+    /// Returns the optional symbol binding for one exact executable role.
+    ///
+    /// `validate` proves the binding is self-consistent with this admitted
+    /// launch descriptor before callers project it into runtime metadata.
+    pub fn admitted_symbol_binding(
+        &self,
+        role: SymbolExecutableRole,
+    ) -> Option<&AdmittedSymbolBinding> {
+        match role {
+            SymbolExecutableRole::Host => self.host_symbol_binding.as_ref(),
+            SymbolExecutableRole::Kernel => self.kernel_symbol_binding.as_ref(),
+        }
+    }
+
     /// Recomputes the descriptor digest after all immutable launch fields have
     /// been materialized.
     ///
@@ -1852,6 +1987,8 @@ impl RuntimeLaunchDescriptor {
             runtime_state_roots: &'a RuntimeStateRoots,
             kernel_work_root: &'a PlatformHandle,
             kernel_artifact_digest: &'a PlatformHandle,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            kernel_symbol_binding: &'a Option<AdmittedSymbolBinding>,
             eliotd_executable_path: &'a PlatformHandle,
             eliotd_artifact_digest: &'a PlatformHandle,
             eliotd_config_path: &'a PlatformHandle,
@@ -1873,6 +2010,8 @@ impl RuntimeLaunchDescriptor {
             canonical_store_arguments: &'a [PlatformHandle],
             host_executable_path: &'a PlatformHandle,
             host_artifact_digest: &'a PlatformHandle,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            host_symbol_binding: &'a Option<AdmittedSymbolBinding>,
             watchdog_executable_path: &'a PlatformHandle,
             watchdog_artifact_digest: &'a PlatformHandle,
             doctor_artifact_digest: &'a PlatformHandle,
@@ -1903,6 +2042,7 @@ impl RuntimeLaunchDescriptor {
             runtime_state_roots: &self.runtime_state_roots,
             kernel_work_root: &self.kernel_work_root,
             kernel_artifact_digest: &self.kernel_artifact_digest,
+            kernel_symbol_binding: &self.kernel_symbol_binding,
             eliotd_executable_path: &self.eliotd_executable_path,
             eliotd_artifact_digest: &self.eliotd_artifact_digest,
             eliotd_config_path: &self.eliotd_config_path,
@@ -1924,6 +2064,7 @@ impl RuntimeLaunchDescriptor {
             canonical_store_arguments: &self.canonical_store_arguments,
             host_executable_path: &self.host_executable_path,
             host_artifact_digest: &self.host_artifact_digest,
+            host_symbol_binding: &self.host_symbol_binding,
             watchdog_executable_path: &self.watchdog_executable_path,
             watchdog_artifact_digest: &self.watchdog_artifact_digest,
             doctor_artifact_digest: &self.doctor_artifact_digest,
@@ -2084,6 +2225,15 @@ impl RuntimeLaunchDescriptor {
             &self.kernel_artifact_digest,
             "runtime_launch.kernel_artifact_digest",
         )?;
+        if let Some(binding) = self.kernel_symbol_binding.as_ref() {
+            validate_admitted_symbol_binding(
+                binding,
+                SymbolExecutableRole::Kernel,
+                &self.kernel_artifact_digest,
+                &self.generation,
+                "runtime_launch.kernel_symbol_binding",
+            )?;
+        }
         approved_path(
             &self.eliotd_executable_path,
             "runtime_launch.eliotd_executable_path",
@@ -2176,6 +2326,15 @@ impl RuntimeLaunchDescriptor {
             &self.host_artifact_digest,
             "runtime_launch.host_artifact_digest",
         )?;
+        if let Some(binding) = self.host_symbol_binding.as_ref() {
+            validate_admitted_symbol_binding(
+                binding,
+                SymbolExecutableRole::Host,
+                &self.host_artifact_digest,
+                &self.generation,
+                "runtime_launch.host_symbol_binding",
+            )?;
+        }
         approved_path(
             &self.store_bridge_executable_path,
             "runtime_launch.store_bridge_executable_path",
