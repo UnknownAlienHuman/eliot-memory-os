@@ -572,16 +572,17 @@ fn governed_transfer_observation(
             structural_digest: None,
         }
     });
-    let after = original.after_revision.as_ref().map(|revision| {
-        ResourceSnapshot {
+    let after = original
+        .after_revision
+        .as_ref()
+        .map(|revision| ResourceSnapshot {
             resource_ref: original.resource.clone(),
             revision: revision.clone(),
             path: Some(original.path.clone()),
             symbol: None,
             content_digest: original.after_digest.clone(),
             structural_digest: None,
-        }
-    });
+        });
     let kind = match (&before, &after) {
         (None, None) => {
             return Err(recovery_refusal(format!(
@@ -755,9 +756,11 @@ pub fn resolve_anchored_review(
     original: &AnchorReference,
     candidates: &[AnchorCandidate],
 ) -> Result<AnchorResolutionObservation, FinishAttemptError> {
-    monitor.resolve_anchor(original, candidates).map_err(|error| {
-        recovery_refusal(format!("anchored-review anchor resolution failed: {error}"))
-    })
+    monitor
+        .resolve_anchor(original, candidates)
+        .map_err(|error| {
+            recovery_refusal(format!("anchored-review anchor resolution failed: {error}"))
+        })
 }
 
 /// Governor adapter over the single task, canonical, and finish owners.
