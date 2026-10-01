@@ -676,6 +676,16 @@ impl StoreComposition {
             return Err("source-admission readback bytes or digest are not canonical".to_owned());
         }
         let admission = &readback.admission;
+        let retained_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
+            &admission.owner_facts_json,
+        )
+        .map_err(|error| format!("invalid retained source-admission owner facts: {error}"))?;
+        retained_facts
+            .validate()
+            .map_err(|error| format!("retained source-admission owner facts are invalid: {error}"))?;
+        owner_facts
+            .validate()
+            .map_err(|error| format!("current open owner facts are invalid: {error}"))?;
         let binding_bytes = canonical_json_bytes(request.binding())
             .map_err(|error| format!("canonical process binding failed: {error}"))?;
         let open_bytes = canonical_json_bytes(request)
@@ -704,6 +714,18 @@ impl StoreComposition {
                     .map_err(|error| format!("Open request is not UTF-8: {error}"))?
             || admission.open_request_sha256 != sha256_hex(&open_bytes)
             || admission.owner_facts_sha256 != sha256_hex(admission.owner_facts_json.as_bytes())
+            || retained_facts.work_scope_binding_json != owner_facts.work_scope_binding_json
+            || retained_facts.work_scope_binding_sha256 != owner_facts.work_scope_binding_sha256
+            || retained_facts.matched_guard_receipt_json != owner_facts.matched_guard_receipt_json
+            || retained_facts.matched_guard_receipt_sha256 != owner_facts.matched_guard_receipt_sha256
+            || retained_facts.canonical_source_receipt_json
+                != owner_facts.canonical_source_receipt_json
+            || retained_facts.canonical_source_receipt_sha256
+                != owner_facts.canonical_source_receipt_sha256
+            || retained_facts.policy_json != owner_facts.policy_json
+            || retained_facts.policy_sha256 != owner_facts.policy_sha256
+            || retained_facts.residency_json != owner_facts.residency_json
+            || retained_facts.residency_sha256 != owner_facts.residency_sha256
             || owner_facts.work_scope_binding_sha256
                 != serde_json::from_str::<serde_json::Value>(&admission.owner_facts_json)
                     .ok()
@@ -957,6 +979,34 @@ impl StoreComposition {
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
         let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
         sink.finalize(session, request).await
+    }
+
+    /// Finalizes one exact stream operation and returns the original typed
+    /// Blob Ready receipt when the terminal proves complete durable source.
+    /// The receipt is canonicalized from the retained Blob owner capability;
+    /// its fields are never reconstructed from terminal SHA/length metadata.
+    pub async fn blob_sink_finalize_with_ready_receipt(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        capability_ref: &str,
+        binding_ref: &str,
+        request: ProcessStreamSinkFinalizeRequest,
+    ) -> Result<(ProcessStreamSinkTerminal, Option<String>, Option<String>), ProcessStreamSinkError> {
+        let (sink, session) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+            .await?;
+        let terminal = sink.finalize(session.clone(), request).await?;
+        if terminal.state() != eliot_process::stream_sink::ProcessStreamSinkState::CompleteSource {
+            return Ok((terminal, None, None));
+        }
+        let ready = sink.finalized_ready_receipt(&session, &terminal)?;
+        let bytes = canonical_json_bytes(&ready)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let json = String::from_utf8(bytes)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let digest = sha256_hex(json.as_bytes());
+        Ok((terminal, Some(json), Some(digest)))
     }
 
     pub async fn blob_sink_abort(
