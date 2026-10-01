@@ -439,9 +439,10 @@ pub use rules::{
     CompetentIntegrationCoverage, IntegrationGapEvaluation, IntegrationGapObservation,
     IntegrationGapSensor, IntegrationGapSignalCandidate, IntegrationGapSignalContext,
     IntegrationGapUnknown, PROVIDER_HOST_EVENT_GAP_RULE_ID, PROVIDER_HOST_EVENT_GAP_RULE_REVISION,
-    ProviderAttemptIdentity, ProviderEventIdentity, RuleImplementation, StateFenceProjection,
-    WATCHDOG_RULE_TABLE, WatchdogRule, covered_rule, evaluate_provider_host_event_gap,
-    find_watchdog_rule, watchdog_rule_table,
+    ProviderAttemptIdentity, ProviderEventIdentity, RuleImplementation, SUPERVISION_GAP_RULE_ID,
+    SUPERVISION_GAP_RULE_REVISION, StateFenceProjection, WATCHDOG_RULE_TABLE, WatchdogRule,
+    covered_rule, evaluate_provider_host_event_gap, find_watchdog_rule, supervision_gap_rule,
+    watchdog_rule_table,
 };
 
 pub use health_detectors::{

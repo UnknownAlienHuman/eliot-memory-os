@@ -93,19 +93,6 @@ const _: () = assert!(
     "one episode must hold fewer events than the table holds episodes"
 );
 
-/// Identity of the Watchdog-owned rule that observes a supervision gap.
-///
-/// This is the rule identity and immutable revision a failure episode is keyed
-/// on. It is a closed constant, not caller prose, and bumping it is what
-/// deliberately starts a new episode generation instead of silently
-/// reinterpreting episodes decided under another rule revision.
-pub(crate) const SUPERVISION_GAP_RULE_ID: &str = "watchdog_supervision_gap_observation";
-
-/// Immutable revision of [`SUPERVISION_GAP_RULE_ID`].
-pub(crate) const SUPERVISION_GAP_RULE_REVISION: u64 = 1;
-
-const _: () = assert!(SUPERVISION_GAP_RULE_REVISION == 1);
-
 /// One admitted source event identity with the payload digest recorded for it.
 ///
 /// Mirrors [`eliot_watchdog_core::AcceptedSourceEvent`] one to one, because the

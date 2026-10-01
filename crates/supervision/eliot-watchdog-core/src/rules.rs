@@ -18,13 +18,26 @@
 //! private constant in the module that implements the rule, so applicability
 //! cannot be asserted in one place and contradicted in another.
 //!
-//! Exactly one row is [`RuleImplementation::CompetentlyCovered`] today: the
-//! coordinator's typed provider host-event sequence-gap observation. The
-//! coordinator package is deliberately not a dependency of this pure core:
-//! STITCH projects the fields only after matching
+//! Two rows are [`RuleImplementation::CompetentlyCovered`] today.
+//!
+//! The first is the coordinator's typed provider host-event sequence-gap
+//! observation. The coordinator package is deliberately not a dependency of this
+//! pure core: STITCH projects the fields only after matching
 //! `CoordinatorEvent::ProviderHostEventGap`, and supplies the owner-issued
 //! `SignalTarget`, profile, clock, coverage and revisions that the event itself
 //! does not carry.
+//!
+//! The second is [`SUPERVISION_GAP_RULE_ID`], whose competent sensor is the
+//! Watchdog's own verified supervision lease: the signing owner issued the
+//! lease identity, the authenticated digest of its exact bytes, the refusal
+//! reason it actually reported and the epoch generation it was bound to, and
+//! the durable episode owner correlates on those. No evaluation function lives
+//! in this crate for it, so [`covered_rule`] is how its Watchdog caller
+//! obtains the descriptor and the identity the episode keys on. That is what
+//! keeps the table load-bearing for the one rule this project actually runs:
+//! a row that is removed, revised away or recorded as an unmet obligation
+//! stops the live supervision path from opening an episode at all, rather than
+//! leaving it to a private constant that can silently disagree with the table.
 
 use crate::episode::{FailureClass, FailureEpisodeIdentity, FailureEpisodeKey};
 use crate::signals::{
@@ -39,6 +52,18 @@ pub const PROVIDER_HOST_EVENT_GAP_RULE_ID: &str = "provider_host_event_sequence_
 
 /// Immutable revision of that rule's applicability contract.
 pub const PROVIDER_HOST_EVENT_GAP_RULE_REVISION: u64 = 1;
+
+/// Exact identity of the supervision-gap episode rule the Watchdog's own
+/// verified-lease sensor feeds.
+///
+/// This identity was the one rule this project ran in production, and it is
+/// named here — in the table's owner — rather than in the spool module that
+/// happens to persist its episodes, so the live path and the table cannot
+/// disagree about what a supervision gap is.
+pub const SUPERVISION_GAP_RULE_ID: &str = "watchdog_supervision_gap_observation";
+
+/// Immutable revision of that rule's applicability contract.
+pub const SUPERVISION_GAP_RULE_REVISION: u64 = 1;
 
 /// Closed statement of how one rule in the finite table obtains its evidence.
 ///
@@ -90,10 +115,21 @@ pub struct WatchdogRule {
 ///
 /// It is closed: a rule absent from here cannot be evaluated, because the
 /// evaluation reads its descriptor from this table. It is also explicit about
-/// incompleteness — nine of the ten rows record the exact sensor or owner join
-/// that is still missing, which is a retained obligation and never a coverage
-/// claim.
-pub const WATCHDOG_RULE_TABLE: [WatchdogRule; 10] = [
+/// incompleteness — nine of the eleven rows record the exact sensor or owner
+/// join that is still missing, which is a retained obligation and never a
+/// coverage claim.
+pub const WATCHDOG_RULE_TABLE: [WatchdogRule; 11] = [
+    WatchdogRule {
+        rule_id: SUPERVISION_GAP_RULE_ID,
+        revision: SUPERVISION_GAP_RULE_REVISION,
+        required_observations: "the verified supervision lease's own issued identity, the authenticated digest of its exact canonical bytes, the closed refusal reason the lease verification actually reported, and the lease's own bound epoch generation",
+        correlation: "one verified lease within one installation identity, its own scope reference and its own epoch generation; the subject is the Watchdog's retained installation identity and the scope and generation are the lease's own, never a cwd string, a path or hook text",
+        bound: "one lease observation per evaluation; bounded distinct source event identities and bounded reopen history per episode, refused rather than trimmed when the bound is reached",
+        threshold: "lease verification reports one refusal that maps to a discriminating failure class; the failure episode opens on the first admitted event and a retransmission of the same lease identity and digest advances nothing",
+        result: "one durable failure episode over the exact immutable signal revision the episode owner persists, with acknowledgement and resolution kept as separate unresolved facts",
+        permissible_proposal: "one linked publication intent through the existing spool intent owner; no effect authority, no process control, and no Incident declaration from a Watchdog observation",
+        implementation: RuleImplementation::CompetentlyCovered,
+    },
     WatchdogRule {
         rule_id: PROVIDER_HOST_EVENT_GAP_RULE_ID,
         revision: PROVIDER_HOST_EVENT_GAP_RULE_REVISION,
@@ -224,6 +260,95 @@ pub const WATCHDOG_RULE_TABLE: [WatchdogRule; 10] = [
     },
 ];
 
+/// The supervision-gap row must be present exactly once and competently
+/// covered, and no two rows may share one rule identity.
+///
+/// Together these keep the table load-bearing for the rule this project
+/// actually runs: a row that is deleted, revised away, duplicated or recorded
+/// as an unmet obligation stops the live supervision path from opening an
+/// episode, instead of leaving it to a private constant that could disagree
+/// with the table unnoticed.
+const _: () = assert!(
+    supervision_gap_row_is_covered() && watchdog_table_rule_ids_are_distinct(),
+    "the supervision-gap rule must be present exactly once in WATCHDOG_RULE_TABLE at its \
+     own revision and recorded as competently covered, and every table row must carry a \
+     distinct rule identity"
+);
+
+/// Const-evaluable string equality.
+///
+/// `&str` equality is not a const operation, so the compile-time identity
+/// checks below compare bytes instead of using `==`.
+const fn rule_id_is(actual: &str, expected: &str) -> bool {
+    let (actual, expected) = (actual.as_bytes(), expected.as_bytes());
+    if actual.len() != expected.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < actual.len() {
+        if actual[index] != expected[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Const-evaluable check that the supervision-gap row is present exactly once,
+/// at its own revision, recorded as competently covered.
+///
+/// Without this, the table could carry no `SUPERVISION_GAP_RULE_ID` row — or
+/// carry one recorded as an unmet obligation — while the live supervision path
+/// kept opening durable episodes under that identity anyway, and the
+/// applicability contract the table states would be decorative. The check is
+/// const-evaluated, so that disagreement is a build failure rather than a
+/// runtime episode nobody notices.
+///
+/// The coverage test is a `match` rather than `==` because
+/// [`RuleImplementation`] derives `PartialEq`, and a derived comparison is not
+/// const-callable.
+const fn supervision_gap_row_is_covered() -> bool {
+    let mut seen = 0;
+    let mut index = 0;
+    while index < WATCHDOG_RULE_TABLE.len() {
+        let rule = &WATCHDOG_RULE_TABLE[index];
+        if rule_id_is(rule.rule_id, SUPERVISION_GAP_RULE_ID) {
+            if rule.revision != SUPERVISION_GAP_RULE_REVISION {
+                return false;
+            }
+            if !matches!(rule.implementation, RuleImplementation::CompetentlyCovered) {
+                return false;
+            }
+            seen += 1;
+        }
+        index += 1;
+    }
+    seen == 1
+}
+
+/// Const-evaluable check that no two rows share one rule identity.
+///
+/// Two rows under one identity would let [`find_watchdog_rule`] return whichever
+/// comes first, so a caller's applicability contract would depend on table
+/// order rather than on the row that actually describes its rule.
+const fn watchdog_table_rule_ids_are_distinct() -> bool {
+    let mut outer = 0;
+    while outer < WATCHDOG_RULE_TABLE.len() {
+        let mut inner = outer + 1;
+        while inner < WATCHDOG_RULE_TABLE.len() {
+            if rule_id_is(
+                WATCHDOG_RULE_TABLE[outer].rule_id,
+                WATCHDOG_RULE_TABLE[inner].rule_id,
+            ) {
+                return false;
+            }
+            inner += 1;
+        }
+        outer += 1;
+    }
+    true
+}
+
 /// Returns the finite rule table this core applies.
 ///
 /// This is the same closed table every evaluation reads its descriptor from, so
@@ -268,6 +393,22 @@ pub fn covered_rule(
                 && rule.implementation == RuleImplementation::CompetentlyCovered
         })
         .ok_or(SignalValidationError::RuleNotApplicable)
+}
+
+/// Returns the descriptor for the supervision-gap episode rule.
+///
+/// The Watchdog calls this instead of reading a private constant, so a rule
+/// that is not recorded here as competently covered cannot open a durable
+/// episode: the applicability contract is consulted at the point the episode
+/// identity is derived, not merely asserted in the module that persists it.
+///
+/// # Errors
+///
+/// Returns [`SignalValidationError::RuleNotApplicable`] when the table does not
+/// name the supervision-gap rule at [`SUPERVISION_GAP_RULE_REVISION`] as
+/// competently covered.
+pub fn supervision_gap_rule() -> Result<&'static WatchdogRule, SignalValidationError> {
+    covered_rule(SUPERVISION_GAP_RULE_ID, SUPERVISION_GAP_RULE_REVISION)
 }
 
 /// Owner-issued provider attempt identity from `ProviderHostEventGap`.

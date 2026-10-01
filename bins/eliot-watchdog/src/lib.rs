@@ -1258,10 +1258,32 @@ impl IndependentKernelSensor {
         if generation == 0 {
             return;
         }
+        // The episode's rule identity and revision are read from the pure core's
+        // finite rule table rather than from this module's own constant, so the
+        // applicability contract is consulted at the point the episode is opened
+        // instead of merely being asserted beside it. A table that no longer
+        // names this rule as competently covered stops this path from opening an
+        // episode at all; it is not a warning, because opening an episode for a
+        // rule with no stated applicability contract is exactly the drift the
+        // finite table exists to prevent.
+        let rule = match eliot_watchdog_core::supervision_gap_rule() {
+            Ok(rule) => rule,
+            Err(_) => {
+                tracing::warn!(
+                    event = "watchdog.signal_episode_rule_not_applicable",
+                    observation = "fenced",
+                    reason_code = "RULE_NOT_APPLICABLE",
+                    "the finite rule table does not record the supervision-gap rule as \
+                     competently covered; no failure episode is opened and the refusal \
+                     stays a plain observation"
+                );
+                return;
+            }
+        };
         let identity = eliot_watchdog_core::FailureEpisodeIdentity {
             rule: eliot_watchdog_core::RuleRevision {
-                rule_id: episode::SUPERVISION_GAP_RULE_ID.to_owned(),
-                revision: episode::SUPERVISION_GAP_RULE_REVISION,
+                rule_id: rule.rule_id.to_owned(),
+                revision: rule.revision,
             },
             target: eliot_watchdog_core::SignalTarget {
                 subject_id: self.installation_id.clone(),
