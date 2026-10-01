@@ -36,6 +36,7 @@ use crate::RecoveryProblem;
 use crate::ReservationRecord;
 use crate::ReservationState;
 use crate::ScanDisclosureOrsRecord;
+use crate::ScanDisclosureQuarantineRecord;
 use crate::ScopeTerminalReceipt;
 use crate::SupervisionLeaseSnapshot;
 use crate::SupervisionLeaseStageReceipt;
@@ -545,6 +546,14 @@ impl PersistedValue for crate::GrantClosureCommit {
 
 impl PersistedValue for ScanDisclosureOrsRecord {
     const RECORD_TYPE: &'static str = crate::SCAN_DISCLOSURE_RECORD_TYPE;
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for ScanDisclosureQuarantineRecord {
+    const RECORD_TYPE: &'static str = crate::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE;
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()
