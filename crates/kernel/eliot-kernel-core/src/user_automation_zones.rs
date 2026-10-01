@@ -552,15 +552,65 @@ fn pinned_table() -> Result<&'static ZoneTable, ZoneTableError> {
         .map_err(|error| *error)
 }
 
+/// Whether a name is carried by the pinned table, kept distinct from whether
+/// its offsets are representable in canonical minutes.
+///
+/// Membership and representability are different facts: collapsing them into
+/// one Boolean is what kept a carried-but-sub-minute zone from ever reaching
+/// its typed refusal. [`pinned_zone_status`] reports the exact outcome, and the
+/// schedule path's later typed lookups ([`offset_minutes_at`],
+/// [`classify_local_clock`]) still refuse the unrepresentable member with its
+/// raw second value rather than answering from a rounded one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PinnedZoneStatus {
+    /// Carried, with a whole-minute timeline.
+    Present,
+    /// Carried, but its pinned timeline holds an offset minutes cannot state
+    /// exactly. The raw second value travels with the status so the downstream
+    /// typed refusal names it.
+    PresentUnrepresentable(SubMinuteOffset),
+    /// Not carried: undefined by the pinned release, withheld for lack of
+    /// independent proof, or an invented spelling.
+    Absent,
+    /// The embedded table failed its pin; every lookup fails closed.
+    IntegrityFailure,
+}
+
+/// Reports the exact pinned-table outcome for `zone` without collapsing it.
+///
+/// A present-but-sub-minute zone is reported as such here rather than as
+/// absent, so the schedule membership precheck admits it and the typed
+/// occurrence lookup refuses it with [`ZoneTableError::SubMinuteOffset`].
+/// Nothing in this status rounds an offset or reaches instant arithmetic.
+pub(crate) fn pinned_zone_status(zone: &str) -> PinnedZoneStatus {
+    let Ok(table) = pinned_table() else {
+        return PinnedZoneStatus::IntegrityFailure;
+    };
+    match table.timeline(zone) {
+        Ok(_) => PinnedZoneStatus::Present,
+        Err(ZoneTableError::SubMinuteOffset(evidence)) => {
+            PinnedZoneStatus::PresentUnrepresentable(evidence)
+        }
+        Err(_) => PinnedZoneStatus::Absent,
+    }
+}
+
 /// Returns whether `zone` is a member of the pinned, proven table.
 ///
-/// This is the whole of zone admission. A name the pinned release does not
-/// define, a withheld zone, and a spelled pair that resembles a real one are all
-/// absent here, so all of them are refused identically. A zone the pinned release
-/// does define but whose canonical timeline cannot be built is absent here for a
-/// different and separately reported reason, and is refused too.
+/// This is the whole of schedule-level zone admission. A name the pinned
+/// release does not define, a withheld zone, and a spelled pair that resembles
+/// a real one are all absent here, so all of them are refused identically. A
+/// zone the pinned release does define but whose canonical timeline cannot be
+/// built in minutes is a member here: admitting it lets the typed occurrence
+/// lookup refuse it by name with its exact second value
+/// ([`ZoneTableError::SubMinuteOffset`]) instead of misreporting a carried zone
+/// as noncanonical. Membership therefore follows [`pinned_zone_status`], never
+/// `timeline(...).is_ok()`.
 pub(crate) fn is_pinned_zone(zone: &str) -> bool {
-    pinned_table().is_ok_and(|table| table.timeline(zone).is_ok())
+    matches!(
+        pinned_zone_status(zone),
+        PinnedZoneStatus::Present | PinnedZoneStatus::PresentUnrepresentable(_)
+    )
 }
 
 /// Returns the offset in force in `zone` at `instant_seconds`, in minutes east of
