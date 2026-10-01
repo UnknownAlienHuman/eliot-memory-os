@@ -285,8 +285,11 @@ struct ActivatedReadDescriptor {
 /// declared exact `task_id` and `task_revision` the caller was admitted
 /// against (issue #325 P1, I7.9: the obligation set belongs to the task's own
 /// contract rather than to a caller's scope, and it must be read at one exact
-/// contract revision rather than at whatever happens to be current).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
+/// contract revision rather than at whatever happens to be current);
+/// `GetMailboxMessage` addresses no scope and selects through the declared
+/// exact `message_id` (issue #1820: the retained identity row is addressed by
+/// the message identity alone, mirroring the `GetBlackboardItem` lookup).
+const ACTIVATED_READS: [ActivatedReadDescriptor; 24] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -388,6 +391,11 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
         scope_kind: SCOPE_KIND_NONE,
     },
     ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetMailboxMessage,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
+    ActivatedReadDescriptor {
         operation: NamedReadOperation::GetLearningRecordRange,
         requires_scope_id: true,
         scope_kind: SCOPE_KIND_SCOPE,
@@ -406,7 +414,7 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 24] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -431,6 +439,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
         ACTIVATED_READS[22].operation,
+        ACTIVATED_READS[23].operation,
     ]
 }
 

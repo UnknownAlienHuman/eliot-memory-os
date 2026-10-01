@@ -174,6 +174,8 @@ pub enum ParameterShape {
     BlackboardItemRevision,
     /// Closed typed mailbox admission and stream-head CAS for issue #1820.
     MailboxItemAdmission,
+    /// Exact message-identity selector for issue #1820.
+    MailboxItemLookup,
     /// Opaque, versioned `InstrumentRegistry` snapshot emitted by `persist`.
     InstrumentRegistrySnapshot,
     /// Closed canonical Problem candidate record for issue #1759 I2: the
@@ -206,6 +208,7 @@ impl ParameterShape {
             Self::BlackboardItemLookup => "eliot.blackboard.item-lookup.v1",
             Self::BlackboardItemRevision => "eliot.blackboard.item-revision.v1",
             Self::MailboxItemAdmission => "eliot.mailbox.item-admission.v1",
+            Self::MailboxItemLookup => "eliot.mailbox.item-lookup.v1",
             Self::InstrumentRegistrySnapshot => "eliot.instrument.registry-snapshot@1.0.0",
             Self::ProblemOwnerState => crate::PROBLEM_OWNER_STATE_SCHEMA_V1,
             Self::TaskContractAcceptanceRecord => crate::TASK_CONTRACT_ACCEPTANCE_RECORD_SCHEMA_V1,
@@ -1285,6 +1288,11 @@ static ADMIT_MAILBOX_ITEM_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDecl
     shape: ParameterShape::MailboxItemAdmission,
     required: true,
 }];
+static MAILBOX_ITEM_LOOKUP_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
+    name: "message_id",
+    shape: ParameterShape::MailboxItemLookup,
+    required: true,
+}];
 
 /// Returns the canonical operation name bound into manifests and digests.
 ///
@@ -1302,6 +1310,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetExperienceBankRange => "GetExperienceBankRange",
         NamedReadOperation::GetAgentFeedbackRange => "GetAgentFeedbackRange",
         NamedReadOperation::GetBlackboardItem => "GetBlackboardItem",
+        NamedReadOperation::GetMailboxMessage => "GetMailboxMessage",
         NamedReadOperation::GetLearningRecordRange => "GetLearningRecordRange",
         NamedReadOperation::GetScopeRevisionView => "GetScopeRevisionView",
         NamedReadOperation::GetOrderingHeads => "GetOrderingHeads",
@@ -1357,6 +1366,7 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
         b"GetExperienceBankRange" => Some(NamedReadOperation::GetExperienceBankRange),
         b"GetAgentFeedbackRange" => Some(NamedReadOperation::GetAgentFeedbackRange),
         b"GetBlackboardItem" => Some(NamedReadOperation::GetBlackboardItem),
+        b"GetMailboxMessage" => Some(NamedReadOperation::GetMailboxMessage),
         b"GetLearningRecordRange" => Some(NamedReadOperation::GetLearningRecordRange),
         b"GetCapabilityEvidenceRecordRange" => {
             Some(NamedReadOperation::GetCapabilityEvidenceRecordRange)
@@ -1466,7 +1476,8 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
 /// continuation selector (issue #223; scope arrives through the typed
 /// `scope_id` request field, mirroring `GetEvidencePack`);
 /// `GetBlackboardItem` declares the exact `task_id` and `item_id` selectors
-/// (issue #1822);
+/// (issue #1822); `GetMailboxMessage` declares the exact `message_id`
+/// selector (issue #1820);
 /// `GetLearningRecordRange` declares the required decimal `max_records`
 /// bound, the optional closed `record_kind` filter, plus the optional
 /// opaque `cursor` continuation selector (issue #1868; scope arrives
@@ -1506,6 +1517,7 @@ pub const fn declared_read_parameters(
             &GET_EXPERIENCE_RANGE_PARAMETERS
         }
         NamedReadOperation::GetBlackboardItem => &BLACKBOARD_ITEM_LOOKUP_PARAMETERS,
+        NamedReadOperation::GetMailboxMessage => &MAILBOX_ITEM_LOOKUP_PARAMETERS,
         NamedReadOperation::GetLearningRecordRange => &GET_LEARNING_RANGE_PARAMETERS,
         NamedReadOperation::GetCapabilityEvidenceRecordRange => {
             &GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS
@@ -1698,7 +1710,8 @@ pub fn verify_declaration_holds_no_payload_encoding(
     let structured = match declaration.shape {
         ParameterShape::OperationId
         | ParameterShape::Subject
-        | ParameterShape::BlackboardItemLookup => false,
+        | ParameterShape::BlackboardItemLookup
+        | ParameterShape::MailboxItemLookup => false,
         ParameterShape::EpistemicRevision
         | ParameterShape::NotificationState
         | ParameterShape::CampaignSourceLookup
@@ -1876,6 +1889,9 @@ fn check_declared_shape(
                 .map_err(|error| StoreError::Serialization(error.to_string()))?;
             admission.validate()
         }
+        ParameterShape::MailboxItemLookup => {
+            validate_mailbox_lookup_selector(value)
+        }
         ParameterShape::ProblemOwnerState => {
             // The candidate record's own bindings are compared by the
             // problem owner-state contract, which needs the whole parameter map
@@ -1996,6 +2012,26 @@ fn validate_blackboard_lookup_selector(
     }
     if declaration.name == "task_id" {
         eliot_contracts::TaskId::new(text).map_err(StoreError::Foundation)?;
+    }
+    Ok(())
+}
+
+/// Validates the exact `message_id` selector for `GetMailboxMessage`
+/// (issue #1820).
+///
+/// The identity row is addressed by the message identity alone, so there is
+/// no `task_id` leg to re-parse here: the value must be non-blank text under
+/// the shared store text rule, exactly like the blackboard identity legs.
+fn validate_mailbox_lookup_selector(value: &Value) -> Result<(), StoreError> {
+    let text = value.as_str().ok_or(StoreError::InvalidField {
+        field: "operation.parameter",
+        reason: "mailbox identity selector must be a string",
+    })?;
+    if text.trim().is_empty() || text.chars().any(char::is_control) {
+        return Err(StoreError::InvalidField {
+            field: "operation.parameter",
+            reason: "mailbox identity selector must be non-blank text",
+        });
     }
     Ok(())
 }
