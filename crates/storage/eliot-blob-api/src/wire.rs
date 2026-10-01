@@ -433,12 +433,21 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     pub process_binding_sha256: String,
     /// Digest of the authenticated outer Kernel request identity.
     pub outer_request_sha256: String,
-    /// WorkScope ID from the authenticated request metadata.
-    pub work_scope_ref: String,
-    /// Task ID from authenticated metadata, if selected.
-    pub task_ref: Option<String>,
-    /// Task revision from the authenticated StateFence, if selected.
-    pub task_revision: Option<u64>,
+    /// Product identity copied from the authenticated request metadata.
+    pub product_id: String,
+    /// Source identity copied from the authenticated request metadata.
+    pub source_id: String,
+    /// Caller session copied from authenticated request metadata, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Task copied from authenticated request metadata, if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Optional expected WorkScope identity, supplied only when Kernel already
+    /// retains a verified binding. Normally absent so the daemon owner resolves
+    /// the exact current scope from the authenticated submission context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_work_scope_ref: Option<String>,
     /// Digest of the exact canonical source-root identity after Kernel checks it.
     pub source_root_identity_sha256: String,
     /// Authenticated outer request fence.
@@ -459,17 +468,19 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             ("pull_ref", self.pull_ref.as_str()),
             ("job_id", self.job_id.as_str()),
             ("invocation_id", self.invocation_id.as_str()),
-            ("work_scope_ref", self.work_scope_ref.as_str()),
+            ("product_id", self.product_id.as_str()),
+            ("source_id", self.source_id.as_str()),
         ] {
             validate_text(field, value)?;
         }
-        if let Some(task_ref) = &self.task_ref {
-            validate_text("task_ref", task_ref)?;
+        if let Some(work_scope_ref) = &self.expected_work_scope_ref {
+            validate_text("expected_work_scope_ref", work_scope_ref)?;
         }
-        if self.task_ref.is_some() != self.task_revision.is_some()
-            || self.task_revision.is_some_and(|revision| revision == 0)
-        {
-            return Err(WireValidationError::InvalidField("task_binding"));
+        if let Some(session_id) = &self.session_id {
+            validate_text("session_id", session_id)?;
+        }
+        if let Some(task_id) = &self.task_id {
+            validate_text("task_id", task_id)?;
         }
         validate_digest("process_binding_sha256", &self.process_binding_sha256)?;
         validate_digest("outer_request_sha256", &self.outer_request_sha256)?;
@@ -525,6 +536,8 @@ pub enum BlobProcessStreamOwnerFactsPullOutcome {
     /// All independent verified owner facts needed by the Store resolver are
     /// current and refer to the exact WorkScope/source/process binding.
     Available {
+        /// Exact WorkScope binding selected by the daemon's independent lookup.
+        work_scope_ref: String,
         /// Opaque resolver lookup reference for the complete validated fact set.
         owner_facts_ref: String,
         /// Digest of the complete owner-facts record.
@@ -613,6 +626,7 @@ impl BlobProcessStreamOwnerFactsPullResponse {
         } = &self.outcome
         {
             for (field, value) in [
+                ("work_scope_ref", work_scope_ref),
                 ("owner_facts_ref", owner_facts_ref),
                 ("matched_guard_receipt_ref", matched_guard_receipt_ref),
                 ("canonical_source_receipt_ref", canonical_source_receipt_ref),
@@ -660,6 +674,15 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             || self.observed_state_fence != request.state_fence
         {
             return Err(WireValidationError::InvalidField("owner_facts_binding"));
+        }
+        if let BlobProcessStreamOwnerFactsPullOutcome::Available { work_scope_ref, .. } =
+            &self.outcome
+            && request
+                .expected_work_scope_ref
+                .as_deref()
+                .is_some_and(|expected| expected != work_scope_ref)
+        {
+            return Err(WireValidationError::InvalidField("work_scope_binding"));
         }
         Ok(())
     }
