@@ -36,7 +36,28 @@
   "module_status": "ADMITTED",
   "prototypes": 9,
   "prototype_targets": 22,
+  "single_writer": "T8-A0",
   "single_writer_comment": "Wave admission (#829/T8-A0) is the single serialized root turn",
+  "single_writer_scope": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "docs/code-navigation/PACKAGE_DOCS_INDEX.md",
+    "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md"
+  ],
+  "single_writer_scope_note": "The root/lock/index families the serialized T8-A0 turn is authorized to write. The turn additionally wrote the six package manifests/routers and the owned proof fixtures; those are the issue's own declared mutable scope, not the root lane.",
+  "admission_merge_commit": "f36816b8d",
+  "admission_parent_commit": "bf219fe3a9615877c6870c0dfbecc1dce97b3904",
+  "pre_admission": {
+    "note": "State observed at the admission merge parent, i.e. BEFORE the #829 T8-A0 root turn. This is the only state allowed to prove pre-admission readiness; status=ADMITTED is written BY the admission and can never be its own prerequisite.",
+    "base_commit": "bf219fe3a9615877c6870c0dfbecc1dce97b3904",
+    "module_status": "PROTOTYPE",
+    "writer_comment": "A cell moves from `exclude` to `members` in its own work unit, as the last commit, once its `[acceptance]` gate passes. That one-line move is the only edit to this file a cell work unit may make. See I0.12 and I2.11.",
+    "writer_comment_lines": [
+      "  # A cell moves from `exclude` to `members` in its own work unit, as the last",
+      "  # commit, once its `[acceptance]` gate passes. That one-line move is the only",
+      "  # edit to this file a cell work unit may make. See I0.12 and I2.11."
+    ]
+  },
   "six": [
     {
       "agent_order": 3,
@@ -48,7 +69,12 @@
       "leaf_issue": 578,
       "lib_sha256": "5bc27114238aa51cf28748ad62bd4e65914a64abb5e7d228924312fac63fea30",
       "name": "eliot-dreamer-contracts",
-      "source_layer": "C0"
+      "source_layer": "C0",
+      "test_root": "crates/smart/eliot-dreamer-contracts/tests",
+      "matrix_cases": 161,
+      "matrix_sha256": "ecb7d419320ffd1aeebe549b8bec45f136fa824523ce6f035d82ca6261cb3c98",
+      "descriptor_toml": "schema_version = \"eliot-work-unit-descriptor-v2\"\nidentity = {value = \"work-unit-578\"}\nissue = {repository = {owner = \"UnknownAlienHuman\", name = \"eliot-memory-os\"}, number = 578}\nunit = {value = \"T8-A0\"}\nmode = \"rust-package\"\nsource_roots = [{value = \"crates/smart/eliot-dreamer-contracts/src/lib.rs\"}]\ntest_roots = [{value = \"crates/smart/eliot-dreamer-contracts/tests\"}]\nmatrix_cases = 161\nproof_ceiling = {value = \"workspace-integration\"}\nrevision = 1\nbody_sha256 = \"5bc27114238aa51cf28748ad62bd4e65914a64abb5e7d228924312fac63fea30\"\nmatrix_sha256 = \"ecb7d419320ffd1aeebe549b8bec45f136fa824523ce6f035d82ca6261cb3c98\"\nrequire_workspace_member = true\npackage = {name = \"eliot-dreamer-contracts\"}\nmodule = {value = \"smart.dreamer.contracts\"}\nrequirements = {source_floor = 1, public_floor = 1, test_floor = 161, required_guards = [{value = \"bounded\"}]}\nbounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}",
+      "wave": "T8-A0"
     },
     {
       "agent_order": 6,
@@ -60,7 +86,12 @@
       "leaf_issue": 580,
       "lib_sha256": "db4a6367f1e856b946717acd1677ffaae6284856a2c0a9ba0602c4848ed349c1",
       "name": "eliot-epistemic-contracts",
-      "source_layer": "C1"
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-epistemic-contracts/tests",
+      "matrix_cases": 51,
+      "matrix_sha256": "648d11908965a0ecdf8eefa6ae3af209ac850fe751b0e3bbedf86e8ed64dc0ca",
+      "descriptor_toml": "schema_version = \"eliot-work-unit-descriptor-v2\"\nidentity = {value = \"work-unit-580\"}\nissue = {repository = {owner = \"UnknownAlienHuman\", name = \"eliot-memory-os\"}, number = 580}\nunit = {value = \"T8-A0\"}\nmode = \"rust-package\"\nsource_roots = [{value = \"crates/smart/eliot-epistemic-contracts/src/lib.rs\"}]\ntest_roots = [{value = \"crates/smart/eliot-epistemic-contracts/tests\"}]\nmatrix_cases = 51\nproof_ceiling = {value = \"workspace-integration\"}\nrevision = 1\nbody_sha256 = \"db4a6367f1e856b946717acd1677ffaae6284856a2c0a9ba0602c4848ed349c1\"\nmatrix_sha256 = \"648d11908965a0ecdf8eefa6ae3af209ac850fe751b0e3bbedf86e8ed64dc0ca\"\nrequire_workspace_member = true\npackage = {name = \"eliot-epistemic-contracts\"}\nmodule = {value = \"smart.epistemic.contracts\"}\nrequirements = {source_floor = 1, public_floor = 1, test_floor = 51, required_guards = [{value = \"bounded\"}]}\nbounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}",
+      "wave": "T8-A0"
     },
     {
       "agent_order": 10,
@@ -72,7 +103,12 @@
       "leaf_issue": 804,
       "lib_sha256": "7929c33a90b7606678533c8e59408e0522b185dc575f5aeb1fd492a2ac7f536d",
       "name": "eliot-cue-contracts",
-      "source_layer": "C1"
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-cue-contracts/tests",
+      "matrix_cases": 76,
+      "matrix_sha256": "d514a5b96381d4db1ff86be5a779c586b26cd0c766a352308acd8a2452ade4b4",
+      "descriptor_toml": "schema_version = \"eliot-work-unit-descriptor-v2\"\nidentity = {value = \"work-unit-804\"}\nissue = {repository = {owner = \"UnknownAlienHuman\", name = \"eliot-memory-os\"}, number = 804}\nunit = {value = \"T8-A0\"}\nmode = \"rust-package\"\nsource_roots = [{value = \"crates/smart/eliot-cue-contracts/src/lib.rs\"}]\ntest_roots = [{value = \"crates/smart/eliot-cue-contracts/tests\"}]\nmatrix_cases = 76\nproof_ceiling = {value = \"workspace-integration\"}\nrevision = 1\nbody_sha256 = \"7929c33a90b7606678533c8e59408e0522b185dc575f5aeb1fd492a2ac7f536d\"\nmatrix_sha256 = \"d514a5b96381d4db1ff86be5a779c586b26cd0c766a352308acd8a2452ade4b4\"\nrequire_workspace_member = true\npackage = {name = \"eliot-cue-contracts\"}\nmodule = {value = \"smart.cue.contracts\"}\nrequirements = {source_floor = 1, public_floor = 1, test_floor = 76, required_guards = [{value = \"bounded\"}]}\nbounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}",
+      "wave": "T8-A0"
     },
     {
       "agent_order": 15,
@@ -84,7 +120,12 @@
       "leaf_issue": 584,
       "lib_sha256": "ccc233498de7a3198a52d54cb844ae03e1a780cd1098b27489fe1f303b4ac47c",
       "name": "eliot-context-contracts",
-      "source_layer": "C0"
+      "source_layer": "C0",
+      "test_root": "crates/smart/eliot-context-contracts/tests",
+      "matrix_cases": 18,
+      "matrix_sha256": "f9d16482298f45d25a5dfb773e4fedb8f4b68eb96c634c012adfaa63d7742bbf",
+      "descriptor_toml": "schema_version = \"eliot-work-unit-descriptor-v2\"\nidentity = {value = \"work-unit-584\"}\nissue = {repository = {owner = \"UnknownAlienHuman\", name = \"eliot-memory-os\"}, number = 584}\nunit = {value = \"T8-A0\"}\nmode = \"rust-package\"\nsource_roots = [{value = \"crates/smart/eliot-context-contracts/src/lib.rs\"}]\ntest_roots = [{value = \"crates/smart/eliot-context-contracts/tests\"}]\nmatrix_cases = 18\nproof_ceiling = {value = \"workspace-integration\"}\nrevision = 1\nbody_sha256 = \"ccc233498de7a3198a52d54cb844ae03e1a780cd1098b27489fe1f303b4ac47c\"\nmatrix_sha256 = \"f9d16482298f45d25a5dfb773e4fedb8f4b68eb96c634c012adfaa63d7742bbf\"\nrequire_workspace_member = true\npackage = {name = \"eliot-context-contracts\"}\nmodule = {value = \"smart.context.contracts\"}\nrequirements = {source_floor = 1, public_floor = 1, test_floor = 18, required_guards = [{value = \"bounded\"}]}\nbounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}",
+      "wave": "T8-A0"
     },
     {
       "agent_order": 19,
@@ -96,7 +137,12 @@
       "leaf_issue": 586,
       "lib_sha256": "48d2c224360cb061507c1b06a983af0fcc57c00e32284ce3b1f3cf7f2efcc44a",
       "name": "eliot-memory-curation-contracts",
-      "source_layer": "C1"
+      "source_layer": "C1",
+      "test_root": "crates/smart/eliot-memory-curation-contracts/tests",
+      "matrix_cases": 54,
+      "matrix_sha256": "9ce959ebfb948e976d310fb9a7321e0538dacfd1cb8fe775cfc68f0d495986d1",
+      "descriptor_toml": "schema_version = \"eliot-work-unit-descriptor-v2\"\nidentity = {value = \"work-unit-586\"}\nissue = {repository = {owner = \"UnknownAlienHuman\", name = \"eliot-memory-os\"}, number = 586}\nunit = {value = \"T8-A0\"}\nmode = \"rust-package\"\nsource_roots = [{value = \"crates/smart/eliot-memory-curation-contracts/src/lib.rs\"}]\ntest_roots = [{value = \"crates/smart/eliot-memory-curation-contracts/tests\"}]\nmatrix_cases = 54\nproof_ceiling = {value = \"workspace-integration\"}\nrevision = 1\nbody_sha256 = \"48d2c224360cb061507c1b06a983af0fcc57c00e32284ce3b1f3cf7f2efcc44a\"\nmatrix_sha256 = \"9ce959ebfb948e976d310fb9a7321e0538dacfd1cb8fe775cfc68f0d495986d1\"\nrequire_workspace_member = true\npackage = {name = \"eliot-memory-curation-contracts\"}\nmodule = {value = \"smart.memory.curation_contracts\"}\nrequirements = {source_floor = 1, public_floor = 1, test_floor = 54, required_guards = [{value = \"bounded\"}]}\nbounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}",
+      "wave": "T8-A0"
     },
     {
       "agent_order": 32,
@@ -108,7 +154,12 @@
       "leaf_issue": 590,
       "lib_sha256": "11306356b374e11ae79b0feffd975a82175ac1db6e3e29938e49244c384b8826",
       "name": "eliot-learning-contracts",
-      "source_layer": "C0"
+      "source_layer": "C0",
+      "test_root": "crates/smart/eliot-learning-contracts/tests",
+      "matrix_cases": 70,
+      "matrix_sha256": "f177efe09ad1d1cb84928b7017de50296da320be753686d9c4810b10d9f60175",
+      "descriptor_toml": "schema_version = \"eliot-work-unit-descriptor-v2\"\nidentity = {value = \"work-unit-590\"}\nissue = {repository = {owner = \"UnknownAlienHuman\", name = \"eliot-memory-os\"}, number = 590}\nunit = {value = \"T8-A0\"}\nmode = \"rust-package\"\nsource_roots = [{value = \"crates/smart/eliot-learning-contracts/src/lib.rs\"}]\ntest_roots = [{value = \"crates/smart/eliot-learning-contracts/tests\"}]\nmatrix_cases = 70\nproof_ceiling = {value = \"workspace-integration\"}\nrevision = 1\nbody_sha256 = \"11306356b374e11ae79b0feffd975a82175ac1db6e3e29938e49244c384b8826\"\nmatrix_sha256 = \"f177efe09ad1d1cb84928b7017de50296da320be753686d9c4810b10d9f60175\"\nrequire_workspace_member = true\npackage = {name = \"eliot-learning-contracts\"}\nmodule = {value = \"smart.learning.contracts\"}\nrequirements = {source_floor = 1, public_floor = 1, test_floor = 70, required_guards = [{value = \"bounded\"}]}\nbounds = {wall_ms = 10000, idle_ms = 5000, output_bytes = 65536, line_bytes = 4096, discovery_tests = 1000, child_processes = 4}",
+      "wave": "T8-A0"
     }
   ]
 }

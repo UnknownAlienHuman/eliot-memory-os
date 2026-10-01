@@ -17,6 +17,30 @@ Every assertion derives from repository file bytes or live command output
 same validator functions as the positive legs; no assertion echoes a
 prewritten ``expected: fail`` label.
 
+Activation/prerequisite cases (1, 3, 4, 6) consume accepted owner evidence
+instead of asserting it:
+
+- cases 1 and 3 read each leaf's #837 descriptor from
+  ``wave-c0/candidate.json`` and run it through the accepted gate's own
+  ``scripts/work_unit_gate/descriptor_runner.py::decode_descriptor`` /
+  ``::resolve_package_manifest``, so leaf assignment, proof receipt,
+  freshness and writer authority are OBSERVED, not hand-written. Both
+  negative legs of case 1 (a foreign descriptor field, a matrix count above
+  the declared test floor) enter that same gate and are refused by it;
+- case 3 reads leaf state at the admission merge parent
+  (``pre_admission.base_commit``) -- the state that existed BEFORE the #829
+  turn. ``status = ADMITTED`` is written BY the admission and can never be
+  its own prerequisite. Its negatives re-observe through the same owner
+  paths: a descriptor whose bound body digest no longer matches its source,
+  and a leaf commit that is not an ancestor of that parent;
+- case 4 DERIVES every proof field from the observed subprocess result and
+  the descriptor binding; nothing about the outcome is written by the test
+  that ran the command. Its negatives re-enter ``derive_proof_receipt`` with
+  real ``CompletedProcess`` results and real descriptor bindings;
+- case 6 checks the writer rule against an INDEPENDENT expected set -- the
+  write seams actually declared for the unit -- never against a copy of the
+  list the validator then checks.
+
 Documented runners (repo root, ``CARGO_TARGET_DIR`` set per owner disk rule)::
 
     python -m py_compile scripts/tests/test_wave_admission_c0.py
@@ -41,9 +65,17 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 from code_navigation_lib.registry import build_registry
+# Accepted #837 evidence API, consumed exactly as the sibling wave suites
+# (scripts/tests/test_wave_admission_d0.py:557) consume it. This is the real
+# owner path; no second evidence mechanism is defined here.
+from scripts.work_unit_gate.descriptor_runner import (
+    RunnerInputError, decode_descriptor, resolve_package_manifest,
+)
 
 FIX = ROOT / "scripts" / "testdata" / "work-unit-gate" / "wave-c0"
 BASE_SHA = "bf219fe3a9615877c6870c0dfbecc1dce97b3904"
@@ -145,14 +177,32 @@ def validate_wave_state(members: list[str], exclude: list[str],
     return errors
 
 
-def validate_activation(prereqs: dict[str, bool]) -> tuple[bool, list[str]]:
-    missing = sorted(name for name, ok in prereqs.items() if not ok)
+def validate_activation(evidence: dict[str, list[str]]) -> tuple[bool, list[str]]:
+    """Activation gate over OBSERVED prerequisite evidence.
+
+    ``evidence`` maps prerequisite name -> list of human-readable defects
+    found by its owner path. An empty defect list means that prerequisite's
+    real evidence was consumed and found complete; a non-empty list blocks
+    activation. Callers must build these records from repository bytes, the
+    accepted #837 gate API and git, never from a literal they choose.
+    """
+    missing = sorted(name for name, defects in evidence.items() if defects)
     if missing:
-        return False, [f"prerequisite missing: {name}" for name in missing]
+        return False, [f"prerequisite incomplete: {name}: {d}"
+                       for name in missing for d in evidence[name]]
     return True, []
 
 
 def validate_leaf_evidence(entries: list[dict]) -> list[str]:
+    """Leaf-evidence shape check over OBSERVED per-leaf records.
+
+    Every field below must be produced by ``observe_leaf_evidence`` from
+    pre-admission repository state (see ``test_03``). The ``accepted`` field
+    is checked against the PRE-admission module status the gate owner
+    (``candidate.json`` ``pre_admission.module_status``), never against
+    ``ADMITTED`` -- which the admission itself writes and which therefore
+    cannot be its own prerequisite.
+    """
     errors: list[str] = []
     for entry in entries:
         tag = entry.get("name", "?")
@@ -162,22 +212,390 @@ def validate_leaf_evidence(entries: list[dict]) -> list[str]:
             errors.append(f"missing router: {tag}")
         if not entry.get("merged"):
             errors.append(f"unmerged leaf: {tag}")
-        if entry.get("status") != "ADMITTED":
-            errors.append(f"unaccepted leaf: {tag}")
+        if entry.get("status") != entry.get("expected_pre_admission_status"):
+            errors.append(
+                f"unaccepted leaf: {tag}: pre-admission status "
+                f"{entry.get('status')!r} != expected "
+                f"{entry.get('expected_pre_admission_status')!r}")
+        if not entry.get("descriptor_accepted"):
+            errors.append(f"descriptor not accepted by #837 gate: {tag}")
     return errors
 
 
 def validate_proof(receipts: list[dict]) -> list[str]:
+    """Package-proof check over receipts DERIVED from the observed run.
+
+    A receipt is built by ``derive_proof_receipt`` from a real
+    ``CompletedProcess`` and its #837 descriptor binding. Nothing here is
+    authored by the test that launched the command: ``exit_code`` is the
+    subprocess returncode, ``passed``/``failed`` are parsed from its output,
+    ``partial`` is passed != the descriptor's ``matrix_cases``, and
+    ``stale`` is the descriptor's bound digests disagreeing with current
+    source bytes. The ``outcome`` label is recomputed here from those facts.
+    """
     errors: list[str] = []
     for receipt in receipts:
         tag = receipt.get("name", "?")
-        if receipt.get("outcome") != "EXECUTED_PASS":
-            errors.append(f"proof not executed-pass: {tag}")
+        expected = derive_outcome(receipt)
+        if receipt.get("outcome") != expected:
+            errors.append(
+                f"proof label not derived from run: {tag}: "
+                f"{receipt.get('outcome')!r} != {expected!r}")
+        if expected != "EXECUTED_PASS":
+            errors.append(f"proof not executed-pass: {tag}: {expected}")
         if receipt.get("partial"):
-            errors.append(f"partial proof: {tag}")
+            errors.append(
+                f"partial proof: {tag}: {receipt.get('passed')} of "
+                f"{receipt.get('required_cases')}")
         if receipt.get("stale"):
-            errors.append(f"stale proof: {tag}")
+            errors.append(
+                f"stale proof: {tag}: {receipt.get('stale_reason')}")
     return errors
+
+
+def derive_outcome(receipt: dict) -> str:
+    """Outcome label DERIVED from the observed subprocess, never authored."""
+    if receipt.get("stale"):
+        return "STALE"
+    if receipt.get("exit_code") != 0:
+        return "EXECUTED_FAIL"
+    if receipt.get("failed"):
+        return "EXECUTED_FAIL"
+    if receipt.get("partial"):
+        return "EXECUTED_PARTIAL"
+    if not receipt.get("passed"):
+        return "EXECUTED_EMPTY"
+    return "EXECUTED_PASS"
+
+
+def derive_proof_receipt(item: dict, run: subprocess.CompletedProcess,
+                         decoded: dict) -> dict:
+    """Build one proof receipt from the real subprocess + descriptor binding.
+
+    ``decoded`` is the descriptor as the accepted #837 gate decoded it. Every
+    field is a measurement of something that happened, so the caller cannot
+    pass its own verdict in.
+    """
+    combined = run.stdout + run.stderr
+    passed = sum(int(m) for m in re.findall(r"(\d+) passed", combined))
+    failed = sum(int(m) for m in re.findall(r"(\d+) failed", combined))
+    ignored = sum(int(m) for m in re.findall(r"(\d+) ignored", combined))
+    required = decoded["matrix_cases"]
+    body_now = sha256_bytes(read_bytes(f"{item['crate_path']}/src/lib.rs"))
+    matrix_now = matrix_sha_of(item)
+    stale_reasons = []
+    if body_now != decoded["body_sha256"]:
+        stale_reasons.append(f"body digest {body_now} != descriptor {decoded['body_sha256']}")
+    if matrix_now != decoded["matrix_sha256"]:
+        stale_reasons.append(
+            f"matrix digest {matrix_now} != descriptor {decoded['matrix_sha256']}")
+    run_reasons = []
+    if run.returncode != 0:
+        run_reasons.append(f"cargo test exit {run.returncode}")
+    receipt = {
+        "name": item["name"],
+        "exit_code": run.returncode,
+        "passed": passed,
+        "failed": failed,
+        "ignored": ignored,
+        "required_cases": required,
+        "body_sha256": body_now,
+        "matrix_sha256": matrix_now,
+        "stale": bool(stale_reasons),
+        "stale_reason": "; ".join(stale_reasons),
+        "run_reason": "; ".join(run_reasons),
+    }
+    receipt["partial"] = passed != required or bool(ignored)
+    receipt["outcome"] = derive_outcome(receipt)
+    return receipt
+
+
+def matrix_sha_of(item: dict) -> str:
+    """Live matrix digest of a leaf's test roots, as the descriptor binds them.
+
+    Same definition the sibling suites use: one test file's bytes, or the
+    concatenated bytes of the sorted test files under a test directory.
+    """
+    root = ROOT / item["test_root"]
+    if root.is_file():
+        return sha256_bytes(root.read_bytes())
+    digest = hashlib.sha256()
+    for rs in sorted(root.rglob("*.rs")):
+        digest.update(rs.read_bytes())
+    return digest.hexdigest()
+
+
+def descriptor_bytes(item: dict) -> bytes:
+    """Frozen #837 descriptor for one leaf, as owned by candidate.json."""
+    return item["descriptor_toml"].encode("utf-8")
+
+
+def descriptor_name(item: dict) -> str:
+    """Registered repository-relative descriptor path for one leaf."""
+    return f".github/work-units/{item['leaf_issue']}.toml"
+
+
+def accept_descriptor(item: dict) -> dict:
+    """Run a leaf's descriptor through the accepted #837 gate.
+
+    Returns the decoded descriptor as the gate itself decoded it. Raises
+    ``RunnerInputError`` if the frozen evidence is not accepted.
+    """
+    return decode_descriptor(descriptor_bytes(item), descriptor_name(item))
+
+
+def descriptor_defects(item: dict) -> list[str]:
+    """Defects in a leaf's frozen #837 descriptor, per the real gate.
+
+    The gate rejects with a stable redacted code; that code is the defect.
+    The identity/membership checks below additionally prove the decoded
+    descriptor still binds THIS leaf's package, module and digests.
+    """
+    try:
+        decoded = accept_descriptor(item)
+    except RunnerInputError as exc:
+        return [f"descriptor rejected by #837 gate: {exc}"]
+    defects = []
+    if decoded["issue"]["number"] != item["leaf_issue"]:
+        defects.append(
+            f"descriptor issue {decoded['issue']['number']} != leaf "
+            f"{item['leaf_issue']}")
+    if decoded["identity"]["value"] != f"work-unit-{item['leaf_issue']}":
+        defects.append(f"descriptor identity {decoded['identity']['value']!r}")
+    if decoded["package"] != {"name": item["name"]}:
+        defects.append(f"descriptor package {decoded['package']} != {item['name']}")
+    if decoded["module"]["value"] != item["functional_cell"]:
+        defects.append(
+            f"descriptor module {decoded['module']['value']!r} != "
+            f"{item['functional_cell']!r}")
+    if decoded["unit"]["value"] != item["wave"]:
+        defects.append(
+            f"descriptor unit {decoded['unit']['value']!r} != {item['wave']!r}")
+    if decoded["require_workspace_member"] is not True:
+        defects.append("descriptor does not require workspace membership")
+    if decoded["proof_ceiling"]["value"] != "workspace-integration":
+        defects.append(
+            f"proof ceiling {decoded['proof_ceiling']['value']!r} is not "
+            f"workspace-integration")
+    if decoded["body_sha256"] != item["lib_sha256"]:
+        defects.append("descriptor body digest is not the leaf body digest")
+    if decoded["matrix_sha256"] != item["matrix_sha256"]:
+        defects.append("descriptor matrix digest is not the leaf matrix digest")
+    if decoded["requirements"]["test_floor"] < decoded["matrix_cases"]:
+        defects.append("descriptor test floor omits matrix cases")
+    for root in decoded["source_roots"] + decoded["test_roots"]:
+        if not (ROOT / root["value"]).exists():
+            defects.append(f"descriptor root missing on disk: {root['value']}")
+    return defects
+
+
+def membership_binding(item: dict, metadata: dict) -> dict:
+    """Bind one leaf package through the accepted gate's membership path.
+
+    ``resolve_package_manifest`` classifies the package from real cargo
+    metadata entries and REJECTS a membership-required descriptor whose
+    package is not an actual workspace member. That rejection is the
+    membership proof, produced by the owner path rather than asserted.
+    """
+    return resolve_package_manifest(
+        package_name=item["name"],
+        metadata_packages=cargo_metadata_packages(metadata),
+        require_workspace_member=True,
+    )
+
+
+def cargo_metadata_packages(metadata: dict) -> list[dict]:
+    """Classify every in-repository cargo package into the gate's kinds.
+
+    Derivation: a package listed in ``metadata.workspace_members`` or
+    sitting directly under a root ``members`` entry is a member; one whose
+    manifest sits directly under a root ``exclude`` entry is excluded; one
+    that declares its own ``[workspace]`` table is standalone; anything else
+    -- including every registry/remote dependency, which has no repository-
+    relative manifest path at all -- is unavailable. This feeds the gate's
+    ``resolve_package_manifest`` the closed entry shape it requires.
+
+    Only repository-local packages get an entry: the gate's path contract is
+    repository-relative, and registry manifests (``~/.cargo/registry/...``)
+    have no such form.
+    """
+    ws = root_workspace()
+    members = set(ws.get("members", []))
+    excluded = set(ws.get("exclude", []))
+    member_ids = set(metadata["workspace_members"])
+    prefix = ROOT.as_posix() + "/"
+    entries = []
+    for pkg in metadata["packages"]:
+        manifest_abs = pkg["manifest_path"].replace("\\", "/")
+        if not manifest_abs.startswith(prefix):
+            continue
+        manifest_rel = manifest_abs[len(prefix):]
+        parent = manifest_rel.rsplit("/", 1)[0]
+        if pkg["id"] in member_ids or parent in members:
+            kind = "member"
+        elif parent in excluded:
+            kind = "excluded"
+        elif re.search(r"(?m)^\s*\[workspace\]",
+                       read_bytes(manifest_rel).decode("utf-8", "replace")):
+            kind = "standalone"
+        else:
+            kind = "unavailable"
+        entries.append({"name": pkg["name"], "manifest_rel": manifest_rel,
+                        "member_kind": kind})
+    return entries
+
+
+def observe_leaf_evidence(item: dict, candidate: dict) -> dict:
+    """Derive one leaf's readiness record from PRE-admission state only.
+
+    Every field is measured: manifest/router presence from the admission
+    parent's tree, ``merged`` from git ancestry of that parent's own leaf
+    commits, ``status`` from the module.toml AT that parent, and
+    ``descriptor_accepted`` from the real #837 gate. The post-admission
+    ``ADMITTED`` status is never read here.
+    """
+    parent = candidate["pre_admission"]["base_commit"]
+    manifest = git("show", f"{parent}:{item['crate_path']}/Cargo.toml")
+    router = git("show", f"{parent}:{item['crate_path']}/module.toml")
+    status = None
+    if router.returncode == 0:
+        status = tomllib.loads(router.stdout).get("status")
+    leaf_commits = candidate["leaf_commits"][item["name"]]
+    merged = bool(leaf_commits)
+    for sha in leaf_commits:
+        probe = git("merge-base", "--is-ancestor", sha, parent)
+        merged = merged and probe.returncode == 0
+    defects = descriptor_defects(item)
+    return {
+        "name": item["name"],
+        "manifest_present": manifest.returncode == 0,
+        "router_present": router.returncode == 0,
+        "merged": merged,
+        "leaf_commits": list(leaf_commits),
+        "status": status,
+        "expected_pre_admission_status":
+            candidate["pre_admission"]["module_status"],
+        "descriptor_accepted": not defects,
+        "descriptor_defects": defects,
+        "observed_at": parent,
+    }
+
+
+def blocking_challenges(six_names: set[str]) -> list[dict]:
+    """Open challenge entries naming any of the six, read from the owner file.
+
+    Same closed read the sibling cases perform against
+    ``crates/smart/cognitive-contract-challenges.toml``; an entry blocks only
+    when its status is OPEN (``OPEN_*``) AND its ``needed_by`` names one of
+    the six admitted packages.
+    """
+    text = read_bytes("crates/smart/cognitive-contract-challenges.toml").decode("utf-8")
+    open_entries: list[dict] = []
+    current: dict | None = None
+    for line in text.splitlines():
+        if line.strip() == "[[challenge]]":
+            current = {"needed_by": []}
+            open_entries.append(current)
+        elif current is not None and line.startswith("status ="):
+            current["status"] = line.split("=", 1)[1].strip().strip('"')
+        elif current is not None and line.startswith("needed_by ="):
+            current["needed_by"] = json.loads(
+                line.split("=", 1)[1].strip().replace("'", '"'))
+        elif current is not None and line.startswith("id ="):
+            current["id"] = line.split("=", 1)[1].strip().strip('"')
+    return [e for e in open_entries
+            if str(e.get("status", "")).startswith("OPEN")
+            and six_names & set(e.get("needed_by", []))]
+
+
+def activation_evidence(candidate: dict, six: list[dict], metadata: dict,
+                        proof_receipts: dict[str, dict],
+                        leaf_records: list[dict]) -> dict[str, list[str]]:
+    """Build C1's prerequisite record from owner paths, not from literals.
+
+    Each prerequisite names the accepted evidence it consumes and returns
+    its observed defects (empty when satisfied). Every input is a real
+    observation produced above; nothing here is a chosen verdict.
+    """
+    six_names = {item["name"] for item in six}
+    membership_defects = []
+    for item in six:
+        try:
+            binding = membership_binding(item, metadata)
+        except RunnerInputError as exc:
+            membership_defects.append(f"{item['name']}: {exc}")
+            continue
+        # The gate returned a binding; its kind must itself say "member",
+        # otherwise a membership-required descriptor would be admitted on a
+        # merely buildable package.
+        if binding["member_kind"] != "member":
+            membership_defects.append(
+                f"{item['name']}: bound as {binding['member_kind']}")
+    leaf_defects = [d for record in leaf_records
+                    for d in record["descriptor_defects"]]
+    proof_defects = [e for item in six
+                     for e in validate_proof([proof_receipts[item["name"]]])]
+    challenge_blockers = blocking_challenges(six_names)
+    writer_defects = validate_single_writer(
+        observed_writers=declared_write_seams(candidate),
+        expected_writers=authorized_write_seams(candidate))
+    plan_defects = []
+    head = git("rev-parse", "HEAD")
+    if head.returncode != 0:
+        plan_defects.append("HEAD is not resolvable")
+    else:
+        base = git("merge-base", "--is-ancestor",
+                   candidate["admission_parent_commit"], head.stdout.strip())
+        if base.returncode != 0:
+            plan_defects.append(
+                "admission parent is not an ancestor of HEAD")
+    return {
+        "leaf-evidence": leaf_defects,
+        "package-membership": membership_defects,
+        "package-proof": proof_defects,
+        "challenges-clear": validate_challenges(challenge_blockers, six_names),
+        "single-writer": writer_defects,
+        "plan-current": plan_defects,
+    }
+
+
+def declared_write_seams(candidate: dict) -> set[str]:
+    """Who actually holds the root/lock/index lane, per the owner path.
+
+    The lane holder is named by the root manifest's serialized-turn comment
+    AT the admission commit, and that turn is real only if it actually wrote
+    the root/lock/index families. Derived from git, not from a literal.
+    """
+    merge = candidate["admission_merge_commit"]
+    parent = candidate["admission_parent_commit"]
+    comment = git("show", f"{merge}:Cargo.toml")
+    if comment.returncode != 0:
+        return set()
+    unit = None
+    for line in comment.stdout.splitlines():
+        if "single serialized root turn" in line:
+            found = re.search(r"/([A-Za-z0-9\-]+)\)", line)
+            if found:
+                unit = found.group(1)
+    if unit is None:
+        return set()
+    changed = set(git("diff", "--name-only", parent, merge).stdout.split())
+    root_families = set(candidate["single_writer_scope"])
+    # The named turn must have actually written the root families; otherwise
+    # it never held the lane and grants no authority.
+    if not root_families <= changed:
+        return set()
+    return {unit}
+
+
+def authorized_write_seams(candidate: dict) -> set[str]:
+    """Independently derived expectation of who may hold the root lane.
+
+    Built from the frozen issue-owned candidate record's ``single_writer``,
+    a different owner path than ``declared_write_seams`` reads. Neither is a
+    copy of the list the validator checks.
+    """
+    return {candidate["single_writer"]}
 
 
 def validate_challenges(open_entries: list[dict], six_names: set[str]) -> list[str]:
@@ -188,10 +606,29 @@ def validate_challenges(open_entries: list[dict], six_names: set[str]) -> list[s
     return errors
 
 
-def validate_single_writer(writers: list[str]) -> list[str]:
-    if len(writers) != 1:
-        return [f"expected exactly one root/lock/index writer, found {len(writers)}"]
-    return []
+def validate_single_writer(observed_writers: set[str],
+                           expected_writers: set[str]) -> list[str]:
+    """Single-writer rule checked against an INDEPENDENT expected set.
+
+    ``observed_writers`` is what the owner paths actually declare (derived
+    from the root manifest's serialized-turn comment and the frozen write
+    scope). ``expected_writers`` is a separately-derived set naming who is
+    authorized to hold the root/lock/index lane. Authority is therefore
+    granted by the evidence, never by a string list the validator is then
+    handed as its own input.
+    """
+    errors: list[str] = []
+    extra = sorted(observed_writers - expected_writers)
+    if extra:
+        errors.append(f"unauthorized root/lock/index writer: {extra}")
+    missing = sorted(expected_writers - observed_writers)
+    if missing:
+        errors.append(f"authorized writer did not take the lane: {missing}")
+    if len(observed_writers) != 1:
+        errors.append(
+            f"expected exactly one root/lock/index writer, found "
+            f"{len(observed_writers)}: {sorted(observed_writers)}")
+    return errors
 
 
 FMT_ONLY_RS_ALLOWLIST = frozenset({
@@ -324,22 +761,93 @@ class TestWaveAdmissionC0(unittest.TestCase):
         cls.code_nav = py_script("scripts/code_navigation.py", "check", "--root", ".")
         cls.dep_policy = py_script("scripts/verify-dependency-policy.py",
                                    "--root", ".", "--profile", "offline-source")
+        # Proof receipts are DERIVED from each real cargo run bound to its
+        # accepted #837 descriptor (see derive_proof_receipt). Nothing about
+        # the outcome is written by the test that launched the command.
+        cls.proof_receipts = {
+            item["name"]: derive_proof_receipt(
+                item, cls.test_runs[item["name"]], accept_descriptor(item))
+            for item in cls.six
+        }
+        # Per-leaf records observed from the PRE-admission tree (test 3).
+        cls.leaf_records = [observe_leaf_evidence(item, cls.candidate)
+                            for item in cls.six]
+
+    def _evidence(self) -> dict[str, list[str]]:
+        """Every C1 prerequisite, recomputed from the observed class state."""
+        return activation_evidence(self.candidate, self.six, self.metadata,
+                                   self.proof_receipts, self.leaf_records)
 
     # WORK_UNIT_CASE: 829/1
     def test_01_activation_refuses_incomplete_prerequisites(self) -> None:
-        live = {item["name"]: True for item in self.six}
-        granted, errors = validate_activation(live)
+        # Activation consumes OBSERVED evidence from each owner path: the
+        # #837 descriptor gate, the gate's membership binding, the derived
+        # package proof, the challenge file, the write-lane evidence and the
+        # plan's git ancestry. No literal booleans grant authority.
+        evidence = self._evidence()
+        self.assertEqual(sorted(evidence), [
+            "challenges-clear", "leaf-evidence", "package-membership",
+            "package-proof", "plan-current", "single-writer"])
+        self.assertTrue(all(not defects for defects in evidence.values()), evidence)
+        granted, errors = validate_activation(evidence)
         self.assertTrue(granted)
         self.assertEqual(errors, [])
-        for victim in self.six_names:
-            prereqs = dict(live)
-            prereqs[victim] = False
-            granted, errors = validate_activation(prereqs)
-            self.assertFalse(granted)
-            self.assertTrue(any(victim in e for e in errors))
+        # Each prerequisite genuinely blocked is refused, and its OWN observed
+        # defect message appears -- the negative enters the same validator.
+        for prereq in evidence:
+            blocked = dict(evidence)
+            blocked[prereq] = [f"observed defect in {prereq}"]
+            granted, errors = validate_activation(blocked)
+            self.assertFalse(granted, prereq)
+            self.assertTrue(any(prereq in e for e in errors), prereq)
+        # The membership prerequisite is real: the accepted gate itself
+        # refuses a package that is not a workspace member under the
+        # membership-required mode every one of these six descriptors sets.
+        # The witness is the FIRST still-excluded package in the real root
+        # manifest -- nothing about it is written here -- and the
+        # classification it is checked against is the SAME one C1 consumed.
+        classified = cargo_metadata_packages(self.metadata)
+        excluded_witness = root_workspace()["exclude"][0]
+        witness_name = load_toml(f"{excluded_witness}/Cargo.toml")["package"]["name"]
+        with self.assertRaises(RunnerInputError) as ctx:
+            resolve_package_manifest(
+                package_name=witness_name,
+                metadata_packages=classified,
+                require_workspace_member=True)
+        self.assertEqual(str(ctx.exception), "WORKSPACE_MEMBER_REQUIRED")
+        # The classification is a measurement, not a label: the same gate over
+        # the same list returns "member" for the six, which is why C1's
+        # package-membership prerequisite was empty.
+        for item in self.six:
+            self.assertEqual(membership_binding(item, self.metadata)["member_kind"],
+                             "member", item["name"])
+        # The manifests/routers the evidence reads must really exist.
         for item in self.six:
             self.assertTrue((ROOT / item["crate_path"] / "Cargo.toml").is_file())
             self.assertTrue((ROOT / item["crate_path"] / "module.toml").is_file())
+        # Descriptor negatives enter the SAME owner gate that granted them.
+        # A real acceptance is destroyed by (a) one more required matrix case
+        # than the test floor allows and (b) a foreign field, both of which
+        # the #837 gate rejects; the fixture bytes fed here are the accepted
+        # ones plus that one bounded mutation.
+        base_item = self.six[0]
+        raw = descriptor_bytes(base_item)
+        raised = raw.replace(
+            f"matrix_cases = {base_item['matrix_cases']}\n"
+            f"proof_ceiling = {{value = \"workspace-integration\"}}",
+            f"matrix_cases = {base_item['matrix_cases']}\n"
+            f"proof_ceiling = {{value = \"workspace-integration\"}}\n"
+            f"future_field = \"no\"")
+        self.assertNotEqual(raised, raw)
+        with self.assertRaises(RunnerInputError) as ctx:
+            decode_descriptor(raised, descriptor_name(base_item))
+        self.assertEqual(str(ctx.exception), "CLOSED_FIELDS")
+        low = raw.replace(f"matrix_cases = {base_item['matrix_cases']}\n",
+                          f"matrix_cases = {base_item['matrix_cases'] + 1}\n")
+        self.assertNotEqual(low, raw)
+        with self.assertRaises(RunnerInputError) as ctx:
+            decode_descriptor(low, descriptor_name(base_item))
+        self.assertEqual(str(ctx.exception), "TEST_FLOOR_TOO_LOW")
 
     # WORK_UNIT_CASE: 829/2
     def test_02_exact_six_package_denominator_no_duplicates(self) -> None:
@@ -356,32 +864,198 @@ class TestWaveAdmissionC0(unittest.TestCase):
 
     # WORK_UNIT_CASE: 829/3
     def test_03_missing_unmerged_unaccepted_leaf_blocks_activation(self) -> None:
-        live = [{"name": i["name"], "manifest_present": True,
-                 "router_present": True, "merged": True, "status": "ADMITTED"}
-                for i in self.six]
+        # Evidence is observed from the admission merge parent -- the state
+        # that existed BEFORE the #829 turn. The post-admission ADMITTED
+        # status is never read here, so it can never be its own prerequisite.
+        parent = self.candidate["pre_admission"]["base_commit"]
+        self.assertEqual(parent, BASE_SHA)
+        live = self.leaf_records
         self.assertEqual(validate_leaf_evidence(live), [])
-        for field in ("manifest_present", "router_present", "merged"):
-            bad = [dict(e) for e in live]
-            bad[0][field] = False
-            self.assertTrue(validate_leaf_evidence(bad), field)
-        bad = [dict(e) for e in live]
-        bad[1]["status"] = "PROTOTYPE"
-        errors = validate_leaf_evidence(bad)
-        self.assertTrue(any("unaccepted" in e for e in errors))
+        for record in live:
+            # status came from the PRE-admission module.toml and is not
+            # ADMITTED, proving readiness precedes admission.
+            self.assertEqual(record["observed_at"], parent, record["name"])
+            self.assertNotEqual(record["status"], "ADMITTED", record["name"])
+            self.assertEqual(record["status"],
+                             self.candidate["pre_admission"]["module_status"])
+            # descriptor accepted by the real #837 gate.
+            self.assertTrue(record["descriptor_accepted"],
+                            record["descriptor_defects"])
+            # "merged" was measured by ancestry at that parent, not written.
+            self.assertTrue(record["leaf_commits"], record["name"])
+            for sha in record["leaf_commits"]:
+                probe = git("merge-base", "--is-ancestor", sha, parent)
+                self.assertEqual(probe.returncode, 0, f"{record['name']}@{sha}")
+        # The post-admission label is exactly what readiness may NOT be: the
+        # live routers DO carry ADMITTED, and that state is only reachable
+        # because the records above already proved readiness beforehand.
+        for item in self.six:
+            self.assertEqual(load_toml(f"{item['crate_path']}/module.toml")["status"],
+                             "ADMITTED", item["name"])
+        # UNACCEPTED: a descriptor the #837 gate refuses, mutated in the REAL
+        # fixture bytes and re-observed through the SAME owner path that
+        # granted acceptance. The record's `descriptor_accepted` is produced
+        # by that gate, so the mutation genuinely flips it.
+        item = self.six[0]
+        corrupt = dict(item)
+        corrupt["descriptor_toml"] = item["descriptor_toml"].replace(
+            f'body_sha256 = "{item["lib_sha256"]}"', 'body_sha256 = "0" * 64')
+        self.assertNotEqual(corrupt["descriptor_toml"], item["descriptor_toml"])
+        blocked = observe_leaf_evidence(corrupt, self.candidate)
+        self.assertFalse(blocked["descriptor_accepted"])
+        self.assertTrue(any("descriptor rejected by #837 gate" in d
+                            for d in blocked["descriptor_defects"]),
+                        blocked["descriptor_defects"])
+        self.assertTrue(validate_leaf_evidence([blocked] + live[1:]))
+        # UNMERGED: a leaf whose recorded commit is NOT an ancestor of the
+        # pre-admission parent. The witness is the real admission merge commit
+        # -- an existing commit that sits after the parent by construction --
+        # fed through the same git ancestry probe `observe_leaf_evidence`
+        # uses. Nothing about `merged` is written by this test.
+        item = self.six[1]
+        late = self.candidate["admission_merge_commit"]
+        self.assertNotEqual(
+            git("merge-base", "--is-ancestor", late, parent).returncode, 0)
+        unmerged = observe_leaf_evidence(
+            item, {**self.candidate,
+                   "leaf_commits": {**self.candidate["leaf_commits"],
+                                    item["name"]: [late]}})
+        self.assertFalse(unmerged["merged"], unmerged)
+        self.assertTrue(validate_leaf_evidence(
+            [live[0], unmerged] + live[2:]))
 
     # WORK_UNIT_CASE: 829/4
     def test_04_failed_partial_stale_proof_blocks_activation(self) -> None:
-        live = []
-        for name, run in self.test_runs.items():
-            self.assertEqual(run.returncode, 0, name)
-            self.assertNotIn("FAILED", run.stdout + run.stderr)
-            live.append({"name": name, "outcome": "EXECUTED_PASS",
-                         "partial": False, "stale": False})
+        # Every field is derived from the real cargo run bound to the leaf's
+        # accepted #837 descriptor. The outcome label is recomputed by
+        # validate_proof from the observed facts, never supplied by the test.
+        live = [self.proof_receipts[item["name"]] for item in self.six]
+        for receipt in live:
+            self.assertEqual(receipt["exit_code"], 0,
+                             f"{receipt['name']}: {receipt['run_reason']}")
+            self.assertEqual(receipt["outcome"], "EXECUTED_PASS", receipt["name"])
+            self.assertEqual(receipt["stale"], False,
+                             f"{receipt['name']}: {receipt['stale_reason']}")
+            self.assertEqual(receipt["passed"], receipt["required_cases"],
+                             receipt["name"])
+            self.assertEqual(receipt["partial"], False, receipt["name"])
         self.assertEqual(validate_proof(live), [])
-        for key, val in (("outcome", "EXECUTED_FAIL"), ("partial", True), ("stale", True)):
-            bad = [dict(r) for r in live]
-            bad[2][key] = val
-            self.assertTrue(validate_proof(bad), f"{key}={val}")
+        # Every receipt field is a measurement of the run that produced it:
+        # exit_code is the subprocess returncode and passed/failed/ignored are
+        # parsed out of its captured output. Re-deriving from those same
+        # observations reproduces the receipt exactly, so nothing between the
+        # command and the verdict can be authored.
+        for item in self.six:
+            run = self.test_runs[item["name"]]
+            again = derive_proof_receipt(item, run, accept_descriptor(item))
+            self.assertEqual(again, self.proof_receipts[item["name"]],
+                             item["name"])
+            self.assertEqual(again["exit_code"], run.returncode)
+        # Negatives enter the SAME derivation from real observations. Each
+        # mutation below corrupts exactly one measured fact and the receipt is
+        # re-derived from the command output, never labelled by hand.
+        item = self.six[2]
+        decoded = accept_descriptor(item)
+        run = self.test_runs[item["name"]]
+        # FAILED: a nonzero exit, with the transcript left otherwise intact so
+        # only the exit code distinguishes it from the accepted receipt.
+        fail_run = subprocess.CompletedProcess(
+            args=run.args, returncode=101, stdout=run.stdout, stderr=run.stderr)
+        failed = derive_proof_receipt(item, fail_run, decoded)
+        self.assertEqual(failed["outcome"], "EXECUTED_FAIL")
+        self.assertTrue(failed["run_reason"])
+        self.assertTrue(validate_proof([failed]))
+        self.assertEqual(
+            derive_proof_receipt(item, run, decoded)["outcome"], "EXECUTED_PASS")
+        # PARTIAL: fewer executed tests than the descriptor's matrix_cases.
+        short_run = subprocess.CompletedProcess(
+            args=run.args, returncode=0,
+            stdout="test result: ok. 1 passed; 0 failed; 0 ignored; "
+                   f"{decoded['matrix_cases'] - 1} filtered out; finished in 0.01s\n",
+            stderr="")
+        partial = derive_proof_receipt(item, short_run, decoded)
+        self.assertTrue(partial["partial"], partial)
+        self.assertEqual(partial["outcome"], "EXECUTED_PARTIAL")
+        self.assertTrue(validate_proof([partial]))
+        # EMPTY: the required denominator ran nothing at all. Zero executed
+        # against a non-zero `matrix_cases` is a denominator shortfall, so the
+        # derivation labels it partial -- either way it is refused.
+        empty_run = subprocess.CompletedProcess(
+            args=run.args, returncode=0,
+            stdout="test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; "
+                   "0 filtered out; finished in 0.01s\n", stderr="")
+        empty = derive_proof_receipt(item, empty_run, decoded)
+        self.assertEqual(empty["passed"], 0)
+        self.assertEqual(empty["outcome"], "EXECUTED_PARTIAL")
+        self.assertTrue(validate_proof([empty]))
+        # STALE: the descriptor's bound digests disagreeing with current
+        # source bytes. The stale binding is produced by re-deriving against
+        # the descriptor's real matrix denominator, not by setting a flag.
+        stale_decoded = dict(decoded)
+        stale_decoded["matrix_sha256"] = "0" * 64
+        stale = derive_proof_receipt(item, run, stale_decoded)
+        self.assertTrue(stale["stale"], stale)
+        self.assertEqual(stale["outcome"], "STALE")
+        self.assertTrue(validate_proof([stale]))
+        body_stale = dict(decoded)
+        body_stale["body_sha256"] = "0" * 64
+        self.assertTrue(derive_proof_receipt(item, run, body_stale)["stale"])
+        # An outcome label that disagrees with the receipt's own facts fails,
+        # so a test cannot hand its own verdict to the validator.
+        tampered = [dict(r) for r in live]
+        tampered[3]["exit_code"] = 101
+        tampered[3]["outcome"] = "EXECUTED_PASS"
+        self.assertNotEqual(derive_outcome(tampered[3]), tampered[3]["outcome"])
+        self.assertTrue(validate_proof(tampered))
+
+    # WORK_UNIT_CASE: 829/6
+    def test_06_second_root_writer_blocks_activation(self) -> None:
+        # The writer rule is checked against an INDEPENDENT expected set: the
+        # write seams declared by the root manifest's serialized-turn comment
+        # (observed) versus the candidate's authorized unit (a different owner
+        # path). Never a literal list handed to the validator.
+        observed = declared_write_seams(self.candidate)
+        expected = authorized_write_seams(self.candidate)
+        self.assertEqual(observed, expected)
+        self.assertEqual(validate_single_writer(observed, expected), [])
+        # The expected set is a measurement of an independent owner path, not
+        # a copy of what the validator was handed: it is the candidate's
+        # authorized unit, while `observed` is parsed out of the root
+        # manifest's serialized-turn comment at the admission commit and is
+        # only honoured because that commit actually wrote the declared
+        # root/lock/index scope. Prove neither path can be short-circuited.
+        self.assertEqual(len(expected), 1)
+        # A second root writer is refused: one that took the same lane.
+        self.assertTrue(validate_single_writer(observed | {"T8-A1"}, expected))
+        self.assertTrue(any("unauthorized root/lock/index writer" in e
+                            for e in validate_single_writer(
+                                observed | {"T8-A1"}, expected)))
+        # An authorized writer that never took the lane is refused, and the
+        # holder is reported by name from the independently derived set.
+        withheld = validate_single_writer(set(), expected)
+        self.assertTrue(any("authorized writer did not take the lane" in e
+                            and sorted(expected)[0] in e for e in withheld),
+                        withheld)
+        # A holder nobody authorized is refused under the same validator.
+        self.assertTrue(validate_single_writer(observed, set()))
+        # The lane holder is derived from the commit that really wrote the
+        # root families: point the fixture's scope at a file that turn did not
+        # touch and the holder is withdrawn, so authority is evidence-bound.
+        unreachable = {**self.candidate,
+                       "single_writer_scope": ["CONTRIBUTING.md"]}
+        self.assertEqual(declared_write_seams(unreachable), set())
+        self.assertTrue(validate_single_writer(
+            declared_write_seams(unreachable), expected))
+        # A candidate that names an unauthorized unit in the root comment is
+        # caught by comparing the two independent paths.
+        self.assertNotEqual(
+            declared_write_seams({**self.candidate,
+                                  "admission_merge_commit": BASE_SHA}),
+            expected)
+        base_members = self._base_manifest()["workspace"]["members"]
+        moved = [p for p in self.six_paths if p in root_workspace()["members"]
+                 and p not in base_members]
+        self.assertEqual(sorted(moved), sorted(self.six_paths))
 
     # WORK_UNIT_CASE: 829/5
     def test_05_unresolved_challenge_blocks_activation(self) -> None:
@@ -405,16 +1079,6 @@ class TestWaveAdmissionC0(unittest.TestCase):
         self.assertEqual(validate_challenges([], set(self.six_names)), [])
         poison = [{"id": "CC-X", "needed_by": [self.six_names[0]]}]
         self.assertTrue(validate_challenges(poison, set(self.six_names)))
-
-    # WORK_UNIT_CASE: 829/6
-    def test_06_second_root_writer_blocks_activation(self) -> None:
-        self.assertEqual(validate_single_writer(["T8-A0"]), [])
-        self.assertTrue(validate_single_writer([]))
-        self.assertTrue(validate_single_writer(["T8-A0", "T8-A1"]))
-        base_members = self._base_manifest()["workspace"]["members"]
-        moved = [p for p in self.six_paths if p in root_workspace()["members"]
-                 and p not in base_members]
-        self.assertEqual(sorted(moved), sorted(self.six_paths))
 
     # WORK_UNIT_CASE: 829/7
     def test_07_stale_plan_invalidated_by_current_main(self) -> None:
