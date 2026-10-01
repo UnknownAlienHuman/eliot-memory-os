@@ -2517,6 +2517,7 @@ impl DaemonComposition {
                     .to_owned(),
             ));
         }
+        let prepared_identity = prepared.identity.clone();
         let causal_receipt = eliot_governor::KernelTransitionPort::apply_prepared_with_causal(
             kernel,
             &claimed.request_identity,
@@ -2526,17 +2527,27 @@ impl DaemonComposition {
         )
         .await
         .map_err(CapturedLspAdoptionError::KernelTransition)?;
-        if causal_receipt.receipt.operation_id != operation_id
+        if causal_receipt.receipt.operation_id != prepared_identity.operation_id
             || causal_receipt.receipt.idempotency_key != claimed.request_identity.idempotency_key
+            || causal_receipt.receipt.canonical_request_hash
+                != prepared_identity.canonical_request_hash
             || causal_receipt.receipt.state_fence != record.state_fence
+            || causal_receipt.receipt.transition_class
+                != eliot_store_api::TransitionClass::TaskControl
+            || causal_receipt.receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || causal_receipt.receipt.commit_id.is_none()
             || causal_receipt.receipt.outbox_refs.is_empty()
         {
             return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
-                "canonical owner receipt does not bind the original staged operation and launch outbox",
+                "canonical owner receipt does not bind the exact prepared staged operation and launch outbox",
             ));
         }
         let activation = kernel
-            .activate_selected_source_capture_async(&claimed.request_identity, &staged)
+            .activate_selected_source_capture_async(
+                &claimed.request_identity,
+                &staged,
+                &causal_receipt,
+            )
             .await
             .map_err(|error| {
                 CapturedLspAdoptionError::SelectedSourceCaptureRequest(match error {
