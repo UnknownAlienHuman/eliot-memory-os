@@ -600,7 +600,8 @@ pub fn parse_selected_source_capture_staged_admission(
         || staged.operation_id != staged.stage_operation_id
         || staged.claims != intent.claims
         || staged.state_fence.generation != envelope.state_fence.resource_generation.value()
-        || staged.state_fence.observed_authority_epoch != envelope.state_fence.authority_epoch
+        || staged.state_fence.observed_authority_epoch
+            != envelope.state_fence.authority_epoch.sequence.get()
         || staged.state != AdmissionReservationState::StagedInactive
         || result.stage_receipt.record_id().as_str() != result.stage_receipt_id
         || result.stage_receipt.subject_id() != &staged.reservation_id
