@@ -73,6 +73,44 @@ fn heartbeat_frame() -> Frame {
     }
 }
 
+fn bind_request_identity(frame: &mut Frame, request_id: &str, cancellation_id: &str) {
+    let state_fence = serde_json::json!({
+        "authority_epoch": {
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 1
+        },
+        "resource_generation": 1,
+        "task_revision": null,
+        "policy_revision": null,
+        "integration_revision": null
+    });
+    let identity: eliot_protocol::RequestIdentity = serde_json::from_value(serde_json::json!({
+        "request": {
+            "metadata": {
+                "request_id": request_id,
+                "session_id": null,
+                "task_id": null,
+                "product_id": "eliot-ipc-test",
+                "source_id": "control-reserve-test",
+                "state_fence": state_fence,
+                "clock": {
+                    "valid_time_ms": null,
+                    "known_time_ms": null,
+                    "transaction_sequence": null,
+                    "monotonic_ns": null
+                }
+            },
+            "state_fence": state_fence
+        },
+        "idempotency_key": "control-reserve-idempotency-1",
+        "deadline_unix_ms": 10_000,
+        "cancellation_id": cancellation_id
+    }))
+    .expect("valid request identity fixture");
+    frame.request_id = Some(identity.request.metadata.request_id.clone());
+    frame.request_identity = Some(identity);
+}
+
 fn fixture_text() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/unsafe_family_cases.json");
     ok(std::fs::read_to_string(&path))
@@ -258,6 +296,11 @@ fn in_flight_saturation_preserves_cancel_heartbeat_control_capacity() {
     let mut request = heartbeat_frame();
     request.kind = FrameKind::Request;
     request.message_type = MessageType::Execute;
+    bind_request_identity(
+        &mut request,
+        "control-reserve-request-1",
+        "control-reserve-cancel-1",
+    );
     assert!(!is_control_capacity_frame(&request));
     let held = [
         ok(queue.admit_frame(&request, 8)),
@@ -279,6 +322,13 @@ fn in_flight_saturation_preserves_cancel_heartbeat_control_capacity() {
         let mut recovery = heartbeat_frame();
         recovery.kind = kind;
         recovery.message_type = message_type;
+        if kind == FrameKind::Cancel {
+            bind_request_identity(
+                &mut recovery,
+                "control-reserve-request-1",
+                "control-reserve-cancel-1",
+            );
+        }
         assert!(
             is_control_capacity_frame(&recovery),
             "recovery lane must classify {kind:?}"
@@ -326,6 +376,13 @@ fn in_flight_saturation_preserves_cancel_heartbeat_control_capacity() {
         let mut recovery = heartbeat_frame();
         recovery.kind = kind;
         recovery.message_type = message_type;
+        if kind == FrameKind::Cancel {
+            bind_request_identity(
+                &mut recovery,
+                "control-reserve-request-1",
+                "control-reserve-cancel-1",
+            );
+        }
         assert!(is_control_capacity_frame(&recovery));
         let reservation = ok(bytes_queue.admit_frame(&recovery, 8));
         ok(bytes_queue.release(reservation));

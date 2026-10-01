@@ -62,26 +62,36 @@ fn discovery_only() -> Vec<CapabilityEvidence> {
 }
 
 fn full_evidence() -> Vec<CapabilityEvidence> {
-    vec![
-        ok(CapabilityEvidence::new(
-            &fingerprint(),
-            EvidenceTier::ConformanceProbe,
-            SCOPE,
-            "probe",
-            LIVE,
-            vec!["probe-run-7".to_owned()],
-            Vec::new(),
-        )),
-        ok(CapabilityEvidence::new(
-            &fingerprint(),
-            EvidenceTier::ProductionObservation,
-            SCOPE,
-            "observed",
-            LIVE,
-            vec!["prod-span-9".to_owned()],
-            Vec::new(),
-        )),
-    ]
+    evidence_for(&fingerprint(), "prod-span-9")
+}
+
+fn evidence_for(active: &HostFingerprint, observed_span: &str) -> Vec<CapabilityEvidence> {
+    let probe = ok(CapabilityEvidence::new(
+        active,
+        EvidenceTier::ConformanceProbe,
+        SCOPE,
+        "probe",
+        LIVE,
+        vec!["probe-run-7".to_owned()],
+        Vec::new(),
+    ));
+    let mut quarantine = FingerprintQuarantine::new();
+    let mut no_prior_evidence: Vec<CapabilityEvidence> = Vec::new();
+    let matched_route = ok(reconcile_attempt_route(
+        "route-main",
+        Some("route-main"),
+        &mut no_prior_evidence,
+        &mut quarantine,
+        active,
+        RouteMismatchDisposition::Quarantine,
+    ));
+    let observation = ok(matched_route.project_production_observation(
+        &probe,
+        active,
+        observed_span,
+        NOW,
+    ));
+    vec![probe, observation]
 }
 
 // ACCEPTANCE/1
@@ -242,15 +252,7 @@ fn route_mismatch_invalidates_only_dependent_fingerprint() {
         "route-main",
     ));
     let mut evidence = full_evidence();
-    evidence.push(ok(CapabilityEvidence::new(
-        &other,
-        EvidenceTier::ProductionObservation,
-        SCOPE,
-        "observed",
-        LIVE,
-        vec!["prod-span-other".to_owned()],
-        Vec::new(),
-    )));
+    evidence.extend(evidence_for(&other, "prod-span-other"));
     let mut quarantine = FingerprintQuarantine::new();
     let outcome = ok(reconcile_attempt_route(
         "route-main",

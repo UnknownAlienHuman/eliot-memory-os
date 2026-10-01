@@ -3465,6 +3465,7 @@ mod tests {
                 "version": {"major": 1, "minor": 0, "patch": 0},
                 "artifact_id": "a".repeat(64),
                 "protocols": ["eliot.agent-bridge.v1"],
+                "capabilities": ["agent.bridge.activate"],
                 "required_capabilities": ["agent.bridge.activate"],
                 "optional_capabilities": [],
                 "advisory_capabilities": [],
@@ -3541,6 +3542,11 @@ mod tests {
         let mut request = heartbeat();
         request.kind = FrameKind::Request;
         request.message_type = MessageType::Execute;
+        bind_request_identity(
+            &mut request,
+            "control-reserve-request-1",
+            "control-reserve-cancel-1",
+        );
         assert!(!is_control_capacity_frame(&request));
         let first = queue.admit_frame(&request, 8)?;
         queue.admit_frame(&request, 8)?;
@@ -3843,6 +3849,44 @@ mod tests {
             payload: ProtocolPayload::Json(serde_json::Value::Null),
             trace_context: BTreeMap::new(),
         }
+    }
+
+    fn bind_request_identity(frame: &mut Frame, request_id: &str, cancellation_id: &str) {
+        let state_fence = serde_json::json!({
+            "authority_epoch": {
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 1
+            },
+            "resource_generation": 1,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+        });
+        let identity: eliot_protocol::RequestIdentity = serde_json::from_value(serde_json::json!({
+            "request": {
+                "metadata": {
+                    "request_id": request_id,
+                    "session_id": null,
+                    "task_id": null,
+                    "product_id": "eliot-ipc-test",
+                    "source_id": "control-reserve-test",
+                    "state_fence": state_fence,
+                    "clock": {
+                        "valid_time_ms": null,
+                        "known_time_ms": null,
+                        "transaction_sequence": null,
+                        "monotonic_ns": null
+                    }
+                },
+                "state_fence": state_fence
+            },
+            "idempotency_key": "control-reserve-idempotency-1",
+            "deadline_unix_ms": 10_000,
+            "cancellation_id": cancellation_id
+        }))
+        .expect("valid request identity fixture");
+        frame.request_id = Some(identity.request.metadata.request_id.clone());
+        frame.request_identity = Some(identity);
     }
 
     #[test]
