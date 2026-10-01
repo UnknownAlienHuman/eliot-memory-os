@@ -18,6 +18,7 @@ use eliot_agent_contracts::{
     SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition, SwarmPlanView,
     WorkItemId, check_owner_join, contract_shape_digest,
 };
+use eliot_kernel_core::CapacityClass;
 use eliot_receipts::ProofCeiling;
 use serde::Serialize;
 
@@ -313,9 +314,137 @@ struct ObservedHostEventEntry {
     event: NormalizedHostEventEnvelope,
 }
 
+/// Every capacity partition the coordinator can be asked to count against
+/// (issue #1683 W4).
+///
+/// This is a *list of the frozen [`CapacityClass`] variants*, not a second
+/// vocabulary: every reader passes each entry straight into
+/// [`RoutePartitionDemand::get`] / [`RoutePartitionDemand::add`] /
+/// [`RoutePartitionDemand::tighten`], whose matches over `CapacityClass` have no
+/// wildcard arm. A new partition therefore cannot be added here without failing
+/// to compile in those matches first — the same compile-time gate
+/// [`crate::model::WorkClass::capacity_class`] uses for a new work class.
+const CAPACITY_PARTITIONS: [CapacityClass; 3] = [
+    CapacityClass::NormalWorkload,
+    CapacityClass::ProtectedControl,
+    CapacityClass::EmergencyLastResort,
+];
+
+/// A count or a limit kept separately for each capacity partition (issue #1683
+/// W4).
+///
+/// One field per [`CapacityClass`] variant. There is deliberately no array and
+/// no numeric index, so there is no width or mapping that can drift out of step
+/// with the enum; the three matches in [`Self::get`], [`Self::add`] and
+/// [`Self::tighten`] are the single place a partition is named, and each is a
+/// no-wildcard match over `CapacityClass`. That makes a new partition a
+/// compile error rather than a silently uncounted partition.
+///
+/// Every count here saturates: an overflow keeps the partition at its maximum
+/// rather than wrapping to zero, so a saturated partition still refuses.
+#[derive(Clone, Copy, Debug, Default)]
+struct RoutePartitionDemand {
+    normal_workload: usize,
+    protected_control: usize,
+    emergency_last_resort: usize,
+}
+
+impl RoutePartitionDemand {
+    /// A demand of `count` in exactly one partition and zero in the others.
+    ///
+    /// Every single-item route request ([`AgentCoordinator::start_attempt`] and
+    /// [`AgentCoordinator::reassign`]) attributes its addition through it, so an
+    /// addition is always charged to the partition its own work class declares
+    /// and never to whichever partition the count happens to fit in.
+    const fn of(partition: CapacityClass, count: usize) -> Self {
+        // Written out rather than `Self::default()`: `Default::default` is not a
+        // `const fn`, and this constructor has to be one so the demand a caller
+        // attributes is a fixed value rather than a runtime-computed one.
+        let mut demand = Self {
+            normal_workload: 0,
+            protected_control: 0,
+            emergency_last_resort: 0,
+        };
+        demand.add(partition, count);
+        demand
+    }
+
+    /// Every partition set to the same value. Used to seed the effective limit
+    /// from [`CoordinatorConfig::max_active_per_route`] so a partition with no
+    /// active attempt on the route still carries the configured budget instead
+    /// of an implicit zero.
+    const fn uniform(value: usize) -> Self {
+        Self {
+            normal_workload: value,
+            protected_control: value,
+            emergency_last_resort: value,
+        }
+    }
+
+    /// The count or limit held for one partition.
+    const fn get(self, partition: CapacityClass) -> usize {
+        match partition {
+            CapacityClass::NormalWorkload => self.normal_workload,
+            CapacityClass::ProtectedControl => self.protected_control,
+            CapacityClass::EmergencyLastResort => self.emergency_last_resort,
+        }
+    }
+
+    /// Adds `count` to one partition, saturating rather than wrapping.
+    const fn add(&mut self, partition: CapacityClass, count: usize) {
+        match partition {
+            CapacityClass::NormalWorkload => {
+                self.normal_workload = self.normal_workload.saturating_add(count);
+            }
+            CapacityClass::ProtectedControl => {
+                self.protected_control = self.protected_control.saturating_add(count);
+            }
+            CapacityClass::EmergencyLastResort => {
+                self.emergency_last_resort = self.emergency_last_resort.saturating_add(count);
+            }
+        }
+    }
+
+    /// Narrows one partition's effective limit to `limit`, never widening it.
+    ///
+    /// The narrowing is written as an explicit conditional rather than
+    /// `.min(limit)` because `Ord::min` is not const-stable on this toolchain
+    /// and a `const fn` cannot call it (`E0658`). On `usize`,
+    /// `if held < limit { held } else { limit }` **is** `min`: the tie takes the
+    /// `else` branch and yields `limit`, which equals `held` there, so the
+    /// result is identical at every input and the limit-fold arithmetic is
+    /// unchanged.
+    const fn tighten(&mut self, partition: CapacityClass, limit: usize) {
+        match partition {
+            CapacityClass::NormalWorkload => {
+                self.normal_workload = if self.normal_workload < limit {
+                    self.normal_workload
+                } else {
+                    limit
+                };
+            }
+            CapacityClass::ProtectedControl => {
+                self.protected_control = if self.protected_control < limit {
+                    self.protected_control
+                } else {
+                    limit
+                };
+            }
+            CapacityClass::EmergencyLastResort => {
+                self.emergency_last_resort = if self.emergency_last_resort < limit {
+                    self.emergency_last_resort
+                } else {
+                    limit
+                };
+            }
+        }
+    }
+}
+
+/// One route's capacity claim in a single call, kept per partition.
 #[derive(Clone, Debug)]
 struct RouteCapacityRequest {
-    requested: usize,
+    requested: RoutePartitionDemand,
     capacity_identity: String,
     capacity_revision: RevisionId,
     capacity_limit: usize,
@@ -1986,7 +2115,11 @@ impl AgentCoordinator {
                 return Err(CoordinatorError::MutatingWriterConflict(scope.clone()));
             }
             let capacity = RouteCapacityRequest {
-                requested: 1,
+                // Issue #1683 W4: the addition is charged to the partition this
+                // lane's own work class declares, not to a route-wide counter, so
+                // one admission touching several classes is counted once per
+                // partition and no partition is under-counted.
+                requested: RoutePartitionDemand::of(lane.work_class.capacity_class(), 1),
                 capacity_identity: candidate_lane.capacity_identity.clone(),
                 capacity_revision: candidate_lane.capacity_revision.clone(),
                 capacity_limit: candidate_lane.capacity_limit,
@@ -1997,13 +2130,17 @@ impl AgentCoordinator {
                 }
                 std::collections::btree_map::Entry::Occupied(mut entry) => {
                     let current = entry.get_mut();
+                    // Route evidence agreement is still a per-route check, so two
+                    // lanes on one route in different partitions must still agree
+                    // on identity, revision and limit or the whole admission is
+                    // refused. Only the *count* became per partition.
                     if current.capacity_identity != capacity.capacity_identity
                         || current.capacity_revision != capacity.capacity_revision
                         || current.capacity_limit != capacity.capacity_limit
                     {
                         return Err(CoordinatorError::RouteEvidence);
                     }
-                    current.requested = current.requested.saturating_add(1);
+                    current.requested.add(lane.work_class.capacity_class(), 1);
                 }
             }
         }
@@ -2146,6 +2283,31 @@ impl AgentCoordinator {
     ///   **normal** weights. Control's own per-class ceilings still apply and
     ///   still refuse first; the reserve changes which partition a pull draws
     ///   from, not whether a ceiling can be exceeded.
+    ///
+    ///   The reservation is real on both halves of a pull, not only the
+    ///   selection half. Service is reserved because the rotation excludes the
+    ///   protected class; *capacity* is reserved because the physical route
+    ///   budget is counted per partition at
+    ///   [`Self::validate_route_capacity`], which is the same function
+    ///   [`Self::start_attempt`] re-runs before it spends this selection. A
+    ///   saturated `normal_background` / `model_jobs` / `swarm` class therefore
+    ///   reaches this selector with its own partition full, and cannot have
+    ///   filled the protected partition's budget on the way.
+    ///
+    ///   What the reservation does **not** reach, stated so this is not
+    ///   overclaimed: `interactive` and `verification` map to
+    ///   [`CapacityClass::NormalWorkload`] by
+    ///   [`WorkClass::capacity_class`], exactly as the frozen contracts say
+    ///   (`NormalWorkClass::Interactive` and `NormalWorkClass::Verification` both
+    ///   admit `NormalWorkload`), so they share the normal partition with the
+    ///   eight classes above and receive a reservation of service only through
+    ///   their `weight / W` share. Giving them a partition of their own would
+    ///   need a new [`CapacityClass`] variant and a third counter in the
+    ///   Kernel's `ControlReserve` — a contracts change outside this crate — so
+    ///   this selector does not pretend to have it. I14.8's remaining
+    ///   "background/model/swarm admission pauses under interactive/control
+    ///   pressure" is likewise not claimed here: it needs a live pressure view
+    ///   this crate does not yet read.
     /// - **round share**: over any complete round of `W = sum(weight)` pulls
     ///   among the normal classes, class `i` is selected exactly `weight_i`
     ///   times, so `weight / W` is the share it receives in a round. In a window
@@ -2666,6 +2828,19 @@ impl AgentCoordinator {
     ///   boundary that can fail against evidence this coordinator does not
     ///   hold.
     ///
+    ///   **The reserved partition is enforced here, not only at admission**
+    ///   (issue #1683 W4, checklist A1). The re-count is per
+    ///   [`WorkClass::capacity_class`] partition, not per route, so a ready
+    ///   `control` item's start is decided against the protected partition's own
+    ///   budget and cannot be refused as `Backpressure` merely because saturated
+    ///   `normal_background` / `model_jobs` / `swarm` work filled the route's
+    ///   normal-workload budget. This is the boundary at which a selection is
+    ///   actually spent, so it is where the reservation becomes a bound rather
+    ///   than a published label. It stays a **refusal**: a partition over its
+    ///   limit is still `Backpressure`, never clamped, dropped or reported as
+    ///   success. Derivation and the exact per-partition limit on
+    ///   [`Self::validate_route_capacity`].
+    ///
     /// Nothing is minted, re-derived or synthesized: the receipt, the proof
     /// reference and the canonical bytes are all read from the coordinator's own
     /// stored admission, the admission lane and reassignment receipt from that
@@ -2762,10 +2937,19 @@ impl AgentCoordinator {
         // an existing slot from queued to in-flight and adds no new one.
         // Requesting 1 here would double-count the item against its own route
         // and refuse a start that admission legitimately reserved.
+        //
+        // The zero is charged to the item's own partition
+        // ([`WorkClass::capacity_class`], issue #1683 W4), so what is
+        // re-asserted here is that *its* partition is still within its budget
+        // rather than that the whole route is. This is the boundary where a
+        // selection is actually spent, so it is the boundary at which the
+        // reserved partition becomes real: bulk work that filled the normal
+        // partition cannot make a ready control item's start refuse as
+        // `Backpressure`.
         self.validate_route_capacity(BTreeMap::from([(
             route_key(&current.route),
             RouteCapacityRequest {
-                requested: 0,
+                requested: RoutePartitionDemand::of(current.work_class.capacity_class(), 0),
                 capacity_identity: current.capacity_identity.clone(),
                 capacity_revision: current.capacity_revision.clone(),
                 capacity_limit: current.capacity_limit,
@@ -3201,7 +3385,11 @@ impl AgentCoordinator {
         self.validate_route_capacity(BTreeMap::from([(
             route_key(&old.route),
             RouteCapacityRequest {
-                requested: 1,
+                // Issue #1683 W4: the replacement is charged to the partition the
+                // old attempt's own work class declares, the same partition the
+                // original was counted in, so a reassignment cannot borrow the
+                // reserved partition from the normal one or vice versa.
+                requested: RoutePartitionDemand::of(old.work_class.capacity_class(), 1),
                 capacity_identity: old.capacity_identity.clone(),
                 capacity_revision: old.capacity_revision.clone(),
                 capacity_limit: old.capacity_limit,
@@ -4474,6 +4662,61 @@ impl AgentCoordinator {
             .count()
     }
 
+    /// Refuses a route addition whose partition is already at its live limit
+    /// (issue #1683 W4).
+    ///
+    /// The count and the limit are both **per capacity partition**, decided by
+    /// [`WorkClass::capacity_class`] on the stored attempt's own work class. That
+    /// is the whole point of this function and it is what was missing: before
+    /// this change `active` was one route-wide counter with no partition term,
+    /// so every non-terminal attempt on the route — whatever class it belonged
+    /// to — was charged against the same budget. The reserved protected
+    /// partition was therefore declared but never checked here, and normal
+    /// workload could consume it outright: with `max_active_per_route = L` and
+    /// `L` running `normal_background` attempts on a route shared with a control
+    /// lane, the `L`-th normal admit succeeded and the control admit was refused
+    /// [`CoordinatorError::Backpressure`] by normal-workload consumption — the
+    /// same at the [`Self::start_attempt`] reserve leg and at [`Self::reassign`].
+    /// I14.3's "Normal workload cannot consume it" and I14.8's "strong
+    /// reviewer/arbitration reserve protected from bulk workers" were unenforced
+    /// on the coordinator's own physical route budget even though
+    /// [`WorkClass::capacity_class`] published `ProtectedControl` for that item.
+    /// Counting per partition is the same split the Kernel already holds
+    /// physically in `eliot_kernel_core::ControlReserve`, whose
+    /// `normal_in_flight` and `protected_in_flight` are disjoint counters.
+    ///
+    /// What the per-partition count does and does not change, stated rather than
+    /// implied:
+    ///
+    /// - The effective limit is
+    ///   `min(CoordinatorConfig::max_active_per_route, addition.capacity_limit)`
+    ///   seeded for every partition and then narrowed by the `capacity_limit` of
+    ///   the attempts **in that same partition** only. Folding in another
+    ///   partition's narrower limit would let a bulk attempt silently tighten
+    ///   the reserved partition, which is the same defect read backwards, so it
+    ///   is deliberately not done.
+    /// - Because each partition carries its own budget, a route's total active
+    ///   attempts can reach the sum of the budgets of the partitions actually in
+    ///   use. That is the arithmetic of
+    ///   `ControlReserve::partitioned(normal_capacity, protected_capacity)`,
+    ///   which likewise lets each partition fill independently. It is a
+    ///   deliberate, bounded consequence of the reservation — bounded by
+    ///   `max_active_per_route` per partition — and it is not a silent overflow:
+    ///   nothing is clamped, nothing is dropped, and a partition over its limit
+    ///   is still refused.
+    /// - Route **evidence** is still validated across every attempt on the
+    ///   route, in every partition: a mismatched `capacity_identity`,
+    ///   `capacity_revision` or zero `capacity_limit` is still
+    ///   [`CoordinatorError::StaleCapacity`], and the addition's own
+    ///   `capacity_limit` is still folded into every partition's seed.
+    ///
+    /// Refusal stays typed and is never a clamp. Each partition is compared
+    /// independently and the **first** partition over its limit is refused with
+    /// that partition's own `active`, `requested` and `limit`, so the report
+    /// names the partition that is full rather than a route-wide total that no
+    /// single class could act on. Both the count and the additions saturate, so
+    /// an overflowing partition stays at its maximum and still refuses instead
+    /// of wrapping to zero and admitting.
     fn validate_route_capacity(
         &self,
         route_additions: BTreeMap<String, RouteCapacityRequest>,
@@ -4485,11 +4728,12 @@ impl AgentCoordinator {
             {
                 return Err(CoordinatorError::StaleCapacity);
             }
-            let mut active = 0usize;
-            let mut effective_limit = self
-                .config
-                .max_active_per_route
-                .min(addition.capacity_limit);
+            let mut active = RoutePartitionDemand::default();
+            let mut effective_limit = RoutePartitionDemand::uniform(
+                self.config
+                    .max_active_per_route
+                    .min(addition.capacity_limit),
+            );
             for attempt in self.attempts.values().filter(|attempt| {
                 !attempt.state.is_terminal() && route_key(&attempt.route) == route
             }) {
@@ -4499,15 +4743,21 @@ impl AgentCoordinator {
                 {
                     return Err(CoordinatorError::StaleCapacity);
                 }
-                active = active.saturating_add(1);
-                effective_limit = effective_limit.min(attempt.capacity_limit);
+                let partition = attempt.work_class.capacity_class();
+                active.add(partition, 1);
+                effective_limit.tighten(partition, attempt.capacity_limit);
             }
-            if active.saturating_add(addition.requested) > effective_limit {
-                return Err(CoordinatorError::Backpressure {
-                    active,
-                    requested: addition.requested,
-                    limit: effective_limit,
-                });
+            for partition in CAPACITY_PARTITIONS {
+                let requested = addition.requested.get(partition);
+                let active_in_partition = active.get(partition);
+                let limit = effective_limit.get(partition);
+                if active_in_partition.saturating_add(requested) > limit {
+                    return Err(CoordinatorError::Backpressure {
+                        active: active_in_partition,
+                        requested,
+                        limit,
+                    });
+                }
             }
         }
         Ok(())
