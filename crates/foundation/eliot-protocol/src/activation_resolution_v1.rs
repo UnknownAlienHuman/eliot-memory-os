@@ -1,9 +1,12 @@
 //! Import-only decoder for the retired v1 activation decision wire.
 //!
 //! This module is intentionally not re-exported at the protocol crate root.
-//! It exists for archival/migration tooling that must inspect historical v1
-//! bytes. Production daemon and Kernel paths must use the closed v2 envelope
-//! and must never call this decoder as a fallback.
+//! Its one production caller is the explicit Kernel import operation
+//! (`agent_activation_v1_import` in `bins/eliot-kernel`), which decodes and
+//! validates historical v1 bytes as an immutable artifact without adopting
+//! them as a result. Archival/migration tooling inspects the same closed shape
+//! through that operation. Production submission paths must use the closed v2
+//! envelope and must never call this decoder as a fallback.
 
 use eliot_contracts::{StateFence, canonical_json_bytes};
 use schemars::JsonSchema;
@@ -177,10 +180,12 @@ impl AgentActivationResolutionDecision {
     }
 }
 
-/// Decodes historical v1 bytes only for an explicit import/migration tool.
+/// Decodes historical v1 bytes only on the explicit import path.
 ///
 /// The decoder is closed, validates the old digest, and returns an immutable
-/// artifact. It never returns a v2 result and has no production fallback path.
+/// artifact. It never returns a v2 result and is never a fallback for the v2
+/// submission path; its production caller is the explicit Kernel import
+/// operation.
 pub fn decode_activation_resolution_v1_import(
     bytes: &[u8],
 ) -> Result<AgentActivationResolutionDecision, ProtocolError> {
