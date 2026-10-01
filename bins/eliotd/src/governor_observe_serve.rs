@@ -1183,7 +1183,10 @@ fn observe_response_document(outcome: &ObserveServeOutcome) -> serde_json::Value
         // A live pending handle is carried as a handle, not as a completion: the
         // response names the owner operation a read resolves against and the
         // exact owner interface that services read/wait/cancel, so a caller
-        // never has to guess how to service it.
+        // never has to guess how to service it. The cancellation identity is
+        // the admitted envelope's own: an envelope that carried none yields
+        // null rather than an empty string a reader could mistake for a real
+        // identity, matching [`PendingObserveHandle::cancel`].
         ObserveServeOutcome::Pending { handle } => serde_json::json!({
             "status": "observation_pending",
             "record_kind": "observation_candidate",
@@ -1191,7 +1194,11 @@ fn observe_response_document(outcome: &ObserveServeOutcome) -> serde_json::Value
             "capability": OBSERVE_CAPABILITY,
             "observation_operation_id": handle.operation_id,
             "read_wait_cancel_owner": handle.receipt_owner,
-            "cancellation_id": handle.cancellation_id,
+            "cancellation_id": if handle.cancellation_id.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(handle.cancellation_id.clone())
+            },
         }),
         // The commit happened and the receipt exists, but the host record was
         // never updated with it. The response says exactly that, keeps the
@@ -1257,8 +1264,11 @@ fn observe_response_document(outcome: &ObserveServeOutcome) -> serde_json::Value
 /// committed observation, so the Kernel's receipt-comparison gate
 /// (`same_observe_owner_receipt`) can tell this retained outcome from a
 /// receiptless or foreign presentation. The output digest is the digest of the
-/// exact response bytes, as the contract requires. A refused or unknown
-/// outcome carries its own class and never claims a semantic receipt.
+/// exact response bytes, as the contract requires. A refused, unknown,
+/// pending-handle, unavailable or authority-refused outcome carries its own
+/// class and never claims a semantic receipt: only a canonical write receipt
+/// result may carry one, and the live pending handle travels in the response
+/// document instead.
 pub fn observation_result_body(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
@@ -1276,10 +1286,17 @@ pub fn observation_result_body(
         ),
         // A pending handle names the owner operation, not a receipt: the owner
         // has admitted it but has issued no terminal receipt, so it stays
-        // unclassified and carries no semantic receipt reference.
-        ObserveServeOutcome::Pending { handle } => (
+        // unclassified and carries no semantic receipt reference. The reference
+        // MUST stay `None`: the protocol's own class gate refuses a receipt
+        // reference on any non-`CanonicalWriteReceipt` class, so carrying the
+        // handle here would fail body validation and no durable pending handle
+        // could ever persist (issue #2565 AUD12). The live handle itself
+        // travels in the response document (`observation_operation_id` plus
+        // `read_wait_cancel_owner`), which is what a read/wait/cancel path
+        // resolves; the lineage only binds the exact response bytes.
+        ObserveServeOutcome::Pending { .. } => (
             eliot_protocol::HostRequestResultClass::Unclassified,
-            Some(handle.operation_id.clone()),
+            None,
         ),
         // A refusal, an unknown outcome and an arm with no connected owner admit
         // no semantic record at all. `Unavailable` never reaches this leg in
