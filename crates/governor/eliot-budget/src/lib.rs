@@ -342,9 +342,9 @@ impl ExhaustionDisposition {
     pub fn refuses_new_paid_work(&self) -> bool {
         match self {
             Self::WithinEnvelope => false,
-            Self::CostExceeded
-            | Self::QuotaExceeded { .. }
-            | Self::CostAndQuotaExceeded { .. } => true,
+            Self::CostExceeded | Self::QuotaExceeded { .. } | Self::CostAndQuotaExceeded { .. } => {
+                true
+            }
         }
     }
 }
