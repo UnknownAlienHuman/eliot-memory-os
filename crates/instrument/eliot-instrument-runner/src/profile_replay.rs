@@ -1219,7 +1219,7 @@ fn rustc_receipt(
     terminal: Option<&ExitStatus>,
     finished_at: ClockReading,
 ) -> Result<ProfileReplayReceipt, ProfileReplayError> {
-    let report = match parse_clippy_jsonl(bytes.bytes()) {
+    let clippy_report = match parse_clippy_jsonl(bytes.bytes()) {
         Ok(report) => report,
         Err(error) => {
             return parse_failed_receipt(
@@ -1232,16 +1232,38 @@ fn rustc_receipt(
             );
         }
     };
-    // Clippy's JSON has no terminal-success record. Diagnostics can prove a
-    // compiler error; absence of errors alone cannot prove a successful exit.
-    let outcome = terminal_outcome(report.outcome(), terminal);
+    let cargo_report = match parse_cargo_jsonl(bytes.bytes()) {
+        Ok(report) => report,
+        Err(error) => {
+            return parse_failed_receipt(
+                source,
+                verified,
+                entry,
+                parser_revision,
+                error.to_string(),
+                finished_at,
+            )
+        }
+    };
+    // Clippy's projection deliberately ignores Cargo lifecycle messages.
+    // Require the independent Cargo projection to observe a successful
+    // build-finished record as well, so a lint diagnostic plus exit 0 cannot
+    // pass when the captured JSON stream omitted or failed Cargo completion.
+    let parsed_outcome = match (clippy_report.outcome(), cargo_report.outcome()) {
+        (VerificationOutcome::Fail, _) | (_, VerificationOutcome::Fail) => {
+            VerificationOutcome::Fail
+        }
+        (VerificationOutcome::Pass, VerificationOutcome::Pass) => VerificationOutcome::Pass,
+        _ => VerificationOutcome::Unknown,
+    };
+    let outcome = terminal_outcome(parsed_outcome, terminal);
     evaluated_report_receipt(
         source,
         verified,
         entry,
         parser_revision,
         outcome,
-        "clippy-json-diagnostic-outcome",
+        "clippy-and-cargo-json-diagnostic-and-completion-outcome",
         finished_at,
     )
 }
