@@ -141,9 +141,10 @@ fn valid_chunk_response(
         } => {
             *chunk_offset == request.offset
                 && bytes.len() <= PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES as usize
-                && chunk_offset.saturating_add(bytes.len() as u64) <= *observed_byte_length
-                && *observed_byte_length == request.expected_byte_length
-                && observed_sha256 == &request.expected_sha256
+                && chunk_offset.saturating_add(bytes.len() as u64)
+                    <= request.expected_byte_length
+                && *observed_byte_length == bytes.len() as u64
+                && observed_sha256 == &eliot_contracts::sha256_hex(bytes)
                 && ready_receipt_ref == &request.ready_receipt_ref
                 && *source_owner_generation > 0
                 && !readback_receipt_id.trim().is_empty()
