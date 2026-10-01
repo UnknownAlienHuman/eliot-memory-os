@@ -208,6 +208,41 @@ fn quality(context: &ContextBinding) -> QualityScorecard {
     }
 }
 
+/// The card bound to one exact packet output.
+///
+/// `quality` above is shape-only: `fixture_output_binding` supplies
+/// intrinsically well-formed placeholders, which is all a card that is only
+/// checked for its own shape needs. A card handed to
+/// `ActiveUnderstandingView::assemble` must instead NAME the output it graded,
+/// because `ActiveUnderstandingView::validate` compares the recorded recipe,
+/// fence, rendered and admitted digests, and the omission handles, against the
+/// values the packet's own owners recompute. This helper overwrites exactly
+/// those placeholders with this packet's values and introduces no second
+/// derivation of any of them.
+///
+/// The serializer and route identities stay with `fixture_output_binding`
+/// because they describe the execution the view is assembled under, which
+/// `ActiveUnderstandingView::validate` compares against the view's own
+/// execution identity. `evidence_revisions` stays empty because that
+/// comparison is claimed-subset-of-observed, so naming no revision is
+/// satisfied by the packet rather than by the card.
+fn quality_for(
+    admitted: &AdmittedContextSet,
+    recipe_digest: &str,
+    fence_digest: &str,
+    output_digest: &str,
+) -> QualityScorecard {
+    let mut card = quality(&admitted.binding);
+    card.output.recipe_digest = recipe_digest.to_owned();
+    card.output.fence_digest = fence_digest.to_owned();
+    card.output.admitted_digest = admitted
+        .canonical_payload_digest()
+        .expect("admitted payload digest");
+    card.output.rendered_digest = output_digest.to_owned();
+    card.output.omission_handles = admitted.economy.displaced.clone();
+    card
+}
+
 #[allow(clippy::too_many_lines)]
 fn admitted_set(candidate: ContextCandidate) -> AdmittedContextSet {
     let context = candidate.binding.clone();
@@ -719,6 +754,13 @@ fn assert_private_view_rejected(admitted: &AdmittedContextSet, view: &ActiveUnde
     .expect("private rendered digest");
     private_view.selection.output_digest = private_view.output_digest.clone();
     private_view.measurement.envelope_digest = private_view.output_digest.clone();
+    // The rendered payload just changed, so the card must name THIS output
+    // before the view can be structurally validated. Binding the card to the
+    // mutated packet is what makes the refusal below about privacy rather than
+    // about a card that still describes the pre-mutation bytes: without this the
+    // view would be refused at the output binding and the privacy field would
+    // never be reached.
+    private_view.quality.output.rendered_digest = private_view.output_digest.clone();
     private_view.measurement.rendered_utf8_bytes =
         ActiveUnderstandingView::canonical_output_utf8_bytes(
             &context,
@@ -777,7 +819,7 @@ fn admitted_view_preserves_protected_fields_and_rejects_injected_content() {
     };
     let mut view = ActiveUnderstandingView::assemble(
         &admitted,
-        quality(&context),
+        quality_for(&admitted, &recipe_digest, &fence_digest, &output_digest),
         measurement,
         execution,
         output_digest.clone(),
