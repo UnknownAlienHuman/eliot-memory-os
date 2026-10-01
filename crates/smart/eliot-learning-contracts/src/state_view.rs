@@ -1571,11 +1571,10 @@ fn derive_slot_completeness(
     for spec in &recipe.slots {
         let Some(slot) = view.slots.iter().find(|slot| slot.slot_id == spec.slot_id) else {
             if view.frontier.contains(&spec.slot_id) {
-                if matches!(spec.requirement, SlotRequirement::Optional) {
-                    partial = true;
-                } else {
-                    blocked = true;
-                }
+                // A frontier entry is the view's own explicit record that this
+                // declared slot was not visited, so the declared coverage stays
+                // open rather than being blocked by a refusing owner.
+                partial = true;
             } else if required_ids.contains(spec.slot_id.as_str())
                 && !view.omissions.contains(&spec.slot_id)
             {
@@ -1584,10 +1583,10 @@ fn derive_slot_completeness(
             continue;
         };
         if !required_ids.contains(spec.slot_id.as_str()) {
-            classify_optional_disposition(slot.disposition, &mut stale, &mut partial);
-            for member in &slot.members {
-                classify_optional_disposition(member.disposition, &mut stale, &mut partial);
-            }
+            // Completeness is measured against the fields the bound recipe
+            // requires. An optional slot outside the required denominator keeps
+            // its own disposition and evidence visible without withholding
+            // completeness.
             continue;
         }
         classify_required_disposition_contract(
@@ -1595,6 +1594,7 @@ fn derive_slot_completeness(
             !slot.evidence.is_empty() && spec.declared_members.is_empty(),
             &mut blocked,
             &mut stale,
+            &mut partial,
         );
         for member in &slot.members {
             classify_required_disposition_contract(
@@ -1602,28 +1602,11 @@ fn derive_slot_completeness(
                 false,
                 &mut blocked,
                 &mut stale,
+                &mut partial,
             );
         }
     }
     completeness_from_flags(blocked, stale, partial)
-}
-
-fn classify_optional_disposition(
-    disposition: SlotDisposition,
-    stale: &mut bool,
-    partial: &mut bool,
-) {
-    match disposition {
-        SlotDisposition::Current => {}
-        SlotDisposition::Stale => *stale = true,
-        SlotDisposition::Blocked
-        | SlotDisposition::Unavailable
-        | SlotDisposition::Historical
-        | SlotDisposition::Superseded
-        | SlotDisposition::Unknown
-        | SlotDisposition::Conflicted
-        | SlotDisposition::KnownEmpty => *partial = true,
-    }
 }
 
 fn classify_required_disposition_contract(
@@ -1631,18 +1614,21 @@ fn classify_required_disposition_contract(
     evidenced_empty: bool,
     blocked: &mut bool,
     stale: &mut bool,
+    partial: &mut bool,
 ) {
     match disposition {
         SlotDisposition::Current => {}
         SlotDisposition::Stale => *stale = true,
         SlotDisposition::KnownEmpty if evidenced_empty => {}
-        SlotDisposition::Blocked
-        | SlotDisposition::Unavailable
-        | SlotDisposition::Historical
+        SlotDisposition::Unavailable | SlotDisposition::Blocked => *blocked = true,
+        // The owner did project the slot, so its declared coverage is open
+        // rather than refused: nothing has to be silently filled, and the
+        // non-current position stays visible on the slot itself.
+        SlotDisposition::Historical
         | SlotDisposition::Superseded
         | SlotDisposition::Unknown
         | SlotDisposition::Conflicted
-        | SlotDisposition::KnownEmpty => *blocked = true,
+        | SlotDisposition::KnownEmpty => *partial = true,
     }
 }
 
