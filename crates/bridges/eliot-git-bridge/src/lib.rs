@@ -45,6 +45,18 @@
 
 #![forbid(unsafe_code)]
 
+mod generation;
+mod removal;
+
+pub use generation::{
+    ActiveGeneration, AdmittedLine, CanaryVerdict, GenerationError, InFlightLedger,
+    StagedGeneration, shadow_admits,
+};
+pub use removal::{
+    BridgeStatusProjection, ObservedHealth, OperationStatusRow, OwnedWorktree, RemovalError,
+    RemovalPhase, RemovalPlan, RemovalReceipt, RevocationKind, RevocationRecord,
+};
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -52,6 +64,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -640,6 +653,10 @@ pub enum BridgeError {
     InvalidArgument(String),
     /// A destructive invocation was requested or constructed.
     DestructiveOpRejected(&'static str),
+    /// Removal fenced new calls: dispatch refused before any process ran.
+    RemovalFenced,
+    /// A removal-plan step refused the call.
+    Removal(RemovalError),
     /// The process port failed.
     Runner(String),
 }
@@ -672,6 +689,8 @@ impl fmt::Display for BridgeError {
             Self::DestructiveOpRejected(reason) => {
                 write!(f, "destructive operation rejected: {reason}")
             }
+            Self::RemovalFenced => write!(f, "bridge fenced for removal: new calls refused"),
+            Self::Removal(error) => write!(f, "removal plan refused: {error}"),
             Self::Runner(detail) => write!(f, "process runner failed: {detail}"),
         }
     }
@@ -977,6 +996,93 @@ pub struct BaseDriftReceipt {
 }
 
 // ---------------------------------------------------------------------------
+// I10.13 application obligations (declaration side of the generation stitch)
+// ---------------------------------------------------------------------------
+
+/// Exact git subcommands this bridge admits, in first-argv position.
+///
+/// Single source for the `supported_operations` declaration below: the
+/// generation stitch snapshots this slice into every staged generation, so
+/// the declaration and the generation cannot drift apart, and no other
+/// subcommand can enter a staged set.
+const GIT_ADMITTED_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "branch",
+    "show",
+    "diff",
+    "worktree",
+    "apply",
+    "blame",
+    "log",
+    "merge-base",
+    "rev-list",
+];
+
+/// I10.13 application obligations for the Git professional-application
+/// bridge: exact supported artifacts/actions, API-versus-UI observation
+/// quality, side effects, undo/recovery scope, artifact verifier,
+/// representation loss, and the interactive Human/session requirement,
+/// resolved per application (the `git` executable bound to the runner port).
+/// There is no universal pipeline: these statements describe only what the
+/// typed operations in this crate do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitApplicationObligations {
+    /// Exact admitted subcommands, in first-argv position.
+    pub supported_operations: &'static [&'static str],
+    /// Exact supported artifacts and actions.
+    pub supported_artifacts_actions: &'static str,
+    /// API versus UI observation quality.
+    pub observation_quality: &'static str,
+    /// Side effects of the admitted operations.
+    pub side_effects: &'static str,
+    /// Undo and recovery scope.
+    pub undo_recovery_scope: &'static str,
+    /// Artifact verifier carried on every receipt.
+    pub artifact_verifier: &'static str,
+    /// Representation loss in normalized output.
+    pub representation_loss: &'static str,
+    /// Interactive Human and session requirement.
+    pub human_session_requirement: &'static str,
+}
+
+/// Returns the I10.13 declaration for the Git application bridged here.
+///
+/// The generation stitch snapshots `supported_operations` into every staged
+/// generation, so the declaration and the generation cannot drift apart.
+#[must_use]
+pub fn git_application_obligations() -> GitApplicationObligations {
+    GitApplicationObligations {
+        supported_operations: GIT_ADMITTED_SUBCOMMANDS,
+        supported_artifacts_actions: "git repositories (working trees), worktree checkouts and \
+            unified-diff patches; read-only inspection (status, branch, show, diff, blame, log, \
+            co-change, manifest and drift probes) plus guarded worktree add/remove and patch \
+            check/apply; reset, checkout, clean, forced worktree removal, forced branch deletion, \
+            forced push and stash destruction are never admitted",
+        observation_quality: "CLI/API capture only, no UI automation and no screenshots: exact \
+            exit code with full stdout/stderr hashed over the observed bytes; a successful exit \
+            reports the tool's claim and the porcelain parsers normalize best-effort, skipping \
+            malformed lines rather than failing",
+        side_effects: "worktree add/remove create or remove checkouts and patch apply mutates \
+            tracked files; every other admitted operation is a read-only probe, including the \
+            dirty-state preflight",
+        undo_recovery_scope: "no bridge-local undo: an applied patch is never reverted by the \
+            bridge and a created worktree is removed only through lease-scoped worktree_remove \
+            (never --force); recovery is a new authorized operation, never restoration of old \
+            state or undo of effects already performed",
+        artifact_verifier: "every receipt carries the exact invocation (executable, argv, working \
+            directory), the exit disposition and SHA-256 over the full observed output bytes; \
+            patch_apply additionally binds patch_sha256 over the applied bytes",
+        representation_loss: "output handles keep a bounded 4096-byte lossy UTF-8 preview with \
+            truncation flagged and the hash over the complete bytes; parsers skip lines that do \
+            not match the expected porcelain shape, which is an explicit observation limit",
+        human_session_requirement: "every call runs under a declared ExecutionIdentity SID and \
+            user-owned roots additionally require a broker-issued lease or explicit ACL \
+            admission; missing interaction/session permission is refused and is never bypassed \
+            by cached credentials or another session",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bridge
 // ---------------------------------------------------------------------------
 
@@ -988,6 +1094,26 @@ pub struct BaseDriftReceipt {
 pub struct GitBridge<R> {
     runner: R,
     sequence: AtomicU64,
+    stitch: Mutex<StitchState>,
+}
+
+/// Dispatch-held stitch state for the generation/removal sequence.
+///
+/// The bridge never stages generations or attests canaries itself: staged
+/// values come from [`git_application_obligations`] through
+/// [`GitBridge::stage_generation`] with a caller-observed upstream version,
+/// and the canary-gated switch stays with the composition owner holding the
+/// [`AdmittedLine`]. What dispatch owns is fence consultation, exact-identity
+/// in-flight tracking, and receipt-exit evidence — recorded here under one
+/// lock that is never held across a runner call. A poisoned lock fails the
+/// call that still needs the state; paths whose outcome is already decided
+/// settle best-effort instead.
+#[derive(Debug, Default)]
+struct StitchState {
+    removal: RemovalPlan,
+    ledger: InFlightLedger,
+    per_operation_exits: BTreeMap<String, i32>,
+    last_exit: Option<i32>,
 }
 
 impl<R: ProcessRunner> GitBridge<R> {
@@ -996,6 +1122,7 @@ impl<R: ProcessRunner> GitBridge<R> {
         Self {
             runner,
             sequence: AtomicU64::new(1),
+            stitch: Mutex::new(StitchState::default()),
         }
     }
 
@@ -1099,20 +1226,26 @@ impl<R: ProcessRunner> GitBridge<R> {
         };
         let arg_slices: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
         validate_invocation(&invocation.exe, &arg_slices)?;
-        let outcome = self
-            .runner
-            .run(
-                &invocation.exe,
-                &arg_slices,
-                &invocation.cwd,
-                // stdin is supplied via exec_stdin; plain exec sends none.
-                &[],
-            )
-            .map_err(BridgeError::Runner)?;
+        let identity = self.note_dispatched(&invocation)?;
+        let outcome = self.runner.run(
+            &invocation.exe,
+            &arg_slices,
+            &invocation.cwd,
+            // stdin is supplied via exec_stdin; plain exec sends none.
+            &[],
+        );
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(detail) => {
+                self.settle_uncertain(&identity);
+                return Err(BridgeError::Runner(detail));
+            }
+        };
         let exit = ExitDisposition {
             code: outcome.code,
             success: outcome.code == 0,
         };
+        self.settle_observed(&identity, &invocation, exit.code);
         Ok((outcome, invocation, exit))
     }
 
@@ -1129,15 +1262,78 @@ impl<R: ProcessRunner> GitBridge<R> {
         };
         let arg_slices: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
         validate_invocation(&invocation.exe, &arg_slices)?;
+        let identity = self.note_dispatched(&invocation)?;
         let outcome = self
             .runner
-            .run(&invocation.exe, &arg_slices, &invocation.cwd, stdin)
-            .map_err(BridgeError::Runner)?;
+            .run(&invocation.exe, &arg_slices, &invocation.cwd, stdin);
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(detail) => {
+                self.settle_uncertain(&identity);
+                return Err(BridgeError::Runner(detail));
+            }
+        };
         let exit = ExitDisposition {
             code: outcome.code,
             success: outcome.code == 0,
         };
+        self.settle_observed(&identity, &invocation, exit.code);
         Ok((outcome, invocation, exit))
+    }
+
+    /// Refuses fenced calls and notes one exact dispatch identity.
+    ///
+    /// Runs before the runner call and after the static invocation guard, so
+    /// refused calls are never noted and noted calls always reach the port.
+    /// The identity binds the exact invocation to one bridge sequence
+    /// position, so concurrent identical dispatches drain independently.
+    fn note_dispatched(&self, invocation: &Invocation) -> Result<String, BridgeError> {
+        let mut stitch = self
+            .stitch
+            .lock()
+            .map_err(|_| BridgeError::Runner("bridge stitch state lock poisoned".to_owned()))?;
+        if stitch.removal.blocks_new_calls() {
+            return Err(BridgeError::RemovalFenced);
+        }
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        let identity = format!("{} #{sequence}", invocation.describe());
+        stitch.ledger.note_dispatched(&identity);
+        Ok(identity)
+    }
+
+    /// Settles one dispatch identity after its terminal outcome reconciled,
+    /// feeding the receipt exit into the observed evidence.
+    ///
+    /// Best-effort: the receipt is already reconciled in hand, so a lost
+    /// record must not fail the call. The identity was noted by this same
+    /// dispatch and identities are unique per call, so absence is unreachable
+    /// outside a poisoned lock.
+    fn settle_observed(&self, identity: &str, invocation: &Invocation, exit_code: i32) {
+        let Ok(mut stitch) = self.stitch.lock() else {
+            return;
+        };
+        if let Some(operation) = invocation.args.first() {
+            stitch
+                .per_operation_exits
+                .insert(operation.clone(), exit_code);
+        }
+        stitch.last_exit = Some(exit_code);
+        let _ = stitch.ledger.note_settled(identity);
+    }
+
+    /// Settles one dispatch identity whose runner outcome never arrived,
+    /// retaining the exact identity for owner reconciliation.
+    ///
+    /// A runner failure after spawn can mask a real effect, so the identity
+    /// leaves the drain ledger (the synchronous call is over and nothing
+    /// remains trackable) but is kept as an unresolved reference: an
+    /// uncertain effect is reconciled by its owner, never absorbed.
+    fn settle_uncertain(&self, identity: &str) {
+        let Ok(mut stitch) = self.stitch.lock() else {
+            return;
+        };
+        let _ = stitch.ledger.note_settled(identity);
+        let _ = stitch.removal.note_unresolved(identity);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1893,6 +2089,71 @@ impl<R: ProcessRunner> GitBridge<R> {
             ahead,
             behind,
         })
+    }
+
+    // -- generation/removal stitch (issue #1797, W6/W7) ----------------------
+
+    /// Fences new calls for removal.
+    ///
+    /// Held by the composition owner: dispatch consults
+    /// [`RemovalPlan::blocks_new_calls`] on every call and refuses fenced
+    /// calls with [`BridgeError::RemovalFenced`] before any process runs.
+    /// Draining, owner revocation, and artifact release stay with the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Removal`] when the plan is already fenced, or
+    /// [`BridgeError::Runner`] when the stitch lock is poisoned.
+    pub fn fence_new_calls(&self) -> Result<(), BridgeError> {
+        self.stitch
+            .lock()
+            .map_err(|_| BridgeError::Runner("bridge stitch state lock poisoned".to_owned()))?
+            .removal
+            .fence_new_calls()
+            .map_err(BridgeError::Removal)
+    }
+
+    /// Stages one generation candidate bound to this bridge's declaration.
+    ///
+    /// The admitted-operation snapshot comes from
+    /// [`git_application_obligations`], so the declaration and the staged
+    /// generation cannot drift apart. The upstream version is the
+    /// caller-observed `git` version string: staging records it and never
+    /// installs or probes anything. The canary-gated switch itself stays
+    /// with the composition owner holding the [`AdmittedLine`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::BlankField`] on a blank version.
+    pub fn stage_generation(upstream_version: &str) -> Result<StagedGeneration, GenerationError> {
+        let obligations = git_application_obligations();
+        StagedGeneration::stage("git", upstream_version, obligations.supported_operations)
+    }
+
+    /// Projects declared-versus-observed status against the owner's line.
+    ///
+    /// The declaration side comes from the caller-held [`AdmittedLine`];
+    /// the evidence side (overall and per-operation exits) is dispatch's own
+    /// receipt evidence recorded on this bridge. Operations with no observed
+    /// receipt stay explicitly unknown instead of inheriting bridge health.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Runner`] when the stitch lock is poisoned.
+    pub fn status_against(
+        &self,
+        line: &AdmittedLine,
+    ) -> Result<BridgeStatusProjection, BridgeError> {
+        let stitch = self
+            .stitch
+            .lock()
+            .map_err(|_| BridgeError::Runner("bridge stitch state lock poisoned".to_owned()))?;
+        Ok(BridgeStatusProjection::project(
+            line.current(),
+            line.retained(),
+            ObservedHealth::from_last_exit(stitch.last_exit),
+            &stitch.per_operation_exits,
+        ))
     }
 }
 
