@@ -560,21 +560,24 @@ impl KernelComposition {
             observe_terminal_error(kernel_build_error_code(&mapped));
             mapped
         })?);
-        let (ors_path, protected_root) = Self::ors_path_for_config(&config).inspect_err(|error| {
-            observe_entrypoint_with_detail(
-                EntrypointStage::Composition,
-                "kernel.composition.build_failed",
-            );
-            observe_terminal_error(kernel_build_error_code(error));
-        })?;
-        let scan_disclosure_storage =
-            Self::open_scan_disclosure_storage(&config, &ors_path, protected_root).inspect_err(|error| {
+        let (ors_path, protected_root) =
+            Self::ors_path_for_config(&config).inspect_err(|error| {
                 observe_entrypoint_with_detail(
                     EntrypointStage::Composition,
                     "kernel.composition.build_failed",
                 );
                 observe_terminal_error(kernel_build_error_code(error));
             })?;
+        let scan_disclosure_storage =
+            Self::open_scan_disclosure_storage(&config, &ors_path, protected_root).inspect_err(
+                |error| {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::Composition,
+                        "kernel.composition.build_failed",
+                    );
+                    observe_terminal_error(kernel_build_error_code(error));
+                },
+            )?;
         let ors = Arc::new(
             Self::open_ors_for_config(&config, &ors_path).inspect_err(|error| {
                 observe_entrypoint_with_detail(
@@ -584,7 +587,15 @@ impl KernelComposition {
                 observe_terminal_error(kernel_build_error_code(error));
             })?,
         );
-        Self::assemble(config, ors, ors_path, None, platform, scan_disclosure_storage).inspect_err(|error| {
+        Self::assemble(
+            config,
+            ors,
+            ors_path,
+            None,
+            platform,
+            scan_disclosure_storage,
+        )
+        .inspect_err(|error| {
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
                 "kernel.composition.build_failed",
@@ -643,12 +654,9 @@ impl KernelComposition {
                 .map_err(&terminal)?,
         );
         let (ors_path, protected_root) = Self::ors_path_for_config(&config).map_err(&terminal)?;
-        let scan_disclosure_storage = Self::open_scan_disclosure_storage(
-            &config,
-            &ors_path,
-            protected_root,
-        )
-        .map_err(&terminal)?;
+        let scan_disclosure_storage =
+            Self::open_scan_disclosure_storage(&config, &ors_path, protected_root)
+                .map_err(&terminal)?;
         let ors = Arc::new(Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?);
         if config.startup_mode.is_shadow_candidate() {
             // I14.16 steps 3-4: a shadow candidate never begins or consumes
@@ -659,8 +667,15 @@ impl KernelComposition {
                 EntrypointStage::Composition,
                 "kernel.composition.shadow_candidate_descriptor_skipped",
             );
-            return Self::assemble(config, ors, ors_path, None, platform, scan_disclosure_storage)
-                .map_err(&terminal);
+            return Self::assemble(
+                config,
+                ors,
+                ors_path,
+                None,
+                platform,
+                scan_disclosure_storage,
+            )
+            .map_err(&terminal);
         }
         let prepared = Self::prepare_authority_descriptor_material(
             &platform,
@@ -688,7 +703,7 @@ impl KernelComposition {
             platform,
             scan_disclosure_storage,
         )
-            .map_err(&terminal)
+        .map_err(&terminal)
     }
 
     /// Adopts the installer-provisioned supervision authority from the
@@ -832,7 +847,7 @@ impl KernelComposition {
             platform,
             scan_disclosure_storage,
         )
-            .map_err(&terminal)
+        .map_err(&terminal)
     }
 
     /// Refuses an owner-authority mutation while this composition is an

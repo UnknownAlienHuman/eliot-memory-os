@@ -1839,10 +1839,7 @@ impl KernelComposition {
             .canonical_path()
             .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         if !windows_paths_equal(&canonical_root, binding.kernel_ors_root())
-            || !windows_paths_equal(
-                ors_path,
-                &binding.kernel_ors_root().join("kernel-ors.redb"),
-            )
+            || !windows_paths_equal(ors_path, &binding.kernel_ors_root().join("kernel-ors.redb"))
         {
             return Err(KernelBuildError::Service(
                 "manifest-bound Kernel ORS path changed before its file lease".to_owned(),
