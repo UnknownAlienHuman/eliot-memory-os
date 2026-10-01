@@ -2195,6 +2195,24 @@ mod packet_commit_unit_tests {
             .contains("governed scope or ELIOT_GOVERNOR_REPO_ROOT"));
     }
 
+    // 783/18: these two `estimated_tokens` values are SYNTHETIC FIXTURE payloads
+    // inside `mod packet_commit_unit_tests`, not production measurement claims.
+    // `packet_response` builds a synthetic `token_budget_report` for the
+    // packet-post-commit outbox tests, and the 431 below is the same shape in a
+    // `PacketQualityReport` fixture. Neither is ever published to a caller, and
+    // neither is an estimate of any real payload: 431 happens to equal
+    // `ceil(1723 / 4)`, the pre-#783 `/4` basis, but the value is chosen to be
+    // an arbitrary non-round integer in a serialization round-trip regression,
+    // and the assertions around it are about f64 bit-exactness across pretty
+    // persistence, never about a token count.
+    //
+    // Routing a fixture through `canonical_serialized_measurement` would make
+    // the test depend on the #704 owner for a number the test never asserts on,
+    // and would make the fixture no longer a fixed input - the value a
+    // round-trip test pins must be constant. The row is therefore satisfied by
+    // holding these literals with their non-measurement fields byte for byte,
+    // and by keeping every production `estimated_tokens` publisher in
+    // `dispatch.rs` (rows 783/15) qualified by `recorded_planning_wire`.
     fn packet_response(
         project_id: ProjectId,
         task_id: TaskId,
@@ -2762,6 +2780,10 @@ mod packet_commit_unit_tests {
             task_id: task_id.to_string(),
             revision_fence: MemoryRevision::new(7),
             structured_bytes: 1_723,
+            // 783/18, second site: synthetic fixture value, see the note on
+            // `packet_response` above. 431 == ceil(1723 / 4) by coincidence,
+            // not because this seam applies a `/4`; the assertion below is
+            // f64 bit-exactness across pretty persistence.
             estimated_tokens: 431,
             task_frame_present: true,
             current_truth_coverage: 1.0_f32 / 3.0_f32,

@@ -1129,14 +1129,25 @@ fn operator_l0_feature_fields(
         // 783/20: `L0FeatureScore::context_cost` is a ranking score, not a
         // context measurement, so it is deliberately published bare.
         //
-        // The value is `i32` (crates/eliot-types/src/memory.rs) and is
-        // computed in crates/eliot-store/src/canonical_store/recall_ranking.rs
-        // as `-ceil(preview.len() / 64)`, clamped to -40: a negative penalty
-        // on a 64-character bucket of the preview text, added straight into
-        // `total` alongside every other feature and compared against the
-        // ranking threshold. It is not a byte count, not an STU, not a token
-        // count, and not a cost derived from any measured payload, so there
-        // is no canonical measurement owner behind it to republish.
+        // The value is `i32` (crates/eliot-types/src/memory.rs:1101) and is
+        // computed in crates/eliot-store/src/canonical_store/recall_ranking.rs:297
+        // as `-min(ceil(preview.len() / 64), 40)`: a negative penalty on a
+        // 64-unit bucket of the preview text, added straight into `total`
+        // alongside every other feature and compared against the ranking
+        // threshold.
+        //
+        // It is NOT a measurement, and the reason is arithmetic rather than
+        // convention. `String::len` is a UTF-8 BYTE length, so the divisor is
+        // 64 BYTES, and the result is a clamped bucket count that is neither a
+        // byte total, an STU, a token count, nor a cost derived from any
+        // measured payload: every value from -1 to -40 is reachable from the
+        // same byte total, so the number cannot be converted back to a length
+        // and there is no canonical #704 measurement behind it to republish.
+        // (An earlier revision of this comment described the divisor as 64
+        // CHARACTERS; `String::len` has always been bytes here, and the
+        // correction matters because a byte length and a character length are
+        // different quantities for exactly the non-ASCII previews this seam
+        // exists to measure honestly.)
         //
         // Wrapping it in a measurement envelope would be the exact relabelling
         // this migration forbids: it would publish a bucketed ranking penalty
