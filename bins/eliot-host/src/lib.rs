@@ -8924,6 +8924,26 @@ impl HostComposition {
                 "Prior kernel disposition does not match durable terminated evidence".to_owned(),
             ));
         }
+        // #1757 W10/W11 boundary revalidation: the approved generation is
+        // re-read after the stop phase and before the irreversible relaunch.
+        // The registry is owned by the installer/update authority, which may
+        // commit a new generation while this restart holds no lock on it;
+        // relaunching the pre-stop clone against a changed approval would act
+        // on a stale registration (I13.5). A changed or withdrawn approval
+        // refuses automatic recovery instead of starting the substitute.
+        let fresh_manifest = self
+            .registry
+            .active()
+            .ok_or_else(|| HostError::ProcessContour("no approved active generation".to_owned()))?
+            .manifest
+            .clone();
+        if fresh_manifest.generation != active_manifest.generation
+            || self.jobs.approved_generation.as_ref() != Some(&fresh_manifest.generation)
+        {
+            return Err(HostError::RecoveryRequired(
+                "Kernel restart refused: approved generation changed between stop and start; manual recovery required".to_owned(),
+            ));
+        }
         let config_digest = self
             .jobs
             .config_digest

@@ -519,6 +519,19 @@ where
 
     /// Attempts one approved candidate service a bounded number of times and
     /// restores the prior service when the candidate cannot prove readiness.
+    ///
+    /// Stop and start reconcile separately (#1757 W10/W11). A requested stop
+    /// is not observed termination: the prior lineage must be observed
+    /// terminated before any start is attempted, so a surviving lineage is
+    /// never adopted as the replacement (I1.4) and an unknown stop effect is
+    /// never retried blindly (I13.5). An unknown or failed stop preserves the
+    /// failure state and is reconciled through the original stop operation on
+    /// retry; the start phase runs only after observed termination. Between
+    /// the verified stop and the irreversible start the prior branch is
+    /// re-observed: a resurrected or substituted lineage refuses the whole
+    /// restart instead of acting on the substitute. Every effect addresses
+    /// exactly the two named kernel-branch identities; sibling branches
+    /// without an invalidated dependency are never restarted (I1.4).
     pub fn restart_kernel_bounded(
         &mut self,
         context: &RequestMetadata,
@@ -549,7 +562,55 @@ where
                 // without releasing the installation-wide owner lease (which
                 // would open a split-brain window with a kernel running and
                 // no lease held). Ownership never transfers mid-restart.
-                let _ = self.stop_kernel_for_restart(context, &prior_service);
+                //
+                // The stop outcome is honored, never discarded: only an
+                // observed termination admits the start phase. An already
+                // absent branch needs no stop effect; a live branch is
+                // stopped through the original stop operation and a stop
+                // that cannot prove termination preserves the failure state
+                // and retries here instead of starting blindly over it.
+                let terminated = match self.observe_prior_kernel_terminated(context, &prior_service)
+                {
+                    Ok(None) => {
+                        // Already-absent branch needs no stop effect,
+                        // but the start below still requires the
+                        // restart-normalized state a verified stop
+                        // establishes: DegradedRecovery admits
+                        // Starting, while Active/ControlReady do not.
+                        self.state = HostServiceState::DegradedRecovery;
+                        true
+                    }
+                    Ok(Some(_)) => match self.stop_kernel_for_restart(context, &prior_service) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            last_error = Some(error.to_string());
+                            false
+                        }
+                    },
+                    Err(error) => {
+                        last_error = Some(error.to_string());
+                        false
+                    }
+                };
+                if !terminated {
+                    continue;
+                }
+                // Boundary revalidation before the irreversible start: the
+                // prior branch must still prove Stopped/Absent with no
+                // process. A lineage observed live after a verified stop is
+                // a resurrection or substitution, so the restart refuses
+                // closed instead of retrying against the substitute.
+                match self.observe_prior_kernel_terminated(context, &prior_service) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => {
+                        self.fail(HostFailure::IdentityMismatch);
+                        return Err(HostServiceError::IdentityMismatch);
+                    }
+                    Err(error) => {
+                        last_error = Some(error.to_string());
+                        continue;
+                    }
+                }
             }
             match self.start_kernel(
                 context,
@@ -902,6 +963,64 @@ where
             service,
             prior_process,
         })
+    }
+
+    /// Read-only re-observation of the prior kernel branch for restart
+    /// separation (#1757 W10/W11).
+    ///
+    /// Returns the live lineage when one is observed, or `None` when the
+    /// branch proves `Stopped`/`Absent` with no process. This issues no
+    /// `Stop`/`Start` effect: it is the observation leg that lets
+    /// [`HostService::restart_kernel_bounded`] reconcile the stop phase
+    /// (skip an unneeded stop, honor a failed one) and revalidate the
+    /// termination boundary before the irreversible start. The adapter
+    /// contract is exact: only a `Known` observation for the requested
+    /// service proves anything; any other service identity is a
+    /// substitution and fails closed, and a `Partial` or `Unknown`
+    /// outcome never proves termination. A provider `Error` propagates
+    /// typed.
+    fn observe_prior_kernel_terminated(
+        &mut self,
+        context: &RequestMetadata,
+        prior_service: &PlatformHandle,
+    ) -> Result<Option<ServiceProcessRecord>, HostServiceError> {
+        let observation = self.execute(
+            context,
+            "kernel-restart-reobserve",
+            prior_service.clone(),
+            ServiceOperation::Inspect,
+        )?;
+        match observation {
+            PortOutcome::Known(observation) => {
+                if observation.service != *prior_service {
+                    self.fail(HostFailure::IdentityMismatch);
+                    return Err(HostServiceError::IdentityMismatch);
+                }
+                if let Some(process) = observation.process {
+                    Ok(Some(process))
+                } else if matches!(
+                    observation.state,
+                    ServiceState::Stopped | ServiceState::Absent
+                ) {
+                    Ok(None)
+                } else {
+                    self.fail(HostFailure::ReadinessNotProven);
+                    Err(HostServiceError::ReadinessNotProven)
+                }
+            }
+            PortOutcome::Partial { .. } => {
+                self.fail(HostFailure::IncompleteObservation);
+                Err(HostServiceError::IncompleteObservation)
+            }
+            PortOutcome::Unknown(_) => {
+                self.fail(HostFailure::UnknownOutcome);
+                Err(HostServiceError::UnknownOutcome)
+            }
+            PortOutcome::Error(error) => {
+                self.fail(HostFailure::Platform(error.to_string()));
+                Err(HostServiceError::Platform(error))
+            }
+        }
     }
 
     /// Restart-scoped stop: same verified platform stop as `stop_kernel`
