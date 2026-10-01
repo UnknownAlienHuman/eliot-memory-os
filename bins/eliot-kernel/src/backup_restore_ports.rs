@@ -190,9 +190,16 @@ pub const MAX_TRACKED_JOURNAL_PAYLOADS: usize = MAX_JOURNAL_PAGE_ENTRIES;
 /// (never caller text); when the archive carries a `config` artifact, the
 /// admitted manifest digest must equal that artifact's digest; the admitted
 /// values pin to [`DESTINATION_ADMISSION_FILE`] at prepare and any drift
-/// refuses later effects. Rehearsal without Host admission carries `None`
-/// instead: isolated import still runs, but cutover refuses without a
-/// pinned owner-approved admission.
+/// refuses later effects.
+///
+/// This record is REQUIRED, not inspected only when present. The restore owner
+/// (`KernelBackupRestore::restore_with_owner`, `backup_restore.rs`) returns
+/// [`KernelRestoreError::DestinationNotAdmitted`] when
+/// `RestorePorts::manifest_evidence` is `None`, before it compiles a plan and
+/// before `KernelIsolatedDestination::open` constructs a root, so an absent
+/// admission refuses rather than importing into a root this owner constructed
+/// from the request's own label. `prepare` pins nothing without a value to pin,
+/// and a rehearsal is refused on exactly the rule a production run is.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DestinationManifestEvidence {
@@ -645,9 +652,11 @@ pub struct RestorePorts<'a> {
     /// value is #962/AUDIT-7 and lives in this file, so the value is now
     /// constructible from owner evidence rather than only describable.
     ///
-    /// `None` is a supported shape, not an absent one: it is a bundle with no Host
-    /// admission, which is the rehearsal-without-admission case the
-    /// [`DestinationManifestEvidence`] doc names.
+    /// `None` is an ABSENT admission, not a supported shape: the restore owner
+    /// refuses it with [`KernelRestoreError::DestinationNotAdmitted`] before it
+    /// constructs a destination root, so an unadmitted bundle imports nothing.
+    /// An admitted import carries the owner-issued evidence, and no other
+    /// shape of this field exists.
     pub manifest_evidence: Option<DestinationManifestEvidence>,
     /// Rehearsal mode: isolated import runs, but cutover refuses and no
     /// activation, retirement, or effect unblocking exists on any path.
@@ -693,17 +702,24 @@ impl RestorePorts<'_> {
     /// defaulted and nothing is dropped: absent key material or blob scope stays
     /// absent, and the rehearsal posture is untouched.
     ///
-    /// ## Why `None` is a supported answer and is not repaired here
+    /// ## Why an absent `None` is not repaired here
     ///
-    /// A bundle whose `manifest_evidence` is `None` is a bundle with **no Host
-    /// admission** — the rehearsal-without-admission shape the type's own doc names.
-    /// That is not a missing value to fill in: isolated import still runs under
-    /// it, prepare writes no [`DESTINATION_ADMISSION_FILE`] pin, and cutover
-    /// qualification refuses for want of a pinned owner-approved admission. A
-    /// caller that holds Host admission calls this method; a caller that does not
-    /// simply keeps the `None` it has, and the gate is what makes the difference
-    /// observable instead of guessed. This method therefore never invents an
-    /// evidence value to fill the gap, and it never clears an existing one.
+    /// A bundle whose `manifest_evidence` is `None` has **no Host admission**, and
+    /// the restore owner refuses it with
+    /// [`KernelRestoreError::DestinationNotAdmitted`] before it compiles a plan or
+    /// constructs a destination root. It is therefore not a missing value to fill
+    /// in: it is a refusal, and this method never invents an evidence value to
+    /// turn that refusal into an import. A caller that holds Host admission calls
+    /// this method; a caller that does not is refused. The method never clears an
+    /// existing value either.
+    ///
+    /// This entry is the admitting side of the record and it has NO production
+    /// call site, measured rather than assumed: the name occurs only in this
+    /// definition and in prose, never as a call. The Host-side value it
+    /// consumes, `OwnerEvidence::owner_manifest_binding` in
+    /// `bins/eliot-host/src/backup_preparation.rs`, is likewise uncalled, so the
+    /// owner-issued evidence is constructible and not yet published on any live
+    /// path.
     ///
     /// The rehearsal flag is deliberately NOT a reason to refuse. A rehearsal that
     /// *does* hold Host admission is a supported shape: it carries this evidence,
