@@ -42,10 +42,10 @@ pub const CAPABILITY_APPLY: &str = "store.apply";
 ///
 /// The wire variant selects this capability through
 /// [`StoreRequest::capability`], but it is deliberately absent from
-/// [`CAPABILITIES`]: API enum presence is not readiness, and the capability
-/// stays unadvertised until the actual scheduler backend is accepted. A
-/// session without this admitted capability rejects the operation before
-/// dispatch.
+/// [`CAPABILITIES`]: that array is a static baseline both the store handshake
+/// and the Kernel `ClientHello` consume unchanged, so it can only name
+/// capabilities every store process can serve, and this one is served only
+/// by an adapter that owns a concurrent execution generation.
 pub const CAPABILITY_RESERVED_WRITE: &str = "store.reserved_write";
 /// Capability for the backup operation (issue #975).
 ///

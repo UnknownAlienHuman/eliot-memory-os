@@ -933,12 +933,12 @@ pub(crate) async fn apply_reserved_write(
     request: ReservedWriteRequest,
 ) -> Result<WriteReceipt, AdapterError> {
     request.validate().map_err(AdapterError::Store)?;
-    let Some(execution) = adapter.execution_handle() else {
+    // Single owner (issue #1925): the `reserved_write_capability`
+    // advertisement predicate and this dispatch refusal are one predicate,
+    // so a store never advertises a reserved write it would refuse.
+    let Some(execution) = adapter.concurrent_execution() else {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     };
-    if !execution.is_concurrent() {
-        return Err(AdapterError::Store(StoreError::UnknownOperation));
-    }
     let operation_id = request.transition.identity.operation_id.clone();
     execution.submit_reserved(request, current_time_ms())?;
     let transport = ProviderReservedTransport { adapter };

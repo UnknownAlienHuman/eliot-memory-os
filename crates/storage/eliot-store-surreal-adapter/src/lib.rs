@@ -336,17 +336,28 @@ impl SurrealStoreAdapter {
     /// Advertises the reserved-write capability exactly when a concurrent
     /// execution generation owns this adapter. No backend without an
     /// accepted scheduler advertises it.
+    ///
+    /// This is the single advertisement owner for the reserved-write
+    /// capability (issue #1925): the answer is derived from the same
+    /// [`Self::concurrent_execution`] owner that gates dispatch, so an
+    /// advertisement and the refusal a store would issue can never disagree.
     #[must_use]
     pub fn reserved_write_capability(&self) -> Option<&'static str> {
-        let slot = self.execution.lock().ok()?;
-        if slot
-            .as_ref()
-            .is_some_and(|execution| execution.is_concurrent())
-        {
-            Some(CAPABILITY_RESERVED_WRITE)
-        } else {
-            None
-        }
+        self.concurrent_execution()
+            .map(|_| CAPABILITY_RESERVED_WRITE)
+    }
+
+    /// Returns the installed execution generation only when it runs the
+    /// concurrent reserved-write profile.
+    ///
+    /// The one owner of "this store can serve a reserved write": the
+    /// advertisement ([`Self::reserved_write_capability`]) and the dispatch
+    /// gate both read it, so neither can claim a capability the other
+    /// refuses. A serial generation and an absent generation are both absent
+    /// here, which is the honest answer for both.
+    pub(crate) fn concurrent_execution(&self) -> Option<std::sync::Arc<WriteExecution>> {
+        self.execution_handle()
+            .filter(|execution| execution.is_concurrent())
     }
 
     /// Returns the installed execution generation, if any.
