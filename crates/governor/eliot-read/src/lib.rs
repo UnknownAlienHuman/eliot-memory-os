@@ -33,11 +33,16 @@
 //! The exhaustive, code-derived form of this inventory is
 //! [`owner_inventory::read_owner_inventory`], which resolves every row below
 //! from the Store declaration tables and this crate's own predicates. It is the
-//! machine-checkable copy; the list here is its human-readable summary. It has
-//! no caller in this repository — the read path resolves the rows it needs
+//! machine-checkable copy; the list here is its human-readable summary. A
+//! single read does NOT resolve it: the read path resolves the one row it needs
 //! through [`owner_inventory::local_read_port_binding`] and
-//! [`owner_inventory::compare_operation_with_store_read_model`] instead, so
-//! resolving the aggregate proves the declared surface is resolvable, not that
+//! [`owner_inventory::compare_operation_with_store_read_model`], so one read
+//! does not pay for rows it never reads. The aggregate is resolved once per
+//! reconstruction, before any role is acquired, by
+//! `KernelContextReadClient::reconstruct_context_inputs`
+//! (`bins/eliotd/src/kernel_context_read_client.rs`) — so the inventory's
+//! completeness check runs on the live `eliot.query` route instead of nowhere.
+//! Resolving it still proves that the declared surface is resolvable, not that
 //! any read was served.
 //!
 //! Two statements in that list are bounded on purpose. `ReadApi`, `LocalReadPort`
@@ -76,15 +81,38 @@
 //!                    ReadError, StoreReadFailure, plus the
 //!                    `provider_memory_feed` module's candidate-only surface
 //!                    (25 further rows, `OffWire`, no wire shape claimed);
-//! store dependency:   CanonicalReadClient (read-only) and the Store operation
-//!                    catalogue, reached ONLY through
-//!                    `owner_inventory::compare_operation_with_store_read_model`
+//! store dependency:   the Store read contract, named by this crate's own
+//!                    import surface. That set is DERIVED, not typed here:
+//!                    `owner_inventory::imported_store_symbols` reads it out
+//!                    of this crate's own text and
+//!                    `owner_inventory::resolve_store_dependency_rows` refuses
+//!                    unless every imported symbol has a row that observes it
+//!                    and every declared row names a symbol this crate really
+//!                    imports — so a new Store dependency fails the inventory
+//!                    by name instead of being silently absent from it. It
+//!                    spans the read port this crate dispatches through
+//!                    (`CanonicalReadClient`, reached from `ReadService::execute`
+//!                    — `execute_named` and both `revision_heads` calls — NOT
+//!                    only through
+//!                    `owner_inventory::compare_operation_with_store_read_model`,
+//!                    which is the catalogue comparison and not the transport),
+//!                    the Store operation catalogue this owner resolves its
+//!                    identity from
 //!                    (generated_operation_manifests, activated_read_operations,
 //!                    declared_read_parameters, project_parameter_schema,
 //!                    parameter_schema_digest, named_read_operation_name,
-//!                    EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME)
-//!                    and the Store-owned experience page coverage statement
-//!                    (ExperienceRangePage). No SurrealDB
+//!                    EXPERIENCE_BANK_READ_NAME, EXPERIENCE_FEEDBACK_READ_NAME),
+//!                    the Store-owned bounded-page contract
+//!                    (`ExperienceRangePage` and its
+//!                    EXPERIENCE_PAGE_STATE_FENCE member, which
+//!                    `classify_payload_coverage` CHECKS against the read's
+//!                    bound fence), and the request/response/fence/head types
+//!                    the identity closure is built from
+//!                    (`NamedReadRequest`, `NamedReadResponse`,
+//!                    `NamedReadOperation`, `NamedOperationManifest`,
+//!                    `ReadConsistency`, `ScopeId`, `RevisionKey`, `RevisionHead`,
+//!                    `OrderingHead`, `StoreError`,
+//!                    `AutomationContinuationFailure`). No SurrealDB
 //!                    SDK, no credentials, no write capability, no raw query
 //!                    text;
 //! serialization:      every public type is `deny_unknown_fields` JSON with
@@ -202,8 +230,12 @@
 //! (`bins/eliotd/src/context_reconstruction_route.rs:203`), invoked from
 //! `daemon_runtime::run_local_read_poll`
 //! (`bins/eliotd/src/daemon_runtime.rs:4467`). That call chain is the A1
-//! evidence; [`owner_inventory::read_owner_inventory`] is not part of it and has
-//! no caller.
+//! evidence. [`owner_inventory::read_owner_inventory`] is not a step of it —
+//! one read does not resolve the aggregate — but it is reached on the same
+//! production route, once per reconstruction, from
+//! `KernelContextReadClient::reconstruct_context_inputs`
+//! (`bins/eliotd/src/kernel_context_read_client.rs`), which is itself called by
+//! that route before it acquires any role.
 //!
 //! `cargo metadata` reports three workspace members with an edge onto
 //! this crate; searching the current source for a non-test call site gives:

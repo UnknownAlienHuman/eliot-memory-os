@@ -140,6 +140,19 @@ pub enum ContextInputsError {
     /// fresh closure instead of serving a mixed snapshot.
     #[error("source heads changed during acquisition; retry with a fresh closure")]
     SourceHeadsChanged,
+    /// The read owner's declared surface did not resolve, so this
+    /// reconstruction cannot claim which Store dependencies the owner behind
+    /// it actually has.
+    ///
+    /// This is not a per-role disposition and not an empty result: it is the
+    /// owner's own completeness check refusing to serve a read whose declared
+    /// surface it cannot resolve. The caller resolves
+    /// `eliot_read::owner_inventory::read_owner_inventory()` before
+    /// acquisition, and a Store dependency this crate imports with no declared
+    /// row — or a declared row naming a dependency it no longer imports —
+    /// surfaces here by name instead of passing as a complete inventory.
+    #[error("read owner declared surface did not resolve: {0}")]
+    ReadOwnerSurfaceUnresolved(String),
     /// A role request was rejected for a caller-shape reason (not a provider
     /// outcome); this is a programming error, never a role disposition.
     #[error("context reconstruction role request was rejected: {0}")]
