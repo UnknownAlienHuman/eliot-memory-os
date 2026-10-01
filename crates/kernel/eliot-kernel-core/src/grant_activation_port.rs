@@ -8460,6 +8460,51 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = enumeration;
         }
+
+        fn replace_owner_declaration(&self, enumeration: GrantClosureEnumeration) {
+            *self
+                .enumeration
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = enumeration;
+        }
+    }
+
+    /// Owns an atomically created directory for one REDB fixture. A candidate
+    /// name alone never grants cleanup ownership; only successful `create_dir`
+    /// does, and collisions retry without touching the existing path.
+    struct OwnedTestDirectory {
+        path: std::path::PathBuf,
+    }
+
+    impl OwnedTestDirectory {
+        fn create(label: &str) -> std::io::Result<Self> {
+            let parent = std::env::temp_dir();
+            for attempt in 0..128_u32 {
+                let path = parent.join(format!(
+                    "eliot-kernel-{label}-{}-{attempt}",
+                    std::process::id()
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self { path }),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not acquire a unique owned test directory",
+            ))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for OwnedTestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     impl RootGrantHydrationSource for TestClosureHydration {
@@ -9310,12 +9355,9 @@ pub(crate) mod tests {
         let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
         let binding = restart_test_binding(&epoch)?;
         let complete = chain_enumeration(&epoch, &binding, 5, Vec::new())?;
-        let path = std::env::temp_dir().join(format!(
-            "eliot-kernel-grant-closure-activation-incomplete-owner-{}-{}.redb",
-            std::process::id(),
-            epoch.sequence
-        ));
-        let _ = std::fs::remove_file(&path);
+        let fixture_dir =
+            OwnedTestDirectory::create("grant-closure-activation-incomplete-owner")?;
+        let path = fixture_dir.path().join("closure.redb");
         let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
         let hydration_source = Arc::new(TestClosureHydration::new(complete.clone()));
         let port = GrantActivationPort::with_durable_root_grant(
@@ -9324,11 +9366,18 @@ pub(crate) mod tests {
         );
 
         // The owner enumeration is structurally valid and agrees with what
-        // the owner returns for the requested activation. Its independent
-        // admitted inventory still contains the omitted descendants.
+        // GovernorClosureSource's declaration-backed enumeration returns
+        // for the request. Its separate admitted hydration inventory retains
+        // all four valid root/descendant rows, just as the production source
+        // stores declarations and members independently.
         let mut incomplete = complete;
         incomplete.members.truncate(1);
-        hydration_source.replace(incomplete.clone());
+        hydration_source.replace_owner_declaration(incomplete.clone());
+        assert_eq!(
+            hydration_source.admitted_grant_hydrations()?.len(),
+            4,
+            "the independent owner hydration inventory retains omitted descendants"
+        );
         let request = GrantClosureActivationIntent {
             operation_id: "op-incomplete-owner-activation".to_owned(),
             enumeration: incomplete,
@@ -9357,7 +9406,6 @@ pub(crate) mod tests {
 
         drop(port);
         drop(store);
-        let _ = std::fs::remove_file(&path);
         Ok(())
     }
 
