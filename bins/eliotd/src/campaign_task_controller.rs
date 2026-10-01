@@ -654,11 +654,28 @@ pub async fn exchange_task_controller_transition(
 ///
 /// The coordination owner is a candidate *reference* owner: what it records is
 /// that one exact Kernel-admitted attempt produced one exact bounded result
-/// artifact, addressed by the Kernel-validated `result_digest` of the response
-/// bytes. The admitted receipt is capped at `CandidateArtifact` by the owner
-/// itself. This records no provider disposition, no verifier outcome, no
-/// acceptance satisfaction, and no Task finish input — a Task result is never
-/// derived from it here.
+/// artifact, addressed by the recorded `result_digest` of the response bytes.
+/// The admitted receipt is capped at `CandidateArtifact` by the owner itself.
+/// This records no provider disposition, no verifier outcome, no acceptance
+/// satisfaction, and no Task finish input — a Task result is never derived from
+/// it here.
+///
+/// `result` is the ORIGINAL RECORDED result body, not a digest handed in beside
+/// it. The recorded `result_digest` is read off that body only after the body's
+/// own owner validator
+/// ([`TaskControllerResultBody::validate`], which re-binds `result_digest` to
+/// the exact canonical response bytes and binds the embedded attempt to the
+/// operation handle) has passed on the original value. Nothing is recomputed
+/// here and compared against a recomputation, so a substituted or stale digest
+/// cannot be recorded as this attempt's candidate artifact.
+///
+/// The body's embedded attempt must BE this leg's attempt. `source.attempt` is
+/// the independent expected set here — the Kernel-issued capability projected
+/// out of the admitted claim before preparation consumed it — so a body carried
+/// over from another admitted claim is refused rather than having its digest
+/// attributed to this one. This is what makes the reference bound to *this*
+/// operation by content instead of by the caller's choice of which bytes to
+/// pass.
 ///
 /// The identity is issued by the Governor, not here: `source` is the exact
 /// Kernel-issued attempt and admitted request identity, and
@@ -674,7 +691,7 @@ pub async fn exchange_task_controller_transition(
 pub async fn record_task_controller_coordination_candidate(
     composition: &mut DaemonComposition,
     source: &TaskControllerCoordinationSource,
-    result_digest: &str,
+    result: &TaskControllerResultBody,
     now: u64,
 ) -> Result<
     (
@@ -683,6 +700,14 @@ pub async fn record_task_controller_coordination_candidate(
     ),
     String,
 > {
+    result
+        .validate()
+        .map_err(|error| format!("coordination candidate result body: {error}"))?;
+    if result.attempt != source.attempt {
+        return Err(
+            "coordination candidate result body does not bind this admitted attempt".to_owned(),
+        );
+    }
     let issued = eliot_governor::issue_coordination_work(&source.attempt, &source.identity, now)
         .map_err(|error| format!("coordination work identity issuance: {error}"))?;
     let ingress = crate::coordination_owner_ingress::CoordinationResultIngress {
@@ -696,7 +721,7 @@ pub async fn record_task_controller_coordination_candidate(
         result_ref: format!(
             "{}:{}",
             eliot_governor::COORDINATION_RESULT_ARTIFACT_NAMESPACE,
-            result_digest
+            result.result_digest
         ),
         now,
     };
