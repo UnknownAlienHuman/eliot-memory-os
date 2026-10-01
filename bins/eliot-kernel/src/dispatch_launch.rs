@@ -121,13 +121,13 @@ use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
-    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope,
-    JobClass, JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
+    BUILD_ROOT_DIRECTORY, BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope, JobClass,
+    JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
     ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
     TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
-    TestdOwnerSubmitDirective, TestdOwnerSubmitRequest, TestdOwnerSubmitResponse, TestdStore,
-    TestdVerifierDispatchBinding, TestdVerifierJobSubmission, TestResourceProfile,
+    TestResourceProfile, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
+    TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
     issue_process_admission, testd_profile_binding, verification_receipt_sha256,
     verify_envelope_layout_binding,
 };

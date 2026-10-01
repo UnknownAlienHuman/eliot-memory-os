@@ -4528,9 +4528,7 @@ impl TestdStore {
         // it would touch. The row just read is the durable authority: nothing
         // here is re-derived from the current ambient environment.
         if let Some(envelope) = job.work_envelope.as_ref() {
-            envelope
-                .admit()
-                .map_err(|_| TestdError::InvalidBinding)?;
+            envelope.admit().map_err(|_| TestdError::InvalidBinding)?;
         }
         let request = permit.request();
         request
