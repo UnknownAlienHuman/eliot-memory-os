@@ -426,6 +426,7 @@ pub(super) async fn write_canonical_transaction(
     transition: &eliot_store_api::PreparedTransition,
     plan: &ApplyPlan,
     receipt: &WriteReceipt,
+    causal: &CanonicalCausalProjection,
     initial_state: bool,
     expected_commit_sequence: u64,
     expected_outbox_sequence: u64,
