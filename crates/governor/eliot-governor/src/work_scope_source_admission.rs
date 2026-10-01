@@ -20,7 +20,7 @@ use eliot_store_api::{
     generated_operation_manifests, operation_manifest_set_digest,
     supported_admission_contract_set_digest,
 };
-use crate::composition::WorkScopeOwnerReadback;
+use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_workscope::{
     GoverningSourceSet, PrivacyProfile, ScopeBinding, WorkScopeBindingOwner,
     WorkScopeBindingSnapshot, WorkScopeDescriptor, admit_initial_binding,
@@ -58,9 +58,12 @@ pub enum WorkScopeSourceAdmissionError {
     /// A supplied identity, authority, causal, binding, or CAS fence differed.
     #[error("WorkScope source admission inputs do not share the exact request fence")]
     FenceMismatch,
-    /// Initial admission was attempted over an already existing owner row.
-    #[error("initial WorkScope source admission requires an absent owner row")]
+    /// Initial admission was attempted over an already bound owner row.
+    #[error("initial WorkScope source admission requires an empty baseline owner")]
     OwnerAlreadyExists,
+    /// The empty owner row lacks a nonzero revision or Store digest.
+    #[error("empty WorkScope owner readback has an invalid revision or Store digest")]
+    InvalidOwnerReadback,
     /// The owner revision overflowed while advancing the admitted snapshot.
     #[error("WorkScope owner revision overflowed")]
     OwnerRevisionOverflow,
@@ -90,17 +93,18 @@ pub enum WorkScopeSourceAdmissionError {
 /// WorkScope validates its canonical bytes and the role/reference/content
 /// digest join against the admitted `sources` before accepting the snapshot.
 ///
-/// `owner_readback` must be the result of the exact-fence named
-/// `owner/work_scope` read. This initial-admission function accepts only the
-/// absent result; existing owners must use their dedicated update/admission
-/// flow. The Store operation receives the exact absence tuple and performs
-/// the CAS.
+/// `owner_readback` must be the exact-fence named `owner/work_scope` read.
+/// This initial-admission function accepts only an empty baseline row; a bound
+/// owner must use its dedicated update/admission flow. The Store operation
+/// receives the exact empty-row revision and provider digest and performs the
+/// CAS.
 #[allow(
     clippy::too_many_arguments,
     reason = "this one owner boundary joins every independently owned admission input without hiding authority in a generic bundle"
 )]
 pub fn prepare_initial_work_scope_source_admission(
     identity: &RequestIdentity,
+    operation_id: &OperationId,
     authority: &AuthorityBinding,
     causal: &CausalBinding,
     descriptor: &WorkScopeDescriptor,
@@ -109,7 +113,7 @@ pub fn prepare_initial_work_scope_source_admission(
     sources: &GoverningSourceSet,
     privacy: &PrivacyProfile,
     capture: &NormativePairSourceCapture,
-    owner_readback: Option<&WorkScopeOwnerReadback>,
+    owner_readback: &WorkScopeOwnerSnapshotReadback,
 ) -> Result<PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError> {
     identity
         .validate()
@@ -128,13 +132,29 @@ pub fn prepare_initial_work_scope_source_admission(
     {
         return Err(WorkScopeSourceAdmissionError::FenceMismatch);
     }
-    if let Some(owner) = owner_readback {
-        if owner.state_fence != *fence {
+    let (expected_revision, expected_digest) = match owner_readback {
+        WorkScopeOwnerSnapshotReadback::Empty {
+            state_fence,
+            owner_revision,
+            value_digest,
+        } if state_fence == fence
+            && *owner_revision > 0
+            && is_sha256(value_digest) => (*owner_revision, value_digest.clone()),
+        WorkScopeOwnerSnapshotReadback::Empty { state_fence, .. }
+            if state_fence != fence =>
+        {
             return Err(WorkScopeSourceAdmissionError::FenceMismatch);
         }
-        return Err(WorkScopeSourceAdmissionError::OwnerAlreadyExists);
-    }
-    let (expected_revision, expected_digest) = (0_u64, String::new());
+        WorkScopeOwnerSnapshotReadback::Empty { .. } => {
+            return Err(WorkScopeSourceAdmissionError::InvalidOwnerReadback);
+        }
+        WorkScopeOwnerSnapshotReadback::Bound(owner) => {
+            if owner.state_fence != *fence {
+                return Err(WorkScopeSourceAdmissionError::FenceMismatch);
+            }
+            return Err(WorkScopeSourceAdmissionError::OwnerAlreadyExists);
+        }
+    };
     let owner_revision = expected_revision
         .checked_add(1)
         .ok_or(WorkScopeSourceAdmissionError::OwnerRevisionOverflow)?;
@@ -160,13 +180,15 @@ pub fn prepare_initial_work_scope_source_admission(
     let capture_json = String::from_utf8(capture_bytes.clone())
         .map_err(|error| WorkScopeSourceAdmissionError::CaptureSerialization(error.to_string()))?;
     let capture_sha256 = sha256_hex(&capture_bytes);
-    let snapshot = WorkScopeBindingSnapshot::new_with_normative_pair_source_capture(
+    let product_id = identity.request.metadata.product_id.clone();
+    let snapshot = WorkScopeBindingSnapshot::new_with_normative_pair_source_capture_for_product(
         fence.clone(),
         owner_revision,
         initial_snapshot.binding.clone(),
         initial_snapshot.guard_receipt.clone(),
         sources.clone(),
         privacy.clone(),
+        product_id.clone(),
         capture_json,
         capture_sha256,
     )
@@ -177,7 +199,7 @@ pub fn prepare_initial_work_scope_source_admission(
     let receipt_work_scope_binding = eliot_receipts::WorkScopeBinding {
         scope_id: eliot_receipts::WorkScopeId::new(binding.scope.scope_ref.clone())
             .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?,
-        product_id: identity.request.metadata.product_id.clone(),
+        product_id,
         resource_generation: fence.resource_generation,
         state_fence: fence.clone(),
     };
@@ -214,10 +236,8 @@ pub fn prepare_initial_work_scope_source_admission(
         .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?;
     let scope_id = ScopeId::new(binding.scope.scope_ref.clone())
         .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?;
-    let operation_id = OperationId::new(identity.request.metadata.request_id.as_str())
-        .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?;
     let envelope = CanonicalWriteEnvelope {
-        operation_id,
+        operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
         scope_id,
@@ -263,4 +283,11 @@ pub fn prepare_initial_work_scope_source_admission(
         receipt_work_scope_binding_json,
         receipt_work_scope_binding_sha256,
     })
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
