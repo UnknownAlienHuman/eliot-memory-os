@@ -1413,15 +1413,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "canonical task does not match the current canonical plan".to_owned(),
             )));
         }
-        let produced =
-            self.produce_finish_evidence(
-                &task_id,
-                task,
-                &fence,
-                &plan,
-                &draft.observation_refs,
-                contract_acceptance_set,
-            )?;
+        let produced = self.produce_finish_evidence(
+            &task_id,
+            task,
+            &fence,
+            &plan,
+            &draft.observation_refs,
+            contract_acceptance_set,
+        )?;
         if self
             .canonical
             .read_finish_evidence(&fence)

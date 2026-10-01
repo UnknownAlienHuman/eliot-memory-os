@@ -717,10 +717,10 @@ pub struct FinishClaimedInvocation {
 
 /// Derives the Governor request identity for one admitted finish candidate.
 ///
-/// The task binding comes from the Kernel-issued FinishAttempt, which carries
+/// The task binding comes from the Kernel-issued `FinishAttempt`, which carries
 /// the authenticated activation owner tuple. The strict draft's task and
 /// revision are compared to that tuple before this identity is constructed;
-/// the RequestIdentity retains the live transport fence unchanged, while the
+/// the `RequestIdentity` retains the live transport fence unchanged, while the
 /// separate attempt retains the complete semantic task fence for this exact
 /// operation and its result reconciliation.
 ///
@@ -785,8 +785,10 @@ fn derive_finish_request_identity(
     let metadata = RequestMetadata {
         request_id: envelope.identity.request_id.clone(),
         session_id,
-        task_id: Some(eliot_contracts::TaskId::new(attempt.task_id.clone())
-            .map_err(|error| format!("Kernel-bound finish task id is invalid: {error}"))?),
+        task_id: Some(
+            eliot_contracts::TaskId::new(attempt.task_id.clone())
+                .map_err(|error| format!("Kernel-bound finish task id is invalid: {error}"))?,
+        ),
         product_id: ProductId::new("eliotd").map_err(|error| error.to_string())?,
         source_id: SourceId::new("eliotd-finish-lane").map_err(|error| error.to_string())?,
         state_fence: fence.clone(),

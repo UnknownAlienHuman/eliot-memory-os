@@ -470,11 +470,11 @@ impl KernelComposition {
         tool: &serde_json::Value,
     ) -> Result<(), TransportError> {
         finish_admission(envelope, tool)?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        self.finish_owner_binding_for_pair(envelope, tool, &_admission_owner)?;
+        self.finish_owner_binding_for_pair(envelope, tool, &admission_owner)?;
         self.host_request_connection_gate_under_transition(envelope)?;
         let mut index = self
             .host_request_connection_index
@@ -801,7 +801,7 @@ impl KernelComposition {
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        let _admission_owner = self
+        let admission_owner = self
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -843,38 +843,24 @@ impl KernelComposition {
             });
         }
         let (envelope, state, tool) = self.finish_queued_pair(body)?;
-        if !self.application_binding_live_for_claim(&envelope, &_admission_owner, true)? {
-            return Ok(LocalReadSubmitDisposition::StaleAttempt(StaleLocalReadObservation {
-                operation_id: body.operation_id.clone(),
-                request_digest: body.request_sha256.clone(),
-                presented_attempt_id: Some(body.attempt.attempt_id.clone()),
-                presented_generation: Some(body.attempt.fencing_generation),
-                current_generation: Some(state.generation),
-                reason: StaleLocalReadReason::Superseded,
-            }));
-        }
-        let owner_binding = self.finish_owner_binding_for_pair(
-            &envelope,
-            tool.as_ref().ok_or(TransportError::SessionFenced)?,
-            &_admission_owner,
-        )?;
-        let mut semantic_fence = envelope.state_fence.clone();
-        semantic_fence.task_revision = Some(owner_binding.task_revision);
-        if body.attempt.principal_id != owner_binding.principal_id
-            || body.attempt.session_id != owner_binding.session_id
-            || body.attempt.task_id != owner_binding.task_id
-            || body.attempt.work_scope_id != owner_binding.work_scope_id
-            || body.attempt.task_revision != owner_binding.task_revision.value()
-            || body.attempt.semantic_state_fence != semantic_fence
+        if !self.application_binding_live_for_claim(&envelope, &admission_owner, true)?
+            || !self.finish_attempt_binding_matches_owner(
+                body,
+                &envelope,
+                tool.as_ref().ok_or(TransportError::SessionFenced)?,
+                &admission_owner,
+            )?
         {
-            return Ok(LocalReadSubmitDisposition::StaleAttempt(StaleLocalReadObservation {
-                operation_id: body.operation_id.clone(),
-                request_digest: body.request_sha256.clone(),
-                presented_attempt_id: Some(body.attempt.attempt_id.clone()),
-                presented_generation: Some(body.attempt.fencing_generation),
-                current_generation: Some(state.generation),
-                reason: StaleLocalReadReason::Superseded,
-            }));
+            return Ok(LocalReadSubmitDisposition::StaleAttempt(
+                StaleLocalReadObservation {
+                    operation_id: body.operation_id.clone(),
+                    request_digest: body.request_sha256.clone(),
+                    presented_attempt_id: Some(body.attempt.attempt_id.clone()),
+                    presented_generation: Some(body.attempt.fencing_generation),
+                    current_generation: Some(state.generation),
+                    reason: StaleLocalReadReason::Superseded,
+                },
+            ));
         }
         if let Some(observation) = finish_stale_attempt(body, &state, session, &envelope) {
             return Ok(LocalReadSubmitDisposition::StaleAttempt(observation));
@@ -905,29 +891,7 @@ impl KernelComposition {
         // replays above stay readback and unrelated lanes are untouched: the
         // monitor owns its ledger, this leg only queries its gate, and the
         // refusal fails closed without crashing the route.
-        let candidate_blocked = {
-            let resources = finish_candidate_resources(tool.as_ref());
-            let mut resolved_paths = Vec::new();
-            let mut has_opaque_handle = false;
-            for resource in &resources {
-                match normalize_finish_candidate_resource(resource) {
-                    Some(normalized) => resolved_paths.push(normalized),
-                    None => has_opaque_handle = true,
-                }
-            }
-            if resolved_paths.is_empty() || has_opaque_handle {
-                // No resolvable declared target, or an opaque job/operation
-                // handle that could name a blocked resource: keep the global
-                // gate as fallback instead of letting an unresolvable list
-                // silently pass the per-resource comparison below.
-                super::change_monitor::governed_acceptance_blocked()
-            } else {
-                resolved_paths.iter().any(|resource| {
-                    super::change_monitor::governed_acceptance_blocked_for(resource.as_str())
-                })
-            }
-        };
-        if candidate_blocked {
+        if finish_candidate_acceptance_blocked(tool.as_ref()) {
             return Err(TransportError::SessionFenced);
         }
         let persisted = self
@@ -953,6 +917,24 @@ impl KernelComposition {
             .ok_or(TransportError::UnknownRequest)?;
         self.retire_finish_pair_under_transition(&body.operation_id, &body.request_sha256);
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
+    }
+
+    fn finish_attempt_binding_matches_owner(
+        &self,
+        body: &FinishResultBody,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        pending: &super::super::AgentActivationPendingState,
+    ) -> Result<bool, TransportError> {
+        let owner_binding = self.finish_owner_binding_for_pair(envelope, tool, pending)?;
+        let mut semantic_fence = envelope.state_fence.clone();
+        semantic_fence.task_revision = Some(owner_binding.task_revision);
+        Ok(body.attempt.principal_id == owner_binding.principal_id
+            && body.attempt.session_id == owner_binding.session_id
+            && body.attempt.task_id == owner_binding.task_id
+            && body.attempt.work_scope_id == owner_binding.work_scope_id
+            && body.attempt.task_revision == owner_binding.task_revision.value()
+            && body.attempt.semantic_state_fence == semantic_fence)
     }
 
     /// Loads the exact live finish queue record for a submitted result. An
@@ -1052,6 +1034,28 @@ impl KernelComposition {
                     && candidate.task_controller_envelope.is_some())
             });
         }
+    }
+}
+
+fn finish_candidate_acceptance_blocked(tool: Option<&serde_json::Value>) -> bool {
+    let resources = finish_candidate_resources(tool);
+    let mut resolved_paths = Vec::new();
+    let mut has_opaque_handle = false;
+    for resource in &resources {
+        match normalize_finish_candidate_resource(resource) {
+            Some(normalized) => resolved_paths.push(normalized),
+            None => has_opaque_handle = true,
+        }
+    }
+    if resolved_paths.is_empty() || has_opaque_handle {
+        // No resolvable declared target, or an opaque job/operation handle
+        // that could name a blocked resource: keep the global gate as fallback
+        // instead of letting an unresolvable list silently pass below.
+        super::change_monitor::governed_acceptance_blocked()
+    } else {
+        resolved_paths.iter().any(|resource| {
+            super::change_monitor::governed_acceptance_blocked_for(resource.as_str())
+        })
     }
 }
 
@@ -1216,9 +1220,11 @@ fn finish_admission(
     // owner before staging, and the task/scope fields are mandatory here so a
     // caller draft can never supply its own missing binding.
     if envelope.identity.task_id.as_deref() != Some(task_id)
-        || envelope.identity.work_scope_id.as_deref().is_none_or(|scope| {
-            scope.trim().is_empty() || scope.chars().any(char::is_control)
-        })
+        || envelope
+            .identity
+            .work_scope_id
+            .as_deref()
+            .is_none_or(|scope| scope.trim().is_empty() || scope.chars().any(char::is_control))
         || envelope.state_fence.task_revision.is_some()
     {
         return Err(TransportError::SessionFenced);
