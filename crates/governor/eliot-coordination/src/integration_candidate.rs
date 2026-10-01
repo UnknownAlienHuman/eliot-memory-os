@@ -6,8 +6,140 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CoordinationError, CoordinationEvent, CoordinationEventKind, CoordinationOwner,
-    IntegrationLease, IntegrationLeaseDecision, IntegrationLeaseRequest,
+    IntegrationLease, IntegrationLeaseDecision, IntegrationLeaseRequest, PeerReviewLifecycle,
 };
+
+/// Recorded reason why one provenance leg is absent, not merely unresolved.
+///
+/// The coordination owner retains no public conversation record, so the
+/// decision/conversation leg can never be closed from these records. Naming the
+/// owner that would have to supply it keeps the gap explicit instead of
+/// letting an absent link read as "no conversation existed".
+pub const CONVERSATION_PROVENANCE_GAP: &str =
+    "public conversation references are not retained by this owner";
+
+/// Recorded reason why a retained verifier reference binds no artifact
+/// revision.
+///
+/// Verification refs are recorded as opaque handles. This owner retains no
+/// verifier run, outcome, or revision binding for them, so a passing run for
+/// different bytes is never read as evidence about the reviewed bytes. A
+/// verifier that binds a revision must be published by the verifier owner and
+/// joined here before navigation can cite it.
+pub const VERIFIER_REVISION_GAP: &str = "verification refs bind no artifact revision here; this owner retains no verifier run or outcome";
+
+/// One retained review correlated to a provenance subject by an exact recorded
+/// identity string.
+///
+/// The match is correlation, never causation (I11.2): `matched_ref` is
+/// character-for-character equal on both retained records, and both endpoints
+/// are reported so a reader can verify the shared string instead of trusting a
+/// summary. Sharing a string proves co-occurrence in one owner's records; it
+/// proves neither that one record caused the other nor that either owns the
+/// other. `operation` is the reviewed operation identity exactly as the owner
+/// retains it, which is where decision-to-change navigation starts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CorrelatedReview {
+    pub review_id: String,
+    /// Reviewed operation identity exactly as the retained review carries it.
+    pub operation: String,
+    pub artifact_id: String,
+    pub artifact_revision: u64,
+    pub artifact_digest: String,
+    pub lifecycle: PeerReviewLifecycle,
+    /// Exact recorded string shared with the provenance subject.
+    pub matched_ref: String,
+}
+
+/// One integration candidate correlated to a code identity by an exact
+/// recorded string.
+///
+/// Same correlation contract as [`CorrelatedReview`]. The candidate's own diff
+/// and base commit ride along so navigation reaches the actual recorded change
+/// without choosing an arbitrary single origin.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CorrelatedCandidate {
+    pub candidate_id: String,
+    /// Exact recorded string shared with the code identity.
+    pub matched_ref: String,
+    pub diff_ref: String,
+    pub base_commit: String,
+}
+
+/// One retained revision digest behind a code identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedArtifactRevision {
+    pub revision: u64,
+    pub digest: String,
+}
+
+/// Recorded origins behind one integration candidate: forward from the
+/// retained submission decision to the retained diff, code and review legs.
+///
+/// Every leg cites retained records only and is rebuilt on each call, so the
+/// index is derived state rather than a second source of truth. Legs this
+/// owner does not retain land in `gaps` with their reason instead of being
+/// invented; a leg that resolves to nothing is never filled from a nearest
+/// match, a repeated snippet, or a path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateProvenance {
+    pub candidate_id: String,
+    /// Sequence of the retained submission event, present only when the
+    /// candidate's first history revision still joins to an
+    /// `IntegrationCandidateSubmitted` event naming this candidate in the
+    /// retained event stream. Otherwise the decision leg is reported absent.
+    pub submission_event_sequence: Option<u64>,
+    /// Every retained lease naming this candidate, in `lease_id` order.
+    pub lease_ids: Vec<String>,
+    /// Exact diff reference as retained on the candidate.
+    pub diff_ref: String,
+    /// Exact base commit as retained on the candidate.
+    pub base_commit: String,
+    /// Exact source-code identities this candidate names, in sorted order.
+    /// These are the handles the reverse lookup is keyed by.
+    pub code_identities: Vec<String>,
+    /// Reviews sharing an exact recorded identity string with this candidate,
+    /// in `review_id` order. Multiple origins stay multiple.
+    pub correlated_reviews: Vec<CorrelatedReview>,
+    /// Verifier references exactly as retained: opaque handles, never an
+    /// outcome. See [`VERIFIER_REVISION_GAP`].
+    pub verification_refs: Vec<String>,
+    /// Absent legs, each with the reason it is absent.
+    pub gaps: Vec<String>,
+}
+
+/// Recorded origins behind one code identity: reverse from the current
+/// admitted head to the retained revisions, reviews and candidates.
+///
+/// The row reports what the owner retains at and around the exact identity. A
+/// head that moved with an unchanged digest is not new content, and a head
+/// whose digest changed never inherits approval of the bytes a review covered,
+/// because every revision is listed with its own retained digest. History is
+/// never rewritten to the head.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactProvenance {
+    pub artifact_id: String,
+    /// Currently admitted head revision, absent when no revision was admitted.
+    pub current_revision: Option<u64>,
+    /// Digest bound at the currently admitted head revision.
+    pub current_digest: Option<String>,
+    /// Every retained revision digest for this identity, in revision order.
+    /// The head entry equals the current pair when a head is admitted.
+    pub retained_revisions: Vec<RetainedArtifactRevision>,
+    /// Reviews retained against this exact artifact identity, in `review_id`
+    /// order.
+    pub reviews: Vec<CorrelatedReview>,
+    /// Candidates naming this exact identity, in `candidate_id` order, each
+    /// citing the shared string.
+    pub correlated_candidates: Vec<CorrelatedCandidate>,
+    /// Absent coverage, each with the reason it is absent.
+    pub gaps: Vec<String>,
+}
 
 /// Lifecycle of one immutable integration candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -162,12 +294,227 @@ impl CoordinationOwner {
         self.integration_candidates.get(candidate_id)
     }
 
+    /// Reads the recorded origins behind one integration candidate, forward
+    /// from the retained submission decision to the retained diff, code and
+    /// review legs.
+    ///
+    /// The view is rebuilt from retained records on every call. The decision
+    /// leg is joined through the candidate's own first history revision to a
+    /// retained `IntegrationCandidateSubmitted` event naming this candidate;
+    /// a history revision that no longer joins is reported absent rather than
+    /// trusted. Reviews join by exact recorded-string equality
+    /// ([`CorrelatedReview`]), so correlation stays visibly non-causal.
+    ///
+    /// Returns `None` only when no candidate carries the identity: a missing
+    /// link stays missing and is never synthesized.
+    #[must_use]
+    pub fn candidate_provenance(&self, candidate_id: &str) -> Option<CandidateProvenance> {
+        let candidate = self.integration_candidates.get(candidate_id)?;
+        let submission_event_sequence = candidate.history.first().and_then(|revision| {
+            let index = usize::try_from(revision.event_sequence.checked_sub(1)?).ok()?;
+            let event = self.events.get(index)?;
+            (event.sequence == revision.event_sequence
+                && event.kind == CoordinationEventKind::IntegrationCandidateSubmitted
+                && event.subject_id == candidate.candidate_id)
+                .then_some(event.sequence)
+        });
+        let mut lease_ids: Vec<String> = self
+            .integration_lease_by_request
+            .values()
+            .filter(|lease| lease.candidate_id.as_deref() == Some(candidate.candidate_id.as_str()))
+            .map(|lease| lease.lease_id.clone())
+            .collect();
+        lease_ids.sort();
+        lease_ids.dedup();
+        let code_identities = retained_code_identities(candidate);
+        let identity_strings: BTreeSet<&str> = code_identities
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let correlated_reviews: Vec<CorrelatedReview> = self
+            .peer_reviews
+            .values()
+            .filter(|review| identity_strings.contains(review.artifact_id.as_str()))
+            .map(|review| correlated_review(review, review.artifact_id.clone()))
+            .collect();
+        let mut gaps = Vec::new();
+        if submission_event_sequence.is_none() {
+            gaps.push(
+                "submission event absent from the retained event stream for this candidate"
+                    .to_owned(),
+            );
+        }
+        if lease_ids.is_empty() {
+            gaps.push("no integration lease decision recorded against this candidate".to_owned());
+        }
+        if correlated_reviews.is_empty() {
+            gaps.push(
+                "no retained review names an exact identity string carried by this candidate"
+                    .to_owned(),
+            );
+        }
+        gaps.push(CONVERSATION_PROVENANCE_GAP.to_owned());
+        gaps.push(VERIFIER_REVISION_GAP.to_owned());
+        Some(CandidateProvenance {
+            candidate_id: candidate.candidate_id.clone(),
+            submission_event_sequence,
+            lease_ids,
+            diff_ref: candidate.diff_ref.clone(),
+            base_commit: candidate.base_commit.clone(),
+            code_identities,
+            correlated_reviews,
+            verification_refs: candidate.verification_refs.clone(),
+            gaps,
+        })
+    }
+
+    /// The code identities this owner was admitted for, in first-seen order.
+    ///
+    /// This is the EXPECTED SET a consumer measures navigation coverage
+    /// against, and it is deliberately this owner's own retained artifact-head
+    /// scope rather than anything a projection assembles. A consumer that
+    /// derived its denominator from the rows it is checking would let a missing
+    /// identity satisfy itself; reading it from here means an artifact the owner
+    /// never admitted can never be quietly absent from the count.
+    ///
+    /// Each entry's requested revision is `None`: admission names the ARTIFACT,
+    /// not a revision, and `artifact_provenance` reports an unretained requested
+    /// revision as a gap rather than resolving it against current code. Entries
+    /// are deduplicated in first-seen order so one identity cannot be counted
+    /// twice against the denominator.
+    #[must_use]
+    pub fn code_navigation_denominator(&self) -> Vec<(String, Option<u64>)> {
+        // BTreeMap iteration is already first-seen-by-identity order, so the
+        // result is deterministic without a second sort. Each revision is
+        // `None`: admission names the ARTIFACT, and an unretained requested
+        // revision is reported as a gap rather than resolved against head.
+        self.peer_artifact_heads
+            .keys()
+            .map(|identity| (identity.clone(), None))
+            .collect()
+    }
+
+    /// Reads the recorded origins behind one code identity, reverse from the
+    /// current admitted head to the retained revisions, reviews and candidates.
+    ///
+    /// Every join is exact. The head and the revision digests come from the
+    /// retained artifact maps, reviews from the retained review records for the
+    /// exact artifact identity, and candidates from exact recorded-string
+    /// correlation ([`CorrelatedCandidate`]). Every retained revision is listed
+    /// with its own digest, so a head that moved with changed bytes is visible
+    /// as new content and never inherits the approval of older bytes.
+    ///
+    /// A requested revision the owner never retained is reported as a gap, not
+    /// looked up in current code: history is never rewritten to the head.
+    #[must_use]
+    pub fn artifact_provenance(
+        &self,
+        artifact_id: &str,
+        requested_revision: Option<u64>,
+    ) -> ArtifactProvenance {
+        let head = self.peer_artifact_heads.get(artifact_id);
+        let mut retained_revisions: Vec<RetainedArtifactRevision> = self
+            .peer_artifact_revisions
+            .iter()
+            .filter(|((identity, _), _)| identity.as_str() == artifact_id)
+            .map(|((_, revision), digest)| RetainedArtifactRevision {
+                revision: *revision,
+                digest: digest.clone(),
+            })
+            .collect();
+        retained_revisions.sort_by_key(|entry| entry.revision);
+        let reviews: Vec<CorrelatedReview> = self
+            .peer_reviews
+            .values()
+            .filter(|review| review.artifact_id == artifact_id)
+            .map(|review| correlated_review(review, review.artifact_id.clone()))
+            .collect();
+        let correlated_candidates: Vec<CorrelatedCandidate> = self
+            .integration_candidates
+            .values()
+            .filter_map(|candidate| {
+                retained_code_identities(candidate)
+                    .into_iter()
+                    .find(|identity| identity == artifact_id)
+                    .map(|matched| CorrelatedCandidate {
+                        candidate_id: candidate.candidate_id.clone(),
+                        matched_ref: matched,
+                        diff_ref: candidate.diff_ref.clone(),
+                        base_commit: candidate.base_commit.clone(),
+                    })
+            })
+            .collect();
+        let mut gaps = Vec::new();
+        if head.is_none() {
+            gaps.push("no admitted head for this artifact identity".to_owned());
+        }
+        if retained_revisions.is_empty() {
+            gaps.push("no retained revision digests for this artifact identity".to_owned());
+        }
+        if requested_revision.is_some_and(|requested| {
+            !retained_revisions
+                .iter()
+                .any(|entry| entry.revision == requested)
+        }) {
+            gaps.push("requested revision is not retained for this artifact identity".to_owned());
+        }
+        if reviews.is_empty() {
+            gaps.push("no retained review names this artifact identity".to_owned());
+        }
+        if correlated_candidates.is_empty() {
+            gaps.push(
+                "no retained candidate names this artifact identity as an exact recorded string"
+                    .to_owned(),
+            );
+        }
+        gaps.push(CONVERSATION_PROVENANCE_GAP.to_owned());
+        ArtifactProvenance {
+            artifact_id: artifact_id.to_owned(),
+            current_revision: head.map(|head| head.revision),
+            current_digest: head.map(|head| head.digest.clone()),
+            retained_revisions,
+            reviews,
+            correlated_candidates,
+            gaps,
+        }
+    }
+
     /// Appends a stale transition only when this candidate depends on the changed base.
     pub fn mark_integration_candidate_stale(
         &mut self,
         req: StaleIntegrationCandidateRequest,
     ) -> Result<IntegrationCandidateReceipt, CoordinationError> {
         mark_integration_candidate_stale(self, req)
+    }
+}
+
+/// Exact source-code identities one candidate records, in sorted order.
+///
+/// Only the two recorded reference families a consumer can navigate to are
+/// included: the artifact refs the candidate was built against and its producer
+/// lineage. They are reported as the retained strings, never rewritten to a
+/// path, a line number, or a current-code alias.
+fn retained_code_identities(candidate: &IntegrationCandidate) -> Vec<String> {
+    let mut identities: BTreeSet<String> = BTreeSet::new();
+    identities.extend(candidate.worktree_or_artifact_refs.iter().cloned());
+    identities.extend(candidate.producer_lineage.iter().cloned());
+    identities.into_iter().collect()
+}
+
+/// Projects one retained review into a correlated provenance leg, citing the
+/// exact string both records share.
+fn correlated_review(
+    review: &crate::peer_communication::AnchoredReview,
+    matched_ref: String,
+) -> CorrelatedReview {
+    CorrelatedReview {
+        review_id: review.review_id.clone(),
+        operation: review.operation.clone(),
+        artifact_id: review.artifact_id.clone(),
+        artifact_revision: review.artifact_revision,
+        artifact_digest: review.artifact_digest.clone(),
+        lifecycle: review.lifecycle,
+        matched_ref,
     }
 }
 

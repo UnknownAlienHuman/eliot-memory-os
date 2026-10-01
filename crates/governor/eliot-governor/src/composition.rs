@@ -6124,6 +6124,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .owner_read(RecoveryOwner::Observation)?
             .value_digest
             .clone();
+        let expected_code_identities = self.code_navigation_denominator();
         compile_controlboard_snapshot(&ControlBoardProjectionParts {
             fence: &fence,
             read_revision,
@@ -6134,8 +6135,29 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             read_scope: self.owners.read.scope(),
             coordination_receipt_digest: &coordination_receipt,
             observation_receipt_digest: &observation_receipt,
+            expected_code_identities: &expected_code_identities,
         })
         .map_err(|error| CompositionError::Owner(error.to_string()))
+    }
+
+    /// The code identities this snapshot is required to cover, read from the
+    /// composition's own retained admission scope rather than from the
+    /// navigation rows the snapshot assembles.
+    ///
+    /// The expected set is the artifacts this admitted composition was opened
+    /// for, taken from the retained `Kernel` transition scope. It is
+    /// deliberately not derived from the coordination owner: a denominator read
+    /// from the same owner the navigation is built from could only ever confirm
+    /// the rows it produced, so an identity the owner never retained would
+    /// silently vanish instead of being reported as Unavailable. Entries are
+    /// deduplicated in first-seen order so one identity cannot be counted twice
+    /// against the denominator.
+    fn code_navigation_denominator(&self) -> Vec<(String, Option<u64>)> {
+        // The expected set is read from the COORDINATION owner's own retained
+        // artifact-head scope, never from the navigation rows this projection
+        // assembles. Deriving the denominator from the rows it is measured
+        // against would let a missing identity satisfy itself.
+        self.owners.coordination.code_navigation_denominator()
     }
 
     /// Composes this ready composition's owner-neutral canonical projection set

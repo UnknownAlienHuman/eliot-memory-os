@@ -41,12 +41,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{ArtifactId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_coordination::{
-    AnchorResolution, CoordinationOwner, PeerReviewLifecycle, PeerReviewStanding, ReviewKind,
-    ReviewRecommendation, ReviewTargetKind,
+    AnchorResolution, ArtifactProvenance, CandidateProvenance, CoordinationOwner,
+    PeerReviewLifecycle, PeerReviewStanding, ReviewKind, ReviewRecommendation, ReviewTargetKind,
 };
 use eliot_evaluation_contracts::HumanAttentionEvaluation;
 use eliot_observation::ObservationJournal;
@@ -75,6 +75,11 @@ pub enum ControlBoardProjectionError {
     /// Owner state could not be serialized for the binding digest.
     #[error("controlboard projection owner state is invalid: {0}")]
     Owner(String),
+    /// The caller recorded the same required code identity twice. A repeated
+    /// identity would let one expected entry be counted twice against the
+    /// navigation denominator, so the assembly fails closed instead.
+    #[error("controlboard projection required code identity is repeated: {0}")]
+    ExpectedCodeIdentity(String),
 }
 
 /// One provider-issued identity binding assembled from a real owner read.
@@ -197,6 +202,247 @@ pub struct ControlBoardReviewBatchObligation {
     pub state_fence: StateFence,
 }
 
+/// One reviewed operation reachable from the current code identity, as the
+/// coordination owner retains it.
+///
+/// This is the navigation start for the decision-to-change direction: the
+/// reviewed operation identity is reproduced verbatim from the retained
+/// review, joined to the exact reviewed revision and digest, and attributed as
+/// correlation. The shared identity string is cited on both endpoints so a
+/// reader can confirm the join instead of trusting a summary, and no edge here
+/// asserts that a decision caused a change.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardReviewedOrigin {
+    /// Stable review identity that recorded the reviewed operation.
+    pub review_id: String,
+    /// Reviewed operation identity exactly as the owner retains it.
+    pub operation: String,
+    /// Exact reviewed artifact revision; never rewritten to the current head.
+    pub artifact_revision: u64,
+    /// Exact reviewed artifact digest at that revision.
+    pub artifact_digest: String,
+    /// This review's own lifecycle, so a pending obligation is never presented
+    /// as a settled one.
+    pub lifecycle: PeerReviewLifecycle,
+    /// Exact recorded string shared with the code identity.
+    pub matched_ref: String,
+}
+
+/// One recorded change reachable from the current code identity.
+///
+/// The candidate's own diff and base commit are reproduced verbatim, so
+/// navigation reaches the actual recorded change. Multiple candidates stay
+/// multiple: no arbitrary single origin is selected to simplify navigation.
+///
+/// `forward` is the same candidate read on its own legs, so the row and the
+/// per-change view cannot drift apart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardChangeOrigin {
+    /// Forward provenance for this candidate: retained decision event, leases,
+    /// exact-string review correlation, and the legs it cannot close.
+    pub forward: ControlBoardCandidateNavigation,
+}
+
+/// Bidirectional change-provenance navigation for one code identity.
+///
+/// Forward, the row lists every retained review that reviewed this exact
+/// identity, with its own operation, revision, digest and lifecycle. Reverse,
+/// it lists every retained candidate naming it with the diff and base commit
+/// that the change was recorded against. Nothing is collapsed: several reviews
+/// or several candidates stay several rows, and every absent leg is named in
+/// `gaps` instead of being filled from a nearest match.
+///
+/// The row is a navigation index, not an approval: a head that moved with
+/// changed bytes is visible through `current_digest` beside the exact reviewed
+/// digest of each review, and no review's approval is read as covering the
+/// current head.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardCodeNavigation {
+    /// Exact code identity this navigation was requested for.
+    pub artifact_id: String,
+    /// Currently admitted head revision, absent when no revision was admitted.
+    pub current_revision: Option<u64>,
+    /// Digest bound at the currently admitted head revision.
+    pub current_digest: Option<String>,
+    /// Every retained revision digest for this identity, in revision order, so
+    /// a moved head with changed bytes is visible rather than implied.
+    pub retained_revisions: Vec<ControlBoardRetainedRevision>,
+    /// Every retained review naming this exact identity, in `review_id` order.
+    pub reviewed_origins: Vec<ControlBoardReviewedOrigin>,
+    /// Every retained candidate naming this exact identity, in `candidate_id`
+    /// order.
+    pub change_origins: Vec<ControlBoardChangeOrigin>,
+    /// Coverage this record cannot supply, each with the reason.
+    pub gaps: Vec<String>,
+}
+
+/// One retained revision digest behind a code identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardRetainedRevision {
+    pub revision: u64,
+    pub digest: String,
+}
+
+/// Recorded origins for one admitted change, read forward from the retained
+/// submission decision to the retained diff, code and review legs.
+///
+/// This is the forward counterpart of [`ControlBoardCodeNavigation`]: it is
+/// requested by the exact candidate identity the navigation row cites, so the
+/// two views are guaranteed to describe the same retained records rather than
+/// two independently assembled summaries.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ControlBoardCandidateNavigation {
+    /// Stable candidate identity.
+    pub candidate_id: String,
+    /// Exact diff reference as retained on the candidate.
+    pub diff_ref: String,
+    /// Exact base commit as retained on the candidate.
+    pub base_commit: String,
+    /// Sequence of the retained submission decision event, absent when the
+    /// candidate's first history revision no longer joins to a retained
+    /// `IntegrationCandidateSubmitted` event naming it. An absent decision leg
+    /// is reported absent, never assumed.
+    pub submission_event_sequence: Option<u64>,
+    /// Leases recorded against this candidate, in `lease_id` order.
+    pub lease_ids: Vec<String>,
+    /// Verifier references exactly as retained. They are opaque handles: this
+    /// owner records no verifier run, outcome, or artifact-revision binding for
+    /// them, so none is inferred here and a passing run for different bytes is
+    /// never read as evidence about the reviewed bytes.
+    pub verification_refs: Vec<String>,
+    /// Exact source-code identities the candidate records, in sorted order.
+    pub code_identities: Vec<String>,
+    /// Reviews sharing an exact recorded identity string with this candidate,
+    /// in `review_id` order.
+    pub reviewed_origins: Vec<ControlBoardReviewedOrigin>,
+    /// Legs this record cannot close, each with the reason.
+    pub gaps: Vec<String>,
+}
+
+/// Reproduces the coordination owner's retained change-provenance legs.
+///
+/// The shape is decided here; every fact is read from
+/// [`CoordinationOwner::artifact_provenance`] and
+/// [`CoordinationOwner::candidate_provenance`], which rebuild the view from
+/// retained records on each call. No visibility, privacy, or role fact is added
+/// to any row or endpoint, so this navigation can never disclose a foreign or
+/// private artifact that the owner itself would not retain.
+fn project_code_navigation(
+    coordination: &CoordinationOwner,
+    artifact_id: &str,
+    requested_revision: Option<u64>,
+) -> ControlBoardCodeNavigation {
+    let ArtifactProvenance {
+        artifact_id: identity,
+        current_revision,
+        current_digest,
+        retained_revisions,
+        reviews,
+        correlated_candidates,
+        gaps,
+    } = coordination.artifact_provenance(artifact_id, requested_revision);
+    let change_origins = correlated_candidates
+        .into_iter()
+        .map(|candidate| ControlBoardChangeOrigin {
+            forward: project_candidate_navigation(coordination, &candidate.candidate_id),
+        })
+        .collect();
+    ControlBoardCodeNavigation {
+        artifact_id: identity,
+        current_revision,
+        current_digest,
+        retained_revisions: retained_revisions
+            .into_iter()
+            .map(|revision| ControlBoardRetainedRevision {
+                revision: revision.revision,
+                digest: revision.digest,
+            })
+            .collect(),
+        reviewed_origins: reviews.into_iter().map(review_origin).collect(),
+        change_origins,
+        gaps,
+    }
+}
+
+/// Projects one retained review into a navigation origin, citing the exact
+/// string that joined it to the requested code identity.
+fn review_origin(review: eliot_coordination::CorrelatedReview) -> ControlBoardReviewedOrigin {
+    ControlBoardReviewedOrigin {
+        review_id: review.review_id,
+        operation: review.operation,
+        artifact_revision: review.artifact_revision,
+        artifact_digest: review.artifact_digest,
+        lifecycle: review.lifecycle,
+        matched_ref: review.matched_ref,
+    }
+}
+
+/// Reproduces the coordination owner's recorded origins for one change.
+///
+/// See [`ControlBoardCandidateNavigation`]: every field is read from
+/// [`CoordinationOwner::candidate_provenance`], which joins the retained
+/// submission decision, the retained lease records and the exact-string review
+/// correlation, and names every leg it cannot close. A candidate identity that
+/// no longer resolves is reported as an absent record rather than projected as
+/// a change with empty legs.
+fn project_candidate_navigation(
+    coordination: &CoordinationOwner,
+    candidate_id: &str,
+) -> ControlBoardCandidateNavigation {
+    let Some(CandidateProvenance {
+        candidate_id: identity,
+        submission_event_sequence,
+        lease_ids,
+        diff_ref,
+        base_commit,
+        code_identities,
+        correlated_reviews,
+        verification_refs,
+        gaps,
+    }) = coordination.candidate_provenance(candidate_id)
+    else {
+        return ControlBoardCandidateNavigation {
+            candidate_id: candidate_id.to_owned(),
+            diff_ref: String::new(),
+            base_commit: String::new(),
+            submission_event_sequence: None,
+            lease_ids: Vec::new(),
+            verification_refs: Vec::new(),
+            code_identities: Vec::new(),
+            reviewed_origins: Vec::new(),
+            gaps: vec!["no retained candidate record carries this identity".to_owned()],
+        };
+    };
+    ControlBoardCandidateNavigation {
+        candidate_id: identity,
+        diff_ref,
+        base_commit,
+        submission_event_sequence,
+        lease_ids,
+        verification_refs,
+        code_identities,
+        reviewed_origins: correlated_reviews.into_iter().map(review_origin).collect(),
+        gaps,
+    }
+}
+
+/// Whether the coordination owner retains any navigation leg for this code
+/// identity.
+///
+/// This decides the reported denominator, so it is asked of the owner rather
+/// than of the navigation rows: an identity is covered only when the owner
+/// itself retained something for it — an admitted head, a retained revision
+/// digest, a review naming it, or a candidate naming it. An identity none of
+/// those records mention is Unavailable, and is reported as missing rather
+/// than as an empty completed section.
+fn retains_code_navigation(coordination: &CoordinationOwner, artifact_id: &str) -> bool {
+    let provenance = coordination.artifact_provenance(artifact_id, None);
+    provenance.current_revision.is_some()
+        || !provenance.retained_revisions.is_empty()
+        || !provenance.reviews.is_empty()
+        || !provenance.correlated_candidates.is_empty()
+}
+
 /// Refresh-consistent `ControlBoard` snapshot assembled over Governor owners.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ControlBoardGovernorSnapshot {
@@ -215,6 +461,16 @@ pub struct ControlBoardGovernorSnapshot {
     /// expectation, obligation, or artifact head; a missing owner would fail
     /// the assembly rather than reach this field.
     pub review_batches: Vec<ControlBoardReviewBatch>,
+    /// Bidirectional change-provenance navigation for every code identity this
+    /// snapshot is required to cover, in identity order. The denominator is the
+    /// caller's independently recorded expected identities, so a navigation row
+    /// can never be closed by the same list it is checked against.
+    pub code_navigations: Vec<ControlBoardCodeNavigation>,
+    /// Caller-recorded code identities the coordination owner retains no
+    /// navigation leg for, in identity order. An identity the owner never
+    /// retained is reported here as an explicit gap, never as an empty
+    /// completed section.
+    pub missing_code_navigations: Vec<String>,
 }
 
 /// Borrowed assembly inputs. The caller retains every owner; this struct only
@@ -238,6 +494,13 @@ pub struct ControlBoardProjectionParts<'a> {
     pub coordination_receipt_digest: &'a str,
     /// Kernel-issued value digest for the observation payload bytes.
     pub observation_receipt_digest: &'a str,
+    /// Code identities the caller independently requires this snapshot to
+    /// cover, in the order the caller recorded them. This is the navigation
+    /// denominator: it is supplied by the caller and is never derived from the
+    /// navigation rows the snapshot assembles, so completeness cannot be
+    /// established by the list it is checked against. Each requested revision
+    /// is paired with the identity it was requested for.
+    pub expected_code_identities: &'a [(String, Option<u64>)],
 }
 
 /// Stable owner identity bound into the G-11 coordination binding.
@@ -292,6 +555,31 @@ pub fn compile_controlboard_snapshot(
     let review_batches = project_review_batches(parts.coordination);
     let review_bytes = serde_json::to_vec(&review_batches)
         .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
+    // Navigation coverage is checked against the caller's own recorded
+    // denominator, never against the rows assembled here, so an identity the
+    // owner never retained is reported missing instead of being satisfied by
+    // the same list it is measured with.
+    let mut code_navigations = Vec::new();
+    let mut missing_code_navigations = Vec::new();
+    let mut seen_identities = BTreeSet::new();
+    for (identity, requested_revision) in parts.expected_code_identities {
+        if !seen_identities.insert(identity.as_str()) {
+            return Err(ControlBoardProjectionError::ExpectedCodeIdentity(
+                identity.clone(),
+            ));
+        }
+        if !retains_code_navigation(parts.coordination, identity) {
+            missing_code_navigations.push(identity.clone());
+            continue;
+        }
+        code_navigations.push(project_code_navigation(
+            parts.coordination,
+            identity,
+            *requested_revision,
+        ));
+    }
+    let navigation_bytes = serde_json::to_vec(&(&code_navigations, &missing_code_navigations))
+        .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
     let owner_digests = (
         sha256_hex(&coordination_bytes),
         sha256_hex(&task_bytes),
@@ -300,9 +588,10 @@ pub fn compile_controlboard_snapshot(
         sha256_hex(&scope_bytes),
     );
     // The G-11 binding is the review projection, so it also covers the
-    // coordination owner's retained review obligations. The I-12 binding is
-    // the observation report projection and deliberately does not: a moved or
-    // disposed review must change the review binding, not the report binding.
+    // coordination owner's retained review obligations and the navigation legs
+    // assembled from them. The I-12 binding is the observation report
+    // projection and deliberately does not: a moved or disposed review must
+    // change the review binding, not the report binding.
     let bind = |binding_id: &str, receipt_ref: &str, review_digest: Option<&str>| {
         canonical_json_bytes(&(
             binding_id,
@@ -319,6 +608,9 @@ pub fn compile_controlboard_snapshot(
         .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))
     };
     let review_digest = sha256_hex(&review_bytes);
+    let bound_digest = canonical_json_bytes(&(review_digest, sha256_hex(&navigation_bytes)))
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|error| ControlBoardProjectionError::Owner(error.to_string()))?;
     Ok(ControlBoardGovernorSnapshot {
         fence: parts.fence.clone(),
         read_revision: parts.read_revision,
@@ -326,10 +618,12 @@ pub fn compile_controlboard_snapshot(
         g11_coordination: bind(
             G11_OWNER_BINDING_ID,
             parts.coordination_receipt_digest,
-            Some(&review_digest),
+            Some(&bound_digest),
         )?,
         i12_report: bind(I12_OWNER_BINDING_ID, parts.observation_receipt_digest, None)?,
         review_batches,
+        code_navigations,
+        missing_code_navigations,
     })
 }
 

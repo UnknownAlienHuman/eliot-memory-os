@@ -30,9 +30,10 @@ pub use handoff_persistence::{
 pub use handoff_resume::resume_from_retained_handoff;
 
 pub use integration_candidate::{
-    IntegrationCandidate, IntegrationCandidateDraft, IntegrationCandidateReceipt,
+    ArtifactProvenance, CONVERSATION_PROVENANCE_GAP, CandidateProvenance, CorrelatedCandidate,
+    CorrelatedReview, IntegrationCandidate, IntegrationCandidateDraft, IntegrationCandidateReceipt,
     IntegrationCandidateRevision, IntegrationCandidateStatus, IntegrationQueue,
-    StaleIntegrationCandidateRequest,
+    RetainedArtifactRevision, StaleIntegrationCandidateRequest, VERIFIER_REVISION_GAP,
 };
 
 pub use peer_communication::{
