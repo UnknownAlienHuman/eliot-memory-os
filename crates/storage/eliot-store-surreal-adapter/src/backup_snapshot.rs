@@ -191,10 +191,10 @@ pub struct EcxfSourceClassCapture {
 /// These are explicit evidence gaps, not zero counts or empty source values.
 ///
 /// The list is a *consequence* of what this capture can read, not a fixed list:
-/// [`observed_capture_gaps`] derives each entry from the admitted generation's
-/// own baseline or from the census this module ran, so a generation that
-/// defines the missing evidence closes its gap without a second vocabulary and
-/// without emptying the vector by hand.
+/// [`observed_capture_gaps`] derives every entry — all eight, not only the first
+/// three — from the admitted generation's own baseline or from the census this
+/// module ran, so a generation that defines the missing evidence closes its gap
+/// without a second vocabulary and without emptying the vector by hand.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EcxfCaptureGap {
     /// The admitted generation declares no scope column on a captured member
@@ -207,20 +207,27 @@ pub enum EcxfCaptureGap {
     /// The census captures no blob-residency class, so the export declares no
     /// reachable residency key and carries no sealed blob.
     BlobStoreEvidenceUnavailable,
-    /// Architecture and `NormativePair` source identity receipts are owned
-    /// outside this adapter and are not columns of the admitted generation.
+    /// No captured table the census reads defines the Architecture source digest
+    /// or the `NormativePair` identity receipt column on the admitted generation's
+    /// baseline, so both stay unobserved; see [`SOURCE_IDENTITY_COLUMNS`].
     ExternalSourceIdentityEvidenceUnavailable,
-    /// The adapter has no durable source-side ECXF export receipt.
+    /// No captured table the census reads defines a source-side ECXF export
+    /// receipt column, so the receipt reference stays unobserved; see
+    /// [`SOURCE_EXPORT_RECEIPT_COLUMNS`].
     SourceExportReceiptUnavailable,
-    /// The capture point reads the schema generation and the canonical fence
-    /// only. `StateFence::resource_generation` is the generation relevant to one
-    /// decision, not the store's own generation, so it cannot stand in for it.
+    /// No captured table the census reads defines the store's own generation
+    /// column. The capture point reads the *schema* generation and the canonical
+    /// fence only, and `StateFence::resource_generation` is the generation
+    /// relevant to one decision, not the store's own, so neither can stand in for
+    /// it; see [`STORE_RESOURCE_GENERATION_COLUMNS`].
     StoreResourceGenerationUnavailable,
-    /// The adapter declares no identity or version of its own, and a build
-    /// constant of the running binary is not an observation of the source store.
+    /// No captured table the census reads defines an adapter identity or version
+    /// column, and a build constant of the running binary is not an observation
+    /// of the source store; see [`SOURCE_ADAPTER_IDENTITY_COLUMNS`].
     SourceAdapterIdentityUnavailable,
-    /// No owner declares the compression or encryption profile this export
-    /// applies; the emitted package's codecs are not read from the source store.
+    /// No captured table the census reads defines the compression or encryption
+    /// profile column this export applies, so the emitted package's codecs are
+    /// unobserved; see [`EXPORT_PROFILE_COLUMNS`].
     ExportProfileUnavailable,
 }
 
@@ -814,28 +821,82 @@ fn captures_blob_residency() -> bool {
     captured_member_classes().any(|class| class.member_type == SnapshotMemberType::Blob)
 }
 
+/// The evidence columns that would close the external source-identity gap.
+///
+/// Named exactly as `eliot-ecxf` names them (`EcxfManifest::architecture_source_digest`
+/// and `normative_pair_identity_receipt_digest`), so the check reads the consumer's
+/// own vocabulary instead of a second one invented here. No admitted baseline defines
+/// either column on any table, so the gap stands: the Architecture source digest and
+/// the `NormativePair` identity receipt are sealed by owners outside the store, and
+/// nothing this crate reads carries them.
+const SOURCE_IDENTITY_COLUMNS: &[&str] =
+    &["architecture_source_digest", "normative_pair_identity_receipt_digest"];
+
+/// The evidence column that would close the source-side export-receipt gap.
+///
+/// `EcxfManifest::export_receipt`. A durable source-side ECXF export receipt has no
+/// artifact anywhere in the store, so the gap stands.
+const SOURCE_EXPORT_RECEIPT_COLUMNS: &[&str] = &["export_receipt"];
+
+/// The evidence column that would close the store-generation gap.
+///
+/// `ExportFence::store_generation`. Distinct from the schema generation this capture
+/// *does* observe at `schema_meta`, and distinct from `StateFence::resource_generation`,
+/// which is the generation relevant to one decision rather than the store's own. No
+/// admitted baseline defines this column, so the gap stands.
+const STORE_RESOURCE_GENERATION_COLUMNS: &[&str] = &["store_generation"];
+
+/// The evidence columns that would close the adapter-identity gap.
+///
+/// `EcxfManifest::source_adapter` and `source_adapter_version`. A build constant of
+/// the running binary is not an observation of the source store, and `schema_meta`'s
+/// `migration_id` names the *migration*, not the adapter, so substituting either would
+/// be a default rather than a reading. No admitted baseline defines these columns, so
+/// the gap stands.
+const SOURCE_ADAPTER_IDENTITY_COLUMNS: &[&str] = &["source_adapter", "source_adapter_version"];
+
+/// The evidence columns that would close the export-profile gap.
+///
+/// `EcxfManifest::compression` and `encryption`. `erasure_intent`'s `encryption_key_ref`
+/// is a key *reference* on a table the admitted generation does not define, not a
+/// profile of the package this export emits, so it cannot stand in for one. No
+/// admitted baseline defines these columns, so the gap stands.
+const EXPORT_PROFILE_COLUMNS: &[&str] = &["compression", "encryption"];
+
+/// Reports whether the census reads a table whose admitted baseline defines every
+/// named evidence column.
+///
+/// Both halves are load-bearing. A column on a table the census does not read is
+/// never observed, and a column on a table the admitted generation does not define
+/// is not evidence for *this* capture, so either alone would report a gap as closed
+/// that no row in `class_rows` can support.
+///
+/// `any` over tables, where [`captures_scope_column`] uses `all`: one evidence table
+/// closes one gap, whereas scope closure must hold for *every* record. The marker
+/// carries the trailing space, as in [`admitted_generation_defines`], so a longer
+/// column name can never satisfy a shorter one.
+fn captures_evidence_columns(ddl: &'static str, columns: &[&str]) -> bool {
+    captured_member_tables().any(|table| {
+        columns
+            .iter()
+            .all(|column| ddl.contains(&format!("DEFINE FIELD {column} ON {table} ")))
+    })
+}
+
 /// The evidence gaps of one ECXF capture, derived from what the capture can read.
 ///
-/// The first three entries are *predicates* over the admitted generation's own
-/// baseline and over the census this module ran, not fixed refusals: a baseline
-/// that gives the captured tables a scope column, a census that captures an
-/// erasure ledger, or a census that captures a blob member each close its gap
-/// with no second vocabulary and no edit to this list.
+/// Every entry is a *predicate* over the admitted generation's own baseline and over
+/// the census this module ran; none is a fixed refusal. The first three ask about the
+/// census, the last five about evidence columns that baseline would have to define on
+/// a table the census reads. Each closes its own gap when its owner supplies the
+/// evidence, with no second vocabulary and no edit to this list.
 ///
-/// The remaining entries are declared absences of *this owner*, and no baseline
-/// or census can close them:
-///
-/// * the Architecture source digest and the `NormativePair` identity receipt are
-///   sealed by owners outside the store, so they are not columns any baseline
-///   defines;
-/// * a source-side ECXF export receipt has no durable artifact anywhere;
-/// * the capture point reads the schema generation and the canonical fence, and
-///   `StateFence::resource_generation` is the generation relevant to one
-///   decision, not the store's own generation, so it cannot stand in for one;
-/// * this adapter declares no identity or version of its own, and a build
-///   constant of the running binary is not an observation of the source store;
-/// * no owner declares the compression or encryption profile this export
-///   applies, and the emitted package's codecs are not read from the store.
+/// A gap that stays open is the honest reading, not an unfinished one: on the admitted
+/// baseline the evidence does not exist, and naming that absence is what lets the
+/// exporter refuse a boundary it cannot prove instead of certifying one it cannot see.
+/// Dropping an entry from this list would not report a stronger observation — it would
+/// delete the only record that the observation is missing, and let an unproven boundary
+/// pass as a proven one.
 fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreError> {
     let Some(ddl) = admitted_generation_ddl(generation) else {
         return Err(StoreError::InvalidField {
@@ -853,13 +914,21 @@ fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreE
     if !captures_blob_residency() {
         gaps.push(EcxfCaptureGap::BlobStoreEvidenceUnavailable);
     }
-    gaps.extend([
-        EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
-        EcxfCaptureGap::SourceExportReceiptUnavailable,
-        EcxfCaptureGap::StoreResourceGenerationUnavailable,
-        EcxfCaptureGap::SourceAdapterIdentityUnavailable,
-        EcxfCaptureGap::ExportProfileUnavailable,
-    ]);
+    if !captures_evidence_columns(ddl, SOURCE_IDENTITY_COLUMNS) {
+        gaps.push(EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable);
+    }
+    if !captures_evidence_columns(ddl, SOURCE_EXPORT_RECEIPT_COLUMNS) {
+        gaps.push(EcxfCaptureGap::SourceExportReceiptUnavailable);
+    }
+    if !captures_evidence_columns(ddl, STORE_RESOURCE_GENERATION_COLUMNS) {
+        gaps.push(EcxfCaptureGap::StoreResourceGenerationUnavailable);
+    }
+    if !captures_evidence_columns(ddl, SOURCE_ADAPTER_IDENTITY_COLUMNS) {
+        gaps.push(EcxfCaptureGap::SourceAdapterIdentityUnavailable);
+    }
+    if !captures_evidence_columns(ddl, EXPORT_PROFILE_COLUMNS) {
+        gaps.push(EcxfCaptureGap::ExportProfileUnavailable);
+    }
     Ok(gaps)
 }
 
