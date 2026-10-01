@@ -5526,6 +5526,14 @@ fn owner_record_digest_parts(records: &OwnerRecords) -> Vec<String> {
 }
 
 /// Builds the digest parts committing one owner-issued causal evidence record.
+///
+/// The returned parts are UNSORTED. `owner_record_digest_parts` sorts the whole
+/// vector before it is serialised and `compute_candidate_digest` sorts again,
+/// which is what makes every list this function emits order independent: two
+/// owners that declared the same members in a different order spell the same
+/// parts and therefore the same identity. Ordering is a property of the caller,
+/// so this function must not sort locally as well; a second sort would be a
+/// second canonicalisation of the same value.
 fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
     let mut parts: Vec<String> = vec![format!(
         "causal_evidence:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
@@ -5552,9 +5560,7 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         "causal_intervention:{}:{intervention}",
         record.source_handle
     ));
-    for handle in &record.rivals.omitted {
-        parts.push(format!("rival_omitted:{}:{handle}", record.source_handle));
-    }
+    parts.extend(rival_denominator_digest_parts(record));
     for evidence in &record.evidence {
         // The envelope's own coverage and provenance are bound here because
         // admission and qualification now both read them: a preimage that
@@ -5608,6 +5614,61 @@ fn causal_evidence_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
         coverage_spelling(derived.evidence_coverage),
         coverage_spelling(derived.rival_coverage)
     ));
+    parts
+}
+
+/// Builds the digest parts committing one record's complete retained
+/// rival/confounder denominator.
+///
+/// The WHOLE denominator enters the preimage, not only its omissions. `expected`
+/// and `observed` are owner-retained values this crate already bounds, handle
+/// checks and charges against the byte budget, so leaving them out made them the
+/// one part of a causal record a changed candidate identity could not see: two
+/// records differing only in how many rivals the owner expected, or in which
+/// rivals it actually observed, produced one byte-identical `candidate_digest`.
+/// The gap could not be delegated to the published record either, because
+/// `CausalClaimRecord` reports only the DERIVED coverage and a denominator with
+/// an empty `observed` list derives `Unknown` for both records.
+///
+/// One part per handle per member list is the shape the pre-existing
+/// `rival_omitted` loop used and the shape the evidence-envelope loop below it
+/// uses. It is a content comparison of the retained values, not a count and not
+/// an existence check: a changed handle, a changed membership, a changed list
+/// length and a duplicate handle each change the part set. It needs no local
+/// sort, because `owner_record_digest_parts` sorts every part before they are
+/// canonicalised, which makes the commitment independent of the order the owner
+/// listed handles in and keeps exact replay byte-stable.
+///
+/// The owner-DECLARED coverage cell is committed with the lists because it is
+/// retained on the same struct and `RivalDenominator::validate` reads it: two
+/// records whose lists agree but whose declared coverage differs are different
+/// owner records and must not share one identity. It is committed separately
+/// from the derived `rival_coverage` in the `causal_derived` part, which is a
+/// different denominator.
+///
+/// Committing these cells is an IDENTITY change and deliberately not an
+/// ADMISSIBILITY change. `RivalDenominator::validate` joins `observed` to
+/// `evidence_ids` and deliberately does not join `expected`, so an `expected`
+/// member that no retained envelope backs stays admissible here. Such a record
+/// still blocks every qualified causal state through the rival leg in
+/// `blocking_causal_leg`; what it can no longer do is share a candidate
+/// identity with a record that declared a different denominator.
+fn rival_denominator_digest_parts(record: &CausalEvidenceRecord) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!(
+        "rival_declared_coverage:{}:{}",
+        record.source_handle,
+        coverage_spelling(record.rivals.coverage)
+    ));
+    for handle in &record.rivals.expected {
+        parts.push(format!("rival_expected:{}:{handle}", record.source_handle));
+    }
+    for handle in &record.rivals.observed {
+        parts.push(format!("rival_observed:{}:{handle}", record.source_handle));
+    }
+    for handle in &record.rivals.omitted {
+        parts.push(format!("rival_omitted:{}:{handle}", record.source_handle));
+    }
     parts
 }
 
