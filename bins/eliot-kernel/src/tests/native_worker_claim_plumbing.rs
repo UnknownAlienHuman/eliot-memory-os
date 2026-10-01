@@ -230,7 +230,7 @@ fn test_capability_cell_registry_digest() -> String {
 /// above, and never a hardcoded digest literal. They are carried for shape:
 /// the route compares them only against the presented join, so the proofs
 /// below do not depend on their content.
-fn test_executable_join() -> NativeWorkerExecutableBinding {
+pub(super) fn test_executable_join() -> NativeWorkerExecutableBinding {
     let now = now_ms();
     NativeWorkerExecutableBinding {
         route_ref: "route://test/full-canonical-route".to_owned(),
