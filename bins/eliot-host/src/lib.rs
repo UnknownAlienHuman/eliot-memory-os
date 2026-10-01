@@ -1624,7 +1624,8 @@ use eliot_contracts::{AuthorityEpoch, EpochContractError, EpochId, ResourceGener
 use eliot_host_service::{HostDurableJobAdapter, HostWakeIntentAdapter};
 use eliot_host_state::{
     ActivationState, AppendReceipt, DrainRecord, DrainState, EpochIdentity, EpochLineageId,
-    EpochTransition, HostInstallationEpoch, HostObservationRecord, HostState,
+    EpochTransition, HostInstallationEpoch, HostObservationRecord,
+    HostProcessIncarnationRecord, HostProcessIncarnationRegistration, HostState,
     HostStateJournalService, HostStateRecord, IdempotencyIdentity, JournalBackend, JournalError,
     KernelJobBinding, KernelRecord, ModuleBuildProvenanceRecord, NonceState, OneTimeNonceState,
     PriorKernelDisposition, ProductionHostStateJournal, ReconcileOutcome, RecordFence,
@@ -9180,7 +9181,11 @@ impl HostComposition {
                 "crash_reporter.already_attached",
             ));
         }
-        if let Err(error) = handle.update_context(self.crash_runtime_context(true)) {
+        let process_incarnation = self.register_current_host_process_birth();
+        if let Err(error) = handle.update_context(self.crash_runtime_context(
+            true,
+            process_incarnation.as_ref().map(|registration| registration.record()),
+        )) {
             handle.invalidate_runtime_context();
             return Err(error);
         }
@@ -9214,7 +9219,71 @@ impl HostComposition {
         self.registry_host_root.join("crash-reports")
     }
 
-    fn crash_runtime_context(&self, journal_head_current: bool) -> CrashRuntimeContext {
+    /// Obtains the current OS birth twice around original-owner registration.
+    /// The journal's typed facts are not self-authenticating: the crash
+    /// reporter receives a generation only when this composition independently
+    /// observes the live native Host and the exact committed owner record,
+    /// receipt, and operation projection all agree.
+    #[cfg(windows)]
+    fn register_current_host_process_birth(
+        &self,
+    ) -> Option<HostProcessIncarnationRegistration> {
+        let process_id = std::process::id();
+        let first = observe_named_pipe_peer_process(process_id).ok()?;
+        let first_identity = first.identity().clone();
+        if first_identity.process_id != process_id {
+            return None;
+        }
+        let registration = self
+            .journal
+            .register_host_process_birth(
+                first_identity.process_id,
+                first_identity.start_time_100ns,
+                first_identity.image_path.clone(),
+            )
+            .ok()?;
+        let second = observe_named_pipe_peer_process(process_id).ok()?;
+        if second.identity() != &first_identity {
+            return None;
+        }
+
+        let record = registration.record();
+        let state = self.journal.snapshot().ok()?;
+        let stored = state.host_process_incarnation.as_ref()?;
+        state.activation.as_ref()?;
+        let applied = state
+            .applied_operations
+            .iter()
+            .find(|operation| operation.identity == *record.operation())?;
+        if state.host != self.host
+            || stored != record
+            || record.fence().host != self.host
+            || record.host_process_nonce() != &self.host.host_process_nonce()
+            || record.process_id() != first_identity.process_id
+            || record.process_start_time_100ns() != first_identity.start_time_100ns
+            || record.process_image_path() != first_identity.image_path.as_str()
+            || applied.checksum != registration.record_checksum()
+            || applied.sequence != registration.receipt().sequence()
+            || applied.identity != *record.operation()
+            || record.generation().value() == 0
+        {
+            return None;
+        }
+        Some(registration)
+    }
+
+    #[cfg(not(windows))]
+    fn register_current_host_process_birth(
+        &self,
+    ) -> Option<HostProcessIncarnationRegistration> {
+        None
+    }
+
+    fn crash_runtime_context(
+        &self,
+        journal_head_current: bool,
+        process_incarnation: Option<&HostProcessIncarnationRecord>,
+    ) -> CrashRuntimeContext {
         let state = self.journal.snapshot().ok();
         let journal_head_gap = !journal_head_current || state.is_none();
         let active = if self.registry.pending_activation().is_none() {
@@ -9230,11 +9299,13 @@ impl HostComposition {
                 .as_str()
                 .to_owned()
         });
-        // Host has no retained self-process start receipt. Its activation
-        // epoch identifies the admitted Host lifecycle contour, not the
-        // operating-system process incarnation, so process generation stays
-        // explicitly missing here.
-        let process_generation_ref = None;
+        let process_generation_ref = process_incarnation.map(|record| {
+            format!(
+                "host-installation:{}:resource-generation:{}",
+                self.host.installation.as_str(),
+                record.generation().value()
+            )
+        });
         let state_fence = active.and_then(|generation| {
             self.registry
                 .last_committed_activation_fence()
@@ -9275,8 +9346,12 @@ impl HostComposition {
 
     fn publish_crash_context(&self, journal_head_current: bool) {
         if let Some(handle) = self.crash_reporter.as_ref() {
+            let process_incarnation = self.register_current_host_process_birth();
             if handle
-                .update_context(self.crash_runtime_context(journal_head_current))
+                .update_context(self.crash_runtime_context(
+                    journal_head_current,
+                    process_incarnation.as_ref().map(|registration| registration.record()),
+                ))
                 .is_err()
             {
                 tracing::warn!(

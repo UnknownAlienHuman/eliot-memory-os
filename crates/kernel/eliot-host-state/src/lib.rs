@@ -33,7 +33,8 @@ pub use eliot_contracts::{EpochId, EpochLineageId, EpochTransition};
 pub use error::{BackendError, JournalError, ReconcileOutcome};
 pub use journal::{
     AppendDisposition, AppendReceipt, EpochRetirementObservation, EpochRetirementQuery,
-    EpochRetirementQueryError, HostStateJournal, JOURNAL_MAGIC, JOURNAL_VERSION,
+    EpochRetirementQueryError, HostProcessIncarnationRegistration, HostStateJournal,
+    JOURNAL_MAGIC, JOURNAL_VERSION,
     JournalAppendObserver, WakeCancellationBatchObservation, WakeCancellationBatchQuery,
     WakeCancellationBatchQueryError, readonly_project_host_state, record_checksum,
 };
@@ -45,6 +46,7 @@ pub use model::{
     DrainCommitRecord, DrainRecord, DrainState, EliotActivationRecord, EpochEvidence,
     EpochRetirementRecord, FailureRecoveryDirective, HostInstallationEpoch, HostKernelStoreLineage,
     HostObservationRecord, HostState, HostStateProjection, HostStateRecord, IdempotencyIdentity,
+    HostProcessIncarnationRecord,
     ImmutableProcessManifest, JournalManifest, KernelJobBinding, KernelReadinessObservationRecord,
     KernelRecord, LifecycleTimestamps, ManagedDependencyRecord, ModuleBuildProvenanceRecord,
     NonceState, OneTimeNonceState, PREDECESSOR_RETIREMENT_RELATION_CONTRACT,

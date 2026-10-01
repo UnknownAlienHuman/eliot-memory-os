@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use eliot_contracts::ResourceGeneration;
 use eliot_platform::{KernelActivationNonce, PlatformHandle};
 use eliot_runtime_contracts::WakeIntentState;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -11,7 +12,8 @@ use crate::backend::{BackendReconcileState, CommittedAppend, DurableImage, Prepa
 use crate::model::{
     AppliedOperation, BackupPreparationState, CutoverIntentState, DrainState,
     EliotActivationRecord, EpochEvidence, EpochRetirementRecord, HostInstallationEpoch, HostState,
-    HostStateRecord, IdempotencyIdentity, PredecessorRetirementRelation, RecordFence,
+    HostProcessIncarnationRecord, HostStateRecord, IdempotencyIdentity,
+    PredecessorRetirementRelation, RecordFence,
     RecoveryLineageReason, WakeCancellationBatchProjection, activation_transition,
     backup_preparation_transition, dependency_transition, drain_transition,
     epoch_transition_is_direct_child_of, kernel_transition, store_rebind_transition,
@@ -27,9 +29,10 @@ use crate::reactive_context::{
 use crate::{JournalBackend, JournalError, ReconcileOutcome};
 
 pub const JOURNAL_MAGIC: &[u8] = b"ELIOT-HOST-STATE\n";
-/// Current journal wire revision. Version 4 adds Host-owned module
-/// build/source-provenance records; version 3 remains readable so existing
-/// Host epochs can append the first v4 frame without rebasing their journal.
+/// Current journal wire revision. Version 5 adds the Host-owned process
+/// incarnation record; version 4 added Host-owned module build/source
+/// provenance records. Version 4 remains readable so existing Host epochs
+/// can append the first v5 frame without rebasing their journal.
 /// Version 1 readiness records did not retain
 /// the exact supervision predecessor and are therefore never replayed into a
 /// current Host contour. Version 2 carried the retired Host-local
@@ -38,8 +41,8 @@ pub const JOURNAL_MAGIC: &[u8] = b"ELIOT-HOST-STATE\n";
 /// frames are rejected explicitly as `UnknownVersion` and are never silently
 /// rewritten: recovery proceeds through an explicit new-lineage Host epoch,
 /// and rollback to a version 2 reader requires the version 2 journal bytes.
-pub const JOURNAL_VERSION: u16 = 4;
-const PREVIOUS_JOURNAL_VERSION: u16 = 3;
+pub const JOURNAL_VERSION: u16 = 5;
+const PREVIOUS_JOURNAL_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppendDisposition {
@@ -68,6 +71,29 @@ impl AppendReceipt {
     /// Stable transaction identity used for UNKNOWN reconciliation.
     pub fn transaction_id(&self) -> &PlatformHandle {
         &self.transaction_id
+    }
+}
+
+/// The original Host-owner record and its exact journal receipt after
+/// committed readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostProcessIncarnationRegistration {
+    record: HostProcessIncarnationRecord,
+    receipt: AppendReceipt,
+    record_checksum: String,
+}
+
+impl HostProcessIncarnationRegistration {
+    pub const fn record(&self) -> &HostProcessIncarnationRecord {
+        &self.record
+    }
+
+    pub const fn receipt(&self) -> &AppendReceipt {
+        &self.receipt
+    }
+
+    pub fn record_checksum(&self) -> &str {
+        &self.record_checksum
     }
 }
 
@@ -1116,6 +1142,32 @@ fn apply(
             }
             state.clean_marker = None;
         }
+        HostStateRecord::HostProcessIncarnation(next) => {
+            let current = state.host_process_incarnation.as_ref();
+            if let Some(current) = current {
+                if current.host_process_nonce() == next.host_process_nonce()
+                    && current.process_id() == next.process_id()
+                    && current.process_start_time_100ns() == next.process_start_time_100ns()
+                {
+                    // A birth identity can only be replayed with the original
+                    // frame. The applied-operation check above handles that
+                    // exact case; any second frame for the same OS birth is a
+                    // conflicting claim, even if one physical field changed.
+                    return Err(JournalError::IdempotencyConflict);
+                }
+                let expected = current
+                    .generation()
+                    .next()
+                    .map_err(|_| JournalError::Sequence)?;
+                if next.generation() != expected {
+                    return Err(JournalError::Sequence);
+                }
+            } else if next.generation() != ResourceGeneration::genesis() {
+                return Err(JournalError::Sequence);
+            }
+            state.host_process_incarnation = Some(next.clone());
+            state.clean_marker = None;
+        }
     }
     state.applied_operations.push(AppliedOperation {
         identity: record.operation().clone(),
@@ -1297,6 +1349,12 @@ fn state_for_host(
         }
         let mut recovered = HostState::new(host.clone(), all_evidence);
         recovered.prior_kernel_unknown = true;
+        recovered.host_process_incarnation = states
+            .iter()
+            .filter(|state| state.host.installation == host.installation)
+            .filter_map(|state| state.host_process_incarnation.as_ref())
+            .max_by_key(|record| record.generation())
+            .cloned();
         return Ok(recovered);
     }
     if host.recovery.is_some() {
@@ -1320,6 +1378,7 @@ fn state_for_host(
         return Err(JournalError::RecoveryRequiresNewEpoch);
     }
     let mut next = HostState::new(host.clone(), all_evidence);
+    next.host_process_incarnation = parent.host_process_incarnation.clone();
     next.prior_kernel = parent
         .kernel
         .clone()
@@ -1555,14 +1614,108 @@ impl<B: JournalBackend> HostStateJournal<B> {
 
     #[allow(clippy::needless_pass_by_value)]
     pub fn append(&self, record: HostStateRecord) -> Result<AppendReceipt, JournalError> {
-        if matches!(&record, HostStateRecord::ReadinessObservation(_)) {
+        if matches!(
+            &record,
+            HostStateRecord::ReadinessObservation(_)
+                | HostStateRecord::HostProcessIncarnation(_)
+        ) {
             return Err(JournalError::Invalid(
-                "readiness observations require exact approved-contour admission".into(),
+                "journal owner records require their exact owner-specific admission API".into(),
             ));
         }
         let result = self.append_inner(record);
         self.observe_append_result(&result);
         result
+    }
+
+    /// Registers one native-observed Host birth in the original operational
+    /// journal owner. The caller supplies only fresh physical observation
+    /// facts; installation, Host nonce, fence, operation identity and the
+    /// monotone diagnostic generation are selected or checked by this owner.
+    /// A successful result includes the exact stored record and append receipt
+    /// read back from the committed reducer projection.
+    pub fn register_host_process_birth(
+        &self,
+        process_id: u32,
+        process_start_time_100ns: u64,
+        process_image_path: String,
+    ) -> Result<HostProcessIncarnationRegistration, JournalError> {
+        let state = self.snapshot()?;
+        let activation = state.activation.as_ref().ok_or(JournalError::StaleFence)?;
+        let record = if let Some(current) = state.host_process_incarnation.as_ref().filter(|item| {
+            item.same_birth(
+                process_id,
+                process_start_time_100ns,
+                &process_image_path,
+                &state.host,
+            )
+        }) {
+            current.clone()
+        } else {
+            let generation = match state.host_process_incarnation.as_ref() {
+                Some(current) => current
+                    .generation()
+                    .next()
+                    .map_err(|_| JournalError::Sequence)?,
+                None => ResourceGeneration::genesis(),
+            };
+            HostProcessIncarnationRecord::new(
+                activation.fence.clone(),
+                process_id,
+                process_start_time_100ns,
+                process_image_path,
+                generation,
+            )?
+        };
+        let host_record = HostStateRecord::HostProcessIncarnation(record.clone());
+        let checksum = record_checksum(&host_record)?;
+        let initial = self.append_inner(host_record.clone());
+        let receipt = match initial {
+            Ok(receipt) => receipt,
+            Err(JournalError::OutcomeUnknown { transaction_id }) => {
+                let reconciled = self.reconcile_with_descriptor(&transaction_id);
+                self.observe_reconcile_result(&reconciled);
+                let (outcome, operation) = reconciled?;
+                match outcome {
+                    ReconcileOutcome::Committed
+                        if operation.as_ref() == Some(record.operation()) =>
+                    {
+                        self.append_inner(host_record.clone())?
+                    }
+                    ReconcileOutcome::NotCommitted => self.append_inner(host_record.clone())?,
+                    ReconcileOutcome::Committed | ReconcileOutcome::StillUnknown => {
+                        return Err(JournalError::OutcomeUnknown { transaction_id });
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        let readback = self.snapshot()?;
+        let stored = readback
+            .host_process_incarnation
+            .as_ref()
+            .filter(|stored| **stored == record)
+            .cloned()
+            .ok_or(JournalError::IdempotencyConflict)?;
+        let applied = readback
+            .applied_operations
+            .iter()
+            .find(|item| item.identity == *record.operation())
+            .ok_or(JournalError::IdempotencyConflict)?;
+        let expected_transaction_id = journal_transaction_id(&host_record, &checksum)?;
+        if applied.checksum != checksum
+            || applied.sequence != receipt.sequence()
+            || receipt.transaction_id() != &expected_transaction_id
+        {
+            return Err(JournalError::IdempotencyConflict);
+        }
+        let result = Ok(receipt.clone());
+        self.observe_append_result(&result);
+        Ok(HostProcessIncarnationRegistration {
+            record: stored,
+            receipt,
+            record_checksum: checksum,
+        })
     }
 
     pub fn append_readiness_observation(
