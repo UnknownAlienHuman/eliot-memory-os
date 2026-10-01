@@ -907,13 +907,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
 
         // One reservation per session: bound to this session, this exact
         // command digest and the one bound blob stage operation.
-        Ok(self.reserve_publish(
-            &mut state,
-            existing,
-            request,
-            identity,
-            admitted_sha256,
-        ))
+        Ok(self.reserve_publish(&mut state, existing, request, identity, admitted_sha256))
     }
 
     /// Builds the never-published terminal plan for a non-publishing
