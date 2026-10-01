@@ -807,15 +807,13 @@ fn reconcile_persisted_intent(
 }
 
 /// Launch-path outcome of the exact-replay check for one child slot.
-enum SlotReplayVerdict {
-    /// The ledger holds no dispatch for this slot: a fresh launch may be
-    /// minted (durable append, then runner).
-    Fresh,
-    /// The ledger's persisted dispatch reproduces the candidate exactly.
-    /// Carries the durable intent from the ledger, which the caller returns
-    /// verbatim. Nothing is re-minted: no second append, no second runner call.
-    ExactReplay(ChildLaunchIntent),
-}
+///
+/// `None` means the slot is fresh; `Some(persisted)` means the ledger's
+/// persisted dispatch reproduces the candidate exactly. An `Option` rather than
+/// a two-variant enum, because carrying the durable intent by value in one arm
+/// made the whole type as large as the intent while the other arm carried
+/// nothing.
+type SlotReplayVerdict = Option<ChildLaunchIntent>;
 
 /// Verifies the fresh candidate intent against the durable ledger's prior
 /// dispatch for the same child slot.
@@ -827,14 +825,14 @@ enum SlotReplayVerdict {
 /// — and the replay is exact only when the whole dispatch envelope, intent plus
 /// lineage, matches. Fail-closed, in order:
 ///
-/// - no persisted dispatch for the slot is [`SlotReplayVerdict::Fresh`]: a
+/// - no persisted dispatch for the slot is `None` (fresh): a
 ///   fresh launch may be minted (append, then runner);
 /// - a persisted prior whose own operation, attempt, cancellation, or fence
 ///   lineage does not re-derive from the sealed attachment is
 ///   [`SwarmCompositionError::StaleLineage`] (identity drift, the same
 ///   [`check_intent_lineage`] verdict rehydration applies);
 /// - a persisted prior equal to the candidate is
-///   [`SlotReplayVerdict::ExactReplay`] carrying that prior: exact child replay
+///   `Some(persisted)` carrying that prior: exact child replay
 ///   is idempotent. An idempotent operation returns the same result for the
 ///   same input, so the caller returns the PERSISTED intent (never a freshly
 ///   minted one) and reaches neither the ledger nor the runner a second time —
@@ -855,11 +853,11 @@ fn verify_slot_exact_replay(
     sealed: &AttachedPlan,
 ) -> Result<SlotReplayVerdict, SwarmCompositionError> {
     let Some(prior) = persisted.iter().find(|prior| prior.slot == candidate.slot) else {
-        return Ok(SlotReplayVerdict::Fresh);
+        return Ok(None);
     };
     check_intent_lineage(prior, sealed)?;
     if prior == candidate {
-        return Ok(SlotReplayVerdict::ExactReplay(prior.clone()));
+        return Ok(Some(prior.clone()));
     }
     // `prior != candidate` is already established above, and
     // `check_intent_lineage` has forced every identity field (operation,
@@ -1409,9 +1407,8 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         // ledger nor the runner a second time and stays exactly one entry in
         // restart and reconciliation accounting. Same-identity drift in the
         // pinned route lineage is a conflict instead.
-        match verify_slot_exact_replay(&self.ledger.intents(), &intent, &plan)? {
-            SlotReplayVerdict::ExactReplay(persisted) => return Ok(persisted),
-            SlotReplayVerdict::Fresh => {}
+        if let Some(persisted) = verify_slot_exact_replay(&self.ledger.intents(), &intent, &plan)? {
+            return Ok(persisted);
         }
         // Fresh slot: the ledger holds nothing for it, so this append is the
         // child's first and only durable record. Persist BEFORE the runner
