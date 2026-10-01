@@ -546,7 +546,8 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     /// SHA-256 of the canonical Open request bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_request_sha256: Option<String>,
-    /// Exact Kernel-created prepared-transition RequestIdentity for OpenAdmission.
+    /// Exact Kernel-created prepared-transition RequestIdentity for the source
+    /// admission update selected by this purpose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_update_identity_json: Option<String>,
     /// SHA-256 of the exact owner-update RequestIdentity bytes.
@@ -558,14 +559,15 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     /// SHA-256 of the exact source-admission record bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_admission_sha256: Option<String>,
-    /// Exact committed WriteReceipt for the Pending source-admission write,
-    /// carried only when resolving the causally subsequent Store Open.
+    /// Exact committed WriteReceipt for the source-admission transition:
+    /// Pending for StoreOpen/ReadyAttach, Ready for SourceReadback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_admission_write_receipt_json: Option<String>,
     /// SHA-256 of the exact committed write receipt bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_admission_write_receipt_sha256: Option<String>,
     /// Exact distinct operation identity for the Pending-to-Ready CAS.
+    /// SourceReadback uses this as a row selector and validates its receipt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_operation_id: Option<String>,
     /// Exact owner-issued BlobReadyReceipt returned by the Blob stage owner.
@@ -697,11 +699,11 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                     && self.source_admission_sha256.is_none()
                     && self.open_request_json.is_none()
                     && self.open_request_sha256.is_none()
-                    && self.owner_update_identity_json.is_none()
-                    && self.owner_update_identity_sha256.is_none()
-                    && self.source_admission_write_receipt_json.is_none()
-                    && self.source_admission_write_receipt_sha256.is_none()
-                    && self.ready_operation_id.is_none()
+                    && self.owner_update_identity_json.is_some()
+                    && self.owner_update_identity_sha256.is_some()
+                    && self.source_admission_write_receipt_json.is_some()
+                    && self.source_admission_write_receipt_sha256.is_some()
+                    && self.ready_operation_id.is_some()
                     && self.blob_ready_receipt_json.is_none()
                     && self.blob_ready_receipt_sha256.is_none()
                     && self.whole_source_sha256.is_some()
@@ -718,6 +720,24 @@ impl BlobProcessStreamOwnerFactsPullRequest {
                 validate_text(
                     "source_admission_operation_id",
                     self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_text(
+                    "ready_operation_id",
+                    self.ready_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "owner_update_identity_json",
+                    self.owner_update_identity_json.as_deref().unwrap_or_default(),
+                    self.owner_update_identity_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_write_receipt",
+                    self.source_admission_write_receipt_json
+                        .as_deref()
+                        .unwrap_or_default(),
+                    self.source_admission_write_receipt_sha256
+                        .as_deref()
+                        .unwrap_or_default(),
                 )?;
                 self.process_stream_binding
                     .as_ref()
@@ -1270,7 +1290,7 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                     has_admission && has_write_receipt
                 }
                 BlobProcessStreamOwnerFactsPullPurpose::SourceReadback => {
-                    has_admission && !has_write_receipt
+                    has_admission && has_write_receipt
                 }
             };
             if !valid {
@@ -1288,6 +1308,16 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             {
                 return Err(WireValidationError::InvalidField(
                     "store_open_source_admission_binding",
+                ));
+            }
+            if request.purpose == BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
+                && (source_admission_write_receipt_json
+                    != request.source_admission_write_receipt_json.as_ref()
+                    || source_admission_write_receipt_sha256
+                        != request.source_admission_write_receipt_sha256.as_ref())
+            {
+                return Err(WireValidationError::InvalidField(
+                    "source_readback_ready_write_receipt",
                 ));
             }
         }
@@ -1681,6 +1711,23 @@ pub struct ProcessStreamSourceReadbackRequest {
     /// Kernel-retained metadata-only owner facts independently checked by
     /// Store against the current source authority.
     pub owner_facts: BlobProcessStreamVerifiedOwnerFacts,
+    /// Fresh current ModuleCatalog owner readback from the authenticated
+    /// source-owner PULL that precedes this chunk read.
+    pub module_catalog_owner_readback_json: String,
+    /// SHA-256 of the exact ModuleCatalog owner readback bytes.
+    pub module_catalog_owner_readback_sha256: String,
+    /// Exact selected accepted GenerationAdmission from that same PULL.
+    pub generation_admission_json: String,
+    /// SHA-256 of the exact GenerationAdmission bytes.
+    pub generation_admission_sha256: String,
+    /// Fresh Ready revision-2 source-admission named-read envelope.
+    pub process_source_admission_readback_json: String,
+    /// SHA-256 of the exact source-admission readback bytes.
+    pub process_source_admission_readback_sha256: String,
+    /// Committed WriteReceipt for the exact Ready CAS, from the same PULL.
+    pub source_admission_write_receipt_json: String,
+    /// SHA-256 of the exact Ready CAS WriteReceipt bytes.
+    pub source_admission_write_receipt_sha256: String,
     /// Exact state fence under which readback is admitted.
     pub fence: StateFence,
     /// Maximum source size accepted by the caller.
@@ -1739,6 +1786,31 @@ impl ProcessStreamSourceReadbackRequest {
             .validate()
             .map_err(|_| WireValidationError::InvalidField("fence"))?;
         self.owner_facts.validate()?;
+        if self.owner_facts.policy_json != self.policy_json
+            || self.owner_facts.policy_sha256 != self.policy_sha256
+        {
+            return Err(WireValidationError::InvalidField("owner_policy_binding"));
+        }
+        validate_canonical_owner_json(
+            "module_catalog_owner_readback",
+            &self.module_catalog_owner_readback_json,
+            &self.module_catalog_owner_readback_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "generation_admission",
+            &self.generation_admission_json,
+            &self.generation_admission_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "process_source_admission_readback",
+            &self.process_source_admission_readback_json,
+            &self.process_source_admission_readback_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "source_admission_write_receipt",
+            &self.source_admission_write_receipt_json,
+            &self.source_admission_write_receipt_sha256,
+        )?;
         for (field, value) in [
             ("policy_ref", self.policy.policy_ref.as_str()),
             ("privacy_ref", self.policy.privacy_ref.as_str()),
@@ -2137,6 +2209,11 @@ pub enum ProcessStreamSourceReadbackResponse {
         process_source_admission_readback_json: String,
         /// SHA-256 of the exact source-admission readback bytes.
         process_source_admission_readback_sha256: String,
+        /// Exact committed WriteReceipt for the Ready CAS, from the correlated
+        /// owner-facts PULL and validated against the Ready row's operation.
+        source_admission_write_receipt_json: String,
+        /// SHA-256 of the exact Ready-CAS WriteReceipt bytes above.
+        source_admission_write_receipt_sha256: String,
     },
     /// Exact original intent is durably reserved and no stage effect began.
     NotStarted,
@@ -2165,9 +2242,11 @@ impl ProcessStreamSourceReadbackResponse {
             module_catalog_owner_readback_sha256,
             generation_admission_json,
             generation_admission_sha256,
-            process_source_admission_readback_json,
-            process_source_admission_readback_sha256,
-        } = self else {
+        process_source_admission_readback_json,
+        process_source_admission_readback_sha256,
+        source_admission_write_receipt_json,
+        source_admission_write_receipt_sha256,
+    } = self else {
             return Ok(());
         };
         validate_digest("whole_source_sha256", whole_source_sha256)?;
@@ -2181,6 +2260,10 @@ impl ProcessStreamSourceReadbackResponse {
         validate_digest(
             "process_source_admission_readback_sha256",
             process_source_admission_readback_sha256,
+        )?;
+        validate_digest(
+            "source_admission_write_receipt_sha256",
+            source_admission_write_receipt_sha256,
         )?;
         for (field, value) in [
             ("ready_receipt_ref", ready_receipt_ref.as_str()),
@@ -2215,6 +2298,11 @@ impl ProcessStreamSourceReadbackResponse {
             "process_source_admission_readback_json",
             process_source_admission_readback_json,
             process_source_admission_readback_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "source_admission_write_receipt_json",
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
         )?;
         Ok(())
     }
