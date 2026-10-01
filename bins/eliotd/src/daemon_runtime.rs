@@ -5704,6 +5704,20 @@ async fn observe_host_workspace(
         if guard.governor_kernel_fence() != retained.state_fence {
             return Err("Observe request fence moved before Host scope observation".to_owned());
         }
+        let current = current_observation_owner_binding(
+            &guard,
+            &retained.policy_origin,
+            unix_ms(SystemTime::now())?,
+        )?;
+        let current_value = current
+            .canonical_value()
+            .map_err(|error| format!("current Observe owner binding: {error}"))?;
+        let retained_value = binding
+            .canonical_value()
+            .map_err(|error| format!("retained Observe owner binding: {error}"))?;
+        if current_value != retained_value {
+            return Err("Observe owners changed before Host scope observation".to_owned());
+        }
         let scope = &binding.work_scope_binding;
         let locator = match (selection, &retained.policy_origin) {
             (Some(owner), _) => guard.activation_workspace_locator_for_selection(owner),
@@ -5738,13 +5752,47 @@ async fn observe_host_workspace(
         locator
             .map_err(|error| format!("Observe retained Host scope workspace locator: {error}"))?
     };
+    let source_closure = if let Some(selection) = selection.as_ref() {
+        let (sources, privacy) = selection.source_closure();
+        (sources.clone(), privacy.clone())
+    } else {
+        let owner = eliot_workscope::WorkScopeBindingOwner::from_snapshot(
+            binding.work_scope_binding.clone(),
+        )
+        .map_err(|error| format!("Observe retained WorkScope owner recovery: {error}"))?;
+        owner
+            .read_current_source_closure(&retained.state_fence)
+            .map_err(|error| format!("Observe retained WorkScope source closure: {error}"))?
+    };
     let observed =
         eliotd::task_binding_admission::observe_explicit_workspace(&root, &retained.state_fence)
             .map_err(|error| format!("Observe fresh Host scope observation: {error}"))?;
+    {
+        let guard = services.composition.lock().await;
+        if guard.governor_kernel_fence() != retained.state_fence {
+            return Err("Observe request fence moved during Host scope observation".to_owned());
+        }
+        let current = current_observation_owner_binding(
+            &guard,
+            &retained.policy_origin,
+            unix_ms(SystemTime::now())?,
+        )?;
+        let current_value = current
+            .canonical_value()
+            .map_err(|error| format!("current Observe owner binding: {error}"))?;
+        let retained_value = binding
+            .canonical_value()
+            .map_err(|error| format!("retained Observe owner binding: {error}"))?;
+        if current_value != retained_value {
+            return Err("Observe owners changed during Host scope observation".to_owned());
+        }
+    }
     if !matches!(
         eliotd::task_binding_admission::scope_guard_disposition(
             &binding.work_scope_binding.binding,
             &observed,
+            Some((&source_closure.0, &source_closure.1)),
+            eliot_workscope::GuardTrigger::CanonicalWrite,
         ),
         Ok(eliot_workscope::ScopeBindingDisposition::Matched)
     ) {
