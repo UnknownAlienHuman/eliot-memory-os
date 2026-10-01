@@ -9496,6 +9496,273 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         .await
     }
 
+    /// Resumes only the canonical second phase of one already committed grant
+    /// closure (issue #2100, audit 5924750035 items 2, 4, 5, 6, 7, 8).
+    ///
+    /// This is the recovery entry the daemon's pending-second-phase pass hands
+    /// its obligation to after the authenticated owner re-admits the exact
+    /// operation. It accepts the already committed [`GrantClosureReceipt`] plus
+    /// the exact retained canonical operation/request identity and the
+    /// re-admitted [`GrantRevocationRequest`]. It never calls
+    /// [`Self::revoke_grant`]: the Kernel/ORS first phase already fenced the
+    /// target, and the Kernel correctly refuses to re-admit a fenced grant, so
+    /// re-striking the first phase is both impossible and forbidden. No second
+    /// graph, ledger, authority machine or Store client is introduced here.
+    ///
+    /// Fail-closed order, all of it ahead of any canonical write:
+    /// - The composition must be `Ready`. No retained P-07 port is required:
+    ///   nothing here presents to P-07, so a degraded activation port neither
+    ///   blocks nor is touched by the second phase.
+    /// - The committed closure revalidates under its own receipt contract and
+    ///   must bind the exact re-admitted request, snapshot, State Fence and
+    ///   authority epoch, with both closure and authority receipt `Revoked`.
+    ///   A diagnostic tick alone is never sufficient: only the owner's
+    ///   re-admitted decision together with the owner's committed bytes
+    ///   authorizes this path.
+    /// - The live composition fence and the admitted canonical request
+    ///   identity fence must equal the closure fence, exactly as the fresh
+    ///   saga requires.
+    /// - A retained presentation for the same grant must carry the exact same
+    ///   bytes, and a pending stricter revocation for the same grant must name
+    ///   the same snapshot. Changed content under a retained operation
+    ///   identity returns `IdentityConflict` and performs no transition
+    ///   (I5.27): the same completed operation returns the same second-phase
+    ///   result, while a changed request, closure, fence, graph revision or
+    ///   receipt under that identity conflicts at the retained presentation or
+    ///   at the store instead of reconciling to different content.
+    ///
+    /// Everything past admission is the existing second half, unchanged:
+    /// the authority graph's origin-bound re-derivation is proven to bind the
+    /// durable declaration, the exact declared members are fenced in this
+    /// projection, the canonical envelope is compiled from that closure and
+    /// committed under the ORIGINAL operation/idempotency identity, and the
+    /// Store-issued receipt identity is linked to the immutable first-phase
+    /// row through the caller-supplied `link` and read back by content. Only
+    /// `Committed` plus `Success` may link: `canonical_receipt_identity`
+    /// refuses unknown, partial and non-commit outcomes, which stay pending or
+    /// terminally refused under their exact disposition and are never read as
+    /// a completed link.
+    ///
+    /// `link` is the authenticated Kernel/ORS owner's link operation: it
+    /// receives the ORIGINAL recorded first-phase operation identity and the
+    /// Store-issued [`ReceiptIdentity`], records the durable link, and returns
+    /// the proved read-back. It is a caller-supplied async closure rather than
+    /// a port reference because the daemon reaches the Kernel-owned ORS over
+    /// the authenticated transport, which is async, while the in-process
+    /// [`GrantClosureCanonicalLinkPort`] the fresh saga uses is sync. The
+    /// closure keeps this entry transport-neutral: no daemon transport type
+    /// enters the Governor.
+    ///
+    /// Every failure after the committed closure validates retains a
+    /// [`PendingCanonicalRevocation`] before returning, exactly as the fresh
+    /// saga does: the mechanical fence already took effect, the grant keeps
+    /// reporting as revoked, a later activation is refused, and an exhausted
+    /// denominator stays partial/recovery-required, never complete. The record
+    /// is removed only when the second-phase link commits.
+    pub async fn resume_committed_closure_second_phase<LinkFn, LinkFut>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        closure: &GrantClosureReceipt,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
+        link: LinkFn,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
+    where
+        LinkFn: FnOnce(String, ReceiptIdentity) -> LinkFut,
+        LinkFut: Future<Output = Result<GrantClosureSecondPhaseLink, KernelPortError>>,
+    {
+        self.require_ready_for_authority()?;
+        closure
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let live_fence = self.snapshot.state_fence();
+        if request.binding.state_fence != live_fence {
+            return Err(CompositionError::Recovery(
+                "resumed grant revocation is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        if canonical_request_identity.request.metadata.state_fence != live_fence {
+            return Err(CompositionError::Provider(
+                "resumed canonical request identity is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        if closure.state != eliot_receipts::GrantClosureState::Revoked
+            || closure.authority_receipt.state != eliot_receipts::GrantClosureState::Revoked
+            || closure.declaration.target_grant_id != request.grant_id.as_str()
+            || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
+            || closure.authority.state_fence != request.binding.state_fence
+            || canonical_request_identity.request.metadata.state_fence
+                != closure.authority.state_fence
+        {
+            return Err(CompositionError::Recovery(
+                "committed grant closure does not bind the exact resumed request, snapshot, and fence"
+                    .to_owned(),
+            ));
+        }
+        if !closure
+            .authority_receipt
+            .authority_epoch
+            .is_same_authority(&closure.authority.state_fence.authority_epoch)
+            || closure.authority_receipt.state != eliot_receipts::GrantClosureState::Revoked
+        {
+            return Err(CompositionError::Authority(P07PortError::InvalidBinding));
+        }
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        let ledger_key = presented.ledger_key();
+        if let Some(retained) = self.authority_presentations.get(ledger_key.as_str())
+            && retained.request() != &presented
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        if let Some(pending) = self
+            .pending_canonical_revocations
+            .get(request.grant_id.as_str())
+            && pending.snapshot_id != request.snapshot_id.as_str()
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        // The committed closure validated above is the proof the mechanical
+        // fence already took effect, so every refusal from here retains the
+        // pending stricter revocation instead of clearing it.
+        let pending_snapshot = closure.authority_receipt.snapshot_id.clone();
+        let pending_revocation = closure.authority_receipt.receipt_id.clone();
+        let retain = |phase: CanonicalRevocationPhase,
+                      error: CompositionError,
+                      pending_canonical_revocations: &mut BTreeMap<String, PendingCanonicalRevocation>,
+                      grant_id: &str| {
+            pending_canonical_revocations.insert(
+                grant_id.to_owned(),
+                PendingCanonicalRevocation {
+                    grant_id: grant_id.to_owned(),
+                    snapshot_id: pending_snapshot.clone(),
+                    revocation_id: pending_revocation.clone(),
+                    phase,
+                },
+            );
+            error
+        };
+        let commit = CanonicalRevocationCommit {
+            canonical_operation_id,
+            canonical_request_identity,
+            operation,
+        };
+        if let Err(error) =
+            self.prepare_revocation_transition_for_commit(request, closure, &commit)
+        {
+            return Err(retain(
+                CanonicalRevocationPhase::ClosureReadback,
+                error,
+                &mut self.pending_canonical_revocations,
+                request.grant_id.as_str(),
+            ));
+        }
+        if let Err(error) = self.owners.authority.grants.revoke_declared_closure(
+            &request.grant_id,
+            &closure.declaration.affected_grants(),
+        ) {
+            return Err(retain(
+                CanonicalRevocationPhase::ClosureReadback,
+                CompositionError::Owner(error.to_string()),
+                &mut self.pending_canonical_revocations,
+                request.grant_id.as_str(),
+            ));
+        }
+        self.owners.authority.invalidate_owner_hydrations();
+        let envelope = match authority_revocation_envelope_from_closure(
+            commit.canonical_request_identity,
+            commit.canonical_operation_id,
+            closure,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return Err(retain(
+                    CanonicalRevocationPhase::CanonicalCommit,
+                    error,
+                    &mut self.pending_canonical_revocations,
+                    request.grant_id.as_str(),
+                ));
+            }
+        };
+        let canonical_receipt = match self
+            .commit_canonical(commit.canonical_request_identity, envelope)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return Err(retain(
+                    CanonicalRevocationPhase::CanonicalCommit,
+                    error,
+                    &mut self.pending_canonical_revocations,
+                    request.grant_id.as_str(),
+                ));
+            }
+        };
+        let receipt_identity = match canonical_receipt_identity(&canonical_receipt) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Err(retain(
+                    CanonicalRevocationPhase::SecondPhaseLink,
+                    error,
+                    &mut self.pending_canonical_revocations,
+                    request.grant_id.as_str(),
+                ));
+            }
+        };
+        // The ORIGINAL recorded first-phase operation identity, not a
+        // re-derived or freshly minted one.
+        let closure_projection = match link(
+            closure.operation_id.clone(),
+            receipt_identity.clone(),
+        )
+        .await
+        {
+            Ok(projection) => projection,
+            Err(error) => {
+                return Err(retain(
+                    CanonicalRevocationPhase::SecondPhaseLink,
+                    CompositionError::Owner(error.to_string()),
+                    &mut self.pending_canonical_revocations,
+                    request.grant_id.as_str(),
+                ));
+            }
+        };
+        if closure_projection.closure().operation_id != closure.operation_id
+            || closure_projection.closure().declaration != closure.declaration
+            || closure_projection.canonical_receipt() != &receipt_identity
+        {
+            return Err(retain(
+                CanonicalRevocationPhase::SecondPhaseLink,
+                CompositionError::Recovery(
+                    "durable second-phase readback does not bind the canonical closure receipt"
+                        .to_owned(),
+                ),
+                &mut self.pending_canonical_revocations,
+                request.grant_id.as_str(),
+            ));
+        }
+        // The authority receipt below is a projection of the committed closure's
+        // own authority reference, not a fresh Kernel presentation: the first
+        // phase already committed, nothing here presents to P-07, and the
+        // receipt identity, snapshot, epoch and terminal state are the owner's
+        // committed bytes verbatim.
+        let authority_receipt = AuthorityRevocationReceipt {
+            revocation_id: closure.authority_receipt.receipt_id.clone(),
+            snapshot_id: closure.authority_receipt.snapshot_id.clone(),
+            authority_epoch: closure.authority_receipt.authority_epoch.clone(),
+            state: AuthorityState::Revoked,
+        };
+        self.pending_canonical_revocations
+            .remove(request.grant_id.as_str());
+        Ok(AuthorityRevocationReconciliation {
+            authority_receipt,
+            canonical_receipt,
+            closure_projection,
+        })
+    }
+
     /// Presents one canonical grant activation to the retained P-07 port and
     /// records `PendingActivation -> Active` only after the exact
     /// Kernel-issued receipt validates `Active`.

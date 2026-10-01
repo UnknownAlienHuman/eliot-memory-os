@@ -71,17 +71,46 @@
 //! receipt, no epoch invention, and no refusal read as an empty result. A
 //! refusal from the closure-receipt read is a typed failure of this pass, never
 //! "this grant needs no closure".
+//!
+//! # Owner resume path (issue #2100, audit 5924750035)
+//!
+//! [`admit_owner_revocation_request`] admits the authenticated Human/Policy
+//! maintenance decision into its exact request; [`resume_pending_second_phase`]
+//! hands one pending obligation to that owner-admitted decision and finishes it
+//! through
+//! [`eliot_governor::GovernorComposition::resume_committed_closure_second_phase`],
+//! which never re-presents to P-07; [`resume_all_pending_second_phases`] scans
+//! every bounded pending closure and resumes each owner-admitted one. Caller
+//! stitch into `daemon_runtime::report_authority_revocation_ingress` is
+//! pending; until then the scan-only contour and
+//! [`AUTHORITY_REVOCATION_RESUME_BLOCKED`] stand unchanged.
 
 use std::sync::Arc;
 
-use eliot_authority::GrantStatus;
-use eliot_contracts::StateFence;
-use eliot_governor::{CompositionError, KernelGenerationSnapshotProvider};
-use eliot_receipts::{GrantClosureReceipt, GrantClosureState};
+use eliot_authority::{
+    AdmittedMaintenanceRevocation, GrantStatus, RevocationOperationIdentity,
+    check_resume_closure_binds_request, check_second_phase_link_binds_closure,
+};
+use eliot_contracts::{OperationId, StateFence};
+use eliot_governor::{
+    AuthorityRevocationReconciliation, CompositionError, GrantClosureSecondPhaseLink,
+    KernelGenerationSnapshotProvider, KernelPortError,
+};
+use eliot_protocol::RequestIdentity;
+use eliot_receipts::{AuthorityBinding, GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_store_api::REVOCATION_HISTORY_MAX_RECORDS;
 
 use super::DaemonComposition;
 use super::daemon_kernel_client::DaemonKernelClient;
+
+/// Daemon->Kernel front-door write of one canonical second-phase link.
+const GRANT_CLOSURE_LINK_OPERATION: &str = "link_grant_closure_canonical_receipt";
+/// Typed link kind answered by the closure-link arm.
+const GRANT_CLOSURE_LINK_KIND: &str = "grant_closure_canonical_receipt_link";
+/// Typed refusal kind answered by the same arm. A refusal is never read as
+/// "no second phase needed": the durable reason maps to a typed
+/// [`KernelPortError`] and the closure stays pending.
+const GRANT_CLOSURE_LINK_REFUSAL_KIND: &str = "grant_closure_canonical_receipt_link_refused";
 
 /// Daemon->Kernel front-door read of one committed closure receipt.
 const GRANT_CLOSURE_RECEIPT_OPERATION: &str = "grant_closure_receipt";
@@ -406,4 +435,373 @@ async fn read_committed_closure(
         )));
     }
     Ok(Some(closure))
+}
+
+/// Admits one authenticated Human/Policy maintenance revocation decision into
+/// its exact [`eliot_authority::GrantRevocationRequest`] (issue #2100, audit
+/// 5924750035 item 1).
+///
+/// Every coordinate arrives from the authenticated maintenance-request ingress
+/// (or its canonical admitted equivalent): target grant, owner snapshot,
+/// `AuthorityBinding` and admitted revocation operation identity. Nothing is
+/// derived from the restored graph or a diagnostic row. Use
+/// [`RevocationOperationIdentity`] for the `operation` parameter; it is
+/// imported here so the owner call site names the admitted type directly.
+pub fn admit_owner_revocation_request(
+    target_grant_id: &str,
+    snapshot_id: &str,
+    binding: AuthorityBinding,
+    operation: RevocationOperationIdentity,
+) -> Result<AdmittedMaintenanceRevocation, CompositionError> {
+    AdmittedMaintenanceRevocation::admit(target_grant_id, snapshot_id, binding, operation)
+        .map_err(|error| CompositionError::Owner(error.to_string()))
+}
+
+/// One authenticated owner decision plus the exact retained canonical
+/// operation/request identity one pending second phase resumes under.
+///
+/// The canonical identities are the ORIGINAL ones the fresh saga committed
+/// under, retained across the interruption. They are never re-derived from the
+/// committed closure: an exact replay resolves to the same receipt while
+/// changed content under one identity conflicts at the store.
+#[derive(Clone, Debug)]
+pub struct OwnerSecondPhaseDecision {
+    /// Re-admitted maintenance decision for the exact pending target.
+    pub owner: AdmittedMaintenanceRevocation,
+    /// ORIGINAL canonical operation identity of the interrupted saga.
+    pub canonical_operation_id: OperationId,
+    /// ORIGINAL admitted canonical request identity of the interrupted saga.
+    pub canonical_request_identity: RequestIdentity,
+}
+
+/// One pending closure whose canonical second phase this owner pass finished.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumedCanonicalSecondPhase {
+    /// Target grant the committed closure fenced.
+    pub grant_id: String,
+    /// Immutable first-phase closure operation identity, as committed.
+    pub closure_operation_id: String,
+    /// Store-issued canonical receipt identity durably linked by this resume.
+    pub canonical_receipt_id: String,
+}
+
+/// What one bounded owner resume pass proved.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundedSecondPhaseResumeReport {
+    revision: u64,
+    resumed: Vec<ResumedCanonicalSecondPhase>,
+    still_pending: Vec<PendingCanonicalSecondPhase>,
+}
+
+impl BoundedSecondPhaseResumeReport {
+    /// Returns the grant-graph revision the pass was bound to.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Returns the pending closures this pass finished, in candidate order.
+    #[must_use]
+    pub fn resumed(&self) -> &[ResumedCanonicalSecondPhase] {
+        &self.resumed
+    }
+
+    /// Returns the committed closures that remain without a canonical second
+    /// phase: grants with no owner decision plus grants whose resume refused.
+    /// Every entry keeps [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]'s admission
+    /// marker until the caller stitch drives it; nothing here is presented as
+    /// discharged.
+    #[must_use]
+    pub fn still_pending(&self) -> &[PendingCanonicalSecondPhase] {
+        &self.still_pending
+    }
+}
+
+/// Resumes the canonical second phase of one committed closure through the
+/// authenticated owner path (issue #2100, audit 5924750035 items 3, 4, 5, 6).
+///
+/// The obligation is handed to the owner only after the owner re-admits the
+/// exact operation: `owner` plus the retained canonical identities are the
+/// admission, and the committed `closure` is checked against that admission by
+/// content before anything is written. A diagnostic tick alone remains
+/// non-authoritative and can never reach this entry.
+///
+/// The canonical write reconciles by the original operation/idempotency
+/// identity: `Committed` plus `Success` may link, while an unknown, partial
+/// or non-commit outcome stays pending or terminally refused under its exact
+/// disposition. The Store-issued [`ReceiptIdentity`] is linked through the
+/// authenticated Kernel/ORS owner over the daemon transport — no in-process
+/// ORS, no second graph — and the original first-phase bytes plus receipt
+/// identity are compared by content on the owner's read-back. Exact replay
+/// returns the same second-phase result; changed content under one identity
+/// conflicts.
+///
+/// A refusal from the committed-closure read, a fence disagreement, or any
+/// Governor refusal is a typed failure or a retained pending, never an empty
+/// success.
+#[allow(clippy::too_many_arguments, reason = "the resume carries the admitted owner decision, both retained canonical identities, and the committed closure as one indivisible admission")]
+pub async fn resume_pending_second_phase(
+    composition: &mut DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    owner: &AdmittedMaintenanceRevocation,
+    canonical_operation_id: &OperationId,
+    canonical_request_identity: &RequestIdentity,
+    closure: GrantClosureReceipt,
+) -> Result<AuthorityRevocationReconciliation, CompositionError> {
+    if kernel.snapshot().state_fence() != closure.authority.state_fence {
+        return Err(CompositionError::Recovery(
+            "resumed closure is bound to a different Kernel generation State Fence".to_owned(),
+        ));
+    }
+    check_resume_closure_binds_request(owner.request(), &closure)
+        .map_err(|error| CompositionError::Owner(error.to_string()))?;
+    canonical_request_identity
+        .validate()
+        .map_err(|error| CompositionError::Provider(error.to_string()))?;
+    let link_kernel = Arc::clone(kernel);
+    let link_fence = closure.authority.state_fence.clone();
+    let expected_closure = closure.clone();
+    composition
+        .governor
+        .resume_committed_closure_second_phase(
+            owner.request(),
+            &closure,
+            canonical_operation_id,
+            canonical_request_identity,
+            owner.operation(),
+            move |operation_id: String, receipt: ReceiptIdentity| {
+                async move {
+                    link_closure_second_phase_over_transport(
+                        &link_kernel,
+                        &link_fence,
+                        operation_id.as_str(),
+                        &receipt,
+                        &expected_closure,
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+}
+
+/// Scans every bounded pending closure and resumes each one the authenticated
+/// owner re-admitted, before any affected descendant or introduction can
+/// regain effect authority (issue #2100, audit 5924750035 item 7).
+///
+/// The pass re-reads every candidate's committed closure from the Kernel's
+/// retained owner, exactly as [`scan_authority_revocation_ingress`] does, and
+/// resumes only the `Revoked`-without-canonical-receipt closures that carry a
+/// matching owner decision. A pending closure with no owner decision stays
+/// pending; a resume refusal stays pending under its Governor-retained phase.
+/// An exhausted denominator (capture bound) refuses before any transport, so it
+/// stays partial/recovery-required, never complete. A pass that cannot
+/// establish the durable state fails closed with a typed error instead of
+/// reporting a complete set.
+///
+/// Caller stitch: `daemon_runtime::report_authority_revocation_ingress` still
+/// runs the scan-only contour; wiring this entry into that driver is the
+/// pending caller stitch, recorded honestly and never faked by degrading a
+/// refusal to an empty report.
+pub async fn resume_all_pending_second_phases(
+    composition: &mut DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    plan: &AuthorityRevocationIngressPlan,
+    decisions: &[OwnerSecondPhaseDecision],
+) -> Result<BoundedSecondPhaseResumeReport, CompositionError> {
+    if kernel.snapshot().state_fence() != plan.state_fence {
+        return Err(CompositionError::Recovery(
+            "authority revocation resume plan is bound to a different Kernel generation State Fence"
+                .to_owned(),
+        ));
+    }
+    let mut resumed = Vec::new();
+    let mut still_pending = Vec::new();
+    for candidate in &plan.candidates {
+        let Some(closure) =
+            read_committed_closure(kernel, &plan.state_fence, &candidate.grant_id).await?
+        else {
+            continue;
+        };
+        if closure.state != GrantClosureState::Revoked || closure.canonical_receipt.is_some() {
+            continue;
+        }
+        let Some(decision) = decisions.iter().find(|decided| {
+            decided.owner.request().grant_id.as_str() == closure.declaration.target_grant_id
+        }) else {
+            still_pending.push(PendingCanonicalSecondPhase {
+                grant_id: closure.declaration.target_grant_id,
+                closure_operation_id: closure.operation_id,
+                authority_receipt_id: closure.authority_receipt.receipt_id,
+                snapshot_id: closure.authority_receipt.snapshot_id,
+                recovered_status: candidate.status,
+                resume_blocked: AUTHORITY_REVOCATION_RESUME_BLOCKED,
+            });
+            continue;
+        };
+        let fallback = PendingCanonicalSecondPhase {
+            grant_id: closure.declaration.target_grant_id.clone(),
+            closure_operation_id: closure.operation_id.clone(),
+            authority_receipt_id: closure.authority_receipt.receipt_id.clone(),
+            snapshot_id: closure.authority_receipt.snapshot_id.clone(),
+            recovered_status: candidate.status,
+            resume_blocked: AUTHORITY_REVOCATION_RESUME_BLOCKED,
+        };
+        match resume_pending_second_phase(
+            composition,
+            kernel,
+            &decision.owner,
+            &decision.canonical_operation_id,
+            &decision.canonical_request_identity,
+            closure,
+        )
+        .await
+        {
+            Ok(reconciliation) => resumed.push(ResumedCanonicalSecondPhase {
+                grant_id: reconciliation
+                    .closure_projection
+                    .closure()
+                    .declaration
+                    .target_grant_id
+                    .clone(),
+                closure_operation_id: reconciliation
+                    .closure_projection
+                    .closure()
+                    .operation_id
+                    .clone(),
+                canonical_receipt_id: reconciliation
+                    .closure_projection
+                    .canonical_receipt()
+                    .receipt_id
+                    .as_str()
+                    .to_owned(),
+            }),
+            Err(_) => {
+                // The Governor retained the pending stricter revocation under
+                // its exact phase; the obligation stays visible here instead
+                // of being degraded to an empty success.
+                still_pending.push(fallback);
+            }
+        }
+    }
+    Ok(BoundedSecondPhaseResumeReport {
+        revision: plan.revision,
+        resumed,
+        still_pending,
+    })
+}
+
+/// Links one Store-issued canonical receipt through the authenticated
+/// Kernel/ORS owner and proves the read-back by content.
+///
+/// The Kernel owns ORS in its own process, so the daemon never touches ORS
+/// directly: this adapter transacts the link over the authenticated front door
+/// and re-checks the owner's served bytes — original first-phase operation
+/// identity, whole declaration, and exact receipt identity — instead of taking
+/// the owner's word for it. No digest is recomputed and no identity is minted.
+///
+/// A transport failure or an unestablished outcome is
+/// [`KernelPortError::Unknown`]; a determinate conflict, an incoherent
+/// read-back, or an unexpected wire shape is [`KernelPortError::Contract`].
+/// The mapping is conservative on purpose: both stay pending at the Governor,
+/// so an imprecise refusal can delay a link but can never complete one
+/// falsely.
+async fn link_closure_second_phase_over_transport(
+    kernel: &Arc<DaemonKernelClient>,
+    state_fence: &StateFence,
+    operation_id: &str,
+    canonical_receipt: &ReceiptIdentity,
+    expected_closure: &GrantClosureReceipt,
+) -> Result<GrantClosureSecondPhaseLink, KernelPortError> {
+    let value = kernel
+        .transact_async(
+            GRANT_CLOSURE_LINK_OPERATION,
+            serde_json::json!({
+                "state_fence": state_fence,
+                "closure_operation_id": operation_id,
+                "canonical_receipt": canonical_receipt,
+            }),
+        )
+        .await
+        .map_err(|error| KernelPortError::Unknown(error.to_string()))?;
+    let object = value.as_object().ok_or_else(|| {
+        KernelPortError::Contract("closure link read is not a typed object".to_owned())
+    })?;
+    let payload = match object.get("kind").and_then(serde_json::Value::as_str) {
+        Some(GRANT_CLOSURE_LINK_KIND) => object.get("value").cloned().ok_or_else(|| {
+            KernelPortError::Contract("closure link read is missing its payload".to_owned())
+        })?,
+        Some(GRANT_CLOSURE_LINK_REFUSAL_KIND) => {
+            let reason = object
+                .get("value")
+                .and_then(|value| value.get("reason"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unspecified durable refusal");
+            return Err(map_link_refusal(reason));
+        }
+        other => {
+            return Err(KernelPortError::Contract(format!(
+                "closure link read returned an unexpected kind: {other:?}"
+            )));
+        }
+    };
+    let commit: GrantClosureReceipt = serde_json::from_value(
+        payload
+            .get("commit")
+            .cloned()
+            .ok_or_else(|| {
+                KernelPortError::Contract("closure link read is missing its commit".to_owned())
+            })?,
+    )
+    .map_err(|error| {
+        KernelPortError::Contract(format!("closure link commit does not decode: {error}"))
+    })?;
+    let linked: ReceiptIdentity = serde_json::from_value(
+        payload
+            .get("second_phase")
+            .cloned()
+            .ok_or_else(|| {
+                KernelPortError::Contract(
+                    "closure link read is missing its second phase".to_owned(),
+                )
+            })?,
+    )
+    .map_err(|error| {
+        KernelPortError::Contract(format!("closure link receipt does not decode: {error}"))
+    })?;
+    if linked != *canonical_receipt {
+        return Err(KernelPortError::Contract(
+            "closure link read-back carries a different canonical receipt".to_owned(),
+        ));
+    }
+    check_second_phase_link_binds_closure(expected_closure, canonical_receipt, &commit, &linked)
+        .map_err(|error| KernelPortError::Contract(error.to_string()))?;
+    Ok(GrantClosureSecondPhaseLink::new(commit, linked))
+}
+
+/// Maps one durable link refusal to the typed Governor port failure.
+///
+/// Determinate contract conflicts stay `Contract`; everything else stays
+/// `Unknown`, i.e. unestablished rather than completed. Both retain the
+/// Governor pending record, so the mapping can delay but never falsely
+/// complete a second phase.
+fn map_link_refusal(reason: &str) -> KernelPortError {
+    let lowered = reason.to_lowercase();
+    let determinate = [
+        "conflict",
+        "mismatch",
+        "invalid",
+        "projection",
+        "immutable",
+        "duplicate",
+    ]
+    .iter()
+    .any(|token| lowered.contains(token));
+    if determinate {
+        KernelPortError::Contract(format!("ORS refused the closure link: {reason}"))
+    } else {
+        KernelPortError::Unknown(format!(
+            "canonical closure link outcome is unestablished at the Kernel boundary: {reason}"
+        ))
+    }
 }

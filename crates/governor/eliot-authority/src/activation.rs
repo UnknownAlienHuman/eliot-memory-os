@@ -1,12 +1,12 @@
 use std::{error::Error, fmt};
 
-use eliot_receipts::AuthorityBinding;
+use eliot_receipts::{AuthorityBinding, GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    GrantId, IntroductionId, RootTransitionActivationReceipt, RootTransitionActivationRequest,
-    SnapshotId,
+    AuthorityError, GrantId, IntroductionId, RevocationOperationIdentity,
+    RootTransitionActivationReceipt, RootTransitionActivationRequest, SnapshotId, validate_text,
 };
 
 /// Typed G-01 request presented to the P-07 activation boundary.
@@ -372,4 +372,150 @@ impl P07AuthorityPort for UnavailableP07AuthorityPort {
     ) -> Result<RootTransitionActivationReceipt, P07PortError> {
         Err(P07PortError::Unavailable)
     }
+}
+
+/// Authenticated Human/Policy maintenance decision owning one grant revocation
+/// (issue #2100, audit 5924750035 item 1).
+///
+/// The target grant, owner snapshot, `AuthorityBinding` (State Fence, epoch,
+/// owner, ceilings) and admitted revocation operation identity arrive from the
+/// authenticated maintenance-request ingress (or its canonical admitted
+/// equivalent). They are never derived from the restored graph, a diagnostic
+/// row, or a pending-scan candidate: a recovered snapshot already carries
+/// fenced grants as `Revoked`, so deriving a request from it would either
+/// fabricate a decision or re-present a fenced grant as a fresh revocation.
+///
+/// Every coordinate is validated here: blank identities refuse, a binding
+/// whose fence disagrees with its own epoch refuses, and a blank authority
+/// owner refuses. The admitted operation identity arrives already refused by
+/// [`RevocationOperationIdentity::admit`] when incomplete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedMaintenanceRevocation {
+    request: GrantRevocationRequest,
+    operation: RevocationOperationIdentity,
+}
+
+impl AdmittedMaintenanceRevocation {
+    /// Admits one maintenance revocation decision into its exact
+    /// [`GrantRevocationRequest`] plus operation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthorityError`] for a blank target/snapshot identity, a
+    /// binding whose State Fence disagrees with its own authority epoch, or a
+    /// blank authority owner.
+    pub fn admit(
+        target_grant_id: &str,
+        snapshot_id: &str,
+        binding: AuthorityBinding,
+        operation: RevocationOperationIdentity,
+    ) -> Result<Self, AuthorityError> {
+        let grant_id = GrantId::new(target_grant_id)?;
+        let snapshot = SnapshotId::new(snapshot_id)?;
+        if !binding
+            .state_fence
+            .authority_epoch
+            .is_same_authority(&binding.authority_epoch)
+        {
+            return Err(AuthorityError::EpochMismatch);
+        }
+        validate_text(
+            binding.authority_owner.as_str(),
+            "maintenance_revocation.authority_owner",
+        )?;
+        Ok(Self {
+            request: GrantRevocationRequest {
+                grant_id,
+                snapshot_id: snapshot,
+                binding,
+            },
+            operation,
+        })
+    }
+
+    /// Returns the exact admitted revocation request.
+    #[must_use]
+    pub const fn request(&self) -> &GrantRevocationRequest {
+        &self.request
+    }
+
+    /// Returns the exact admitted revocation operation identity.
+    #[must_use]
+    pub const fn operation(&self) -> &RevocationOperationIdentity {
+        &self.operation
+    }
+}
+
+/// Proves one already committed closure binds the exact re-admitted request
+/// (issue #2100, audit 5924750035 items 3 and 6).
+///
+/// The committed target, snapshot, State Fence and authority epoch must equal
+/// the re-admitted decision's own coordinates, and both the closure and its
+/// authority receipt must be `Revoked`. A diagnostic tick alone never satisfies
+/// this: only the owner's re-admitted decision plus the owner's committed
+/// bytes together authorize the second phase.
+///
+/// # Errors
+///
+/// Returns [`AuthorityError`] for a target/snapshot/fence/epoch disagreement
+/// or a non-revoked closure. The failure is typed so a changed request under
+/// one operation identity conflicts instead of reconciling.
+pub fn check_resume_closure_binds_request(
+    request: &GrantRevocationRequest,
+    closure: &GrantClosureReceipt,
+) -> Result<(), AuthorityError> {
+    if closure.state != GrantClosureState::Revoked
+        || closure.authority_receipt.state != GrantClosureState::Revoked
+    {
+        return Err(AuthorityError::InvalidField(
+            "maintenance_resume.closure_state",
+        ));
+    }
+    if closure.declaration.target_grant_id != request.grant_id.as_str() {
+        return Err(AuthorityError::InvalidField(
+            "maintenance_resume.target_grant_id",
+        ));
+    }
+    if closure.authority_receipt.snapshot_id != request.snapshot_id.as_str() {
+        return Err(AuthorityError::InvalidField(
+            "maintenance_resume.snapshot_id",
+        ));
+    }
+    if closure.authority.state_fence != request.binding.state_fence {
+        return Err(AuthorityError::FenceMismatch);
+    }
+    if !closure
+        .authority_receipt
+        .authority_epoch
+        .is_same_authority(&request.binding.state_fence.authority_epoch)
+    {
+        return Err(AuthorityError::EpochMismatch);
+    }
+    Ok(())
+}
+
+/// Proves one linked second phase binds the original first-phase bytes plus
+/// the Store-issued receipt identity by content (issue #2100, audit 5924750035
+/// item 5).
+///
+/// The linked closure's operation identity and whole declaration must equal
+/// the committed closure's, and the linked receipt must equal the presented
+/// `ReceiptIdentity`. Existence or shape agreement is never enough.
+///
+/// # Errors
+///
+/// Returns [`AuthorityError::ReceiptMismatch`] for any content disagreement.
+pub fn check_second_phase_link_binds_closure(
+    closure: &GrantClosureReceipt,
+    receipt_identity: &ReceiptIdentity,
+    linked_closure: &GrantClosureReceipt,
+    linked_receipt: &ReceiptIdentity,
+) -> Result<(), AuthorityError> {
+    if linked_closure.operation_id != closure.operation_id
+        || linked_closure.declaration != closure.declaration
+        || linked_receipt != receipt_identity
+    {
+        return Err(AuthorityError::ReceiptMismatch);
+    }
+    Ok(())
 }
