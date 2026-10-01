@@ -2210,7 +2210,9 @@ impl KernelContextReadClient {
     /// hands them back on every path. The owner-issued `headroom_result` is no
     /// longer accepted as proof on its own: it is proved against the held
     /// permits before the selection and the permits are revalidated against the
-    /// live owner across it. `headroom_recheck_now_ms` is a second clock reading
+    /// live owner across it. The revalidation clock is read inside this composition,
+    /// at the revalidation itself, rather than supplied by the caller: a
+    /// caller-supplied reading can predate the work it is meant to bound.
     /// taken after the selection, so the revalidation is an observation rather
     /// than a restatement of the pre-selection one.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2229,7 +2231,6 @@ impl KernelContextReadClient {
         headroom_result: &DownstreamHeadroomResult,
         headroom_ledger: &HeadroomAllocationLedger,
         observed_now_ms: u64,
-        headroom_recheck_now_ms: u64,
         admission_parts: impl FnOnce(
             &ContextCandidateSetResult,
         ) -> Result<PacketAdmissionParts, PacketCompositionError>,
@@ -2344,11 +2345,17 @@ impl KernelContextReadClient {
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         let (admitted, delivery) = admit_packet_candidates(&input, &headroom, presented)?;
-        // The selection happened under the reservation. Re-read the live owner
-        // now, with the second clock reading, so a reservation the owner has
-        // since fenced or expired cannot carry the assembled packet.
+        // The selection happened under the reservation. The revalidation clock
+        // is read HERE, after the selection and after the delivery record, and
+        // immediately before the revalidation — not precomputed by the caller at
+        // the top of this composition. A caller-supplied reading can be as old
+        // as the pre-selection one, which is exactly the restatement the
+        // reservation contract forbids: the whole point is to prove the lease is
+        // still inside its own expiry NOW, so a reading taken before the work
+        // cannot stand for the instant after it. `crate::unix_ms` is this
+        // crate's one wall-clock source; no new clock is introduced.
         headroom_join
-            .revalidate(headroom_recheck_now_ms)
+            .revalidate(crate::unix_ms())
             .map_err(|refusal| PacketCompositionError::HeadroomJoinRefused {
                 attempted_recipe_digest: recipe.recipe_sha256.clone(),
                 refusal: Box::new(refusal),
