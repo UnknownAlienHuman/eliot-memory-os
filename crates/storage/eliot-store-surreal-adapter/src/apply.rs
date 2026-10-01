@@ -29,7 +29,7 @@ use eliot_store_api::{
     RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
     StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
     StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, TransitionClass, WriteReceipt,
-    canonical_json_bytes, sha256_hex, decode_erasure_surfaces, generated_operation_manifests,
+    decode_erasure_surfaces, generated_operation_manifests,
     operation_manifest_set_digest,
 };
 use serde::Deserialize;
@@ -155,8 +155,8 @@ async fn write_work_scope_owner_direct(
         return Err(AdapterError::Store(StoreError::IdentityConflict));
     }
 
-    let owner_id = work_scope_owner_record_id(&key)?;
-    let statement = "BEGIN TRANSACTION; LET $work_scope_schema = (SELECT * FROM ONLY schema_meta:current); LET $work_scope_fence = (SELECT VALUE { state_fence: state_fence } FROM ONLY canonical_fence:current); IF !type::is_object($work_scope_schema) OR $work_scope_schema.generation != $expected_generation OR $work_scope_schema.migration_state != 'APPLIED' OR $work_scope_fence.state_fence != $expected_state_fence { THROW 'work_scope_owner_fence_conflict'; }; LET $work_scope_current = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM ONLY type::record($owner_table, $owner_id)); IF NOT type::is_object($work_scope_current) OR $work_scope_current.namespace != $expected_namespace OR $work_scope_current.key != $expected_key OR $work_scope_current.state_fence != $expected_state_fence OR $work_scope_current.revision != $expected_owner_revision OR $work_scope_current.schema != $expected_schema { THROW 'work_scope_owner_revision_conflict'; }; LET $work_scope_updated = (UPDATE type::record($owner_table, $owner_id) CONTENT { namespace: $owner.namespace, key: $owner.key, state_fence: $owner.state_fence, revision: $owner.revision, schema: $owner.schema, payload: <bytes>$owner.payload, value_digest: $owner.value_digest } WHERE revision = $expected_owner_revision AND state_fence = $expected_state_fence RETURN AFTER); IF array::len($work_scope_updated ?? []) != 1 { THROW 'work_scope_owner_revision_conflict'; }; COMMIT TRANSACTION;";
+    let owner_id = surreal_blackboard::recovery_owner_id(&key)?;
+    let statement = "BEGIN TRANSACTION; LET $work_scope_schema = (SELECT * FROM ONLY schema_meta:current); LET $work_scope_fence = (SELECT VALUE { state_fence: state_fence } FROM ONLY canonical_fence:current); IF !type::is_object($work_scope_schema) OR $work_scope_schema.generation != $expected_generation OR $work_scope_schema.migration_state != 'APPLIED' OR $work_scope_fence.state_fence != $expected_state_fence { THROW 'work_scope_owner_fence_conflict'; }; LET $work_scope_current = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM ONLY type::record($owner_table, $owner_id)); IF !type::is_object($work_scope_current) OR $work_scope_current.namespace != $expected_namespace OR $work_scope_current.key != $expected_key OR $work_scope_current.state_fence != $expected_state_fence OR $work_scope_current.revision != $expected_owner_revision OR $work_scope_current.schema != $expected_schema OR $work_scope_current != { namespace: $expected_owner.namespace, key: $expected_owner.key, state_fence: $expected_owner.state_fence, revision: $expected_owner.revision, schema: $expected_owner.schema, payload: <bytes>$expected_owner.payload, value_digest: $expected_owner.value_digest } { THROW 'work_scope_owner_revision_conflict'; }; LET $work_scope_updated = (UPDATE type::record($owner_table, $owner_id) CONTENT { namespace: $owner.namespace, key: $owner.key, state_fence: $owner.state_fence, revision: $owner.revision, schema: $owner.schema, payload: <bytes>$owner.payload, value_digest: $owner.value_digest } WHERE revision = $expected_owner_revision AND state_fence = $expected_state_fence RETURN AFTER); IF array::len($work_scope_updated ?? []) != 1 { THROW 'work_scope_owner_revision_conflict'; }; COMMIT TRANSACTION;";
     let bindings = json!({
         "expected_generation": adapter.config.expected_schema_generation.as_str(),
         "expected_state_fence": request.state_fence,
@@ -164,6 +164,7 @@ async fn write_work_scope_owner_direct(
         "expected_key": request.owner_record.key,
         "expected_owner_revision": request.expected_owner_revision,
         "expected_schema": request.owner_record.schema,
+        "expected_owner": current,
         "owner_table": schema::table::RECOVERY_OWNER,
         "owner_id": owner_id,
         "owner": request.owner_record,
@@ -193,14 +194,6 @@ async fn write_work_scope_owner_direct(
     write_result?;
     readback?;
     Err(AdapterError::Store(StoreError::IdentityConflict))
-}
-
-fn work_scope_owner_record_id(
-    key: &eliot_store_api::RecoveryRecordKey,
-) -> Result<String, AdapterError> {
-    let bytes = canonical_json_bytes(key)
-        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-    Ok(sha256_hex(&bytes))
 }
 
 #[cfg(test)]

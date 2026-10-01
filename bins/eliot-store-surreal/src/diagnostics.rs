@@ -1006,7 +1006,6 @@ pub fn classify_response(response: &Response) -> RequestOutcome {
         | Response::OrderingHeads { .. }
         | Response::ValidationSnapshot { .. }
         | Response::Recovery { .. }
-        | Response::WorkScopeOwner { .. }
         | Response::DreamerJob { .. } => RequestOutcome::ReadCompleted,
         Response::Backup { response } => match response {
             StoreBackupResponse::Status { report } => match report.outcome {
