@@ -440,9 +440,7 @@ fn admitted_envelope(
 fn admits_source_records(state: &ProjectionState) -> bool {
     matches!(
         state,
-        ProjectionState::Complete
-            | ProjectionState::KnownEmpty
-            | ProjectionState::Partial { .. }
+        ProjectionState::Complete | ProjectionState::KnownEmpty | ProjectionState::Partial { .. }
     )
 }
 
@@ -505,7 +503,8 @@ impl SevenRoleInputs {
     /// Returns every role label with its disposition, in slot order.
     #[must_use]
     pub fn role_states(&self) -> [(&'static str, &ProjectionState); 7] {
-        self.role_acquisitions().map(|(label, role)| (label, &role.state))
+        self.role_acquisitions()
+            .map(|(label, role)| (label, &role.state))
     }
 
     /// Returns the labels of roles whose source could not be read or
