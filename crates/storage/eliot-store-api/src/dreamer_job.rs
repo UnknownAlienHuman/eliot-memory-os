@@ -815,16 +815,7 @@ fn validate_bundle_revision_state(
                 return Err(StoreError::IdentityConflict);
             }
         }
-        JobOperation::RecordApplicability { .. } => {
-            if event.prior_state != event.next_state
-                || event.prior_revision != event.next_revision
-                || response.disposition
-                    != Some(eliot_protocol::dreamer_job::MutationDisposition::Committed)
-            {
-                return Err(StoreError::InvalidProjection);
-            }
-        }
-        JobOperation::RecordAdmission { .. } => {
+        JobOperation::RecordApplicability { .. } | JobOperation::RecordAdmission { .. } => {
             if event.prior_state != event.next_state
                 || event.prior_revision != event.next_revision
                 || response.disposition
