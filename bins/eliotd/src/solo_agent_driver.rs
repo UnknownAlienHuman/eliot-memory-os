@@ -114,7 +114,7 @@ use crate::daemon_kernel_client::DaemonKernelClient;
 #[cfg(not(test))]
 use crate::semantic_revision_store::SemanticRevisionStore;
 use crate::staffing_policy::{
-    StaffingPlanReceipt, plan_coordinator_staffing, verify_receipt_digest,
+    StaffedLane, StaffingPlanReceipt, plan_coordinator_staffing, verify_receipt_digest,
 };
 use crate::{DaemonComposition, DaemonError};
 use eliot_governor::{CompositionError, CompositionReadiness, RouteScopeFingerprint};
@@ -1257,13 +1257,16 @@ fn check_verified_binds_intake(
 ///
 /// Missing, substituted, moved-route, or stale-activation material refuses
 /// here, before the first possible external effect: the activation must
-/// address this exact admission and attempt (and belong to it), and the live
+/// address this exact admission and attempt (and belong to it), the live
+/// queue head must still carry the consumed route revision, and the live
 /// fence/epoch must still match the activation fence/epoch.
 fn revalidate_launch_gate(
+    composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     admission: &FabricAdmission,
     attempt_id: &AttemptId,
     evidence: &ActivationEvidence,
+    consumed: &VerifiedProviderMaterial,
 ) -> Result<(), DaemonError> {
     if evidence.admission_id != admission.admission_id
         || evidence.attempt_id != *attempt_id
@@ -1272,6 +1275,29 @@ fn revalidate_launch_gate(
         return Err(DaemonError::ProviderAdmission(FabricError::StaleAdmission(
             "solo launch gate refuses activation for another admission or attempt".to_owned(),
         )));
+    }
+    {
+        let state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        let Some(head) = state.queue.front() else {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo launch gate refuses: queue head left before dispatch".to_owned(),
+                ),
+            ));
+        };
+        if head.claimed.operation_id != consumed.operation_id
+            || head.claimed.route_revision != consumed.route_revision
+        {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo launch gate refuses a route-moved activation".to_owned(),
+                ),
+            ));
+        }
     }
     let live = kernel.kernel_fence();
     if !fences_match_exact(&live, &evidence.fence) {
@@ -1319,19 +1345,167 @@ fn check_dispatch_record(
     Ok(())
 }
 
+/// Re-resolves the exact dispatch material immediately before dispatch
+/// (issue #2567 AUD12/I4).
+///
+/// The fabric chain above resolved each piece through its owner, but nothing
+/// yet proves the resolved pieces still cohere at dispatch time: the
+/// admission must bind the planned definition and the staged reservation,
+/// the definition must still echo the consumed frozen plan (task, launch,
+/// revisions, class), the frozen delegate packet must still bind its bytes
+/// with artifact scope present, the resolved route must be the receipt-staffed
+/// lane route with the receipt (budget, routes, evidence) still digest-bound,
+/// and the solo launch contract, the consumed binding halves, and a
+/// still-live claim deadline must hold. Anything missing, substituted, or
+/// moved refuses here, before the first possible external effect, with the
+/// same typed vocabulary as the launch gate.
+#[allow(clippy::too_many_arguments)]
+fn revalidate_dispatch_material(
+    intake: &SoloDelegateIntake,
+    prepared: &VerifiedProviderMaterial,
+    receipt: &StaffingPlanReceipt,
+    staffed: &StaffedLane,
+    route: &RouteFingerprint,
+    definition: &SwarmDefinition,
+    reservation: &Reservation,
+    admission: &FabricAdmission,
+) -> Result<(), DaemonError> {
+    if definition.definition_id != intake.plan.candidate_id
+        || definition.task_id != intake.plan.launch.task_id.as_str()
+        || definition.task_revision != intake.plan.task_revision
+        || definition.plan_revision != intake.plan.plan_revision.as_str()
+        || definition.work_class != intake.plan.work_class
+    {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo dispatch refuses a definition that no longer echoes the frozen plan"
+                    .to_owned(),
+            ),
+        ));
+    }
+    if reservation.definition_id != definition.definition_id
+        || reservation.definition_digest != definition.definition_digest
+    {
+        return Err(DaemonError::ProviderAdmission(FabricError::ReceiptBinding(
+            "solo dispatch refuses a reservation that no longer stages the planned definition"
+                .to_owned(),
+        )));
+    }
+    if admission.definition_id != definition.definition_id
+        || admission.definition_digest != definition.definition_digest
+        || admission.reservation_id != reservation.reservation_id
+    {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleAdmission(
+            "solo dispatch refuses an admission that no longer commits the staged definition"
+                .to_owned(),
+        )));
+    }
+    if sha256_hex(&intake.delegate.source_bytes) != intake.delegate.source_digest {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo dispatch refuses a delegate packet whose bytes no longer bind its digest"
+                    .to_owned(),
+            ),
+        ));
+    }
+    if intake.delegate.owned_resources.is_empty() {
+        return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+            "solo dispatch refuses a delegate packet with no artifact scope".to_owned(),
+        )));
+    }
+    if *route != staffed.route {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo dispatch refuses a route that is not the receipt-staffed lane route"
+                    .to_owned(),
+            ),
+        ));
+    }
+    verify_receipt_digest(receipt).map_err(|error| {
+        DaemonError::ProviderAdmission(FabricError::Contract(format!(
+            "solo dispatch refuses a staffing receipt that no longer binds its body: {error}"
+        )))
+    })?;
+    guard_solo_plan(&intake.plan).map_err(DaemonError::ProviderAdmission)?;
+    if intake.deadline_unix_ms == 0 || intake.deadline_unix_ms <= crate::unix_ms() {
+        return Err(DaemonError::ProviderAdmission(FabricError::Contract(
+            "solo claim deadline elapsed before dispatch".to_owned(),
+        )));
+    }
+    if prepared.operation_id != intake.claimed.operation_id
+        || prepared.binding_digest != intake.claimed.binding_digest
+        || prepared.executable_digest != intake.claimed.executable_digest
+        || prepared.route_revision != intake.claimed.route_revision
+    {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo dispatch refuses consumed material that no longer binds the intake"
+                    .to_owned(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Binds the recorded dispatch authority to the retained intent (issue #2567
+/// I4).
+///
+/// The intent the fabric retained must address this exact dispatch identity,
+/// admission, attempt, and activation digest, and carry the activation
+/// fence/epoch and the admission work class verbatim. A mismatch refuses with
+/// typed stale/substitution instead of persisting foreign authority under
+/// this operation.
+fn check_dispatch_intent(
+    intent: &DispatchIntent,
+    dispatch_id: &str,
+    admission: &FabricAdmission,
+    attempt_id: &AttemptId,
+    activation: &ActivationEvidence,
+) -> Result<(), DaemonError> {
+    if intent.dispatch_id != dispatch_id
+        || intent.admission_id != admission.admission_id
+        || intent.attempt_id != *attempt_id
+        || intent.activation_digest != activation.activation_digest
+        || intent.work_class != admission.work_class
+    {
+        return Err(DaemonError::ProviderAdmission(
+            FabricError::IdentityConflict(
+                "solo dispatch refuses an intent that does not bind this admission and activation"
+                    .to_owned(),
+            ),
+        ));
+    }
+    if !fences_match_exact(&intent.fence, &activation.fence) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleFence(
+            "solo dispatch refuses an intent with a moved fence".to_owned(),
+        )));
+    }
+    if !intent.epoch.is_same_authority(&activation.epoch) {
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleEpoch(
+            "solo dispatch refuses an intent with a moved epoch".to_owned(),
+        )));
+    }
+    Ok(())
+}
+
 /// Returns true when the live queue head still carries the consumed revisions.
 ///
 /// The compared tuple is the prepare/adopt contract: operation/claim/attempt
-/// identity, task and candidate binding, route and capacity revisions, worker
-/// generation, binding digests, and the presented fence. Anything else about
-/// the head may evolve; a move in this tuple means the consumed plan no
+/// identity, provider identity, task and candidate binding, route and
+/// capacity revisions, the Governor currentness expectation, the restore
+/// floor, the route-gate requirements and observed scope, the claim deadline,
+/// worker generation, binding digests, and the presented fence. Anything else
+/// about the head may evolve; a move in this tuple means the consumed plan no
 /// longer addresses the queued head.
 fn intake_revisions_match(live: &SoloDelegateIntake, consumed: &SoloDelegateIntake) -> bool {
     live.claimed.operation_id == consumed.claimed.operation_id
         && live.claimed.claim_id == consumed.claimed.claim_id
         && live.claimed.attempt_id == consumed.claimed.attempt_id
+        && live.claimed.identity == consumed.claimed.identity
         && live.claimed.route_revision == consumed.claimed.route_revision
         && live.claimed.capacity_revision == consumed.claimed.capacity_revision
+        && live.claimed.expectation == consumed.claimed.expectation
+        && live.claimed.minimum_event_sequence == consumed.claimed.minimum_event_sequence
         && live.claimed.worker_generation == consumed.claimed.worker_generation
         && live.claimed.binding_digest == consumed.claimed.binding_digest
         && live.claimed.executable_digest == consumed.claimed.executable_digest
@@ -1339,6 +1513,9 @@ fn intake_revisions_match(live: &SoloDelegateIntake, consumed: &SoloDelegateInta
             &live.claimed.presented_fence,
             &consumed.claimed.presented_fence,
         )
+        && live.requirements == consumed.requirements
+        && live.observed_scope == consumed.observed_scope
+        && live.deadline_unix_ms == consumed.deadline_unix_ms
         && live.plan.launch.task_id.as_str() == consumed.plan.launch.task_id.as_str()
         && live.plan.candidate_id == consumed.plan.candidate_id
         && live.delegate.source_digest == consumed.delegate.source_digest
@@ -1351,11 +1528,11 @@ fn intake_revisions_match(live: &SoloDelegateIntake, consumed: &SoloDelegateInta
 /// moved under the seam await refuses with a typed stale fence; a live
 /// authority epoch that no longer matches the consumed expectation refuses
 /// with a typed stale epoch; a queue head that no longer carries the
-/// consumed task/route revisions refuses with a typed identity conflict;
-/// and a live slot that another unsettled operation now holds refuses with
-/// a typed identity conflict (a settled slot clears under the same rule as
-/// the prepare step). Every refusal leaves the queue head queued for a
-/// fresh evaluation instead of adopting verified material under another
+/// consumed task/route/admission revisions refuses with a typed identity
+/// conflict; and a live slot that another unsettled operation now holds
+/// refuses with a typed identity conflict (a settled slot clears under the
+/// same rule as the prepare step). Every refusal leaves the queue head queued
+/// for a fresh evaluation instead of adopting verified material under another
 /// generation, task, route, or admission.
 fn recheck_adopt_revisions(
     composition: &DaemonComposition,
@@ -1393,7 +1570,8 @@ fn recheck_adopt_revisions(
         if !intake_revisions_match(head, intake) {
             return Err(DaemonError::ProviderAdmission(
                 FabricError::IdentityConflict(
-                    "solo adopt refuses a task or route moved during owner IO".to_owned(),
+                    "solo adopt refuses a task, route, or admission moved during owner IO"
+                        .to_owned(),
                 ),
             ));
         }
@@ -1471,11 +1649,12 @@ async fn drive_solo_delegate_verified_async(
 /// cross-check, and single live slot are prepared under short borrows; the
 /// snapshot below is cloned before the seam await so the adopt step
 /// (`recheck_adopt_revisions`) can revalidate the exact consumed
-/// fence/epoch, task/route, and live-slot admission revisions after owner
+/// fence/epoch, task/route/admission, and live-slot revisions after owner
 /// IO; the fabric chain (`define_and_plan` -> `stage_reservation` ->
 /// `commit_admission` -> `activate` -> launch-gate revalidation ->
-/// `dispatch` -> persist -> frame) adopts the typed result only when every
-/// revision still binds.
+/// dispatch-material revalidation -> `dispatch` -> intent-authority check ->
+/// persist -> frame) adopts the typed result only when every revision still
+/// binds.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::needless_pass_by_value)]
 async fn drive_admitted_material_async(
@@ -1568,9 +1747,36 @@ async fn drive_admitted_material_async(
     // after the last owner write and before the first possible external
     // effect. Missing, substituted, moved-route, or stale-activation
     // material refuses here instead of launching.
-    revalidate_launch_gate(kernel, &admission, &attempt_id, &activation)?;
+    revalidate_launch_gate(
+        composition,
+        kernel,
+        &admission,
+        &attempt_id,
+        &activation,
+        &prepared,
+    )?;
+    // AUD12/I4: the resolved material is re-resolved immediately before
+    // dispatch: frozen definition, staged reservation, committed admission,
+    // frozen packet bytes, staffed route, digest-bound receipt (budget,
+    // routes, evidence), solo launch contract, consumed binding halves, and
+    // a still-live deadline. Anything moved refuses before any external
+    // effect.
+    revalidate_dispatch_material(
+        &intake,
+        &prepared,
+        &receipt,
+        staffed,
+        &route,
+        &definition,
+        &reservation,
+        &admission,
+    )?;
     let dispatch_id = solo_dispatch_identity(attempt_id.as_str(), admission.admission_id.as_str());
     let intent = fabric.dispatch(&admission.admission_id, &attempt_id, &dispatch_id)?;
+    // I4: the retained intent must carry this exact dispatch identity,
+    // admission, attempt, activation digest, fence, epoch, and work class
+    // before anything persists it.
+    check_dispatch_intent(&intent, &dispatch_id, &admission, &attempt_id, &activation)?;
     let dispatch = SoloDispatchRecord {
         dispatch_id: dispatch_id.clone(),
         claim_id: intake.claimed.claim_id.clone(),
@@ -2636,10 +2842,10 @@ pub async fn solo_poll_queue_async(
     // Queue adopt (issue #2567 AUD9): recheck the consumed revisions under a
     // short lock before dequeuing. The drive adopt already revalidated
     // post-seam; this closes the remaining window over the sync fabric
-    // chain and persist. A head that left or moved (task/route), or a live
-    // fence/epoch that no longer binds the consumed fence, refuses with a
-    // typed stale/conflict and the head stays queued instead of dequeuing
-    // another operation's intake.
+    // chain and persist. A head that left or moved (task/route/admission),
+    // or a live fence/epoch that no longer binds the consumed fence, refuses
+    // with a typed stale/conflict and the head stays queued instead of
+    // dequeuing another operation's intake.
     {
         let composition = composition.lock().await;
         let live = kernel.kernel_fence();
@@ -2658,7 +2864,7 @@ pub async fn solo_poll_queue_async(
         if !intake_revisions_match(head, &expected) {
             return Err(DaemonError::ProviderAdmission(
                 FabricError::IdentityConflict(
-                    "solo queue adopt refuses a task or route moved during the verified drive"
+                    "solo queue adopt refuses a task, route, or admission moved during the verified drive"
                         .to_owned(),
                 ),
             ));
