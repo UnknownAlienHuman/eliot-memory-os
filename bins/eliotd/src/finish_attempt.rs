@@ -234,7 +234,7 @@ pub async fn serve_finish_claim(
                 ),
             );
         }
-        guard.historical_finish_receipt(
+        guard.governor.historical_finish_receipt(
             &claimed.request_identity,
             &claimed.operation_id,
             &draft,
