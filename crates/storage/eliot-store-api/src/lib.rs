@@ -257,7 +257,7 @@ pub use work_admission::{
     WorkAdmissionDependency, WorkAdmissionRecord, WorkAdmissionSemanticRevision,
     WorkAdmissionState, WorkAdmissionSubmission, admit_work_operation, decode_work_admission_record,
     validate_admit_work_command, validate_work_admission_transition,
-    work_admission_value_digest,
+    work_admission_value_digest, WORK_ADMISSION_RECORD_NAMESPACE,
 };
 
 pub use wire::{

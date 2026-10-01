@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub const WORK_ADMISSION_SCHEMA_V1: &str = "eliot.storage.work-admission.v1";
+pub const WORK_ADMISSION_RECORD_NAMESPACE: &str = "work-admission-v1";
 
 /// Original semantic revision key and revision that admitted this work.
 ///
@@ -32,11 +33,18 @@ pub struct WorkAdmissionSemanticRevision {
 impl WorkAdmissionSemanticRevision {
     pub fn validate(&self) -> Result<(), StoreError> {
         validate_text(&self.key, "work_admission.semantic_revision.key")?;
-        validate_text(&self.revision, "work_admission.semantic_revision.revision")
-    }
-
-    fn prepared_revision(&self) -> String {
-        format!("{}@{}", self.key, self.revision)
+        validate_text(&self.revision, "work_admission.semantic_revision.revision")?;
+        let revision = self.revision.parse::<u64>().map_err(|_| StoreError::InvalidField {
+            field: "work_admission.semantic_revision.revision",
+            reason: "must be a canonical positive owner revision",
+        })?;
+        if revision == 0 || revision.to_string() != self.revision {
+            return Err(StoreError::InvalidField {
+                field: "work_admission.semantic_revision.revision",
+                reason: "must be a canonical positive owner revision",
+            });
+        }
+        Ok(())
     }
 }
 
@@ -167,8 +175,14 @@ pub struct WorkAdmissionRecord {
     pub expires_at_ms: i64,
     /// Original semantic-owner revision, stored first-class.
     pub semantic_admission_revision: WorkAdmissionSemanticRevision,
+    /// Owner-observed predecessor of the proposed semantic admission revision.
+    /// The canonical commit compares this exact value before advancing it.
+    pub semantic_admission_predecessor_revision: u64,
     /// Canonical operation whose transaction commits this ADMITTED row.
     pub canonical_operation_id: OperationId,
+    /// Exact idempotency key from the original canonical submission.
+    /// Retries and restart reconciliation reuse this value unchanged.
+    pub canonical_idempotency_key: String,
     /// Exact launch outbox row written by that same canonical operation.
     pub launch_outbox_id: OutboxId,
 }
@@ -198,6 +212,10 @@ impl WorkAdmissionRecord {
                 "work_admission.receipt_contract_revision",
                 self.receipt_contract_revision.as_str(),
             ),
+            (
+                "work_admission.canonical_idempotency_key",
+                self.canonical_idempotency_key.as_str(),
+            ),
         ] {
             validate_text(value, field)?;
         }
@@ -220,6 +238,20 @@ impl WorkAdmissionRecord {
             });
         }
         self.semantic_admission_revision.validate()?;
+        if self
+            .semantic_admission_predecessor_revision
+            .checked_add(1)
+            != self
+                .semantic_admission_revision
+                .revision
+                .parse::<u64>()
+                .ok()
+        {
+            return Err(StoreError::InvalidField {
+                field: "work_admission.semantic_admission_predecessor_revision",
+                reason: "must be the exact predecessor of the owner-issued admission revision",
+            });
+        }
         let mut dependency_ids = std::collections::BTreeSet::new();
         for dependency in &self.dependencies {
             dependency.validate()?;
@@ -344,6 +376,12 @@ impl WorkAdmissionSubmission {
         let record = decode_work_admission_record(
             &prepared_transition.named_operations[0].parameters,
         )?;
+        if prepared_transition.identity.idempotency_key != record.canonical_idempotency_key {
+            return Err(StoreError::InvalidField {
+                field: "work_admission.canonical_idempotency_key",
+                reason: "must match the original prepared transition identity",
+            });
+        }
         if request.task_id.as_ref().map(|task| task.as_str()) != Some(record.task_id.as_str())
             || request.session_id.as_ref().map(|session| session.as_str())
                 != Some(record.session_id.as_str())
@@ -359,6 +397,11 @@ impl WorkAdmissionSubmission {
                 return Err(StoreError::FenceMismatch);
             }
         }
+        validate_work_admission_predecessor_heads(
+            &record,
+            &prepared_transition.state_fence,
+            &expected_revision_heads,
+        )?;
         for head in &expected_ordering_heads {
             head.validate()?;
             if head.state_fence != prepared_transition.state_fence {
@@ -388,6 +431,8 @@ impl WorkAdmissionSubmission {
                 != Some(record.task_id.as_str())
             || self.request.session_id.as_ref().map(|session| session.as_str())
                 != Some(record.session_id.as_str())
+            || self.prepared_transition.identity.idempotency_key
+                != record.canonical_idempotency_key
         {
             return Err(StoreError::InvalidReceipt);
         }
@@ -397,6 +442,11 @@ impl WorkAdmissionSubmission {
                 return Err(StoreError::FenceMismatch);
             }
         }
+        validate_work_admission_predecessor_heads(
+            &record,
+            &self.prepared_transition.state_fence,
+            &self.expected_revision_heads,
+        )?;
         for head in &self.expected_ordering_heads {
             head.validate()?;
             if head.state_fence != self.prepared_transition.state_fence {
@@ -444,10 +494,15 @@ pub fn validate_work_admission_transition(
         || transition.scope_id.as_str() != record.scope_id
         || transition.state_fence != record.state_fence
         || transition.identity.operation_id != record.canonical_operation_id
+        || transition.identity.idempotency_key != record.canonical_idempotency_key
     {
         return Err(StoreError::FenceMismatch);
     }
-    let expected_revision = record.semantic_admission_revision.prepared_revision();
+    let expected_revision = format!(
+        "{}@{}",
+        record.semantic_admission_revision.key,
+        record.semantic_admission_predecessor_revision
+    );
     if !transition
         .semantic_source_revisions
         .iter()
@@ -465,6 +520,32 @@ pub fn validate_work_admission_transition(
         )?
     {
         return Err(StoreError::InvalidReceipt);
+    }
+    Ok(())
+}
+
+fn validate_work_admission_predecessor_heads(
+    record: &WorkAdmissionRecord,
+    state_fence: &StateFence,
+    expected_revision_heads: &[RevisionHeadExpectation],
+) -> Result<(), StoreError> {
+    let mut matching = expected_revision_heads.iter().filter(|head| {
+        head.key.as_str() == record.semantic_admission_revision.key
+    });
+    let Some(head) = matching.next() else {
+        return Err(StoreError::InvalidField {
+            field: "work_admission.semantic_admission_predecessor_revision",
+            reason: "the original owner CAS predecessor must be retained in the submission",
+        });
+    };
+    if matching.next().is_some()
+        || head.expected_revision != record.semantic_admission_predecessor_revision
+        || head.state_fence != *state_fence
+    {
+        return Err(StoreError::InvalidField {
+            field: "work_admission.semantic_admission_predecessor_revision",
+            reason: "the submission must retain exactly the owner-observed CAS predecessor",
+        });
     }
     Ok(())
 }
