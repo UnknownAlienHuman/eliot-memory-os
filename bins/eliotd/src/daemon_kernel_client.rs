@@ -61,6 +61,10 @@ use eliot_protocol::{
 };
 use eliot_receipts::RequestBinding;
 #[cfg(windows)]
+use eliot_ors::{AdmissionReservationRecord, AdmissionReservationState, OperationalMutationReceipt};
+#[cfg(windows)]
+use eliot_store_api::ProposedAttemptRecord;
+#[cfg(windows)]
 use eliot_runtime_contracts::{MODULE_MANIFEST_SCHEMA_VERSION, ModuleManifest};
 use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
 use eliot_testd_core::{
@@ -439,6 +443,18 @@ pub struct SelectedSourceCaptureClaimedInvocation {
     pub request_identity: RequestIdentity,
 }
 
+/// Exact Kernel-owned inactive ORS stage returned for one selected-source
+/// claim. The receipt and staged row are returned as typed original owner
+/// readback, not reconstructed authority.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub struct SelectedSourceCaptureStagedAdmission {
+    pub record: ProposedAttemptRecord,
+    pub stage_receipt_id: String,
+    pub staged_record: AdmissionReservationRecord,
+    pub stage_receipt: OperationalMutationReceipt,
+}
+
 /// Parses one `source_capture.claim` answer into its exact typed request.
 pub fn parse_selected_source_capture_claimed_pair(
     value: &serde_json::Value,
@@ -500,6 +516,100 @@ pub fn parse_selected_source_capture_claimed_pair(
         invocation,
         request_identity,
     }))
+}
+
+/// Parses the original Kernel `source_capture.stage` response and compares
+/// every echoed record, ORS snapshot, and receipt binding with its retained
+/// claim and Governor owner selection.
+#[cfg(windows)]
+pub fn parse_selected_source_capture_staged_admission(
+    value: &serde_json::Value,
+    claimed: &SelectedSourceCaptureClaimedInvocation,
+    selected: &eliot_governor::TaskSelectionAdmissionBinding,
+    intent: &eliot_kernel_service::source_capture_mutation::SelectedSourceCaptureStageIntent,
+) -> Result<SelectedSourceCaptureStagedAdmission, String> {
+    let stage = value
+        .get("stage")
+        .ok_or_else(|| "Kernel source_capture.stage answer omits stage".to_owned())?;
+    let decode = |field: &str| {
+        stage
+            .get(field)
+            .cloned()
+            .ok_or_else(|| format!("Kernel source_capture.stage answer omits {field}"))
+    };
+    let result = SelectedSourceCaptureStagedAdmission {
+        record: serde_json::from_value(decode("record")?)
+            .map_err(|error| format!("staged ProposedAttempt record does not decode: {error}"))?,
+        stage_receipt_id: decode("stage_receipt_id")?
+            .as_str()
+            .ok_or_else(|| "source_capture.stage receipt id is not a string".to_owned())?
+            .to_owned(),
+        staged_record: serde_json::from_value(decode("staged_record")?)
+            .map_err(|error| format!("inactive ORS record does not decode: {error}"))?,
+        stage_receipt: serde_json::from_value(decode("stage_receipt")?)
+            .map_err(|error| format!("inactive ORS receipt does not decode: {error}"))?,
+    };
+    let record = &result.record;
+    let staged = &result.staged_record;
+    record
+        .validate()
+        .map_err(|error| format!("Kernel staged ProposedAttempt record is invalid: {error}"))?;
+    staged
+        .validate()
+        .map_err(|error| format!("Kernel inactive ORS staged row is invalid: {error}"))?;
+    let invocation = &claimed.invocation;
+    let envelope = &claimed.host_request_envelope;
+    let identity = &claimed.request_identity;
+    let request_identity = serde_json::to_value(identity)
+        .map_err(|error| format!("original request identity cannot be encoded: {error}"))?;
+    let reservation_claims = serde_json::to_value(&intent.claims)
+        .map_err(|error| format!("typed ORS claims cannot be encoded: {error}"))?;
+    let authority_epoch = serde_json::to_value(&staged.authority_epoch)
+        .map_err(|error| format!("staged ORS epoch cannot be encoded: {error}"))?;
+    let expected_operation = match invocation.operation {
+        eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
+        eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
+    };
+    if record.work_item_id != selected.evidence_ref()
+        || record.proposed_attempt_id == record.work_item_id
+        || record.reservation_id == record.work_item_id
+        || record.reservation_id == record.proposed_attempt_id
+        || record.reservation_stage_receipt_id != result.stage_receipt_id
+        || record.request_identity != request_identity
+        || record.task_id != selected.task_ref()
+        || record.session_id != selected.session_ref()
+        || record.work_scope_id != selected.work_scope().binding.scope.scope_ref
+        || record.work_lease_id != selected.selection_source_ref()
+        || record.principal_id != selected.principal_ref()
+        || record.operation != expected_operation
+        || record.operation != intent.operation
+        || record.selected_relative_path != invocation.selected_relative_path
+        || record.selected_relative_path != intent.selected_relative_path
+        || record.selector != invocation.selector
+        || record.selector != intent.selector
+        || record.source_digest != intent.source_digest
+        || record.configuration_digest != intent.configuration_digest
+        || record.action_contract_digest != intent.action_contract_digest
+        || record.disposition != "ADMITTED"
+        || record.reservation_claims != reservation_claims
+        || record.authority_epoch != authority_epoch
+        || record.state_fence != envelope.state_fence
+        || staged.reservation_id != record.reservation_id
+        || staged.work_item_id != record.work_item_id
+        || staged.proposed_attempt_id != record.proposed_attempt_id
+        || staged.operation_id != staged.stage_operation_id
+        || staged.claims != intent.claims
+        || staged.state_fence.generation != envelope.state_fence.resource_generation.value()
+        || staged.state_fence.observed_authority_epoch != envelope.state_fence.authority_epoch
+        || staged.state != AdmissionReservationState::StagedInactive
+        || result.stage_receipt.record_id().as_str() != result.stage_receipt_id
+        || result.stage_receipt.subject_id() != &staged.reservation_id
+    {
+        return Err(
+            "source_capture.stage response differs from the retained claim, current owner selection, intent, or exact inactive ORS evidence".to_owned(),
+        );
+    }
+    Ok(result)
 }
 
 /// Typed outcome of one `task_controller_result` submit.
@@ -2903,6 +3013,67 @@ impl DaemonKernelClient {
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         parse_selected_source_capture_claimed_pair(&value)
             .map_err(super::DaemonError::Kernel)
+    }
+
+    /// Stages one distinct inactive ORS reservation for the exact claimed
+    /// source mutation and current Governor selection. The original request
+    /// identity rides the authenticated frame unchanged; Kernel binds it to
+    /// the retained HostRequest and derives proposal/reservation identities.
+    #[cfg(windows)]
+    pub async fn stage_selected_source_capture_async(
+        &self,
+        claimed: &SelectedSourceCaptureClaimedInvocation,
+        selected: &eliot_governor::TaskSelectionAdmissionBinding,
+        intent: eliot_kernel_service::source_capture_mutation::SelectedSourceCaptureStageIntent,
+    ) -> Result<SelectedSourceCaptureStagedAdmission, super::DaemonError> {
+        let expected_operation = match claimed.invocation.operation {
+            eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
+            eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
+        };
+        if intent.operation != expected_operation
+            || intent.selected_relative_path != claimed.invocation.selected_relative_path
+            || intent.selector != claimed.invocation.selector
+            || intent.work_item_id.as_str() != selected.evidence_ref()
+            || intent.work_lease_id != selected.selection_source_ref()
+            || intent.principal_id != selected.principal_ref()
+            || claimed.request_identity.request.metadata.task_id.as_ref().map(ToString::to_string)
+                .as_deref()
+                != Some(selected.task_ref())
+            || claimed.request_identity.request.metadata.session_id.as_ref().map(ToString::to_string)
+                .as_deref()
+                != Some(selected.session_ref())
+            || claimed.host_request_envelope.identity.work_scope_id.as_deref()
+                != Some(selected.work_scope().binding.scope.scope_ref.as_str())
+            || claimed.host_request_envelope.state_fence != *selected.state_fence()
+        {
+            return Err(super::DaemonError::Kernel(
+                "source_capture.stage intent differs from the exact claim or current Governor owner selection"
+                    .to_owned(),
+            ));
+        }
+        let operation_id = eliot_protocol::host_request_operation_id(
+            &claimed.host_request_envelope,
+        );
+        let staged_intent = intent.clone();
+        let value = self
+            .transact_async_with_identity(
+                "source_capture.stage",
+                serde_json::json!({
+                    "operation_id": operation_id,
+                    "request_digest": claimed.host_request_envelope.envelope_sha256,
+                    "intent": intent,
+                }),
+                claimed.request_identity.clone(),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_selected_source_capture_staged_admission(
+            &value,
+            claimed,
+            selected,
+            &staged_intent,
+        )
+        .map_err(super::DaemonError::Kernel)
     }
 
     /// Submits one daemon-produced local-read result body for its waiting
