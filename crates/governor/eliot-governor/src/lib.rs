@@ -77,7 +77,10 @@ pub use cue_composition::{
 // a composition descendant, because it needs no private composition field: it
 // derives identity from the Kernel-issued attempt and the admitted request
 // identity, and persists nothing.
-pub use composition::{CommittedCoordinationResult, CoordinationCommitError};
+pub use composition::{
+    CommittedCoordinationLease, CommittedCoordinationResult, CoordinationCommitError,
+    CoordinationEventContext,
+};
 pub use coordination_work_identity::{
     COORDINATION_RESULT_ARTIFACT_NAMESPACE, COORDINATION_RESULT_NAMESPACE,
     COORDINATION_WORK_IDENTITY_REVISION, COORDINATION_WORK_ITEM_NAMESPACE,
