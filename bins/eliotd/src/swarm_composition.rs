@@ -861,6 +861,12 @@ fn verify_slot_exact_replay(
     if prior == candidate {
         return Ok(SlotReplayVerdict::ExactReplay(prior.clone()));
     }
+    // `prior != candidate` is already established above, and
+    // `check_intent_lineage` has forced every identity field (operation,
+    // attempt, cancellation, slot, job, revision, fence) equal against the same
+    // sealed attachment, so the fields that can still differ are exactly these
+    // four. The list is therefore never empty here: an empty one would mean the
+    // two intents are equal, which the branch above already returned.
     let mut drifted: Vec<&str> = Vec::new();
     if prior.route_class != candidate.route_class {
         drifted.push("route_class");
@@ -873,9 +879,6 @@ fn verify_slot_exact_replay(
     }
     if prior.generation_fingerprint != candidate.generation_fingerprint {
         drifted.push("generation_fingerprint");
-    }
-    if drifted.is_empty() {
-        drifted.push("operation_identity");
     }
     Err(SwarmCompositionError::PayloadConflict {
         slot: candidate.slot.clone(),
