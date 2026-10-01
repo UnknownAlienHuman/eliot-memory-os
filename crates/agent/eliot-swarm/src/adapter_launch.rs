@@ -33,9 +33,10 @@
 //!   owns the registry. This module constructs no provider clients, no SDK
 //!   handles, no credentials, and no shell paths.
 //! - A supplied prior dispatch is always checked through the existing
-//!   [`verify_exact_replay`](super::durable_dispatch::verify_exact_replay),
-//!   even when the registry entry digest matches the grant fingerprint. A
-//!   same-identity changed payload is `PayloadConflict`; a different identity
+//!   [`verify_exact_replay_full`](super::durable_dispatch::verify_exact_replay_full)
+//!   — the one full-dispatch replay scheme — even when the registry entry
+//!   digest matches the grant fingerprint. A same-identity changed payload or
+//!   changed complete route lineage is `PayloadConflict`; a different identity
 //!   is `ForeignIdentity` (not a replay: the candidate proceeds); only a
 //!   validated exact replay with matching complete dispatch lineage is
 //!   idempotent. Entry/grant drift without a prior blocks a new launch.
@@ -52,7 +53,7 @@ use super::{
     durable_dispatch::{
         DispatchedLaunch, DurableJobAttachment, ReplayVerdict, SealedChildIdentities,
         attach_plan_job_through_port, dispatch_child, rehydrate_attachment_through_port,
-        verify_exact_replay, verify_sealed_dispatch,
+        verify_exact_replay_full, verify_sealed_dispatch,
     },
     durable_work::{DurableWorkStore, RouteGrant, WorkExecutor, WorkUnitId},
     validate_text,
@@ -166,11 +167,15 @@ fn hex_digest(bytes: &[u8; 32]) -> String {
 /// generation, generation fingerprint, or adapter-entry digest is
 /// `RouteBlocked`; request lineage that disagrees with the attachment or item
 /// is `StaleLineage`; the remaining dispatch rules are `dispatch_child`'s
-/// own. Any supplied prior dispatch is checked for exact replay regardless of
-/// registry digest equality (`PayloadConflict` propagates; `Idempotent`
-/// requires the complete dispatch lineage to match before re-observation;
-/// `ForeignIdentity` is not a replay and proceeds). Registry drift without a
-/// prior blocks a new launch rather than silently relaunching on a stale route.
+/// own. Any supplied prior dispatch is checked through the single
+/// full-dispatch replay scheme
+/// ([`verify_exact_replay_full`](super::durable_dispatch::verify_exact_replay_full))
+/// regardless of registry digest equality (`PayloadConflict` propagates for
+/// same-identity drift in either the intent payload or the complete
+/// dispatch lineage; `Idempotent` requires that lineage to match before
+/// re-observation; `ForeignIdentity` is not a replay and proceeds). Registry
+/// drift without a prior blocks a new launch rather than silently relaunching
+/// on a stale route.
 pub fn launch_admitted_child(
     _store: &dyn DurableWorkStore,
     _executor: &dyn WorkExecutor,
@@ -216,11 +221,15 @@ pub fn launch_admitted_child(
     )?;
     let entry_matches_grant =
         hex_digest(&registry.adapter_entry_digest) == launch.lineage.route_fingerprint;
+    // One replay scheme only: the full-dispatch verifier is the single
+    // admission decision for a supplied prior. It proves the `LaunchIntent`
+    // half through `verify_exact_replay` and then adds the `DispatchLineage`
+    // half, so a same-identity prior re-observes idempotently only when the
+    // complete job/plan/slot/fence/route lineage matches, and any same-identity
+    // drift is `PayloadConflict`. A different identity is not a replay and
+    // proceeds on its own lineage.
     match prior {
-        Some(prior) => match verify_exact_replay(prior, &launch.intent)? {
-            ReplayVerdict::Idempotent if prior.lineage != launch.lineage => {
-                return Err(SwarmError::PayloadConflict);
-            }
+        Some(prior) => match verify_exact_replay_full(prior, &launch)? {
             ReplayVerdict::Idempotent | ReplayVerdict::ForeignIdentity => {}
         },
         None if !entry_matches_grant => return Err(SwarmError::RouteBlocked),
@@ -264,7 +273,8 @@ pub struct SealedChildInputs<'a> {
 /// after. The returned intent is still candidate-only: the caller persists it
 /// through the owner-side append path (`DurableWorkStore` append, or the
 /// daemon `LaunchIntentLedger`) BEFORE calling the executor, and reconciles
-/// through [`verify_exact_replay`] plus attachment rehydration before any
+/// through [`verify_exact_replay_full`](super::durable_dispatch::verify_exact_replay_full)
+/// plus attachment rehydration before any
 /// relaunch, so no launched child is omitted from restart accounting.
 /// DAG acyclicity and denominator finiteness were proven at admission and are
 /// not re-proved here.
