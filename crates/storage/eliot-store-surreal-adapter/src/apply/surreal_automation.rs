@@ -2,7 +2,7 @@
 //! (issue #1779).
 //!
 //! Mirrors the reference contour's closed legs through the store-api wire
-//! contract, persisted in five automation tables plus the ephemeral
+//! contract, persisted in six automation tables plus the ephemeral
 //! `automation_continuation` owner table: `automation_revision` holds one
 //! immutable row per `(automation_id, revision)` carrying the verbatim
 //! Kernel-owned revision document; `automation_current` holds one
@@ -13,7 +13,9 @@
 //! `(automation_id, revision, fingerprint)` carrying the verbatim
 //! failure document with first-writer provenance; `automation_last_failure`
 //! holds one last-wins pointer per automation naming the most recently
-//! committed failure row. Revision and failure documents stay opaque:
+//! committed failure row; `automation_normalization` independently retains
+//! the original normalized revision, receipt, request, and transition
+//! provenance without activating it. Revision and failure documents stay opaque:
 //! lineage validity is Kernel-owned, and this module arbitrates keys,
 //! pointers, and immutability only. Concurrent writers arbitrate through
 //! the in-transaction compare-and-set inside the canonical transaction;
@@ -67,6 +69,25 @@ pub(crate) struct AutomationRevisionWrite {
     /// Scope provenance from the transition envelope.
     pub scope_id: String,
     /// Task-binding provenance from the transition envelope, when bound.
+    pub task_id: Option<String>,
+}
+
+/// One independently retained owner-normalized revision for the canonical
+/// transaction. Producer identity and provenance come only from
+/// `PreparedTransition`; the source request, normalized revision, and receipt
+/// remain the originals submitted by the owner.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AutomationNormalizationWrite {
+    pub automation_id: String,
+    pub revision: String,
+    pub revision_json: String,
+    pub normalization_receipt_json: Value,
+    pub normalization_request_json: String,
+    pub operation_id: String,
+    pub idempotency_key: String,
+    pub canonical_request_hash: String,
+    pub state_fence: StateFence,
+    pub scope_id: String,
     pub task_id: Option<String>,
 }
 
@@ -146,6 +167,8 @@ pub(crate) struct AutomationLastFailureWrite {
 pub(crate) struct AutomationWrites {
     /// Revision creates in admitted command order.
     pub revisions: Vec<AutomationRevisionWrite>,
+    /// Immutable owner-normalization records, separate from active revisions.
+    pub normalizations: Vec<AutomationNormalizationWrite>,
     /// Current-pointer creates/updates in admitted command order.
     pub currents: Vec<AutomationCurrentWrite>,
     /// Invocation creates in admitted command order.
@@ -169,6 +192,23 @@ pub(crate) struct StoredAutomationRevision {
     pub normalization_receipt_json: Option<Value>,
     /// Admission fence.
     pub state_fence: StateFence,
+}
+
+/// Stored independently retained normalization record projected by an exact
+/// owner read.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StoredAutomationNormalization {
+    pub automation_id: String,
+    pub revision: String,
+    pub revision_json: String,
+    pub normalization_receipt_json: Value,
+    pub normalization_request_json: String,
+    pub operation_id: String,
+    pub idempotency_key: String,
+    pub canonical_request_hash: String,
+    pub state_fence: StateFence,
+    pub scope_id: String,
+    pub task_id: Option<String>,
 }
 
 /// Stored current-pointer shape as projected by reads.
@@ -325,8 +365,9 @@ async fn ensure_automation_tables(
     config: &SurrealAdapterConfig,
 ) -> Result<(), AdapterError> {
     let sql = format!(
-        "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
+        "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
         crate::schema::table::AUTOMATION_REVISION,
+        crate::schema::table::AUTOMATION_NORMALIZATION,
         crate::schema::table::AUTOMATION_CURRENT,
         crate::schema::table::AUTOMATION_INVOCATION,
         crate::schema::table::AUTOMATION_FAILURE,
@@ -1372,6 +1413,23 @@ impl PrepareContext<'_> {
         decoded: DecodedAutomationMutation,
     ) -> Result<(), AdapterError> {
         match decoded {
+            DecodedAutomationMutation::RetainNormalization {
+                automation_id,
+                revision,
+                revision_json,
+                normalization_receipt_json,
+                normalization_request_json,
+            } => {
+                self.apply_retain_normalization(
+                    writes,
+                    automation_id,
+                    revision,
+                    revision_json,
+                    normalization_receipt_json,
+                    normalization_request_json,
+                )
+                .await
+            }
             DecodedAutomationMutation::Create {
                 automation_id,
                 revision,
@@ -1454,6 +1512,62 @@ impl PrepareContext<'_> {
                 .await
             }
         }
+    }
+
+    /// Retains an owner result independently from revision activation. Exact
+    /// replay is allowed; any changed source, receipt, operation identity, or
+    /// transition provenance is an identity conflict.
+    async fn apply_retain_normalization(
+        &self,
+        writes: &mut AutomationWrites,
+        automation_id: String,
+        revision: String,
+        revision_json: String,
+        normalization_receipt_json: Value,
+        normalization_request_json: String,
+    ) -> Result<(), AdapterError> {
+        let normalization_receipt_json = validate_automation_normalization_envelope(Some(
+            normalization_receipt_json,
+        ))?
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+        let (state_fence, scope_id, task_id) = self.provenance();
+        if scope_id.as_str() != eliot_store_api::USER_AUTOMATION_SCOPE {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "automation.scope_id",
+                reason: "normalization retention requires the canonical automation scope",
+            }));
+        }
+        let write = AutomationNormalizationWrite {
+            automation_id,
+            revision,
+            revision_json,
+            normalization_receipt_json,
+            normalization_request_json,
+            operation_id: self.transition.identity.operation_id.to_string(),
+            idempotency_key: self.transition.identity.idempotency_key.clone(),
+            canonical_request_hash: self
+                .transition
+                .identity
+                .canonical_request_hash
+                .clone(),
+            state_fence,
+            scope_id,
+            task_id,
+        };
+        if let Some(existing) = read_normalization_row(
+            self.db,
+            self.config,
+            &write.automation_id,
+            &write.revision,
+        )
+        .await?
+        {
+            if !normalization_write_matches_row(&write, &existing) {
+                return Err(AdapterError::Store(StoreError::IdentityConflict));
+            }
+        }
+        writes.normalizations.push(write);
+        Ok(())
     }
 
     /// Provenance columns carried by every automation row write.
@@ -1675,6 +1789,60 @@ async fn read_revision_row(
     row.as_ref().map(decode_revision_row).transpose()
 }
 
+/// Reads one independent normalization owner row by the exact automation and
+/// immutable revision identity.
+async fn read_normalization_row(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+    revision: &str,
+) -> Result<Option<StoredAutomationNormalization>, AdapterError> {
+    let mut bindings = Map::new();
+    bindings.insert(
+        "normalization_table".to_owned(),
+        json!(schema::table::AUTOMATION_NORMALIZATION),
+    );
+    bindings.insert(
+        "normalization_key".to_owned(),
+        json!(revision_key(automation_id, revision)),
+    );
+    let statement = "SELECT * FROM ONLY type::record($normalization_table, $normalization_key);";
+    let mut response = client::query(
+        db,
+        config,
+        "automation.read_normalization",
+        statement,
+        bindings,
+    )
+    .await?;
+    let errors = response.take_errors();
+    if missing_automation_table(&errors) {
+        return Ok(None);
+    }
+    if !errors.is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    let row: Option<Value> = response.take(0)?;
+    row.as_ref().map(decode_normalization_row).transpose()
+}
+
+fn normalization_write_matches_row(
+    write: &AutomationNormalizationWrite,
+    row: &StoredAutomationNormalization,
+) -> bool {
+    write.automation_id == row.automation_id
+        && write.revision == row.revision
+        && write.revision_json == row.revision_json
+        && write.normalization_receipt_json == row.normalization_receipt_json
+        && write.normalization_request_json == row.normalization_request_json
+        && write.operation_id == row.operation_id
+        && write.idempotency_key == row.idempotency_key
+        && write.canonical_request_hash == row.canonical_request_hash
+        && write.state_fence == row.state_fence
+        && write.scope_id == row.scope_id
+        && write.task_id == row.task_id
+}
+
 /// Reads one current pointer by automation identity.
 async fn read_current_row(
     db: &RpcTransport,
@@ -1809,6 +1977,7 @@ pub(crate) fn missing_automation_table(errors: &[String]) -> bool {
                     || error.contains(schema::table::AUTOMATION_INVOCATION)
                     || error.contains(schema::table::AUTOMATION_FAILURE)
                     || error.contains(schema::table::AUTOMATION_LAST_FAILURE)
+                    || error.contains(schema::table::AUTOMATION_NORMALIZATION)
                     || error.contains(schema::table::AUTOMATION_CONTINUATION))
         })
 }
@@ -1919,6 +2088,47 @@ fn decode_revision_row(value: &Value) -> Result<StoredAutomationRevision, Adapte
     })
 }
 
+fn decode_normalization_row(value: &Value) -> Result<StoredAutomationNormalization, AdapterError> {
+    let object = value
+        .as_object()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.normalization_row",
+            reason: "normalization row must be an object",
+        }))?;
+    let normalization_receipt_json = object
+        .get(eliot_store_api::AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    let normalization_receipt_json = validate_automation_normalization_envelope(Some(
+        normalization_receipt_json,
+    ))?
+    .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
+    let task_id = match object.get("task_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(task_id)) => Some(task_id.clone()),
+        _ => {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "automation.normalization_row.task_id",
+                reason: "normalization row task binding is malformed",
+            }));
+        }
+    };
+    Ok(StoredAutomationNormalization {
+        automation_id: text_row_field(object, "automation_id")?,
+        revision: text_row_field(object, "revision")?,
+        revision_json: text_row_field(object, "revision_json")?,
+        normalization_receipt_json,
+        normalization_request_json: text_row_field(object, "normalization_request_json")?,
+        operation_id: text_row_field(object, "operation_id")?,
+        idempotency_key: text_row_field(object, "idempotency_key")?,
+        canonical_request_hash: text_row_field(object, "canonical_request_hash")?,
+        state_fence: fence_row_field(object)?,
+        scope_id: text_row_field(object, "scope_id")?,
+        task_id,
+    })
+}
+
 /// Reads the retained owner normalization envelope column, when the row
 /// carries one.
 ///
@@ -2003,6 +2213,9 @@ pub(crate) fn automation_write_statements(
     for (index, write) in writes.revisions.iter().enumerate() {
         append_revision_statement(&mut sql, &mut bindings, index, write);
     }
+    for (index, write) in writes.normalizations.iter().enumerate() {
+        append_normalization_statement(&mut sql, &mut bindings, index, write);
+    }
     for (index, write) in writes.currents.iter().enumerate() {
         append_current_statement(&mut sql, &mut bindings, index, write);
     }
@@ -2016,6 +2229,91 @@ pub(crate) fn automation_write_statements(
         append_last_failure_statement(&mut sql, &mut bindings, index, write);
     }
     (sql, bindings)
+}
+
+/// Appends one create-only normalization retention fragment. An exact row is
+/// an idempotent replay; any payload or provenance divergence aborts the
+/// enclosing canonical transaction with an identity-conflict marker.
+fn append_normalization_statement(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    index: usize,
+    write: &AutomationNormalizationWrite,
+) {
+    let suffix = format!("normalization_{index}");
+    sql.push_str(
+        "LET $normalization_current_{s} = (SELECT * FROM ONLY type::record($normalization_table_{s}, $normalization_key_{s})); IF type::is_object($normalization_current_{s}) { IF $normalization_current_{s}.automation_id != $normalization_automation_id_{s} OR $normalization_current_{s}.revision != $normalization_revision_{s} OR $normalization_current_{s}.revision_json != $normalization_revision_json_{s} OR $normalization_current_{s}.normalization_receipt_json != $normalization_receipt_json_{s} OR $normalization_current_{s}.normalization_request_json != $normalization_request_json_{s} OR $normalization_current_{s}.operation_id != $normalization_operation_id_{s} OR $normalization_current_{s}.idempotency_key != $normalization_idempotency_key_{s} OR $normalization_current_{s}.canonical_request_hash != $normalization_canonical_request_hash_{s} OR $normalization_current_{s}.state_fence != $normalization_state_fence_{s} OR $normalization_current_{s}.scope_id != $normalization_scope_id_{s} OR ($normalization_current_{s}.task_id ?? '') != ($normalization_task_id_{s} ?? '') { THROW 'automation_normalization_identity_conflict'; }; } ELSE { CREATE type::record($normalization_table_{s}, $normalization_key_{s}) CONTENT $normalization_record_{s}; };"
+            .replace("{s}", &suffix)
+            .as_str(),
+    );
+    bindings.insert(
+        format!("normalization_table_{suffix}"),
+        json!(schema::table::AUTOMATION_NORMALIZATION),
+    );
+    bindings.insert(
+        format!("normalization_key_{suffix}"),
+        json!(revision_key(&write.automation_id, &write.revision)),
+    );
+    bindings.insert(
+        format!("normalization_automation_id_{suffix}"),
+        json!(&write.automation_id),
+    );
+    bindings.insert(
+        format!("normalization_revision_{suffix}"),
+        json!(&write.revision),
+    );
+    bindings.insert(
+        format!("normalization_revision_json_{suffix}"),
+        json!(&write.revision_json),
+    );
+    bindings.insert(
+        format!("normalization_receipt_json_{suffix}"),
+        json!(&write.normalization_receipt_json),
+    );
+    bindings.insert(
+        format!("normalization_request_json_{suffix}"),
+        json!(&write.normalization_request_json),
+    );
+    bindings.insert(
+        format!("normalization_operation_id_{suffix}"),
+        json!(&write.operation_id),
+    );
+    bindings.insert(
+        format!("normalization_idempotency_key_{suffix}"),
+        json!(&write.idempotency_key),
+    );
+    bindings.insert(
+        format!("normalization_canonical_request_hash_{suffix}"),
+        json!(&write.canonical_request_hash),
+    );
+    bindings.insert(
+        format!("normalization_state_fence_{suffix}"),
+        json!(&write.state_fence),
+    );
+    bindings.insert(
+        format!("normalization_scope_id_{suffix}"),
+        json!(&write.scope_id),
+    );
+    bindings.insert(
+        format!("normalization_task_id_{suffix}"),
+        json!(&write.task_id),
+    );
+    bindings.insert(
+        format!("normalization_record_{suffix}"),
+        json!({
+            "automation_id": write.automation_id,
+            "revision": write.revision,
+            "revision_json": write.revision_json,
+            "normalization_receipt_json": write.normalization_receipt_json,
+            "normalization_request_json": write.normalization_request_json,
+            "operation_id": write.operation_id,
+            "idempotency_key": write.idempotency_key,
+            "canonical_request_hash": write.canonical_request_hash,
+            "state_fence": write.state_fence,
+            "scope_id": write.scope_id,
+            "task_id": write.task_id,
+        }),
+    );
 }
 
 /// Appends one revision create-or-converge fragment.
@@ -2247,6 +2545,17 @@ pub(crate) async fn read_revision_for_read(
     read_revision_row(db, config, automation_id, revision).await
 }
 
+/// Reads one independently retained normalization record by exact owner
+/// selector.
+pub(crate) async fn read_normalization_for_read(
+    db: &RpcTransport,
+    config: &SurrealAdapterConfig,
+    automation_id: &str,
+    revision: &str,
+) -> Result<Option<StoredAutomationNormalization>, AdapterError> {
+    read_normalization_row(db, config, automation_id, revision).await
+}
+
 /// Reads revision rows for one automation in deterministic key order.
 pub(crate) async fn read_revisions_for_read(
     db: &RpcTransport,
@@ -2354,6 +2663,7 @@ mod template_tests {
                 scope_id: "user-automation".to_owned(),
                 task_id: None,
             }],
+            normalizations: Vec::new(),
             currents: vec![
                 AutomationCurrentWrite {
                     automation_id: "auto-1".to_owned(),

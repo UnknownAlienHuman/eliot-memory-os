@@ -569,6 +569,7 @@ pub(crate) static RESTORE_SCHEMA_DEPENDENCIES: [RestoreSchemaDependency; 4] = [
             schema::table::AUTOMATION_FAILURE,
             schema::table::AUTOMATION_INVOCATION,
             schema::table::AUTOMATION_LAST_FAILURE,
+            schema::table::AUTOMATION_NORMALIZATION,
             schema::table::AUTOMATION_REVISION,
             schema::table::CANONICAL_EVENT,
             schema::table::CANONICAL_FENCE,
