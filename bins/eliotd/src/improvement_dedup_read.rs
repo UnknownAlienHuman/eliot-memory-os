@@ -576,22 +576,22 @@ pub fn restored_registry(
             Row::Archived(candidate_id) => {
                 archived.insert(candidate_id);
             }
-            // A reconciliation obligation names a candidate whose EXTERNAL
-            // effect is unresolved, not a candidate that entered or left the
-            // registry. Excluding it here would be wrong for this read's own
-            // question — which is whether the same evidence lineage was already
-            // observed as a candidate — and the debt it records is settled by
-            // the effect owner through the Governor pipeline's own retry gate,
-            // not by the registry refusing to restore a candidate. So it is
-            // recognised and dropped, and the pass continues.
-            Row::Reconciliation => {}
-            // A terminal DECISION about a candidate is recognised, re-proved, and
-            // dropped for the same reason an obligation is: it neither adds nor
-            // removes a registry entry. The distinction from an obligation is that
-            // this one carries the pipeline's own disposition, so a document that
-            // disagrees with the evidence it also carries must not pass — that is
-            // what `classify_terminal_decision` refuses.
-            Row::Decision => {}
+            // A reconciliation obligation names a candidate whose EXTERNAL effect
+            // is unresolved; a terminal DECISION names a candidate the pipeline
+            // already disposed of. Both are facts ABOUT a candidate rather than
+            // observations OF one, and both contribute no registry entry, which is
+            // why they share one arm: excluding either here would be wrong for this
+            // read's own question — whether the same evidence lineage was already
+            // observed as a candidate — and the debt and the decision each record
+            // are settled by their own owners (the effect owner's retry gate and the
+            // Governor admission gate), not by the registry refusing to restore a
+            // candidate. Both are recognised, re-proved, dropped, and the pass
+            // continues. They are re-proved differently before they get here: the
+            // obligation against `ImprovementUnknownEffectIdentity::validate`, the
+            // decision against `ImprovementTerminalDecision::validate`, so a
+            // decision whose disposition disagrees with the evidence it also
+            // carries is refused rather than read.
+            Row::Reconciliation | Row::Decision => {}
         }
     }
     records.retain(|record| {
