@@ -391,6 +391,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         plan: &CanonicalPlanBinding,
         fence: &StateFence,
+        nominated_refs: &[String],
         observation_refs: &mut BTreeSet<String>,
     ) -> Result<String, FinishAttemptError> {
         let mut selection_identity: Option<String> = None;
@@ -424,6 +425,16 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             }
             selection_identity = Some(selection.acceptance_digest.clone());
             observation_refs.insert(receipt.record_id.clone());
+        }
+        if let Some(reference) = nominated_refs
+            .iter()
+            .find(|reference| !observation_refs.contains(*reference))
+        {
+            return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+                format!(
+                    "caller-nominated observation {reference:?} is not a current task-and-plan-bound accepted observation"
+                ),
+            )));
         }
         selection_identity.ok_or_else(|| {
             FinishAttemptError::Composition(CompositionError::Recovery(
@@ -544,6 +555,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         fence: &StateFence,
         plan: &CanonicalPlanBinding,
+        nominated_observation_refs: &[String],
         contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
         let (frame_refs, finish_authority_ref) =
@@ -584,6 +596,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
             task,
             plan,
             fence,
+            nominated_observation_refs,
             &mut observation_refs,
         )?;
         // The verifier requirement is unchanged: a plan the Task Controller has
@@ -1401,7 +1414,14 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             )));
         }
         let produced =
-            self.produce_finish_evidence(&task_id, task, &fence, &plan, contract_acceptance_set)?;
+            self.produce_finish_evidence(
+                &task_id,
+                task,
+                &fence,
+                &plan,
+                &draft.observation_refs,
+                contract_acceptance_set,
+            )?;
         if self
             .canonical
             .read_finish_evidence(&fence)
