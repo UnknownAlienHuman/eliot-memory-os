@@ -2735,13 +2735,14 @@ mod tests {
     fn action_carrier(
         carrier_op: &str,
         envelope_op: &str,
+        scope_ref: &str,
         fence: &serde_json::Value,
         epoch: &serde_json::Value,
     ) -> ActionEnvelopeCarrier {
         let envelope = serde_json::json!({
             "operation": envelope_op,
             "intent": format!("execute governed {envelope_op}"),
-            "scope_ref": "scope-1911",
+            "scope_ref": scope_ref,
             "preconditions": "claim admitted; fence live",
             "expected_effect": format!("bounded {envelope_op} effect"),
             "invariants": "no ambient effects",
@@ -2762,12 +2763,13 @@ mod tests {
     }
 
     fn drive_carriers(
+        scope_ref: &str,
         fence: &serde_json::Value,
         epoch: &serde_json::Value,
     ) -> Vec<ActionEnvelopeCarrier> {
         GOVERNED_DRIVE_OPS
             .iter()
-            .map(|operation| action_carrier(operation, operation, fence, epoch))
+            .map(|operation| action_carrier(operation, operation, scope_ref, fence, epoch))
             .collect()
     }
 
@@ -2794,7 +2796,7 @@ mod tests {
         let epoch = action_epoch();
         let actions = admit_product_envelopes(
             &GOVERNED_DRIVE_OPS,
-            &drive_carriers(&fence, &epoch),
+            &drive_carriers("scope-1", &fence, &epoch),
             "scope-1",
             &fence,
             &epoch,
@@ -2811,6 +2813,7 @@ mod tests {
             &[action_carrier(
                 GOVERNED_SERVE_OP,
                 GOVERNED_SERVE_OP,
+                "scope-1",
                 &fence,
                 &epoch,
             )],
@@ -2840,7 +2843,13 @@ mod tests {
         let detail = expect_denial(
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
-                &[action_carrier("register", "claim", &fence, &epoch)],
+                &[action_carrier(
+                    "register",
+                    "claim",
+                    "scope-1",
+                    &fence,
+                    &epoch,
+                )],
                 "scope-1",
                 &fence,
                 &epoch,
@@ -2856,7 +2865,13 @@ mod tests {
         let detail = expect_denial(
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
-                &[action_carrier("register", "register", &stale_fence, &epoch)],
+                &[action_carrier(
+                    "register",
+                    "register",
+                    "scope-1",
+                    &stale_fence,
+                    &epoch,
+                )],
                 "scope-1",
                 &fence,
                 &epoch,
@@ -2875,7 +2890,13 @@ mod tests {
         let detail = expect_denial(
             admit_product_envelopes(
                 &GOVERNED_DRIVE_OPS,
-                &[action_carrier("register", "register", &fence, &stale_epoch)],
+                &[action_carrier(
+                    "register",
+                    "register",
+                    "scope-1",
+                    &fence,
+                    &stale_epoch,
+                )],
                 "scope-1",
                 &fence,
                 &epoch,
