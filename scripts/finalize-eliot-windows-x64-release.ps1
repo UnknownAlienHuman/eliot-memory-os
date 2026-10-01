@@ -17,7 +17,11 @@ param(
     [Alias('PlanOnly')]
     [switch]$FinalizerPlanOnly,
     [Alias('RetirementApproval')]
-    [string]$FinalizerGovernorRetirementApproval
+    [string]$FinalizerGovernorRetirementApproval,
+    [Alias('RetirementTrustRoot')]
+    [string]$FinalizerGovernorRetirementTrustRoot,
+    [Alias('RetirementOwnerReceipt')]
+    [string]$FinalizerGovernorRetirementOwnerReceipt
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,9 +43,11 @@ if (-not (Get-Command Test-ReleaseBundle -CommandType Function -ErrorAction Sile
 function Invoke-ReleaseBundleInputVerification {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [string]$GovernorRetirementApproval = ''
+        [string]$GovernorRetirementApproval = '',
+        [string]$GovernorRetirementTrustRoot = '',
+        [string]$GovernorRetirementOwnerReceipt = ''
     )
-    Test-ReleaseBundle $Path $GovernorRetirementApproval
+    Test-ReleaseBundle $Path $GovernorRetirementApproval $GovernorRetirementTrustRoot $GovernorRetirementOwnerReceipt
 }
 
 # Issue #2968: the Authenticode finalizer is NOT a retirement issuer. Signing
@@ -58,9 +64,16 @@ function Invoke-ReleaseBundleInputVerification {
 function Assert-GovernorRetirementApprovalReadback(
     [string]$Bundle,
     [string]$SourceCommit,
-    [string]$GovernorRetirementApproval
+    [string]$GovernorRetirementApproval,
+    [string]$GovernorRetirementTrustRoot = '',
+    [string]$GovernorRetirementOwnerReceipt = ''
 ) {
-    $context = Resolve-GovernorApprovalContext $repo $SourceCommit $GovernorRetirementApproval
+    # Issue #2968 (external audit 5918050095 defect 1): the finalizer re-resolves
+    # the SAME owner-pinned trust root the builder used. Passing the approval
+    # without the owner-pinned ref would resolve an absent trust root, and this
+    # seam exists precisely so signing can never re-decide the disposition under
+    # weaker inputs than the builder used.
+    $context = Resolve-GovernorApprovalContext $repo $SourceCommit $GovernorRetirementApproval $GovernorRetirementTrustRoot $GovernorRetirementOwnerReceipt
     $release = Get-Content -LiteralPath (Join-Path $Bundle 'RELEASE.json') -Raw | ConvertFrom-Json
     $carried = Resolve-GovernorApprovalReferenceOrNull $release
     $disposition = [string](Read-ObjectProperty $release 'governor_disposition')
@@ -1660,7 +1673,9 @@ function New-AuthenticodeSigningPlan(
     [string]$CertificateStoreLocation,
     [string]$CertificateThumbprint,
     [string]$TimestampUrl,
-    [string]$GovernorRetirementApproval
+    [string]$GovernorRetirementApproval,
+    [string]$GovernorRetirementTrustRoot = '',
+    [string]$GovernorRetirementOwnerReceipt = ''
 ) {
     $source = Assert-ExistingBundleDirectory $UnsignedBundle 'UnsignedBundle'
     $destination = Assert-AbsentOutputBundle $SignedBundle 'SignedBundle'
@@ -1710,7 +1725,7 @@ function New-AuthenticodeSigningPlan(
     # Authenticode role set is chosen by what is present; this gate is what
     # stops signing from retroactively approving an artifact set whose
     # omissions were never authorized.
-    $governorApprovalReadback = Assert-GovernorRetirementApprovalReadback $source ([string]$release.source_commit) $GovernorRetirementApproval
+    $governorApprovalReadback = Assert-GovernorRetirementApprovalReadback $source ([string]$release.source_commit) $GovernorRetirementApproval $GovernorRetirementTrustRoot $GovernorRetirementOwnerReceipt
     [void](Assert-AuthorSignerPublisherDisjointness ([pscustomobject][ordered]@{
                 unsigned_bundle = $source
                 signed_bundle = $destination
@@ -1749,7 +1764,9 @@ function New-AuthenticodeVerificationPlan(
     [string]$CertificateStoreLocation,
     [string]$CertificateThumbprint,
     [string]$TimestampUrl,
-    [string]$GovernorRetirementApproval
+    [string]$GovernorRetirementApproval,
+    [string]$GovernorRetirementTrustRoot = '',
+    [string]$GovernorRetirementOwnerReceipt = ''
 ) {
     $source = Assert-ExistingBundleDirectory $UnsignedBundle 'UnsignedBundle'
     $destination = Assert-ExistingBundleDirectory $SignedBundle 'VerifyBundle'
@@ -1766,7 +1783,7 @@ function New-AuthenticodeVerificationPlan(
     $release = Get-Content -LiteralPath (Join-Path $source 'RELEASE.json') -Raw | ConvertFrom-Json
     $roles = @(Get-AuthenticodeRoleDefinitions $source $source)
     [void](Assert-CompleteCodeBearingDenominator $source $roles)
-    $governorApprovalReadback = Assert-GovernorRetirementApprovalReadback $source ([string]$release.source_commit) $GovernorRetirementApproval
+    $governorApprovalReadback = Assert-GovernorRetirementApprovalReadback $source ([string]$release.source_commit) $GovernorRetirementApproval $GovernorRetirementTrustRoot $GovernorRetirementOwnerReceipt
     [pscustomobject][ordered]@{
         unsigned_bundle = $source
         signed_bundle = $destination
@@ -3612,8 +3629,8 @@ if ($FinalizerVerifyBundle) {
     $verificationPlan = New-AuthenticodeVerificationPlan `
         $FinalizerUnsignedBundle $FinalizerVerifyBundle $FinalizerSignToolPath `
         $FinalizerCertificateStoreLocation $FinalizerCertificateThumbprint $FinalizerTimestampUrl `
-        $FinalizerGovernorRetirementApproval
-    Invoke-ReleaseBundleInputVerification $verificationPlan.unsigned_bundle $FinalizerGovernorRetirementApproval | Out-Null
+        $FinalizerGovernorRetirementApproval $FinalizerGovernorRetirementTrustRoot $FinalizerGovernorRetirementOwnerReceipt
+    Invoke-ReleaseBundleInputVerification $verificationPlan.unsigned_bundle $FinalizerGovernorRetirementApproval $FinalizerGovernorRetirementTrustRoot $FinalizerGovernorRetirementOwnerReceipt | Out-Null
     $verificationBaseline = New-ReleaseFinalizationBaseline $verificationPlan.unsigned_bundle
     $verificationCertificate = Resolve-CodeSigningCertificateIdentity $verificationPlan.certificate_store_location $verificationPlan.certificate_thumbprint
     Test-FinalizedReleaseBundle $FinalizerVerifyBundle $null $verificationBaseline $verificationPlan $verificationCertificate | ConvertTo-Json -Depth 12
@@ -3636,7 +3653,7 @@ foreach ($required in @{
 $plan = New-AuthenticodeSigningPlan `
     $FinalizerUnsignedBundle $FinalizerSignedBundle $FinalizerSignToolPath `
     $FinalizerCertificateStoreLocation $FinalizerCertificateThumbprint $FinalizerTimestampUrl `
-    $FinalizerGovernorRetirementApproval
+    $FinalizerGovernorRetirementApproval $FinalizerGovernorRetirementTrustRoot $FinalizerGovernorRetirementOwnerReceipt
 if ($FinalizerPlanOnly) {
     $plan | ConvertTo-Json -Depth 8
     exit 0
