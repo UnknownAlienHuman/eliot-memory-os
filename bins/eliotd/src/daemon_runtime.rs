@@ -7011,7 +7011,7 @@ async fn run_testd_owner_drain(
     {
         let response = {
             let guard = composition.lock().await;
-            resolve_blob_owner_facts(&guard, &request)?
+            resolve_blob_owner_facts(&guard, &request).await?
         };
         kernel
             .complete_testd_blob_owner_facts_request_async(&request, response)
