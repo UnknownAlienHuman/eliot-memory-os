@@ -125,15 +125,16 @@ pub use backup_capture_ports::{
 pub use backup_restore::{
     BlobOwnerClient, CanonicalOwnerClient, CutoverQualification, InvalidationKind,
     InvalidationOwnerClient, KernelBackupRestore, KernelRestoreOutcome, OrsOwnerClient,
-    PurgeOwnerClient, phase_owner,
+    PurgeOwnerClient, TEMP_RESTORE_EXTENSION, phase_owner,
 };
 pub use backup_restore_ports::{
     DESTINATION_ADMISSION_FILE, DestinationManifestEvidence, KernelIsolatedDestination,
     KernelRestoreError, MAX_DESTINATION_LABEL_LEN, OrsRestoreBinding, OrsRestoreJournal,
     OrsRestoreJournalOwner, PinnedDestinationAdmission, RESTORE_EVIDENCE_FILE,
     RESTORE_ISOLATED_AREA, RESTORE_JOURNAL_IDENTITY, RESTORE_JOURNAL_OWNER_LABEL,
-    RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, backup_to_kernel, check_kernel_effect_fence,
-    kernel_to_backup, ors_to_backup, require_production_admitted,
+    RESTORE_JOURNAL_PAYLOAD_AREA, RestorePorts, RetainedPhaseMaterial, StagedCleanupOutcome,
+    StagedCleanupRefusal, backup_to_kernel, check_kernel_effect_fence, kernel_to_backup,
+    ors_to_backup, require_production_admitted,
 };
 pub use blob_store_controller::{
     BLOB_INLINE_THRESHOLD_DEFAULT_BYTES, BLOB_INLINE_THRESHOLD_MAX_BYTES,
