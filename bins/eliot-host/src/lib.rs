@@ -12728,7 +12728,7 @@ impl HostComposition {
             store_artifact,
             &materialized_config_digest,
             &supervision_evidence,
-                admitted_heartbeat.as_ref(),
+            admitted_heartbeat.as_ref(),
         )?;
         let post_probe = (|| -> Result<ReadinessContourIdentity, HostError> {
             // ProbeReady may renew the same owner lease. Publish that actual
