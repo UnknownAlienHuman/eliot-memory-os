@@ -114,6 +114,21 @@ def _validate_text(tmp: Path, text: str) -> None:
     tool.validate_against_artifact(tmp, fresh, doc)
 
 
+def _expect_line_rejection(
+    case: unittest.TestCase, tmp: Path, pristine: str, key: str, new_line: str, code: str
+) -> None:
+    """Replace the single top-level ``key = ...`` line and assert ``check`` refuses it."""
+    prefix = "%s = " % key
+    lines = pristine.split("\n")
+    index = next(i for i, line in enumerate(lines) if line.startswith(prefix))
+    edited = "\n".join(lines[:index] + [new_line] + lines[index + 1:])
+    (tmp / tool.OWNED_TOML_REL).write_text(edited, encoding="utf-8")
+    with case.assertRaises(tool.InventoryError) as ctx:
+        tool.check_cli(tmp)
+    case.assertEqual(ctx.exception.code, code)
+    (tmp / tool.OWNED_TOML_REL).write_text(pristine, encoding="utf-8")
+
+
 class SerdeBoundaryInventoryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -575,6 +590,22 @@ class SerdeBoundaryInventoryTests(unittest.TestCase):
         self.assertEqual(text_before, text_after)
         tool.check_cli(tmp)
         self.assertEqual(inventory2["header"]["aggregate_digest"], _inventory["header"]["aggregate_digest"])
+        # Invalidation is affected-row scoped, not global: a tracked source file
+        # that produces no candidate row is not an input to any row, so adding
+        # one must not stale the artifact or restate its aggregate.
+        (tmp / "bins/demo/src/unrelated.rs").write_text(
+            "pub fn unrelated_helper() -> usize { 7 }\n", encoding="utf-8")
+        tool.check_cli(tmp)
+        _inv3, text_unrelated = _sync_and_load(tmp)
+        self.assertEqual(
+            _inv3["header"]["aggregate_digest"], _inventory["header"]["aggregate_digest"])
+        self.assertIn("scan_file_count", text_unrelated)
+        (tmp / "bins/demo/src/unrelated.rs").unlink()
+        _inv4, text_back = _sync_and_load(tmp)
+        self.assertEqual(
+            _inv4["header"]["aggregate_digest"], _inventory["header"]["aggregate_digest"])
+        self.assertEqual(text_back, text_before)
+        tool.check_cli(tmp)
         (tmp / "bins/demo/src/only.rs").write_text(
             _strict_derive("Only") + "// trailing comment changes source bytes\n", encoding="utf-8")
         with self.assertRaises(tool.InventoryError) as ctx:
@@ -626,14 +657,39 @@ class SerdeBoundaryInventoryTests(unittest.TestCase):
         before = snapshot()
         tool.check_cli(tmp)
         self.assertEqual(before, snapshot())
-        text = (tmp / tool.OWNED_TOML_REL).read_text(encoding="utf-8")
-        line = next(l for l in text.split("\n") if l.startswith("disposition = "))
+        pristine = (tmp / tool.OWNED_TOML_REL).read_text(encoding="utf-8")
+        line = next(l for l in pristine.split("\n") if l.startswith("disposition = "))
         replacement = 'disposition = "needs-repair"' if "current-closed" in line else 'disposition = "current-closed"'
         (tmp / tool.OWNED_TOML_REL).write_text(
-            text.replace(line, replacement, 1), encoding="utf-8")
+            pristine.replace(line, replacement, 1), encoding="utf-8")
         with self.assertRaises(tool.InventoryError) as ctx:
             tool.check_cli(tmp)
         self.assertEqual(ctx.exception.code, "HAND_EDIT_OR_DRIFT")
+        (tmp / tool.OWNED_TOML_REL).write_text(pristine, encoding="utf-8")
+        tool.check_cli(tmp)
+        # A load-bearing field the row/aggregate scalars do not cover: a hand edit
+        # to the owner must be refused by the aggregate recomputed from the stored
+        # TOML content itself, with the stored aggregate string left untouched.
+        owner_line = next(l for l in pristine.split("\n") if l.startswith("owner = "))
+        tampered = pristine.replace(owner_line, 'owner = "hand-edited-owner"', 1)
+        self.assertEqual(tampered.count("aggregate_digest"), pristine.count("aggregate_digest"))
+        (tmp / tool.OWNED_TOML_REL).write_text(tampered, encoding="utf-8")
+        with self.assertRaises(tool.InventoryError) as ctx:
+            tool.check_cli(tmp)
+        self.assertEqual(ctx.exception.code, "HAND_EDIT_OR_DRIFT")
+        # Provenance is classified informational and outside the proof ceiling,
+        # yet it is inside the canonical payload: a substituted base_sha is still
+        # refused rather than ignored by the verifier.
+        for key, new_line, code in (
+            ("base_sha", 'base_sha = "%s"' % ("0" * 40), "HAND_EDIT_OR_DRIFT"),
+            ("base_sha", 'base_sha = "not-a-sha"', "MALFORMED_PROVENANCE"),
+            ("base_sha_source", 'base_sha_source = "hand-edit"', "STALE_RULE"),
+            ("provenance_authority", 'provenance_authority = "authoritative"', "STALE_RULE"),
+        ):
+            with self.subTest(field=key, value=new_line):
+                _expect_line_rejection(self, tmp, pristine, key, new_line, code)
+        (tmp / tool.OWNED_TOML_REL).write_text(pristine, encoding="utf-8")
+        tool.check_cli(tmp)
 
     # WORK_UNIT_CASE: 929/23
     def test_23_workset_includes_required_reading_and_oversized_remains_blocked(self) -> None:
