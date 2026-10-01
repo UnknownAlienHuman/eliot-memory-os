@@ -3763,6 +3763,9 @@ pub struct TaskSelectionAdmissionBinding {
     acceptance_digest: String,
     /// Independent current `WorkScope` snapshot at the request fence.
     work_scope: WorkScopeBindingSnapshot,
+    /// Original current governing-source and privacy closure read from the
+    /// same `WorkScope` owner at this request fence.
+    source_closure: (GoverningSourceSet, PrivacyProfile),
     /// Exact retained active-work selection source and evidence record ids.
     selection_source_ref: String,
     evidence_ref: String,
@@ -3813,6 +3816,13 @@ impl TaskSelectionAdmissionBinding {
         &self.work_scope
     }
 
+    /// Current governing-source and privacy closure retained by the exact
+    /// `WorkScope` owner read.
+    #[must_use]
+    pub fn source_closure(&self) -> (&GoverningSourceSet, &PrivacyProfile) {
+        (&self.source_closure.0, &self.source_closure.1)
+    }
+
     /// Exact immutable selection source handle.
     #[must_use]
     pub fn selection_source_ref(&self) -> &str {
@@ -3839,6 +3849,7 @@ pub struct PendingTaskSelectionRequest {
     activation: GovernorActivationSnapshot,
     selected: ActiveWorkLeaseProjection,
     work_scope: WorkScopeBindingSnapshot,
+    source_closure: (GoverningSourceSet, PrivacyProfile),
 }
 
 impl PendingTaskSelectionRequest {
@@ -8239,11 +8250,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::ActivationStaleFence);
         }
 
-        let work_scope = self
+        let work_scope_owner = self
             .owners
             .work_scope
             .as_ref()
-            .ok_or(CompositionError::ActivationScopeSelectionRequired)?
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
+        let work_scope = work_scope_owner
             .read_current(request_fence)
             .map_err(CompositionError::ScanDisclosure)?;
         ensure_snapshot_fresh(
@@ -8253,12 +8265,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if work_scope.binding.scope.scope_ref != request_scope_ref {
             return Err(CompositionError::ActivationScopeSelectionRequired);
         }
+        let source_closure = work_scope_owner
+            .read_current_source_closure(request_fence)
+            .map_err(CompositionError::ScanDisclosure)?;
 
         Ok(PendingTaskSelectionRequest {
             now,
             activation,
             selected,
             work_scope,
+            source_closure,
         })
     }
 
@@ -8275,12 +8291,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::ActivationStaleFence);
         }
         let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
-        let current_scope = self
+        let work_scope_owner = self
             .owners
             .work_scope
             .as_ref()
-            .ok_or(CompositionError::ActivationScopeSelectionRequired)?
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
+        let current_scope = work_scope_owner
             .read_current(&pending.activation.state_fence)
+            .map_err(CompositionError::ScanDisclosure)?;
+        let source_closure = work_scope_owner
+            .read_current_source_closure(&pending.activation.state_fence)
             .map_err(CompositionError::ScanDisclosure)?;
         ensure_snapshot_fresh(
             &current_scope,
@@ -8289,6 +8309,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if activation != pending.activation
             || selected != pending.selected
             || current_scope != pending.work_scope
+            || source_closure != pending.source_closure
             || !fences_match_exact(
                 &self.snapshot.state_fence(),
                 &pending.activation.state_fence,
@@ -8324,6 +8345,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             task_revision: activation.task_revision,
             acceptance_digest,
             work_scope: pending.work_scope,
+            source_closure,
             state_fence: activation.state_fence,
         })
     }
