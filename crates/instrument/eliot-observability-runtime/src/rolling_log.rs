@@ -16,12 +16,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::config::RollingLogPolicy;
+use crate::config::{MAX_ROLLING_BYTES, RollingLogPolicy};
 
 /// Typed appender failure. Every variant is diagnostic: the operational log
 /// never gates the host operation that produced the record.
@@ -52,7 +52,7 @@ impl std::error::Error for RollingLogError {}
 /// queue, and the one drop counter.
 #[derive(Clone, Debug)]
 pub struct RollingLogWriter {
-    sender: SyncSender<String>,
+    sender: SyncSender<RollingLogRecord>,
     dropped_records: std::sync::Arc<AtomicU64>,
     shutdown_requested: std::sync::Arc<AtomicBool>,
 }
@@ -69,11 +69,46 @@ impl RollingLogWriter {
             self.dropped_records.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        match self.sender.try_send(line.to_owned()) {
+        match self.sender.try_send(RollingLogRecord {
+            line: line.to_owned(),
+            acknowledgement: None,
+        }) {
             Ok(()) => true,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.dropped_records.fetch_add(1, Ordering::Relaxed);
                 false
+            }
+        }
+    }
+
+    /// Enqueues one already-formatted record and returns a bounded receipt
+    /// channel for its append/retention result. Queue admission remains
+    /// nonblocking; only the caller's separate receipt wait may block.
+    pub fn try_send_with_ack(
+        &self,
+        line: &str,
+    ) -> Result<Receiver<RollingLogAppendOutcome>, RollingLogAppendError> {
+        if u64::try_from(line.len().saturating_add(1)).unwrap_or(u64::MAX) > MAX_ROLLING_BYTES {
+            return Err(RollingLogAppendError::OverBound);
+        }
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            self.dropped_records.fetch_add(1, Ordering::Relaxed);
+            return Err(RollingLogAppendError::WriterUnavailable);
+        }
+        let (ack_sender, ack_receiver) = sync_channel(1);
+        let record = RollingLogRecord {
+            line: line.to_owned(),
+            acknowledgement: Some(ack_sender),
+        };
+        match self.sender.try_send(record) {
+            Ok(()) => Ok(ack_receiver),
+            Err(TrySendError::Full(_)) => {
+                self.dropped_records.fetch_add(1, Ordering::Relaxed);
+                Err(RollingLogAppendError::QueueFull)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.dropped_records.fetch_add(1, Ordering::Relaxed);
+                Err(RollingLogAppendError::WriterUnavailable)
             }
         }
     }
@@ -83,6 +118,33 @@ impl RollingLogWriter {
     pub fn dropped_records(&self) -> u64 {
         self.dropped_records.load(Ordering::Relaxed)
     }
+}
+
+/// Durable outcome returned by the rolling writer for one acknowledged line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollingLogAppendOutcome {
+    /// The line was appended and configured generation retention succeeded.
+    Written,
+    /// The line was refused or configured generation retention failed.
+    RetentionFailure,
+    /// The line could not be written because file I/O failed.
+    StorageFailure,
+}
+
+/// Nonblocking queue-admission failure for an acknowledged line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RollingLogAppendError {
+    /// The line itself exceeds the global accepted generation ceiling.
+    OverBound,
+    /// The configured writer queue was full.
+    QueueFull,
+    /// The writer has stopped or is unavailable.
+    WriterUnavailable,
+}
+
+struct RollingLogRecord {
+    line: String,
+    acknowledgement: Option<SyncSender<RollingLogAppendOutcome>>,
 }
 
 /// Adapts the non-blocking appender to `tracing_subscriber`'s `MakeWriter`, so
@@ -131,7 +193,7 @@ impl RollingLogHandle {
             .validate()
             .map_err(|error| RollingLogError::InvalidPolicy(error.to_string()))?;
         fs::create_dir_all(&policy.directory).map_err(RollingLogError::Io)?;
-        let (sender, receiver) = sync_channel::<String>(policy.max_buffered_records);
+        let (sender, receiver) = sync_channel::<RollingLogRecord>(policy.max_buffered_records);
         let shutdown_requested = std::sync::Arc::new(AtomicBool::new(false));
         let thread_flag = std::sync::Arc::clone(&shutdown_requested);
         let worker = std::thread::Builder::new()
@@ -204,58 +266,124 @@ struct ActiveGeneration {
 
 fn run_writer(
     policy: &RollingLogPolicy,
-    receiver: &Receiver<String>,
+    receiver: &Receiver<RollingLogRecord>,
     shutdown_requested: &std::sync::Arc<AtomicBool>,
 ) -> u64 {
     let mut active = match open_generation(&generation_path(policy, 0)) {
-        Ok(file) => ActiveGeneration {
-            file,
-            written: 0,
-            index: 0,
+        Ok(file) => match file.metadata() {
+            Ok(metadata) => ActiveGeneration {
+                file,
+                written: metadata.len(),
+                index: 0,
+            },
+            Err(_) => return reject_queued(receiver, RollingLogAppendOutcome::StorageFailure),
         },
-        Err(_) => return receiver.try_iter().count() as u64,
+        Err(_) => return reject_queued(receiver, RollingLogAppendOutcome::StorageFailure),
     };
-    while let Ok(line) = receiver.recv() {
-        let payload = format!("{line}\n");
+    while let Ok(record) = receiver.recv() {
+        let payload = format!("{}\n", record.line);
         let size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-        if active.written > 0
+        let mut retention_failed = false;
+        let mut write_allowed = true;
+        let mut outcome = if size > policy.max_bytes_per_generation {
+            RollingLogAppendOutcome::RetentionFailure
+        } else {
+            RollingLogAppendOutcome::Written
+        };
+        if outcome == RollingLogAppendOutcome::Written
             && active.written.saturating_add(size) > policy.max_bytes_per_generation
         {
-            rotate(&mut active, policy);
+            let mut rotations = 0_u32;
+            while active.written.saturating_add(size) > policy.max_bytes_per_generation
+                && rotations <= policy.max_generations
+            {
+                match rotate(&mut active, policy) {
+                    Ok(retention_ok) => retention_failed |= !retention_ok,
+                    Err(_) => {
+                        retention_failed = true;
+                        if record.acknowledgement.is_some() {
+                            write_allowed = false;
+                        }
+                        break;
+                    }
+                }
+                rotations = rotations.saturating_add(1);
+            }
+            if active.written.saturating_add(size) > policy.max_bytes_per_generation {
+                outcome = RollingLogAppendOutcome::RetentionFailure;
+                if record.acknowledgement.is_some() {
+                    write_allowed = false;
+                }
+            }
         }
-        if active.file.write_all(payload.as_bytes()).is_ok() {
-            active.written = active.written.saturating_add(size);
+        if write_allowed {
+            if active.file.write_all(payload.as_bytes()).is_ok() {
+                active.written = active.written.saturating_add(size);
+                if retention_failed || outcome == RollingLogAppendOutcome::Written
+                    && active.written > policy.max_bytes_per_generation
+                {
+                    outcome = RollingLogAppendOutcome::RetentionFailure;
+                }
+            } else {
+                outcome = RollingLogAppendOutcome::StorageFailure;
+            }
+        }
+        if let Some(acknowledgement) = record.acknowledgement {
+            let _ = acknowledgement.try_send(outcome);
         }
         if shutdown_requested.load(Ordering::Acquire) {
             break;
         }
     }
     let _ = active.file.flush();
-    receiver.try_iter().count() as u64
+    reject_queued(receiver, RollingLogAppendOutcome::StorageFailure)
+}
+
+fn reject_queued(
+    receiver: &Receiver<RollingLogRecord>,
+    outcome: RollingLogAppendOutcome,
+) -> u64 {
+    let mut unsent = 0_u64;
+    loop {
+        match receiver.try_recv() {
+            Ok(record) => {
+                if let Some(acknowledgement) = record.acknowledgement {
+                    let _ = acknowledgement.try_send(outcome);
+                }
+                unsent = unsent.saturating_add(1);
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return unsent,
+        }
+    }
 }
 
 /// Starts the next generation and deletes generations past the retention
 /// bound. A generation that cannot be opened leaves the active generation
 /// receiving records rather than losing them, so a failed rotation is a
 /// visible over-bound file and not a silent gap.
-fn rotate(active: &mut ActiveGeneration, policy: &RollingLogPolicy) {
-    let Some(next) = active.index.checked_add(1) else {
-        return;
-    };
-    if let Ok(file) = open_generation(&generation_path(policy, next)) {
-        let _ = active.file.flush();
-        active.file = file;
-        active.written = 0;
-        active.index = next;
-    } else {
-        return;
-    }
+fn rotate(active: &mut ActiveGeneration, policy: &RollingLogPolicy) -> io::Result<bool> {
+    let next = active
+        .index
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("rolling generation index overflow"))?;
+    active.file.flush()?;
+    let file = open_generation(&generation_path(policy, next))?;
+    let written = file.metadata()?.len();
+    active.file = file;
+    active.written = written;
+    active.index = next;
     let horizon = next
         .saturating_add(1)
         .saturating_sub(policy.max_generations);
+    let mut retention_ok = true;
     for index in 0..horizon {
-        let _ = fs::remove_file(generation_path(policy, index));
+        if let Err(error) = fs::remove_file(generation_path(policy, index))
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            retention_ok = false;
+        }
     }
+    Ok(retention_ok)
 }
 
 fn generation_path(policy: &RollingLogPolicy, index: u32) -> PathBuf {

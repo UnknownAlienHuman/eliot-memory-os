@@ -126,6 +126,26 @@ pub struct RollingLogPolicy {
 }
 
 impl RollingLogPolicy {
+    /// Builds the process rolling policy from the runtime's existing declared
+    /// finite bounds. Composition roots choose the owned directory and stable
+    /// file stem; consumers such as crash evidence may then bind the same
+    /// accepted bounds to a dedicated purpose-specific directory.
+    #[must_use]
+    pub fn declared_bounded(
+        directory: PathBuf,
+        file_stem: impl Into<String>,
+        exit_code: u32,
+    ) -> Self {
+        Self {
+            directory,
+            file_stem: file_stem.into(),
+            max_bytes_per_generation: MAX_ROLLING_BYTES,
+            max_generations: MAX_ROLLING_GENERATIONS,
+            max_buffered_records: MAX_ROLLING_QUEUED_RECORDS,
+            exit_code,
+        }
+    }
+
     /// Validates the rolling bounds.
     ///
     /// # Errors

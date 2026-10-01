@@ -43,7 +43,12 @@ pub use bootstrap::{MetricsRegistry, ObservabilityInstall, ObservabilityInstallO
 pub use config::{
     ObservabilityConfig, ObservabilityConfigError, RollingLogPolicy, RuntimeProfile, SpoolPolicy,
 };
-pub use crash::{CrashReport, CrashReportError, CrashReportMetadata, SymbolArtifact};
+pub use crash::{
+    CrashDigestAlgorithm, CrashExecutableRole, CrashOwnerHead, CrashOwnerHeadKind, CrashReport,
+    CrashReportError, CrashReportMetadata, CrashReporterConfig, CrashReporterHandle,
+    CrashRuntimeContext, CrashTelemetryGapReason, CrashTelemetryOutcome,
+    MissingCrashContextField, RedactedEvidenceHandle, SymbolArtifact, install_crash_reporter,
+};
 pub use critical_path::{
     CriticalEventError, CriticalEventRecord, CriticalEventSinks, CriticalEventSinksEntry,
     CriticalEventState, CriticalPath, CriticalPathOutcome, SinkStatus, UnavailableReason,
