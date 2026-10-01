@@ -15,6 +15,25 @@ use sha2::{Digest as _, Sha256};
 
 use super::FileIdentity;
 
+/// Leaf name of the owner-declared isolated restore area: one level below the
+/// profile root, beside `Eliot\installations` and beside `Eliot\packages`.
+///
+/// I5.13 (`restore to isolated root;`) and A13.7 (`Restore occurs in an
+/// isolated area and verifies: ...`) require the restore contour to be an area
+/// of its own, not a location inside the installation being captured. The
+/// installation root contract (`eliot-installation`,
+/// `RuntimeStateRoots::ISOLATED_RESTORE_ROOT_DIR`) publishes that area as one
+/// `CreateRoot` leaf of the installer root hierarchy and every destination
+/// preparation proves it **already exists** through this contour, so nothing
+/// downstream may create it on demand.
+///
+/// The name is declared here, in the crate that owns the profile contour that
+/// has to admit it, and the installation contract reads its derivation from
+/// this constant. The leaf the owner publishes and the leaf the executor admits
+/// are therefore the same fact with one owner, not two literals that can drift
+/// apart into an effect that can never execute.
+pub const ISOLATED_RESTORE_ROOT_DIR: &str = "isolated-restore";
+
 /// ACL and root-contour policy selected by the installation profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallerRootProfile {
