@@ -557,12 +557,12 @@ fn reobserve_tool_files(observation: &TestdToolObservation) -> Result<(), TestdE
     ] {
         let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
             field: "tool_environment",
-            reason: "owner-observed tool cannot be reread before start",
+            reason: "owner-observed tool cannot be reread at the replay boundary",
         })?;
         if eliot_testd_core::sha256_hex(&bytes) != expected {
             return Err(TestdError::Invalid {
                 field: "tool_environment",
-                reason: "owner-observed tool changed before start",
+                reason: "owner-observed tool changed before replay",
             });
         }
     }
@@ -842,6 +842,7 @@ fn build_replay_observed_inputs(
     source.validate()?;
     if source.before.repository_root != job.target_roots.source_root
         || source.after.repository_root != job.target_roots.source_root
+        || !source.unchanged()
     {
         return Err(TestdError::InvalidBinding);
     }
