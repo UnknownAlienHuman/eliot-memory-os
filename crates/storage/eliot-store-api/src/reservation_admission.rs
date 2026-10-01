@@ -61,7 +61,7 @@ use serde_json::{Map, Value};
 
 use super::{CanonicalRequestView, SwarmOwnerAuthorization, SwarmOwnerRevisionBatch};
 use super::{
-    EffectClass, EventProjectionRelationIntents, OperationId, OperationIdentity,
+    EventProjectionRelationIntents, OperationId, OperationIdentity,
     OrderingHeadExpectation, PreparedTransition, RequestMeta, ScopeId, SecurityContext, StoreError,
     TransitionClass, canonical_request_hash, generated_operation_manifests,
     operation_manifest_set_digest, swarm_owner_revisions_request, validate_digest, validate_text,
@@ -82,7 +82,7 @@ pub const RESERVATION_ADMISSION_DISPOSITION_ADMITTED: &str = "ADMITTED";
 /// from the canonical operation identity, so two reservations never share a
 /// scope and no real `WorkScope` is claimed.
 pub fn reservation_admission_scope(operation_id: &OperationId) -> Result<ScopeId, StoreError> {
-    ScopeId::new(format!("admission-reservation:{}", operation_id))
+    ScopeId::new(format!("admission-reservation:{operation_id}"))
 }
 
 /// One staged claim reference carried into the admitted definition.
