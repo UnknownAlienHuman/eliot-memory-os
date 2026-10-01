@@ -23,27 +23,39 @@ mod windows_durable_owner {
         BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding,
         BLOB_PROCESS_STREAM_STAGE_MAX_CHUNKS, BLOB_PROCESS_STREAM_STAGE_MAX_PREVIEW_BYTES,
         BlobProcessStreamStageAppendRequest, BlobProcessStreamStageFinalizeRequest,
-        BlobProcessStreamStageOpenRequest,
+        BlobProcessStreamStageOpenRequest, BlobProcessStreamStageTerminal,
         BlobProcessStreamStageResumeRequest, BlobReceiptContext, BlobStoreClient, ObjectResidencyKey,
         RetentionClass, VersionedContentDigest,
     };
     use eliot_platform::PlatformHandle;
     use eliot_platform_windows::{WindowsBlobStorePlatform, WindowsPlatform};
+    use eliot_process::{
+        DurableProcessStreamSource, DurableStreamLocatorKind, ProcessExecutionBinding,
+        ProcessStreamEvidence, ProcessStreamKind, ProcessStreamPolicyBinding,
+        ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
+        ProcessStreamSinkAbortRequest, ProcessStreamDigestAlgorithm,
+        ProcessStreamSinkFinalizeRequest, ProcessStreamSinkLimits,
+        ProcessStreamSinkOpenRequest, ProcessStreamSinkSession,
+        ProcessStreamSinkSessionId, ProcessStreamSinkSourceId, ProcessStreamSinkState,
+        ProcessStreamSinkTerminal, ProcessStreamSinkTerminalId, StreamEvidenceGap,
+        StreamPersistenceStatus, StreamTransportStatus,
+    };
     use eliot_security_contracts::{EffectCeiling, InstructionTaint, PrivacyClass};
     use sha2::{Digest, Sha256};
 
     static ROOT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     /// Test-only delegated platform wrapper that reports a precise Windows
-    /// disk-full result for the next ciphertext publication. It never fills a
-    /// volume or changes production fault behavior.
-    struct DiskFullAtChunkPublication {
+    /// disk-full result for the next matching durable publication path. It
+    /// never fills a volume or changes production fault behavior.
+    struct DiskFullAtSelectedPublication {
         inner: WindowsBlobPlatformPort,
         armed: AtomicBool,
         context: BlobReceiptContext,
+        path_fragment: &'static str,
     }
 
-    impl BlobPlatformPort for DiskFullAtChunkPublication {
+    impl BlobPlatformPort for DiskFullAtSelectedPublication {
         fn claim_root(&mut self, lease: &eliot_blob::BlobRootLease) -> Result<RootClaimProof, BlobError> {
             self.inner.claim_root(lease)
         }
@@ -61,7 +73,9 @@ mod windows_durable_owner {
         }
 
         fn write_new_durable(&mut self, path: &eliot_platform::WorkScopePath, bytes: &[u8]) -> Result<(), BlobError> {
-            if path.normalized_identity().contains(".chunk-") && self.armed.swap(false, Ordering::SeqCst) {
+            if path.normalized_identity().contains(self.path_fragment)
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
                 return Err(BlobError::StorageCapacity {
                     failure: Box::new(BlobCapacityFailure {
                         identity: BlobCapacityIdentity::Operation {
@@ -266,7 +280,7 @@ mod windows_durable_owner {
         owner: &BlobRootOwner,
         request: &BlobProcessStreamStageOpenRequest,
     ) -> BlobStoreService<
-        DiskFullAtChunkPublication,
+        DiskFullAtSelectedPublication,
         RleCompressionPort,
         DpapiUserKeyPort,
         DpapiUserAeadPort,
@@ -279,10 +293,11 @@ mod windows_durable_owner {
             owner,
             request.root_lease.clone(),
             BlobServicePorts {
-                platform: DiskFullAtChunkPublication {
+                platform: DiskFullAtSelectedPublication {
                     inner,
                     armed: AtomicBool::new(true),
                     context: request.stage_context.clone(),
+                    path_fragment: ".chunk-",
                 },
                 compression: RleCompressionPort,
                 keys: DpapiUserKeyPort::new(
@@ -296,6 +311,44 @@ mod windows_durable_owner {
             },
         )
         .expect("single owner-bound Blob service with test-only fault adapter")
+    }
+
+    fn service_with_disk_full_at_blob_payload_publication(
+        root: &Path,
+        owner: &BlobRootOwner,
+        request: &BlobProcessStreamStageOpenRequest,
+    ) -> BlobStoreService<
+        DiskFullAtSelectedPublication,
+        RleCompressionPort,
+        DpapiUserKeyPort,
+        DpapiUserAeadPort,
+        UnavailableBlobLiveSetPort,
+    > {
+        let inner = WindowsBlobPlatformPort::new(root.to_path_buf()).expect("Blob platform");
+        let anchor = inner.load_or_create_issuer_anchor().expect("pinned issuer anchor");
+        let aead_platform = WindowsPlatform::new(root.to_path_buf()).expect("DPAPI platform");
+        BlobStoreService::new_with_owner(
+            owner,
+            request.root_lease.clone(),
+            BlobServicePorts {
+                platform: DiskFullAtSelectedPublication {
+                    inner,
+                    armed: AtomicBool::new(true),
+                    context: request.stage_context.clone(),
+                    path_fragment: ".payload",
+                },
+                compression: RleCompressionPort,
+                keys: DpapiUserKeyPort::new(
+                    BlobId::new("process-stream-test-key").expect("key lineage"),
+                    1,
+                )
+                .expect("DPAPI key lineage"),
+                aead: DpapiUserAeadPort::new(aead_platform),
+                live_sets: UnavailableBlobLiveSetPort,
+                issuer_anchor: anchor,
+            },
+        )
+        .expect("single owner-bound Blob service with finalization fault adapter")
     }
 
     fn append(session: &BlobProcessStreamStageOpenRequest, sequence: u64, offset: u64, bytes: &[u8]) -> BlobProcessStreamStageAppendRequest {
@@ -327,6 +380,191 @@ mod windows_durable_owner {
             final_sequence,
             final_offset: bytes.len() as u64,
             admitted_sha256: sha256(bytes),
+        }
+    }
+
+    fn process_open_request(
+        session: &BlobProcessStreamStageOpenRequest,
+    ) -> ProcessStreamSinkOpenRequest {
+        let authority_epoch = serde_json::json!({
+            "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+            "sequence": 7
+        });
+        let binding: ProcessExecutionBinding = serde_json::from_value(serde_json::json!({
+            "operation_id": "process-stream-finalize-restart",
+            "process_tree_id": "tree-finalize-restart",
+            "job_id": "job-finalize-restart",
+            "image_id": "image-finalize-restart",
+            "session_id": "session-finalize-restart",
+            "generation": session.root_lease.root_generation,
+            "action_lease_ref": "lease-finalize-restart",
+            "authority_id": "authority-finalize-restart",
+            "authority_epoch": authority_epoch,
+            "state_fence": {
+                "authority_epoch": authority_epoch,
+                "generation": session.root_lease.root_generation,
+                "nonce": "fence-finalize-restart"
+            },
+            "request_digest": sha256(b"process-stream-finalize-restart-request"),
+            "permit_digest": sha256(b"process-stream-finalize-restart-permit"),
+            "effect_digest": sha256(b"process-stream-finalize-restart-effect"),
+            "validation_revision": 1
+        }))
+        .expect("typed process execution binding");
+        let policy = ProcessStreamPolicyBinding::new(
+            session.policy.policy_ref.as_str(),
+            "privacy:private",
+            "visibility:owner",
+            "retention:task",
+            "redaction:exact-v1",
+        )
+        .expect("typed process policy binding");
+        let limits = ProcessStreamSinkLimits::new(32, 32, 4, 32, 2, 8, 10, 20, 20)
+            .expect("bounded process stream limits");
+        ProcessStreamSinkOpenRequest::new(
+            ProcessStreamSinkSessionId::new(session.session_id.clone())
+                .expect("process sink session id"),
+            ProcessStreamSinkSourceId::new(session.source_id.clone())
+                .expect("process source id"),
+            ProcessStreamSinkTerminalId::new(session.terminal_id.clone())
+                .expect("process terminal id"),
+            binding,
+            ProcessStreamKind::Stdout,
+            policy,
+            limits,
+            ProcessStreamDigestAlgorithm::Sha256,
+            ProcessStreamDigestAlgorithm::Sha256,
+        )
+        .expect("typed process sink open")
+    }
+
+    fn bind_process_open(
+        session: &mut BlobProcessStreamStageOpenRequest,
+        process_open: &ProcessStreamSinkOpenRequest,
+    ) {
+        session.open_request_sha256 = process_open.open_request_sha256().to_owned();
+        session.process_source_binding.process_binding_json =
+            serde_json::to_string(process_open.binding()).expect("serialize process binding");
+        session.process_source_binding.process_binding_sha256 =
+            sha256(session.process_source_binding.process_binding_json.as_bytes());
+        session.process_source_binding.policy_json =
+            serde_json::to_string(process_open.policy()).expect("serialize process policy");
+        session.process_source_binding.policy_sha256 =
+            sha256(session.process_source_binding.policy_json.as_bytes());
+    }
+
+    fn canonical_json<T: serde::Serialize>(value: &T) -> String {
+        let value = serde_json::to_value(value).expect("serialize canonical JSON value");
+        serde_json::to_string(&value).expect("encode sorted canonical JSON object")
+    }
+
+    fn abort_terminal(
+        process_session: ProcessStreamSinkSession,
+        bytes: &[u8],
+    ) -> ProcessStreamSinkTerminal {
+        let digest = sha256(bytes);
+        let preview = ProcessStreamPrefixPreview::from_transport_prefix(
+            bytes.to_vec(),
+            bytes.len() as u64,
+        )
+        .expect("exact cancellation preview");
+        let evidence = ProcessStreamEvidence::new_raw(
+            process_session.binding().clone(),
+            ProcessStreamKind::Stdout,
+            process_session.policy().clone(),
+            StreamTransportStatus::CancelledBeforeEof,
+            StreamPersistenceStatus::SourceUnavailable,
+            digest.clone(),
+            bytes.len() as u64,
+            preview.clone(),
+            None,
+            vec![
+                StreamEvidenceGap::CancelledBeforeEof,
+                StreamEvidenceGap::PersistenceUnavailable,
+            ],
+        )
+        .expect("typed cancellation evidence for the exact staged prefix");
+        ProcessStreamSinkTerminal::from_abort(
+            process_session.clone(),
+            ProcessStreamSinkAbortRequest::new(
+                process_session.terminal_id().clone(),
+                ProcessStreamSinkAbortReason::Cancellation,
+                1,
+                bytes.len() as u64,
+                1,
+                StreamTransportStatus::CancelledBeforeEof,
+                digest.clone(),
+                bytes.len() as u64,
+                preview,
+                None,
+                evidence.gaps().to_vec(),
+            )
+            .expect("typed competing Abort command"),
+            ProcessStreamSinkState::Cancelled,
+            1,
+            bytes.len() as u64,
+            digest,
+            evidence,
+        )
+        .expect("checked process Abort terminal")
+    }
+
+    fn complete_terminal(
+        process_session: ProcessStreamSinkSession,
+        finalize_request: ProcessStreamSinkFinalizeRequest,
+        bytes: &[u8],
+        ready: &eliot_blob_api::BlobReadyReceipt,
+    ) -> BlobProcessStreamStageTerminal {
+        let digest = sha256(bytes);
+        let source = DurableProcessStreamSource::exact_transport(
+            DurableStreamLocatorKind::Blob,
+            format!("blob:{}", ready.locator().hash.as_str()),
+            ready.receipt().identity.receipt_id.to_string(),
+            ready.plaintext_sha256().to_owned(),
+            ready.plaintext_length(),
+        )
+        .expect("source tied to owner-issued Ready receipt");
+        let evidence = ProcessStreamEvidence::new_raw(
+            process_session.binding().clone(),
+            ProcessStreamKind::Stdout,
+            process_session.policy().clone(),
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            digest.clone(),
+            bytes.len() as u64,
+            ProcessStreamPrefixPreview::from_transport_prefix(bytes.to_vec(), bytes.len() as u64)
+                .expect("exact source preview"),
+            Some(source),
+            Vec::new(),
+        )
+        .expect("typed complete source evidence from owner readback");
+        let terminal = ProcessStreamSinkTerminal::from_finalize(
+            process_session,
+            finalize_request,
+            ProcessStreamSinkState::CompleteSource,
+            1,
+            bytes.len() as u64,
+            digest,
+            evidence,
+        )
+        .expect("checked CompleteSource terminal");
+        let terminal_json = canonical_json(&terminal);
+        BlobProcessStreamStageTerminal {
+            terminal_json_sha256: sha256(terminal_json.as_bytes()),
+            terminal_json,
+            ready_receipt_sha256: Some(sha256(
+                canonical_json(ready).as_bytes(),
+            )),
+            ready_receipt_json: Some(canonical_json(ready)),
+        }
+    }
+
+    fn resume_request(session: &BlobProcessStreamStageOpenRequest) -> BlobProcessStreamStageResumeRequest {
+        BlobProcessStreamStageResumeRequest {
+            session_id: session.session_id.clone(),
+            source_id: session.source_id.clone(),
+            terminal_id: session.terminal_id.clone(),
+            open_request_sha256: session.open_request_sha256.clone(),
         }
     }
 
@@ -723,6 +961,190 @@ mod windows_durable_owner {
         assert_eq!(
             recovered.receipt().identity.receipt_id.to_string(),
             first_receipt_id
+        );
+        drop(store);
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("remove isolated Blob root");
+    }
+
+    #[test]
+    fn persisted_finalize_intent_survives_restart_and_refuses_competing_abort() {
+        let root = isolated_root();
+        let generation = windows_root_generation(&root);
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-finalize-restart-owner",
+            std::process::id(),
+        )
+        .expect("exclusive root claim");
+        let mut session = open_request(
+            &owner,
+            "session-finalize-intent-restart",
+            "source-finalize-intent-restart",
+            "STDOUT",
+            generation,
+            32,
+            32,
+        );
+        let process_open = process_open_request(&session);
+        bind_process_open(&mut session, &process_open);
+        let process_session = ProcessStreamSinkSession::from_open_request(process_open)
+            .expect("mint the exact process sink session");
+        let bytes = b"persisted finalization intent";
+        let append_request = append(&session, 0, 0, bytes);
+        let process_finalize_request = ProcessStreamSinkFinalizeRequest::new(
+            process_session.terminal_id().clone(),
+            1,
+            bytes.len() as u64,
+            1,
+            StreamTransportStatus::Complete,
+            sha256(bytes),
+            bytes.len() as u64,
+            ProcessStreamPrefixPreview::from_transport_prefix(
+                bytes.to_vec(),
+                bytes.len() as u64,
+            )
+            .expect("exact original Finalize preview"),
+            None,
+            Vec::new(),
+        )
+        .expect("typed original Finalize terminal command");
+        let finalize_request = BlobProcessStreamStageFinalizeRequest {
+            session: resume_request(&session),
+            terminal_command_sha256: process_finalize_request
+                .command_identity()
+                .expect("original Finalize command identity")
+                .request_sha256()
+                .to_owned(),
+            final_sequence: 1,
+            final_offset: bytes.len() as u64,
+            admitted_sha256: sha256(bytes),
+        };
+
+        let store = service_with_disk_full_at_blob_payload_publication(&root, &owner, &session);
+        block_on(store.open_process_stream_stage(session.clone())).expect("open durable stage");
+        block_on(store.append_process_stream_stage(append_request))
+            .expect("persist exact process output");
+        match block_on(store.finalize_process_stream_stage(finalize_request.clone()))
+            .expect_err("fault occurs after durable Finalize intent")
+        {
+            BlobError::StorageCapacity { failure } => {
+                assert_eq!(failure.stage, BlobCapacityStage::PayloadWrite);
+                assert_eq!(
+                    failure.evidence.cause,
+                    BlobCapacityCause::WindowsErrorDiskFull { code: 112 }
+                );
+            }
+            other => panic!("expected injected payload publication failure, got {other:?}"),
+        }
+        drop(store);
+        drop(owner);
+
+        // A normal owner restart recovers the actual durable StageOpen,
+        // committed append prefix, and original Finalize intent.
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-finalize-restart-owner",
+            std::process::id(),
+        )
+        .expect("reclaim after simulated restart");
+        let store = service(&root, &owner, &session);
+        let resumed = block_on(store.resume_process_stream_stage(resume_request(&session)))
+            .expect("ordinary resume reads the durable session after restart");
+        assert_eq!(resumed.append_receipts.len(), 1);
+        assert_eq!(resumed.next_sequence, 1);
+        assert_eq!(resumed.next_offset, bytes.len() as u64);
+        assert_eq!(resumed.sha256, sha256(bytes));
+        assert_eq!(resumed.finalize_intent.as_ref(), Some(&finalize_request));
+        assert_eq!(resumed.terminal, None);
+
+        let competing_abort = abort_terminal(process_session.clone(), bytes);
+        let competing_abort_json = canonical_json(&competing_abort);
+        assert_eq!(
+            block_on(store.record_process_stream_stage_terminal(
+                resume_request(&session),
+                BlobProcessStreamStageTerminal {
+                    terminal_json_sha256: sha256(competing_abort_json.as_bytes()),
+                    terminal_json: competing_abort_json,
+                    ready_receipt_json: None,
+                    ready_receipt_sha256: None,
+                },
+            )),
+            Err(BlobError::IdempotencyConflict),
+            "Abort cannot replace an exact persisted Finalize intent"
+        );
+        let after_abort = block_on(store.resume_process_stream_stage(resume_request(&session)))
+            .expect("resume remains readable after Abort refusal");
+        assert_eq!(after_abort.finalize_intent.as_ref(), Some(&finalize_request));
+        assert_eq!(after_abort.terminal, None);
+
+        let ready = block_on(store.finalize_process_stream_stage(finalize_request.clone()))
+            .expect("the original same-operation Finalize resolves the Ready object");
+        assert_eq!(ready.plaintext_sha256(), sha256(bytes));
+        assert_eq!(ready.plaintext_length(), bytes.len() as u64);
+        let complete_terminal =
+            complete_terminal(process_session, process_finalize_request, bytes, &ready);
+        block_on(store.record_process_stream_stage_terminal(
+            resume_request(&session),
+            complete_terminal,
+        ))
+        .expect("persist owner-backed CompleteSource terminal and exact Ready receipt");
+        drop(store);
+        drop(owner);
+
+        // The terminal lookup and Finalize reconciliation are both durable
+        // across a second normal service/owner restart.
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-finalize-restart-owner",
+            std::process::id(),
+        )
+        .expect("reclaim after persisted CompleteSource terminal");
+        let store = service(&root, &owner, &session);
+        let terminal_readback =
+            block_on(store.resume_process_stream_stage(resume_request(&session)))
+                .expect("ordinary resume reads the persisted terminal after restart");
+        let persisted_terminal = terminal_readback
+            .terminal
+            .expect("CompleteSource terminal survived restart");
+        persisted_terminal.validate().expect("terminal remains valid");
+        assert_eq!(
+            terminal_readback.finalize_intent.as_ref(),
+            Some(&finalize_request)
+        );
+        let ready_after_restart =
+            block_on(store.finalize_process_stream_stage(finalize_request))
+                .expect("exact original Finalize returns the original Ready receipt");
+        assert_eq!(ready_after_restart, ready);
+
+        let read_context = context("READ", "finalize-intent-restart-readback", generation);
+        let read_lease = owner
+            .lease_for_request(read_context.request.clone())
+            .expect("current read lease");
+        let readback = block_on(store.read_process_stream_source_authorized_range_context(
+            BlobProcessStreamReadbackRangeRequest {
+                source: BlobProcessStreamReadbackRequest {
+                    session_id: session.session_id.clone(),
+                    terminal_id: session.terminal_id.clone(),
+                    open_request_sha256: session.open_request_sha256.clone(),
+                    process_source_binding: session.process_source_binding.clone(),
+                    expected_content_hash: ready.locator().hash.clone(),
+                    expected_plaintext_sha256: ready.plaintext_sha256().to_owned(),
+                    expected_plaintext_length: ready.plaintext_length(),
+                    ready_receipt_id: ready.receipt().identity.receipt_id.to_string(),
+                    max_bytes: bytes.len() as u64,
+                },
+                offset: 0,
+                max_chunk_bytes: bytes.len() as u64,
+            },
+            read_context,
+            read_lease,
+        ))
+        .expect("authorized Ready readback from the restarted Blob owner");
+        assert_eq!(readback.bytes(), bytes);
+        assert_eq!(
+            readback.ready_receipt().receipt().identity.receipt_id,
+            ready.receipt().identity.receipt_id
         );
         drop(store);
         drop(owner);
