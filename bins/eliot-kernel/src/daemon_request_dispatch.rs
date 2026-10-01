@@ -97,6 +97,11 @@ pub(crate) const DAEMON_SUPERVISION_PROGRESS_OPERATION: &str = "daemon_supervisi
 /// profile and records the projection, so Material/Critical gates admit
 /// only under current owner-issued authority.
 pub(crate) const PUBLISH_GOVERNOR_AUTHORITY_OPERATION: &str = "publish_governor_authority";
+/// Authenticated bounded readback of the active bridge admission and the
+/// original committed bridge-event source rows used by Governor observation
+/// derivation (issue #1935 AUD1).
+pub(crate) const READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION: &str =
+    "read_governor_authority_observation";
 /// Authenticated daemon route that drives the typed Host `UserAutomation`
 /// transport.  The daemon session supplies the outer authority; the Host
 /// open handshake supplies the channel evidence and the Host owner supplies
@@ -683,6 +688,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "query_owner_bundle" => "query_owner_bundle",
         "initialize_owner_revision" => "initialize_owner_revision",
         PUBLISH_GOVERNOR_AUTHORITY_OPERATION => PUBLISH_GOVERNOR_AUTHORITY_OPERATION,
+        READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION => {
+            READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION
+        }
         "activate_grant" => "activate_grant",
         "revoke_grant" => "revoke_grant",
         "activate_introduction" => "activate_introduction",
@@ -816,6 +824,28 @@ struct GovernorAuthorityPublishOperation {
     verified: bool,
     authorizes_enforcement: bool,
     authorizes_complete_coverage_ops: bool,
+    source_selectors: Option<GovernorAuthorityObservationPublishSelectors>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GovernorAuthorityObservationPublishSelectors {
+    after_owner_sequence: u64,
+    after_event_sequence: u64,
+    page_limit: u32,
+}
+
+/// Closed cursor-only request for one page of the retained original ORS
+/// bridge-event source. Owner, principal, producer, and adapter identity are
+/// intentionally absent: Kernel derives them from the active admitted bridge
+/// profile and the original ORS owner roster.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GovernorAuthorityObservationReadOperation {
+    operation: String,
+    after_owner_sequence: u64,
+    after_event_sequence: u64,
+    page_limit: u32,
 }
 
 /// Closed owner-lineage revision initialization operation (`#2100`).
@@ -2911,6 +2941,399 @@ impl KernelComposition {
 }
 
 impl KernelComposition {
+    /// Rejoins a Governor projection to the exact latest ORS observation page
+    /// on this authenticated transport before advancing the existing profile.
+    /// This source slice cannot establish native-host conformance,
+    /// independent ALL_EVENTS denominator, Watchdog, or trace evidence, so any
+    /// positive authorization axis is refused.
+    #[cfg(windows)]
+    fn publish_governor_authority_observation(
+        &self,
+        session: &Session,
+        operation: GovernorAuthorityPublishOperation,
+    ) -> Result<(), TransportError> {
+        if operation.verified
+            || operation.authorizes_enforcement
+            || operation.authorizes_complete_coverage_ops
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let _transition = self.agent_bridge_transition_read()?;
+        let current_admission = self
+            .agent_bridge_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|profile| {
+                super::startup_coordinator::GovernorObservationAdmissionIdentity {
+                    descriptor_sha256: profile.admission.descriptor_sha256.clone(),
+                    profile_id: profile.admission.profile_id.as_str().to_owned(),
+                    profile_sha256: profile.admission.profile_sha256.clone(),
+                    executable_sha256: profile.admission.executable_sha256.clone(),
+                }
+            });
+        let readback = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .governor_authority_observation_readback();
+        let expected_fingerprint = if let Some(admission) = current_admission.as_ref() {
+            admission.descriptor_sha256.clone()
+        } else {
+            let current = self
+                .startup_coordinator
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .current_governor_issued_authority()
+                .ok_or(TransportError::SessionFenced)?;
+            if current.fingerprint() != operation.fingerprint {
+                return Err(TransportError::SessionFenced);
+            }
+            current.fingerprint().to_owned()
+        };
+        if operation.fingerprint != expected_fingerprint {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let mut consumed_readback = None;
+        match (
+            &operation.source_selectors,
+            readback
+                .as_ref()
+                .and_then(|readback| readback.source_snapshot.as_ref()),
+        ) {
+            (Some(selectors), Some(snapshot))
+                if readback.as_ref().is_some_and(|readback| {
+                    readback.connection_id == session.connection_id
+                        && readback.launch_nonce == session.launch_nonce
+                        && readback.session_epoch == session.session_epoch
+                        && readback.state_fence == session.module_generation.state_fence
+                        && readback.bridge_peer_set_revision
+                            == self.agent_bridge_peer_set_revision()
+                        && readback.admission == current_admission
+                        && readback.source_reason.is_none()
+                        && readback.published_revision.is_none()
+                }) =>
+            {
+                let readback = readback.as_ref().ok_or(TransportError::SessionFenced)?;
+                if selectors.after_owner_sequence != readback.selectors.after_owner_sequence
+                    || selectors.after_event_sequence != readback.selectors.after_event_sequence
+                    || selectors.page_limit != readback.selectors.page_limit
+                    || snapshot.roster.owners.len() > 1
+                    || snapshot.streams.len() > 1
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let (owner_cutoff, owner_total) = if snapshot.roster.owner_cutoff == 0 {
+                    (None, None)
+                } else {
+                    (
+                        Some(snapshot.roster.owner_cutoff),
+                        Some(snapshot.roster.owner_total),
+                    )
+                };
+                let roster_query = eliot_ors::BridgeEventObservationRosterQuery {
+                    authority_lineage: snapshot.roster.authority_lineage.clone(),
+                    principal: snapshot.roster.principal.clone(),
+                    owner_cutoff,
+                    owner_total,
+                    after_owner_sequence: selectors.after_owner_sequence,
+                    page_limit: 1,
+                };
+                let source_still_matches = self
+                    .p07_ors
+                    .list_bridge_event_observation_owners_checked(&roster_query)
+                    .is_ok_and(|roster| roster == snapshot.roster)
+                    && snapshot.streams.iter().all(|(owner, retained_page)| {
+                        let Ok(page_limit) = u16::try_from(selectors.page_limit) else {
+                            return false;
+                        };
+                        let query = eliot_ors::BridgeEventObservationQuery {
+                            owner: owner.clone(),
+                            after_event_sequence: selectors.after_event_sequence,
+                            page_limit,
+                        };
+                        self.p07_ors
+                            .load_bridge_event_observation_page_checked(&query)
+                            .is_ok_and(|page| page == *retained_page)
+                    }) && snapshot.streams.len() == snapshot.roster.owners.len();
+                // An ORS race or source change cannot authorize a positive
+                // projection. A fresh negative revision remains safe and
+                // narrows authority under the exact current adapter key.
+                let _source_still_matches = source_still_matches;
+                consumed_readback = Some(readback.clone());
+            }
+            (None, _) => {
+                // A transport/schema/read failure may mean Kernel never saw a
+                // new read request. A null selector therefore permits only a
+                // negative revision bound to the current descriptor (or the
+                // retained Governor fingerprint after descriptor removal).
+                // If a same-session readback exists, consume it so it cannot
+                // be replayed as a later positive candidate.
+                if let Some(readback) = readback.as_ref().filter(|readback| {
+                    readback.connection_id == session.connection_id
+                        && readback.launch_nonce == session.launch_nonce
+                        && readback.session_epoch == session.session_epoch
+                        && readback.state_fence == session.module_generation.state_fence
+                        && readback.bridge_peer_set_revision
+                            == self.agent_bridge_peer_set_revision()
+                        && readback.admission == current_admission
+                        && readback.published_revision.is_none()
+                }) {
+                    consumed_readback = Some(readback.clone());
+                }
+            }
+            _ => return Err(TransportError::SessionFenced),
+        }
+
+        if let Some(readback) = consumed_readback.as_ref() {
+            self.startup_coordinator
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .mark_governor_authority_observation_published(readback, operation.revision)
+                .map_err(|_| TransportError::SessionFenced)?;
+        }
+        self.record_governor_issued_coverage_projection(
+            operation.revision,
+            operation.fingerprint,
+            operation.verified,
+            operation.authorizes_enforcement,
+            operation.authorizes_complete_coverage_ops,
+        )
+        .map_err(|_| TransportError::SessionFenced)
+    }
+
+    /// Reads one bounded page from original ORS bridge-event owners. The
+    /// authenticated daemon supplies cursors only; Kernel derives source
+    /// identity from the active admitted bridge profile and retained roster.
+    #[cfg(windows)]
+    fn governor_authority_observation_read(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: GovernorAuthorityObservationReadOperation =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
+        if operation.operation != READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION {
+            return Err(TransportError::SessionFenced);
+        }
+        let event_page_limit = u16::try_from(operation.page_limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or(TransportError::SessionFenced)?;
+        let _transition = self.agent_bridge_transition_read()?;
+        let admission = self
+            .agent_bridge_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|profile| profile.admission.clone());
+        let admission_identity = admission.as_ref().map(|admission| {
+            super::startup_coordinator::GovernorObservationAdmissionIdentity {
+                descriptor_sha256: admission.descriptor_sha256.clone(),
+                profile_id: admission.profile_id.as_str().to_owned(),
+                profile_sha256: admission.profile_sha256.clone(),
+                executable_sha256: admission.executable_sha256.clone(),
+            }
+        });
+        let admission_wire = admission.as_ref().map(|admission| {
+            serde_json::json!({
+                "descriptor_sha256": admission.descriptor_sha256,
+                "profile_id": admission.profile_id.as_str(),
+                "profile_sha256": admission.profile_sha256,
+                "executable_sha256": admission.executable_sha256,
+            })
+        });
+        let selectors = super::startup_coordinator::GovernorObservationSelectors {
+            after_owner_sequence: operation.after_owner_sequence,
+            after_event_sequence: operation.after_event_sequence,
+            page_limit: operation.page_limit,
+        };
+        let bridge_peer_set_revision = self.agent_bridge_peer_set_revision();
+        let session_matches = |readback: &super::startup_coordinator::GovernorAuthorityObservationReadback| {
+            readback.connection_id == session.connection_id
+                && readback.launch_nonce == session.launch_nonce
+                && readback.session_epoch == session.session_epoch
+                && readback.state_fence == session.module_generation.state_fence
+                && readback.bridge_peer_set_revision == bridge_peer_set_revision
+                && readback.admission == admission_identity
+        };
+        let unavailable = |reason: &'static str| -> Result<serde_json::Value, TransportError> {
+            self.startup_coordinator
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?
+                .retain_governor_authority_observation(
+                    super::startup_coordinator::GovernorAuthorityObservationReadback {
+                        connection_id: session.connection_id.clone(),
+                        launch_nonce: session.launch_nonce.clone(),
+                        session_epoch: session.session_epoch,
+                        state_fence: session.module_generation.state_fence.clone(),
+                        bridge_peer_set_revision,
+                        admission: admission_identity.clone(),
+                        selectors,
+                        source_snapshot: None,
+                        source_reason: Some(reason.to_owned()),
+                        published_revision: None,
+                    },
+                );
+            Ok(serde_json::json!({
+                "kind": "governor_authority_observation",
+                "schema_version": 1,
+                "admission": admission_wire.clone(),
+                "source_status": "unavailable",
+                "source_reason": reason,
+                "source_snapshot": null,
+                "watchdog": { "status": "unavailable", "reason": "no_original_watchdog_owner_readback" },
+                "trace": { "status": "unavailable", "reason": "no_original_trace_owner_readback" },
+            }))
+        };
+        let Some(admission) = admission else {
+            return unavailable("no_active_original_admission");
+        };
+        if self.validate_active_bridge_profile(&admission).is_err() {
+            return unavailable("active_original_admission_not_validated");
+        }
+        let authority_lineage = eliot_ors::OpaqueLabel::new(
+            admission.state_fence.authority_epoch.lineage_id.as_str(),
+        );
+        let principal = eliot_ors::OpaqueLabel::new(admission.approved_user_sid.as_str());
+        let (Ok(authority_lineage), Ok(principal)) = (authority_lineage, principal) else {
+            return unavailable("active_source_scope_invalid");
+        };
+        let prior = self
+            .startup_coordinator
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .governor_authority_observation_readback();
+        let continuation = operation.after_owner_sequence != 0 || operation.after_event_sequence != 0;
+        let (owner_cutoff, owner_total) = if continuation {
+            let Some(prior) = prior.as_ref() else {
+                return unavailable("source_continuation_binding_missing");
+            };
+            if !session_matches(prior)
+                || prior.source_snapshot.is_none()
+                || prior.source_reason.is_some()
+            {
+                return unavailable("source_continuation_binding_mismatch");
+            }
+            let Some(snapshot) = prior.source_snapshot.as_ref() else {
+                return unavailable("source_continuation_binding_missing");
+            };
+            if snapshot.next.after_owner_sequence != operation.after_owner_sequence
+                || snapshot.next.after_event_sequence != operation.after_event_sequence
+                || prior.selectors.page_limit != operation.page_limit
+            {
+                return unavailable("source_continuation_cursor_mismatch");
+            }
+            (
+                Some(snapshot.roster.owner_cutoff),
+                Some(snapshot.roster.owner_total),
+            )
+        } else {
+            (None, None)
+        };
+        let roster_query = eliot_ors::BridgeEventObservationRosterQuery {
+            authority_lineage,
+            principal,
+            owner_cutoff,
+            owner_total,
+            after_owner_sequence: operation.after_owner_sequence,
+            page_limit: 1,
+        };
+        let roster = match self
+            .p07_ors
+            .list_bridge_event_observation_owners_checked(&roster_query)
+        {
+            Ok(roster) if roster.owners.len() <= 1 => roster,
+            Ok(_) => return unavailable("source_roster_bound_exceeded"),
+            Err(_) => return unavailable("source_roster_read_failed"),
+        };
+        let mut streams = Vec::new();
+        let mut retained_streams = Vec::new();
+        let mut next_after_owner_sequence = roster
+            .continuation
+            .unwrap_or(operation.after_owner_sequence);
+        let mut next_after_event_sequence = 0;
+        if let Some(owner) = roster.owners.first() {
+            let query = eliot_ors::BridgeEventObservationQuery {
+                owner: owner.clone(),
+                after_event_sequence: operation.after_event_sequence,
+                page_limit: event_page_limit,
+            };
+            let page = match self
+                .p07_ors
+                .load_bridge_event_observation_page_checked(&query)
+            {
+                Ok(page) if page.owner == *owner => page,
+                Ok(_) => {
+                    return unavailable("source_owner_binding_mismatch");
+                }
+                Err(_) => return unavailable("source_event_page_read_failed"),
+            };
+            if let Some(continuation) = page.continuation {
+                next_after_owner_sequence = operation.after_owner_sequence;
+                next_after_event_sequence = continuation;
+            } else {
+                next_after_owner_sequence = owner.owner_list_sequence;
+            }
+            retained_streams.push((owner.clone(), page.clone()));
+            streams.push(serde_json::json!({ "owner": owner, "page": page }));
+        }
+        let source_snapshot = super::startup_coordinator::GovernorObservationSourceSnapshot {
+            roster: roster.clone(),
+            streams: retained_streams,
+            next: super::startup_coordinator::GovernorObservationContinuation {
+                after_owner_sequence: next_after_owner_sequence,
+                after_event_sequence: next_after_event_sequence,
+            },
+        };
+        self.startup_coordinator
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .retain_governor_authority_observation(
+                super::startup_coordinator::GovernorAuthorityObservationReadback {
+                    connection_id: session.connection_id.clone(),
+                    launch_nonce: session.launch_nonce.clone(),
+                    session_epoch: session.session_epoch,
+                    state_fence: session.module_generation.state_fence.clone(),
+                    bridge_peer_set_revision,
+                    admission: admission_identity,
+                    selectors,
+                    source_snapshot: Some(source_snapshot),
+                    source_reason: None,
+                    published_revision: None,
+                },
+            );
+        let snapshot = serde_json::json!({
+            "selectors": {
+                "after_owner_sequence": operation.after_owner_sequence,
+                "after_event_sequence": operation.after_event_sequence,
+                "page_limit": operation.page_limit,
+            },
+            "roster": roster,
+            "streams": streams,
+            "next": {
+                "after_owner_sequence": next_after_owner_sequence,
+                "after_event_sequence": next_after_event_sequence,
+            },
+        });
+        Ok(serde_json::json!({
+            "kind": "governor_authority_observation",
+            "schema_version": 1,
+            "admission": {
+                "descriptor_sha256": admission.descriptor_sha256,
+                "profile_id": admission.profile_id.as_str(),
+                "profile_sha256": admission.profile_sha256,
+                "executable_sha256": admission.executable_sha256,
+            },
+            "source_status": "available",
+            "source_reason": null,
+            "source_snapshot": snapshot,
+            "watchdog": { "status": "unavailable", "reason": "no_original_watchdog_owner_readback" },
+            "trace": { "status": "unavailable", "reason": "no_original_trace_owner_readback" },
+        }))
+    }
+
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
     /// Governor mutations remain owned by `eliotd` and the existing Kernel
@@ -4287,6 +4710,15 @@ impl KernelComposition {
                     Err(_) => Err(TransportError::SessionFenced),
                 }
             }
+            #[cfg(windows)]
+            READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION => {
+                let value = self.governor_authority_observation_read(session, payload)?;
+                Ok(serde_json::json!({
+                    "status": "known",
+                    "value": value,
+                    "recovery": null,
+                }))
+            }
             PUBLISH_GOVERNOR_AUTHORITY_OPERATION => {
                 let operation: GovernorAuthorityPublishOperation =
                     serde_json::from_value(payload.clone())
@@ -4294,6 +4726,7 @@ impl KernelComposition {
                 if operation.operation != PUBLISH_GOVERNOR_AUTHORITY_OPERATION {
                     return Err(TransportError::SessionFenced);
                 }
+                let revision = operation.revision;
                 // Issue #1935 AUD1: the live Governor-owned derivation
                 // projects its exact revision, exact active fingerprint, and
                 // exact authorization axes across this authenticated boundary.
@@ -4302,19 +4735,12 @@ impl KernelComposition {
                 // degraded projection revokes everything issued under the old
                 // one. Until the first publish records, every
                 // Material/Critical gate refuses closed.
-                self.record_governor_issued_coverage_projection(
-                    operation.revision,
-                    operation.fingerprint,
-                    operation.verified,
-                    operation.authorizes_enforcement,
-                    operation.authorizes_complete_coverage_ops,
-                )
-                .map_err(|_| TransportError::SessionFenced)?;
+                self.publish_governor_authority_observation(session, operation)?;
                 Ok(serde_json::json!({
                     "status": "known",
                     "value": {
                         "kind": "governor_authority_receipt",
-                        "value": { "revision": operation.revision, "status": "recorded" },
+                        "value": { "revision": revision, "status": "recorded" },
                     },
                     "recovery": null,
                 }))

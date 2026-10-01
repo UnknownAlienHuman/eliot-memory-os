@@ -20,14 +20,73 @@
 //!   event existence, and its coverage is explicit; an absent or expired
 //!   observation leaves coverage unestablished rather than presumed.
 //!
-//! Ordinary module: pure ordered gating only. No I/O, no ORS/store/daemon
-//! mechanics, no credentials. `KernelComposition` owns the single instance
-//! and consults it from normal-write and Material/Critical admission paths.
+//! Ordinary module: ordered gating and one bounded transient source-readback
+//! binding for the existing Governor publish gate. It performs no I/O, ORS
+//! reads, daemon mechanics, or credential handling. `KernelComposition` owns
+//! the single instance and consults it from admission and publication paths.
 
 use eliot_contracts::StateFence;
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::SupervisionJournalEpoch;
 use serde::Serialize;
+
+/// Original admission identity projected as the adapter candidate key. This
+/// is a source binding only; it makes no claim about native-host conformance.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernorObservationAdmissionIdentity {
+    pub(crate) descriptor_sha256: String,
+    pub(crate) profile_id: String,
+    pub(crate) profile_sha256: String,
+    pub(crate) executable_sha256: String,
+}
+
+/// The exact bounded selectors exchanged on the authenticated daemon route.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GovernorObservationSelectors {
+    pub(crate) after_owner_sequence: u64,
+    pub(crate) after_event_sequence: u64,
+    pub(crate) page_limit: u32,
+}
+
+/// Continuation returned by one checked ORS roster/event read.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GovernorObservationContinuation {
+    pub(crate) after_owner_sequence: u64,
+    pub(crate) after_event_sequence: u64,
+}
+
+/// Exact original ORS source page retained until the next authenticated read
+/// or publish. No Kernel-minted digest or receipt is added to these rows.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernorObservationSourceSnapshot {
+    pub(crate) roster: eliot_ors::BridgeEventObservationRosterPage,
+    pub(crate) streams: Vec<(
+        eliot_ors::BridgeEventObservationOwner,
+        eliot_ors::BridgeEventObservationPage,
+    )>,
+    pub(crate) next: GovernorObservationContinuation,
+}
+
+/// One last-read binding, scoped to the authenticated daemon transport and
+/// the active original bridge descriptor. It is in-memory join state only.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GovernorAuthorityObservationReadback {
+    pub(crate) connection_id: String,
+    pub(crate) launch_nonce: String,
+    pub(crate) session_epoch: u64,
+    pub(crate) state_fence: StateFence,
+    pub(crate) bridge_peer_set_revision: u64,
+    pub(crate) admission: Option<GovernorObservationAdmissionIdentity>,
+    pub(crate) selectors: GovernorObservationSelectors,
+    pub(crate) source_snapshot: Option<GovernorObservationSourceSnapshot>,
+    pub(crate) source_reason: Option<String>,
+    pub(crate) published_revision: Option<u64>,
+}
 
 /// Ordered I1.11 startup step (1-11). Step 0 means nothing completed.
 pub const STARTUP_FIRST_STEP: u8 = 1;
@@ -520,6 +579,11 @@ pub struct StartupCoordinator {
     /// refuses. A newer recorded revision supersedes (revokes) the older
     /// one: admission binds to the exact current revision and fingerprint.
     governor_authority: Option<GovernorIssuedAuthority>,
+    /// Latest original Kernel/ORS readback available for a same-session
+    /// Governor publish join. Replaced on each read and invalidated by exact
+    /// transport, fence, descriptor, cursor, or source-row mismatch.
+    #[cfg(windows)]
+    governor_observation_readback: Option<GovernorAuthorityObservationReadback>,
     blob_degraded: bool,
     capability_degraded: bool,
 }
@@ -545,6 +609,8 @@ impl StartupCoordinator {
             superseded_supervision_observation: None,
             supervision_progress_frontier: 0,
             governor_authority: None,
+            #[cfg(windows)]
+            governor_observation_readback: None,
             blob_degraded: false,
             capability_degraded: false,
         }
@@ -811,6 +877,44 @@ impl StartupCoordinator {
     #[must_use]
     pub(crate) fn current_governor_issued_authority(&self) -> Option<GovernorIssuedAuthority> {
         self.governor_authority.clone()
+    }
+
+    /// Replaces the single latest authenticated source-read binding. This is
+    /// transient join state for the next Governor publish, not a second source
+    /// store or an authority-bearing receipt.
+    #[cfg(windows)]
+    pub(crate) fn retain_governor_authority_observation(
+        &mut self,
+        readback: GovernorAuthorityObservationReadback,
+    ) {
+        self.governor_observation_readback = Some(readback);
+    }
+
+    /// Returns the exact last readback for continuation or publish rejoin.
+    #[cfg(windows)]
+    pub(crate) fn governor_authority_observation_readback(
+        &self,
+    ) -> Option<GovernorAuthorityObservationReadback> {
+        self.governor_observation_readback.clone()
+    }
+
+    /// Consumes exactly the readback used by one publish. A fresh source read
+    /// is required before the same page can be associated with another
+    /// revision.
+    #[cfg(windows)]
+    pub(crate) fn mark_governor_authority_observation_published(
+        &mut self,
+        expected: &GovernorAuthorityObservationReadback,
+        revision: u64,
+    ) -> Result<(), String> {
+        let Some(current) = self.governor_observation_readback.as_mut() else {
+            return Err("governor observation readback is absent".to_owned());
+        };
+        if current != expected || current.published_revision.is_some() || revision == 0 {
+            return Err("governor observation readback is stale or already published".to_owned());
+        }
+        current.published_revision = Some(revision);
+        Ok(())
     }
 
     /// Binds presented Governor-issued authority to the current revision
