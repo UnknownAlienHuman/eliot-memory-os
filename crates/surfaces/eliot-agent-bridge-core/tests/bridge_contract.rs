@@ -80,6 +80,7 @@ impl HostActivationPort for SequencedHost {
 struct ForwardState {
     hooks: usize,
     events: usize,
+    forwarded_events: Vec<EventEnvelope>,
     gaps: Vec<CoverageGap>,
     outcomes: VecDeque<EventPortOutcome>,
     reconciliations: VecDeque<ReconciliationPortOutcome>,
@@ -112,6 +113,7 @@ impl McpForwardingPort for FakeForwarder {
             .lock()
             .map_err(|_| ProviderFailure::new("mcp", "test lock poisoned"))?;
         state.events += 1;
+        state.forwarded_events.push(event.clone());
         state
             .outcomes
             .pop_front()
@@ -561,12 +563,22 @@ fn durable_duplicate_replay_is_idempotent_and_ack_phase_controls_cursor()
             cursor_advanced: false,
         }
     );
+    // I7.2 permits at-least-once durable delivery, while #2732 requires the
+    // cursor phase to come from the owner's current acknowledgement. Exact
+    // replays therefore query the owner again without creating a new event.
     assert_eq!(
         forward_state
             .lock()
             .map_err(|_| "forward state lock poisoned")?
             .events,
-        1
+        2
+    );
+    assert_eq!(
+        forward_state
+            .lock()
+            .map_err(|_| "forward state lock poisoned")?
+            .forwarded_events,
+        vec![durable.clone(), durable.clone()]
     );
 
     let mut conflicting = durable;
@@ -662,8 +674,8 @@ fn received_and_durable_ack_retry_until_required_normalized_phase()
         Arc::clone(&forward_state),
     )?;
     bridge.attach(managed_request("connection-1")?)?;
-    // Start at the stream's next contiguous sequence so this proof isolates
-    // acknowledgement phase advancement from an unrelated sequence-1 hole.
+    // Start at the stream's initial contiguous sequence so this proof
+    // isolates acknowledgement phase advancement from a sequence-1 hole.
     let durable = event("durable_observation", "event-2", 1)?;
 
     for phase in [AckPhase::Received, AckPhase::Durable] {
@@ -687,7 +699,7 @@ fn received_and_durable_ack_retry_until_required_normalized_phase()
         }
     );
     assert!(bridge.outstanding_deliveries().is_empty());
-    assert_eq!(bridge.cursor("stream-1"), Some(2));
+    assert_eq!(bridge.cursor("stream-1"), Some(1));
     assert_eq!(
         forward_state
             .lock()
