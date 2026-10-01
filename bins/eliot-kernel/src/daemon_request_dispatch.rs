@@ -3855,11 +3855,8 @@ impl KernelComposition {
                 {
                     let (installation_id, outcomes) =
                         host_request_route::watchdog_intent_outcome_from_payload(payload)?;
-                    let projections = self.record_watchdog_intent_outcomes(
-                        session,
-                        &installation_id,
-                        &outcomes,
-                    )?;
+                    let projections =
+                        self.record_watchdog_intent_outcomes(session, &installation_id, &outcomes)?;
                     Ok(host_request_route::watchdog_intent_outcome_response(
                         &projections,
                     ))
