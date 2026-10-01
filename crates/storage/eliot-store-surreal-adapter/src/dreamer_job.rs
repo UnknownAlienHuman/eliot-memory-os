@@ -310,6 +310,12 @@ pub(crate) async fn dreamer_job(
         JobOperation::RecordApplicability { .. } => {
             Box::pin(op_record_applicability(adapter, db, ctx, request)).await
         }
+        JobOperation::RecordAdmission { .. } => {
+            // Surreal backend has no admission-history writer yet; the
+            // canonical admission validation lives in store-api. Fail
+            // closed rather than mis-recording admission as applicability.
+            Err(AdapterError::Store(StoreError::UnknownOperation))
+        }
     }
 }
 
@@ -2495,6 +2501,7 @@ pub(crate) fn is_supported_operation(operation: &JobOperation) -> bool {
             | JobOperation::RequestCancel { .. }
             | JobOperation::Reconcile { .. }
             | JobOperation::RecordApplicability { .. }
+            | JobOperation::RecordAdmission { .. }
     )
 }
 
