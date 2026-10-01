@@ -20237,16 +20237,18 @@ impl RedbRecoveryStore {
     }
 
     /// Retires one namespace's handoffs inside the recovery transaction
-    /// (issue #2731, items 4 and 5) over a contiguous eligible prefix
+    /// (issue #2731, items 1, 4, and 5) over a contiguous eligible prefix
     /// (issue #2885, item 6). Eligibility is evaluated per row by
     /// [`BridgeEventHandoffRow::retirement_eligible`] against the retiring
-    /// operation's admitted owner and acknowledged receipt, and the first
-    /// gap-covered, unknown-handoff, nonterminal, or missing position
-    /// stops the prefix instead of being skipped to free space. The
+    /// operation's admitted owner and acknowledged receipt, joined to the
+    /// handoff's exact receiving-owner receipt, and the first
+    /// gap-covered, unknown-handoff, nonterminal, receipt-less, or missing
+    /// position stops the prefix instead of being skipped to free space. The
     /// stored reconcile tuple is the admitting owner's frontier/owner
-    /// evidence: it retires a row only when it names the currently
-    /// admitted owner epoch with a covering frontier inside the
-    /// acknowledged receipt. A terminalized prefix is
+    /// evidence: it is necessary but insufficient, counting only when it
+    /// names the currently admitted owner epoch with a covering frontier
+    /// inside the acknowledged receipt — producer acknowledgement alone
+    /// never retires an unconsumed event. A terminalized prefix is
     /// certified as a cumulative compacted range binding owner
     /// namespace/incarnation, interval, predecessor, ack frontier,
     /// segment commitment, schema version, and retention revision (issue
@@ -20336,6 +20338,10 @@ impl RedbRecoveryStore {
         let mut terminalized_boundary = compacted;
         let mut earliest_terminalized_sequence = None;
         let mut terminalized_leaves: Vec<(u64, String, String, String)> = Vec::new();
+        // First eligible sequence whose receiving-owner receipt is still
+        // missing (issue #2731, item 1); the prefix stops there instead of
+        // disposing the handoff.
+        let mut receipt_blocked_at: Option<u64> = None;
         for (_, key, row) in &eligible {
             let record_key = format!("{}::{}", access.namespace, row.event_id);
             let record: Option<BridgeEventRow> = {
@@ -20368,6 +20374,32 @@ impl RedbRecoveryStore {
             Self::require_bridge_event_relation_in(write, &record, record_key.as_str())?;
             if !row.retirement_eligible(&owner, acked) {
                 continue;
+            }
+            // Issue #2731 item 1 (I6 residual): the producer reconcile tuple
+            // checked above is necessary but insufficient — it records local
+            // staging plus producer receipt acknowledgement, never the
+            // receiving owner's durable acceptance. Retirement additionally
+            // requires the exact owner receipt binding stream, incarnation,
+            // event identity and sequence, the content commitment, the
+            // receiving operation, and the retained source/projection
+            // references, carrying its own APPLIED, REJECTED, or UNKNOWN
+            // disposition. The three stay distinct by construction here: no
+            // disposition is inferred from the reconciled flag or the
+            // response digest, so UNKNOWN can never retire as success and a
+            // legacy reconciled row never retires on its bare state string.
+            // Join flag for the kernel receipt route: set once the route
+            // records the handoff's receipt and this arm joins it by handoff
+            // key. The handoff row retains no receiving-operation or
+            // disposition columns — reconcile_key is a response digest,
+            // never an owner operation — so no retained row presents the
+            // receipt yet and the flag stays clear. The prefix stops here
+            // instead of disposing the handoff: the obligation stays pending
+            // with its source, projection, and replay identity intact.
+            // Nothing here fabricates acceptance.
+            let owner_receipt_joined = false;
+            if !owner_receipt_joined {
+                receipt_blocked_at = Some(row.sequence);
+                break;
             }
             let commitment = Self::bridge_replay_commitment_for(&record, now_ms, acked);
             Self::write_bridge_commitment_in(write, &commitment)?;
@@ -20433,6 +20465,11 @@ impl RedbRecoveryStore {
             )?;
             cursor.last_compacted_sequence = terminalized_boundary;
         }
+        // A receipt-blocked prefix still has work behind its blocker, and
+        // resumes at the blocker so the next bounded entry re-meets the
+        // same handoff instead of stranding it behind the page cursor.
+        let retirement_continuation = retirement_continuation || receipt_blocked_at.is_some();
+        let receipt_resume_after = receipt_blocked_at.map(|blocked| blocked.saturating_sub(1));
         let mut next_scan = if retirement_continuation {
             let scan = scan.as_ref().ok_or(OrsError::IntegrityProblem {
                 record_type: "bridge_event_position",
@@ -20442,10 +20479,13 @@ impl RedbRecoveryStore {
                 owner_revision: scan.owner_revision,
                 owner_incarnation: scan.owner_incarnation,
                 recovery_revision: scan.recovery_revision,
-                after_sequence: eligible_after.ok_or(OrsError::IntegrityProblem {
-                    record_type: "bridge_event_position",
-                    reason: "bounded retirement continuation has no processed position".to_owned(),
-                })?,
+                after_sequence: receipt_resume_after.or(eligible_after).ok_or(
+                    OrsError::IntegrityProblem {
+                        record_type: "bridge_event_position",
+                        reason: "bounded retirement continuation has no processed position"
+                            .to_owned(),
+                    },
+                )?,
                 upper_sequence: scan.upper_sequence,
             })
         } else {
