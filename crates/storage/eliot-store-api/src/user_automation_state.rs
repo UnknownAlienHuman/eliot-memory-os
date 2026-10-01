@@ -82,7 +82,7 @@ use thiserror::Error;
 
 use crate::{
     NamedMutationOperation, NamedMutationRequest, NamedReadOperation, NamedReadRequest,
-    ReadConsistency, StateFence, StoreError,
+    ReadConsistency, ScopeId, StateFence, StoreError,
 };
 
 /// Versioned wire/schema identity for canonical user-automation state.
@@ -133,6 +133,8 @@ pub const AUTOMATION_PARAM_AUTOMATION_ID: &str = "automation_id";
 pub const AUTOMATION_PARAM_REVISION: &str = "revision";
 /// Opaque canonical revision document (revision legs).
 pub const AUTOMATION_PARAM_REVISION_JSON: &str = "revision_json";
+/// Original authenticated normalization producer request (retention leg only).
+pub const AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON: &str = "normalization_request_json";
 /// Superseded revision identity (edit leg only).
 pub const AUTOMATION_PARAM_PREVIOUS_REVISION: &str = "previous_revision";
 /// Closed admission state (revision legs; stored on the current pointer).
@@ -196,6 +198,8 @@ pub const AUTOMATION_OPERATION_REMOVE: &str = "remove";
 pub const AUTOMATION_OPERATION_RUN_NOW: &str = "run-now";
 /// Mutation leg discriminator values (failure-history writer leg).
 pub const AUTOMATION_OPERATION_FAILURE: &str = "failure";
+/// Closed internal leg that retains an owner-normalized immutable revision.
+pub const AUTOMATION_OPERATION_RETAIN_NORMALIZATION: &str = "retain_normalization";
 
 /// Read query discriminator values (mirror the domain query kinds minus
 /// `Preflight`, which is B-owned).
@@ -209,6 +213,8 @@ pub const AUTOMATION_QUERY_INVOCATIONS: &str = "invocations";
 /// Read query discriminator values (the failure writer leg records the
 /// last failure row; absence stays explicit, never fabricated).
 pub const AUTOMATION_QUERY_FAILURE: &str = "failure";
+/// Read query for one independently retained owner-normalization record.
+pub const AUTOMATION_QUERY_NORMALIZATION: &str = "normalization";
 
 /// Closed admission-state wire values (mirror the domain
 /// `SCREAMING_SNAKE_CASE` states).
@@ -282,6 +288,20 @@ impl AutomationContractError {
 /// beyond leg completeness.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecodedAutomationMutation {
+    /// Retain the original owner-normalized revision and envelope independently
+    /// of activation state, current pointers, and occurrence history.
+    RetainNormalization {
+        /// Stable automation identity.
+        automation_id: String,
+        /// Exact immutable revision identity.
+        revision: String,
+        /// Original canonical revision document bytes.
+        revision_json: String,
+        /// Original owner-issued normalization envelope object.
+        normalization_receipt_json: Value,
+        /// Original authenticated normalization request document bytes.
+        normalization_request_json: String,
+    },
     /// Create the first immutable revision + current pointer.
     Create {
         /// Stable automation identity.
@@ -824,6 +844,45 @@ pub fn automation_edit_params(
     params
 }
 
+/// Builds the internal retention leg for one owner-normalized revision.
+///
+/// The revision and envelope are carried unchanged. This leg does not create
+/// an active revision, move a current pointer, or record occurrence history.
+pub fn automation_normalization_params(
+    automation_id: String,
+    revision: String,
+    revision_json: String,
+    normalization_receipt_json: Value,
+    normalization_request_json: String,
+) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        (
+            AUTOMATION_PARAM_OPERATION.to_owned(),
+            Value::String(AUTOMATION_OPERATION_RETAIN_NORMALIZATION.to_owned()),
+        ),
+        (
+            AUTOMATION_PARAM_AUTOMATION_ID.to_owned(),
+            Value::String(automation_id),
+        ),
+        (
+            AUTOMATION_PARAM_REVISION.to_owned(),
+            Value::String(revision),
+        ),
+        (
+            AUTOMATION_PARAM_REVISION_JSON.to_owned(),
+            Value::String(revision_json),
+        ),
+        (
+            AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON.to_owned(),
+            normalization_receipt_json,
+        ),
+        (
+            AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON.to_owned(),
+            Value::String(normalization_request_json),
+        ),
+    ])
+}
+
 /// Attaches the owner-issued schedule normalization envelope to one
 /// revision-leg parameter map.
 ///
@@ -976,9 +1035,9 @@ pub fn automation_read_request(
 
 /// Builds an exact immutable-revision read for the canonical owner boundary.
 ///
-/// The selector is accepted only by the closed `current`/`history` read
-/// contract. Provider adapters must use it to address the immutable row by
-/// identity; it is not a page cursor or a caller-authored revision document.
+/// The selector is accepted only by closed exact-revision read contracts.
+/// Provider adapters must use it to address the immutable row by identity; it
+/// is not a page cursor or a caller-authored revision document.
 pub fn automation_revision_read_request(
     query: String,
     automation_id: String,
@@ -1027,6 +1086,45 @@ pub fn automation_invocation_read_request(
     Ok(request)
 }
 
+/// Builds an exact read for one independently retained normalization record.
+pub fn automation_normalization_read_request(
+    state_fence: StateFence,
+    automation_id: String,
+    revision: String,
+) -> Result<NamedReadRequest, StoreError> {
+    let parameters = BTreeMap::from([
+        (
+            AUTOMATION_PARAM_QUERY.to_owned(),
+            Value::String(AUTOMATION_QUERY_NORMALIZATION.to_owned()),
+        ),
+        (
+            AUTOMATION_PARAM_AUTOMATION_ID.to_owned(),
+            Value::String(automation_id),
+        ),
+        (
+            AUTOMATION_PARAM_REVISION.to_owned(),
+            Value::String(revision),
+        ),
+        (
+            AUTOMATION_PARAM_INCLUDE_RETIRED.to_owned(),
+            Value::String("false".to_owned()),
+        ),
+        (
+            AUTOMATION_PARAM_MAX_RECORDS.to_owned(),
+            Value::String("1".to_owned()),
+        ),
+    ]);
+    let request = NamedReadRequest {
+        operation: NamedReadOperation::GetUserAutomationState,
+        scope_id: Some(ScopeId::new(USER_AUTOMATION_SCOPE)?),
+        consistency: ReadConsistency::ExactFence,
+        state_fence,
+        parameters,
+    };
+    request.validate()?;
+    Ok(request)
+}
+
 /// Validates closed mutation parameters for one automation operation.
 ///
 /// The operation identity is the discriminator: each leg declares exactly
@@ -1043,6 +1141,15 @@ pub fn validate_automation_mutation_params(
     }
     let leg = text_param(parameters, AUTOMATION_PARAM_OPERATION)?;
     validate_automation_id(text_param(parameters, AUTOMATION_PARAM_AUTOMATION_ID)?)?;
+    if leg == AUTOMATION_OPERATION_RETAIN_NORMALIZATION {
+        return validate_automation_normalization_mutation_params(parameters);
+    }
+    if parameters.contains_key(AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON) {
+        return Err(StoreError::InvalidField {
+            field: AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON,
+            reason: "original normalization request is only valid for normalization retention",
+        });
+    }
     // The retained owner envelope is optional per leg but never untyped: when a
     // revision leg carries one it must be the canonical envelope JSON object, so
     // the backend can decode it through the shared `ReceiptEnvelope::validate()`
@@ -1114,6 +1221,49 @@ pub fn validate_automation_mutation_params(
     }
 }
 
+/// Validates the closed internal leg that independently retains owner-issued
+/// normalization evidence. Its strict parameter and document rules do not
+/// change the historical acceptance boundary for the existing mutation legs.
+fn validate_automation_normalization_mutation_params(
+    parameters: &BTreeMap<String, Value>,
+) -> Result<(), StoreError> {
+    if !matches!(
+        parameters.get(AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON),
+        Some(Value::Object(_))
+    ) {
+        return Err(StoreError::InvalidField {
+            field: AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON,
+            reason: "owner normalization envelope must be a JSON object",
+        });
+    }
+    if parameters.keys().any(|name| {
+        !matches!(
+            name.as_str(),
+            AUTOMATION_PARAM_OPERATION
+                | AUTOMATION_PARAM_AUTOMATION_ID
+                | AUTOMATION_PARAM_REVISION
+                | AUTOMATION_PARAM_REVISION_JSON
+                | AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON
+                | AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON
+        )
+    }) {
+        return Err(StoreError::InvalidField {
+            field: "automation.operation",
+            reason: "parameter is not valid for normalization retention",
+        });
+    }
+    validate_revision_id(text_param(parameters, AUTOMATION_PARAM_REVISION)?)?;
+    validate_automation_doc(
+        text_param(parameters, AUTOMATION_PARAM_REVISION_JSON)?,
+        AUTOMATION_PARAM_REVISION_JSON,
+    )?;
+    validate_automation_doc(
+        text_param(parameters, AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON)?,
+        AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON,
+    )?;
+    Ok(())
+}
+
 /// Decodes one validated mutation parameter map into its raw leg.
 pub fn decode_automation_mutation(
     operation: NamedMutationOperation,
@@ -1140,6 +1290,19 @@ pub fn decode_automation_mutation(
             .cloned()
     };
     match leg.as_str() {
+        AUTOMATION_OPERATION_RETAIN_NORMALIZATION => {
+            let normalization_receipt_json = envelope_of().ok_or(StoreError::InvalidField {
+                field: AUTOMATION_PARAM_NORMALIZATION_RECEIPT_JSON,
+                reason: "owner normalization envelope must be present",
+            })?;
+            Ok(DecodedAutomationMutation::RetainNormalization {
+                automation_id: text_of(AUTOMATION_PARAM_AUTOMATION_ID)?,
+                revision: text_of(AUTOMATION_PARAM_REVISION)?,
+                revision_json: text_of(AUTOMATION_PARAM_REVISION_JSON)?,
+                normalization_receipt_json,
+                normalization_request_json: text_of(AUTOMATION_PARAM_NORMALIZATION_REQUEST_JSON)?,
+            })
+        }
         AUTOMATION_OPERATION_CREATE => Ok(DecodedAutomationMutation::Create {
             automation_id: text_of(AUTOMATION_PARAM_AUTOMATION_ID)?,
             revision: text_of(AUTOMATION_PARAM_REVISION)?,
@@ -1353,6 +1516,41 @@ pub fn validate_automation_read_params(
                 include_retired,
                 max_records,
                 cursor,
+            })
+        }
+        AUTOMATION_QUERY_NORMALIZATION => {
+            if include_retired || max_records != 1 {
+                return Err(StoreError::InvalidField {
+                    field: AUTOMATION_PARAM_MAX_RECORDS,
+                    reason: "normalization read must select at most one retained record",
+                });
+            }
+            if requested_occurrence_id.is_some() || cursor_text.is_some() {
+                return Err(StoreError::InvalidField {
+                    field: if requested_occurrence_id.is_some() {
+                        AUTOMATION_PARAM_OCCURRENCE_ID
+                    } else {
+                        AUTOMATION_PARAM_CURSOR
+                    },
+                    reason: "selector is not valid for exact normalization reads",
+                });
+            }
+            let automation_id = automation_id.ok_or(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            })?;
+            let requested_revision = requested_revision.ok_or(StoreError::InvalidField {
+                field: AUTOMATION_PARAM_REVISION,
+                reason: "exact revision selector is required",
+            })?;
+            Ok(DecodedAutomationRead {
+                query: query.to_owned(),
+                automation_id: Some(automation_id),
+                requested_revision: Some(requested_revision),
+                requested_occurrence_id: None,
+                include_retired: false,
+                max_records: 1,
+                cursor: None,
             })
         }
         AUTOMATION_QUERY_FAILURE => {

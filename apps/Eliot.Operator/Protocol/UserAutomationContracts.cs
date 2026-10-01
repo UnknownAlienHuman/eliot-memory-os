@@ -1,4 +1,6 @@
+using System.Buffers;
 using System.Security.Cryptography;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -7,9 +9,15 @@ using Eliot.Operator.Protocol.Generated;
 namespace Eliot.Operator.Protocol;
 
 /// Closed UserAutomation operation surface carried by the authenticated
-/// Governor command. It contains no principal, StateFence, Store receipt,
+/// Governor command. Except for the read-only context handshake, each request
+/// also carries the exact owner-issued StateFence witness against which the
+/// Kernel admits the operation. It contains no principal, Store receipt,
 /// scheduler, provider credential, or ambient settings.
-[JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
+[JsonPolymorphic(
+    TypeDiscriminatorPropertyName = OperatorScheduleContract.USER_AUTOMATION_OPERATION_DISCRIMINATOR)]
+[JsonDerivedType(typeof(UserAutomationGetContextOperation), "get_context")]
+[JsonDerivedType(typeof(UserAutomationNormalizeScheduleOperation), "normalize_schedule")]
+[JsonDerivedType(typeof(UserAutomationMigrateLegacyScheduleOperation), "migrate_legacy_schedule")]
 [JsonDerivedType(typeof(UserAutomationCreateOperation), "create")]
 [JsonDerivedType(typeof(UserAutomationListOperation), "list")]
 [JsonDerivedType(typeof(UserAutomationStatusOperation), "status")]
@@ -35,13 +43,64 @@ public abstract record UserAutomationOperation
     /// `UserAutomationOperation` is `deny_unknown_fields`, so a serialized
     /// `isEffect` member would make every request undecodable. A method has no
     /// serialized surface at all, which keeps the exclusion exact for the
-    /// abstract declaration, all ten derived records, the polymorphic
+    /// abstract declaration, every derived record, the polymorphic
     /// `UserAutomationOperation` contract and the outer request at once.
     public abstract bool IsEffect();
 }
 
+/// Read-only authenticated route handshake. This operation is never shown as
+/// a business action and its result supplies the StateFence for the next
+/// independently identified request.
+public sealed record UserAutomationGetContextOperation : UserAutomationOperation
+{
+    public override void Validate() { }
+
+    public override bool IsEffect() => false;
+}
+
+/// <summary>Ask the authenticated Kernel owner to normalize one immutable revision draft.</summary>
+public sealed record UserAutomationNormalizeScheduleOperation(
+    [property: JsonPropertyName("revision")] UserAutomationRevision Revision,
+    [property: JsonPropertyName("occurrence_count")] ushort OccurrenceCount)
+    : UserAutomationOperation
+{
+    public override void Validate()
+    {
+        if (Revision is null) throw new InvalidOperationException("normalize_schedule requires one revision draft.");
+        Revision.ValidateForNormalizationSubmission();
+        UserAutomationScheduleMirror.RequireNormalizationOccurrenceCount(OccurrenceCount);
+    }
+
+    // Normalization is retained by the Kernel owner with its original request
+    // and receipt. It writes owner state but does not activate the automation.
+    public override bool IsEffect() => true;
+}
+
+/// <summary>Explicitly migrate a legacy immutable revision into a distinct successor.</summary>
+public sealed record UserAutomationMigrateLegacyScheduleOperation(
+    [property: JsonPropertyName("previous_revision")] UserAutomationRevision PreviousRevision,
+    [property: JsonPropertyName("revision")] UserAutomationRevision Revision,
+    [property: JsonPropertyName("occurrence_count")] ushort OccurrenceCount)
+    : UserAutomationOperation
+{
+    public override void Validate()
+    {
+        if (PreviousRevision is null || Revision is null)
+        {
+            throw new InvalidOperationException("migrate_legacy_schedule requires previous and candidate revisions.");
+        }
+        Revision.ValidateForMigrationNormalizationSubmission(PreviousRevision);
+        UserAutomationScheduleMirror.RequireNormalizationOccurrenceCount(OccurrenceCount);
+    }
+
+    // Migration is retained by the Kernel owner with its original request
+    // and receipt. It writes owner state but does not activate the automation.
+    public override bool IsEffect() => true;
+}
+
 public sealed record UserAutomationCreateOperation(
-    [property: JsonPropertyName("revision")] UserAutomationRevision Revision)
+    [property: JsonPropertyName("revision")] UserAutomationRevision Revision,
+    [property: JsonPropertyName("normalization_receipt_envelope")] JsonElement NormalizationReceiptEnvelope)
     : UserAutomationOperation
 {
     public override void Validate()
@@ -56,7 +115,11 @@ public sealed record UserAutomationCreateOperation(
         {
             throw new InvalidOperationException("create requires one typed revision payload.");
         }
-        Revision.ValidateForNormalizationSubmission();
+        Revision.Validate();
+        UserAutomationNormalizationReceiptEnvelope.Validate(
+            NormalizationReceiptEnvelope,
+            Revision,
+            UserAutomationNormalizationReceiptEnvelope.NormalizationOperationKind);
     }
 
     public override bool IsEffect() => true;
@@ -111,7 +174,8 @@ public sealed record UserAutomationResumeOperation(
 
 public sealed record UserAutomationEditOperation(
     [property: JsonPropertyName("previous_revision")] UserAutomationRevision PreviousRevision,
-    [property: JsonPropertyName("revision")] UserAutomationRevision Revision)
+    [property: JsonPropertyName("revision")] UserAutomationRevision Revision,
+    [property: JsonPropertyName("normalization_receipt_envelope")] JsonElement NormalizationReceiptEnvelope)
     : UserAutomationOperation
 {
     public override void Validate()
@@ -122,22 +186,371 @@ public sealed record UserAutomationEditOperation(
         {
             throw new InvalidOperationException("edit requires both typed revision payloads.");
         }
-        PreviousRevision.Validate();
-        Revision.ValidateForNormalizationSubmission();
+        Revision.Validate();
+        var previousIsLegacy = false;
+        try
+        {
+            PreviousRevision.Validate();
+        }
+        catch (InvalidOperationException)
+        {
+            PreviousRevision.ValidateForLegacyScheduleMigration();
+            previousIsLegacy = true;
+        }
         if (!string.Equals(PreviousRevision.AutomationId, Revision.AutomationId, StringComparison.Ordinal)
             || !string.Equals(Revision.Supersedes, PreviousRevision.Revision, StringComparison.Ordinal)
             || string.Equals(PreviousRevision.Revision, Revision.Revision, StringComparison.Ordinal))
         {
             throw new InvalidOperationException("UserAutomation edit must supersede one distinct revision of the same automation.");
         }
-        // This checks the V3 source/digest relation only. The Store owner still
-        // compiles the submitted schedule and issues its normalization receipt.
-        UserAutomationScheduleMirror.RequireV3SourceDigestConsistencyForEdit(
-            PreviousRevision.Schedule,
-            Revision.Schedule);
+        if (previousIsLegacy)
+        {
+            UserAutomationNormalizationReceiptEnvelope.Validate(
+                NormalizationReceiptEnvelope,
+                Revision,
+                UserAutomationNormalizationReceiptEnvelope.LegacyMigrationOperationKind);
+        }
+        else
+        {
+            // This local relation catches reuse of a receipt projection after a
+            // source-field edit. The Kernel still validates the complete
+            // original envelope against the immutable revision and scope.
+            UserAutomationScheduleMirror.RequireV3SourceDigestConsistencyForEdit(
+                PreviousRevision.Schedule,
+                Revision.Schedule);
+            UserAutomationNormalizationReceiptEnvelope.Validate(
+                NormalizationReceiptEnvelope,
+                Revision,
+                UserAutomationNormalizationReceiptEnvelope.NormalizationOperationKind);
+        }
     }
 
     public override bool IsEffect() => true;
+}
+
+/// Shallow transport binding for the exact original owner receipt envelope.
+/// The Kernel owns the full receipt schema and semantic authority validation;
+/// this boundary checks only the identity join needed to carry the unmodified
+/// envelope beside its immutable revision.
+internal static class UserAutomationNormalizationReceiptEnvelope
+{
+    internal const string NormalizationOperationKind =
+        OperatorScheduleContract.USER_AUTOMATION_NORMALIZATION_OPERATION_KIND;
+    internal const string LegacyMigrationOperationKind =
+        OperatorScheduleContract.USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND;
+
+    internal static void Validate(
+        JsonElement envelope,
+        UserAutomationRevision revision,
+        string expectedOperationKind)
+    {
+        ArgumentNullException.ThrowIfNull(revision);
+        if (envelope.ValueKind != JsonValueKind.Object
+            || !UserAutomationOutcomeClassifier.HasUniqueObjectPropertiesRecursively(envelope)
+            || !HasExactProperties(envelope, "identity", "core")
+            || !envelope.TryGetProperty("identity", out var identity)
+            || !HasExactProperties(identity, "receipt_id", "canonical_sha256")
+            || !TryReadBoundedText(identity, "receipt_id", OperatorScheduleContract.MAX_TEXT_BYTES, out var receiptId)
+            || !TryReadLowerSha256(identity, "canonical_sha256", out var canonicalSha256)
+            || !envelope.TryGetProperty("core", out var core)
+            || core.ValueKind != JsonValueKind.Object
+            || !HasExactProperties(
+                core,
+                "contract",
+                "kind",
+                "work_scope",
+                "task",
+                "session",
+                "causal",
+                "request",
+                "operation",
+                "authority",
+                "artifacts",
+                "verifier",
+                "problem",
+                "coordination",
+                "disposition")
+            || !MatchesCanonicalIdentity(receiptId, canonicalSha256, core)
+            || !core.TryGetProperty("operation", out var operation)
+            || operation.ValueKind != JsonValueKind.Object
+            || !HasExactProperties(
+                operation,
+                "operation_id",
+                "request_id",
+                "idempotency_key",
+                "operation_kind",
+                "effect",
+                "state_fence")
+            || !core.TryGetProperty("request", out var request)
+            || !HasExactProperties(request, "metadata", "state_fence")
+            || !request.TryGetProperty("metadata", out var metadata)
+            || !HasExactProperties(
+                metadata,
+                "request_id",
+                "session_id",
+                "task_id",
+                "product_id",
+                "source_id",
+                "state_fence",
+                "clock")
+            || !metadata.TryGetProperty("clock", out var clock)
+            || !HasExactProperties(
+                clock,
+                "valid_time_ms",
+                "known_time_ms",
+                "transaction_sequence",
+                "monotonic_ns")
+            || !TryReadBoundedText(operation, "operation_kind", OperatorScheduleContract.MAX_TEXT_BYTES, out var operationKind)
+            || !string.Equals(operationKind, expectedOperationKind, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "normalization_receipt_envelope must be the closed owner receipt identity bound to this operation kind");
+        }
+
+        if (revision.Schedule is null
+            || revision.Schedule.NormalizationBinding is null
+            || !string.Equals(
+                revision.Schedule.NormalizationBinding.ReceiptId,
+                receiptId,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "normalization_receipt_envelope.identity.receipt_id must equal the revision schedule receipt identity");
+        }
+    }
+
+    private static bool HasExactProperties(JsonElement value, params string[] names)
+    {
+        if (value.ValueKind != JsonValueKind.Object) return false;
+        var actual = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var property in value.EnumerateObject())
+        {
+            if (!actual.Add(property.Name)) return false;
+        }
+        return actual.Count == names.Length && names.All(actual.Contains);
+    }
+
+    private static bool TryReadBoundedText(
+        JsonElement value,
+        string propertyName,
+        int maxUtf8Bytes,
+        out string text)
+    {
+        text = string.Empty;
+        return value.TryGetProperty(propertyName, out var member)
+            && member.ValueKind == JsonValueKind.String
+            && (text = member.GetString() ?? string.Empty).Length > 0
+            && !text.Any(char.IsControl)
+            && Encoding.UTF8.GetByteCount(text) <= maxUtf8Bytes;
+    }
+
+    private static bool TryReadLowerSha256(JsonElement value, string propertyName, out string digest)
+    {
+        digest = string.Empty;
+        if (!TryReadBoundedText(value, propertyName, 64, out digest) || digest.Length != 64)
+        {
+            return false;
+        }
+        return digest.All(character => character is >= '0' and <= '9' or >= 'a' and <= 'f');
+    }
+
+    /// <summary>
+    /// Checks the content-derived receipt identity using the same canonical
+    /// JSON rule as the Rust receipt owner: recursively sorted object members,
+    /// preserved array order, and compact UTF-8 JSON. Full receipt semantics
+    /// remain Kernel-owned; this prevents a substituted self-identity from
+    /// being displayed as a successful normalization result.
+    /// </summary>
+    private static bool MatchesCanonicalIdentity(
+        string receiptId,
+        string canonicalSha256,
+        JsonElement core)
+    {
+        try
+        {
+            using var bytes = new MemoryStream();
+            WriteCanonicalJson(core, bytes);
+
+            var digest = Convert.ToHexString(SHA256.HashData(bytes.ToArray())).ToLowerInvariant();
+            return string.Equals(canonicalSha256, digest, StringComparison.Ordinal)
+                && string.Equals(receiptId, $"receipt-{digest}", StringComparison.Ordinal);
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static void WriteCanonicalJson(JsonElement value, Stream writer)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteByte((byte)'{');
+                var firstProperty = true;
+                foreach (var property in value.EnumerateObject().OrderBy(
+                    property => property.Name,
+                    CanonicalJsonPropertyNameComparer.Instance))
+                {
+                    if (!firstProperty) writer.WriteByte((byte)',');
+                    firstProperty = false;
+                    WriteCanonicalString(property.Name, writer);
+                    writer.WriteByte((byte)':');
+                    WriteCanonicalJson(property.Value, writer);
+                }
+                writer.WriteByte((byte)'}');
+                break;
+            case JsonValueKind.Array:
+                writer.WriteByte((byte)'[');
+                var firstItem = true;
+                foreach (var item in value.EnumerateArray())
+                {
+                    if (!firstItem) writer.WriteByte((byte)',');
+                    firstItem = false;
+                    WriteCanonicalJson(item, writer);
+                }
+                writer.WriteByte((byte)']');
+                break;
+            case JsonValueKind.String:
+                WriteCanonicalString(value.GetString() ?? string.Empty, writer);
+                break;
+            case JsonValueKind.Number:
+                if (value.TryGetInt64(out var signed))
+                {
+                    WriteCanonicalAscii(writer, signed.ToString(CultureInfo.InvariantCulture));
+                }
+                else if (value.TryGetUInt64(out var unsigned))
+                {
+                    WriteCanonicalAscii(writer, unsigned.ToString(CultureInfo.InvariantCulture));
+                }
+                else
+                {
+                    // ReceiptCore uses integer numeric fields. Refuse any
+                    // number that cannot be represented in that closed shape
+                    // instead of guessing at cross-language float formatting.
+                    throw new InvalidOperationException("receipt core contains a non-integer number");
+                }
+                break;
+            case JsonValueKind.True:
+                WriteCanonicalAscii(writer, "true");
+                break;
+            case JsonValueKind.False:
+                WriteCanonicalAscii(writer, "false");
+                break;
+            case JsonValueKind.Null:
+                WriteCanonicalAscii(writer, "null");
+                break;
+            default:
+                throw new InvalidOperationException("receipt core contains an unsupported JSON value");
+        }
+    }
+
+    private static void WriteCanonicalString(string value, Stream writer)
+    {
+        writer.WriteByte((byte)'"');
+        var offset = 0;
+        Span<byte> utf8 = stackalloc byte[4];
+        Span<byte> escapedControl = stackalloc byte[6];
+        while (offset < value.Length)
+        {
+            if (Rune.DecodeFromUtf16(value.AsSpan(offset), out var rune, out var consumed)
+                != OperationStatus.Done)
+            {
+                throw new InvalidOperationException("receipt core contains invalid Unicode text");
+            }
+            offset += consumed;
+
+            switch (rune.Value)
+            {
+                case '"':
+                    WriteCanonicalAscii(writer, "\\\"");
+                    break;
+                case '\\':
+                    WriteCanonicalAscii(writer, "\\\\");
+                    break;
+                case '\b':
+                    WriteCanonicalAscii(writer, "\\b");
+                    break;
+                case '\t':
+                    WriteCanonicalAscii(writer, "\\t");
+                    break;
+                case '\n':
+                    WriteCanonicalAscii(writer, "\\n");
+                    break;
+                case '\f':
+                    WriteCanonicalAscii(writer, "\\f");
+                    break;
+                case '\r':
+                    WriteCanonicalAscii(writer, "\\r");
+                    break;
+                default:
+                    if (rune.Value <= 0x1f)
+                    {
+                        escapedControl[0] = (byte)'\\';
+                        escapedControl[1] = (byte)'u';
+                        escapedControl[2] = (byte)'0';
+                        escapedControl[3] = (byte)'0';
+                        escapedControl[4] = HexDigit((rune.Value >> 4) & 0xf);
+                        escapedControl[5] = HexDigit(rune.Value & 0xf);
+                        writer.Write(escapedControl);
+                    }
+                    else
+                    {
+                        var encodedLength = rune.EncodeToUtf8(utf8);
+                        writer.Write(utf8[..encodedLength]);
+                    }
+                    break;
+            }
+        }
+        writer.WriteByte((byte)'"');
+    }
+
+    private static byte HexDigit(int value) => (byte)(value < 10 ? '0' + value : 'a' + value - 10);
+
+    private static void WriteCanonicalAscii(Stream writer, string value) =>
+        writer.Write(Encoding.ASCII.GetBytes(value));
+
+    /// <summary>
+    /// Rust string ordering compares UTF-8 bytes, which is Unicode scalar
+    /// ordering. Ordinal .NET string ordering compares UTF-16 code units and
+    /// differs when supplementary-plane names are compared with some BMP
+    /// names, so canonical member ordering must compare decoded scalar values.
+    /// </summary>
+    private sealed class CanonicalJsonPropertyNameComparer : IComparer<string>
+    {
+        internal static CanonicalJsonPropertyNameComparer Instance { get; } = new();
+
+        public int Compare(string? left, string? right)
+        {
+            if (ReferenceEquals(left, right)) return 0;
+            if (left is null) return -1;
+            if (right is null) return 1;
+
+            var leftOffset = 0;
+            var rightOffset = 0;
+            while (leftOffset < left.Length && rightOffset < right.Length)
+            {
+                if (Rune.DecodeFromUtf16(left.AsSpan(leftOffset), out var leftRune, out var leftConsumed)
+                        != OperationStatus.Done
+                    || Rune.DecodeFromUtf16(right.AsSpan(rightOffset), out var rightRune, out var rightConsumed)
+                        != OperationStatus.Done)
+                {
+                    throw new InvalidOperationException("receipt core contains an invalid Unicode property name");
+                }
+
+                var comparison = leftRune.Value.CompareTo(rightRune.Value);
+                if (comparison != 0) return comparison;
+                leftOffset += leftConsumed;
+                rightOffset += rightConsumed;
+            }
+
+            return (left.Length - leftOffset).CompareTo(right.Length - rightOffset);
+        }
+    }
 }
 
 public sealed record UserAutomationRunNowOperation(
@@ -175,12 +588,16 @@ public sealed record UserAutomationInspectLastFailureOperation(
 }
 
 /// Exact authenticated UserAutomation front-door payload. The named route
-/// adds the authenticated session, principal, request metadata, State Fence
-/// and issued operation identity; the surface supplies only the closed
-/// operation and one retry-stable idempotency key.
+/// adds the authenticated session, principal, request metadata and issued
+/// operation identity. The read-only get_context handshake omits
+/// expected_state_fence; every later request carries the unchanged fence that
+/// handshake returned.
 public sealed record UserAutomationOperatorRequest(
     [property: JsonPropertyName("operation")] UserAutomationOperation Operation,
-    [property: JsonPropertyName("idempotency_key")] string IdempotencyKey)
+    [property: JsonPropertyName("idempotency_key")] string IdempotencyKey,
+    [property: JsonPropertyName("expected_state_fence")]
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        JsonElement? ExpectedStateFence)
 {
     /// The retry-stable identity of one typed operation. It is derived from
     /// the exact canonical operation bytes, so a lost response, a transport
@@ -202,8 +619,45 @@ public sealed record UserAutomationOperatorRequest(
         return Convert.ToHexString(digest.AsSpan(0, 16)).ToLowerInvariant();
     }
 
-    public static UserAutomationOperatorRequest Create(UserAutomationOperation operation) =>
-        new(operation, DeriveIdempotencyKey(operation));
+    public static UserAutomationOperatorRequest Create(UserAutomationOperation operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        if (operation is not UserAutomationGetContextOperation)
+        {
+            throw new InvalidOperationException(
+                "a UserAutomation business request requires a fresh owner State Fence witness");
+        }
+
+        return CreateContext();
+    }
+
+    /// Mints the short-lived read-only handshake identity. It is deliberately
+    /// unique per call so a newly authenticated session cannot receive a
+    /// retained result from an earlier context read.
+    public static UserAutomationOperatorRequest CreateContext() =>
+        new(
+            new UserAutomationGetContextOperation(),
+            Guid.NewGuid().ToString("N"),
+            ExpectedStateFence: null);
+
+    /// Mints one business request from the same typed operation and exact
+    /// owner-issued fence. The fence is retained and replayed byte-for-byte;
+    /// it is never reacquired while reconciling this identity.
+    public static UserAutomationOperatorRequest Create(
+        UserAutomationOperation operation,
+        JsonElement expectedStateFence)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        if (operation is UserAutomationGetContextOperation)
+        {
+            throw new InvalidOperationException("get_context must not carry an expected State Fence");
+        }
+
+        return new UserAutomationOperatorRequest(
+            operation,
+            DeriveIdempotencyKey(operation),
+            expectedStateFence.Clone());
+    }
 
     public void Validate()
     {
@@ -233,6 +687,19 @@ public sealed record UserAutomationOperatorRequest(
         if (Operation is null) throw new InvalidOperationException("operation must be present.");
         Operation.Validate();
         OperatorIntentContract.RequireOperationId(IdempotencyKey);
+        if (Operation is UserAutomationGetContextOperation)
+        {
+            if (ExpectedStateFence is not null)
+            {
+                throw new InvalidOperationException("get_context must omit expected_state_fence");
+            }
+        }
+        else if (ExpectedStateFence is not { } expectedStateFence
+            || !UserAutomationOutcomeClassifier.IsClosedStateFence(expectedStateFence))
+        {
+            throw new InvalidOperationException(
+                "a UserAutomation business request requires one closed expected_state_fence");
+        }
     }
 
     /// Validates the CURRENT-shape identity binding: the operation decodes
@@ -280,10 +747,10 @@ public sealed record UserAutomationRetainedRequest(
     /// `IsEffect` property under the closed Web naming policy.
     public const string SupersededLocalClassifierMember = "isEffect";
 
-    /// The outer request is exactly these two members. It is stated here rather
-    /// than read back off the request type so the retained envelope is checked
-    /// against the wire contract, not against its own reader.
-    private static readonly string[] RequestMemberNames = ["operation", "idempotency_key"];
+    /// The outer business request is exactly these three members. It is stated
+    /// here rather than read back off the request type so the retained envelope
+    /// is checked against the wire contract, not against its own reader.
+    private static readonly string[] RequestMemberNames = ["operation", "idempotency_key", "expected_state_fence"];
 
     /// The one tolerated deviation, scoped to retained local recovery bytes.
     /// `OperatorJson.Reader` itself is untouched, so no unrelated surface
@@ -509,11 +976,27 @@ public sealed record UserAutomationRevision(
     [property: JsonPropertyName("current_execution_refs")] IReadOnlyList<string> CurrentExecutionRefs,
     [property: JsonPropertyName("execution_history_query_ref")] string ExecutionHistoryQueryRef)
 {
-    public void Validate() => Validate(allowReceiptFreeSchedule: false);
+    public void Validate() => Validate(allowReceiptFreeSchedule: false, legacySchedule: false);
 
-    internal void ValidateForNormalizationSubmission() => Validate(allowReceiptFreeSchedule: true);
+    internal void ValidateForNormalizationSubmission() => Validate(allowReceiptFreeSchedule: true, legacySchedule: false);
 
-    private void Validate(bool allowReceiptFreeSchedule)
+    internal void ValidateForMigrationNormalizationSubmission(UserAutomationRevision previousRevision)
+    {
+        ArgumentNullException.ThrowIfNull(previousRevision);
+        ValidateForNormalizationSubmission();
+        previousRevision.ValidateForLegacyScheduleMigration();
+        if (!string.Equals(AutomationId, previousRevision.AutomationId, StringComparison.Ordinal)
+            || string.Equals(Revision, previousRevision.Revision, StringComparison.Ordinal)
+            || !string.Equals(Supersedes, previousRevision.Revision, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "legacy schedule migration must create a distinct immutable revision immediately superseding its predecessor.");
+        }
+    }
+
+    internal void ValidateForLegacyScheduleMigration() => Validate(allowReceiptFreeSchedule: false, legacySchedule: true);
+
+    private void Validate(bool allowReceiptFreeSchedule, bool legacySchedule)
     {
         // Each nested record below is a required reference-typed member that
         // decodes to null when the member is absent, and every one of them is
@@ -565,9 +1048,13 @@ public sealed record UserAutomationRevision(
         UserAutomationContract.RequireOneOf(OverlapPolicy, "overlap_policy", "FORBID_OVERLAP", "QUEUE_ONE", "COALESCE_LATEST");
         if (Supersedes is not null) UserAutomationContract.RequireText(Supersedes, "supersedes");
         WorkScope.Validate();
-        if (allowReceiptFreeSchedule)
+        if (legacySchedule)
         {
-            Schedule.ValidateForNormalizationSubmission();
+            Schedule.ValidateForLegacyScheduleMigration();
+        }
+        else if (allowReceiptFreeSchedule)
+        {
+            Schedule.ValidateForOwnerNormalizationSubmission();
         }
         else
         {
@@ -663,6 +1150,63 @@ public sealed record UserAutomationNormalizedSchedule(
     public void Validate() => Validate(allowReceiptFreeDraft: false);
 
     internal void ValidateForNormalizationSubmission() => Validate(allowReceiptFreeDraft: true);
+
+    internal void ValidateForOwnerNormalizationSubmission()
+    {
+        ValidateSourceFields();
+        if (NextOccurrences is null || NextOccurrences.Count != 0)
+        {
+            throw new InvalidOperationException(
+                "schedule.next_occurrences must be empty until the Kernel owner normalizes this revision.");
+        }
+        if (NormalizationBinding is not null)
+        {
+            throw new InvalidOperationException(
+                "schedule.normalization_receipt must be omitted until the Kernel owner normalizes this revision.");
+        }
+        _ = UserAutomationScheduleMirror.ReadScheduleProjection(
+            Timezone, DstFold, DstGap, StartAt, EndAt, Array.Empty<string>());
+    }
+
+    internal void ValidateForLegacyScheduleMigration()
+    {
+        ValidateSourceFields();
+        if (NextOccurrences is null || NextOccurrences.Count == 0
+            || NextOccurrences.Count > OperatorScheduleContract.MAX_REFERENCES)
+        {
+            throw new InvalidOperationException(
+                "legacy schedule.next_occurrences must contain a bounded non-empty occurrence set.");
+        }
+        if (Kind == "ONE_SHOT" && NextOccurrences.Count != 1)
+        {
+            throw new InvalidOperationException("legacy ONE_SHOT schedules require one next occurrence.");
+        }
+
+        foreach (var occurrence in NextOccurrences)
+        {
+            UserAutomationContract.RequireText(occurrence, "schedule.next_occurrences");
+            if (Encoding.UTF8.GetByteCount(occurrence) > OperatorScheduleContract.MAX_TEXT_BYTES
+                || !UserAutomationScheduleMirror.IsLegacyOccurrenceEncoding(occurrence))
+            {
+                throw new UserAutomationScheduleContractException(
+                    "LegacyScheduleEncoding",
+                    UserAutomationScheduleMirror.OwnerText("LegacyScheduleEncoding", "schedule.next_occurrences"),
+                    "migration requires a uniformly retired V1, V2, or V3 occurrence set; preserve the predecessor unchanged");
+            }
+        }
+    }
+
+    private void ValidateSourceFields()
+    {
+        UserAutomationContract.RequireOneOf(Kind, "schedule.kind", "ONE_SHOT", "RECURRING");
+        UserAutomationContract.RequireText(Expression, "schedule.expression");
+        UserAutomationContract.RequireText(Calendar, "schedule.calendar");
+        UserAutomationContract.RequireText(Timezone, "schedule.timezone");
+        UserAutomationContract.RequireOneOf(DstFold, "schedule.dst_fold", "FIRST", "SECOND", "REJECT");
+        UserAutomationContract.RequireOneOf(DstGap, "schedule.dst_gap", "SHIFT_FORWARD", "REJECT");
+        UserAutomationContract.RequireText(StartAt, "schedule.start_at");
+        if (EndAt is not null) UserAutomationContract.RequireText(EndAt, "schedule.end_at");
+    }
 
     private void Validate(bool allowReceiptFreeDraft)
     {
@@ -1036,10 +1580,10 @@ public static class UserAutomationContract
     public const string PreflightContractRevision =
         Generated.OperatorScheduleContract.USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION;
 
-    public static readonly IReadOnlyList<string> OperationKinds =
-    [
-        "create", "list", "status", "history", "pause", "resume", "edit", "run_now", "remove", "inspect_last_failure"
-    ];
+    public static readonly IReadOnlyList<string> OperationKinds = Array.AsReadOnly(
+        OperatorScheduleContract.USER_AUTOMATION_OPERATION_KINDS
+            .Where(kind => !string.Equals(kind, "get_context", StringComparison.Ordinal))
+            .ToArray());
 
     public static void RequireText(string? value, string field)
     {

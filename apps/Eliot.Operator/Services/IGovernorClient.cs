@@ -49,9 +49,9 @@ public interface IGovernorClient
     /// Sends one PREPARED typed UserAutomation request. The operation bytes and
     /// the retry-stable identity are fixed by the caller before the first send,
     /// so the journaled request and the transmitted request are the same
-    /// commitment. Re-deriving the key here would silently rename a retained
-    /// identity to whatever today's serializer produces, which is a different
-    /// request commitment rather than a retry of the retained one.
+    /// commitment, including its expected State Fence. Re-deriving the key or
+    /// reacquiring the fence here would silently change a retained operation
+    /// instead of retrying the same request commitment.
     Task<JsonElement> UserAutomationAsync(
         UserAutomationOperatorRequest request,
         CancellationToken cancellationToken = default);

@@ -833,12 +833,12 @@ static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 1] = [Parame
     required: true,
 }];
 
-/// Owner-approved user-automation mutation fields (issue #1779): the leg
-/// discriminator, the always-present automation identity, and the
-/// conditionally-required leg payloads. Leg completeness (which payload
-/// each leg requires) is enforced by the automation-state contract; every
-/// name here is optional at the declaration level so one closed table
-/// serves all six legs.
+/// Owner-approved user-automation mutation fields (issue #1779 and #2865):
+/// the leg discriminator, the always-present automation identity, and the
+/// conditionally-required leg payloads. Leg completeness (which payload each
+/// leg requires) is enforced by the automation-state contract; every name
+/// here is optional at the declaration level so one closed table serves all
+/// legs.
 ///
 /// `normalization_receipt_json` is the owner-issued schedule normalization
 /// envelope a create/edit leg retains beside its own immutable revision, and
@@ -849,8 +849,9 @@ static APPLY_INSTRUMENT_REGISTRY_PARAMETERS: [ParameterDeclaration; 1] = [Parame
 /// automation-state contract plus the backends decide its shape and its
 /// retention. Absence is never a synthesized receipt: a revision that
 /// retained no envelope leaves its compiled occurrence set unadmitted by name
-/// downstream.
-static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 10] = [
+/// downstream. `normalization_request_json` is the original authenticated
+/// producer request retained only by the internal normalization leg.
+static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 11] = [
     ParameterDeclaration {
         name: "operation",
         shape: ParameterShape::Subject,
@@ -883,6 +884,11 @@ static APPLY_USER_AUTOMATION_PARAMETERS: [ParameterDeclaration; 10] = [
     },
     ParameterDeclaration {
         name: "normalization_receipt_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "normalization_request_json",
         shape: ParameterShape::Subject,
         required: false,
     },

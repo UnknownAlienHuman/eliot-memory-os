@@ -2331,8 +2331,85 @@ async fn automation_state_payload(
         eliot_store_api::AUTOMATION_QUERY_FAILURE => {
             automation_failure_payload(db, config, state_fence, &decoded).await
         }
+        eliot_store_api::AUTOMATION_QUERY_NORMALIZATION => {
+            automation_normalization_payload(db, config, query, state_fence, &decoded).await
+        }
         _ => Err(AdapterError::Store(StoreError::UnknownOperation)),
     }
+}
+
+/// Reads one independently retained normalized revision by exact identity,
+/// scope, and fence. This projection is not an activation or current-pointer
+/// read.
+async fn automation_normalization_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+    decoded: &eliot_store_api::DecodedAutomationRead,
+) -> Result<Value, AdapterError> {
+    let scope_id =
+        query
+            .scope_id
+            .as_ref()
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "scope_id",
+                reason: "normalization reads require the exact automation scope",
+            }))?;
+    if scope_id.as_str() != eliot_store_api::USER_AUTOMATION_SCOPE {
+        return Err(AdapterError::Store(StoreError::InvalidField {
+            field: "scope_id",
+            reason: "normalization read scope does not match the canonical automation scope",
+        }));
+    }
+    let automation_id =
+        decoded
+            .automation_id
+            .as_deref()
+            .ok_or(AdapterError::Store(StoreError::InvalidField {
+                field: "automation.automation_id",
+                reason: "exact automation selector is required",
+            }))?;
+    let revision = decoded
+        .requested_revision
+        .as_deref()
+        .ok_or(AdapterError::Store(StoreError::InvalidField {
+            field: "automation.revision",
+            reason: "exact revision selector is required",
+        }))?;
+    let entries = match super::surreal_automation::read_normalization_for_read(
+        db,
+        config,
+        automation_id,
+        revision,
+    )
+    .await?
+    {
+        None => Vec::new(),
+        Some(row) => {
+            if row.automation_id != automation_id || row.revision != revision {
+                return Err(AdapterError::Store(StoreError::IdentityConflict));
+            }
+            if row.state_fence != *state_fence || row.scope_id != scope_id.as_str() {
+                Vec::new()
+            } else {
+                vec![json!({
+                    "automation_id": row.automation_id,
+                    "revision": row.revision,
+                    "normalization_request_json": row.normalization_request_json,
+                    "revision_json": row.revision_json,
+                    "normalization_receipt_json": row.normalization_receipt_json,
+                    "operation_id": row.operation_id,
+                    "idempotency_key": row.idempotency_key,
+                    "canonical_request_hash": row.canonical_request_hash,
+                    "state_fence": row.state_fence,
+                    "scope_id": row.scope_id,
+                    "task_id": row.task_id,
+                })]
+            }
+        }
+    };
+    Ok(json!({"entries": entries, "state_fence": state_fence}))
 }
 
 /// Projects the automation list from current pointers.

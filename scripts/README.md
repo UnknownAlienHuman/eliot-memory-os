@@ -55,6 +55,7 @@ committed as repository authority.
 | `audit_cue_kind_retirement.py` | Cross-package `CueKind` retirement oracle library over the static source/wire/caller denominator (#835); exercised by `scripts/tests/test_cue_kind_retirement.py` | Static source denominator evidence only |
 | `verify-excluded-dispositions-1811.py` | Fail-closed excluded/standalone disposition gate over standalone packages and root exclude entries with consumption evidence checks (#1811) | Static source and packaging evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
+| `capture_clippy_diagnostics.py` | Run `cargo clippy --locked --workspace --all-targets --message-format=json` once (#838 W1) and store the complete untruncated JSON stream with its source revision, tool identity, complete declared target denominator and the cfg predicates this run did not compile | Single-run source-capture evidence only; no lint-cleanliness, build-success or acceptance claim, and it never carries `-D warnings` |
 | `audit_host_diagnostic_coverage.py` | Bounded Host diagnostic coverage and identity validator (#985) | Static host diagnostic coverage evidence only |
 | `documentation_evidence_check.py` | Frozen outer documentation evidence package verifier (I18.31 W4) | Documentation evidence package re-extraction evidence only |
 | `gen_operator_schedule_contract.py` | Generate C# mirror of Kernel UserAutomation schedule contract (#2865) | Generated C# schedule contract mirror only |
