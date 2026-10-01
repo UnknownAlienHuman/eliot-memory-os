@@ -58,6 +58,7 @@ jobs:
         run: python -m pip install --disable-pip-version-check --no-input --require-hashes -r scripts/requirements-verification.txt
 
       - name: Cache Cargo inputs
+        id: cargo-inputs
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
@@ -126,6 +127,15 @@ jobs:
           $scannerDirectory = Join-Path $env:GITHUB_WORKSPACE $scanner.install_directory
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $scannerDirectory
           $env:PATH = $scannerDirectory + [IO.Path]::PathSeparator + $env:PATH
+          # Cold-cache vs warm-replay identity (issue #3004, audit 5887267578
+          # item 4): a cache miss means this run is the cold-cache candidate;
+          # a hit means it replays the exact declared inputs warm. Either way
+          # every mandatory gate still executes; a hit never skips a gate and
+          # never mints a pass receipt.
+          $cargoCacheHit = '${{ steps.cargo-inputs.outputs.cache-hit }}'
+          if ([string]::IsNullOrWhiteSpace($cargoCacheHit)) { $cargoCacheHit = 'unknown' }
+          Write-Host "PREPARE_CACHE: cargo cache_hit=$cargoCacheHit"
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Cargo cache: hit=$cargoCacheHit (miss=cold-cache candidate; hit=exact-input warm replay; a hit never skips a gate)"
           $preparationManifest = '.eliot/dependency-policy-preparation.json'
           $preparationOutput = @(& python scripts/prepare-dependency-policy-inputs.py --root . --profile offline-source --manifest-out $preparationManifest 2>&1)
           $preparationExit = $LASTEXITCODE
@@ -207,6 +217,61 @@ jobs:
           $rootFetchExit = $LASTEXITCODE
           Write-Host "PREPARE_ROOT_FETCH_LOCKED: exit=$rootFetchExit"
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Root cargo fetch --locked exit=$rootFetchExit (prepares the root resolution only; standalone resolution inputs are declared by the owner above)"
+          # Standalone-scope prefetch (issue #3004, audit 5887267578 item 2):
+          # for every standalone workspace the owner preparation above bound
+          # to a ready adjacent-lock record, fetch the exact lock-selected
+          # bytes (the nonmember verifier scope included) into the shared
+          # cargo cache before the read-only offline gate. --locked refuses
+          # to resolve anything new; the adjacent lock is re-hashed
+          # afterwards and must be byte-identical, proving the fetch mutated
+          # no input. Workspaces with no ready lock record (cold cache, #1229
+          # residual: no accepted lock-input contract) are reported, never
+          # resolved here; the offline gate reports the same inputs and owns
+          # the verdict.
+          $standalonePrefetchFailures = @()
+          $standalonePrefetchReady = @()
+          $standaloneRecord = $null
+          if ($null -ne $preparation -and $null -ne $preparation.inputs) {
+            foreach ($preparationInput in @($preparation.inputs)) {
+              if ([string]$preparationInput.input -eq 'standalone_resolver_inputs') {
+                $standaloneRecord = $preparationInput
+              }
+            }
+          }
+          if ($null -ne $standaloneRecord -and $null -ne $standaloneRecord.workspaces) {
+            foreach ($workspaceRecord in @($standaloneRecord.workspaces)) {
+              $workspaceLockDigest = ([string]$workspaceRecord.lock_sha256).ToLowerInvariant()
+              if ([string]$workspaceRecord.lock_status -eq 'ready' -and $workspaceLockDigest -match '^[0-9a-f]{64}$' -and -not [string]::IsNullOrWhiteSpace([string]$workspaceRecord.adjacent_lock) -and -not [string]::IsNullOrWhiteSpace([string]$workspaceRecord.manifest)) {
+                $standalonePrefetchReady += $workspaceRecord
+              }
+            }
+          }
+          if ($standalonePrefetchReady.Count -eq 0) {
+            Write-Host 'PREPARE_PREFETCH_STANDALONE: none (no ready adjacent-lock inputs; the offline gate reports the same inputs and owns the verdict)'
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Standalone prefetch: no ready lock inputs (cold cache and no #1229 retained-lock contract); nothing fetched, nothing resolved; the offline gate owns the verdict'
+          } else {
+            foreach ($workspaceRecord in $standalonePrefetchReady) {
+              $workspaceManifest = Join-Path $env:GITHUB_WORKSPACE ([string]$workspaceRecord.manifest)
+              $workspaceLock = Join-Path $env:GITHUB_WORKSPACE ([string]$workspaceRecord.adjacent_lock)
+              cargo fetch --locked --manifest-path $workspaceManifest
+              $workspaceFetchExit = $LASTEXITCODE
+              $workspacePostDigest = ''
+              if (Test-Path -LiteralPath $workspaceLock -PathType Leaf) {
+                $workspacePostDigest = ((Get-FileHash -LiteralPath $workspaceLock -Algorithm SHA256).Hash).ToLowerInvariant()
+              }
+              $workspaceUnchanged = ($workspaceFetchExit -eq 0 -and $workspacePostDigest -eq ([string]$workspaceRecord.lock_sha256).ToLowerInvariant())
+              Write-Host "PREPARE_PREFETCH_STANDALONE: manifest=$($workspaceRecord.manifest) exit=$workspaceFetchExit lock_unchanged=$workspaceUnchanged"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone prefetch $($workspaceRecord.manifest): exit=$workspaceFetchExit lock_unchanged=$workspaceUnchanged (exact lock-selected bytes only; the adjacent lock is never rewritten)"
+              if (-not $workspaceUnchanged) {
+                $standalonePrefetchFailures += [string]$workspaceRecord.manifest
+              }
+            }
+            if ($standalonePrefetchFailures.Count -eq 0) {
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Standalone prefetch: every ready adjacent lock byte-identical after fetch'
+            } else {
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Standalone prefetch lock drift: $($standalonePrefetchFailures -join ', ') (the offline gate below keeps the failed result failed)"
+            }
+          }
 
       - name: Bind integration candidate identity
         shell: pwsh
@@ -271,6 +336,56 @@ jobs:
       - name: Run MergeCompile verification profile
         shell: pwsh
         run: pwsh -NoProfile -File scripts/verify.ps1 -Profile MergeCompile
+
+      # Failure-diagnostics retention (issue #3004, audit 5887267578 item 4):
+      # when any gate fails, the proof-ceiling manifest below is skipped, so
+      # this step retains the failure diagnostics with source/profile/input
+      # identities instead. Digests are recomputed over the exact bytes on
+      # disk, never quoted from the files themselves. No upload-artifact pin
+      # is introduced: no upload-artifact SHA is verifiable from base content
+      # (see .github/workflows/integration.yml), so this step uses only the
+      # runner shell and the run log plus step summary carry the retained
+      # evidence. Report-only: it always exits 0 and never converts a failed
+      # gate into PASS; the gate owns the verdict.
+      - name: Retain failure diagnostics
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateSha = 'unknown'
+          try { $candidateSha = ((git rev-parse HEAD) | Out-String).Trim() } catch { $candidateSha = 'unknown' }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Failure diagnostics (MERGE_COMPILE_SOURCE_ONLY)'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Candidate source SHA=$candidateSha profile=MergeCompile event=$env:GITHUB_EVENT_NAME ref=$env:GITHUB_REF run=$env:GITHUB_RUN_ID"
+          $diagnosticPaths = @(
+            '.eliot/dependency-policy-preparation.json',
+            '.eliot/dependency-policy/surrealdb/provisioning-receipt.json',
+            '.eliot/dependency-policy-artifacts/sbom.json',
+            '.eliot/dependency-policy-artifacts/licenses.json',
+            '.eliot/dependency-policy-artifacts/advisories.json'
+          )
+          foreach ($diagnosticRelative in $diagnosticPaths) {
+            $diagnosticAbsolute = Join-Path $env:GITHUB_WORKSPACE $diagnosticRelative
+            try {
+              if (-not (Test-Path -LiteralPath $diagnosticAbsolute -PathType Leaf)) {
+                Write-Host "FAILURE_DIAGNOSTIC: path=$diagnosticRelative state=absent"
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Diagnostic ${diagnosticRelative}: absent (no provisioned material on this runner)"
+                continue
+              }
+              $diagnosticBytes = [System.IO.File]::ReadAllBytes($diagnosticAbsolute)
+              if ($diagnosticBytes.Length -eq 0) {
+                Write-Host "FAILURE_DIAGNOSTIC: path=$diagnosticRelative state=empty"
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Diagnostic ${diagnosticRelative}: empty"
+                continue
+              }
+              $diagnosticDigest = ([System.Security.Cryptography.SHA256]::Create().ComputeHash($diagnosticBytes) | ForEach-Object { $_.ToString('x2') }) -join ''
+              Write-Host "FAILURE_DIAGNOSTIC: path=$diagnosticRelative sha256=$diagnosticDigest bytes=$($diagnosticBytes.Length)"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Diagnostic ${diagnosticRelative}: sha256=$diagnosticDigest bytes=$($diagnosticBytes.Length)"
+            } catch {
+              Write-Host "FAILURE_DIAGNOSTIC: path=$diagnosticRelative state=unreadable $($_.Exception.Message)"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Diagnostic ${diagnosticRelative}: unreadable ($($_.Exception.Message))"
+            }
+          }
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Verdict ownership: the MergeCompile gate above owns the FAIL result; this step retains inputs only and never mints a pass receipt'
 
       - name: Record proof ceiling and manifest
         shell: pwsh

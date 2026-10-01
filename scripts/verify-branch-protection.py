@@ -69,13 +69,25 @@ class ReadError(Exception):
 
 
 def gh_api(path: str) -> tuple[int, str]:
-    """Run ``gh api`` and return (returncode, stdout)."""
-    proc = subprocess.run(
-        ["gh", "api", "--paginate", path],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    """Run ``gh api`` and return (returncode, stdout).
+
+    A missing/timed-out ``gh`` connection is a typed ``ReadError``, never an
+    unhandled traceback: W10 requires a blocking owner action when the
+    connection cannot read protection.
+    """
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "--paginate", path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except FileNotFoundError as exc:
+        raise ReadError(f"gh CLI not available on PATH: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ReadError(f"gh api timed out after 120s: {path}") from exc
+    except OSError as exc:
+        raise ReadError(f"gh api could not run: {exc}") from exc
     return proc.returncode, proc.stdout
 
 
@@ -250,6 +262,17 @@ def main(argv: list[str] | None = None) -> int:
         emitted = emitted_check_names(Path(args.emitter))
     except ReadError as exc:
         print(f"BP-READ-ERROR {exc}", file=sys.stderr)
+        if args.readback_out:
+            readback = {
+                "repo": args.repo,
+                "branch": args.branch,
+                "expected_rule": args.expect,
+                "verdict": "READ-ERROR",
+                "findings": [{"code": "BP-READ-ERROR", "detail": str(exc)}],
+                "observed": None,
+                "emitter": {"workflow": args.emitter, "emitted_check_names": []},
+            }
+            Path(args.readback_out).write_text(json.dumps(readback, indent=2) + "\n", encoding="utf-8")
         return 2
 
     findings = compare(expected, protection, rulesets, emitted)
