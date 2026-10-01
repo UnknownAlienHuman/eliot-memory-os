@@ -952,6 +952,10 @@ impl KernelComposition {
                         .map_err(|_| TransportError::SessionFenced)?
                         .reconcile(request.candidate.clone())
                         .map_err(|_| TransportError::SessionFenced)?;
+                    // The admitted candidate carries the Host-journal
+                    // Kernel incarnation. Publish it only after reconciliation
+                    // commits and releases the service lock.
+                    self.publish_crash_context();
                 }
                 KernelControlCommand::BootstrapStore(_)
                 | KernelControlCommand::Activate(_)
