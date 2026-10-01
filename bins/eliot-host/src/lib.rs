@@ -3582,6 +3582,7 @@ impl HostJobBranches {
             .enable_all()
             .build()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        let mut startup_report_compensation_attempted = false;
         let ready = runtime.block_on(async {
             let mut transport =
                 connect_authenticated_kernel_front_door(&candidate, process).await?;
@@ -3887,6 +3888,7 @@ impl HostJobBranches {
             )
             .await
             {
+                startup_report_compensation_attempted = true;
                 return match self
                     .revoke_host_supervision_evidence_async(generation)
                     .await
@@ -3940,7 +3942,22 @@ impl HostJobBranches {
         let (activation_receipt, ready) = match ready {
             Ok(receipts) => receipts,
             Err(error) => {
-                if let Err(revocation_error) = self.revoke_host_supervision_evidence(generation) {
+                if startup_report_compensation_attempted
+                    && matches!(
+                        &error,
+                        HostError::KernelSupervisionRevocationSuperseded(_)
+                            | HostError::KernelSupervisionRevocationUncontained(_)
+                    )
+                {
+                    // The inner Report-failure path already owns compensation.
+                    // In particular, do not CAS-revoke B after stale attempt A
+                    // was superseded by B.
+                    return Err(error);
+                }
+                if !startup_report_compensation_attempted
+                    && let Err(revocation_error) =
+                        self.revoke_host_supervision_evidence(generation)
+                {
                     return Err(revocation_error);
                 }
                 let failure = activation.fail("kernel-control-activation-failed");
