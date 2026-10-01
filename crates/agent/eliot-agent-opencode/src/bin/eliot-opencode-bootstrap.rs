@@ -5,8 +5,8 @@ use eliot_agent_api::{
 use eliot_agent_opencode::{
     AdmittedAttemptOutcome, AdmittedOpenCodeAttempt, BasicAuth, LoopbackEndpoint, ModelSelection,
     NoAuthorityRunResult, OpenCodeClient, OpenCodeRouteAdmission, OpenCodeRouteRole,
-    OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus,
-    classify_sealed_candidate, opencode_adapter_contract, opencode_pilot_observation,
+    OpenCodeRunError, OpenCodeRunPolicy, ReadOnlyRunRequest, RunStatus, classify_sealed_candidate,
+    opencode_adapter_contract, opencode_pilot_observation,
     opencode_pilot_observation_with_fallback, opencode_pilot_probe_evidence,
     redact_route_diagnostics, select_opencode_route, validate_opencode_adapter_contract,
 };

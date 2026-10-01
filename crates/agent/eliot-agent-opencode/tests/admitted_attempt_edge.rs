@@ -17,10 +17,10 @@ use eliot_agent_api::{
     WorkUnitId, candidate_digest_for,
 };
 use eliot_agent_opencode::{
-    AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedObservation,
-    AdmittedObservationKind, AdmittedOpenCodeAttempt, AuthorityCeiling, BasicAuth,
-    LoopbackEndpoint, ModelSelection, NoAuthorityRunResult, OpenCodeClient, OpenCodeRunPolicy,
-    OpenCodeWireRouteReceipt, QuotaAvailability, ReadOnlyRunRequest, RunStatus, UsageAvailability,
+    AdmittedAttemptCandidate, AdmittedAttemptError, AdmittedObservation, AdmittedObservationKind,
+    AdmittedOpenCodeAttempt, AuthorityCeiling, BasicAuth, LoopbackEndpoint, ModelSelection,
+    NoAuthorityRunResult, OpenCodeClient, OpenCodeRunPolicy, OpenCodeWireRouteReceipt,
+    QuotaAvailability, ReadOnlyRunRequest, RunStatus, UsageAvailability,
 };
 use eliot_contracts::{
     DecisionId, EpochId, EpochLineageId, LowercaseSha256, ResourceGeneration, StateFence, TaskId,
