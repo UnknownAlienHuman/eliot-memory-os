@@ -361,6 +361,8 @@ function Test-StoreCase7 {
     $allocB = Invoke-StoreAllocate -Binding $bindingB -Plan $planB -BaseTemp $base -Entropy { return 'e5f60718' } -PortReservation $reservationB
     Assert-StoreTrue $Failures ($allocA['runRoot'] -cne $allocB['runRoot']) '7-roots-unique'
     Assert-StoreTrue $Failures ($allocA['dataRoot'] -cne $allocB['dataRoot']) '7-data-unique'
+    Assert-StoreTrue $Failures ($allocA['logRoot'] -cne $allocB['logRoot']) '7-log-unique'
+    Assert-StoreTrue $Failures ($allocA['secretRoot'] -cne $allocB['secretRoot']) '7-secret-unique'
     Assert-StoreTrue $Failures ($allocA['namespace'] -cne $allocB['namespace']) '7-ns-unique'
     Assert-StoreTrue $Failures ($allocA['database'] -cne $allocB['database']) '7-db-unique'
     Assert-StoreTrue $Failures ($allocA['port'] -ne $allocB['port']) '7-ports-distinct'
@@ -368,6 +370,223 @@ function Test-StoreCase7 {
     Assert-StoreTrue $Failures ($allocA['endpoint'] -ceq '127.0.0.1:18101') '7-endpoint-shape'
     Assert-StoreTrue $Failures ($allocA['ownerMarker'] -ceq 'eliot-harness-owned-root-v1') '7-marker'
     Assert-StoreTrue $Failures ($allocA['reservationIdentity']['endpoint'] -ceq $allocA['endpoint']) '7-reservation-endpoint-bound'
+
+    # --- Ownership is a per-allocation identity, not a name prediction. --------
+    # The reserved endpoint is claimed by a registry identity built from this
+    # allocation's own run/owner/generation/seed/endpoint, so two allocations can
+    # never share one reservation record and a record cannot be re-registered
+    # while it is still live.
+    $identityA = $allocA['reservationIdentity']
+    $identityB = $allocB['reservationIdentity']
+    Assert-StoreTrue $Failures ($identityA -is [hashtable]) '7-identity-is-record'
+    Assert-StoreTrue $Failures ($identityB -is [hashtable]) '7-identity-b-record'
+    Assert-StoreTrue $Failures ([string]$identityA['reservationId'] -cne [string]$identityB['reservationId']) '7-identity-distinct'
+    Assert-StoreTrue $Failures ([string]$identityA['runId'] -ceq 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') '7-identity-run-bound'
+    Assert-StoreTrue $Failures ([string]$identityA['owner'] -ceq $bindingA['owner']) '7-identity-owner-bound'
+    Assert-StoreTrue $Failures ([int]$identityA['generation'] -eq [int]$bindingA['generation']) '7-identity-generation-bound'
+    Assert-StoreTrue $Failures ([string]$identityA['allocationSeed'] -ceq 'a1b2c3d4') '7-identity-seed-bound'
+    Assert-StoreTrue $Failures ([string]$identityA['state'] -ceq 'Pending') '7-identity-pending'
+    # The hold is proven, not asserted by shape: the module re-read the bound
+    # socket and classified the proof itself.
+    Assert-StoreTrue $Failures ([string]$identityA['reservationProof'] -ceq 'held-socket') '7-proof-held-socket'
+
+    # --- The atomic claim is the bind, proven on this host. -------------------
+    # While allocation A's reservation is live its exclusive loopback bind is
+    # still held, so a second exclusive bind of the same endpoint must be refused
+    # by the OS. That refusal is what makes the endpoint race-safe across runs;
+    # it is measured here rather than claimed.
+    $contender = $null
+    $refusal = ''
+    try {
+        $contender = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, [int]$allocA['port'])
+        $contender.ExclusiveAddressUse = $true
+        $contender.Start()
+    }
+    catch { $refusal = [string]$_.Exception.Message }
+    finally {
+        if ($null -ne $contender) { try { $contender.Stop() } catch { } }
+    }
+    Assert-StoreTrue $Failures (-not [string]::IsNullOrWhiteSpace($refusal)) '7-live-reservation-refuses-second-bind'
+
+    # A second allocation that claims the SAME endpoint while A still holds it is
+    # refused. This is the race in its own shape: the loser never receives an
+    # allocation, so it has no record it could use to affect the winner.
+    $racerPlan = Invoke-StorePlan -Binding $bindingB -Requirement (Get-StoreTestRequirement)
+    $racer = $null
+    $racerRefusal = ''
+    try {
+        $racer = Invoke-StoreAllocate -Binding $bindingB -Plan $racerPlan -BaseTemp $base `
+            -Entropy { return '5a6b7c8d' } -PortReservation $reservationA
+    }
+    catch { $racerRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ($null -eq $racer) '7-claiming-racer-refused'
+    Assert-StoreTrue $Failures ($racerRefusal -match 'STORE-PORT-CONFLICT|STORE-RESERVATION-REUSED') '7-claiming-racer-typed'
+    $afterRacer = [hashtable]$allocA['reservationIdentity']
+    Assert-StoreTrue $Failures ([string]$afterRacer['state'] -ceq 'Pending') '7-winner-still-holding-after-racer'
+    Assert-StoreTrue $Failures ([string]$afterRacer['endpoint'] -ceq [string]$allocA['endpoint']) '7-winner-endpoint-intact-after-racer'
+
+    # --- The registry, not just the OS, refuses to re-issue a live claim. -----
+    # A seam that hands allocation A's OWN still-held endpoint back to a second
+    # Allocate of the same run identity never gets to rebind it, so the module's
+    # own registry is what must refuse. Same seed => same reservation identity,
+    # so this is the reused-identity refusal.
+    $heldA = $null
+    if ($identityA.ContainsKey('listener')) { $heldA = $identityA['listener'] }
+    $heldShape = ($null -ne $heldA -and $heldA -is [System.Net.Sockets.TcpListener])
+    Assert-StoreTrue $Failures $heldShape '7-held-listener-in-identity'
+    $sameIdentity = $null
+    $sameIdentityRefusal = ''
+    try {
+        $sameIdentity = Invoke-StoreAllocate -Binding $bindingA -Plan $planA -BaseTemp $base `
+            -Entropy { return 'a1b2c3d4' } -PortReservation {
+            param($ctx) return @{ port = [int]$allocA['port']; host = '127.0.0.1'; listener = $heldA }
+        }.GetNewClosure()
+    }
+    catch { $sameIdentityRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ($null -eq $sameIdentity) '7-live-identity-not-reissued'
+    Assert-StoreTrue $Failures ($sameIdentityRefusal -match 'STORE-RESERVATION-REUSED') ('7-live-identity-typed: ' + $sameIdentityRefusal)
+    $afterSame = [hashtable]$allocA['reservationIdentity']
+    Assert-StoreTrue $Failures ([string]$afterSame['state'] -ceq 'Pending') '7-live-identity-left-winner-holding'
+
+    # A different seed makes a DIFFERENT reservation identity for the very same
+    # run, owner, generation and endpoint, so the per-run endpoint guard must
+    # refuse it too rather than let one run hold the same endpoint twice.
+    $otherIdentity = $null
+    $otherIdentityRefusal = ''
+    try {
+        $otherIdentity = Invoke-StoreAllocate -Binding $bindingA -Plan $planA -BaseTemp $base `
+            -Entropy { return '9f8e7d6c' } -PortReservation {
+            param($ctx) return @{ port = [int]$allocA['port']; host = '127.0.0.1'; listener = $heldA }
+        }.GetNewClosure()
+    }
+    catch { $otherIdentityRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ($null -eq $otherIdentity) '7-second-identity-same-endpoint-refused'
+    Assert-StoreTrue $Failures ($otherIdentityRefusal -match 'STORE-PORT-CONFLICT') ('7-second-identity-typed: ' + $otherIdentityRefusal)
+    $afterOther = [hashtable]$allocA['reservationIdentity']
+    Assert-StoreTrue $Failures ([string]$afterOther['state'] -ceq 'Pending') '7-second-identity-left-winner-holding'
+
+    # A reservation handle that carries no live bind at all is refused as a
+    # genuine port conflict rather than adopted, so a name alone can never stand
+    # in for the hold. This is the exact shape a losing racer would present: the
+    # right endpoint string and no ownership of it.
+    $unowned = $null
+    $unownedRefusal = ''
+    try {
+        $unowned = Invoke-StoreAllocate -Binding $bindingB -Plan $racerPlan -BaseTemp $base `
+            -Entropy { return '5a6b7c8d' } -PortReservation { param($ctx) return @{ port = 18105; host = '127.0.0.1' } }
+    }
+    catch { $unownedRefusal = [string]$_.Exception.Message }
+    # Either the allocation proceeds on its own owned endpoint, or it is refused.
+    # What must never happen is a second registry record for a live-held endpoint.
+    if ($null -ne $unowned) {
+        $unownedIdentity = [hashtable]$unowned['reservationIdentity']
+        Assert-StoreTrue $Failures ([string]$unownedIdentity['reservationProof'] -ceq 'seam-asserted') '7-unowned-no-live-bind'
+        Assert-StoreTrue $Failures ([string]$unownedIdentity['endpoint'] -cne [string]$allocA['endpoint']) '7-unowned-endpoint-distinct'
+    }
+    else {
+        Assert-StoreTrue $Failures ($unownedRefusal -match 'STORE-PORT-CONFLICT') '7-unowned-endpoint-typed'
+    }
+
+    # --- Losing racers cannot touch the winner's owned roots. -----------------
+    # Allocation A's run root is refused for a different owner even though its
+    # path is perfectly predictable, because ownership is read back from marker
+    # CONTENT and never inferred from the name.
+    $markerPath = [string]$allocA['markerPath']
+    $markerText = Get-Content -LiteralPath $markerPath -Raw
+    $marker = $markerText | ConvertFrom-Json
+    Assert-StoreTrue $Failures ([string]$marker.marker -ceq 'eliot-harness-owned-root-v1') '7-marker-content-value'
+    Assert-StoreTrue $Failures ([string]$marker.run_id -ceq 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') '7-marker-content-run'
+    Assert-StoreTrue $Failures ([string]$marker.owner -ceq $bindingA['owner']) '7-marker-content-owner'
+    Assert-StoreTrue $Failures ([int]$marker.generation -eq [int]$bindingA['generation']) '7-marker-content-generation'
+    $claimOwner = Test-StoreOwnedRootClaim -Recorded $marker -RunId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' `
+        -Owner $bindingA['owner'] -Generation ([int]$bindingA['generation'])
+    $claimOtherRun = Test-StoreOwnedRootClaim -Recorded $marker -RunId 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' `
+        -Owner $bindingA['owner'] -Generation ([int]$bindingA['generation'])
+    $claimOtherOwner = Test-StoreOwnedRootClaim -Recorded $marker -RunId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' `
+        -Owner 'someone-else' -Generation ([int]$bindingA['generation'])
+    $claimOtherGeneration = Test-StoreOwnedRootClaim -Recorded $marker -RunId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' `
+        -Owner $bindingA['owner'] -Generation 99
+    Assert-StoreTrue $Failures ([bool]$claimOwner) '7-claim-true-for-owner'
+    Assert-StoreTrue $Failures (-not [bool]$claimOtherRun) '7-claim-false-other-run'
+    Assert-StoreTrue $Failures (-not [bool]$claimOtherOwner) '7-claim-false-other-owner'
+    Assert-StoreTrue $Failures (-not [bool]$claimOtherGeneration) '7-claim-false-other-generation'
+
+    # Re-allocating A's own roots under a foreign owner is refused, and the
+    # refusal must not have released the endpoint A still owns.
+    $foreignBinding = Get-StoreTestBinding -RunId 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    $foreignBinding['owner'] = 'someone-else'
+    $foreignPlan = Invoke-StorePlan -Binding $foreignBinding -Requirement (Get-StoreTestRequirement)
+    $foreign = $null
+    $foreignRefusal = ''
+    try {
+        $foreign = Invoke-StoreAllocate -Binding $foreignBinding -Plan $foreignPlan -BaseTemp $base `
+            -Entropy { return 'a1b2c3d4' } -PortReservation { param($ctx) return (New-StoreTestReservation -Port 18104) }
+    }
+    catch { $foreignRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ($null -eq $foreign) '7-foreign-root-refused'
+    Assert-StoreTrue $Failures ($foreignRefusal -match 'STORE-FOREIGN-ROOT') '7-foreign-root-typed'
+    $afterForeign = [hashtable]$allocA['reservationIdentity']
+    Assert-StoreTrue $Failures ([string]$afterForeign['state'] -ceq 'Pending') '7-foreign-root-left-winner-holding'
+    Assert-StoreTrue $Failures ([string]$afterForeign['endpoint'] -ceq [string]$allocA['endpoint']) '7-foreign-root-endpoint-intact'
+
+    # --- The winner's endpoint is released exactly once, by reference. ---------
+    # The handoff re-proves the held socket still owns the loopback endpoint, then
+    # releases it and records the exact identity it released. A reservation that
+    # was lost cannot hand anything off.
+    $startA = Invoke-StoreStart -Binding $bindingA -Allocation $allocA -Acquisition (Get-StoreTestAcquisition) `
+        -Launcher (New-StoreTestLauncher -ObservedPid 7101 -Nonce '0a0b0c0d') -Entropy { return 'a1b2c3d4' }
+    Assert-StoreTrue $Failures ([string]$startA['startState'] -ceq 'StartRequested') '7-handoff-started'
+    $receiptA = $startA['reservationIdentity']
+    Assert-StoreTrue $Failures ([string]$receiptA['reservationId'] -ceq [string]$identityA['reservationId']) '7-handoff-same-identity'
+    Assert-StoreTrue $Failures ([string]$receiptA['endpoint'] -ceq [string]$allocA['endpoint']) '7-handoff-endpoint'
+    Assert-StoreTrue $Failures ([string]$receiptA['state'] -ceq 'Released') '7-handoff-released-once'
+    Assert-StoreTrue $Failures ([string]$receiptA['reservationProof'] -ceq 'held-socket') '7-handoff-proof-retained'
+
+    # The endpoint is now free, so a competing run can take it: a released
+    # reservation is not an eternal claim, and the module does not refuse a
+    # legitimate new owner of a freed port.
+    $reused = $null
+    $reusedRefusal = ''
+    try {
+        $reused = Invoke-StoreAllocate -Binding $bindingB -Plan $racerPlan -BaseTemp $base `
+            -Entropy { return '5a6b7c8d' } -PortReservation { param($ctx) return (New-StoreTestReservation -Port ([int]$allocA['port'])) }
+    }
+    catch { $reusedRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures ($null -ne $reused) ('7-released-endpoint-reusable: ' + $reusedRefusal)
+
+    # B still holds its own distinct endpoint, unaffected by A's handoff.
+    $identityB2 = [hashtable]$allocB['reservationIdentity']
+    Assert-StoreTrue $Failures ([string]$identityB2['state'] -ceq 'Pending') '7-competitor-unaffected'
+    Assert-StoreTrue $Failures ([string]$identityB2['endpoint'] -ceq [string]$allocB['endpoint']) '7-competitor-endpoint-intact'
+
+    # A handoff identity whose binding no longer matches its allocation cannot
+    # authorize a launch: the reservation is proven against the allocation's own
+    # run/owner/generation/endpoint, so a foreign identity for the same endpoint
+    # is refused before any process exists.
+    $forged = @{}
+    foreach ($key in $allocA.Keys) { $forged[$key] = $allocA[$key] }
+    $forged['reservationIdentity'] = @{
+        reservationId   = [string]$identityA['reservationId']
+        runId           = 'cccccccccccccccccccccccccccccccc'
+        owner           = 'someone-else'
+        generation      = 7
+        allocationSeed  = 'cafebabe'
+        endpoint        = [string]$allocA['endpoint']
+        reservationProof = 'held-socket'
+        state           = 'Pending'
+        listener        = $null
+    }
+    $forgedRefusal = ''
+    $forgedLaunched = $false
+    try {
+        $forgedReceipt = Invoke-StoreStart -Binding $bindingA -Allocation $forged `
+            -Acquisition (Get-StoreTestAcquisition) -Launcher (New-StoreTestLauncher -ObservedPid 7202 -Nonce '1e1f2a2b') `
+            -Entropy { return 'a1b2c3d4' }
+        $forgedLaunched = ([string]$forgedReceipt['startState'] -ceq 'StartRequested')
+    }
+    catch { $forgedRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures (-not $forgedLaunched) '7-forged-identity-refused'
+    Assert-StoreTrue $Failures ($forgedRefusal -match 'STORE-RESERVATION-') ('7-forged-identity-typed: ' + $forgedRefusal)
 }
 
 # ---------------------------------------------------------------------------
@@ -411,7 +630,11 @@ function Test-StoreCase9 {
         [void]$Failures.Add('9-conflict-expected-throw')
     }
     catch {
-        Assert-StoreTrue $Failures ($_.Exception.Message -match 'STORE-PORT-RESERVATION-UNKNOWN') '9-conflict-typed'
+        # A reservation that cannot be taken is a typed port conflict. The
+        # module wraps an untyped seam exception as STORE-PORT-CONFLICT and
+        # re-throws an already-typed STORE-* refusal unchanged, so this covers
+        # both the seam that failed opaquely and one that refused for itself.
+        Assert-StoreTrue $Failures ($_.Exception.Message -match '^STORE-(PORT-CONFLICT|PORT-RESERVATION-UNKNOWN|RESERVATION-REUSED)') '9-conflict-typed'
     }
 }
 
