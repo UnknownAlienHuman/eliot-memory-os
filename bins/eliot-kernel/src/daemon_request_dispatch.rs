@@ -77,6 +77,10 @@ use serde::Deserialize;
 use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
 use super::admission_reservation_use_route::OPERATION
     as ADMISSION_RESERVATION_CURRENT_USE_OPERATION;
+use super::admission_reservation_saga::{
+    INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION,
+    INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION,
+};
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
     ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
@@ -666,6 +670,12 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         ADMISSION_RESERVATION_ADMIT_OPERATION => ADMISSION_RESERVATION_ADMIT_OPERATION,
         ADMISSION_RESERVATION_CURRENT_USE_OPERATION => {
             ADMISSION_RESERVATION_CURRENT_USE_OPERATION
+        }
+        INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION => {
+            INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION
+        }
+        INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION => {
+            INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION
         }
         INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION => {
             INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
@@ -3197,6 +3207,46 @@ impl KernelComposition {
                 serde_json::from_value(without_daemon_routing_key(payload.clone())?)
                     .map_err(|_| TransportError::SessionFenced)?;
             let value = self.read_operator_registry_registration_status(session, &body, identity)?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION {
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value = self
+                .instrument_registry_effect_reservation_stage_operation(
+                    session,
+                    payload.clone(),
+                    Some(identity),
+                )
+                .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION {
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value = self
+                .instrument_registry_effect_reservation_activate_operation(
+                    session,
+                    payload.clone(),
+                    Some(identity),
+                )
+                .await?;
             let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
             frame.request_id = Some(request_id);
             frame.validate()?;

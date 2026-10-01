@@ -3883,6 +3883,144 @@ pub struct InstrumentRegistryRegistrationStatusRequest {
     pub work_scope_id: String,
 }
 
+/// Closed Kernel D1 stage request for the separate E source-snapshot effect
+/// reservation. The authenticated outer request identity remains the original
+/// selected-source S identity; this body carries its durable selector and the
+/// distinct E child identity/owner claim references.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryEffectReservationStageRequest {
+    /// Stable request wire identity.
+    pub wire_id: String,
+    /// Request contract version.
+    pub wire_version: u16,
+    /// Original selected-source S operation handle.
+    pub parent_operation_id: String,
+    /// Exact original selected-source S envelope digest.
+    pub parent_request_digest: String,
+    /// Exact E child identity issued by the Governor owner.
+    pub child_request_identity: RequestIdentity,
+    /// E WorkScope selected by the Governor owner.
+    pub work_scope_id: String,
+    /// Owner-issued work item identity.
+    pub work_item_id: String,
+    /// Owner-issued proposed attempt identity.
+    pub proposed_attempt_id: String,
+    /// Complete five-role ORS claim set, parsed into the typed ORS contract by Kernel.
+    pub claims: serde_json::Value,
+    /// Governor's exact semantic admission revision.
+    pub semantic_admission_revision: String,
+    /// Digest of the exact E ActionContract bytes.
+    pub action_contract_sha256: String,
+    /// Exact claim/attempt expiry boundary, in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+}
+
+/// Closed Kernel D1 activation request for one staged source-snapshot E
+/// reservation. The two canonical receipts are carried as JSON only because
+/// the protocol crate does not depend on the storage API; Kernel strictly
+/// decodes them as owner-issued `WriteReceipt` values before ORS activation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryEffectReservationActivateRequest {
+    /// Stable request wire identity.
+    pub wire_id: String,
+    /// Request contract version.
+    pub wire_version: u16,
+    /// Original selected-source S operation handle.
+    pub parent_operation_id: String,
+    /// Exact original selected-source S envelope digest.
+    pub parent_request_digest: String,
+    /// Exact E child identity issued by the Governor owner.
+    pub child_request_identity: RequestIdentity,
+    /// E WorkScope selected by the Governor owner.
+    pub work_scope_id: String,
+    /// Kernel-derived reservation identity returned by stage.
+    pub reservation_id: String,
+    /// Owner-issued work item identity.
+    pub work_item_id: String,
+    /// Owner-issued proposed attempt identity.
+    pub proposed_attempt_id: String,
+    /// Complete five-role ORS claim set, compared against the staged row.
+    pub claims: serde_json::Value,
+    /// Governor's exact semantic admission revision used for stage.
+    pub semantic_admission_revision: String,
+    /// Digest of the exact E ActionContract bytes.
+    pub action_contract_sha256: String,
+    /// Original canonical owner's committed `ADMITTED` WriteReceipt.
+    pub canonical_write_receipt: serde_json::Value,
+    /// Exact same-operation receipt readback returned by the canonical owner.
+    pub canonical_receipt_readback: serde_json::Value,
+}
+
+/// Original durable Kernel/ORS readback returned after D1 stage.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryEffectReservationStageResponse {
+    /// Original selected-source S operation selector.
+    pub parent_operation_id: String,
+    /// Original selected-source S envelope digest.
+    pub parent_request_digest: String,
+    /// Full retained S identity (not reconstructed from the ORS projection).
+    pub parent_request_identity: RequestIdentity,
+    /// Exact child E identity presented by the Governor owner.
+    pub child_request_identity: RequestIdentity,
+    /// Governor-selected WorkScope identifier.
+    pub work_scope_id: String,
+    /// Kernel-derived ORS reservation identity.
+    pub reservation_id: String,
+    /// Exact owner work item identity read from the staged row.
+    pub work_item_id: String,
+    /// Exact owner proposed attempt identity read from the staged row.
+    pub proposed_attempt_id: String,
+    /// Exact ORS reservation record read back after stage.
+    pub record: serde_json::Value,
+    /// Exact original ORS OperationalMutationReceipt for the record.
+    pub receipt: serde_json::Value,
+    /// The receipt's own operation order; this is not a separately asserted semantic revision.
+    pub receipt_operation_order: u64,
+    /// Exact current ORS row operation identity.
+    pub row_operation_id: String,
+    /// Exact StateFenceSnapshot read from the ORS row.
+    pub state_fence: serde_json::Value,
+    /// Exact epoch lineage read from the ORS row.
+    pub authority_epoch: serde_json::Value,
+}
+
+/// Original durable Kernel/ORS readback returned after D1 activation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryEffectReservationActivateResponse {
+    /// Original selected-source S operation selector.
+    pub parent_operation_id: String,
+    /// Original selected-source S envelope digest.
+    pub parent_request_digest: String,
+    /// Full retained S identity (not reconstructed from the ORS projection).
+    pub parent_request_identity: RequestIdentity,
+    /// Exact child E identity presented by the Governor owner.
+    pub child_request_identity: RequestIdentity,
+    /// Governor-selected WorkScope identifier.
+    pub work_scope_id: String,
+    /// Kernel-derived ORS reservation identity.
+    pub reservation_id: String,
+    /// Exact ORS reservation record read back after activation.
+    pub record: serde_json::Value,
+    /// Exact original ORS OperationalMutationReceipt for the active record.
+    pub receipt: serde_json::Value,
+    /// The receipt's own operation order; this is not a separately asserted semantic revision.
+    pub receipt_operation_order: u64,
+    /// Exact current ORS row operation identity.
+    pub row_operation_id: String,
+    /// Exact StateFenceSnapshot read from the ORS row.
+    pub state_fence: serde_json::Value,
+    /// Exact epoch lineage read from the ORS row.
+    pub authority_epoch: serde_json::Value,
+    /// Original ORS activation receipt reference read back from the active row.
+    pub activation_receipt: serde_json::Value,
+    /// Original canonical ADMITTED receipt reference retained by the active row.
+    pub canonical_admission_receipt: serde_json::Value,
+}
+
 /// Closed authenticated operator route for the inert registry registration
 /// candidate. The outer EBP frame supplies the original RequestIdentity.
 pub const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
@@ -3890,6 +4028,12 @@ pub const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
 /// Authenticated operator readback of one durable registry registration.
 pub const INSTRUMENT_REGISTRY_REGISTRATION_STATUS_OPERATION: &str =
     "instrument_registry_registration.status";
+/// Kernel D1 operation that stages the separate source-snapshot E reservation.
+pub const INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION: &str =
+    "admission_reservation.source_snapshot.stage";
+/// Kernel D1 operation that activates the same reservation from canonical owner evidence.
+pub const INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION: &str =
+    "admission_reservation.source_snapshot.activate";
 
 impl InstrumentRegistryRegistrationOperatorRequest {
     /// Stable closed request wire identity.
@@ -3963,6 +4107,328 @@ impl InstrumentRegistryRegistrationStatusRequest {
             MAX_HOST_REQUEST_TEXT_BYTES,
         )
     }
+}
+
+impl InstrumentRegistryEffectReservationStageRequest {
+    /// Stable request wire identity.
+    pub const WIRE_ID: &'static str = "eliot.instrument-registry-effect-reservation.stage";
+    /// Current request contract version.
+    pub const WIRE_VERSION: u16 = 1;
+
+    /// Validates shape and child identity without granting reservation authority.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_effect_reservation_stage.wire",
+                reason: "unsupported source-snapshot reservation stage request",
+            });
+        }
+        validate_parent_host_request_selector(
+            &self.parent_operation_id,
+            &self.parent_request_digest,
+            "instrument_registry_effect_reservation_stage",
+        )?;
+        self.child_request_identity
+            .validate()
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "instrument_registry_effect_reservation_stage.child_request_identity",
+                reason: "child request identity is invalid",
+            })?;
+        bounded_text(
+            &self.work_scope_id,
+            "instrument_registry_effect_reservation_stage.work_scope_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.work_item_id,
+            "instrument_registry_effect_reservation_stage.work_item_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        bounded_text(
+            &self.proposed_attempt_id,
+            "instrument_registry_effect_reservation_stage.proposed_attempt_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if !self.claims.is_object() {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_effect_reservation_stage.claims",
+                reason: "must be a closed object decoded by the ORS owner",
+            });
+        }
+        bounded_text(
+            &self.semantic_admission_revision,
+            "instrument_registry_effect_reservation_stage.semantic_admission_revision",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        lowercase_sha256(
+            &self.action_contract_sha256,
+            "instrument_registry_effect_reservation_stage.action_contract_sha256",
+        )?;
+        if self.expires_at_unix_ms == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_effect_reservation_stage.expires_at_unix_ms",
+                reason: "must be a positive Unix-millisecond boundary",
+            });
+        }
+        Ok(())
+    }
+
+    /// Derives the revision string that binds parent S, distinct child E,
+    /// semantic owner revision and ActionContract digest into the existing ORS
+    /// reservation-identity preimage. This is an identity join, not authority.
+    pub fn derived_semantic_admission_revision(&self) -> Result<String, ProtocolError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(&serde_json::json!({
+            "domain": "eliot.instrument-registry.source-snapshot-e-reservation.v1",
+            "parent_operation_id": self.parent_operation_id,
+            "parent_request_digest": self.parent_request_digest,
+            "child_request_identity": self.child_request_identity,
+            "work_scope_id": self.work_scope_id,
+            "semantic_admission_revision": self.semantic_admission_revision,
+            "action_contract_sha256": self.action_contract_sha256,
+        }))
+        .map_err(|_| ProtocolError::Json("reservation revision encoding failed".to_owned()))?;
+        Ok(format!(
+            "source-snapshot-e:v1:{}",
+            eliot_contracts::sha256_hex(&bytes)
+        ))
+    }
+}
+
+impl InstrumentRegistryEffectReservationActivateRequest {
+    /// Stable request wire identity.
+    pub const WIRE_ID: &'static str = "eliot.instrument-registry-effect-reservation.activate";
+    /// Current request contract version.
+    pub const WIRE_VERSION: u16 = 1;
+
+    /// Validates immutable joins and evidence container shape. Receipt meaning
+    /// is checked by Kernel against the staged ORS row and canonical owner.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_effect_reservation_activate.wire",
+                reason: "unsupported source-snapshot reservation activation request",
+            });
+        }
+        validate_parent_host_request_selector(
+            &self.parent_operation_id,
+            &self.parent_request_digest,
+            "instrument_registry_effect_reservation_activate",
+        )?;
+        self.child_request_identity
+            .validate()
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "instrument_registry_effect_reservation_activate.child_request_identity",
+                reason: "child request identity is invalid",
+            })?;
+        for (value, field) in [
+            (&self.work_scope_id, "work_scope_id"),
+            (&self.reservation_id, "reservation_id"),
+            (&self.work_item_id, "work_item_id"),
+            (&self.proposed_attempt_id, "proposed_attempt_id"),
+            (
+                &self.semantic_admission_revision,
+                "semantic_admission_revision",
+            ),
+        ] {
+            bounded_text(
+                value,
+                match field {
+                    "work_scope_id" => "instrument_registry_effect_reservation_activate.work_scope_id",
+                    "reservation_id" => "instrument_registry_effect_reservation_activate.reservation_id",
+                    "work_item_id" => "instrument_registry_effect_reservation_activate.work_item_id",
+                    "proposed_attempt_id" => "instrument_registry_effect_reservation_activate.proposed_attempt_id",
+                    _ => "instrument_registry_effect_reservation_activate.semantic_admission_revision",
+                },
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
+        self.reservation_id
+            .strip_prefix("admission-reservation:")
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or(ProtocolError::InvalidField {
+                field: "instrument_registry_effect_reservation_activate.reservation_id",
+                reason: "must be a Kernel-derived admission reservation identity",
+            })?;
+        if !self.claims.is_object()
+            || !self.canonical_write_receipt.is_object()
+            || !self.canonical_receipt_readback.is_object()
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_effect_reservation_activate.evidence",
+                reason: "claims and canonical receipt evidence must be objects",
+            });
+        }
+        lowercase_sha256(
+            &self.action_contract_sha256,
+            "instrument_registry_effect_reservation_activate.action_contract_sha256",
+        )
+    }
+
+    /// Re-derives the D1 semantic revision join from the exact activation
+    /// carrier. Kernel uses this to recompute the same ORS reservation identity
+    /// that the stage route issued; the value is an identity join, not authority.
+    pub fn derived_semantic_admission_revision(&self) -> Result<String, ProtocolError> {
+        self.validate()?;
+        let bytes = canonical_json_bytes(&serde_json::json!({
+            "domain": "eliot.instrument-registry.source-snapshot-e-reservation.v1",
+            "parent_operation_id": self.parent_operation_id,
+            "parent_request_digest": self.parent_request_digest,
+            "child_request_identity": self.child_request_identity,
+            "work_scope_id": self.work_scope_id,
+            "semantic_admission_revision": self.semantic_admission_revision,
+            "action_contract_sha256": self.action_contract_sha256,
+        }))
+        .map_err(|_| ProtocolError::Json("reservation revision encoding failed".to_owned()))?;
+        Ok(format!(
+            "source-snapshot-e:v1:{}",
+            eliot_contracts::sha256_hex(&bytes)
+        ))
+    }
+}
+
+#[cfg(test)]
+mod instrument_registry_effect_reservation_tests {
+    use super::*;
+    use eliot_contracts::{
+        ClockReading, EpochLineageId, ProductId, RequestId, ResourceGeneration, SessionId,
+        SourceId, StateFence, TaskId,
+    };
+    use eliot_receipts::{RequestBinding, RequestMetadata};
+
+    fn identity() -> RequestIdentity {
+        let fence = StateFence::new(
+            EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("lineage"),
+                std::num::NonZeroU64::new(1).expect("sequence"),
+            )
+            .expect("epoch"),
+            ResourceGeneration::genesis(),
+        );
+        RequestIdentity {
+            request: RequestBinding {
+                metadata: RequestMetadata {
+                    request_id: RequestId::new("request-d1-s").expect("request"),
+                    session_id: Some(SessionId::new("session-d1").expect("session")),
+                    task_id: Some(TaskId::new("task-d1").expect("task")),
+                    product_id: ProductId::new("product-d1").expect("product"),
+                    source_id: SourceId::new("source-d1").expect("source"),
+                    state_fence: fence.clone(),
+                    clock: ClockReading {
+                        valid_time_ms: Some(1),
+                        known_time_ms: Some(1),
+                        transaction_sequence: None,
+                        monotonic_ns: None,
+                    },
+                },
+                state_fence: fence,
+            },
+            idempotency_key: "idem-d1".to_owned(),
+            deadline_unix_ms: 100,
+            cancellation_id: "cancel-d1".to_owned(),
+        }
+    }
+
+    fn stage_request() -> InstrumentRegistryEffectReservationStageRequest {
+        InstrumentRegistryEffectReservationStageRequest {
+            wire_id: InstrumentRegistryEffectReservationStageRequest::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryEffectReservationStageRequest::WIRE_VERSION,
+            parent_operation_id: format!("hostreq:{}", "a".repeat(64)),
+            parent_request_digest: "a".repeat(64),
+            child_request_identity: identity(),
+            work_scope_id: "scope-d1".to_owned(),
+            work_item_id: "work-d1".to_owned(),
+            proposed_attempt_id: "attempt-d1".to_owned(),
+            claims: serde_json::json!({
+                "resources": {"reference":"resource-d1", "sha256":"b".repeat(64)},
+                "lane": {"reference":"lane-d1", "sha256":"c".repeat(64)},
+                "environment": {"reference":"env-d1", "sha256":"d".repeat(64)},
+                "effects": {"reference":"effects-d1", "sha256":"e".repeat(64)},
+                "quota_view": {"reference":"quota-d1", "sha256":"f".repeat(64)}
+            }),
+            semantic_admission_revision: "revision-d1".to_owned(),
+            action_contract_sha256: "0".repeat(64),
+            expires_at_unix_ms: 90,
+        }
+    }
+
+    #[test]
+    fn issue_1814_source_snapshot_reservation_stage_accepts_closed_bound_carrier() {
+        let request = stage_request();
+        request.validate().expect("valid stage carrier");
+        assert!(request
+            .derived_semantic_admission_revision()
+            .expect("derived identity join")
+            .starts_with("source-snapshot-e:v1:"));
+    }
+
+    #[test]
+    fn issue_1814_source_snapshot_reservation_stage_refuses_selector_or_claim_substitution() {
+        let mut changed = stage_request();
+        changed.parent_operation_id = format!("hostreq:{}", "1".repeat(64));
+        assert!(changed.validate().is_err());
+
+        let mut wrong_wire = stage_request();
+        wrong_wire.wire_version += 1;
+        assert!(wrong_wire.validate().is_err());
+        let mut bad_claim_shape = stage_request();
+        bad_claim_shape.claims = serde_json::json!([]);
+        assert!(bad_claim_shape.validate().is_err());
+    }
+
+    #[test]
+    fn issue_1814_source_snapshot_reservation_activation_requires_exact_carriers() {
+        let stage = stage_request();
+        let activation = InstrumentRegistryEffectReservationActivateRequest {
+            wire_id: InstrumentRegistryEffectReservationActivateRequest::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryEffectReservationActivateRequest::WIRE_VERSION,
+            parent_operation_id: stage.parent_operation_id.clone(),
+            parent_request_digest: stage.parent_request_digest.clone(),
+            child_request_identity: stage.child_request_identity.clone(),
+            work_scope_id: stage.work_scope_id.clone(),
+            reservation_id: format!("admission-reservation:{}", "a".repeat(64)),
+            work_item_id: stage.work_item_id.clone(),
+            proposed_attempt_id: stage.proposed_attempt_id.clone(),
+            claims: stage.claims.clone(),
+            semantic_admission_revision: stage
+                .derived_semantic_admission_revision()
+                .expect("derived revision"),
+            action_contract_sha256: stage.action_contract_sha256.clone(),
+            canonical_write_receipt: serde_json::json!({"owner": "canonical"}),
+            canonical_receipt_readback: serde_json::json!({"owner": "canonical"}),
+        };
+        activation.validate().expect("valid closed activation carrier");
+
+        let mut substituted = activation;
+        substituted.reservation_id = "caller-selected".to_owned();
+        assert!(substituted.validate().is_err());
+    }
+}
+
+fn validate_parent_host_request_selector(
+    operation_id: &str,
+    request_digest: &str,
+    field_prefix: &'static str,
+) -> Result<(), ProtocolError> {
+    bounded_text(
+        operation_id,
+        "host_request.parent_operation_id",
+        MAX_HOST_REQUEST_TEXT_BYTES,
+    )?;
+    lowercase_sha256(request_digest, "host_request.parent_request_digest")?;
+    if operation_id != format!("hostreq:{request_digest}") {
+        return Err(ProtocolError::InvalidField {
+            field: field_prefix,
+            reason: "parent operation must be the exact handle for its request digest",
+        });
+    }
+    Ok(())
 }
 
 impl InstrumentRegistryRegistrationInvocation {

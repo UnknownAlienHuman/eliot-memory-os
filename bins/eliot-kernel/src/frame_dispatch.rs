@@ -10,7 +10,11 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
-use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
+use super::admission_reservation_saga::{
+    ADMISSION_RESERVATION_ADMIT_OPERATION,
+    INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION,
+    INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION,
+};
 use super::admission_reservation_use_route::OPERATION as ADMISSION_RESERVATION_CURRENT_USE_OPERATION;
 use super::daemon_request_dispatch::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
@@ -1614,6 +1618,8 @@ fn is_daemon_operation(operation: &str) -> bool {
             // reads the canonical owner's own `WriteReceipt` for the original
             // operation identity, so the frame admits nothing.
             | ADMISSION_RESERVATION_ADMIT_OPERATION
+            | INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION
+            | INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION
             // The original-reservation read is a separate authenticated
             // daemon operation and must reach its owner route rather than the
             // generic process-execution decoder.

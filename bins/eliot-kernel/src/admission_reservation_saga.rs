@@ -139,6 +139,12 @@ use super::{KernelComposition, Session, TransportError};
 /// and `frame_dispatch` admits the frame. It is not a probe, a helper, or an
 /// unhooked surface.
 pub(crate) const ADMISSION_RESERVATION_ADMIT_OPERATION: &str = "admission_reservation.admit";
+/// D1 stage route for the distinct E source-snapshot effect reservation.
+pub(crate) const INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION: &str =
+    eliot_protocol::INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION;
+/// D1 activation route for the staged source-snapshot effect reservation.
+pub(crate) const INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION: &str =
+    eliot_protocol::INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION;
 
 /// ORS operational-kind key prefix for one admission reservation row.
 ///
@@ -721,6 +727,377 @@ impl OrsGenerationCoordinator {
         }
         observe_admission_saga("kernel.admission_reservation.recovery_completed", "success");
         Ok(nonterminal)
+    }
+}
+
+#[cfg(windows)]
+impl KernelComposition {
+    /// Stages the separate E reservation for the original selected-source S
+    /// request. The full S identity must still be retained in the bounded
+    /// Kernel queue; ORS's projection intentionally lacks Product/Source/Clock.
+    pub(crate) async fn instrument_registry_effect_reservation_stage_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+        outer_identity: Option<&eliot_protocol::RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        use super::daemon_request_dispatch::{
+            validate_store_session_fence, without_daemon_routing_key,
+        };
+        use eliot_ors::{
+            AdmissionReservationIdentityInput, AdmissionReservationStageRequest,
+            OperationIdentity as OrsOperationIdentity, admission_reservation_identity,
+            epoch_lineage_for, stage_admission_reservation_inactive, stage_operation_identity,
+            StateFenceSnapshot,
+        };
+
+        let request: eliot_protocol::InstrumentRegistryEffectReservationStageRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        request.validate().map_err(|_| TransportError::SessionFenced)?;
+        let parent_identity = outer_identity.ok_or(TransportError::SessionFenced)?;
+        parent_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        validate_store_session_fence(session, &parent_identity.request.state_fence)?;
+        if parent_identity.request.state_fence != request.child_request_identity.request.state_fence
+            || parent_identity.request.metadata.task_id
+                != request.child_request_identity.request.metadata.task_id
+            || parent_identity.request.metadata.session_id
+                != request.child_request_identity.request.metadata.session_id
+            || parent_identity.request.metadata.product_id
+                != request.child_request_identity.request.metadata.product_id
+            || parent_identity.request.metadata.source_id
+                != request.child_request_identity.request.metadata.source_id
+            || request.child_request_identity.deadline_unix_ms > parent_identity.deadline_unix_ms
+            || request.expires_at_unix_ms > request.child_request_identity.deadline_unix_ms
+        {
+            return Err(TransportError::SessionFenced);
+        }
+
+        let retained_parent = self.retained_selected_source_parent_identity(
+            &request.parent_operation_id,
+            &request.parent_request_digest,
+        )?;
+        if &retained_parent != parent_identity
+            || retained_parent.request.state_fence != parent_identity.request.state_fence
+            || request.child_request_identity.request.metadata.request_id
+                == retained_parent.request.metadata.request_id
+            || request.child_request_identity.idempotency_key == retained_parent.idempotency_key
+            || request.child_request_identity.cancellation_id == retained_parent.cancellation_id
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let parent_operation = OrsOperationIdentity::new(&request.parent_operation_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let parent_record = self
+            .generation_gateway
+            .ors
+            .load_host_request(&parent_operation, &request.parent_request_digest)
+            .map_err(|_| TransportError::SessionFenced)?
+            .ok_or(TransportError::UnknownRequest)?;
+        if parent_record.kind != eliot_ors::HostRequestKind::SelectedSourceCapture
+            || parent_record.request_digest != request.parent_request_digest
+            || parent_record.capability_ref.as_str() != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
+            || parent_record.payload_schema_id.as_ref().map(|value| value.as_str())
+                != Some(eliot_protocol::SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID)
+            || parent_record.scope_ref.as_ref().map(|value| value.as_str())
+                != Some(request.work_scope_id.as_str())
+            || parent_record.task_ref.as_ref().map(|value| value.as_str())
+                != retained_parent.request.metadata.task_id.as_ref().map(ToString::to_string).as_deref()
+            || parent_record.session_ref.as_ref().map(|value| value.as_str())
+                != retained_parent.request.metadata.session_id.as_ref().map(ToString::to_string).as_deref()
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let claims: eliot_ors::AdmissionReservationClaims =
+            serde_json::from_value(request.claims.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+        claims.validate().map_err(|_| TransportError::SessionFenced)?;
+        let revision = request
+            .derived_semantic_admission_revision()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state_fence = StateFenceSnapshot::capture(
+            &request.child_request_identity.request.state_fence,
+            request
+                .child_request_identity
+                .request
+                .state_fence
+                .authority_epoch
+                .sequence
+                .get(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let authority_epoch = epoch_lineage_for(
+            &request.child_request_identity.request.state_fence.authority_epoch,
+            None,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let work_item_id = OrsOperationIdentity::new(&request.work_item_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let proposed_attempt_id = OrsOperationIdentity::new(&request.proposed_attempt_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let identity_input = AdmissionReservationIdentityInput {
+            work_item_id: work_item_id.clone(),
+            proposed_attempt_id: proposed_attempt_id.clone(),
+            semantic_admission_revision: revision,
+            claims: claims.clone(),
+            state_fence: state_fence.clone(),
+            authority_epoch: authority_epoch.clone(),
+        };
+        let reservation_id = admission_reservation_identity(&identity_input)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let stage_operation_id = stage_operation_identity(&reservation_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let now_unix_ms = i64::try_from(super::unix_ms())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let expires_at_ms = i64::try_from(request.expires_at_unix_ms)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let staged = stage_admission_reservation_inactive(
+            self.generation_gateway.ors.as_ref(),
+            &AdmissionReservationStageRequest {
+                reservation_id: reservation_id.clone(),
+                work_item_id: work_item_id.clone(),
+                proposed_attempt_id: proposed_attempt_id.clone(),
+                operation_id: stage_operation_id,
+                claims,
+                authority_epoch,
+                state_fence,
+                expires_at_ms,
+                now_unix_ms,
+            },
+        )
+        .map_err(|_| TransportError::IdentityConflict)?;
+        let receipt = staged.snapshot.receipt();
+        let record = staged.snapshot.record();
+        let response = eliot_protocol::InstrumentRegistryEffectReservationStageResponse {
+            parent_operation_id: request.parent_operation_id,
+            parent_request_digest: request.parent_request_digest,
+            parent_request_identity: retained_parent,
+            child_request_identity: request.child_request_identity,
+            work_scope_id: request.work_scope_id,
+            reservation_id: staged.reservation_id.as_str().to_owned(),
+            work_item_id: record.work_item_id.as_str().to_owned(),
+            proposed_attempt_id: record.proposed_attempt_id.as_str().to_owned(),
+            record: serde_json::to_value(record).map_err(|_| TransportError::SessionFenced)?,
+            receipt: serde_json::to_value(receipt).map_err(|_| TransportError::SessionFenced)?,
+            receipt_operation_order: receipt.operation_order(),
+            row_operation_id: record.operation_id.as_str().to_owned(),
+            state_fence: serde_json::to_value(&record.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?,
+            authority_epoch: serde_json::to_value(&record.authority_epoch)
+                .map_err(|_| TransportError::SessionFenced)?,
+        };
+        Ok(serde_json::json!({
+            "kind": "admission_reservation_source_snapshot_stage",
+            "value": response,
+        }))
+    }
+
+    /// Activates a staged E reservation only when the canonical owner supplied
+    /// two identical, valid original receipt readbacks for its exact operation.
+    pub(crate) async fn instrument_registry_effect_reservation_activate_operation(
+        &self,
+        session: &Session,
+        payload: serde_json::Value,
+        outer_identity: Option<&eliot_protocol::RequestIdentity>,
+    ) -> Result<serde_json::Value, TransportError> {
+        use super::daemon_request_dispatch::{
+            validate_store_session_fence, without_daemon_routing_key,
+        };
+        use eliot_ors::{
+            AdmissionReservationActivationRequest, AdmissionReservationIdentityInput,
+            CanonicalAdmissionCommit, OperationIdentity as OrsOperationIdentity,
+            activate_admission_reservation_from_owner_evidence, admission_reservation_identity,
+            activation_operation_identity, epoch_lineage_for, launch_outbox_readback,
+            prove_canonical_admission_for_reservation, reload_staged_admission_reservation,
+            stage_operation_identity, StateFenceSnapshot,
+        };
+
+        let request: eliot_protocol::InstrumentRegistryEffectReservationActivateRequest =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        request.validate().map_err(|_| TransportError::SessionFenced)?;
+        let parent_identity = outer_identity.ok_or(TransportError::SessionFenced)?;
+        parent_identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        validate_store_session_fence(session, &parent_identity.request.state_fence)?;
+        let retained_parent = self.retained_selected_source_parent_identity(
+            &request.parent_operation_id,
+            &request.parent_request_digest,
+        )?;
+        if &retained_parent != parent_identity
+            || parent_identity.request.state_fence != request.child_request_identity.request.state_fence
+            || request.child_request_identity.request.metadata.request_id
+                == retained_parent.request.metadata.request_id
+            || request.child_request_identity.idempotency_key == retained_parent.idempotency_key
+            || request.child_request_identity.cancellation_id == retained_parent.cancellation_id
+            || parent_identity.request.metadata.task_id
+                != request.child_request_identity.request.metadata.task_id
+            || parent_identity.request.metadata.session_id
+                != request.child_request_identity.request.metadata.session_id
+            || parent_identity.request.metadata.product_id
+                != request.child_request_identity.request.metadata.product_id
+            || parent_identity.request.metadata.source_id
+                != request.child_request_identity.request.metadata.source_id
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+        let claims: eliot_ors::AdmissionReservationClaims =
+            serde_json::from_value(request.claims.clone())
+                .map_err(|_| TransportError::SessionFenced)?;
+        claims.validate().map_err(|_| TransportError::SessionFenced)?;
+        let semantic_revision = request
+            .derived_semantic_admission_revision()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let state_fence = StateFenceSnapshot::capture(
+            &request.child_request_identity.request.state_fence,
+            request
+                .child_request_identity
+                .request
+                .state_fence
+                .authority_epoch
+                .sequence
+                .get(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let authority_epoch = epoch_lineage_for(
+            &request.child_request_identity.request.state_fence.authority_epoch,
+            None,
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let work_item_id = OrsOperationIdentity::new(&request.work_item_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let proposed_attempt_id = OrsOperationIdentity::new(&request.proposed_attempt_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let reservation_id = admission_reservation_identity(&AdmissionReservationIdentityInput {
+            work_item_id: work_item_id.clone(),
+            proposed_attempt_id: proposed_attempt_id.clone(),
+            semantic_admission_revision: semantic_revision,
+            claims: claims.clone(),
+            state_fence: state_fence.clone(),
+            authority_epoch: authority_epoch.clone(),
+        })
+        .map_err(|_| TransportError::SessionFenced)?;
+        if reservation_id.as_str() != request.reservation_id {
+            return Err(TransportError::IdentityConflict);
+        }
+        let now_unix_ms = i64::try_from(super::unix_ms())
+            .map_err(|_| TransportError::SessionFenced)?;
+        let staged = reload_staged_admission_reservation(
+            self.generation_gateway.ors.as_ref(),
+            &reservation_id,
+            now_unix_ms,
+        )
+        .map_err(|_| TransportError::IdentityConflict)?;
+        if staged.record().work_item_id != work_item_id
+            || staged.record().proposed_attempt_id != proposed_attempt_id
+            || staged.record().claims != claims
+            || staged.record().state_fence != state_fence
+            || staged.record().authority_epoch != authority_epoch
+            || staged.record().stage_operation_id
+                != stage_operation_identity(&reservation_id)
+                    .map_err(|_| TransportError::SessionFenced)?
+        {
+            return Err(TransportError::IdentityConflict);
+        }
+
+        let canonical_write_receipt: WriteReceipt = serde_json::from_value(
+            request.canonical_write_receipt.clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        let canonical_receipt_readback: WriteReceipt = serde_json::from_value(
+            request.canonical_receipt_readback.clone(),
+        )
+        .map_err(|_| TransportError::SessionFenced)?;
+        canonical_write_receipt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        canonical_receipt_readback
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if canonical_write_receipt != canonical_receipt_readback {
+            return Err(TransportError::IdentityConflict);
+        }
+        let canonical_operation_id = stage_operation_identity(&reservation_id)
+            .map_err(|_| TransportError::SessionFenced)?;
+        let commit = CanonicalAdmissionCommit {
+            receipt: canonical_write_receipt,
+        };
+        let proven = prove_canonical_admission_for_reservation(
+            self.generation_gateway.ors.as_ref(),
+            &reservation_id,
+            &work_item_id,
+            &proposed_attempt_id,
+            &canonical_operation_id,
+            &commit,
+            &authority_epoch,
+            &state_fence,
+            now_unix_ms,
+        )
+        .map_err(|_| TransportError::IdentityConflict)?;
+        launch_outbox_readback(Some(&canonical_receipt_readback), &proven.canonical_admission)
+            .map_err(|_| TransportError::IdentityConflict)?;
+        let activation_receipt = activation_receipt_identity(
+            &reservation_id,
+            &proven.canonical_admission.admission_receipt,
+        )?;
+        let activated = activate_admission_reservation_from_owner_evidence(
+            self.generation_gateway.ors.as_ref(),
+            &AdmissionReservationActivationRequest {
+                reservation_id: reservation_id.clone(),
+                work_item_id: work_item_id.clone(),
+                proposed_attempt_id: proposed_attempt_id.clone(),
+                operation_id: activation_operation_identity(&reservation_id)
+                    .map_err(|_| TransportError::SessionFenced)?,
+                claims,
+                canonical_admission_receipt: proven
+                    .canonical_admission
+                    .admission_receipt
+                    .clone(),
+                canonical_admission: Some(proven.canonical_admission.clone()),
+                activation_receipt,
+                expected_current_receipt: proven.expected_current_receipt,
+                authority_epoch,
+                state_fence,
+                now_ms: now_unix_ms,
+            },
+        )
+        .map_err(|_| TransportError::IdentityConflict)?;
+        let receipt = activated.snapshot.receipt();
+        let record = activated.snapshot.record();
+        let response = eliot_protocol::InstrumentRegistryEffectReservationActivateResponse {
+            parent_operation_id: request.parent_operation_id,
+            parent_request_digest: request.parent_request_digest,
+            parent_request_identity: retained_parent,
+            child_request_identity: request.child_request_identity,
+            work_scope_id: request.work_scope_id,
+            reservation_id: activated.reservation_id.as_str().to_owned(),
+            record: serde_json::to_value(record).map_err(|_| TransportError::SessionFenced)?,
+            receipt: serde_json::to_value(receipt).map_err(|_| TransportError::SessionFenced)?,
+            receipt_operation_order: receipt.operation_order(),
+            row_operation_id: record.operation_id.as_str().to_owned(),
+            state_fence: serde_json::to_value(&record.state_fence)
+                .map_err(|_| TransportError::SessionFenced)?,
+            authority_epoch: serde_json::to_value(&record.authority_epoch)
+                .map_err(|_| TransportError::SessionFenced)?,
+            activation_receipt: serde_json::to_value(
+                activated.activation_receipt().map_err(|_| TransportError::SessionFenced)?,
+            )
+            .map_err(|_| TransportError::SessionFenced)?,
+            canonical_admission_receipt: serde_json::to_value(
+                activated
+                    .canonical_admission_receipt()
+                    .map_err(|_| TransportError::SessionFenced)?,
+            )
+            .map_err(|_| TransportError::SessionFenced)?,
+        };
+        Ok(serde_json::json!({
+            "kind": "admission_reservation_source_snapshot_activate",
+            "value": response,
+        }))
     }
 }
 
