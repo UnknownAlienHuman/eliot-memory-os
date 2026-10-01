@@ -75,6 +75,8 @@ use eliot_store_api::{
 use serde::Deserialize;
 
 use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
+use super::admission_reservation_use_route::OPERATION
+    as ADMISSION_RESERVATION_CURRENT_USE_OPERATION;
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
     ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
@@ -656,6 +658,9 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         // canonical owner receipt it must read is live `KernelStoreGateway`
         // IO, which the synchronous claim route structurally cannot reach.
         ADMISSION_RESERVATION_ADMIT_OPERATION => ADMISSION_RESERVATION_ADMIT_OPERATION,
+        ADMISSION_RESERVATION_CURRENT_USE_OPERATION => {
+            ADMISSION_RESERVATION_CURRENT_USE_OPERATION
+        }
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
@@ -3382,6 +3387,18 @@ impl KernelComposition {
             // outcome keeps the reservation inactive and launch blocked.
             ADMISSION_RESERVATION_ADMIT_OPERATION => {
                 Box::pin(self.admission_reservation_admit_operation(session, payload.clone())).await
+            }
+            // Read the exact currently active owner-issued reservation using
+            // the original authenticated Host RequestIdentity. This route is
+            // a read-only consumer gate; it cannot authorize from caller
+            // payload fields alone.
+            ADMISSION_RESERVATION_CURRENT_USE_OPERATION => {
+                Box::pin(self.current_use_operation(
+                    session,
+                    payload.clone(),
+                    request_identity,
+                ))
+                .await
             }
             "receipt" => {
                 // F-LOG-KERNEL-1 (#897 T20): only a dispatch failure carries
