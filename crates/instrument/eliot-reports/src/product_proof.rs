@@ -10,8 +10,11 @@
 //!   owner/authority that imposed the stop, and the required evidence that is
 //!   still missing;
 //! * build evidence as a separate, typed [`ProductProofBuildEvidence`] handle
-//!   that carries no live-product outcome at all, so a successful release build
+//!   that carries no outcome field at all, so a successful release build
 //!   can be linked as non-product proof and can never be read as live `PASS`;
+//!   the binaries it produced are named by the caller that built them, which is
+//!   the binding that a constant could not make — see
+//!   [`ProductProofBuildEvidence`];
 //! * the I18.22 failure class of a Windows run attempt that did not complete,
 //!   kept on the separate [`ExecutionStatus`] lifecycle axis so a launch failure
 //!   is never conflated with a block;
@@ -143,17 +146,40 @@ impl ProductProofEvidence {
 /// nine-binary release build can be linked from a product-proof record as
 /// non-product proof while remaining structurally incapable of being read as a
 /// live-product `PASS`.
+///
+/// [`Self::binary_names`] is deliberately caller-supplied and this owner
+/// deliberately holds no nine-binary constant. The nine-binary build scope is
+/// published once, by the release surface owner
+/// (`bins/eliot/src/release_surface.rs::BUNDLE_BINARIES`, bound to
+/// `docs/release/CLAIM_BOUNDARY.md`) and enforced by the claim-boundary checker
+/// (`scripts/verify-release-claim-boundary.py::EXPECTED_NINE_BINARIES`); that
+/// package is a binary-only crate, so a report library cannot reference it
+/// without inverting the bin -> lib dependency direction, and restating the
+/// nine names here would create a second owner of one published list.
+///
+/// Restating them would also be unsound rather than merely duplicated: a
+/// constant on this type would let a record name a binary set that no build
+/// produced. A caller that names the binaries it actually built binds this
+/// record to the build that happened, which is the stronger guarantee, and this
+/// owner verifies that binding the only way it can be verified without
+/// re-deriving a digest it does not retain — each name must be non-blank and
+/// free of control characters, and the list must be canonical (sorted) and
+/// free of duplicates. Completeness against the published nine is deliberately
+/// NOT checked here: that would validate the caller's list against a copy of
+/// itself, and the release surface owner is the independent expected set.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProductProofBuildEvidence {
     /// Identity of the build evidence the record links.
     pub evidence: ProductProofEvidence,
-    /// Binaries the exact build produced, in canonical order.
+    /// Binaries the exact build that produced [`Self::evidence`] actually
+    /// produced, in canonical order.
     pub binary_names: Vec<String>,
 }
 
 impl ProductProofBuildEvidence {
-    /// Binds one release build to its retained handle and produced binaries.
+    /// Binds one release build to its retained handle and the binaries that
+    /// build produced.
     pub fn new(
         evidence: ProductProofEvidence,
         mut binary_names: Vec<String>,
@@ -182,6 +208,15 @@ impl ProductProofBuildEvidence {
         for name in &self.binary_names {
             valid_text(name, "product_proof.build_evidence.binary_name")
                 .map_err(ProductProofError::Report)?;
+        }
+        // One binary named once: a repeated name would let a record inflate its
+        // own binary set from a single observed artifact. The list is checked
+        // against the names this record actually carries, which is a property
+        // of the record and not a copy of an external expected list.
+        if self.binary_names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ProductProofError::DuplicateField {
+                field: "product_proof.build_evidence.binary_names",
+            });
         }
         Ok(())
     }
@@ -823,4 +858,259 @@ pub enum ProductProofError {
     /// A parked run was recorded with an observed installed-route execution.
     #[error("a parked run cannot observe an installed-route execution")]
     ParkedRunCannotObserveInstalledRoute,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::projection::ReportInputSource;
+
+    /// One canonical read of the exact candidate bytes this record is bound to.
+    fn observed_by() -> ReportInputRevision {
+        ReportInputRevision::new(
+            ReportInputSource::Evidence,
+            "build-candidate-1903",
+            1,
+            b"nine-binary release build observed bytes",
+        )
+        .expect("report input revision")
+    }
+
+    fn authority() -> ProductProofAuthority {
+        ProductProofAuthority::new("ProductProof/FinishService", "finish-authority-1903")
+            .expect("product-proof authority")
+    }
+
+    fn runtime_evidence(id: &str) -> ProductProofEvidence {
+        ProductProofEvidence::new(
+            ProductProofEvidenceDomain::Runtime,
+            id,
+            "installed-route launch receipt observed at runtime",
+            observed_by(),
+        )
+        .expect("runtime-domain evidence handle")
+    }
+
+    /// The retained readback evidence, with the installed-route launch receipt
+    /// explicitly recorded as the absent receipt it is.
+    fn retained_launch_receipt_absent() -> ProductProofRetainedEvidence {
+        ProductProofRetainedEvidence {
+            raw_log_refs: vec!["raw://eliotd/1903.log".to_owned()],
+            executable: ProductProofExecutableIdentity::new(
+                "eliotd.exe",
+                Some("sha256:observed-eliotd-bytes".to_owned()),
+                false,
+            )
+            .expect("executable identity"),
+            environment: ProductProofEnvironmentIdentity::new(
+                "windows-x86_64",
+                Some("installation-1903".to_owned()),
+            )
+            .expect("environment identity"),
+            stage_receipts: ProductProofStageReceipts {
+                installed_route: ProductProofStageReceipt::Missing {
+                    required_proof: "installed Windows route pulse executed end to end".to_owned(),
+                },
+            },
+        }
+    }
+
+    /// The retained readback evidence of a run whose installed-route launch
+    /// receipt was independently observed.
+    fn retained_launch_receipt_observed(receipt_id: &str) -> ProductProofRetainedEvidence {
+        ProductProofRetainedEvidence {
+            stage_receipts: ProductProofStageReceipts {
+                installed_route: ProductProofStageReceipt::Observed {
+                    receipt_id: receipt_id.to_owned(),
+                },
+            },
+            ..retained_launch_receipt_absent()
+        }
+    }
+
+    /// The successful release build, linked as build evidence only.
+    fn build_evidence(binary_names: Vec<&str>) -> ProductProofBuildEvidence {
+        let evidence = ProductProofEvidence::new(
+            ProductProofEvidenceDomain::Build,
+            "build:release-1903",
+            "nine-binary release build observed at its exact source head",
+            observed_by(),
+        )
+        .expect("build-domain evidence handle");
+        ProductProofBuildEvidence::new(
+            evidence,
+            binary_names.into_iter().map(str::to_owned).collect(),
+        )
+        .expect("release build evidence")
+    }
+
+    fn succeeded_attempt(run_id: &str) -> ProductProofRunAttempt {
+        ProductProofRunAttempt::completed(
+            run_id,
+            ExecutionStatus::Succeeded,
+            "installed route executed end to end on the installed generation",
+        )
+        .expect("completed run attempt")
+    }
+
+    /// The parked record: the current product state, with the installed-route
+    /// launch receipt explicitly absent.
+    fn parked() -> ProductProofStatus {
+        ProductProofStatus::parked(
+            "windows-installed-pulse-11",
+            VerificationOutcome::Blocked,
+            "no installed Windows route pulse has been attempted",
+            authority(),
+            vec!["installed-route launch receipt".to_owned()],
+            Some(build_evidence(vec!["eliot", "eliotd"])),
+            retained_launch_receipt_absent(),
+        )
+        .expect("parked product-proof record")
+    }
+
+    /// The only path to `Pass`: an I18.24 `PASS` whose installed-route launch
+    /// receipt was independently observed, whose attempt reached `Succeeded`,
+    /// and which carries a runtime-domain live handle.
+    fn observed_launch_receipt_pass() -> ProductProofStatus {
+        parked()
+            .record_attempt(
+                succeeded_attempt("windows-pulse-11-run-1"),
+                VerificationOutcome::Pass,
+                "installed Windows route pulse observed end to end",
+                Vec::new(),
+                vec![runtime_evidence("pulse:windows-installed-pulse-11-run-1")],
+                retained_launch_receipt_observed("receipt:windows-installed-pulse-11-run-1"),
+            )
+            .expect("passing product-proof record")
+    }
+
+    /// The same passing record, except that this attempt's launch receipt is
+    /// absent. This is the accepted near-miss: it is reachable, and it is not a
+    /// `PASS`.
+    fn absent_launch_receipt_pass() -> ProductProofStatus {
+        parked()
+            .record_attempt(
+                succeeded_attempt("windows-pulse-11-run-2"),
+                VerificationOutcome::Pass,
+                "installed Windows route pulse observed end to end",
+                Vec::new(),
+                vec![runtime_evidence("pulse:windows-installed-pulse-11-run-2")],
+                retained_launch_receipt_absent(),
+            )
+            .expect("a record that presents an absent launch receipt is still a record")
+    }
+
+    /// ACCEPTANCE: a simulated absent launch receipt cannot be rolled up as
+    /// `PASS`.
+    ///
+    /// This is the real record and the real rollup. The rule is not restated
+    /// here: the assertion reads `ProductProofStatus::rollup` on the same
+    /// record that does roll up as `Pass` once its launch receipt is observed.
+    #[test]
+    fn absent_launch_receipt_cannot_roll_up_as_pass_1903() {
+        assert!(
+            observed_launch_receipt_pass().rollup().is_pass(),
+            "premise: an observed launch receipt does roll up as PASS"
+        );
+
+        let refused = absent_launch_receipt_pass().rollup();
+        assert!(
+            !refused.is_pass(),
+            "an absent launch receipt can never roll up as PASS, got {refused:?}"
+        );
+        assert_eq!(
+            refused,
+            ProductProofRollup::Refused {
+                proof_id: "windows-installed-pulse-11".to_owned(),
+                outcome: VerificationOutcome::Pass,
+                reason: "installed Windows route pulse observed end to end".to_owned(),
+                authority_ref: "finish-authority-1903".to_owned(),
+                missing_evidence: vec!["installed-route launch receipt".to_owned()],
+            },
+            "the refusal retains the exact outcome, reason, authority and the required \
+             missing evidence"
+        );
+    }
+
+    /// REFUSAL: the record refuses a `PASS` outright when the launch receipt is
+    /// absent, so no publication of it exists to be read as a pass.
+    #[test]
+    fn pass_claiming_an_absent_launch_receipt_is_refused_1903() {
+        assert!(matches!(
+            parked().record_attempt(
+                succeeded_attempt("windows-pulse-11-run-2"),
+                VerificationOutcome::Pass,
+                "installed Windows route pulse observed end to end",
+                Vec::new(),
+                vec![runtime_evidence("pulse:windows-installed-pulse-11-run-2")],
+                retained_launch_receipt_absent(),
+            ),
+            Err(ProductProofError::PassWithoutInstalledRoute)
+        ));
+    }
+
+    /// REFUSAL: a build handle cannot stand in for a live-product runtime
+    /// handle, so it is refused at the point it would have granted the proof.
+    #[test]
+    fn build_domain_live_evidence_is_refused_1903() {
+        let build_handle = ProductProofEvidence::new(
+            ProductProofEvidenceDomain::Build,
+            "build:release-1903",
+            "nine-binary release build observed at its exact source head",
+            observed_by(),
+        )
+        .expect("build-domain evidence handle");
+        assert!(matches!(
+            parked().record_attempt(
+                succeeded_attempt("windows-pulse-11-run-3"),
+                VerificationOutcome::Pass,
+                "installed Windows route pulse observed end to end",
+                Vec::new(),
+                vec![build_handle],
+                retained_launch_receipt_observed("receipt:windows-pulse-11-run-3"),
+            ),
+            Err(ProductProofError::LiveEvidenceWrongDomain { .. })
+        ));
+    }
+
+    /// REFUSAL: one observed artifact named twice would inflate the recorded
+    /// binary set, so a duplicated list is refused.
+    #[test]
+    fn duplicated_binary_name_is_refused_1903() {
+        let evidence = ProductProofEvidence::new(
+            ProductProofEvidenceDomain::Build,
+            "build:release-1903",
+            "nine-binary release build observed at its exact source head",
+            observed_by(),
+        )
+        .expect("build-domain evidence handle");
+        let duplicated = ProductProofBuildEvidence::new(
+            evidence,
+            vec!["eliotd.exe".to_owned(), "eliotd.exe".to_owned()],
+        );
+        assert!(matches!(
+            duplicated,
+            Err(ProductProofError::DuplicateField {
+                field: "product_proof.build_evidence.binary_names"
+            })
+        ));
+    }
+
+    /// POSITIVE: the caller-supplied binary set binds the record to the build
+    /// that actually produced it, in canonical order with one name per
+    /// artifact.
+    #[test]
+    fn observed_binary_set_is_recorded_in_canonical_order_1903() {
+        let record = build_evidence(vec!["eliot-testd", "eliotd", "eliot-doctor"]);
+        assert_eq!(
+            record.binary_names,
+            vec![
+                "eliot-doctor".to_owned(),
+                "eliot-testd".to_owned(),
+                "eliotd".to_owned()
+            ]
+        );
+        record.validate().expect("recorded binary set is valid");
+    }
 }
