@@ -12,12 +12,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use eliot_blob::BlobStoreStreamSink;
 use eliot_blob::{
-    BlobRootOwner, BlobStoreService, BlobStreamSinkStoreBinding, DpapiUserAeadPort,
+    BlobRootOwner, BlobStoreService, BlobStoreStreamSink, BlobStreamSinkStoreBinding, DpapiUserAeadPort,
     DpapiUserKeyPort, RleCompressionPort, WindowsBlobPlatformPort,
 };
-use eliot_blob_api::BlobStoreClient;
+use eliot_blob_api::{
+    BlobHash, BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding, BlobStoreClient,
+};
+use eliot_blob_api::wire::{
+    ProcessStreamSourceReadbackRequest, ProcessStreamSourceReadbackResponse,
+};
 use eliot_contracts::StateFence;
 use eliot_installation::{
     InstallationProfile, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
@@ -43,6 +47,7 @@ use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
     ProtocolVersion, RequestIdentity, ServerHello,
 };
+use eliot_process::ProcessExecutionBinding;
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
@@ -351,6 +356,17 @@ pub trait BlobStreamAuthorityResolver: Send + Sync {
         identity: &RequestIdentity,
         request: &ProcessStreamSinkOpenRequest,
     ) -> Result<Option<BlobStreamSinkStoreBinding>, String>;
+
+    /// Resolves fresh current read authority for one immutable-source
+    /// readback. Implementations may not depend on the in-memory sink map or
+    /// reuse the lease retained at Open; the Blob owner independently resolves
+    /// the durable original stage intent and ready receipt.
+    fn resolve_readback(
+        &self,
+        owner: &BlobRootOwner,
+        identity: &RequestIdentity,
+        request: &ProcessStreamSourceReadbackRequest,
+    ) -> Result<Option<BlobStreamSinkStoreBinding>, String>;
 }
 
 struct RetainedBlobStreamSink {
@@ -363,6 +379,13 @@ struct RetainedBlobStreamSink {
 }
 
 const MAX_RETAINED_BLOB_STREAM_SINKS: usize = 1024;
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
 
 impl std::fmt::Debug for StoreComposition {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -622,7 +645,7 @@ impl StoreComposition {
     /// create a binding: first demand may initialize the one root service,
     /// but absence of full authority facts then returns typed unavailable
     /// before retaining a sink session or starting a Blob effect.
-    pub(crate) async fn blob_sink_open(
+    pub async fn blob_sink_open(
         &self,
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
@@ -708,7 +731,7 @@ impl StoreComposition {
         Ok((binding_ref, session))
     }
 
-    pub(crate) async fn blob_sink_append(
+    pub async fn blob_sink_append(
         &self,
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
@@ -722,7 +745,7 @@ impl StoreComposition {
         sink.append(session, request).await
     }
 
-    pub(crate) async fn blob_sink_finalize(
+    pub async fn blob_sink_finalize(
         &self,
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
@@ -736,7 +759,7 @@ impl StoreComposition {
         sink.finalize(session, request).await
     }
 
-    pub(crate) async fn blob_sink_abort(
+    pub async fn blob_sink_abort(
         &self,
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
@@ -750,7 +773,7 @@ impl StoreComposition {
         sink.abort(session, request).await
     }
 
-    pub(crate) async fn blob_sink_readback(
+    pub async fn blob_sink_readback(
         &self,
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
@@ -763,7 +786,171 @@ impl StoreComposition {
         sink.readback(session).await
     }
 
-    pub(crate) async fn blob_sink_reconcile(
+    /// Reads an exact previously published Blob stream source under fresh
+    /// current owner authority. The in-memory sink map is deliberately not
+    /// consulted: Blob resolves the original stage intent, full locator,
+    /// metadata digest, and ready receipt from its durable owner records.
+    pub async fn blob_source_readback(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        request: ProcessStreamSourceReadbackRequest,
+    ) -> Result<ProcessStreamSourceReadbackResponse, ProcessStreamSinkError> {
+        request
+            .capability
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        request
+            .binding
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        validate_blob_sink_transport(transport, identity, &request.capability.reference)?;
+        request
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        if request.locator_kind != eliot_blob_api::wire::DurableStreamLocatorKind::Blob
+            || request.fence != identity.request.state_fence
+            || identity.request.state_fence != transport.state_fence
+            || request.deadline_ms <= current_unix_ms()
+        {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
+        let resolver = self
+            .blob_stream_authority
+            .lock()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+            .as_ref()
+            .cloned();
+        let Some(resolver) = resolver else {
+            return Ok(ProcessStreamSourceReadbackResponse::Unknown);
+        };
+        let current = resolver
+            .resolve_readback(&self.blob, identity, &request)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let Some(current) = current else {
+            return Ok(ProcessStreamSourceReadbackResponse::Unknown);
+        };
+        let process_binding: ProcessExecutionBinding = serde_json::from_str(
+            request.process_binding_json.as_str(),
+        )
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        if process_binding.job_id().to_string() != request.job_id
+            || process_binding.operation_id().to_string() != request.operation_id
+            || process_binding.process_tree_id().to_string() != request.process_tree_id
+        {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
+        if current.read_context().request != identity.request
+            || current.read_context().request.state_fence != request.fence
+        {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
+        let fresh_lease = self
+            .blob
+            .lease_for_request(identity.request.clone())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        if current.root_lease() != &fresh_lease {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
+        BlobStreamSinkStoreBinding::new(
+            fresh_lease.clone(),
+            current.stage_context().clone(),
+            current.read_context().clone(),
+            current.policy().clone(),
+            current.residency().clone(),
+        )
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let Some(content_hash) = request.locator.strip_prefix("blob:") else {
+            return Ok(ProcessStreamSourceReadbackResponse::Unknown);
+        };
+        let content_hash = BlobHash::new(content_hash.to_owned())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let source_binding = BlobProcessStreamSourceBinding {
+            process_binding_json: request.process_binding_json.clone(),
+            process_binding_sha256: request.process_binding_sha256.clone(),
+            stream_kind: match request.stream {
+                eliot_blob_api::wire::ProcessStreamKind::Stdout => "STDOUT",
+                eliot_blob_api::wire::ProcessStreamKind::Stderr => "STDERR",
+            }
+            .to_owned(),
+            policy_json: request.policy_json.clone(),
+            policy_sha256: request.policy_sha256.clone(),
+        };
+        let source_request = BlobProcessStreamReadbackRequest {
+            session_id: request.binding.session_id.clone(),
+            terminal_id: request.binding.terminal_id.clone(),
+            open_request_sha256: request.binding.open_request_sha256.clone(),
+            process_source_binding: source_binding,
+            expected_content_hash: content_hash,
+            expected_plaintext_sha256: request.expected_sha256.clone(),
+            expected_plaintext_length: request.expected_byte_length,
+            ready_receipt_id: request.ready_receipt_ref.clone(),
+            max_bytes: request.max_bytes,
+        };
+        let client = self
+            .blob_client_for_lease(fresh_lease.clone())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let readback = match client
+            .read_process_stream_source_authorized_context(
+                source_request,
+                current.read_context().clone(),
+                fresh_lease,
+            )
+            .await
+        {
+            Ok(readback) => readback,
+            // An absent intent is not proof of `NotStarted`; only the Blob
+            // owner can resolve durable publication state. All non-success
+            // cases therefore remain Unknown at this transport boundary.
+            Err(_) => return Ok(ProcessStreamSourceReadbackResponse::Unknown),
+        };
+        if readback.validate().is_err()
+            || readback.ready_receipt().plaintext_sha256() != request.expected_sha256
+            || readback.ready_receipt().plaintext_length() != request.expected_byte_length
+            || readback.ready_receipt().receipt().identity.receipt_id.as_str()
+                != request.ready_receipt_ref
+            || format!("{:x}", Sha256::digest(readback.bytes())) != request.expected_sha256
+            || u64::try_from(readback.bytes().len()).ok() != Some(request.expected_byte_length)
+        {
+            return Ok(ProcessStreamSourceReadbackResponse::Unknown);
+        }
+        let whole_bytes = readback.bytes();
+        let start = usize::try_from(request.offset)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let chunk_limit = usize::try_from(request.chunk_limit)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let end = start.saturating_add(chunk_limit).min(whole_bytes.len());
+        let bytes = whole_bytes
+            .get(start..end)
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?
+            .to_vec();
+        let observed_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let observed_byte_length = u64::try_from(bytes.len())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        Ok(ProcessStreamSourceReadbackResponse::Ready {
+            bytes,
+            whole_source_sha256: readback.ready_receipt().plaintext_sha256().to_owned(),
+            whole_source_byte_length: readback.ready_receipt().plaintext_length(),
+            chunk_offset: request.offset,
+            observed_sha256,
+            observed_byte_length,
+            ready_receipt_ref: request.ready_receipt_ref,
+            source_owner_generation: readback.ready_receipt().root_generation(),
+            readback_receipt_id: readback.receipt().identity.receipt_id.to_string(),
+            observed_fence: identity.request.state_fence.clone(),
+            observed_at_unix_ms: current_unix_ms(),
+        })
+    }
+
+    pub async fn blob_sink_reconcile(
         &self,
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
@@ -806,7 +993,7 @@ impl StoreComposition {
     /// Releases only the in-memory stream bindings for one disconnected
     /// authenticated Store session. Durable Blob stage intents remain owned
     /// by Blob and are never deleted by transport cleanup.
-    pub(crate) async fn release_blob_stream_session(&self, connection_id: &str) {
+    pub async fn release_blob_stream_session(&self, connection_id: &str) {
         self.blob_stream_sinks
             .lock()
             .await

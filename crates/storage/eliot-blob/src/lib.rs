@@ -4702,11 +4702,26 @@ where
         request: BlobProcessStreamReadbackRequest,
         current_read: BlobReadRequest,
     ) -> Result<BlobReadChunk, BlobError> {
+        self.read_process_stream_source_authorized_context_sync(
+            request,
+            current_read.context,
+            current_read.root_lease,
+        )
+    }
+
+    /// Resolves all original object identity from the durable Blob owner
+    /// intent. Only the current read context and root lease come from the
+    /// present authority resolver; the original locator, metadata digest and
+    /// ready receipt are never accepted from the readback caller.
+    fn read_process_stream_source_authorized_context_sync(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> Result<BlobReadChunk, BlobError> {
         request.validate()?;
-        current_read
-            .context
-            .validate_for(eliot_receipts::EffectClass::Read)?;
-        self.ensure_lease(&current_read.root_lease)?;
+        current_context.validate_for(eliot_receipts::EffectClass::Read)?;
+        self.ensure_lease(&current_root_lease)?;
         let path = WorkScopePath::new(format!(
             "transactions/process-source-{}.intent",
             request.process_source_intent_key()?
@@ -4717,7 +4732,10 @@ where
         };
         let persisted_phase = observed.phase;
         let recovery = observed.request;
-        if recovery.process_source_binding != request.process_source_binding
+        if recovery.session_id != request.session_id
+            || recovery.terminal_id != request.terminal_id
+            || recovery.open_request_sha256 != request.open_request_sha256
+            || recovery.process_source_binding != request.process_source_binding
             || recovery.expected_content_hash != request.expected_content_hash
             || recovery.expected_plaintext_sha256 != request.expected_plaintext_sha256
             || recovery.expected_plaintext_length != request.expected_plaintext_length
@@ -4767,8 +4785,8 @@ where
         }
         drop(_guards);
         self.read_sync(&BlobReadRequest {
-            context: current_read.context,
-            root_lease: current_read.root_lease,
+            context: current_context,
+            root_lease: current_root_lease,
             locator: ready.locator().clone(),
             expected_metadata_sha256: ready.metadata_sha256().to_owned(),
             expected_ready_receipt_id: request.ready_receipt_id,
@@ -5632,6 +5650,22 @@ where
     ) -> BlobFuture<'_, BlobReadChunk> {
         let core = Arc::clone(&self.core);
         Box::pin(async move { core.read_process_stream_source_sync(request, current_read) })
+    }
+
+    fn read_process_stream_source_authorized_context(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move {
+            core.read_process_stream_source_authorized_context_sync(
+                request,
+                current_context,
+                current_root_lease,
+            )
+        })
     }
 
     fn stage_with_recovery(

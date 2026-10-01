@@ -160,6 +160,7 @@ pub mod swarm_composition;
 pub mod task_binding_admission;
 mod task_lifecycle_adapters;
 pub mod testd_terminal_completion;
+pub mod testd_scope_admission;
 
 pub use activation_projection::AgentActivationResolver;
 pub use activation_projection::{
@@ -1983,6 +1984,35 @@ impl DaemonComposition {
     #[must_use]
     pub fn policy_owner(&self) -> Option<&eliot_governor::PolicyOwner> {
         self.governor.owners().policy.as_ref()
+    }
+
+    /// Revalidates the one current Governor WorkScope binding for a blob
+    /// owner-facts pull. This returns only the matched snapshot; callers must
+    /// resolve source, policy, residency, causal, and authority facts from
+    /// their own current owners before reporting `Available`.
+    pub fn current_testd_blob_work_scope(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<Option<eliot_governor::WorkScopeBindingSnapshot>, String> {
+        state_fence
+            .validate()
+            .map_err(|error| format!("invalid owner-facts fence: {error}"))?;
+        if self.governor.kernel_snapshot().state_fence() != *state_fence {
+            return Err("owner-facts fence is not the current Governor fence".to_owned());
+        }
+        let Some(owner) = self.governor.owners().work_scope.as_ref() else {
+            return Ok(None);
+        };
+        let snapshot = owner
+            .read_current(state_fence)
+            .map_err(|error| format!("current WorkScope guard is unavailable: {error}"))?;
+        snapshot
+            .validate()
+            .map_err(|error| format!("current WorkScope guard is invalid: {error}"))?;
+        if snapshot.guard_receipt.disposition != eliot_governor::ScopeBindingDisposition::Matched {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
     }
 
     /// Returns the retained protected daemon state root.
