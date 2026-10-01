@@ -932,6 +932,7 @@ impl McpCore {
             &forwarded.request.session,
             &projection,
             semantic_profile.evidence_ceiling,
+            semantic_profile.completion_ceiling,
         )?;
         let kind = match projection.kind {
             ProjectionKind::Candidate => ResponseKind::Candidate,
@@ -1746,12 +1747,19 @@ fn validate_projection(
     request_session: &SessionBinding,
     projection: &PortProjection,
     evidence_ceiling: ProofCeiling,
+    completion_ceiling: ProofCeiling,
 ) -> Result<(), BridgeError> {
     validate_proof_ceiling(projection.proof_ceiling).map_err(contract_violation)?;
     if !projection.proof_ceiling.is_at_most(evidence_ceiling) {
         return Err(BridgeError::invalid(
             "response.proof_ceiling",
             "must not exceed the tool semantic profile evidence ceiling",
+        ));
+    }
+    if !projection.proof_ceiling.is_at_most(completion_ceiling) {
+        return Err(BridgeError::invalid(
+            "response.proof_ceiling",
+            "must not exceed the tool semantic profile completion ceiling",
         ));
     }
     let mut artifacts = BTreeSet::new();
