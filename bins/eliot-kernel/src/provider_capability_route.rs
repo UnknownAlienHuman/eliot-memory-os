@@ -309,15 +309,41 @@ impl ProviderCapabilityContext {
             // replay-route expectation).
             revoked: row.state.is_terminal(),
         };
-        // W-A owner signature is the 9-parameter pure verifier
+        // W-A owner signature is the 10-parameter pure verifier
         // (request, expectation, loaded attempt/operation/binding/executable/
-        // generation/fence, live epoch). The presented executable digest is
+        // generation/fence/payload, live epoch). The presented executable digest is
         // compared against the owner-verified digest retained on the durable
         // claim row (issue #2567): a row that predates the column or carries
-        // no join retains empty and never verifies. The durable
-        // attempt/operation/binding/executable/generation/fence come from
+        // no join retains empty and never verifies. The presented
+        // canonical-payload digest is compared against the owner-retained
+        // per-kind payload digest selected below from the row's receipt
+        // column (issue #1108 A5): a retained digest that disagrees fails
+        // closed as a changed payload under one identity, while a kind with
+        // no retained payload yet carries no owner evidence on that leg. The durable
+        // attempt/operation/binding/executable/generation/fence/payloads come from
         // the row and the epoch is the freshly re-queried live authority
         // epoch.
+        let loaded_canonical_payload_sha256: &str = match kind {
+            ProviderProofKind::Admission => row.receipt_payloads.admission_payload_sha256.as_deref(),
+            ProviderProofKind::Cancellation => {
+                row.receipt_payloads.cancellation_payload_sha256.as_deref()
+            }
+            ProviderProofKind::WorkerFence => {
+                row.receipt_payloads.worker_fence_payload_sha256.as_deref()
+            }
+            ProviderProofKind::Reassignment => {
+                row.receipt_payloads.reassignment_payload_sha256.as_deref()
+            }
+            ProviderProofKind::Result => row.receipt_payloads.result_payload_sha256.as_deref(),
+            ProviderProofKind::UnknownOutcome => {
+                row.receipt_payloads.unknown_outcome_payload_sha256.as_deref()
+            }
+            // The ORS receipt column covers the six receipt kinds only: the
+            // exact-start correlation carries no retained payload, so this
+            // leg passes on no owner evidence.
+            ProviderProofKind::Binding => None,
+        }
+        .unwrap_or("");
         verify_provider_capability(
             &request,
             &expectation,
@@ -327,6 +353,7 @@ impl ProviderCapabilityContext {
             row.executable_binding_digest.as_str(),
             row.worker_generation,
             row.fence_digest.as_str(),
+            loaded_canonical_payload_sha256,
             &live_epoch,
         )?;
         Ok(())
@@ -386,7 +413,9 @@ impl ProviderCapabilityContext {
     /// projection body; the dispatch path seals it with
     /// [`seal_capability_receipt`]. Every body field comes from the loaded
     /// row — claim, attempt, operation, binding and executable digests,
-    /// claiming-worker generation, fence digest — never from presented
+    /// claiming-worker generation, fence digest, and the per-receipt
+    /// canonical-payload digests retained on the row's receipt column
+    /// (issue #1108, A5) — never from presented
     /// values: the request carries only the claim identity, so echoing
     /// presented values as loaded ones is impossible by construction. The
     /// row is returned verbatim (including a zero generation or a stale
@@ -421,6 +450,14 @@ impl ProviderCapabilityContext {
             "executable_binding_digest": row.executable_binding_digest.as_str(),
             "worker_generation": row.worker_generation,
             "fence_digest": row.fence_digest.as_str(),
+            "receipt_payloads": {
+                "admission_payload_sha256": row.receipt_payloads.admission_payload_sha256,
+                "cancellation_payload_sha256": row.receipt_payloads.cancellation_payload_sha256,
+                "worker_fence_payload_sha256": row.receipt_payloads.worker_fence_payload_sha256,
+                "reassignment_payload_sha256": row.receipt_payloads.reassignment_payload_sha256,
+                "result_payload_sha256": row.receipt_payloads.result_payload_sha256,
+                "unknown_outcome_payload_sha256": row.receipt_payloads.unknown_outcome_payload_sha256,
+            },
             "read_at_unix_ms": unix_ms(),
         }))
     }
@@ -675,8 +712,10 @@ impl KernelComposition {
     /// `native_worker_provider_capability_claim_row`, `wire_version` is
     /// [`PROVIDER_CAPABILITY_WIRE_VERSION`], then the exact durable fields
     /// `claim_id`, `attempt_id`, `operation_id`, `binding_digest`,
-    /// `executable_binding_digest`, `worker_generation`, `fence_digest`
-    /// (shaped for `OwnerLoadedClaimRow::new`), plus `read_at_unix_ms`.
+    /// `executable_binding_digest`, `worker_generation`, `fence_digest`,
+    /// and the per-receipt `receipt_payloads` column (issue #1108, A5)
+    /// (shaped for `OwnerLoadedClaimRow::new` plus the payload builder),
+    /// plus `read_at_unix_ms`.
     fn handle_provider_capability_claim_row_read(
         &self,
         session: &Session,

@@ -1689,6 +1689,7 @@ fn native_worker_claim_staged_record(
             .as_ref()
             .map(|join| join.executable_binding_digest.clone())
             .unwrap_or_default(),
+        receipt_payloads: Default::default(),
         execution_unit_schema_version: request.execution_unit_schema_version,
         predecessor_revision: native_worker_claim_identity(
             OpaqueLabel::new(request.predecessor_revision.as_str()),
