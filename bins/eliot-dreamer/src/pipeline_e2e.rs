@@ -197,7 +197,7 @@ fn orientation_pipeline_threads_screen_to_packet_receipt() {
         },
         JobClass::Orientation,
         Some(&records.1),
-        PipelineOrientationRecords::new(&records.0, &records.1),
+        Some(PipelineOrientationRecords::new(&records.0, &records.1)),
     );
     let Ok(DreamResult::Packet(packet)) = result else {
         panic!("orientation dispatch must project, got {result:?}");
@@ -273,10 +273,17 @@ fn curation_pipeline_routes_a31_without_class_refusal() {
     let refused = dispatch_admitted(
         &admission,
         &job,
-        Some(binding),
-        None,
+        OwnerCarriers {
+            curation: None,
+            screen: Some(binding),
+            curation_protection: None,
+            orientation: None,
+        },
         JobClass::Curation,
         None,
+        // Curation is directed by the common A-05 owner to its separate typed
+        // post-handler carrier (proved above), so it holds neither a validated
+        // candidate nor a pipeline record.
         None,
     );
     assert!(
@@ -501,7 +508,21 @@ fn submit_chain_curation_stops_before_generic_stages_without_carrier() {
     assert_eq!(error.code(), "DREAMER_REQUEST_REJECTED");
     assert_ne!(error.code(), KERNEL_ADMISSION_REQUIRED);
     // Dispatch level: the same missing carrier refuses with the same reason.
-    let refused = dispatch_admitted(&admission, &job, None, None, JobClass::Curation, None, None);
+    let refused = dispatch_admitted(
+        &admission,
+        &job,
+        OwnerCarriers {
+            curation: None,
+            screen: None,
+            curation_protection: None,
+            orientation: None,
+        },
+        JobClass::Curation,
+        None,
+        // Curation never reaches the common A-05 validation stage, so it holds
+        // neither a validated candidate nor a pipeline record.
+        None,
+    );
     let Err(error) = refused else {
         panic!("carrier-less dispatch must refuse at the carrier check");
     };

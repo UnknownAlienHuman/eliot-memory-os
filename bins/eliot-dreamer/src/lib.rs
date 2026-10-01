@@ -730,7 +730,7 @@ fn run_admitted_pipeline(
         },
         job.job_class,
         Some(&validated),
-        dispatch_stage::PipelineOrientationRecords::new(&grounding_request, &validated),
+        Some(dispatch_stage::PipelineOrientationRecords::new(&grounding_request, &validated)),
     )
 }
 

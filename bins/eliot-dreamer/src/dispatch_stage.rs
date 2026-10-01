@@ -140,6 +140,23 @@ const FRAME_SOURCE_REFUSAL: &str =
 /// receipt refuses before any owner work.
 pub(crate) const VALIDATION_RECEIPT_REFUSAL: &str =
     "admitted dispatch requires validated pre-handler candidate";
+/// Fail-closed reason when the Orientation arm is entered without the two
+/// pipeline-produced records its carrier joins (see
+/// [`PipelineOrientationRecords`]).
+///
+/// The records exist only for a job that genuinely ran the grounding and A-05
+/// validation stages, and the common A-05 owner never issues them for the
+/// other classes: Curation is directed to its separate typed post-handler
+/// carrier and the five `submit` never admits classes are refused by
+/// `resolve_validation_inputs`, so neither can produce a validated candidate to
+/// record. The parameter is therefore genuinely optional per class rather than
+/// mandatory for arms that provably cannot have one, and this refusal restores
+/// the requirement where it is real: Orientation consumes the records at the
+/// carrier join, so their absence is a typed refusal, never a silent
+/// degradation of an Orientation run into a projection with no committed
+/// grounding receipt behind it.
+const ORIENTATION_PIPELINE_REFUSAL: &str =
+    "admitted Orientation dispatch requires the pipeline grounding and validated records";
 
 /// Governor-injected Curation execution carrier: the validated batch plus the
 /// ten live handler ports A-31 routes it through.
@@ -279,14 +296,29 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 /// admitted class, carried from the validation stage; `None` for Curation,
 /// which owns its separate carrier, and for refused classes, which never
 /// reach validation), and the two pipeline-produced records the Orientation
-/// carrier joins (read only on the Orientation arm). Returns the owner-typed
-/// [`DreamResult`].
+/// carrier joins (`Some` for every class that genuinely ran the grounding and
+/// A-05 stages and therefore holds them; `None` only for the classes that
+/// provably cannot hold one; read only on the Orientation arm). Returns the
+/// owner-typed [`DreamResult`].
+///
+/// The `pipeline` records are honestly optional per class because the common
+/// A-05 owner provably never issues a validated candidate for the other
+/// classes: `validate_family` directs Curation to its separate typed
+/// post-handler carrier, and `resolve_validation_inputs` refuses the five
+/// classes `submit` never admits, so no arm may be made to fabricate a record
+/// to satisfy the signature. Optionality is confined to those arms — the
+/// requirement stays real and is enforced inside this function for the arm
+/// that consumes it: `JobClass::Orientation` refuses with
+/// [`ORIENTATION_PIPELINE_REFUSAL`] when the records are absent, so no caller
+/// can reach the carrier join without them and absence can never silently
+/// degrade an Orientation run.
 ///
 /// Fail-closed: the admission/job binding is verified first, then the class
 /// parameter is bound against the semantic job, then the exhaustive nine-arm
 /// match runs with no wildcard. Orientation proves the structured receipt
-/// binding first ([`require_validated_binding`]), then derives the v1
-/// hypothesis pair, validates it through the real v1 A-05 entry, resolves
+/// binding first ([`require_validated_binding`]), then the pipeline-record
+/// requirement, then derives the v1 hypothesis pair, validates it through the
+/// real v1 A-05 entry, resolves
 /// the production carrier prerequisites, and returns the typed
 /// [`DreamResult::Orientation`] complete/partial/blocked result (blocked
 /// until the Governor supply channel lands); Curation checks the carrier first
@@ -303,7 +335,7 @@ pub(crate) fn dispatch_admitted(
     carriers: OwnerCarriers<'_>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
-    pipeline: PipelineOrientationRecords<'_>,
+    pipeline: Option<PipelineOrientationRecords<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -332,11 +364,24 @@ pub(crate) fn dispatch_admitted(
         // on the structured A-05 receipt: without the validated candidate
         // there is no proved pre-handler gate, so the arm refuses before any
         // v1 derivation or owner projection work.
+        //
+        // This is the only arm that consumes the pipeline records, so this is
+        // also where their absence must refuse. Making the parameter optional
+        // for the arms that provably cannot hold a record must not become a way
+        // to dispatch Orientation with no committed grounding receipt: the
+        // records are unwrapped here, not defaulted, so the call into
+        // `dispatch_orientation` still requires them by type and their absence
+        // is a typed refusal rather than a degraded projection.
         JobClass::Orientation => {
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate, carriers.orientation, pipeline)
+            let Some(records) = pipeline else {
+                return Err(DreamerError::InvalidAdmission(
+                    ORIENTATION_PIPELINE_REFUSAL,
+                ));
+            };
+            dispatch_orientation(admission, job, candidate, carriers.orientation, records)
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -1942,7 +1987,7 @@ mod slice_7_native_owner_tests {
             no_owner_carriers(),
             JobClass::Orientation,
             Some(&validated.1),
-            PipelineOrientationRecords::new(&validated.0, &validated.1),
+            Some(PipelineOrientationRecords::new(&validated.0, &validated.1)),
         );
         let Ok(DreamResult::Packet(packet)) = result else {
             panic!("orientation must project, got {result:?}");
@@ -2012,7 +2057,7 @@ mod slice_7_native_owner_tests {
             no_owner_carriers(),
             JobClass::Orientation,
             Some(&validated.1),
-            PipelineOrientationRecords::new(&validated.0, &validated.1),
+            Some(PipelineOrientationRecords::new(&validated.0, &validated.1)),
         );
         assert!(
             matches!(
@@ -2044,7 +2089,7 @@ mod slice_7_native_owner_tests {
             no_owner_carriers(),
             JobClass::Orientation,
             None,
-            PipelineOrientationRecords::new(&records.0, &records.1),
+            Some(PipelineOrientationRecords::new(&records.0, &records.1)),
         );
         assert!(
             matches!(
@@ -2070,8 +2115,7 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            no_owner_carriers(),
             JobClass::Orientation,
             None,
             None,
@@ -2098,7 +2142,7 @@ mod slice_7_native_owner_tests {
             no_owner_carriers(),
             JobClass::Curation,
             None,
-            PipelineOrientationRecords::new(&records.0, &records.1),
+            Some(PipelineOrientationRecords::new(&records.0, &records.1)),
         );
         assert!(
             matches!(
@@ -2117,10 +2161,21 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            None,
+            // The screen binding is present and the protection assessment is
+            // derivable from it, but the carrier is deliberately withheld: the
+            // carrier check runs first, so this stays a carrier-gate proof and
+            // never reaches screen, protection, or registry work.
+            OwnerCarriers {
+                curation: None,
+                screen: Some(valid_screen()),
+                curation_protection: None,
+                orientation: None,
+            },
             JobClass::Curation,
             None,
+            // Curation is directed by the common A-05 owner to its separate
+            // typed post-handler carrier, so no validated candidate and no
+            // pipeline record can exist for this class.
             None,
         );
         assert!(
@@ -2153,10 +2208,11 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            None,
-            None,
+            no_owner_carriers(),
             JobClass::Curation,
             None,
+            // Curation never reaches the common A-05 validation stage, so it
+            // holds neither a validated candidate nor a pipeline record.
             None,
         );
         assert!(
@@ -2180,10 +2236,19 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            None,
-            Some(harness.carrier()),
+            // The carrier is injected and the screen binding is deliberately
+            // withheld. The protection assessment is derived from that binding,
+            // so without it there is no honest assessment to supply either.
+            OwnerCarriers {
+                curation: Some(harness.carrier()),
+                screen: None,
+                curation_protection: None,
+                orientation: None,
+            },
             JobClass::Curation,
             None,
+            // Curation never reaches the common A-05 validation stage, so it
+            // holds neither a validated candidate nor a pipeline record.
             None,
         );
         assert!(
@@ -2211,13 +2276,26 @@ mod slice_7_native_owner_tests {
             batch: harness.batch().clone(),
             ports: NativeCurationPortSet { ports: Vec::new() },
         };
+        let job = semantic_job(JobClass::Curation);
+        let screen = valid_screen();
+        // The genuine A-20 protection assessment, derived from the admitted job
+        // against this exact binding by the same owner helper the screen stage
+        // uses, so the port boundary is reached rather than short-circuited by
+        // a missing assessment.
+        let protection = crate::curation_screen_stage::protection_for_admitted(&job, &screen);
         let refused = dispatch_admitted(
             &admission(),
-            &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            Some(carrier),
+            &job,
+            OwnerCarriers {
+                curation: Some(carrier),
+                screen: Some(screen),
+                curation_protection: Some(protection),
+                orientation: None,
+            },
             JobClass::Curation,
             None,
+            // Curation never reaches the common A-05 validation stage, so it
+            // holds neither a validated candidate nor a pipeline record.
             None,
         );
         assert!(
@@ -2249,13 +2327,26 @@ mod slice_7_native_owner_tests {
         use crate::{JobState, JobView};
 
         let harness = harness_for_fixture();
+        let job = semantic_job(JobClass::Curation);
+        let screen = valid_screen();
+        // The genuine A-20 protection assessment, derived from the admitted job
+        // against this exact binding by the same owner helper the screen stage
+        // uses, so the success twin really routes and the pulse really carries
+        // the per-member protection finding.
+        let protection = crate::curation_screen_stage::protection_for_admitted(&job, &screen);
         let result = dispatch_admitted(
             &admission(),
-            &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            Some(harness.carrier()),
+            &job,
+            OwnerCarriers {
+                curation: Some(harness.carrier()),
+                screen: Some(screen),
+                curation_protection: Some(protection),
+                orientation: None,
+            },
             JobClass::Curation,
             None,
+            // Curation never reaches the common A-05 validation stage, so it
+            // holds neither a validated candidate nor a pipeline record.
             None,
         );
         let Ok(DreamResult::Curation {
@@ -2357,7 +2448,7 @@ mod slice_7_native_owner_tests {
                 no_owner_carriers(),
                 class,
                 Some(&records.1),
-                PipelineOrientationRecords::new(&records.0, &records.1),
+                Some(PipelineOrientationRecords::new(&records.0, &records.1)),
             );
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
@@ -2387,10 +2478,12 @@ mod slice_7_native_owner_tests {
             let refused = dispatch_admitted(
                 &admission(),
                 &semantic_job(class),
-                None,
-                None,
+                no_owner_carriers(),
                 class,
                 None,
+                // These five classes are refused by `resolve_validation_inputs`
+                // before any validation stage runs, so no pipeline record can
+                // exist for them and none is fabricated to fill the parameter.
                 None,
             );
             assert!(

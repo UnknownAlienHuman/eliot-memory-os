@@ -1939,6 +1939,7 @@ mod tests {
             KernelPortError::InvalidMaterial(_) => "InvalidMaterial",
             KernelPortError::StaleEpoch { .. } => "StaleEpoch",
             KernelPortError::StaleGeneration { .. } => "StaleGeneration",
+            KernelPortError::OwnerRecordStale(_) => "OwnerRecordStale",
             KernelPortError::SemanticInputUnavailable => "SemanticInputUnavailable",
             KernelPortError::SemanticInputStale(_) => "SemanticInputStale",
             KernelPortError::StaleClaimBinding => "StaleClaimBinding",
