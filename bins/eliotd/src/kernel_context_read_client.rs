@@ -2130,14 +2130,13 @@ fn admit_packet_candidates(
         }
         None => admit_context_traced_with_headroom(input, headroom),
     };
-    let (result, traces) = match guarded
-        .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?
-    {
-        HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
-        HeadroomAdmissionOutcome::Refused(refusal) => {
-            return Err(PacketCompositionError::HeadroomRefused { refusal });
-        }
-    };
+    let (result, traces) =
+        match guarded.map_err(|error| PacketCompositionError::Admission(Box::new(error)))? {
+            HeadroomAdmissionOutcome::Admitted { result, traces, .. } => (*result, traces),
+            HeadroomAdmissionOutcome::Refused(refusal) => {
+                return Err(PacketCompositionError::HeadroomRefused { refusal });
+            }
+        };
     result
         .validate_for(input)
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
