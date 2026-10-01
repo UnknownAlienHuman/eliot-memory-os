@@ -100,6 +100,74 @@ impl VerifiedTestdReplayContext {
         }
     }
 
+    /// Validates the exact retained stage against this live profile registry
+    /// and the context's independently verified catalog lifecycle. The
+    /// provider/currentness match still runs again when the stream bytes are
+    /// replayed with finish-boundary observations.
+    pub fn validate_registered_stage(
+        &self,
+        stage: &InstrumentStageRequest,
+    ) -> Result<(), ProfileReplayError> {
+        stage
+            .validate()
+            .map_err(|error| ProfileReplayError::InvalidStage {
+                detail: error.to_string(),
+            })?;
+        let admitted = ProfileCompiler::new(&self.profile_registry)
+            .compile_exact(&stage.profile_name, stage.profile_revision)
+            .map_err(|error| ProfileReplayError::InvalidStage {
+                detail: error.to_string(),
+            })?;
+        if admitted.registry_generation != stage.registry_generation
+            || admitted.registry_digest != stage.registry_digest
+            || admitted.profile_digest != stage.profile_digest
+            || admitted.dag_digest != stage.dag_digest
+        {
+            return Err(ProfileReplayError::StaleProfileGeneration);
+        }
+        let selected = admitted
+            .stages
+            .iter()
+            .find(|candidate| candidate.stage_id == stage.stage_id)
+            .ok_or(ProfileReplayError::StageMismatch { field: "stage_id" })?;
+        for (matches, field) in [
+            (selected.spec == stage.spec, "spec"),
+            (selected.spec_revision == stage.spec_revision, "spec_revision"),
+            (selected.spec_digest == stage.spec_digest, "spec_digest"),
+            (selected.kind == stage.kind, "kind"),
+            (selected.parser == stage.parser, "parser"),
+            (selected.parser_generation == stage.parser_generation, "parser_generation"),
+        ] {
+            if !matches {
+                return Err(ProfileReplayError::StageMismatch { field });
+            }
+        }
+        let command = stage
+            .stage_command
+            .as_ref()
+            .ok_or(ProfileReplayError::StageMismatch { field: "stage_command" })?;
+        if command.executable != selected.command.executable
+            || command.argv != selected.command.argv
+            || command.spec_digest != selected.spec_digest
+        {
+            return Err(ProfileReplayError::StageMismatch { field: "stage_command" });
+        }
+        let lifecycle = stage
+            .provider_catalog_lifecycle
+            .as_ref()
+            .ok_or(ProfileReplayError::StageMismatch {
+                field: "provider_catalog_lifecycle",
+            })?;
+        if !lifecycle_matches(lifecycle, &self.lifecycle)
+            || lifecycle.state_fence != stage.invocation.request.state_fence
+        {
+            return Err(ProfileReplayError::StageMismatch {
+                field: "provider_catalog_lifecycle",
+            });
+        }
+        Ok(())
+    }
+
     /// Issues a replay context only after the exact current catalog readback
     /// revalidates its accepted module generation and current WorkScope source
     /// snapshot at the same exact state fence.

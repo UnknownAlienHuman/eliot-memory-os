@@ -1683,6 +1683,102 @@ pub(crate) async fn submit_testd_owner_job(
         .issue_testd_process_request(&process_owner, process_admission, identity)
         .await
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let expected_catalog = stage_request
+        .provider_catalog_lifecycle
+        .as_ref()
+        .ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD stage has no accepted catalog selectors for owner pull"
+                    .to_owned(),
+            )
+        })?;
+    let process_deadline_ms = now_unix_ms.saturating_add(limits.wall_timeout_ms());
+    let source_root_identity_sha256 = sha256_hex(target_roots.source_root.as_bytes());
+    let stream_grant = kernel
+        .issue_testd_blob_process_stream_grant(
+            &process_owner,
+            &process,
+            identity,
+            operation_id,
+            &source_root_identity_sha256,
+            Some(expected_catalog.module_id.clone()),
+            Some(expected_catalog.generation_id.clone()),
+            process_deadline_ms,
+        )
+        .await
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let owner_projection = &stream_grant.owner_projection;
+    let owner_facts: eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts =
+        serde_json::from_str(&owner_projection.owner_facts_json)
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    owner_facts
+        .validate()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    if sha256_hex(owner_projection.owner_facts_json.as_bytes())
+        != owner_projection.owner_facts_sha256
+        || owner_facts.work_scope_binding_sha256 != owner_projection.work_scope_snapshot_sha256
+        || owner_facts.policy_sha256 != owner_projection.policy_sha256
+        || owner_facts.currentness_sha256 != owner_projection.owner_currentness_sha256
+    {
+        return Err(DispatchLaunchError::Gate(
+            "Kernel owner projection does not bind its exact owner-facts, WorkScope, policy, and currentness domains"
+                .to_owned(),
+        ));
+    }
+    let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry(
+        stage_request.registry_generation,
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let replay_context = eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
+        profile_registry,
+        &stream_grant.owner_facts_response.observed_state_fence,
+        owner_projection
+            .module_catalog_owner_readback_json
+            .as_bytes(),
+        &owner_projection.module_catalog_owner_readback_sha256,
+        owner_projection.generation_admission_json.as_bytes(),
+        &owner_projection.generation_admission_sha256,
+        owner_facts.work_scope_binding_json.as_bytes(),
+        &owner_facts.work_scope_binding_sha256,
+    )
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    replay_context
+        .validate_registered_stage(stage_request)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let verified_catalog = replay_context.accepted_catalog_lifecycle();
+    let provider_freshness = stage_request
+        .provider_freshness
+        .as_ref()
+        .ok_or_else(|| DispatchLaunchError::Gate(
+            "productive TestD stage has no provider freshness tuple".to_owned(),
+        ))?;
+    let job_currentness_bytes = canonical_json_bytes(&(
+        provider_freshness,
+        &verified_catalog,
+        &request.process_tool.observation,
+        &environment,
+    ))
+    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job_currentness_sha256 = sha256_hex(&job_currentness_bytes);
+    let blob_process_stream_grant = TestdBlobProcessStreamGrant {
+        capability_ref: stream_grant.capability.reference.clone(),
+        process_binding_sha256: owner_projection.process_binding_sha256.clone(),
+        fence_sha256: owner_projection.fence_sha256.clone(),
+        policy_sha256: owner_projection.policy_sha256.clone(),
+        owner_facts_sha256: owner_projection.owner_facts_sha256.clone(),
+        work_scope_snapshot_sha256: owner_projection.work_scope_snapshot_sha256.clone(),
+        module_catalog_owner_readback_sha256: owner_projection
+            .module_catalog_owner_readback_sha256
+            .clone(),
+        generation_admission_sha256: owner_projection.generation_admission_sha256.clone(),
+        owner_currentness_sha256: owner_projection.owner_currentness_sha256.clone(),
+        job_currentness_sha256,
+        revoked_at_ms: None,
+        tokens: vec![TestdBlobProcessStreamTokenRef {
+            reference: stream_grant.initial_call_token.reference.clone(),
+            ordinal: stream_grant.initial_call_token.ordinal,
+        }],
+    };
     let process_request = KernelProcessAdmissionRequest {
         job_id: job_id.clone(),
         project_id: request.submission.project_id.clone(),
@@ -1726,6 +1822,9 @@ pub(crate) async fn submit_testd_owner_job(
     submission
         .validate()
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
+    blob_process_stream_grant
+        .validate()
+        .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
 
     let owner_path = testd_owner_store_path(&work_root);
     let owner_parent = owner_path.parent().ok_or_else(|| {
@@ -1737,6 +1836,9 @@ pub(crate) async fn submit_testd_owner_job(
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let job = store
         .submit_productive_verifier(submission, identity.clone(), permit, now_unix_ms)
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let job = store
+        .persist_blob_process_stream_grant(&job.job_id, blob_process_stream_grant)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let response = TestdOwnerSubmitResponse::Admitted {
         wire_id: TESTD_OWNER_SUBMIT_OPERATION.to_owned(),
