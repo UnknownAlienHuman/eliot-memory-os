@@ -74,7 +74,9 @@ pub struct InitialSetupMutationConsent {
 impl InitialSetupMutationConsent {
     /// Constructs the exact effect set only after the caller has collected an
     /// affirmative Human confirmation in the trusted setup interaction.
-    pub fn from_explicit_confirmation(confirmed: bool) -> Result<Self, WorkScopeSourceAdmissionError> {
+    pub fn from_explicit_confirmation(
+        confirmed: bool,
+    ) -> Result<Self, WorkScopeSourceAdmissionError> {
         if !confirmed {
             return Err(WorkScopeSourceAdmissionError::InitialSetupConsentMissing);
         }
