@@ -261,13 +261,11 @@ fn validate_capture_submission_binding(
         ));
     }
 
-    let selection = submission
-        .get("task_selection")
-        .ok_or_else(|| {
-            TaskBindingRejection::selection_required(
-                "retained observation submission is missing TaskSelectionEvidence",
-            )
-        })?;
+    let selection = submission.get("task_selection").ok_or_else(|| {
+        TaskBindingRejection::selection_required(
+            "retained observation submission is missing TaskSelectionEvidence",
+        )
+    })?;
     if selection != evidence {
         return Err(TaskBindingRejection::selection_required(
             "observation submission and named operation carry different original TaskSelectionEvidence",
@@ -289,14 +287,11 @@ fn validate_capture_submission_binding(
     let scope_ref = affected_scope
         .get("work_scope")
         .and_then(serde_json::Value::as_str);
-    let evidence_task_ref = evidence
-        .get("task_ref")
-        .and_then(serde_json::Value::as_str);
+    let evidence_task_ref = evidence.get("task_ref").and_then(serde_json::Value::as_str);
     let evidence_scope_ref = evidence
         .get("work_scope_ref")
         .and_then(serde_json::Value::as_str);
-    if task_ref != evidence_task_ref || scope_ref != evidence_scope_ref
-    {
+    if task_ref != evidence_task_ref || scope_ref != evidence_scope_ref {
         return Err(TaskBindingRejection::scope_incompatible(
             "retained observation subject task or WorkScope differs from TaskSelectionEvidence",
         ));
@@ -413,9 +408,13 @@ fn validate_retained_selection(
         if retained_revision != revision
             || current_revision != Some(task_revision)
             || recorded_acceptance_digest.as_str() != acceptance_digest
-            || evidence.get("selection_source_ref").and_then(serde_json::Value::as_str)
+            || evidence
+                .get("selection_source_ref")
+                .and_then(serde_json::Value::as_str)
                 != Some(source_ref)
-            || evidence.get("evidence_ref").and_then(serde_json::Value::as_str)
+            || evidence
+                .get("evidence_ref")
+                .and_then(serde_json::Value::as_str)
                 != Some(evidence_ref)
             || !transition
                 .required_proof_and_approval_refs
