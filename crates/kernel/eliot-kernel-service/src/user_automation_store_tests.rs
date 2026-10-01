@@ -148,6 +148,46 @@ fn valid_revision(
     }
 }
 
+/// Supplies the newly required typed field without certifying the retired
+/// shape-only revision used by these refused port fixtures.
+fn unbound_normalization_receipt_envelope() -> Box<eliot_receipts::ReceiptEnvelope> {
+    let mut revision = valid_revision(
+        "normalization-fixture",
+        "r-normalization-fixture",
+        UserAutomationConfigurationState::Active,
+    );
+    revision.schedule = NormalizedSchedule {
+        kind: ScheduleKind::OneShot,
+        expression: "utc:2026-09-21T00:00:00Z".to_owned(),
+        calendar: "gregorian-utc".to_owned(),
+        timezone: "UTC".to_owned(),
+        dst_fold: eliot_kernel_core::user_automation::DstFoldPolicy::First,
+        dst_gap: eliot_kernel_core::user_automation::DstGapPolicy::ShiftForward,
+        start_at: "2026-09-21T00:00:00Z".to_owned(),
+        end_at: None,
+        next_occurrences: Vec::new(),
+        normalization_receipt: Box::new(Default::default()),
+    };
+    let mut context = context();
+    context.task_id = None;
+    let request = crate::user_automation::UserAutomationServiceRequest {
+        context,
+        authenticated_principal: "human-1".to_owned(),
+        identity: OperationIdentity {
+            operation_id: OperationId::new("op-normalization-fixture").expect("operation"),
+            idempotency_key: "idem-normalization-fixture".to_owned(),
+            canonical_request_hash: String::new(),
+        },
+        intent: intent(UserAutomationOperation::NormalizeSchedule {
+            revision: Box::new(revision),
+            occurrence_count: 1,
+        }),
+    };
+    let (_, envelope) = super::normalize_user_automation_operation(&request)
+        .expect("Kernel normalization fixture");
+    Box::new(envelope)
+}
+
 /// Builds the owner-issued denominator completeness block this double
 /// serves. The double answers with an empty revision-head set, so the
 /// read revision is the digest of exactly that empty set and the page is
@@ -557,6 +597,7 @@ async fn create_lists_and_reads_back_typed_revision() {
         "op-port-create-1",
         UserAutomationOperation::Create {
             revision: Box::new(revision.clone()),
+            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
         },
     )
     .await;
@@ -644,6 +685,7 @@ async fn edit_pause_remove_move_lineage_with_typed_results() {
         "op-port-create-2",
         UserAutomationOperation::Create {
             revision: Box::new(first.clone()),
+            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
         },
     )
     .await;
@@ -655,6 +697,7 @@ async fn edit_pause_remove_move_lineage_with_typed_results() {
         UserAutomationOperation::Edit {
             previous_revision: Box::new(first),
             revision: Box::new(second.clone()),
+            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
         },
     )
     .await;
@@ -729,6 +772,7 @@ async fn run_now_projects_invocation_and_pending_wake() {
         "op-port-create-3",
         UserAutomationOperation::Create {
             revision: Box::new(revision.clone()),
+            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
         },
     )
     .await;
@@ -834,6 +878,7 @@ async fn replay_reports_replayed_without_remutation() {
     let revision = valid_revision("auto-1", "r-1", UserAutomationConfigurationState::Active);
     let operation = UserAutomationOperation::Create {
         revision: Box::new(revision.clone()),
+        normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
     };
     let first = admitted_response(&port, "op-port-replay-4", operation.clone()).await;
     let UserAutomationStoreOutcome::Committed { receipt, .. } = first.outcome else {
@@ -869,6 +914,7 @@ async fn divergent_identity_and_unknown_automation_fail_closed() {
         "op-port-sealed-5",
         UserAutomationOperation::Create {
             revision: Box::new(revision.clone()),
+            normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
         },
     )
     .await;
@@ -879,6 +925,7 @@ async fn divergent_identity_and_unknown_automation_fail_closed() {
     other.natural_language_intent = "forged intent".to_owned();
     let forged = UserAutomationOperation::Create {
         revision: Box::new(other),
+        normalization_receipt_envelope: unbound_normalization_receipt_envelope(),
     };
     let draft = store_request("op-port-sealed-5", forged.clone());
     let observed = match port.execute_user_automation(draft).await {
