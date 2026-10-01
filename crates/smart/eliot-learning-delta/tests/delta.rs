@@ -409,8 +409,14 @@ fn bind_slot_source_contract(
     recipe.seal()
 }
 
+/// The bound recipe and view whose slot projection is recorded at
+/// `slot_disposition`. The bound recipe declares the exact slot projection
+/// payload a reconciling view carries, so a base value that is no longer current
+/// exists only in a fixture that declares that disposition, and the recorded
+/// completeness is the one the bound contract derives for it.
 fn recipe_and_view(
     tag: &str,
+    slot_disposition: SlotDisposition,
 ) -> (
     LearningStateViewRecipe,
     eliot_learning_contracts::CampaignLearningStateView,
@@ -455,7 +461,7 @@ fn recipe_and_view(
     };
     let slots = vec![SlotProjection {
         slot_id,
-        disposition: SlotDisposition::Current,
+        disposition: slot_disposition,
         members: vec![member],
         evidence: vec![aid("view-slot-evidence")],
     }];
@@ -483,6 +489,10 @@ fn recipe_and_view(
         invalidation_reason: None,
         canonical_digest: String::new(),
     };
+    // `validate_against` refuses any recorded completeness that is not the one
+    // this view's own contract derives from the bound recipe, so the fixture
+    // records that derivation instead of naming a completeness class.
+    view.completeness = view.derived_completeness(&recipe);
     view.seal_content_addressed().expect("view seal");
     (recipe, view)
 }
@@ -598,7 +608,23 @@ fn base_input_with_outcome(
     AttemptEvidence,
     &'static DerivationContext<'static>,
 ) {
-    let (recipe, view) = recipe_and_view(tag);
+    base_input_with_slot_disposition(tag, evaluator_outcome, SlotDisposition::Current)
+}
+
+/// The base attempt evidence bound to a view whose slot projection is recorded
+/// at `slot_disposition`, with the same recipe, input and context shape as
+/// `base_input_with_outcome`.
+fn base_input_with_slot_disposition(
+    tag: &str,
+    evaluator_outcome: SemanticOutcome,
+    slot_disposition: SlotDisposition,
+) -> (
+    LearningStateViewRecipe,
+    eliot_learning_contracts::CampaignLearningStateView,
+    AttemptEvidence,
+    &'static DerivationContext<'static>,
+) {
+    let (recipe, view) = recipe_and_view(tag, slot_disposition);
     let binding = view.binding.clone();
     let attempt_id = AgentAttemptId::new(format!("attempt-{tag}")).expect("attempt");
     let target = view.target.clone();
@@ -2314,10 +2340,16 @@ fn exact_before_value_with_stale_missing_and_conflicted_base() {
         Err(LearningDeltaError::BeforeValueUnavailable { field: "selector" })
     );
     for disposition in [SlotDisposition::Stale, SlotDisposition::Conflicted] {
-        let (_, mut view, input, context) = base_input("c08-disposition");
-        view.slots[0].disposition = disposition;
-        view.completeness = Completeness::Partial;
-        view.seal_content_addressed().expect("view seal");
+        // The bound recipe declares the exact slot projection payload its view
+        // carries, so a stale or conflicted base value is only derivable from a
+        // fixture that declares that disposition and the completeness the
+        // contract derives for it. This view therefore still reconciles with its
+        // recipe, and the refusal under test is the before-value one.
+        let (_, view, input, context) = base_input_with_slot_disposition(
+            "c08-disposition",
+            SemanticOutcome::Benefit,
+            disposition,
+        );
         assert_eq!(
             derive_attempt_learning_outcome(
                 &view,
@@ -2331,10 +2363,18 @@ fn exact_before_value_with_stale_missing_and_conflicted_base() {
             })
         );
     }
-    let (_, mut view, input, context) = base_input("c08-invalidated");
+    let (recipe, mut view, input, context) = base_input("c08-invalidated");
     view.invalidated = true;
     view.invalidation_reason = Some("retired".to_owned());
-    view.completeness = Completeness::Partial;
+    // An invalidated view never records `CompleteForDeclaredRecipe`, and the
+    // derived completeness reads declared slot and source state rather than the
+    // invalidation marker itself, so this fixture drops the derivation history
+    // plan that made the base view complete and records the completeness its own
+    // contract derives. The slot projection and its member lineage stay
+    // `Current`, so the invalidation marker is the only remaining reason for the
+    // refusal.
+    view.provenance.history_plans.clear();
+    view.completeness = view.derived_completeness(&recipe);
     view.seal_content_addressed().expect("view seal");
     assert_eq!(
         derive_attempt_learning_outcome(
