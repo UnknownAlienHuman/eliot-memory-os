@@ -985,11 +985,9 @@ pub fn reserve_for_transition(
     if token.reservation_order == 0
         || token.operation_id.as_str() != seed.operation_id
         || token.scopes.len() != requested_scopes.len()
-        || token
-            .scopes
-            .iter()
-            .any(|reserved| reserved.reserved_sequence == 0
-                || !requested_scopes.contains(reserved.scope.scope.as_str()))
+        || token.scopes.iter().any(|reserved| {
+            reserved.reserved_sequence == 0 || !requested_scopes.contains(reserved.scope.as_str())
+        })
     {
         return Err(ReservationWriteError::Binding {
             operation_id,
