@@ -450,7 +450,11 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
             .restricted_source_bytes
             .as_deref()
             .is_some_and(|source| {
-                !restricted_source_matches_normalized_event(source, &submission.envelope_json)
+                !restricted_source_matches_normalized_event(
+                    source,
+                    &submission.envelope_json,
+                    &submission.kind,
+                )
             })
         {
             return Err(HostEventAdmissionError::of(
@@ -656,13 +660,16 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
     }
 }
 
-/// Confirms that identity fields present in the original callback are the
-/// same fields projected into the normalized event before its raw sidecar is
-/// sent to Kernel. Fields absent from the callback are not inferred from
-/// caller metadata.
+/// Confirms the native callback class discriminator and all identity fields
+/// actually supplied by that callback before its raw sidecar is sent to
+/// Kernel. OpenCode lifecycle events arrive wrapped as `{ event }` and must
+/// carry their native event `type`; tool hooks arrive as the direct tool input
+/// and must carry the native `tool` name. Hook callbacks do not have to invent
+/// lifecycle-only `type`, sequence, or timestamp fields.
 fn restricted_source_matches_normalized_event(
     source_bytes: &[u8],
     normalized: &serde_json::Value,
+    kind: &HostEventKind,
 ) -> bool {
     let Ok(source) = serde_json::from_slice::<serde_json::Value>(source_bytes) else {
         return false;
@@ -674,10 +681,40 @@ fn restricted_source_matches_normalized_event(
         return false;
     }
 
-    let event = source
-        .get("event")
-        .filter(|value| value.is_object())
-        .unwrap_or(&source);
+    let expected_kind = match kind {
+        HostEventKind::Gate => "tool.execute.before",
+        HostEventKind::Skipped => "tool.execute.skipped",
+        HostEventKind::Passive(kind) => kind.as_str(),
+    };
+    if normalized
+        .get("event_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_kind)
+    {
+        return false;
+    }
+
+    let event = match kind {
+        HostEventKind::Passive(_) => {
+            let Some(event) = source.get("event").filter(|value| value.is_object()) else {
+                return false;
+            };
+            event
+        }
+        HostEventKind::Gate | HostEventKind::Skipped => {
+            let Some(tool) = source
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .filter(|tool| !tool.trim().is_empty())
+            else {
+                return false;
+            };
+            if normalized.get("tool").and_then(serde_json::Value::as_str) != Some(tool) {
+                return false;
+            }
+            &source
+        }
+    };
     let properties = event.get("properties");
 
     let first_text = |values: &[Option<&serde_json::Value>]| {
@@ -721,38 +758,108 @@ fn restricted_source_matches_normalized_event(
         properties.and_then(|value| value.get("emitted_at")),
         properties.and_then(|value| value.get("timestamp")),
     ]);
+    let host_session_id = first_text(&[
+        source.get("sessionID"),
+        source.get("sessionId"),
+        properties.and_then(|value| value.get("sessionID")),
+        properties.and_then(|value| value.get("sessionId")),
+        properties.and_then(|value| value.get("session_id")),
+    ]);
+    let tool = first_text(&[
+        source.get("tool"),
+        properties.and_then(|value| value.get("tool")),
+    ]);
+    let changed_path = first_text(&[
+        properties.and_then(|value| value.get("file")),
+        properties.and_then(|value| value.get("path")),
+    ]);
 
-    vendor_kind.is_none_or(|value| {
-        normalized
-            .get("vendor_event_kind")
-            .and_then(serde_json::Value::as_str)
-            == Some(value)
-    }) && native_id.is_none_or(|value| {
-        normalized
-            .get("native_event_id")
-            .and_then(serde_json::Value::as_str)
-            == Some(value)
-    }) && native_sequence.is_none_or(|value| {
-        normalized
-            .get("native_sequence")
-            .and_then(serde_json::Value::as_u64)
-            == Some(value)
-    }) && native_emitted_at.is_none_or(|value| {
-        normalized
-            .get("native_emitted_at")
-            .and_then(serde_json::Value::as_str)
-            == Some(value)
-    })
+    let event_class_matches = match kind {
+        HostEventKind::Passive(_) => {
+            vendor_kind == Some(expected_kind)
+                && normalized
+                    .get("vendor_event_kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(expected_kind)
+        }
+        HostEventKind::Gate | HostEventKind::Skipped => {
+            normalized
+                .get("vendor_event_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some(vendor_kind.unwrap_or(expected_kind))
+        }
+    };
+
+    event_class_matches
+        && native_id.is_none_or(|value| {
+            normalized
+                .get("native_event_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(value)
+        })
+        && native_sequence.is_none_or(|value| {
+            normalized
+                .get("native_sequence")
+                .and_then(serde_json::Value::as_u64)
+                == Some(value)
+        })
+        && native_emitted_at.is_none_or(|value| {
+            normalized
+                .get("native_emitted_at")
+                .and_then(serde_json::Value::as_str)
+                == Some(value)
+        })
+        && host_session_id.is_none_or(|value| {
+            normalized
+                .get("host_session_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(value)
+        })
+        && tool.is_none_or(|value| {
+            normalized.get("tool").and_then(serde_json::Value::as_str) == Some(value)
+        })
+        && changed_path.is_none_or(|value| {
+            normalized
+                .get("changed_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(value)
+        })
 }
 
 #[cfg(test)]
 mod issue_1935_restricted_source_binding_tests {
     use super::restricted_source_matches_normalized_event;
+    use eliot_agent_opencode::HostEventKind;
     use eliot_contracts::canonical_json_bytes;
     use serde_json::json;
 
     #[test]
     fn issue_1935_restricted_source_accepts_matching_native_identity() {
+        for class in [
+            "session.created",
+            "session.compacted",
+            "session.error",
+            "session.idle",
+            "permission.asked",
+            "permission.replied",
+            "file.edited",
+            "todo.updated",
+        ] {
+            let source = json!({"event": {"type": class, "properties": {"sessionID": "ses-7"}}});
+            let bytes = canonical_json_bytes(&source).expect("canonical callback source");
+            let normalized = json!({
+                "event_kind": class,
+                "vendor_event_kind": class,
+                "host_session_id": "ses-7"
+            });
+
+            assert!(restricted_source_matches_normalized_event(
+                &bytes,
+                &normalized,
+                &HostEventKind::Passive(class.to_owned())
+            ));
+        }
+
         let source = json!({
             "event": {
                 "type": "session.idle",
@@ -763,15 +870,16 @@ mod issue_1935_restricted_source_binding_tests {
         });
         let bytes = canonical_json_bytes(&source).expect("canonical callback source");
         let normalized = json!({
+            "event_kind": "session.idle",
             "vendor_event_kind": "session.idle",
             "native_event_id": "native-event-7",
             "native_sequence": 7,
             "native_emitted_at": "2026-10-01T12:00:00Z"
         });
-
         assert!(restricted_source_matches_normalized_event(
             &bytes,
-            &normalized
+            &normalized,
+            &HostEventKind::Passive("session.idle".to_owned())
         ));
     }
 
@@ -786,6 +894,7 @@ mod issue_1935_restricted_source_binding_tests {
         });
         let bytes = canonical_json_bytes(&source).expect("canonical callback source");
         let normalized = json!({
+            "event_kind": "session.idle",
             "vendor_event_kind": "session.idle",
             "native_event_id": "native-event-7",
             "native_sequence": 7
@@ -793,8 +902,63 @@ mod issue_1935_restricted_source_binding_tests {
 
         assert!(!restricted_source_matches_normalized_event(
             &bytes,
-            &normalized
+            &normalized,
+            &HostEventKind::Passive("session.idle".to_owned())
         ));
+    }
+
+    #[test]
+    fn issue_1935_restricted_source_refuses_missing_lifecycle_discriminator() {
+        let normalized = json!({
+            "event_kind": "session.idle",
+            "vendor_event_kind": "session.idle"
+        });
+        for source in [json!({}), json!({"unrelated": "callback"}), json!({"event": {}})] {
+            let bytes = canonical_json_bytes(&source).expect("canonical callback source");
+            assert!(!restricted_source_matches_normalized_event(
+                &bytes,
+                &normalized,
+                &HostEventKind::Passive("session.idle".to_owned())
+            ));
+        }
+    }
+
+    #[test]
+    fn issue_1935_restricted_source_accepts_native_tool_hook_schema_without_event_type() {
+        let source = json!({"tool": "bash", "args": {"command": "pwd"}});
+        let bytes = canonical_json_bytes(&source).expect("canonical hook input");
+        for (event_kind, kind) in [
+            ("tool.execute.before", HostEventKind::Gate),
+            ("tool.execute.skipped", HostEventKind::Skipped),
+        ] {
+            let normalized = json!({
+                "event_kind": event_kind,
+                "vendor_event_kind": event_kind,
+                "tool": "bash"
+            });
+            assert!(restricted_source_matches_normalized_event(
+                &bytes,
+                &normalized,
+                &kind
+            ));
+        }
+    }
+
+    #[test]
+    fn issue_1935_restricted_source_refuses_missing_or_substituted_tool_hook_identity() {
+        let normalized = json!({
+            "event_kind": "tool.execute.before",
+            "vendor_event_kind": "tool.execute.before",
+            "tool": "bash"
+        });
+        for source in [json!({}), json!({"args": {"command": "pwd"}}), json!({"tool": "write"})] {
+            let bytes = canonical_json_bytes(&source).expect("canonical hook input");
+            assert!(!restricted_source_matches_normalized_event(
+                &bytes,
+                &normalized,
+                &HostEventKind::Gate
+            ));
+        }
     }
 }
 
