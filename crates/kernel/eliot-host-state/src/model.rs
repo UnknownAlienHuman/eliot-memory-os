@@ -1250,10 +1250,8 @@ impl ManagedDependencyRecord {
         {
             return Err(CanonicalStoreWriteRefusal::ProcessApprovalMismatch);
         }
-        if !duplicate_free_exact_lineage(
-            &self.pid_job_lineage_refs,
-            required_pid_job_lineage_refs,
-        ) {
+        if !duplicate_free_exact_lineage(&self.pid_job_lineage_refs, required_pid_job_lineage_refs)
+        {
             return Err(CanonicalStoreWriteRefusal::MissingPidJobLineage);
         }
         if self.observed_liveness() {
@@ -1298,10 +1296,7 @@ impl ManagedDependencyRecord {
 /// duplicate scan applies the same rule the journal's [`handles`] validator
 /// enforces at record admission, extended here to the caller-supplied required
 /// slice that admission never sees.
-fn duplicate_free_exact_lineage(
-    recorded: &[PlatformHandle],
-    required: &[PlatformHandle],
-) -> bool {
+fn duplicate_free_exact_lineage(recorded: &[PlatformHandle], required: &[PlatformHandle]) -> bool {
     if recorded.is_empty() || required.is_empty() {
         return false;
     }

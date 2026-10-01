@@ -71,7 +71,9 @@ pub enum CanonicalStoreWriteStatusRefusal {
     /// front-door/recovery status names each failing dimension instead of
     /// reporting only the first failure.
     HostAndSemantic {
+        /// Host-side refusal, kept alongside the bridge receipt.
         host: CanonicalStoreWriteRefusal,
+        /// Bridge-side typed semantic readiness receipt.
         semantic: StoreSemanticReadiness,
     },
 }
@@ -97,25 +99,23 @@ pub fn project_canonical_store_write_status(
     let bridge_ready = semantic.is_ready();
     match (host, bridge_ready) {
         (Ok(()), true) => CanonicalStoreWriteStatus::Ready,
-        (Err(refusal), true) => CanonicalStoreWriteStatus::Refused(
-            CanonicalStoreWriteStatusRefusal::Host(refusal),
-        ),
-        (Ok(()), false) => {
-            CanonicalStoreWriteStatus::Refused(resolve_semantic_refusal(semantic))
+        (Err(refusal), true) => {
+            CanonicalStoreWriteStatus::Refused(CanonicalStoreWriteStatusRefusal::Host(refusal))
         }
-        (Err(refusal), false) => CanonicalStoreWriteStatus::Refused(
-            CanonicalStoreWriteStatusRefusal::HostAndSemantic {
+        (Ok(()), false) => CanonicalStoreWriteStatus::Refused(resolve_semantic_refusal(*semantic)),
+        (Err(refusal), false) => {
+            CanonicalStoreWriteStatus::Refused(CanonicalStoreWriteStatusRefusal::HostAndSemantic {
                 host: refusal,
                 semantic: *semantic,
-            },
-        ),
+            })
+        }
     }
 }
 
 /// Resolves the exact failing bridge dimension in version/schema/transaction
 /// probe order. A result that is not ready but names no failed dimension is
 /// unobserved, never ready.
-fn resolve_semantic_refusal(semantic: &StoreSemanticReadiness) -> CanonicalStoreWriteStatusRefusal {
+fn resolve_semantic_refusal(semantic: StoreSemanticReadiness) -> CanonicalStoreWriteStatusRefusal {
     match (semantic.version, semantic.schema, semantic.transaction) {
         (SemanticDimension::Incompatible, _, _) => {
             CanonicalStoreWriteStatusRefusal::VersionIncompatible
