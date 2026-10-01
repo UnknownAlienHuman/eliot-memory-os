@@ -40,6 +40,7 @@ use eliot_agent_api::StateFence;
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::ProviderCapabilityExpectation;
 
+use crate::core::ProviderProofKind;
 use crate::model::{CoordinatorError, ProviderIdentity, validate_text};
 use crate::provider_admission::{
     AdmittedProviderCapability, OwnerCurrentness, PresentedClaimMaterial, ProviderSelectionHealth,
@@ -51,7 +52,9 @@ use crate::provider_admission::{
 /// The exact durable fields the daemon resolved from the Kernel/ORS claim
 /// read projection under the exact `claim_id` key plus the attempt/operation
 /// reverse projection (T9-04): the loaded attempt, operation, binding and
-/// executable digests, claiming-worker generation, and fence digest. Carries
+/// executable digests, claiming-worker generation, and fence digest, plus
+/// the owner-retained per-receipt canonical-payload digests (issue #1108,
+/// A5) the sealed verifier passes as the loaded payload leg. Carries
 /// no secret material (identities, digests, generation only); the live fence
 /// and Governor currentness travel alongside through [`OwnerCurrentness`],
 /// never inside this row.
@@ -64,6 +67,24 @@ pub struct OwnerLoadedClaimRow {
     executable_digest: String,
     worker_generation: u64,
     fence_digest: String,
+    /// Owner-retained canonical-payload digest of the admission receipt, if
+    /// recorded on the durable row yet.
+    admission_payload_sha256: Option<String>,
+    /// Owner-retained canonical-payload digest of the cancellation receipt,
+    /// if recorded on the durable row yet.
+    cancellation_payload_sha256: Option<String>,
+    /// Owner-retained canonical-payload digest of the worker-fence receipt,
+    /// if recorded on the durable row yet.
+    worker_fence_payload_sha256: Option<String>,
+    /// Owner-retained canonical-payload digest of the reassignment receipt,
+    /// if recorded on the durable row yet.
+    reassignment_payload_sha256: Option<String>,
+    /// Owner-retained canonical-payload digest of the result submission, if
+    /// recorded on the durable row yet.
+    result_payload_sha256: Option<String>,
+    /// Owner-retained canonical-payload digest of the unknown-outcome
+    /// receipt, if recorded on the durable row yet.
+    unknown_outcome_payload_sha256: Option<String>,
 }
 
 impl OwnerLoadedClaimRow {
@@ -109,7 +130,67 @@ impl OwnerLoadedClaimRow {
             executable_digest,
             worker_generation,
             fence_digest,
+            // No per-kind payload evidence yet: the daemon attaches the
+            // witnessed slots through `with_receipt_payloads` once it holds
+            // the Kernel claim-row projection, so a row built without that
+            // projection carries no owner evidence on the payload leg and the
+            // owner passes that leg until the recorder lands.
+            admission_payload_sha256: None,
+            cancellation_payload_sha256: None,
+            worker_fence_payload_sha256: None,
+            reassignment_payload_sha256: None,
+            result_payload_sha256: None,
+            unknown_outcome_payload_sha256: None,
         })
+    }
+
+    /// Attaches the owner-retained per-receipt payload digests witnessed on
+    /// the durable row (issue #1108, A5 carrier).
+    ///
+    /// Called only by the daemon row loader with the six slots exactly as
+    /// the Kernel claim-row projection returned them: a slot is `None`
+    /// until its kind's payload is recorded (pre-column rows decode
+    /// all-`None`). Shape validation reuses the existing loaded-digest rule;
+    /// a malformed retained digest fails closed here and never verifies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError::InvalidField`] for a retained payload
+    /// digest that is not a lowercase SHA-256.
+    pub fn with_receipt_payloads(
+        mut self,
+        admission_payload_sha256: Option<String>,
+        cancellation_payload_sha256: Option<String>,
+        worker_fence_payload_sha256: Option<String>,
+        reassignment_payload_sha256: Option<String>,
+        result_payload_sha256: Option<String>,
+        unknown_outcome_payload_sha256: Option<String>,
+    ) -> Result<Self, CoordinatorError> {
+        for (slot, field) in [
+            (&admission_payload_sha256, "loaded_admission_payload_sha256"),
+            (&cancellation_payload_sha256, "loaded_cancellation_payload_sha256"),
+            (
+                &worker_fence_payload_sha256,
+                "loaded_worker_fence_payload_sha256",
+            ),
+            (&reassignment_payload_sha256, "loaded_reassignment_payload_sha256"),
+            (&result_payload_sha256, "loaded_result_payload_sha256"),
+            (
+                &unknown_outcome_payload_sha256,
+                "loaded_unknown_outcome_payload_sha256",
+            ),
+        ] {
+            if let Some(digest) = slot {
+                require_loaded_digest(digest, field)?;
+            }
+        }
+        self.admission_payload_sha256 = admission_payload_sha256;
+        self.cancellation_payload_sha256 = cancellation_payload_sha256;
+        self.worker_fence_payload_sha256 = worker_fence_payload_sha256;
+        self.reassignment_payload_sha256 = reassignment_payload_sha256;
+        self.result_payload_sha256 = result_payload_sha256;
+        self.unknown_outcome_payload_sha256 = unknown_outcome_payload_sha256;
+        Ok(self)
     }
 
     /// Requires the ingress-presented half to equal this loaded owner row
@@ -174,6 +255,28 @@ impl OwnerLoadedClaimRow {
     /// Returns the loaded claiming-worker generation.
     pub(crate) fn worker_generation(&self) -> u64 {
         self.worker_generation
+    }
+
+    /// Returns the witnessed retained payload digest for one proof kind
+    /// (issue #1108, A5 carrier).
+    ///
+    /// Crate-internal: the sealed verifier passes this as the loaded
+    /// canonical-payload leg, so it never aliases the presented half. A
+    /// kind with no retained slot (`Binding`, which the ORS column does not
+    /// cover) or with no recorded payload yet yields empty, which the owner
+    /// treats as "no evidence on this leg"; a retained digest that
+    /// disagrees with the presented payload fails closed in the owner.
+    pub(crate) fn receipt_payload_for_kind(&self, kind: &ProviderProofKind) -> &str {
+        match kind {
+            ProviderProofKind::Admission => self.admission_payload_sha256.as_deref(),
+            ProviderProofKind::Cancellation => self.cancellation_payload_sha256.as_deref(),
+            ProviderProofKind::WorkerFence => self.worker_fence_payload_sha256.as_deref(),
+            ProviderProofKind::Reassignment => self.reassignment_payload_sha256.as_deref(),
+            ProviderProofKind::Result => self.result_payload_sha256.as_deref(),
+            ProviderProofKind::UnknownOutcome => self.unknown_outcome_payload_sha256.as_deref(),
+            ProviderProofKind::Binding => None,
+        }
+        .unwrap_or("")
     }
 }
 

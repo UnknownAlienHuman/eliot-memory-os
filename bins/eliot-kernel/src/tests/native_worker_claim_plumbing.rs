@@ -580,6 +580,7 @@ fn stage_persists_requested_row_with_real_store() {
             .as_ref()
             .map(|join| join.executable_binding_digest.clone())
             .unwrap_or_default(),
+        receipt_payloads: Default::default(),
         execution_unit_schema_version: request.execution_unit_schema_version,
         predecessor_revision: eliot_ors::OpaqueLabel::new(request.predecessor_revision.as_str())
             .expect("pred"),

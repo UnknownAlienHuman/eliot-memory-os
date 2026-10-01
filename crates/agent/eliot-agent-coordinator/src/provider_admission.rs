@@ -575,14 +575,16 @@ impl ProviderVerifier for KernelProviderVerifier {
         // the epoch value and resource generation alone still agree. Digest
         // equality of the remaining legs against the durable ORS row stays
         // enforced Kernel-side per effecting operation through the
-        // authenticated capability wire operation, and the payload-digest
-        // slot carries the true digest of these original receipt bytes
-        // because the owner wire requires digest form (the pure owner
-        // shape-checks it; per-receipt payload content equality under one
-        // identity is enforced by the coordinator's own per-kind replay
-        // checks and the daemon's durable envelopes, since the ORS claim row
-        // carries no per-receipt payload column in this slice). Currency is
-        // re-proved on every call, so a capability built under stale
+        // authenticated capability wire operation, and the loaded
+        // canonical-payload leg rides the witnessed per-kind payload digest
+        // retained on the factory-witnessed row (selected by kind below,
+        // never a caller echo): a retained digest that disagrees with the
+        // presented payload fails closed as a changed payload under one
+        // identity, while a kind with no retained payload yet carries no
+        // owner evidence on this leg and enforcement engages per kind as
+        // the recorder lands, with the coordinator's own per-kind replay
+        // checks and the daemon's durable envelopes as the backstop. Currency
+        // is re-proved on every call, so a capability built under stale
         // currentness cannot verify even before the Kernel owner tuple runs.
         self.capability.check_currentness()?;
         let presented = &self.capability.presented;
@@ -617,6 +619,11 @@ impl ProviderVerifier for KernelProviderVerifier {
             witnessed.executable_digest(),
             witnessed.worker_generation(),
         );
+        // The loaded canonical-payload leg comes only from the witnessed
+        // row, selected by proof kind: never the presented value echoed
+        // back. A kind with no retained payload yet yields empty, which the
+        // owner treats as "no evidence on this leg".
+        let loaded_canonical_payload_sha256 = witnessed.receipt_payload_for_kind(&kind);
         let request = ProviderCapabilityRequest {
             claim_id: presented.claim_id.clone(),
             attempt_id: receipt_attempt_id,
@@ -634,8 +641,10 @@ impl ProviderVerifier for KernelProviderVerifier {
         // Validates the ORIGINAL assembled request via the existing owner
         // validator before delegating: shape, revocation, exact
         // receipt-versus-claim attempt/operation match, epoch currency,
-        // revision agreement, digest equality, generation and fence binding
-        // are all owner-checked below against the loaded claim row.
+        // revision agreement, digest equality, generation and fence binding,
+        // then canonical-payload content equality against the retained
+        // per-kind evidence are all owner-checked below against the loaded
+        // claim row.
         request.validate().map_err(map_capability_error)?;
         verify_provider_capability(
             &request,
@@ -646,6 +655,7 @@ impl ProviderVerifier for KernelProviderVerifier {
             loaded_executable_digest,
             loaded_worker_generation,
             &live_fence_digest,
+            loaded_canonical_payload_sha256,
             &currentness.live_epoch(),
         )
         .map_err(map_capability_error)?;

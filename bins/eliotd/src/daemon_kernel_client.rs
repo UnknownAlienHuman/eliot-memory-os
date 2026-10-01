@@ -47,7 +47,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
-use eliot_ors::OperationIdentity;
+use eliot_ors::{NativeWorkerClaimReceiptPayloads, OperationIdentity};
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
@@ -151,7 +151,9 @@ struct ProviderCapabilityReceiptWire {
 /// (`bins/eliot-kernel/src/provider_capability_route.rs::ProviderCapabilityContext::read_claim_row`,
 /// sealed by `seal_capability_receipt`): the `kind` discriminator, the
 /// capability wire version, the exact durable fields shaped for
-/// [`OwnerLoadedClaimRow::new`], the read timestamp, and the seal digest.
+/// [`OwnerLoadedClaimRow::new`] plus the owner-retained per-receipt
+/// payload column (issue #1108, A5) the loader attaches through the row's
+/// payload builder, the read timestamp, and the seal digest.
 /// `deny_unknown_fields` keeps a widened reply a typed failure, never a
 /// silently accepted row.
 #[derive(Deserialize)]
@@ -166,6 +168,8 @@ struct ProviderClaimRowReadWire {
     executable_binding_digest: String,
     worker_generation: u64,
     fence_digest: String,
+    #[serde(default)]
+    receipt_payloads: NativeWorkerClaimReceiptPayloads,
     read_at_unix_ms: u64,
     receipt_digest: String,
 }
@@ -1904,7 +1908,9 @@ impl DaemonKernelClient {
     /// path, then parses the sealed reply into the seven
     /// [`OwnerLoadedClaimRow::new`] arguments (claim, attempt, operation,
     /// binding and executable digests, claiming-worker generation, fence
-    /// digest). The claim identity is validated pre-transport with the same
+    /// digest) plus the six per-receipt payload slots (issue #1108, A5)
+    /// attached through the row's payload builder. The claim identity is
+    /// validated pre-transport with the same
     /// owner the Kernel read arm enforces (`eliot_ors::OperationIdentity`),
     /// and the call requires an already-validated Kernel owner session, so a
     /// row never loads without live session evidence. The transport identity
@@ -1983,6 +1989,15 @@ impl DaemonKernelClient {
             row.executable_binding_digest,
             row.worker_generation,
             row.fence_digest,
+        )
+        .map_err(|error| KernelClientError::Unknown(error.to_string()))?
+        .with_receipt_payloads(
+            row.receipt_payloads.admission_payload_sha256,
+            row.receipt_payloads.cancellation_payload_sha256,
+            row.receipt_payloads.worker_fence_payload_sha256,
+            row.receipt_payloads.reassignment_payload_sha256,
+            row.receipt_payloads.result_payload_sha256,
+            row.receipt_payloads.unknown_outcome_payload_sha256,
         )
         .map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
