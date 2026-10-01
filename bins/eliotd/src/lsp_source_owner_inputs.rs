@@ -14,7 +14,9 @@ use eliot_git_bridge::{AsyncProcessRunner, GitSnapshotError, RepoRoot};
 use eliot_lsp_bridge::{BridgeError, LspSourceArtifactProof, SourceCandidate};
 use thiserror::Error;
 
-use crate::source_artifact_owner::{SourceArtifactOwner, SourceArtifactOwnerError};
+use crate::source_artifact_owner::{
+    SourceArtifactOwner, SourceArtifactOwnerError, SourceArtifactStagingTarget,
+};
 use crate::task_binding_admission::BoundSelectedSourceObservation;
 
 /// Live, non-Serde proof and its original process capability for one selected
@@ -71,6 +73,21 @@ impl StagedSelectedSourceSnapshot {
     pub(crate) fn artifact_reference(&self) -> &ArtifactReference {
         &self.reference
     }
+}
+
+/// Derives the real prospective S-04 target from the exact retained archive
+/// and a current Policy profile issued against the original selected-source
+/// Read. The profile supplies policy data only; it does not authorize staging.
+pub(crate) fn prepare_selected_source_staging_target(
+    owner: &SourceArtifactOwner,
+    source_read_profile: &SourceArtifactBlobProfile,
+    observed: &ObservedSelectedSourceSnapshot,
+) -> Result<SourceArtifactStagingTarget, SelectedSourceArtifactInputError> {
+    Ok(owner.prepare_source_snapshot_target(
+        source_read_profile,
+        &observed.source_id,
+        observed.snapshot.archive_bytes(),
+    )?)
 }
 
 /// Failures while joining the current owner-observed source to its stored
@@ -148,6 +165,7 @@ pub(crate) fn stage_selected_source_snapshot(
     owner: &SourceArtifactOwner,
     mutation_admission: &SourceArtifactAdmission,
     mutation_profile: &SourceArtifactBlobProfile,
+    target: &SourceArtifactStagingTarget,
     observed: ObservedSelectedSourceSnapshot,
 ) -> Result<StagedSelectedSourceSnapshot, SelectedSourceArtifactInputError> {
     if mutation_admission.request().metadata.source_id != observed.source_id {
@@ -161,9 +179,10 @@ pub(crate) fn stage_selected_source_snapshot(
         None,
         observed.captured_at.clone(),
     )?;
-    let reference = owner.stage_source_snapshot(
+    let reference = owner.stage_source_snapshot_at_target(
         mutation_admission,
         mutation_profile,
+        target,
         identity,
         observed.snapshot.archive_bytes(),
     )?;
