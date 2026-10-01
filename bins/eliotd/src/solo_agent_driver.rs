@@ -1369,7 +1369,10 @@ fn recheck_adopt_revisions(
             "solo adopt refuses a fence moved during owner IO".to_owned(),
         )));
     }
-    if !live.authority_epoch.is_same_authority(&prepared.expectation.live_authority_epoch) {
+    if !live
+        .authority_epoch
+        .is_same_authority(&prepared.expectation.live_authority_epoch)
+    {
         return Err(DaemonError::ProviderAdmission(FabricError::StaleEpoch(
             "solo adopt refuses an epoch moved during owner IO".to_owned(),
         )));
