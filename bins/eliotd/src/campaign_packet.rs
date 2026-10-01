@@ -26,6 +26,23 @@
 //! `eliot_context::ContextCompiler` is deliberately not called here: the
 //! frozen donor surface takes no new caller, and no legacy-only helper may
 //! accept a view the current owner cells refused.
+//!
+//! #1724 W5: this route now also reaches the ADMISSION decision's recipe
+//! binding, and its terminal outcome is a typed gap/blocked outcome carrying the
+//! attempted recipe reference rather than a successful View. The admission cell
+//! resolves the approved reusable `ContextRecipePolicy` revision through
+//! `eliot_context_admission::bind_admission_policy_revision` — the contract
+//! owner's own `ContextRecipePolicy::binds_recipe`, against approved owner
+//! content rather than the instance's own recorded claim — and the response
+//! delivers that approved revision, the bound instance digest and the re-derived
+//! owner body digest as `attempted_context_recipe`. The admission DECISION
+//! itself is still not made here, because `PriorityPolicyIdentity`,
+//! `AdmissionRuleIdentity`, `MeasurementCompositionProfile` and the candidate
+//! denominator have no production construction site; the response therefore
+//! reports `CampaignPacketGapCode::AdmissionClosureUnbound` with outcome
+//! `Blocked` and publishes the view only as the diagnostic material account
+//! this route already publishes for every other refusal. There is no
+//! `COMPILED` outcome: see [`CampaignPacketOutcome`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,10 +51,10 @@ use eliot_context::campaign_publication::{
     ContextCampaignRecipeBody, context_delivery_body_digest, context_recipe_body_digest,
     context_safety_floor_identity,
 };
-use eliot_context_admission::check_campaign_view_for_admission;
+use eliot_context_admission::{bind_admission_policy_revision, check_campaign_view_for_admission};
 use eliot_context_candidates::{CandidateRequest, check_campaign_learning_state_view};
 use eliot_context_contracts::{
-    ContextError, ContextRecipe, ProjectedCitation, SessionDeliverySnapshot,
+    ContextError, ContextRecipe, ProjectedCitation, RecipePolicyIdentity, SessionDeliverySnapshot,
 };
 use eliot_contracts::{
     ArtifactId, RequestId, StateFence, TaskId, canonical_json_bytes, sha256_hex,
@@ -164,17 +181,28 @@ struct AuthenticatedCampaignSourceRead {
 /// is no second, legacy-compiled product on this route: the frozen
 /// `eliot_context::ContextCompiler` takes no new caller, so nothing may claim
 /// a compiled result that the current owner pipeline did not accept.
+///
+/// #1724 W5 removed the `COMPILED` outcome rather than leaving it unproducible.
+/// I12.13 makes the packet a compiled product only when the admission decision
+/// ran and its `ContextEconomyReceipt` and `ActiveUnderstandingView` bound the
+/// exact recipe revision, and #1724 step 5 requires an incomplete compilation to
+/// return its typed gap/blocked outcome with the attempted recipe reference
+/// instead of a successful View. This route cannot assemble the admission
+/// closure — see
+/// [`CampaignPacketGapCode::AdmissionClosureUnbound`] — so a `COMPILED` value
+/// here could only ever mean "a view with no economy evidence", which is the
+/// outcome the item forbids. It is deleted rather than kept as an unreachable
+/// wire value, so the response cannot read as compiled at all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum CampaignPacketOutcome {
-    /// The immutable view was compiled, or an exact current prior view was
-    /// reused, and the current owner accepted it against the fresh
-    /// authenticated owner reads and the packet State Fence.
-    Compiled,
     /// The view exists but is explicitly marked stale against the current
     /// owner revisions; it is published for diagnosis and never used.
     Stale,
-    /// No usable view could be produced or the current owner refused it.
+    /// No usable view could be produced, the current owner refused it, or the
+    /// admission decision it would need could not be made. The response carries
+    /// the typed gap and the attempted recipe reference, and the view it does
+    /// publish is a diagnostic account rather than a compiled product.
     Blocked,
 }
 
@@ -267,7 +295,12 @@ enum CampaignPacketGapCode {
     /// owner. The admission cell reaches its own join from this route through
     /// `eliot_context_admission::check_campaign_view_for_admission`, which
     /// re-derives the join from the binding admission decides under rather than
-    /// inheriting the candidate cell's verdict. The assembly cell's join is
+    /// inheriting the candidate cell's verdict, and its approved-revision binding
+    /// through
+    /// `eliot_context_admission::bind_admission_policy_revision`, which resolves
+    /// the approved `ContextRecipePolicy` content and runs the contract owner's
+    /// `ContextRecipePolicy::binds_recipe` against this attempt's instance. The
+    /// assembly cell's join is
     /// reached from `KernelContextReadClient::compile_context_packet`, which is
     /// the only place an actual `AdmittedContextSet` exists to join against;
     /// this route produces none because `admit_context` has no callable
@@ -279,6 +312,12 @@ enum CampaignPacketGapCode {
     /// the refusal instead. Reporting it is what keeps the withheld rank trace
     /// from being read as support: the absence of a handle is a named, delivered
     /// gap, not a silent omission and not a claim that nothing was withheld.
+    ///
+    /// #1724 W5: since this gap is the reason no `ContextEconomyReceipt` and no
+    /// `ActiveUnderstandingView` exists for the attempt, it is also the reason
+    /// the response is `Blocked` and carries `attempted_context_recipe` rather
+    /// than a compiled View. It is the terminal condition of this route's
+    /// context chain, not a note attached to a delivered packet.
     AdmissionClosureUnbound,
     /// The current learning-state owner refused the view for this attempt:
     /// stale, missing, invalidated, or partial across a load-bearing slot,
@@ -356,6 +395,30 @@ struct ContextDeliveryMaterialAccount {
     materials: Vec<DeliveredMaterialTrace>,
     /// The full rank-trace handle, or `None` when no closure could be bound.
     rank_trace_handle: Option<String>,
+}
+
+/// The exact Context recipe one packet attempt was made under.
+///
+/// #1724 W5. The approved reusable policy revision is resolved by the admission
+/// cell from the approved owner content and is NOT read off the packet's own
+/// compilation-bound instance: `policy` is what
+/// `ContextRecipePolicy::binds_recipe` compared the instance against, so it is a
+/// content resolution a consumer can re-derive from the owner catalogue rather
+/// than a value this route asserts about itself. `instance_digest` is the bound
+/// instance that revision was compared with, kept separate because I12.13 keeps
+/// the approved reusable policy revision and the compilation-bound instance
+/// apart, and `owner_body_digest` is the exact authenticated owner body the
+/// Context owner re-derived — the same value the candidate and admission joins
+/// compared this attempt against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptedContextRecipeBinding {
+    /// The approved reusable policy revision, resolved from owner content.
+    policy: RecipePolicyIdentity,
+    /// Digest of the compilation-bound instance that revision is bound to.
+    instance_digest: String,
+    /// The Context owner's re-derived digest of the exact owner body.
+    owner_body_digest: String,
 }
 
 /// Counts the delivered and suppressed material of one published view.
@@ -447,6 +510,21 @@ struct CampaignPacketResponse {
     /// [`CampaignPacketGapCode::RequiredSourceUnavailable`], and a consumer
     /// never sees a citation for a revision the gate did not verify.
     cited_support: Option<ProjectedCitation>,
+    /// The exact Context recipe this attempt was made under, or `None` when the
+    /// attempt never reached the admission decision's recipe binding.
+    ///
+    /// #1724 W5 / I12.13. A refused or incomplete compilation must carry the
+    /// recipe it ATTEMPTED rather than publishing a view whose recipe identity
+    /// is unreadable, and that attempted reference has to be an independently
+    /// resolved approved revision — not the instance's own recorded claim. This
+    /// field is that reference, and it is present only where the admission cell
+    /// itself resolved the approved policy content and bound this attempt's
+    /// instance to it through
+    /// `eliot_context_admission::bind_admission_policy_revision` (the contract
+    /// owner's `ContextRecipePolicy::binds_recipe`). It is `None` on every
+    /// response that refused before that binding, so a consumer can never read
+    /// an absent reference as "no recipe was attempted".
+    attempted_context_recipe: Option<AttemptedContextRecipeBinding>,
     gaps: Vec<CampaignPacketGap>,
     missing_roles: Vec<CampaignSourceRole>,
     stale_roles: Vec<CampaignSourceRole>,
@@ -687,6 +765,7 @@ async fn resolve_compile_and_bind_result(
                         view: None,
                         material_account: None,
                         cited_support: None,
+                        attempted_context_recipe: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::TaskPlanUnavailable,
                             role: Some(CampaignSourceRole::TaskPlan),
@@ -713,6 +792,7 @@ async fn resolve_compile_and_bind_result(
                         view: None,
                         material_account: None,
                         cited_support: None,
+                        attempted_context_recipe: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::PriorViewUnavailable,
                             role: None,
@@ -749,6 +829,7 @@ async fn resolve_compile_and_bind_result(
                     view: None,
                     material_account: None,
                     cited_support: None,
+                    attempted_context_recipe: None,
                     gaps: vec![CampaignPacketGap {
                         code: CampaignPacketGapCode::OwnerReadUnavailable,
                         role: None,
@@ -775,6 +856,7 @@ async fn resolve_compile_and_bind_result(
                         view: None,
                         material_account: None,
                         cited_support: None,
+                        attempted_context_recipe: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::HistoryPlanUnavailable,
                             role: None,
@@ -830,6 +912,7 @@ async fn resolve_compile_and_bind_result(
                         view: None,
                         material_account: None,
                         cited_support: None,
+                        attempted_context_recipe: None,
                         gaps: source_gaps(&resolved.resolutions),
                         missing_roles: missing_roles(&resolved.resolutions),
                         stale_roles: stale_roles(&resolved.resolutions),
@@ -855,6 +938,7 @@ async fn resolve_compile_and_bind_result(
                         view: None,
                         material_account: None,
                         cited_support: None,
+                        attempted_context_recipe: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::RequiredSourceUnavailable,
                             role: None,
@@ -895,6 +979,7 @@ async fn resolve_compile_and_bind_result(
                     view: None,
                     material_account: None,
                     cited_support: None,
+                    attempted_context_recipe: None,
                     gaps: vec![CampaignPacketGap {
                         code: CampaignPacketGapCode::RequiredSourceUnavailable,
                         role: Some(CampaignSourceRole::FrozenAnchor),
@@ -958,6 +1043,7 @@ async fn resolve_compile_and_bind_result(
                         view: None,
                         material_account: None,
                         cited_support: None,
+                        attempted_context_recipe: None,
                         gaps: source_gaps(&resolved.resolutions),
                         missing_roles: missing_roles(&resolved.resolutions),
                         stale_roles: stale_roles(&resolved.resolutions),
@@ -987,6 +1073,7 @@ async fn resolve_compile_and_bind_result(
                         view: None,
                         material_account: None,
                         cited_support: None,
+                        attempted_context_recipe: None,
                         gaps: vec![CampaignPacketGap {
                             code: CampaignPacketGapCode::RequiredSourceUnavailable,
                             role: None,
@@ -1020,6 +1107,7 @@ async fn resolve_compile_and_bind_result(
                 view: Some(publication),
                 material_account: Some(material_account),
                 cited_support: None,
+                attempted_context_recipe: None,
                 gaps: source_gaps(&resolved.resolutions),
                 missing_roles: missing_roles(&resolved.resolutions),
                 stale_roles: stale_roles(&resolved.resolutions),
@@ -1275,7 +1363,10 @@ async fn resolve_compile_and_bind_result(
     // floor as the one piece this route does hold). The join is the load-bearing
     // revision, State Fence and Decision Safety Floor check the audit names; the
     // decision it would feed is separately absent and is reported as absent
-    // rather than fabricated.
+    // rather than fabricated. #1724 W5 adds the one admission-side fact the
+    // decision cannot exist without and that CAN be resolved from owner content
+    // today — the approved reusable policy revision — immediately below, and
+    // the response now refuses to present this route's product as compiled.
     //
     // #1862: the admission owner's typed refusal crosses this boundary intact.
     // It used to be discarded by `.is_err()`, which flattened five distinct
@@ -1309,6 +1400,77 @@ async fn resolve_compile_and_bind_result(
             ),
         );
     }
+    // #1724 W5: the ADMISSION DECISION this packet's economy evidence must come
+    // from, reached as far as the owner records this tree actually holds.
+    //
+    // The admission cell names the approved reusable policy revision an
+    // admission runs under, and the only fact that can carry it independently of
+    // the compilation-bound instance is the approved revision's own content
+    // digest. `AdmissionInput` carries the instance and not the approved policy
+    // (see `crates/smart/eliot-context-admission/src/lib.rs`), so the approved
+    // CONTENT is what this route brings, and the binding itself is made by the
+    // admission cell rather than here.
+    //
+    // It is re-resolved at this consumption edge from the same authenticated
+    // Context owner row every other check on this route reads, so the admission
+    // cell compares the instance against owner content and not against a value
+    // another cell handed over. `ApprovedRecipeCatalogue::resolve` selects
+    // exactly one applicable, current, unrevoked revision or refuses with the
+    // contract owner's own typed `RecipeResolutionRefusal`; there is no
+    // first-match and no newest-revision fallback.
+    let approved_policy = match context_recipe_body.catalogue.resolve() {
+        Ok(resolved_policy) => resolved_policy,
+        Err(refusal) => {
+            tracing::warn!(
+                reason = %refusal,
+                "no approved Context policy revision resolved for this packet attempt"
+            );
+            return campaign_packet_result_body(
+                envelope,
+                attempt,
+                context_blocked_response(
+                    publication,
+                    CampaignPacketGapCode::ContextRecipeUnavailable,
+                    Some(CampaignSourceRole::ContextRecipe),
+                    &resolved.resolutions,
+                    prior.is_some() && !prior_is_current,
+                ),
+            );
+        }
+    };
+    //
+    // `bind_admission_policy_revision` is the contract owner's
+    // `ContextRecipePolicy::binds_recipe` under the admission cell's name: the
+    // approved revision re-derives its own content digest, and the instance's
+    // recorded `DecisionRevision::policy_sha256` is compared with it. An
+    // instance issued under a stale, revoked, unpointed or substituted revision
+    // is refused HERE, before anything this route publishes can be read as
+    // bound to the currently approved recipe — and a recipe may not make itself
+    // applicable by dropping a mandatory role, admitting an unconfigured role,
+    // or declaring a mandatory role suppressible.
+    let attempted_policy = match bind_admission_policy_revision(
+        &approved_policy.policy,
+        &context_recipe_body.recipe,
+    ) {
+        Ok(policy) => policy,
+        Err(refusal) => {
+            tracing::warn!(
+                reason = %refusal,
+                "admission cell refused the approved Context policy binding for this packet attempt"
+            );
+            return campaign_packet_result_body(
+                envelope,
+                attempt,
+                context_blocked_response(
+                    publication,
+                    CampaignPacketGapCode::ContextRecipeUnavailable,
+                    Some(CampaignSourceRole::ContextRecipe),
+                    &resolved.resolutions,
+                    prior.is_some() && !prior_is_current,
+                ),
+            );
+        }
+    };
     // Issue #1948: the Task Plan is the load-bearing source this packet is
     // compiled from, so before it may support a compiled packet its exact
     // admitted owner document is reopened through the governed source owner and
@@ -1346,29 +1508,64 @@ async fn resolve_compile_and_bind_result(
             ),
         );
     }
-    // Issue #1949 (I12.26): this compiled packet is the delivery a consumer
-    // resolves per-material handles against, so it states its own material
-    // account here. The account is counted from the published owner view, and
-    // the admission closure that would carry a full `FusedRankTrace` handle is
-    // reported as unbound beside it rather than left silently absent.
+    // Issue #1949 (I12.26): this packet is the delivery a consumer resolves
+    // per-material handles against, so it states its own material account here.
+    // The account is counted from the published owner view, and the admission
+    // closure that would carry a full `FusedRankTrace` handle is reported as
+    // unbound beside it rather than left silently absent.
     let material_account = account_delivered_materials(&publication.view)?;
     let mut gaps = source_gaps(&resolved.resolutions);
     gaps.push(CampaignPacketGap {
         code: CampaignPacketGapCode::AdmissionClosureUnbound,
         role: None,
     });
+    //
+    // #1724 W5: this is the typed blocked outcome, and it is the whole reason
+    // the previous revision of this route was wrong.
+    //
+    // The approved policy revision bound above is real, independently resolved
+    // evidence: `attempted_context_recipe` names it, together with the exact
+    // instance it was compared with and the owner body the Context owner
+    // re-derived. What is still absent is the admission DECISION and, with it,
+    // the `ContextEconomyReceipt` and the `ActiveUnderstandingView` I12.13
+    // requires that receipt to bind. `PriorityPolicyIdentity`,
+    // `AdmissionRuleIdentity` and `MeasurementCompositionProfile` have no
+    // production construction site anywhere in the tree, and the candidate
+    // denominator and per-atom measurements have no producer on this route
+    // either, so no `AdmissionInput` can be assembled here and `admit_context`
+    // stays uncallable. Minting any of them from a constant, a flag or this
+    // route's own reading would fabricate the selection record, which
+    // `CampaignPacketGapCode::AdmissionClosureUnbound` already states.
+    //
+    // I12.13 and #1724 step 5 require the typed gap/blocked outcome WITH the
+    // attempted recipe reference for an incomplete compilation, never a
+    // successful View. So this response is `Blocked`. It keeps the view, for the
+    // same reason every other refusal on this route does: a consumer must be
+    // able to see which material the attempt withheld, and the counted account
+    // above is that account — but it is a diagnostic publication, not a
+    // compiled product, and nothing here may be read as recipe-bound Context
+    // economy evidence. The `AdmissionClosureUnbound` gap alone was disclosure
+    // beside a `Compiled` outcome, not delivery, which is the outcome the
+    // cross-check refused.
     campaign_packet_result_body(
         envelope,
         attempt,
         CampaignPacketResponse {
-            outcome: CampaignPacketOutcome::Compiled,
+            outcome: CampaignPacketOutcome::Blocked,
             completeness: publication.view.completeness,
             view: Some(publication),
             material_account: Some(material_account),
-            // The gate invoked its consumer exactly once on the way here, so
-            // this is present on every `Compiled` response and absent from
-            // every response that published no cited support.
+            // The gate invoked its consumer exactly once on the way here and
+            // verified it, and the admission-closure refusal is not a refusal of
+            // the cited source revision, so the verified citation is delivered:
+            // dropping it here would report the Task Plan as refused when the
+            // gate accepted it.
             cited_support,
+            attempted_context_recipe: Some(AttemptedContextRecipeBinding {
+                policy: attempted_policy,
+                instance_digest: context_recipe_body.recipe.recipe_sha256.clone(),
+                owner_body_digest: context_recipe_digest,
+            }),
             gaps,
             missing_roles: missing_roles(&resolved.resolutions),
             stale_roles: stale_roles(&resolved.resolutions),
@@ -2157,6 +2354,10 @@ fn context_blocked_response(
         // refused or withheld, so there is no revision any consumer may read
         // back through.
         cited_support: None,
+        // A context refusal publishes no recipe binding either: it refused
+        // before the admission cell resolved the approved policy revision, so
+        // there is no attempted reference to report.
+        attempted_context_recipe: None,
         gaps,
         missing_roles: missing_roles(resolutions),
         stale_roles: stale_roles(resolutions),
