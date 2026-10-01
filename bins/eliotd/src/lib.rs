@@ -131,6 +131,7 @@ pub mod maintenance_trigger_evaluator;
 mod negative_memory_action_gate;
 pub mod notification_acknowledge_emit;
 pub mod notification_board_attach;
+mod notification_plan_admission;
 pub mod notification_state_emit;
 mod observation_adapters;
 mod owner_feed;
