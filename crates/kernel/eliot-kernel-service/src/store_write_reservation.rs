@@ -842,6 +842,16 @@ fn admitted_write_binding(
 /// reference. That binding is what makes the staged record a recoverable
 /// canonical write rather than opaque bytes, and it is the identity ORS indexes
 /// so an exact retry or a startup read-back reconciles to this same operation.
+///
+/// The CONTENT commitment for the staged transition is the protected-payload
+/// digest, not the prepared-transition digest: ORS measures
+/// `protected_payload_sha256`/`protected_payload_length` over the exact bytes it
+/// holds, and re-checks that measurement against the binding on the way in and
+/// on every `verify_staged_envelope` read-back. The prepared-transition digest is
+/// a retained identity this route records and the executor re-checks later
+/// against the transition it actually presents
+/// ([`project_reserved_write`]); at staging it cannot be compared against
+/// anything ORS measured, because ORS copies it verbatim from this request.
 pub fn reserve_for_transition(
     owner: &CompositionReservation,
     seed: &ReservationSeed,
@@ -919,6 +929,13 @@ pub fn reserve_for_transition(
     let envelope = envelope
         .with_write_binding(write_binding)
         .map_err(ReservationWriteError::Ors)?;
+    // The reserved scope identities are compared against the token below, so
+    // the requested set is fixed before the envelope is moved into the request.
+    let requested_scopes = seed
+        .heads
+        .iter()
+        .map(|head| head.scope.clone())
+        .collect::<BTreeSet<_>>();
     let mut scopes: Vec<ScopeReservationRequest> = seed
         .heads
         .iter()
@@ -945,9 +962,34 @@ pub fn reserve_for_transition(
         recovery_owner: RecoveryOwner::new(seed.recovery_owner.clone())
             .map_err(ReservationWriteError::Ors)?,
     })?;
+    // #1925: only values ORS MEASURED are checked here. `reservation_order` is
+    // allocated by the ORS coordinator and each `reserved_sequence` is the
+    // per-scope successor ORS read out of its own scope head, so a token that
+    // did not cover exactly the requested scope set, or that carried an
+    // unallocated order or sequence, is refused.
+    //
+    // `prepared_transition_sha256` is deliberately NOT compared here. ORS
+    // copies it verbatim from this same request (`stage_and_reserve`), so any
+    // comparison against `transition_digest` would be a recomputation against
+    // an echo of itself and could never fail on a content mismatch. The
+    // content commitment for the staged transition is the protected-payload
+    // digest: `RecoveryPayloadEnvelope::encrypted` computes
+    // `payload_sha256` over the staged bytes ITSELF, and
+    // `RecoveryPayloadEnvelope::validate` refuses any envelope whose
+    // `write_binding.protected_payload_sha256`/`protected_payload_length`
+    // differs from the bytes it holds, both on the way in and again on the
+    // `verify_staged_envelope` read-back. The transition digest's real binding
+    // duty is downstream, where it is compared against the transition the
+    // executor later presents (`project_reserved_write`), which is where a
+    // post-reservation mutation is actually detectable.
     if token.reservation_order == 0
-        || token.prepared_transition_sha256 != transition_digest
         || token.operation_id.as_str() != seed.operation_id
+        || token.scopes.len() != requested_scopes.len()
+        || token
+            .scopes
+            .iter()
+            .any(|reserved| reserved.reserved_sequence == 0
+                || !requested_scopes.contains(reserved.scope.scope.as_str()))
     {
         return Err(ReservationWriteError::Binding {
             operation_id,
@@ -2334,6 +2376,51 @@ pub struct StartupStagedEnvelope {
     pub authority_epoch_sequence: u64,
     /// State-fence digest the envelope is bound to.
     pub state_fence_sha256: String,
+    /// The bound write identity this envelope carries, or `None` for a
+    /// retained non-write envelope that predates the binding.
+    ///
+    /// Startup reconciliation is required to be BY OPERATION IDENTITY, not
+    /// merely by the operation-id string: `I5.6` step 13 and `I5.19` reconcile
+    /// a staged operation through its idempotency key, write intent, canonical
+    /// request digest and complete Ordering Scope set, because those are the
+    /// members a `WriteReceipt` and an exact replay are resolved by. This is
+    /// the OWNER's own recorded binding, restated verbatim after
+    /// `RecoveryPayloadEnvelope::validate` accepted the joined envelope — not a
+    /// recomputation, and never a decode of the payload.
+    ///
+    /// Nothing here interprets the payload as claims, decisions, Current
+    /// Epistemic Position or project graph, and nothing here grants authority
+    /// (`A13.6`): these are opaque identity labels and digests the recovery
+    /// owner matches on.
+    pub write_identity: Option<StartupStagedWriteIdentity>,
+}
+
+/// The admitted write identity one staged envelope carries, projected for
+/// reconciliation by identity rather than by operation-id string.
+///
+/// Every member is the owner's own recorded value inside
+/// [`eliot_ors::RecoveryWriteBinding`], restated verbatim. No member is
+/// recomputed here and no payload byte is read, so this projection can never
+/// replace a recorded binding with a fresh value derived from what the reader
+/// happens to hold.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupStagedWriteIdentity {
+    /// Write-envelope protocol revision the submission was admitted under.
+    pub write_envelope_protocol_version: u32,
+    /// Stable intent that survives a typed correction attempt.
+    pub write_intent_id: String,
+    /// Retry identity the canonical receipt is resolved by.
+    pub idempotency_key: String,
+    /// Canonical request digest of the admitted submission.
+    pub canonical_request_sha256: String,
+    /// Digest of the exact admitted prepared transition.
+    pub prepared_transition_sha256: String,
+    /// Admitted contract-set identity of the receiving build.
+    pub admission_contract_set_digest: String,
+    /// Exact operation-manifest identity admitted for the transition.
+    pub operation_manifest_digest: String,
+    /// Complete ordering-scope set declared before staging, in ORS's own order.
+    pub ordering_scopes: Vec<String>,
 }
 
 /// One staged operation whose envelope could not be validated at startup.
@@ -2501,6 +2588,32 @@ pub async fn reconcile_staged_writes_at_startup(
                     .to_owned(),
                 authority_epoch_sequence: envelope.authority_epoch.current.epoch,
                 state_fence_sha256: envelope.state_fence.sha256,
+                // Projected from the envelope's OWN binding, never recomputed
+                // and never derived from the payload bytes, so startup
+                // reconciliation matches on the same admitted identity the
+                // live route staged rather than on the operation-id string
+                // alone.
+                write_identity: envelope.write_binding.as_ref().map(|binding| {
+                    StartupStagedWriteIdentity {
+                        write_envelope_protocol_version: binding.write_envelope_protocol_version,
+                        write_intent_id: binding.write_intent_id.as_str().to_owned(),
+                        idempotency_key: binding.idempotency_key.as_str().to_owned(),
+                        canonical_request_sha256: binding.canonical_request_sha256.clone(),
+                        prepared_transition_sha256: binding.prepared_transition_sha256.clone(),
+                        admission_contract_set_digest: binding
+                            .admission_contract_set_digest
+                            .clone(),
+                        operation_manifest_digest: binding
+                            .operation_manifest_digest
+                            .as_str()
+                            .to_owned(),
+                        ordering_scopes: binding
+                            .ordering_scopes
+                            .iter()
+                            .map(|scope| scope.as_str().to_owned())
+                            .collect(),
+                    }
+                }),
             }),
             // The owner already retained a durable Recovery Problem for this
             // staged operation; the record stays available for disposition and

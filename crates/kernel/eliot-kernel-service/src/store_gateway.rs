@@ -10772,6 +10772,14 @@ mod tests {
         let set_digest = operation_manifest_set_digest(&entries).unwrap_or_else(|_| unreachable!());
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
+            // #1925: the declared write intent is the OWNER's derivation over
+            // this leg's own scope, never a literal and never a default.
+            write_intent_id: eliot_store_api::admission_write_intent(
+                "store-gateway-1927-probe",
+                "scope-1927",
+            )
+            .unwrap_or_else(|| unreachable!()),
+            write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-1927-1").unwrap_or_else(|_| unreachable!()),
                 idempotency_key: "idem-1927-1".to_owned(),
@@ -11612,6 +11620,14 @@ mod live_surreal_evidence_pack_e2e {
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
+            // #1925: the declared write intent is the OWNER's derivation over
+            // this leg's own scope, never a literal and never a default.
+            write_intent_id: eliot_store_api::admission_write_intent(
+                "store-gateway-live-capture",
+                scope.as_str(),
+            )
+            .expect("the live capture scope declares a stable write intent"),
+            write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new(format!("op-t11-live-{tag}"))
                     .expect("operation identity"),

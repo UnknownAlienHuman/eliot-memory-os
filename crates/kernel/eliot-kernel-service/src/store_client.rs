@@ -1151,6 +1151,11 @@ mod tests {
 
     const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
+    /// Closed leg name of the plain-apply probe transition (#1925).
+    const APPLY_LEG_WRITE_INTENT_LEG: &str = "store-client-apply";
+    /// Closed leg name of the reserved-write probe transition (#1925).
+    const RESERVED_WRITE_LEG_WRITE_INTENT_LEG: &str = "store-client-reserved-write";
+
     fn test_epoch(sequence: u64) -> EpochId {
         EpochId::new(
             EpochLineageId::new(TEST_LINEAGE_A).expect("valid test lineage"),
@@ -1688,6 +1693,14 @@ mod tests {
         }];
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
+            // #1925: the declared write intent is the OWNER's derivation over
+            // this leg's own scope, never a literal and never a default.
+            write_intent_id: eliot_store_api::admission_write_intent(
+                APPLY_LEG_WRITE_INTENT_LEG,
+                "scope-authority",
+            )
+            .expect("the apply scope declares a stable write intent"),
+            write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("apply-op-1").expect("operation id"),
                 idempotency_key: "apply-idem-1".to_owned(),
@@ -2340,6 +2353,14 @@ mod tests {
         }];
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
+            // #1925: the declared write intent is the OWNER's derivation over
+            // this leg's own scope, never a literal and never a default.
+            write_intent_id: eliot_store_api::admission_write_intent(
+                RESERVED_WRITE_LEG_WRITE_INTENT_LEG,
+                "scope-991-k1",
+            )
+            .expect("the reserved-write scope declares a stable write intent"),
+            write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
             identity: OperationIdentity {
                 operation_id: OperationId::new("op-991-k1").expect("operation id"),
                 idempotency_key: "idem-991-k1".to_owned(),

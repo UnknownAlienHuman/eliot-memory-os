@@ -54,6 +54,11 @@ use serde_json::json;
 
 const LINEAGE_991: &str = "550e8400-e29b-41d4-a716-446655440000";
 
+/// Closed leg name of this reserved-write client fixture, so its declared write
+/// intent is derived by the OWNER from a leg and this leg's own scope rather
+/// than manufactured as a literal (#1925).
+const RESERVED_WRITE_CLIENT_WRITE_INTENT_LEG: &str = "reserved-write-client";
+
 fn epoch(sequence: u64) -> EpochId {
     EpochId::new(
         EpochLineageId::new(LINEAGE_991).unwrap(),
@@ -95,17 +100,26 @@ fn context_with(tag: &str) -> RequestMeta {
 }
 
 fn transition_with(tag: &str) -> PreparedTransition {
+    let scope = format!("scope-991-{tag}");
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: the declared write intent is the OWNER's derivation over this
+        // reserved-write leg's own scope, never a literal and never a default.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            RESERVED_WRITE_CLIENT_WRITE_INTENT_LEG,
+            &scope,
+        )
+        .expect("the reserved-write scope declares a stable write intent"),
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(format!("op-991-{tag}")).unwrap(),
             idempotency_key: format!("idem-991-{tag}"),
             canonical_request_hash: "a".repeat(64),
         },
         state_fence: fence(),
-        scope_id: ScopeId::new(format!("scope-991-{tag}")).unwrap(),
+        scope_id: ScopeId::new(scope.clone()).unwrap(),
         task_id: None,
-        ordering_scopes: vec![OrderingScopeId::new(format!("scope-991-{tag}")).unwrap()],
+        ordering_scopes: vec![OrderingScopeId::new(scope).unwrap()],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),

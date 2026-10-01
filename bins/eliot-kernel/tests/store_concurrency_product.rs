@@ -71,6 +71,11 @@ use serde_json::{Value, json};
 
 const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 
+/// Closed leg name of the product-contour capture transition, so its declared
+/// write intent is derived by the OWNER from a leg and that leg's own scope
+/// rather than manufactured as a literal (#1925).
+const PRODUCT_CAPTURE_WRITE_INTENT_LEG: &str = "store-concurrency-product-capture";
+
 static HARNESS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn data_dir() -> PathBuf {
@@ -175,6 +180,14 @@ fn admitted(operation: &str, scope: &str, subject: &str) -> (RequestMeta, Prepar
     let ctx = ctx_for(operation, &fence);
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: the declared write intent is the OWNER's derivation over this
+        // leg's own scope, never a literal and never a default.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            PRODUCT_CAPTURE_WRITE_INTENT_LEG,
+            scope,
+        )
+        .expect("the product capture scope declares a stable write intent"),
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(operation).expect("operation"),
             idempotency_key: format!("idem-994-{operation}"),

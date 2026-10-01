@@ -39,6 +39,11 @@ const FOREIGN_LINEAGE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 const REFERENCE_CASES: [u64; 7] = [1, 4, 5, 6, 7, 8, 20];
 const PRODUCT_CASES: [u64; 13] = [2, 3, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
 
+/// Closed leg name of the reference-contour capture transition, so its
+/// declared write intent is derived by the OWNER from a leg and that leg's own
+/// scope rather than manufactured as a literal (#1925).
+const REFERENCE_CAPTURE_WRITE_INTENT_LEG: &str = "store-concurrency-reference-capture";
+
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data")
 }
@@ -129,6 +134,14 @@ fn admitting_manifest() -> NamedOperationManifest {
     assert!(!entries.is_empty(), "catalogue must be non-empty");
     let mut probe = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: the declared write intent is the OWNER's derivation over this
+        // leg's own scope, never a literal and never a default.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            REFERENCE_CAPTURE_WRITE_INTENT_LEG,
+            "scope-994-a",
+        )
+        .expect("the reference probe scope declares a stable write intent"),
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new("op-994-probe").expect("operation"),
             idempotency_key: "idem-994-probe".to_owned(),
@@ -193,6 +206,14 @@ fn build_transition(
 ) -> PreparedTransition {
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
+        // #1925: the declared write intent is the OWNER's derivation over this
+        // leg's own scope, never a literal and never a default.
+        write_intent_id: eliot_store_api::admission_write_intent(
+            REFERENCE_CAPTURE_WRITE_INTENT_LEG,
+            scope,
+        )
+        .expect("the reference capture scope declares a stable write intent"),
+        write_envelope_protocol_version: eliot_store_api::WRITE_ENVELOPE_PROTOCOL_VERSION,
         identity: OperationIdentity {
             operation_id: OperationId::new(operation).expect("operation"),
             idempotency_key: format!("idem-994-{operation}"),
