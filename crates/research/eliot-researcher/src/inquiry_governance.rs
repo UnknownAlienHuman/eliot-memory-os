@@ -4346,7 +4346,11 @@ impl ResearchDebt {
             push_field(&mut preimage, "expires_at_ms", &expiry.to_string());
         }
         push_field(&mut preimage, "blocks", &self.blocks);
-        push_field(&mut preimage, "resolution_evidence", &self.resolution_evidence);
+        push_field(
+            &mut preimage,
+            "resolution_evidence",
+            &self.resolution_evidence,
+        );
         push_field(&mut preimage, "discriminator", &self.discriminator);
         freeze(&preimage)
     }
@@ -5085,7 +5089,11 @@ impl ResearchDebtRegistrationRequest {
         push_field(&mut preimage, "gate_id", &self.gate_id);
         push_field(&mut preimage, "gate_family", &self.gate_family);
         push_field(&mut preimage, "gate_digest", &self.gate_digest);
-        push_field(&mut preimage, "state_fence", &fence_preimage(&self.state_fence));
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
+        );
         push_field(
             &mut preimage,
             "candidate_only",
@@ -5120,11 +5128,17 @@ impl ResearchDebtRegistrationRequest {
         }
         for (value, field) in [
             (self.request_kind.as_str(), "debt_registration.request_kind"),
-            (self.obligation_id.as_str(), "debt_registration.obligation_id"),
+            (
+                self.obligation_id.as_str(),
+                "debt_registration.obligation_id",
+            ),
             (self.operation_id.as_str(), "debt_registration.operation_id"),
             (self.inquiry_id.as_str(), "debt_registration.inquiry_id"),
             (self.debt_id.as_str(), "debt_registration.debt_id"),
-            (self.blocked_claim.as_str(), "debt_registration.blocked_claim"),
+            (
+                self.blocked_claim.as_str(),
+                "debt_registration.blocked_claim",
+            ),
             (self.owner.as_str(), "debt_registration.owner"),
             (
                 self.review_condition.as_str(),
@@ -5144,7 +5158,10 @@ impl ResearchDebtRegistrationRequest {
             require_text(value, field)?;
         }
         for (value, field) in [
-            (self.profile_digest.as_str(), "debt_registration.profile_digest"),
+            (
+                self.profile_digest.as_str(),
+                "debt_registration.profile_digest",
+            ),
             (self.debt_digest.as_str(), "debt_registration.debt_digest"),
             (self.gate_digest.as_str(), "debt_registration.gate_digest"),
         ] {
