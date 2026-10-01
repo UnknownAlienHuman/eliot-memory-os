@@ -135,7 +135,7 @@ async fn main() {
     // and an AlreadyOwned re-init continue into the launch funnel.
     let _ = install_kernel_diagnostics();
     #[cfg(windows)]
-    let mut crash_reporter = eliot_observability_runtime::install_crash_reporter(
+    let mut crash_reporter = match eliot_observability_runtime::install_crash_reporter(
         eliot_observability_runtime::CrashReporterConfig {
             process: "eliot-kernel".to_owned(),
             package_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -144,8 +144,20 @@ async fn main() {
             retention_policy: None,
             initial_context: crash_context::unavailable_context(),
         },
-    )
-    .ok();
+    ) {
+        Ok(reporter) => {
+            reporter.invalidate_runtime_context();
+            Some(reporter)
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "eliot::crash_reporter",
+                event = "kernel_reporter_install_failed",
+                "Kernel crash reporter could not be installed; crash capture is unavailable"
+            );
+            None
+        }
+    };
     observe_entrypoint(EntrypointStage::Startup);
     let options = match startup_binding::parse_launch_options(std::env::args_os().skip(1)) {
         Ok(options) => options,
@@ -194,17 +206,33 @@ async fn main() {
     let _observability =
         eliot_observability_runtime::install(&kernel_observability_config);
     #[cfg(windows)]
+    let mut reporter_binding_incomplete = false;
+    #[cfg(windows)]
     if let Some(reporter) = &crash_reporter {
         let runtime_profile = match supervision_profile {
             eliot_installation::InstallationProfile::SystemService => "system_service",
             eliot_installation::InstallationProfile::UserMode => "user_mode",
             eliot_installation::InstallationProfile::PortableDev => "portable_dev",
         };
-        let _ = reporter.update_runtime_profile(runtime_profile);
-        if let Ok(Some(artifact)) =
-            crash_context::kernel_symbol_artifact(startup_binding.admitted_symbol_binding())
-        {
-            let _ = reporter.update_symbol_artifact(artifact);
+        if reporter.update_runtime_profile(runtime_profile).is_err() {
+            reporter_binding_incomplete = true;
+        }
+        match crash_context::kernel_symbol_artifact(startup_binding.admitted_symbol_binding()) {
+            Ok(Some(artifact)) => {
+                if reporter.update_symbol_artifact(artifact).is_err() {
+                    reporter_binding_incomplete = true;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => reporter_binding_incomplete = true,
+        }
+        if reporter_binding_incomplete {
+            reporter.invalidate_runtime_context();
+            tracing::warn!(
+                target: "eliot::crash_reporter",
+                event = "kernel_reporter_binding_incomplete",
+                "Kernel crash reporter identity is incomplete; later capture will record gaps"
+            );
         }
     }
     let prepared_store = match startup_binding::prepare_store_bootstrap(&options) {
@@ -375,14 +403,38 @@ async fn main() {
     observe_entrypoint(EntrypointStage::Composition);
     #[cfg(windows)]
     if let Some(reporter) = crash_reporter {
-        let _ = reporter.update_retention_policy(crash_context::incident_retention_policy(
-            kernel_observability_config.rolling_log.clone(),
-            &startup_binding.receipt_root,
-        ));
-        let _ = kernel.attach_crash_reporter(
-            reporter,
-            Some(startup_binding.approved_generation.clone()),
+        let retention_result = reporter.update_retention_policy(
+            crash_context::incident_retention_policy(
+                kernel_observability_config.rolling_log.clone(),
+                &startup_binding.receipt_root,
+            ),
         );
+        if retention_result.is_err() {
+            reporter.invalidate_runtime_context();
+        }
+        let attachment_result = if retention_result.is_err() || reporter_binding_incomplete {
+            reporter.invalidate_runtime_context();
+            None
+        } else {
+            Some(kernel.attach_crash_reporter(
+                reporter.clone(),
+                Some(startup_binding.approved_generation.clone()),
+            ))
+        };
+        let attachment_failed = attachment_result.is_some_and(|result| result.is_err());
+        if attachment_failed {
+            reporter.invalidate_runtime_context();
+        }
+        if retention_result.is_err()
+            || reporter_binding_incomplete
+            || attachment_failed
+        {
+            tracing::warn!(
+                target: "eliot::crash_reporter",
+                event = "kernel_reporter_attachment_incomplete",
+                "Kernel crash reporter attachment is incomplete; later capture will record gaps"
+            );
+        }
     }
     #[cfg(windows)]
     {
