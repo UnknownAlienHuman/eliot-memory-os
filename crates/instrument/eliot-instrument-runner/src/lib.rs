@@ -84,6 +84,7 @@ pub use profile::{
     admitted_profile_for_alias, bundle_verification_profile, compiler_profile,
     package_verification_profile, test_profile,
 };
+pub use eliot_module_registry::VerifiedModuleCatalogGeneration;
 pub use profile_run::{
     AggregateStatus, InstrumentRun, MappedStageLauncher, PlannedStage, ProfileAggregate,
     ProfileRunError, ProviderDispatch, RetainedExitOutcome, RetainedToolIdentity, StageEvidence,

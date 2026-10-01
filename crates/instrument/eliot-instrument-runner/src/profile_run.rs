@@ -41,9 +41,10 @@ use crate::registry::{
 };
 use crate::testd_port::{TestdAdmission, TestdAdmissionPort, TestdPortError, testd_dispatchable};
 use eliot_testd_core::{
-    InstrumentStageRequest, StageExecutionKind, TestdProviderFingerprints,
+    InstrumentStageRequest, StageExecutionKind, TestdProviderCatalogLifecycle, TestdProviderFingerprints,
     TestdProviderRegistryFreshness,
 };
+use eliot_module_registry::VerifiedModuleCatalogGeneration;
 use crate::{
     InstrumentBinding, InstrumentRequestPort, InstrumentRunner, InstrumentStartReceipt,
     RunnerError, bridge_executor_observation,
@@ -367,6 +368,13 @@ pub trait StageLauncher: Send + Sync {
 
     /// Returns the governed evidence sink for one planned stage.
     fn sink(&self, stage: &PlannedStage) -> Arc<dyn ProcessEvidenceSink>;
+
+    /// Current accepted Module Catalog lifecycle that issued the provider
+    /// registry used for this launch. Implementations without owner readback
+    /// provenance return `None`, which fails closed before process launch.
+    fn provider_catalog_lifecycle(&self) -> Option<&VerifiedModuleCatalogGeneration> {
+        None
+    }
 }
 
 /// Raw evidence state carried by one [`InstrumentRun`].
@@ -1250,7 +1258,16 @@ impl StageOrchestrator {
                 );
             }
         };
-        let stage_request = match stage_request(plan, planned, &invocation, entry) {
+        let lifecycle = match launcher.provider_catalog_lifecycle() {
+            Some(lifecycle) => lifecycle,
+            None => {
+                return InstrumentRun::missing(
+                    route,
+                    "stage admission refused: selected provider registry has no accepted Module Catalog owner readback",
+                );
+            }
+        };
+        let stage_request = match stage_request(plan, planned, &invocation, entry, lifecycle) {
             Ok(request) => request,
             Err(error) => {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
@@ -1363,6 +1380,7 @@ pub fn stage_request(
     planned: &PlannedStage,
     invocation: &InstrumentInvocation,
     entry: &RegistryEntry,
+    lifecycle: &VerifiedModuleCatalogGeneration,
 ) -> Result<InstrumentStageRequest, TestdPortError> {
     let stage = &planned.stage;
     let route = planned.route.stage();
@@ -1377,6 +1395,7 @@ pub fn stage_request(
         || invocation.arguments != stage.argument_template
         || entry.instrument.as_str() != stage.spec.as_str()
         || !entry.supports(stage.kind)
+        || lifecycle.provider_registry_generation() != entry.generation
     {
         return Err(TestdPortError::StageBinding {
             detail: "planned stage, invocation, and selected entry identities disagree",
@@ -1402,6 +1421,19 @@ pub fn stage_request(
                 profile: entry.invalidation.profile.clone(),
                 parser: entry.invalidation.parser.clone(),
             },
+        }),
+        provider_catalog_lifecycle: Some(TestdProviderCatalogLifecycle {
+            owner_revision: lifecycle.owner_revision(),
+            catalog_revision: lifecycle.catalog_revision(),
+            catalog_digest: lifecycle.catalog_digest().to_owned(),
+            state_fence: lifecycle.state_fence().clone(),
+            module_id: lifecycle.module_id().to_string(),
+            generation_id: lifecycle.generation_id().to_string(),
+            artifact_digest: lifecycle.artifact_digest().to_owned(),
+            config_digest: lifecycle.config_digest().to_owned(),
+            protocol_digest: lifecycle.protocol_digest().to_owned(),
+            manifest_digest: lifecycle.manifest_digest().to_owned(),
+            admission_receipt: lifecycle.admission_receipt().to_owned(),
         }),
         stage_id: stage.stage_id.clone(),
         spec: stage.spec.clone(),

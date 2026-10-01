@@ -9,8 +9,9 @@ use eliot_instrument_nextest::{
 };
 use eliot_testd_core::{
     EphemeralSourceBytes, InstrumentStageRequest, StageExecutionKind, TestdEvaluationObservation,
-    TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus, TestdStreamDisposition,
-    TestdStreamEvidenceBinding, TESTD_LIST_PROFILE,
+    TestdEvaluationStatus, TestdParsingObservation, TestdParsingStatus,
+    TestdProviderCatalogLifecycle, TestdStreamDisposition, TestdStreamEvidenceBinding,
+    TESTD_LIST_PROFILE,
 };
 use thiserror::Error;
 
@@ -147,6 +148,27 @@ fn current_selection<'a>(
     freshness: &RegistryFreshness<'_>,
     stage: &InstrumentStageRequest,
 ) -> Result<(&'a RegistryEntry, String), ProfileReplayError> {
+    let lifecycle = provider_registry
+        .lifecycle_binding()
+        .ok_or(ProfileReplayError::StageMismatch {
+            field: "provider_catalog_lifecycle",
+        })?;
+    if lifecycle.provider_registry_generation() != provider_registry.generation() {
+        return Err(ProfileReplayError::StageMismatch {
+            field: "provider_catalog_generation",
+        });
+    }
+    let retained_lifecycle = stage
+        .provider_catalog_lifecycle
+        .as_ref()
+        .ok_or(ProfileReplayError::StageMismatch {
+            field: "provider_catalog_lifecycle",
+        })?;
+    if !lifecycle_matches(retained_lifecycle, lifecycle) {
+        return Err(ProfileReplayError::StageMismatch {
+            field: "provider_catalog_lifecycle",
+        });
+    }
     let admitted = ProfileCompiler::new(profile_registry)
         .compile_exact(&stage.profile_name, stage.profile_revision)
         .map_err(|error| ProfileReplayError::InvalidStage {
@@ -218,6 +240,23 @@ fn current_selection<'a>(
         });
     }
     Ok((entry, format!("generation:{}", selected.parser_generation)))
+}
+
+fn lifecycle_matches(
+    retained: &TestdProviderCatalogLifecycle,
+    current: &eliot_module_registry::VerifiedModuleCatalogGeneration,
+) -> bool {
+    retained.owner_revision == current.owner_revision()
+        && retained.catalog_revision == current.catalog_revision()
+        && retained.catalog_digest == current.catalog_digest()
+        && retained.state_fence == *current.state_fence()
+        && retained.module_id == current.module_id().as_str()
+        && retained.generation_id == current.generation_id().as_str()
+        && retained.artifact_digest == current.artifact_digest()
+        && retained.config_digest == current.config_digest()
+        && retained.protocol_digest == current.protocol_digest()
+        && retained.manifest_digest == current.manifest_digest()
+        && retained.admission_receipt == current.admission_receipt()
 }
 
 fn verify_source<'a>(

@@ -2020,7 +2020,18 @@ fn capture_testd_launch_owner_binding(
                 "productive TestD launch has no retained provider environment".to_owned(),
             )
         })?;
-        let currentness_bytes = canonical_json_bytes(&(stage_freshness, tool_observation, environment))
+        let catalog_lifecycle = stage.provider_catalog_lifecycle.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no accepted Module Catalog lifecycle record"
+                    .to_owned(),
+            )
+        })?;
+        let currentness_bytes = canonical_json_bytes(&(
+            stage_freshness,
+            catalog_lifecycle,
+            tool_observation,
+            environment,
+        ))
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
         if sha256_hex(&currentness_bytes) != grant.currentness_sha256 {
             return Err(DispatchLaunchError::Gate(
