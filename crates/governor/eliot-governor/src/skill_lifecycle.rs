@@ -473,6 +473,16 @@ fn skill_envelope(
         operation_id,
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued lifecycle
+        // candidate it admits, exactly the candidate whose digest the
+        // transition's admission decision already binds.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "skill-lifecycle-admission",
+            candidate.candidate_digest.as_str(),
+        )
+        .ok_or_else(|| SkillError::IdentityMismatch)?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
         task_id: identity
             .request

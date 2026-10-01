@@ -84,6 +84,13 @@ use eliot_store_api::{
 
 use crate::composition::{CompositionError, GovernorComposition, KernelGenerationPort};
 
+/// Closed leg name of the experience-bank commit, domain-separating its
+/// declared write intent (#1925).
+const EXPERIENCE_BANK_WRITE_INTENT_LEG: &str = "experience-bank-commit";
+/// Closed leg name of the experience-feedback commit. Distinct from the bank
+/// leg so the two never share a declared intent for the same record digest.
+const EXPERIENCE_FEEDBACK_WRITE_INTENT_LEG: &str = "experience-feedback-commit";
+
 /// Closed commit leg plus its deterministic idempotency key.
 struct CommitLeg {
     /// Single named operation the transition carries.
@@ -315,6 +322,20 @@ pub async fn commit_experience_bank<P: KernelGenerationPort + ?Sized>(
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: leg.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued experience bank
+        // record it commits, distinct from the per-attempt operation identity
+        // and the per-correction idempotency key.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            EXPERIENCE_BANK_WRITE_INTENT_LEG,
+            &record.digest,
+        )
+        .ok_or_else(|| {
+            CompositionError::Owner(
+                "experience bank record has no owner-issued subject to declare".to_owned(),
+            )
+        })?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
         task_id: record.scope.task_ref.clone(),
         transition_class: TransitionClass::CaptureCandidate,
@@ -383,6 +404,20 @@ pub async fn commit_experience_feedback<P: KernelGenerationPort + ?Sized>(
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: leg.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued experience record
+        // it commits, distinct from the per-attempt operation identity and the
+        // per-correction idempotency key.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            EXPERIENCE_FEEDBACK_WRITE_INTENT_LEG,
+            &record.digest,
+        )
+        .ok_or_else(|| {
+            CompositionError::Owner(
+                "experience feedback record has no owner-issued subject to declare".to_owned(),
+            )
+        })?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
         task_id: record.scope.task_ref.clone(),
         transition_class: TransitionClass::CaptureCandidate,

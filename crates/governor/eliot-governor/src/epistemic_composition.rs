@@ -155,6 +155,16 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
             operation_id: proposal.request.operation_id.clone(),
             request: identity.request.metadata.clone(),
             idempotency_key: identity.idempotency_key.clone(),
+            // #1925: this leg's stable intent is the owner-issued epistemic
+            // proposal it admits, distinct from the proposal's own operation
+            // identity and the caller's idempotency key.
+            write_intent_id: crate::write_intent::admission_write_intent(
+                "epistemic-proposal-admission",
+                &digest(proposal)?,
+            )
+            .ok_or_else(|| refused("epistemic proposal has no owner-issued subject to declare"))?,
+            write_envelope_protocol_version:
+                crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
             scope_id: proposal.source_heads.scope_id.clone(),
             task_id: Some(proposal.request.task_id.as_str().to_owned()),
             transition_class: TransitionClass::Epistemic,

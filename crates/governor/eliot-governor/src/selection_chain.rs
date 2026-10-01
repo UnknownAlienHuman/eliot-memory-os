@@ -949,6 +949,19 @@ pub fn selection_chain_envelope(
         operation_id,
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued selection chain
+        // append it commits, addressed by the selection it appends to. The
+        // per-attempt operation identity additionally binds the observed head
+        // ordinal and revision, so the two identities are genuinely distinct.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "selection-chain-append",
+            &receipt.selection_id,
+        )
+        .ok_or_else(|| {
+            owner_refusal("selection chain append has no owner-issued subject".to_owned())
+        })?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id: ScopeId::new("governor")
             .map_err(|error| owner_refusal(format!("scope identity invalid: {error}")))?,
         task_id: identity

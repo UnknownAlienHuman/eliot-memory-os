@@ -161,6 +161,10 @@ pub fn envelope(
             clock: eliot_contracts::ClockReading::default(),
         },
         idempotency_key: operation.to_owned(),
+        // The fixture's own stable intent, distinct from the operation
+        // identity and the idempotency key it reuses above.
+        write_intent_id: format!("intent-{operation}"),
+        write_envelope_protocol_version: 1,
         scope_id: ScopeId::new("scope")?,
         task_id: Some("task".to_owned()),
         transition_class: TransitionClass::Epistemic,
