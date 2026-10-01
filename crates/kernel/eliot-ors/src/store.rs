@@ -7604,11 +7604,17 @@ impl RedbRecoveryStore {
     /// 3. the grant row, decoded and re-validated from its RECORDED binding;
     /// 4. [`BackupVerifySuccessionGrant::binds`] — every recorded predecessor and
     ///    successor term against the presented ones;
-    /// 5. unspent, through [`BackupVerifySuccessionGrant::is_consumed`];
-    /// 6. the DUE ORDER: the redeeming session's transport fence must be strictly
-    ///    greater than the issuing session's, which excludes the issuing session
-    ///    and every earlier session;
-    /// 7. the named operation must be a real stored verification result whose OWN
+    /// 5. unspent, through [`BackupVerifySuccessionGrant::is_consumed`] — read
+    ///    inside the very transaction that later sets it, which is what bounds the
+    ///    grant to ONE observed reconciliation. This replaces the session-fence
+    ///    "due order" an earlier delivery gated on: that comparison could never be
+    ///    false in production (every live `Session` carries `session_epoch == 1`,
+    ///    `crates/kernel/eliot-ipc/src/lib.rs:1450`, `:1478`, `:1540`), so it
+    ///    refused every redemption and the contract authorized nothing. No
+    ///    replacement order was invented — see [`BackupVerifySuccessionGrant`]'s
+    ///    doc for why none exists on this tree and why excluding the issuing
+    ///    session would refuse the I14.21 reconciliation itself;
+    /// 6. the named operation must be a real stored verification result whose OWN
     ///    key, canonical request hash and archive digest are exactly the three the
     ///    grant and the redemption name. This is what makes the grant non-forgeable
     ///    by key: a grant that points at no row, or at a row holding different
@@ -7644,10 +7650,17 @@ impl RedbRecoveryStore {
             return Ok(BackupVerifySuccessionDisposition::NotAuthorized);
         };
         let mut grant: BackupVerifySuccessionGrant = decode(&staged_bytes)?;
-        if grant.is_consumed()
-            || !grant.binds(redemption)
-            || redemption.redeeming_session_epoch <= grant.issued_by_session_epoch
-        {
+        // Single-use is the ONLY unconsumed test, and it is read here inside the
+        // very transaction that sets it below. That is what makes immediate
+        // double-redemption impossible rather than merely discouraged: two
+        // sessions redeeming one grant serialise on this write transaction, and
+        // the second reads the first one's committed consumption. There is
+        // deliberately no session-order comparison here — see
+        // `BackupVerifySuccessionGrant`'s doc for the measurement showing no
+        // per-session value on this tree orders two live sessions, and why an
+        // order excluding the issuing session would refuse the very I14.21
+        // reconciliation the grant exists to authorize.
+        if grant.is_consumed() || !grant.binds(redemption) {
             return Ok(BackupVerifySuccessionDisposition::NotAuthorized);
         }
         {

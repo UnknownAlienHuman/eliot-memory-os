@@ -131,10 +131,17 @@
 //!   `backup_capture.rs::KernelBackupCapture::issue_verify_succession_grant` and
 //!   redeemed through `p07_ors::redeem_backup_verify_succession_grant`): one durable
 //!   row per operation, whose content is entirely owner-decided or authenticated,
-//!   whose durable key the owner derives from that content, which a later session
-//!   must present under a strictly greater transport session fence, and which is
-//!   consumed once inside the redeeming transaction and can never be re-armed
-//!   because its key is a function of its own binding. Nothing a transport caller
+//!   whose durable key the owner derives from that content, which is consumed once
+//!   inside the redeeming transaction and can never be re-armed because its key is
+//!   a function of its own binding. That durable single-use record is the grant's
+//!   order: there is deliberately NO transport session-fence gate, because no
+//!   per-session value on this tree is monotone across live sessions
+//!   (`Session::session_epoch` is a literal `1` in every production constructor,
+//!   `crates/kernel/eliot-ipc/src/lib.rs:1450`, `:1478`, `:1540`) and because the
+//!   successor in the I14.21 case is this same principal in this same logon session
+//!   reconnecting after a lost response — so an order excluding the issuing session
+//!   would refuse exactly the reconciliation acceptance clause 3 requires. Nothing
+//!   a transport caller
 //!   holds reaches any of that — the predecessor pair is on the wire in the
 //!   predecessor's own `ok` reply and still authorizes nothing on its own.
 //!   Alongside it, unchanged: the route is scope-guarded, the authorization checks
@@ -1906,10 +1913,19 @@ fn successor_caller_principal(session: &Session) -> Result<&str, TransportError>
 /// and session come from the one shared
 /// [`authenticated_backup_principal`] reader, so the principal the route compares
 /// against the stored row and the principal the grant authorizes cannot drift
-/// apart; the scope and the authority LINEAGE are the admitted session's own; the
-/// session fence is the transport's own monotone fence, and the instant is the
-/// crate-wide [`unix_ms`](crate::unix_ms) the rest of the Kernel's durable
-/// timestamping reads.
+/// apart; the scope and the authority LINEAGE are the admitted session's own; and
+/// the instant is the crate-wide [`unix_ms`](crate::unix_ms) the rest of the
+/// Kernel's durable timestamping reads.
+///
+/// No transport session ordering is carried here, deliberately. The store gates
+/// the redemption on the grant's durable single-use record rather than on a
+/// session fence, because no per-session value on this tree is monotone across
+/// live sessions (`Session::session_epoch` is a literal `1` in every production
+/// constructor) and because the successor in the I14.21 case this exists for is
+/// this same principal in this same logon session reconnecting after a lost
+/// response — so an order that excluded the issuing session would refuse exactly
+/// the reconciliation acceptance clause 3 requires. See
+/// `eliot_ors::BackupVerifySuccessionGrant` for the full measurement.
 ///
 /// The LINEAGE is carried and the epoch SEQUENCE deliberately is not, for the same
 /// reason the durable verification key binds the lineage alone: a rotation on one
@@ -1940,7 +1956,6 @@ fn verify_succession_redemption(
             .as_str()
             .to_owned(),
         redeeming_session_id: session_id.to_owned(),
-        redeeming_session_epoch: session.session_epoch,
         observed_at_unix_ms: crate::unix_ms(),
     })
 }
@@ -2377,10 +2392,12 @@ enum PriorVerification {
 /// What the pair therefore still is NOT is the authorization itself, and saying so
 /// is the point: no caller-presented value can stand in for the grant, because the
 /// grant's content is owner-decided, its durable key is derived from that content,
-/// its redemption is due-ordered against the transport session fence and consumed
-/// durably exactly once. Before that grant existed, this pair plus those joins
-/// authorized a REPEAT reconciliation of the same row, unboundedly, from any
-/// transcript of the predecessor's own `ok` body. It no longer does.
+/// its redemption is gated on a durable owner-issued single-use record and can
+/// never be re-armed, so the second and every later reconciliation of the same
+/// operation is refused however many times this pair is replayed. Before that
+/// grant existed, this pair plus those joins authorized a REPEAT reconciliation of
+/// the same row, unboundedly, from any transcript of the predecessor's own `ok`
+/// body. It no longer does.
 struct VerifySuccessorEvidence {
     /// The predecessor operation's durable namespace key.
     predecessor_namespace_digest: String,
@@ -3051,11 +3068,14 @@ impl KernelComposition {
     /// the capture owner once per decided operation, out of the owner's own archive
     /// digest and the accepted identity it was called under; its durable key is derived
     /// from that content, so a caller holding the pair on the wire addresses nothing;
-    /// the redeeming session must present a strictly greater transport session fence
-    /// than the issuing one, so the issuing session and every earlier session are
-    /// excluded; and the redemption is consumed durably inside its own transaction, so
-    /// a second attempt is refused and the grant cannot be re-armed, because re-issuing
-    /// addresses the same content-derived key and writes nothing. What it still does
+    /// and the redemption is consumed durably inside its own transaction, so a second
+    /// attempt is refused and the grant cannot be re-armed, because re-issuing
+    /// addresses the same content-derived key and writes nothing. There is
+    /// deliberately NO session-fence gate on that redemption: it could never be
+    /// satisfied (every live `Session` carries `session_epoch == 1`), and excluding
+    /// the issuing session would refuse the I14.21 lost-response reconciliation this
+    /// very clause exists to permit — the successor there is the same principal in
+    /// the same logon session. What it still does
     /// NOT prove is that the owner would ever be willing to reconcile this operation at
     /// all: the grant is minted automatically for every decided verification, because
     /// the owner's decision here is "this decided operation may be reconciled at most
@@ -3312,7 +3332,6 @@ impl KernelComposition {
             fresh.archive_sha256.as_str(),
             identity,
             issued_by_session_id,
-            session.session_epoch,
             crate::unix_ms(),
         );
         answer

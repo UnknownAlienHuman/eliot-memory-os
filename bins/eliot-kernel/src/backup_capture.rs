@@ -1045,8 +1045,11 @@ impl KernelBackupCapture {
     /// archive; the predecessor namespace and request digests are the accepted
     /// request identity's own; the successor principal, scope and authority LINEAGE
     /// are that same identity's authenticated and admitted terms; the issuing
-    /// session and its transport fence are the session this owner was called
-    /// under. The durable key is DERIVED from the binding by
+    /// session is the session this owner was called under, recorded as evidence and
+    /// deliberately not compared at redemption, because the successor in the I14.21
+    /// case this grant exists for is this same principal in this same logon session
+    /// reconnecting after a lost response. The durable key is DERIVED from the
+    /// binding by
     /// [`BackupVerifySuccessionGrant`], so a caller holding the predecessor digest
     /// pair — which is on the wire in the predecessor's own `ok` reply — still
     /// holds nothing that addresses this row.
@@ -1069,7 +1072,6 @@ impl KernelBackupCapture {
         owner_archive_sha256: &str,
         identity: &BackupVerifyRequestIdentity,
         issued_by_session_id: &str,
-        issued_by_session_epoch: u64,
         issued_at_unix_ms: u64,
     ) -> Result<BackupVerifySuccessionGrantDisposition, KernelCaptureError> {
         let predecessor_namespace_digest = identity.namespace_digest().map_err(|error| {
@@ -1089,7 +1091,6 @@ impl KernelBackupCapture {
             successor_scope_id: identity.scope_id.clone(),
             successor_authority_lineage_id: identity.authority_epoch.lineage_id.as_str().to_owned(),
             issued_by_session_id: issued_by_session_id.to_owned(),
-            issued_by_session_epoch,
             issued_at_unix_ms,
             consumed_at_unix_ms: None,
             consumed_by_session_id: None,

@@ -10389,16 +10389,31 @@ pub const BACKUP_VERIFY_SUCCESSION_GRANT_KEY_PREFIX: &str = "backup-verify-succe
 /// `ActivationSuccessorBinding` (immutable identity) and
 /// `ActivationLifecycleRecord`'s mutable state:
 ///
-/// - `issued_by_session_id` and `issued_by_session_epoch` are the grant's DUE
-///   ORDER, not its identity. The due order is a monotone lifecycle value; if it
-///   were in the identity, a redeemer would have to already know it in order to
-///   find the row that tells it, which is a bootstrap inversion. It is not
-///   silently omitted either: it is a declared lifecycle member with its own gate
-///   in `RedbRecoveryStore::redeem_backup_verify_succession_grant`;
+/// - `issued_by_session_id` is retained owner evidence of WHICH session the owner
+///   issued under, and it is not in the identity: if it were, a redeemer would
+///   have to already know it in order to find the row that tells it, which is a
+///   bootstrap inversion;
 /// - `issued_at_unix_ms` is retained owner observation of when the succession
 ///   window was opened, and is explicitly NOT a gate;
 /// - the consumption members are the mutable lifecycle, changed exactly once by
 ///   the store inside the redeeming transaction and never by a caller.
+///
+/// There is deliberately NO session-order term here at all, and the reason is a
+/// measurement of this tree rather than a preference. #2883's earlier delivery
+/// carried an `issued_by_session_epoch` due-order gate requiring a redeeming
+/// session to present a strictly greater transport session fence; that gate could
+/// never be false in production, because every production `Session` constructor
+/// sets `session_epoch` to a literal `1`
+/// (`crates/kernel/eliot-ipc/src/lib.rs:1450`, `:1478`, `:1540`) and the only
+/// increment, `Session::fence()` (`:1567`), runs at teardown and also sets
+/// `SessionState::Fenced`, which live dispatch forbids
+/// (`Session::accepts`, `:1582`). Two successive LIVE sessions therefore both
+/// carried `1`, every redemption was refused, and the whole contract authorised
+/// nothing. It was removed rather than repaired, because there is no value on
+/// this tree that orders two live sessions AND because ordering them would forbid
+/// the reconciliation this grant exists to enable — see
+/// [`BackupVerifySuccessionGrant`]'s own doc for the full argument. The grant's
+/// order is the STORE's single-use linearisation, not a session order.
 struct BackupVerifySuccessionBindingTerms<'a> {
     domain_separator: &'a str,
     contract_version: u16,
@@ -10459,9 +10474,54 @@ impl BackupVerifySuccessionBindingTerms<'_> {
 ///   content, re-issuing is structurally unable to re-arm it: an existing row at
 ///   that key is the same binding, and the store returns
 ///   [`BackupVerifySuccessionGrantDisposition::AlreadyBound`] without writing.
-/// - DUE-ORDERED. A redeeming session must present a strictly greater transport
-///   session fence than the issuing session's, so the issuing session itself and
-///   every earlier session are excluded by construction.
+/// - NOT RE-DERIVABLE BY A CALLER. Every term is either the owner's own digest of
+///   the decoded bytes or an authenticated identity the owner was itself called
+///   under, and the store derives the ONE key a redemption can address from the
+///   redemption's own terms. A caller holding the predecessor digest pair — which
+///   is on the wire in the predecessor's own `ok` reply — therefore names a key
+///   nothing is filed under, which is a refusal and not a lookup.
+///
+/// There is deliberately NO session-order gate, and the reason is a measurement of
+/// this tree. An earlier delivery required a redeeming session to present a
+/// strictly greater transport `session_epoch` than the issuing session's, on the
+/// stated claim that this "excludes the issuing session and every earlier one by
+/// construction". That claim was false and the gate was inert: every production
+/// `Session` constructor sets `session_epoch` to a literal `1`
+/// (`crates/kernel/eliot-ipc/src/lib.rs:1450`, `:1478`, `:1540`), and the only
+/// increment, `Session::fence()` (`:1567`), runs at connection TEARDOWN and also
+/// sets `SessionState::Fenced`, which live dispatch forbids
+/// (`Session::accepts`, `:1582`). Two successive live sessions both carried `1`, so
+/// the comparison was always true and EVERY redemption was refused: an
+/// owner-authorized contract that authorized nothing.
+///
+/// No replacement order was invented, because two measurements say there is
+/// nothing to order BY. First, no per-session value on this tree is monotone
+/// across live sessions: `PeerIdentity::Authenticated::session_identity` is the
+/// Windows LOGON session id (`lib.rs:175`, parsed as `u32` at `lib.rs:1212`), not
+/// a connection; `connection_id` and `launch_nonce` are caller-presented
+/// (`bins/eliotd/src/daemon_kernel_client.rs:1618`,
+/// `bins/eliotd/src/daemon_config.rs:264`); and `EpochId::sequence` is monotone in
+/// Authority Epoch ROTATIONS, so two sessions on one lineage share it. Second, and
+/// decisively: in the reconciliation case this grant exists for — I14.21 recovery
+/// of a LOST RESPONSE — the successor IS the same principal in the same logon
+/// session reconnecting. Any gate excluding "the issuing session" would refuse the
+/// exact case acceptance clause 3 requires. An order that excluded it would be an
+/// order that blocked the delivery it was added to authorize.
+///
+/// So what now prevents an immediate double-redemption is the store's own
+/// single-use linearisation, and it is a real one rather than a convention: the
+/// consumption flag is set inside the SAME write transaction that reads the
+/// unconsumed state, so two sessions redeeming one grant serialise on that
+/// transaction and the second reads the first's committed consumption and is
+/// refused. On top of that, no code path clears `consumed_at_unix_ms`, and
+/// re-issuing cannot re-arm the row because its key is a function of its own
+/// binding (see CONSUMED ONCE, DURABLY). What is deliberately NOT claimed: that a
+/// grant cannot be redeemed by the very session that issued it. That session is
+/// the same principal, in the same scope, on the same lineage, reconciling the
+/// operation it itself just decided — so redeeming it discloses nothing the
+/// issuer does not already hold, and denying it would be denying the I14.21
+/// recovery. The single-use flag, not a session order, is what bounds how many
+/// times any session can observe the reconciliation.
 ///
 /// It deliberately does NOT weaken the namespace-plus-identity binding that was
 /// already there. The grant names BOTH halves and the store re-derives the named
@@ -10501,17 +10561,14 @@ pub struct BackupVerifySuccessionGrant {
     /// key: a rotation on one lineage must still permit an I14.21 reconciliation.
     pub successor_authority_lineage_id: String,
     /// Authenticated session the owner issued this grant under. Retained owner
-    /// evidence of who issued it and shape-validated on every read; it is
-    /// deliberately not compared at redemption, because the strictly-greater
-    /// session fence already excludes the issuing session and a second identity
-    /// compare that cannot fail is not evidence.
+    /// evidence of who issued it, shape-validated on every read, and deliberately
+    /// NOT compared at redemption: the successor in the reconciliation this
+    /// contract exists for is the same principal in the same logon session
+    /// reconnecting, so such a compare could only refuse the case the grant was
+    /// issued to authorize. It is not in the durable key either — a redeemer must
+    /// be able to derive that key before it knows this value, and a term it has to
+    /// already hold in order to find the row would be a bootstrap inversion.
     pub issued_by_session_id: String,
-    /// Monotonic transport session fence of the issuing session, and therefore the
-    /// grant's DUE ORDER: a redeeming session must present a strictly greater
-    /// fence. It is a fence, not a clock, and deliberately so — a wall-clock due
-    /// time would be a second, weaker ordering source that a session could observe
-    /// differently from the transport that carries it.
-    pub issued_by_session_epoch: u64,
     /// Owner observation of the instant the succession window was opened.
     /// Retained evidence, explicitly NOT a gate: `Some(_)` on the consumption
     /// member is the only test of "spent", so even a zero instant is not read as
@@ -10710,11 +10767,11 @@ pub struct BackupVerifySuccessionRedemption {
     pub successor_scope_id: String,
     /// Authority LINEAGE of the redeeming session.
     pub successor_authority_lineage_id: String,
-    /// Authenticated session redeeming the grant.
+    /// Authenticated session redeeming the grant, recorded as the grant's
+    /// consumption evidence. It is deliberately never compared against
+    /// [`BackupVerifySuccessionGrant::issued_by_session_id`]: see that field's doc
+    /// for why the two are not required to differ.
     pub redeeming_session_id: String,
-    /// Monotonic transport session fence of the redeeming session, which must be
-    /// strictly greater than the issuing session's.
-    pub redeeming_session_epoch: u64,
     /// Owner clock reading recorded as the consumption instant.
     pub observed_at_unix_ms: u64,
 }
