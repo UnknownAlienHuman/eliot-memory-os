@@ -2319,9 +2319,7 @@ fn verify_bound_tool_digests(
 ///
 /// Returns `0` for a map that carries neither key (an unallocated lane, which
 /// has no namespace to isolate one with) and `2` for a map that carries both.
-fn admit_governed_fixture_pair(
-    values: &BTreeMap<String, String>,
-) -> Result<usize, TestdError> {
+fn admit_governed_fixture_pair(values: &BTreeMap<String, String>) -> Result<usize, TestdError> {
     let fixture_keys = [FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV];
     let bound_fixture_keys = fixture_keys
         .iter()
