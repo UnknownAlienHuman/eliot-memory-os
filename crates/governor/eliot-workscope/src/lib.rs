@@ -3439,12 +3439,7 @@ impl WorkScopeBindingSnapshot {
             if sources.generation != self.binding.governing_source_generation {
                 return Err(WorkScopeError::SourceSetMismatch);
             }
-            let current = ScopeBindingGuard.check(
-                &self.binding,
-                &self.binding,
-                sources,
-                privacy,
-            );
+            let current = ScopeBindingGuard.check(&self.binding, &self.binding, sources, privacy);
             if current.disposition != ScopeBindingDisposition::Matched {
                 return Err(WorkScopeError::BindingReceiptNotMatched);
             }
@@ -3507,12 +3502,8 @@ impl WorkScopeBindingOwner {
         if sources.generation != snapshot.binding.governing_source_generation {
             return Err(WorkScopeError::SourceSetMismatch);
         }
-        let receipt = ScopeBindingGuard.check(
-            &snapshot.binding,
-            &snapshot.binding,
-            sources,
-            privacy,
-        );
+        let receipt =
+            ScopeBindingGuard.check(&snapshot.binding, &snapshot.binding, sources, privacy);
         if receipt.disposition != ScopeBindingDisposition::Matched {
             return Err(WorkScopeError::BindingReceiptNotMatched);
         }
