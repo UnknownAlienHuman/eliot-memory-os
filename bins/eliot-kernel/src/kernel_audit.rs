@@ -3149,7 +3149,7 @@ impl crate::KernelComposition {
             return CrashOperationContext::UnavailableWithOwnerEvidence(original_owner_evidence);
         }
         CrashOperationContext::Current {
-            runtime_context,
+            runtime_context: Box::new(runtime_context),
             operation_id: Some(operation_id.to_owned()),
             original_owner_evidence,
         }
@@ -3228,9 +3228,12 @@ impl crate::KernelComposition {
             return self.crash_operation_context_for_host_request(session, frame, envelope);
         }
         let (action_kind, action_operation_id) = match action {
-            crate::KernelFrameAction::Process { request, .. } => {
-                ("process", request.operation_id().map(ToString::to_string))
-            }
+            crate::KernelFrameAction::Process { request, .. } => (
+                "process",
+                request
+                    .operation_id()
+                    .map(|operation| operation.as_str().to_owned()),
+            ),
             crate::KernelFrameAction::Daemon { .. } => ("daemon", None),
             crate::KernelFrameAction::Doctor { .. } => ("doctor", None),
             crate::KernelFrameAction::Testd { .. } => ("testd", None),
@@ -3337,7 +3340,7 @@ impl crate::KernelComposition {
             return CrashOperationContext::UnavailableWithOwnerEvidence(original_owner_evidence);
         }
         CrashOperationContext::Current {
-            runtime_context,
+            runtime_context: Box::new(runtime_context),
             operation_id: lineage.operation_id,
             original_owner_evidence,
         }
@@ -3440,7 +3443,7 @@ impl crate::KernelComposition {
             format!(
                 "{}:{}",
                 policy.module_generation.module_id.as_str(),
-                policy.module_generation.generation.get()
+                policy.module_generation.generation.value()
             )
         });
         let state_fence = policy.map(|policy| policy.module_generation.state_fence.clone());

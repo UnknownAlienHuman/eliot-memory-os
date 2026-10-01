@@ -1089,27 +1089,7 @@ pub(crate) fn validate_exact_expected_file_digests(
             .iter()
             .any(|(name, _)| *name == item.relative_path)
         {
-            let spec = manifest
-                .files
-                .iter()
-                .find(|spec| spec.relative_path == item.relative_path)
-                .ok_or(InstallationError::IdentityConflict)?;
-            if spec.executable
-                || item.expected_size == 0
-                || item.expected_size != spec.expected_size
-            {
-                return Err(InstallationError::IdentityConflict);
-            }
-            crate::sha256_handle(&item.sha256, "expected symbol artifact digest")?;
-            let binding = if item.relative_path == RELEASE_SYMBOL_ROLES[0].0 {
-                candidate.runtime_launch.host_symbol_binding.as_ref()
-            } else {
-                candidate.runtime_launch.kernel_symbol_binding.as_ref()
-            }
-            .ok_or(InstallationError::IdentityConflict)?;
-            if item.sha256 != binding.symbol_artifact_sha256 {
-                return Err(InstallationError::IdentityConflict);
-            }
+            validate_exact_release_symbol_digest(candidate, manifest, item)?;
             continue;
         }
         if item.relative_path == USER_BROKER_STAGED_ROLE {
@@ -1157,6 +1137,32 @@ pub(crate) fn validate_exact_expected_file_digests(
         .map(|(name, _)| (*name).to_owned())
         .collect::<BTreeSet<_>>();
     if seen != expected_names {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(())
+}
+
+fn validate_exact_release_symbol_digest(
+    candidate: &CandidateManifest,
+    manifest: &PackageManifest,
+    item: &PackageArtifactDigest,
+) -> Result<(), InstallationError> {
+    let spec = manifest
+        .files
+        .iter()
+        .find(|spec| spec.relative_path == item.relative_path)
+        .ok_or(InstallationError::IdentityConflict)?;
+    if spec.executable || item.expected_size == 0 || item.expected_size != spec.expected_size {
+        return Err(InstallationError::IdentityConflict);
+    }
+    crate::sha256_handle(&item.sha256, "expected symbol artifact digest")?;
+    let binding = if item.relative_path == RELEASE_SYMBOL_ROLES[0].0 {
+        candidate.runtime_launch.host_symbol_binding.as_ref()
+    } else {
+        candidate.runtime_launch.kernel_symbol_binding.as_ref()
+    }
+    .ok_or(InstallationError::IdentityConflict)?;
+    if item.sha256 != binding.symbol_artifact_sha256 {
         return Err(InstallationError::IdentityConflict);
     }
     Ok(())

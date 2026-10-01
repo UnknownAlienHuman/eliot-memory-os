@@ -4635,6 +4635,7 @@ impl HostJobBranches {
             &kernel_arguments,
             &kernel_working_directory,
             self.kernel_launch_binding.as_ref(),
+            launch.kernel_symbol_binding.as_ref(),
             Some((
                 Path::new(launch.runtime_state_roots.host_state_root.as_str()),
                 Path::new(launch.runtime_state_roots.kernel_ors_root.as_str()),
@@ -4712,6 +4713,7 @@ impl HostJobBranches {
             host,
             &launch.store_bridge_arguments,
             &store_working_directory,
+            None,
             None,
             None,
             None,
@@ -9358,7 +9360,7 @@ impl HostComposition {
                 state
                     .last_checksum
                     .as_ref()
-                    .filter(|checksum| state.sequence > 0)
+                    .filter(|_| state.sequence > 0)
                     .map(|digest| CrashOwnerHead {
                         kind: CrashOwnerHeadKind::HostStateJournal,
                         algorithm: CrashDigestAlgorithm::Sha256,

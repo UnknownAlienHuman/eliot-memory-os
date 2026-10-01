@@ -23,7 +23,7 @@ use eliot_process::{
 
 #[cfg(windows)]
 use super::DaemonRestartRefusal;
-use super::daemon_supervision::DaemonQuarantineLineage;
+use super::daemon_supervision::{DaemonQuarantineEvidence, DaemonQuarantineLineage};
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{

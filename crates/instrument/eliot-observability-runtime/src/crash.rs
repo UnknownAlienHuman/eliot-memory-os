@@ -11,12 +11,10 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
@@ -76,11 +74,11 @@ pub enum CrashOperationContext {
     /// Full bounded owner snapshot joined to the current admitted operation.
     Current {
         /// Full bounded runtime identities from the same admitted owner.
-        runtime_context: CrashRuntimeContext,
+        runtime_context: Box<CrashRuntimeContext>,
         /// Original owner operation identifier when the action supplies one.
         operation_id: Option<String>,
         /// Canonical redacted bytes projected from the original Kernel-owned
-        /// AuditLineage and, when already sealed, TraceManifest owner data.
+        /// `AuditLineage` and, when already sealed, `TraceManifest` owner data.
         original_owner_evidence: String,
     },
     /// The operation is admitted, but its exact context producer/readback is
@@ -140,7 +138,7 @@ pub fn enter_crash_operation(
             let mut current = current
                 .try_borrow_mut()
                 .map_err(|_| CrashReportError::InvalidMetadata("operation_context.borrowed"))?;
-            let previous = std::mem::replace(&mut *current, Some(context));
+            let previous = current.replace(context);
             Ok(CrashOperationContextGuard {
                 previous,
                 _not_send: PhantomData,
@@ -160,10 +158,10 @@ pub fn with_crash_operation<R>(context: CrashOperationContext, operation: impl F
         }
         _ => CrashOperationContext::Unavailable,
     };
-    let _guard = enter_crash_operation(context)
+    let guard = enter_crash_operation(context)
         .or_else(|_| enter_crash_operation(fallback))
         .ok();
-    let _install_failure = _guard
+    let _install_failure = guard
         .is_none()
         .then(OperationContextInstallFailureGuard::enter);
     operation()
@@ -220,10 +218,10 @@ where
             }
             _ => CrashOperationContext::Unavailable,
         };
-        let _guard = enter_crash_operation(context.clone())
+        let guard = enter_crash_operation(context.clone())
             .or_else(|_| enter_crash_operation(fallback))
             .ok();
-        let _install_failure = _guard
+        let _install_failure = guard
             .is_none()
             .then(OperationContextInstallFailureGuard::enter);
         future.as_mut().poll(task_context)
@@ -1241,32 +1239,46 @@ impl CrashReporterState {
         format!("{}-{}-{sequence}", self.process, std::process::id())
     }
 
-    fn capture_panic(&self) {
-        let report_id = self.next_report_id();
+    fn panic_artifact_and_profile(&self, report_id: &str) -> Option<(SymbolArtifact, String)> {
         let symbol_artifact = if let Ok(symbol_artifact) = self.symbol_artifact.try_read() {
             symbol_artifact.clone()
         } else {
-            self.enqueue_gap(report_id, CrashTelemetryGapReason::SymbolBindingUnavailable);
-            return;
+            self.enqueue_gap(
+                report_id.to_owned(),
+                CrashTelemetryGapReason::SymbolBindingUnavailable,
+            );
+            return None;
         };
         let Some(symbol_artifact) = symbol_artifact else {
-            self.enqueue_gap(report_id, CrashTelemetryGapReason::SymbolBindingUnavailable);
-            return;
+            self.enqueue_gap(
+                report_id.to_owned(),
+                CrashTelemetryGapReason::SymbolBindingUnavailable,
+            );
+            return None;
         };
         let runtime_profile = if let Ok(runtime_profile) = self.runtime_profile.try_read() {
             runtime_profile.clone()
         } else {
             self.enqueue_gap(
-                report_id,
+                report_id.to_owned(),
                 CrashTelemetryGapReason::RuntimeProfileUnavailable,
             );
-            return;
+            return None;
         };
         let Some(runtime_profile) = runtime_profile else {
             self.enqueue_gap(
-                report_id,
+                report_id.to_owned(),
                 CrashTelemetryGapReason::RuntimeProfileUnavailable,
             );
+            return None;
+        };
+        Some((symbol_artifact, runtime_profile))
+    }
+
+    fn capture_panic(&self) {
+        let report_id = self.next_report_id();
+        let Some((symbol_artifact, runtime_profile)) = self.panic_artifact_and_profile(&report_id)
+        else {
             return;
         };
         if OPERATION_CONTEXT_INSTALL_FAILED
@@ -1282,8 +1294,9 @@ impl CrashReporterState {
         let operation_context = match ACTIVE_OPERATION_CONTEXT.try_with(|current| {
             current
                 .try_borrow()
-                .map(|value| value.clone())
-                .unwrap_or(Some(CrashOperationContext::Unavailable))
+                .map_or(Some(CrashOperationContext::Unavailable), |value| {
+                    value.clone()
+                })
         }) {
             Ok(context) => context,
             Err(_) => Some(CrashOperationContext::Unavailable),
@@ -1310,7 +1323,7 @@ impl CrashReporterState {
                     operation_id,
                     original_owner_evidence,
                 }) => (
-                    runtime_context,
+                    *runtime_context,
                     operation_id,
                     Some(original_owner_evidence),
                     Some("active_operation".to_owned()),
@@ -1556,23 +1569,7 @@ fn validate_original_owner_evidence_for_context(
         .map_err(|_| {
             CrashReportError::InvalidMetadata("operation_owner_evidence.request_identity")
         })?;
-    if request_identity
-        .get("idempotency_key")
-        .and_then(serde_json::Value::as_str)
-        .is_none_or(str::is_empty)
-        || request_identity
-            .get("cancellation_id")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(str::is_empty)
-        || request_identity
-            .get("deadline_unix_ms")
-            .and_then(serde_json::Value::as_u64)
-            .is_none_or(|deadline| deadline == 0)
-    {
-        return Err(CrashReportError::InvalidMetadata(
-            "operation_owner_evidence.request_identity",
-        ));
-    }
+    validate_original_request_identity_bounds(&request_identity)?;
     let expected_authority_epoch = runtime_context
         .authority_epoch
         .as_ref()
@@ -1598,6 +1595,29 @@ fn validate_original_owner_evidence_for_context(
     }
     if let Some(operation_id) = operation_id {
         validate_identity(operation_id, "operation_owner_evidence.operation_id")?;
+    }
+    Ok(())
+}
+
+fn validate_original_request_identity_bounds(
+    request_identity: &serde_json::Value,
+) -> Result<(), CrashReportError> {
+    if request_identity
+        .get("idempotency_key")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+        || request_identity
+            .get("cancellation_id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        || request_identity
+            .get("deadline_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|deadline| deadline == 0)
+    {
+        return Err(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.request_identity",
+        ));
     }
     Ok(())
 }

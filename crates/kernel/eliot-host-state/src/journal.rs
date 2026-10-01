@@ -1384,7 +1384,8 @@ fn state_for_host(
         return Err(JournalError::RecoveryRequiresNewEpoch);
     }
     let mut next = HostState::new(host.clone(), all_evidence);
-    next.host_process_incarnation = parent.host_process_incarnation.clone();
+    next.host_process_incarnation
+        .clone_from(&parent.host_process_incarnation);
     next.prior_kernel = parent
         .kernel
         .clone()
