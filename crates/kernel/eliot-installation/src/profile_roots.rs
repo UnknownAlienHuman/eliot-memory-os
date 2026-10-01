@@ -200,10 +200,13 @@ impl InstallationRoots {
         &self,
         profile: InstallationProfile,
     ) -> Result<(), InstallationError> {
-        let profile_root = self.runtime_state_roots.installer_profile_root()?;
-        let profile_root = WindowsPathIdentity::parse_root(
-            profile_root.as_str(),
-            "runtime_state_roots.profile_root",
+        // The I3.1 durable-data root is the ancestor; the per-installation
+        // runtime root refines it (`...\\Eliot\\installations\\<key>` for
+        // SystemService, `...\\Eliot\\data\\installations\\<key>` for UserMode)
+        // and must sit strictly below it.
+        let installation = WindowsPathIdentity::parse_root(
+            self.runtime_state_roots.installation_root.as_str(),
+            "runtime_state_roots.installation_root",
         )?;
         let durable = WindowsPathIdentity::parse_root(&self.durable_data, "durable_data")?;
         match profile {
@@ -216,8 +219,8 @@ impl InstallationRoots {
                     "durable_data",
                 )?;
                 if durable != expected_durable
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || durable == installation
+                    || !durable.contains(&installation)
                 {
                     return Err(InstallationError::ProfileViolation(
                         "runtime installation root must sit strictly below the I3.1 durable-data root"
@@ -248,8 +251,8 @@ impl InstallationRoots {
                 if durable != expected_data
                     || user_config != expected_config
                     || user_cache != expected_cache
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || durable == installation
+                    || !durable.contains(&installation)
                 {
                     return Err(InstallationError::ProfileViolation(
                         "UserMode data, config, cache, and runtime roots must preserve the I3.1 sibling layout"

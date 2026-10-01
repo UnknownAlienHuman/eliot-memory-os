@@ -611,10 +611,18 @@ impl RegistryFixture {
         let user_broker_digest = Self::artifact_digest(&user_broker_path);
         let config_handle = path_handle(&config_path);
         let installer_user_root = r"C:\Users\eliot-installer\AppData\Local\Eliot";
+        // I3.1 SystemService durable state is `%ProgramData%\Eliot` (the profile
+        // anchor joined with `Eliot`); the per-installation runtime root refines
+        // it as `...\Eliot\installations\<key>` and must sit strictly below it.
+        let durable_data = self
+            .program_data
+            .join("Eliot")
+            .to_string_lossy()
+            .into_owned();
         let profile_governed_roots = eliot_installation::InstallationRoots {
             binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
             immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
-            durable_data: roots.installation_root.as_str().to_owned(),
+            durable_data,
             user_config: installer_user_root.to_owned(),
             user_cache: installer_user_root.to_owned(),
             runtime_state_roots: roots.clone(),
