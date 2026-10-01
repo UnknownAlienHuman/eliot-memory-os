@@ -122,6 +122,7 @@ mod kernel_recovery_client;
 mod kernel_transition_client;
 pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
+pub mod maintenance_resume_admission;
 // Public because `daemon_runtime` lives in the `eliotd` binary crate and
 // reaches the maintenance publication owner through it, exactly as it reaches
 // `maintenance_dispatch` and `maintenance_family_catalog` beside it. The
@@ -312,6 +313,11 @@ pub use improvement_candidate_route::{
 pub(crate) use kernel_authority_client::KernelAuthorityClient;
 pub use kernel_context_read_client::{KernelContextReadClient, ReconstructionReadComposition};
 pub use maintenance_dispatch::{MaintenanceDecisionGap, MaintenanceDispatch, decision_gap};
+pub use maintenance_resume_admission::{
+    ReconciledAttemptView, ResumeAdmission, ResumeContinuity, ResumeFreshEvidence,
+    ResumeRefusal, ResumeRefusalReason, ResumeSessionBinding, ResumeStatus, attempt_reconciliation,
+    decide_resume_admission, project_resume_status,
+};
 pub use maintenance_trigger_evaluator::{
     MaintenanceObservation, MaintenanceTriggerOrigin, SELF_OBSERVED_FAMILY, UNRESOLVED_AUTHORITIES,
 };
