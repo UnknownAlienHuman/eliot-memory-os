@@ -1943,12 +1943,11 @@ impl ReconnectRequest {
 /// boundary. It is inert until A-16 validates and seals it.
 ///
 /// A result built by [`ReconciliationPortResult::reconciled`] carries no
-/// recovered facts: it attests an empty inventory through a legacy port and
-/// keeps the historical gate-clearing semantics. A result built by
-/// [`ReconciliationPortResult::reconciled_with_pages`] carries the checked
-/// owner page facts plus the declared window binding; the core imports those
-/// facts into its recovery progress and clears the gate only when the walk
-/// disposition is complete (issue #2732).
+/// recovered facts and cannot satisfy an external-attach recovery gate. A
+/// result built by [`ReconciliationPortResult::reconciled_with_pages`] carries
+/// checked owner page facts plus the declared window binding; the core imports
+/// those facts into its recovery progress and clears the gate only when the
+/// walk disposition is complete (issue #2732).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReconciliationPortResult {
     session_id: SessionId,

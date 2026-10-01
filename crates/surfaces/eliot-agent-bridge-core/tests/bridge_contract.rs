@@ -13,9 +13,9 @@ use eliot_agent_bridge_core::{
     NormalizationCoverage, NormalizedHostEventEnvelope, NormalizedHostEventPayload, PrincipalId,
     ProofCeiling, ProviderFailure, ProviderObservationLineage, ProviderReadiness,
     QualifiedSourceDigest, RawSourceRecord, ReconciliationPortOutcome, ReconciliationPortResult,
-    ReconciliationReceiptRef, ReconnectRequest, RequiredProvider, RestrictedRawSourceHandle,
-    SessionId, SessionLifecycleObservation, SessionLifecycleTransition, SessionObservation, TaskId,
-    UnsupportedDisposition, WorkUnitId,
+    ReconciliationReceiptRef, ReconnectRequest, RecoveryResponseSelector, RecoveryWindowStatus,
+    RequiredProvider, RestrictedRawSourceHandle, SessionId, SessionLifecycleObservation,
+    SessionLifecycleTransition, SessionObservation, TaskId, UnsupportedDisposition, WorkUnitId,
 };
 use eliot_contracts::{EpochId, EpochLineageId, sha256_hex};
 use serde_json::json;
@@ -524,6 +524,16 @@ fn durable_duplicate_replay_is_idempotent_and_ack_phase_controls_cursor()
             AckPhase::Durable,
             EventDisposition::Accepted,
         )?));
+    forward_state
+        .lock()
+        .map_err(|_| "forward state lock poisoned")?
+        .outcomes
+        .push_back(EventPortOutcome::Acknowledged(EventForwardAck::new(
+            "stream-1",
+            "event-1",
+            AckPhase::Durable,
+            EventDisposition::Duplicate,
+        )?));
     let mut bridge = bridge(
         Arc::new(Mutex::new(HostState::default())),
         Arc::clone(&forward_state),
@@ -652,7 +662,9 @@ fn received_and_durable_ack_retry_until_required_normalized_phase()
         Arc::clone(&forward_state),
     )?;
     bridge.attach(managed_request("connection-1")?)?;
-    let durable = event("durable_observation", "event-2", 2)?;
+    // Start at the stream's next contiguous sequence so this proof isolates
+    // acknowledgement phase advancement from an unrelated sequence-1 hole.
+    let durable = event("durable_observation", "event-2", 1)?;
 
     for phase in [AckPhase::Received, AckPhase::Durable] {
         assert_eq!(
@@ -813,7 +825,42 @@ fn external_attach_stays_candidate_until_reconciled_and_never_promotes_history()
         .push_back(ReconciliationPortOutcome::Reconciled(
             ReconciliationPortResult::reconciled(
                 view.binding(),
-                ReconciliationReceiptRef::new("external-attach-reconciliation-receipt-1")?,
+                ReconciliationReceiptRef::new("external-attach-windowless-receipt-1")?,
+            )?,
+        ));
+
+    // #2732 impl-6: an identity-only/windowless response cannot close an
+    // external attach's recovery gate without complete owner-window coverage.
+    let windowless = bridge.reconcile_external()?;
+    assert!(windowless.reconciliation_required());
+
+    forward_state
+        .lock()
+        .map_err(|_| "forward state lock poisoned")?
+        .reconciliations
+        .push_back(ReconciliationPortOutcome::Reconciled(
+            ReconciliationPortResult::reconciled_with_pages(
+                view.binding(),
+                ReconciliationReceiptRef::new("external-attach-complete-window-receipt-1")?,
+                "external-attach-window-1".to_owned(),
+                1_900_000_000_000,
+                RecoveryWindowStatus::Active,
+                RecoveryResponseSelector::Open,
+                None,
+                view.binding().activation_generation(),
+                view.binding().connection_id().clone(),
+                false,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0,
+                None,
+                true,
+                None,
+                0,
+                None,
+                true,
+                None,
             )?,
         ));
 

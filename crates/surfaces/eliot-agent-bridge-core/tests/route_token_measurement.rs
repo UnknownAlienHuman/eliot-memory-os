@@ -238,9 +238,8 @@ fn observation(
         route_state: state,
         diverged_fields,
         execution_outcome: ExecutionOutcome::Observed,
-        request_digest: serde_json::from_value(serde_json::Value::String(sha256_hex(
-            b"request-1",
-        )))?,
+        // Preserve the exact start-request commitment required by the receipt contract.
+        request_digest: PhysicalRouteObservationReceipt::bound_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest,
         raw_evidence_ref,
