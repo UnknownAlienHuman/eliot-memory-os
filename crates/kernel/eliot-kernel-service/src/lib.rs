@@ -52,6 +52,8 @@ mod storage_replacement;
 mod store_client;
 #[cfg(windows)]
 mod store_gateway;
+#[cfg(windows)]
+pub mod source_capture_mutation;
 mod store_write_reservation;
 #[cfg(test)]
 mod store_write_reservation_tests;
