@@ -1224,8 +1224,8 @@ mod tests {
             module_id: AGENT_BRIDGE_MODULE_ID.to_owned(),
             profile_id: "caller-value".to_owned(),
             protocol_range: ProtocolRange {
-                minimum: ProtocolVersion { major: 1, minor: 0 },
-                maximum: ProtocolVersion { major: 1, minor: 0 },
+                minimum: ProtocolVersion::CURRENT,
+                maximum: ProtocolVersion::CURRENT,
             },
             module_contract: contract,
             module_generation: generation,
