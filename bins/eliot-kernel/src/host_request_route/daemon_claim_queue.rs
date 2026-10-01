@@ -268,9 +268,10 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
-            return Err(TransportError::SessionFenced);
-        }
+        // Historical readback is bound to the original retained activation
+        // tuple below; requiring a still-live task lease here would turn a
+        // completed decision into a new-work admission and strand legitimate
+        // post-closure replay.
         let owner = self.finish_owner_binding_for_pair(envelope, tool, &admission_owner)?;
         Ok((operation_id, owner))
     }
@@ -1053,9 +1054,10 @@ impl KernelComposition {
     ) -> Result<LocalReadSubmitDisposition, TransportError> {
         body.validate().map_err(|_| TransportError::SessionFenced)?;
         // Read the immutable canonical receipt before entering the synchronous
-        // route locks. A deadline can pass while the Store read is in flight;
-        // this lets only an already committed exact operation reconcile after
-        // expiry, while a missing receipt still times out below.
+        // route locks. Every Finish result, including an ordinary first submit,
+        // must match the committed canonical operation before ORS can retain
+        // its response. A deadline can pass while the Store read is in flight;
+        // a missing receipt still times out below.
         let (envelope, _, _) = self.finish_queued_pair(body)?;
         let gateway = self.retained_store_gateway()?;
         let historical_receipt = gateway
