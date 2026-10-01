@@ -93,6 +93,8 @@ pub enum ModuleError {
     NotFound,
     #[error("module generation admission receipt has not been read back from its owner")]
     AdmissionReceiptUnverified,
+    #[error("module manifest has no explicit generation execution policy")]
+    MissingExecutionPolicy,
     #[error("module catalog operation identity conflict")]
     IdentityConflict,
     /// The declared required dependency edges contain a cycle.
@@ -744,6 +746,8 @@ impl GenerationCandidateReceipt {
     }
 
     pub fn validate(&self) -> Result<(), ModuleError> {
+        text(self.candidate_id.as_str(), "candidate.candidate_id")?;
+        text(self.module_id.as_str(), "candidate.module_id")?;
         digest(&self.artifact_digest, "candidate.artifact_digest")?;
         digest(&self.config_digest, "candidate.config_digest")?;
         digest(&self.protocol_digest, "candidate.protocol_digest")?;
@@ -759,6 +763,176 @@ impl GenerationCandidateReceipt {
         digest(&self.candidate_digest, "candidate.candidate_digest")?;
         if self.identity_digest()? != self.candidate_digest {
             return Err(ModuleError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Source-derived Kernel execution fields copied from one exact catalog row.
+/// This projection is preparation evidence only; it carries no admission
+/// receipt and cannot activate a generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedKernelExecutionProjection {
+    pub artifact_digest: String,
+    pub config_digest: String,
+    pub protocol_digest: String,
+    pub command_ref: String,
+    pub dependency_order: Vec<ModuleDependency>,
+    pub health_contract_ref: String,
+    pub effect_ceiling: EffectCeiling,
+    pub restart_authorization: RestartAuthorization,
+    pub restart_policy_digest: String,
+    pub execution_policy: GenerationExecutionPolicy,
+}
+
+/// Read-only join between a source candidate and the current admitted catalog
+/// revision. A later owner-issued receipt and Kernel readback are still needed
+/// before this can become an accepted generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedGenerationExecution {
+    pub candidate: GenerationCandidateReceipt,
+    pub source_module_id: ModuleId,
+    pub catalog_revision: u64,
+    pub state_fence: StateFence,
+    pub source_catalog_digest: String,
+    pub source_manifest: ModuleManifest,
+    pub source_manifest_digest: String,
+    pub projection: PreparedKernelExecutionProjection,
+}
+
+impl PreparedGenerationExecution {
+    pub fn validate(&self) -> Result<(), ModuleError> {
+        self.candidate.validate()?;
+        self.state_fence
+            .validate()
+            .map_err(|error| ModuleError::Contract(error.to_string()))?;
+        if self.catalog_revision == 0 {
+            return Err(ModuleError::InvalidField {
+                field: "prepared_execution.catalog_revision",
+                reason: "must be greater than zero",
+            });
+        }
+        digest(
+            &self.source_catalog_digest,
+            "prepared_execution.source_catalog_digest",
+        )?;
+        digest(
+            &self.source_manifest_digest,
+            "prepared_execution.source_manifest_digest",
+        )?;
+        self.source_manifest
+            .validate_for_module(&self.candidate.module_id)?;
+        if self.source_module_id != self.candidate.module_id
+            || self.source_manifest.manifest_digest != self.source_manifest_digest
+        {
+            return Err(ModuleError::IdentityConflict);
+        }
+        let source_policy = self
+            .source_manifest
+            .execution_policy
+            .as_ref()
+            .ok_or(ModuleError::MissingExecutionPolicy)?;
+        let source_restart_policy_digest =
+            admitted_manifest_policy_digest(&self.source_manifest)?;
+        let mut source_dependencies = self.source_manifest.dependencies.clone();
+        source_dependencies.sort_by_key(|dependency| dependency.startup_order);
+        let capability_profile_digest = self
+            .source_manifest
+            .capability_profile_digest(&self.candidate.module_id)?;
+        if self.candidate.capability_profile_digest != capability_profile_digest
+            || self.projection.artifact_digest != self.source_manifest.artifact_digest
+            || self.projection.config_digest != self.source_manifest.config_digest
+            || self.projection.protocol_digest != self.source_manifest.protocol_digest
+            || self.projection.command_ref != self.source_manifest.command_ref
+            || self.projection.dependency_order != source_dependencies
+            || self.projection.health_contract_ref != self.source_manifest.health_contract_ref
+            || self.projection.effect_ceiling != self.source_manifest.effect_ceiling
+            || self.projection.restart_authorization
+                != self.source_manifest.restart_authorization
+            || self.projection.restart_policy_digest != source_restart_policy_digest
+            || &self.projection.execution_policy != source_policy
+        {
+            return Err(ModuleError::IdentityConflict);
+        }
+        digest(
+            &self.projection.artifact_digest,
+            "prepared_execution.artifact_digest",
+        )?;
+        digest(
+            &self.projection.config_digest,
+            "prepared_execution.config_digest",
+        )?;
+        digest(
+            &self.projection.protocol_digest,
+            "prepared_execution.protocol_digest",
+        )?;
+        text(&self.projection.command_ref, "prepared_execution.command_ref")?;
+        text(
+            &self.projection.health_contract_ref,
+            "prepared_execution.health_contract_ref",
+        )?;
+        digest(
+            &self.projection.restart_policy_digest,
+            "prepared_execution.restart_policy_digest",
+        )?;
+        unique(
+            self.projection
+                .dependency_order
+                .iter()
+                .map(|dependency| dependency.module_id.clone()),
+            "prepared_execution.dependency_order.module_id",
+        )?;
+        unique(
+            self.projection
+                .dependency_order
+                .iter()
+                .map(|dependency| dependency.startup_order),
+            "prepared_execution.dependency_order.startup_order",
+        )?;
+        for dependency in &self.projection.dependency_order {
+            dependency.validate()?;
+        }
+        self.projection
+            .execution_policy
+            .validate_for_module(&self.candidate.module_id, &self.source_manifest)?;
+        if self.candidate.artifact_digest != self.projection.artifact_digest
+            || self.candidate.config_digest != self.projection.config_digest
+            || self.candidate.protocol_digest != self.projection.protocol_digest
+            || self
+                .projection
+                .execution_policy
+                .allowed_route_scopes
+                .iter()
+                .any(|scope| scope.module_id != self.candidate.module_id)
+        {
+            return Err(ModuleError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+/// Exact inputs for preparing, but not accepting, a generation execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationPreparationRequest {
+    pub candidate: GenerationCandidateReceipt,
+    pub expected_catalog_revision: u64,
+    pub state_fence: StateFence,
+}
+
+impl GenerationPreparationRequest {
+    pub fn validate(&self) -> Result<(), ModuleError> {
+        self.candidate.validate()?;
+        self.state_fence
+            .validate()
+            .map_err(|error| ModuleError::Contract(error.to_string()))?;
+        if self.expected_catalog_revision == 0 {
+            return Err(ModuleError::InvalidField {
+                field: "expected_catalog_revision",
+                reason: "must be non-zero",
+            });
         }
         Ok(())
     }
@@ -1279,6 +1453,76 @@ impl ModuleCatalog {
         &self.state_fence
     }
 
+    /// Projects the current, enabled catalog row into the exact technical
+    /// inputs Kernel needs for a generation proposal. This is read-only and
+    /// grants no activation or effect authority.
+    pub fn prepare_generation_execution(
+        &self,
+        request: &GenerationPreparationRequest,
+    ) -> Result<PreparedGenerationExecution, ModuleError> {
+        request.validate()?;
+        if request.state_fence != self.state_fence {
+            return Err(ModuleError::FenceMismatch);
+        }
+        if request.expected_catalog_revision != self.revision {
+            return Err(ModuleError::RevisionConflict);
+        }
+        let source_catalog = self.snapshot()?;
+        let entry = self
+            .entries
+            .get(&request.candidate.module_id)
+            .ok_or(ModuleError::NotFound)?;
+        entry.validate()?;
+        if entry.desired_state != DesiredModuleState::Enabled {
+            return Err(ModuleError::InvalidField {
+                field: "desired_state",
+                reason: "only enabled modules can prepare a generation",
+            });
+        }
+        if request.candidate.artifact_digest != entry.manifest.artifact_digest
+            || request.candidate.config_digest != entry.manifest.config_digest
+            || request.candidate.protocol_digest != entry.manifest.protocol_digest
+            || request.candidate.capability_profile_digest
+                != entry
+                    .manifest
+                    .capability_profile_digest(&entry.module_id)?
+        {
+            return Err(ModuleError::IdentityConflict);
+        }
+        let execution_policy = entry
+            .manifest
+            .execution_policy
+            .clone()
+            .ok_or(ModuleError::MissingExecutionPolicy)?;
+        execution_policy.validate_for_module(&entry.module_id, &entry.manifest)?;
+        let restart_policy_digest = admitted_manifest_policy_digest(&entry.manifest)?;
+        let mut dependency_order = entry.manifest.dependencies.clone();
+        dependency_order.sort_by_key(|dependency| dependency.startup_order);
+        let prepared = PreparedGenerationExecution {
+            candidate: request.candidate.clone(),
+            source_module_id: entry.module_id.clone(),
+            catalog_revision: self.revision,
+            state_fence: self.state_fence.clone(),
+            source_catalog_digest: source_catalog.catalog_digest,
+            source_manifest: entry.manifest.clone(),
+            source_manifest_digest: entry.manifest.manifest_digest.clone(),
+            projection: PreparedKernelExecutionProjection {
+                artifact_digest: entry.manifest.artifact_digest.clone(),
+                config_digest: entry.manifest.config_digest.clone(),
+                protocol_digest: entry.manifest.protocol_digest.clone(),
+                command_ref: entry.manifest.command_ref.clone(),
+                dependency_order,
+                health_contract_ref: entry.manifest.health_contract_ref.clone(),
+                effect_ceiling: entry.manifest.effect_ceiling,
+                restart_authorization: entry.manifest.restart_authorization,
+                restart_policy_digest,
+                execution_policy,
+            },
+        };
+        prepared.validate()?;
+        Ok(prepared)
+    }
+
     pub fn desired(&self, module_id: &ModuleId) -> Option<&ModuleCatalogEntry> {
         self.entries.get(module_id)
     }
@@ -1495,6 +1739,20 @@ impl ModuleCatalog {
             }
         }
     }
+}
+
+/// Returns the admitted versioned restart policy digest. A withheld policy is
+/// not converted into a default or a fabricated Kernel policy identity.
+fn admitted_manifest_policy_digest(manifest: &ModuleManifest) -> Result<String, ModuleError> {
+    let disposition = dispose_restart_policy(manifest.restart_policy.as_ref())
+        .map_err(|error| ModuleError::Contract(error.to_string()))?;
+    if !disposition.permits_automatic_restart() {
+        return Err(ModuleError::IdentityConflict);
+    }
+    disposition
+        .policy_digest()
+        .map(str::to_owned)
+        .ok_or(ModuleError::IdentityConflict)
 }
 
 /// A manifest that declares itself as its own dependency is refused, because
