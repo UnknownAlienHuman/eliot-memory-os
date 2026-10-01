@@ -3174,9 +3174,7 @@ impl HostJobBranches {
                 HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
             })?;
             let candidate = self.kernel_candidate.as_ref().ok_or_else(|| {
-                HostError::ProcessContour(
-                    "retained Kernel candidate binding is missing".to_owned(),
-                )
+                HostError::ProcessContour("retained Kernel candidate binding is missing".to_owned())
             })?;
             if self.approved_generation.as_ref() != Some(generation) {
                 return Err(HostError::ProcessContour(
@@ -3212,11 +3210,9 @@ impl HostJobBranches {
                     let cleanup = self.terminate_kernel();
                     return Err(match cleanup {
                         Ok(()) => error,
-                        Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(
-                            format!(
-                                "supervision preparation failed ({error}); retained Kernel Job containment failed ({cleanup})"
-                            ),
-                        ),
+                        Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                            "supervision preparation failed ({error}); retained Kernel Job containment failed ({cleanup})"
+                        )),
                     });
                 }
             };
@@ -12246,7 +12242,10 @@ impl HostComposition {
         // contour inspection can fail or decide to skip fresh evidence.
         let mut control = None;
         if disposition == HostBranchDisposition::LiveAwaitingReadiness {
-            match self.jobs.begin_fresh_supervision_control_context(generation) {
+            match self
+                .jobs
+                .begin_fresh_supervision_control_context(generation)
+            {
                 Ok(context) => control = Some(context),
                 Err(error) => {
                     self.readiness_gate
