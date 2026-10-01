@@ -567,10 +567,7 @@ impl<C> CanonicalUserAutomationStore<C> {
             provenance: UserAutomationOwnerReadProvenance {
                 current_before: owner_read_provenance(current_request, &current_response),
                 history: owner_read_provenance(history_request, &history_response),
-                current_after: owner_read_provenance(
-                    current_after_request,
-                    current_after_response,
-                ),
+                current_after: owner_read_provenance(current_after_request, current_after_response),
             },
         })
     }
