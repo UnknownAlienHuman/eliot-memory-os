@@ -177,7 +177,7 @@ impl PreferenceCasExpected {
     /// against the publisher's freshly loaded publication.
     ///
     /// The anchor crosses as three plain strings: this owner never imports
-    /// the coordinator or ControlBoard crates. An anchor that does not match
+    /// the coordinator or `ControlBoard` crates. An anchor that does not match
     /// the loaded predecessor field-for-field — including the absent-store /
     /// non-empty-anchor case — fails closed with
     /// [`ModelPreferenceStoreError::Stale`]. The store revision comes from the
