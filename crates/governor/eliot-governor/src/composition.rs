@@ -7767,7 +7767,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         let snapshot = WorkScopeBindingSnapshot::new(fence, owner_revision, relocated, fresh)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        WorkScopeBindingOwner::new(snapshot)
+        WorkScopeBindingOwner::new_with_source_closure(snapshot, sources, privacy)
             .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
