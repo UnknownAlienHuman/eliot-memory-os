@@ -972,28 +972,49 @@ fn changed_same_id_payload_conflict() -> TestResult {
     let (profile, policy) = profile_and_policy(&state);
     let first_row = LegacyEliotCuesV1Row {
         mode: Some("exact".to_owned()),
-        ..legacy_row("concept", "shared")
+        ..legacy_row("file_path", "shared")
     };
     let first_observed = owner_observed(1, "shared", &state);
     let first_normalized = normalize_cue(&first_observed, &policy, &profile)?;
+    // The retained bytes are the identity-bound v1 envelope `convert_v1_row`
+    // parses back and compares to the presented row, so the row id and the
+    // payload are both carried by the bytes rather than asserted beside them.
+    let first_bytes = serde_json::to_vec(&serde_json::json!({
+        "row_id": "legacy:shared",
+        "scope": "scope",
+        "kind": "file_path",
+        "value": "shared",
+        "mode": "exact",
+        "target": "shared",
+        "revision": 1
+    }))?;
     let first = eliot_cues::legacy_adapter::convert_v1_row_from_fresh_observation(
         "legacy:shared",
         &first_row,
-        b"raw-shared",
+        &first_bytes,
         &first_observed,
         &first_normalized.normalized,
     )?;
     assert!(first.disposition.is_converted());
     let changed_row = LegacyEliotCuesV1Row {
         mode: Some("exact".to_owned()),
-        ..legacy_row("concept", "changed")
+        ..legacy_row("file_path", "changed")
     };
     let changed_observed = owner_observed(1, "changed", &state);
     let changed_normalized = normalize_cue(&changed_observed, &policy, &profile)?;
+    let changed_bytes = serde_json::to_vec(&serde_json::json!({
+        "row_id": "legacy:changed",
+        "scope": "scope",
+        "kind": "file_path",
+        "value": "changed",
+        "mode": "exact",
+        "target": "changed",
+        "revision": 1
+    }))?;
     let changed = eliot_cues::legacy_adapter::convert_v1_row_from_fresh_observation(
         "legacy:changed",
         &changed_row,
-        b"raw-changed",
+        &changed_bytes,
         &changed_observed,
         &changed_normalized.normalized,
     )?;
@@ -1001,6 +1022,30 @@ fn changed_same_id_payload_conflict() -> TestResult {
         first.disposition.v2_row_id(),
         changed.disposition.v2_row_id()
     );
+    // The same legacy row id bound to a changed payload is refused before any
+    // v2 identity is issued: the retained bytes no longer decode to the row
+    // the caller presented under that id.
+    let rebound = serde_json::to_vec(&serde_json::json!({
+        "row_id": "legacy:shared",
+        "scope": "scope",
+        "kind": "file_path",
+        "value": "changed",
+        "mode": "exact",
+        "target": "changed",
+        "revision": 1
+    }))?;
+    assert!(matches!(
+        eliot_cues::legacy_adapter::convert_v1_row_from_fresh_observation(
+            "legacy:shared",
+            &first_row,
+            &rebound,
+            &first_observed,
+            &first_normalized.normalized,
+        ),
+        Err(eliot_cues::FacadeError::ResponseIdentityMismatch {
+            what: "migration.row_payload"
+        })
+    ));
     Ok(())
 }
 
