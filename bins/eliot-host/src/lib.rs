@@ -6790,11 +6790,14 @@ impl HostComposition {
             ProposedRestorationRequirements,
         };
         use eliot_platform_windows::ProtectedRootLease;
-        // The renderer only SELECTS a static class from the typed error, so it
-        // borrows rather than taking it by value; this one binding adapts the
-        // four call sites below without repeating the closure at each.
-        let reason = |error: &eliot_installation::IsolatedDestinationError| {
-            Self::isolated_destination_reason(error)
+        // The renderer only SELECTS a static class from the typed error, so it borrows
+        // rather than taking it by value. `map_err` is `FnOnce(E) -> F`, so this
+        // adapter must ACCEPT the owned value `E` and borrow inside its body;
+        // the borrow cannot escape because the result is a `&'static str`. All
+        // four call sites below yield `IsolatedDestinationError` by value, so
+        // one binding serves them all.
+        let reason = |error: eliot_installation::IsolatedDestinationError| {
+            Self::isolated_destination_reason(&error)
         };
         let max_restore_bytes =
             u64::try_from(eliot_protocol::backup::MAX_BACKUP_PAYLOAD_BYTES).unwrap_or(u64::MAX);
