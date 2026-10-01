@@ -115,6 +115,12 @@ impl From<StoreError> for CanonicalError {
     }
 }
 
+/// Returns the independent receiving-build identity for the supported
+/// admission contract set carried by every prepared transition.
+pub fn supported_admission_contract_set_digest() -> Result<String, CanonicalError> {
+    eliot_store_api::supported_admission_contract_set_digest().map_err(CanonicalError::Store)
+}
+
 impl CanonicalError {
     /// Projects the store boundary failure behind this error into bounded
     /// recovery semantics. Returns `None` for non-store errors. The projection
@@ -462,7 +468,8 @@ pub struct CanonicalWriteEnvelope {
     pub transition_class: TransitionClass,
     /// Effect ceiling requested by the candidate, never an authority grant.
     pub requested_effect_ceiling: EffectClass,
-    /// Digest of the admitted semantic contract set.
+    /// Receiving-build support identity for the versioned Store API,
+    /// write-admission contract, and generated operation catalogue.
     pub admission_contract_set_digest: String,
     /// Digest of the named store operation manifest.
     pub operation_manifest_digest: OperationManifestDigest,
@@ -490,6 +497,9 @@ impl CanonicalWriteEnvelope {
             &self.admission_contract_set_digest,
             "admission_contract_set_digest",
         )?;
+        if self.admission_contract_set_digest != supported_admission_contract_set_digest()? {
+            return Err(CanonicalError::Store(StoreError::ManifestMismatch));
+        }
         if self.semantic_commands.is_empty() {
             return Err(CanonicalError::Empty {
                 field: "semantic_commands",

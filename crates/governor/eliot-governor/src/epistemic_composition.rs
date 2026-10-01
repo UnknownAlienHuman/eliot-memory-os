@@ -159,7 +159,7 @@ impl<P: KernelTransitionPort + ?Sized, R: CanonicalReadClient + ?Sized>
             task_id: Some(proposal.request.task_id.as_str().to_owned()),
             transition_class: TransitionClass::Epistemic,
             requested_effect_ceiling: TransitionClass::Epistemic.maximum_effect(),
-            admission_contract_set_digest: digest(proposal)?,
+            admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
             operation_manifest_digest: manifest,
             semantic_commands: vec![command],
             event_projection_relation_intents: EventProjectionRelationIntents {

@@ -9694,13 +9694,10 @@ fn refuse_determinate_reserved_write(
 /// this Kernel implements; the manifest half is decided by
 /// `validate_against_catalogue` against the generated manifests.
 ///
-/// `admission_contract_set_digest` is deliberately NOT claimed here: it is
-/// carried and hash-bound like every other plan field, but this boundary holds
-/// no live contract-set value to compare it against, because I05-15 records that
-/// no generated authoritative catalogue exists yet
-/// (`ImplementationSupport = TARGET`). Inventing one here would be exactly the
-/// invented authority this gate must not create. When that catalogue lands,
-/// this is where the comparison belongs.
+/// The recorded `admission_contract_set_digest` is compared against this
+/// receiving Kernel's independently derived support identity, which binds the
+/// current Store API/write-admission revisions and generated operation
+/// catalogue.
 ///
 /// The gate ORDER is load-bearing and unchanged: every gate below runs before
 /// any store send, and this is the *unreserved* admission point, so a refusal
@@ -9735,6 +9732,11 @@ fn admit_prepared_transition(
 ) -> Result<(), StoreApplyRefusal> {
     let gate: Result<(), StoreError> = (|| {
         context.validate().map_err(StoreError::Foundation)?;
+        if transition.admission_contract_set_digest
+            != eliot_store_api::supported_admission_contract_set_digest()?
+        {
+            return Err(StoreError::ManifestMismatch);
+        }
         transition.validate()?;
         if transition.state_fence != context.state_fence {
             return Err(StoreError::FenceMismatch);

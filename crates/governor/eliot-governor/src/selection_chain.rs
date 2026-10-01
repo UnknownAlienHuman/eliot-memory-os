@@ -959,10 +959,8 @@ pub fn selection_chain_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: security.selection_chain_head.as_ref().map_or_else(
-            || receipt.revision.to_string(),
-            |head| head.chain_head_digest.clone(),
-        ),
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
+            .map_err(|error| CompositionError::Canonical(error))?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::AppendAuditEvent,

@@ -222,14 +222,7 @@ pub fn operator_command_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: canonical_digest(&(
-            session_id,
-            access_digest,
-            action_digest,
-            expected_revision,
-            operation_id.as_str(),
-            identity.idempotency_key.clone(),
-        ))?,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::AppendAuditEvent,

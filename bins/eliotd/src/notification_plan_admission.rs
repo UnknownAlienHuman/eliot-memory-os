@@ -15,7 +15,7 @@
 //! [`NotificationPlanAdmission`] carries only state that was already admitted
 //! before this function runs: the authenticated ingress identity the leg
 //! derived from observed store state, the operation text that identity is keyed
-//! by, the leg's own contract-set input digest, the closed leg's exact
+//! by, the receiving build's supported contract-set digest, the closed leg's exact
 //! named-operation parameters, and the live ordering head the leg
 //! compare-and-swaps. Nothing here reads a clock, draws a random value, reads
 //! the environment, or iterates an unordered collection:
@@ -79,14 +79,10 @@
 //!   `CanonicalWriteEnvelope::prepare` over the exact ordered
 //!   `NamedMutationRequest` plan and the exact admitted decision tuple, from
 //!   the carried content. They are never accepted from a caller.
-//! * `admission_contract_set_digest` is the leg's admitted contract-set INPUT
-//!   digest, supplied by the leg because only the leg knows which contract set
-//!   it admits under. It is validated as a digest and is hash-bound downstream;
-//!   it is NOT claimed here to be compared against a live catalogue, because
-//!   `docs/architecture/I05-15-canonical-contract-catalogue.md` records that
-//!   catalogue as `ImplementationSupport = TARGET`, so no such live value
-//!   exists to compare it to and inventing one would be exactly the invented
-//!   authority this boundary must not create.
+//! * `admission_contract_set_digest` is independently derived from the
+//!   receiving Store API's current versioned admission contract and generated
+//!   operation catalogue; request-specific values remain in the operation
+//!   parameters.
 //!
 //! # The recorded values are checked before the plan is transportable
 //!
@@ -186,13 +182,6 @@ pub struct NotificationPlanAdmission<'a> {
     /// and idempotency identity is a function of the admitted identity rather
     /// than a second formatting of it.
     pub operation_text: &'a str,
-    /// The digest of the semantic contract set this leg admits under.
-    ///
-    /// Supplied by the leg because only the leg knows which contract set its
-    /// own admission was made against. It is recorded, never re-derived, and
-    /// the module documentation states plainly which check is and is not
-    /// claimed for it.
-    pub admission_contract_set_digest: &'a str,
     /// The closed leg's exact named-operation parameters, in canonical key
     /// order.
     ///
@@ -306,7 +295,7 @@ pub fn admit_notification_transition(
         transition_class: TransitionClass::NotificationState,
         // Exactly the class maximum, never a wider ceiling.
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: admission.admission_contract_set_digest.to_owned(),
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()?,
         operation_manifest_digest: operation_manifest_set_digest(&authorizing_manifests)?,
         // Exactly one named command, built by the store's own closed request
         // builder from the leg's own parameters.

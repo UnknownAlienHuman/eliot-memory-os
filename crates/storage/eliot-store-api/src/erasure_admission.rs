@@ -198,6 +198,9 @@ impl ErasureAdmissionRequest {
             &self.admission_contract_set_digest,
             "admission_contract_set_digest",
         )?;
+        if self.admission_contract_set_digest != super::supported_admission_contract_set_digest()? {
+            return Err(StoreError::ManifestMismatch);
+        }
         self.event_projection_relation_intents.validate()?;
         self.security.validate(&self.state_fence)?;
         Ok(())
