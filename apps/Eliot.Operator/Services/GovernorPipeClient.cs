@@ -144,6 +144,44 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         return new OperatorRestartRequiredException(reason);
     }
 
+    /// The closed set of admitted routes that change state rather than read:
+    /// the legacy command tool and the typed user-automation owner route. Both
+    /// act on the installation, so both are routed through the principal check;
+    /// the three read routes are not, because a read changes nothing.
+    private static bool IsStateChangingRoute(string tool) =>
+        string.Equals(tool, LegacyOperatorAdapter.ToolCommand, StringComparison.Ordinal)
+        || string.Equals(tool, UserAutomationContract.Route, StringComparison.Ordinal);
+
+    /// Admits a state-changing route only against the explicit authenticated
+    /// Human principal the User Broker issued and this client retained at
+    /// redemption (I11.8), and only when that broker-issued grant covers the
+    /// capability the route acts on.
+    ///
+    /// Two refusals share one disposition, because this process can hold no
+    /// other one: a state-changing route with no retained principal has no
+    /// principal to present, and a route whose principal the broker granted
+    /// without `operator.command` is a capability-expanded request. In both
+    /// cases the retained binding authorizes nothing on this route, and the
+    /// handoff is single-use, so a fresh broker-issued handoff - and therefore
+    /// a fresh UI process - is the only owner of the remedy. That is the same
+    /// `ReacquisitionRequirement` the lost-binding latch already reports, so no
+    /// new fault code is invented and no value from the retained principal ever
+    /// reaches a message.
+    ///
+    /// The check reads the retained binding, never a constant and never the
+    /// endpoint's requested authority: the broker's granted answer is the only
+    /// one that counts. A capability outside that grant is refused here as well
+    /// as by the broker, because a client that would send it is already wrong.
+    private void RequireRetainedHumanPrincipal(string tool)
+    {
+        if (!IsStateChangingRoute(tool)) return;
+        var principal = BrokerPipeClient.RetainedPrincipal;
+        if (principal is null || !principal.Grant.GrantsCommands)
+        {
+            throw BindingLost(OperatorHandoff.ReacquisitionRequirement);
+        }
+    }
+
     public async Task<OperatorSnapshot> SnapshotAsync(string? projectId = null, string? taskId = null, CancellationToken cancellationToken = default)
     {
         using var budget = new OperationBudget("read:snapshot", cancellationToken, _closing.Token);
@@ -376,6 +414,14 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
                     operationScope, tool, OperatorFaultReason.ForException(error), OperatorExchangeStages.Establishment);
             }
 
+            // I11.8: a state-changing request carries an explicit
+            // authenticated Human principal. The only principal this client can
+            // present is the one the User Broker issued and this client retained
+            // at redemption, so the check runs HERE - after the connection is
+            // established, which is what proves that redemption, and before the
+            // exchange's own try block, so the refusal keeps its own typed
+            // disposition instead of being reported as an owner outcome.
+            RequireRetainedHumanPrincipal(tool);
             var state = new ExchangeState();
             var requestId = Interlocked.Increment(ref _requestId);
             try
