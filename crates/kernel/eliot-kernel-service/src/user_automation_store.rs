@@ -2065,6 +2065,56 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         Self::build_transition_with_parameters(request, parameters)
     }
 
+    /// Applies a prepared normalization-retention leg through the same
+    /// authenticated borrowed Store client used by Create/Edit.
+    pub async fn apply_normalization_transition(
+        &self,
+        context: &RequestMetadata,
+        mut transition: PreparedTransition,
+        manifest_digest: eliot_store_api::OperationManifestDigest,
+    ) -> Result<WriteReceipt, StoreError> {
+        if transition.state_fence != context.state_fence
+            || !transition.identity.canonical_request_hash.is_empty()
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        let view = CanonicalRequestView::from_apply(context, &transition, &[], &[]);
+        let request_hash = canonical_request_hash(&view)?;
+        transition.identity.canonical_request_hash = request_hash.clone();
+        let operation_id = transition.identity.operation_id.clone();
+        let idempotency_key = transition.identity.idempotency_key.clone();
+        let state_fence = transition.state_fence.clone();
+        let receipt = if let Some(existing) = self
+            .client
+            .receipt(operation_id.clone())
+            .await?
+        {
+            if existing.idempotency_key != idempotency_key
+                || existing.canonical_request_hash != request_hash
+            {
+                return Err(StoreError::IdentityConflict);
+            }
+            existing
+        } else {
+            self.client
+                .apply_prepared(context, transition, Vec::new(), Vec::new())
+                .await?
+        };
+        receipt.validate()?;
+        if receipt.status != WriteReceiptStatus::Committed
+            || receipt.operation_id != operation_id
+            || receipt.idempotency_key != idempotency_key
+            || receipt.canonical_request_hash != request_hash
+            || receipt.state_fence != state_fence
+            || receipt.transition_class != TransitionClass::UserAutomation
+            || receipt.operation_manifest_digest != manifest_digest
+        {
+            return Err(StoreError::IdentityConflict);
+        }
+        receipt.require_reconciliation_envelope()?;
+        Ok(receipt)
+    }
+
     fn build_transition_with_parameters(
         request: &UserAutomationStoreRequest,
         parameters: BTreeMap<String, Value>,
