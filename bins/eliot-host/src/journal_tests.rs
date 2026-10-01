@@ -416,11 +416,7 @@ fn readiness_supervision_snapshot(
         kernel_epoch: fixture.candidate.kernel_epoch.clone(),
         kernel_front_door_server_sid: "S-1-5-19".to_owned(),
         kernel_front_door_session_id: 0,
-        kernel_front_door_artifact_sha256: fixture
-            .candidate
-            .kernel_artifact_digest
-            .as_str()
-            .to_owned(),
+        kernel_front_door_artifact_sha256: fixture.candidate.artifact_hash.as_str().to_owned(),
         watchdog_epoch: AuthorityEpoch::new(1)?,
         generation_binding: eliot_runtime_contracts::SupervisionGenerationBinding {
             target_id: "kernel-readiness".to_owned(),
@@ -807,9 +803,13 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
     let bridge_path = path(&portable, "eliot-store-surreal.exe");
     let provider_path = path(&portable, "surreal.exe");
     let host_path = path(&portable, "eliot-host.exe");
+    // `PlatformHandle` carries no filesystem access, so the fixture writes the
+    // approved image through the real filesystem path and keeps the handle for
+    // the descriptor fields that require one.
+    let user_broker_file = portable.join("eliot-user-broker.exe");
     let user_broker_path = path(&portable, "eliot-user-broker.exe");
     let user_broker_bytes = b"approved-user-broker-fixture";
-    std::fs::write(&user_broker_path, user_broker_bytes)?;
+    std::fs::write(&user_broker_file, user_broker_bytes)?;
     let user_broker_digest = handle(format!("{:x}", Sha256::digest(user_broker_bytes)));
     let profile_governed_roots = eliot_installation::InstallationRoots {
         binding_version: eliot_installation::INSTALLATION_ROOT_BINDING_VERSION,
