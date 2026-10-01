@@ -231,6 +231,9 @@ const P07_DISPOSITION_UNAVAILABLE_OR_CAPACITY: &str = "UNAVAILABLE_OR_CAPACITY";
 /// Fence, operation identity, and canonical request hash from authenticated
 /// evidence, so the selector itself grants no authority.
 pub(crate) const USER_AUTOMATION_OPERATOR_OPERATION: &str = "eliot_user_automation";
+/// Authenticated `eliot` operator ingress for an inert registry candidate.
+pub(crate) const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
+    eliot_protocol::INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION;
 
 /// Authenticated named-read selector serving the complete owner-issued
 /// `UserAutomation` preflight projection (issue #1779, I11.12).
@@ -660,6 +663,13 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         ADMISSION_RESERVATION_ADMIT_OPERATION => ADMISSION_RESERVATION_ADMIT_OPERATION,
         ADMISSION_RESERVATION_CURRENT_USE_OPERATION => {
             ADMISSION_RESERVATION_CURRENT_USE_OPERATION
+        }
+        INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION => {
+            INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
+        }
+        #[cfg(windows)]
+        process_execution::current_source_executable::OPERATION => {
+            process_execution::current_source_executable::OPERATION
         }
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
@@ -3141,6 +3151,31 @@ impl KernelComposition {
             return Ok(frame);
         }
         #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION {
+            // Operator registration is a source-specific HostRequest
+            // producer. It uses the live authenticated EBP Session and the
+            // exact outer RequestIdentity; candidate scope/snapshot fields
+            // supply no authority and no AgentBridge descriptor is created.
+            session
+                .peer
+                .validate()
+                .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let body: eliot_protocol::InstrumentRegistryRegistrationOperatorRequest =
+                serde_json::from_value(without_daemon_routing_key(payload.clone())?)
+                    .map_err(|_| TransportError::SessionFenced)?;
+            let value = self.submit_operator_registry_registration(session, &body, identity)?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
         if operation == USER_AUTOMATION_PREFLIGHT_SELECTOR {
             // The complete preflight projection is a front-door read, not a
             // daemon-module operation: the principal comes from the
@@ -3402,6 +3437,13 @@ impl KernelComposition {
                 ))
                 .await
             }
+            #[cfg(windows)]
+            process_execution::current_source_executable::OPERATION => self
+                .observe_current_source_executable_operation(
+                    session,
+                    payload.clone(),
+                    request_identity,
+                ),
             "receipt" => {
                 // F-LOG-KERNEL-1 (#897 T20): only a dispatch failure carries
                 // the subordinate designated terminal, so only that leg
@@ -12968,6 +13010,7 @@ mod local_read_dispatch_tests {
             state_fence: test_fence(),
             descriptor_sha256: "d".repeat(64),
             peer_admission_receipt_sha256: "e".repeat(64),
+            authenticated_source: None,
             activation_binding: None,
             envelope_sha256: String::new(),
         }

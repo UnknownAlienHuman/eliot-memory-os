@@ -3843,6 +3843,65 @@ pub struct InstrumentRegistryRegistrationInvocation {
     pub snapshot_json: String,
 }
 
+/// Closed CLI request body for an Instrument Registry registration. The
+/// enclosing authenticated EBP frame remains the source of `RequestIdentity`;
+/// the caller supplies only the explicit WorkScope selector and inert typed
+/// snapshot candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentRegistryRegistrationOperatorRequest {
+    /// Stable request wire identity.
+    pub wire_id: String,
+    /// Request contract version.
+    pub wire_version: u16,
+    /// Explicit candidate WorkScope selector, re-resolved by Governor.
+    pub work_scope_id: String,
+    /// Exact candidate registry snapshot bytes.
+    pub snapshot_json: String,
+}
+
+/// Closed authenticated operator route for the inert registry registration
+/// candidate. The outer EBP frame supplies the original RequestIdentity.
+pub const INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION: &str =
+    "instrument_registry_registration.operator";
+
+impl InstrumentRegistryRegistrationOperatorRequest {
+    /// Stable closed request wire identity.
+    pub const WIRE_ID: &'static str = "eliot.instrument-registry-registration.operator";
+    /// Current request contract version.
+    pub const WIRE_VERSION: u16 = 1;
+
+    /// Validates the untrusted candidate envelope without granting authority.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.wire",
+                reason: "unsupported operator registration request",
+            });
+        }
+        bounded_text(
+            &self.work_scope_id,
+            "instrument_registry_registration_operator.work_scope_id",
+            MAX_HOST_REQUEST_TEXT_BYTES,
+        )?;
+        if self.snapshot_json.is_empty()
+            || self.snapshot_json.len() > InstrumentRegistryRegistrationInvocation::MAX_SNAPSHOT_BYTES
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.snapshot_json",
+                reason: "candidate snapshot is empty or exceeds the registration bound",
+            });
+        }
+        let _: Value = serde_json::from_str(&self.snapshot_json).map_err(|_| {
+            ProtocolError::InvalidField {
+                field: "instrument_registry_registration_operator.snapshot_json",
+                reason: "candidate snapshot is not valid JSON",
+            }
+        })?;
+        Ok(())
+    }
+}
+
 impl InstrumentRegistryRegistrationInvocation {
     /// Stable closed payload wire identity.
     pub const WIRE_ID: &'static str = "eliot.instrument-registry-registration";
@@ -3901,8 +3960,14 @@ impl InstrumentRegistryRegistrationInvocation {
             || envelope.identity.deadline_unix_ms != self.request_identity.deadline_unix_ms
             || envelope.identity.session_id.as_ref() != expected_session.as_ref()
             || envelope.identity.task_id.as_ref() != expected_task.as_ref()
+            || envelope.identity.work_scope_id.is_none()
             || envelope.state_fence != self.request_identity.request.state_fence
             || envelope.identity.payload_sha256 != self.action_payload_sha256()?
+            || matches!(
+                &envelope.authenticated_source,
+                Some(HostRequestAuthenticatedSource::Operator { request_identity })
+                    if request_identity != &self.request_identity
+            )
         {
             return Err(ProtocolError::InvalidField {
                 field: "instrument_registry_registration.envelope",
@@ -4281,10 +4346,27 @@ pub struct HostRequestEnvelope {
     pub descriptor_sha256: String,
     /// Digest of the exact Kernel-produced transport admission receipt.
     pub peer_admission_receipt_sha256: String,
+    /// Authenticated source for the small operator-owned registration subset.
+    /// `None` preserves the existing AgentBridge descriptor/receipt contract.
+    /// The operator variant carries the exact identity already authenticated
+    /// on the enclosing Kernel frame and deliberately has no bridge descriptor
+    /// or peer-admission receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_source: Option<HostRequestAuthenticatedSource>,
     /// Ticket/result binding, present only for Activation.
     pub activation_binding: Option<HostRequestActivationBinding>,
     /// Lowercase SHA-256 over every envelope field except this field.
     pub envelope_sha256: String,
+}
+
+/// Source-specific authentication binding for the existing HostRequest
+/// registration queue. It is not a transferable credential: Kernel compares
+/// the retained identity to the authenticated outer frame and live Session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostRequestAuthenticatedSource {
+    /// Registration issued from the authenticated `eliot` operator Session.
+    Operator { request_identity: RequestIdentity },
 }
 
 impl HostRequestEnvelope {
@@ -4334,11 +4416,27 @@ impl HostRequestEnvelope {
                 reason: "pre-activation fence must not contain a task revision",
             });
         }
-        lowercase_sha256(&self.descriptor_sha256, "host_request.descriptor_sha256")?;
-        lowercase_sha256(
-            &self.peer_admission_receipt_sha256,
-            "host_request.peer_admission_receipt_sha256",
-        )?;
+        match &self.authenticated_source {
+            None => {
+                lowercase_sha256(&self.descriptor_sha256, "host_request.descriptor_sha256")?;
+                lowercase_sha256(
+                    &self.peer_admission_receipt_sha256,
+                    "host_request.peer_admission_receipt_sha256",
+                )?;
+            }
+            Some(HostRequestAuthenticatedSource::Operator { request_identity }) => {
+                request_identity.validate()?;
+                if self.kind != HostRequestKind::InstrumentRegistryRegistration
+                    || !self.descriptor_sha256.is_empty()
+                    || !self.peer_admission_receipt_sha256.is_empty()
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.authenticated_source",
+                        reason: "operator source is only valid for registration and carries no bridge descriptor or receipt",
+                    });
+                }
+            }
+        }
         match (&self.kind, &self.activation_binding) {
             (HostRequestKind::Activation, Some(binding)) => binding.validate()?,
             (HostRequestKind::Activation, None) => {
@@ -7941,5 +8039,31 @@ mod tests {
             event_replay_key("s", "e"),
             EventReplayKey::new("s", "e").canonical_key()
         );
+    }
+
+    #[test]
+    fn issue_1814_operator_registration_accepts_explicit_candidate() {
+        let request = InstrumentRegistryRegistrationOperatorRequest {
+            wire_id: InstrumentRegistryRegistrationOperatorRequest::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryRegistrationOperatorRequest::WIRE_VERSION,
+            work_scope_id: "scope-1814".to_owned(),
+            snapshot_json: r#"{"wire_id":"candidate"}"#.to_owned(),
+        };
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn issue_1814_operator_registration_refuses_unknown_wire_and_bad_json() {
+        let mut request = InstrumentRegistryRegistrationOperatorRequest {
+            wire_id: InstrumentRegistryRegistrationOperatorRequest::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryRegistrationOperatorRequest::WIRE_VERSION,
+            work_scope_id: "scope-1814".to_owned(),
+            snapshot_json: "{}".to_owned(),
+        };
+        request.wire_version += 1;
+        assert!(request.validate().is_err());
+        request.wire_version = InstrumentRegistryRegistrationOperatorRequest::WIRE_VERSION;
+        request.snapshot_json = "{".to_owned();
+        assert!(request.validate().is_err());
     }
 }

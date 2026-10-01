@@ -381,6 +381,7 @@ impl KernelComposition {
     /// and is also retained in the digest-bound payload body.
     pub(super) fn admit_and_queue_instrument_registry_registration(
         &self,
+        session: &Session,
         envelope: &HostRequestEnvelope,
         invocation: &InstrumentRegistryRegistrationInvocation,
         request_identity: &RequestIdentity,
@@ -398,7 +399,18 @@ impl KernelComposition {
         if &invocation.request_identity != request_identity {
             return Err(TransportError::IdentityConflict);
         }
-        let admitted = self.admit_host_request_envelope_under_transition(envelope)?;
+        let admitted = if matches!(
+            envelope.authenticated_source.as_ref(),
+            Some(eliot_protocol::HostRequestAuthenticatedSource::Operator { .. })
+        ) {
+            self.admit_operator_registry_registration_under_transition(
+                envelope,
+                session,
+                request_identity,
+            )?
+        } else {
+            self.admit_host_request_envelope_under_transition(envelope)?
+        };
         if admitted.1.state == HostRequestState::ResultReceived {
             return Ok(admitted);
         }
@@ -541,9 +553,25 @@ impl KernelComposition {
                 invocation
                     .validate_for_envelope(envelope)
                     .map_err(|_| TransportError::SessionFenced)?;
+                let source_is_live = match envelope.authenticated_source.as_ref() {
+                    Some(eliot_protocol::HostRequestAuthenticatedSource::Operator {
+                        request_identity,
+                    }) => {
+                        envelope.kind == eliot_protocol::HostRequestKind::InstrumentRegistryRegistration
+                            && request_identity == identity
+                            && session.module_generation.state_fence == envelope.state_fence
+                            && session
+                                .accepts(&session.authority_epoch, session.session_epoch)
+                    }
+                    None => self.application_binding_live_for_claim(
+                        envelope,
+                        &admission_owner,
+                        true,
+                    )?,
+                };
                 if &invocation.request_identity != identity
                     || activation_deadline_expired(unix_ms(), envelope.identity.deadline_unix_ms)
-                    || !self.application_binding_live_for_claim(envelope, &admission_owner, true)?
+                    || !source_is_live
                 {
                     continue;
                 }

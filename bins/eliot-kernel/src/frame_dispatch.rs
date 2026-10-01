@@ -1495,6 +1495,8 @@ fn is_daemon_operation(operation: &str) -> bool {
             // the `UserAutomation` runtime dispatch, and admitting it twice in
             // this matcher would make the second arm unreachable.
             | super::daemon_request_dispatch::USER_AUTOMATION_RUNTIME_OPERATION
+            | super::daemon_request_dispatch::INSTRUMENT_REGISTRY_REGISTRATION_OPERATOR_OPERATION
+            | "current_source_executable.observe"
             | "health"
             | "daemon_degraded"
             | "daemon_fatal"

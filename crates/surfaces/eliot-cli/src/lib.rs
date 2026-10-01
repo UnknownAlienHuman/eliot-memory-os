@@ -57,6 +57,7 @@ pub enum CommandId {
     DevTestChanged,
     DevPulse,
     InstrumentRun,
+    InstrumentRegistryRegister,
     ModuleValidate,
     ModuleTest,
     ModuleContractTest,
@@ -89,6 +90,7 @@ impl CommandId {
             Self::DevTestChanged => "dev-test-changed",
             Self::DevPulse => "dev-pulse",
             Self::InstrumentRun => "instrument-run",
+            Self::InstrumentRegistryRegister => "instrument-registry-register",
             Self::ModuleValidate => "module-validate",
             Self::ModuleTest => "module-test",
             Self::ModuleContractTest => "module-contract-test",
@@ -140,6 +142,12 @@ pub enum CommandArguments {
     InstrumentRun {
         profile: String,
         scope: Option<String>,
+    },
+    /// Submit an inert registry snapshot candidate for current Governor
+    /// admission under the authenticated operator request identity.
+    InstrumentRegistryRegister {
+        work_scope_id: String,
+        snapshot_json: String,
     },
     ModuleValidate {
         module_id: String,
@@ -233,6 +241,7 @@ impl CommandArguments {
             Self::DevTestChanged => CommandId::DevTestChanged,
             Self::DevPulse { .. } => CommandId::DevPulse,
             Self::InstrumentRun { .. } => CommandId::InstrumentRun,
+            Self::InstrumentRegistryRegister { .. } => CommandId::InstrumentRegistryRegister,
             Self::ModuleValidate { .. } => CommandId::ModuleValidate,
             Self::ModuleTest { .. } => CommandId::ModuleTest,
             Self::ModuleContractTest { .. } => CommandId::ModuleContractTest,
@@ -288,6 +297,21 @@ impl CommandArguments {
                 Self::validate_text(profile, "profile")?;
                 if let Some(scope) = scope {
                     Self::validate_text(scope, "scope")?;
+                }
+                Ok(())
+            }
+            Self::InstrumentRegistryRegister {
+                work_scope_id,
+                snapshot_json,
+            } => {
+                Self::validate_text(work_scope_id, "work_scope_id")?;
+                if snapshot_json.is_empty()
+                    || snapshot_json.len() > 1_048_576
+                    || serde_json::from_str::<Value>(snapshot_json).is_err()
+                {
+                    return Err(CliError::InvalidArgument {
+                        field: "snapshot_json",
+                    });
                 }
                 Ok(())
             }
@@ -1487,6 +1511,7 @@ pub enum ArgumentKind {
     Objective,
     Profile,
     ProfileScope,
+    RegistryCandidate,
     Module,
     ModuleAgainst,
     Edge,
@@ -1662,6 +1687,17 @@ static COMMANDS: &[CommandSpec] = &[
             missing_work_id: "A-06",
             dependency: "no admitted Kernel/Governor provider is injected",
         },
+    },
+    CommandSpec {
+        id: CommandId::InstrumentRegistryRegister,
+        usage: "eliot instrument registry register --work-scope <scope> --snapshot-json <json>",
+        summary: "submit an explicit registry candidate for admitted registration",
+        owner: "eliot-cli",
+        required_work_id: "W1.2",
+        argument_kind: ArgumentKind::RegistryCandidate,
+        effect: EffectClass::ReversibleMutation,
+        proof_ceiling: ProofCeiling::CandidateArtifact,
+        availability: CommandAvailability::Admitted,
     },
     CommandSpec {
         id: CommandId::ModuleValidate,
@@ -2992,6 +3028,32 @@ mod tests {
             ),
             Err(CliError::ResultMismatch)
         );
+    }
+
+    #[test]
+    fn issue_1814_registry_candidate_accepts_explicit_bounded_snapshot() {
+        let args = CommandArguments::InstrumentRegistryRegister {
+            work_scope_id: "scope-1814".to_owned(),
+            snapshot_json: r#"{"wire_id":"candidate"}"#.to_owned(),
+        };
+        assert!(args.validate().is_ok());
+        assert_eq!(args.command_id(), CommandId::InstrumentRegistryRegister);
+    }
+
+    #[test]
+    fn issue_1814_registry_candidate_refuses_missing_or_malformed_snapshot() {
+        for snapshot_json in [String::new(), "{".to_owned()] {
+            let args = CommandArguments::InstrumentRegistryRegister {
+                work_scope_id: "scope-1814".to_owned(),
+                snapshot_json,
+            };
+            assert!(matches!(
+                args.validate(),
+                Err(CliError::InvalidArgument {
+                    field: "snapshot_json"
+                })
+            ));
+        }
     }
 
     #[test]

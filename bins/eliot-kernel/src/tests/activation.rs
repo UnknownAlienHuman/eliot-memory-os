@@ -370,6 +370,7 @@ fn activation_host_envelope(
         state_fence: ticket.state_fence.clone(),
         descriptor_sha256: "f".repeat(64),
         peer_admission_receipt_sha256: "b".repeat(64),
+        authenticated_source: None,
         activation_binding: Some(HostRequestActivationBinding {
             ticket_id: ticket.ticket_id.clone(),
             ticket_sha256: ticket.ticket_sha256.clone(),
