@@ -55,6 +55,8 @@ pub use backup_io::{
 pub use compression_port::{RLE_COMPRESSION_ALGORITHM, RLE_COMPRESSION_VERSION, RleCompressionPort};
 pub mod demand;
 pub mod key_ports;
+pub mod live_set;
+pub mod platform_port;
 pub mod publication_owner;
 pub mod stream_sink;
 pub use demand::{
@@ -80,6 +82,8 @@ use eliot_receipts::{
     ReceiptKind, contract_identity,
 };
 pub use key_ports::{DpapiUserAeadPort, DpapiUserKeyPort, KEY_PORT_ALGORITHM, KEY_PORT_VERSION};
+pub use live_set::UnavailableBlobLiveSetPort;
+pub use platform_port::WindowsBlobPlatformPort;
 pub use publication_owner::{BlobArchivePublicationBinding, BlobArchivePublicationOwner};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1439,7 +1443,8 @@ pub trait BlobPlatformPort: Send + Sync {
 /// Provider evidence for one conditional journal operation. The service binds
 /// this physical result to the authority-issued request and receipt before it
 /// exposes success to its caller.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlobCasProviderResult {
     pub operation_id: String,
     pub request_commitment_sha256: String,
@@ -1716,6 +1721,9 @@ struct StageIntent {
     request: BlobStageRecoveryRequest,
     revision: u64,
     phase: StageIntentPhase,
+    /// Physical root object generation captured by the current pinned CAS
+    /// backend when the original intent was reserved.
+    root_backend_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1728,6 +1736,9 @@ enum StageIntentPhase {
 impl StageIntent {
     fn validate(&self) -> Result<(), BlobError> {
         self.request.validate()?;
+        if self.root_backend_generation == 0 {
+            return Err(BlobError::StaleFence);
+        }
         let revision_is_valid = match self.phase {
             StageIntentPhase::Reserved => self.revision.is_multiple_of(2),
             StageIntentPhase::Dispatched => !self.revision.is_multiple_of(2),
@@ -2910,16 +2921,40 @@ where
             || lease.owner_id != self.owner.lease.owner_id
             || lease.lease_id != self.owner.lease.lease_id
             || lease.root_generation != self.owner.lease.root_generation
-            || lease.fence_binding.state_fence != self.owner.lease.fence_binding.state_fence
+            || lease.state_fence != self.owner.lease.state_fence
         {
             return Err(BlobError::StaleFence);
         }
-        let observed = self.platform_read()?.inspect_root(lease)?;
-        observed.validate(lease)?;
+        self.ensure_current_owner()
+    }
+
+    /// Validate the current retained physical root claim independently from
+    /// any operation lease. This is used only after recovery has matched a
+    /// persisted owner record; it never authorizes a fresh effect by itself.
+    fn ensure_current_owner(&self) -> Result<(), BlobError> {
+        self.owner.lease.validate()?;
+        let observed = self
+            .platform_read()?
+            .inspect_root(&self.owner.lease)?;
+        observed.validate(&self.owner.lease)?;
         if observed != self.owner.claim {
             return Err(BlobError::OwnerConflict);
         }
         Ok(())
+    }
+
+    /// Restart readback may use an original lease only when it came from the
+    /// durable owner intent. Keep its full generation and fence binding exact,
+    /// and independently require the currently pinned exclusive root claim.
+    fn ensure_recovery_lease(&self, lease: &BlobRootLease) -> Result<(), BlobError> {
+        lease.validate()?;
+        if lease.root_id != self.owner.lease.root_id
+            || lease.owner_id != self.owner.lease.owner_id
+            || lease.root_generation != self.owner.lease.root_generation
+        {
+            return Err(BlobError::StaleFence);
+        }
+        self.ensure_current_owner()
     }
 
     fn contained(&self, path: &WorkScopePath) -> Result<(), BlobError> {
@@ -4269,6 +4304,22 @@ where
     ) -> Result<(BlobReadyReceipt, Vec<u8>, Vec<u8>), BlobError> {
         request.validate()?;
         self.ensure_lease(&request.root_lease)?;
+        self.read_verified_inner(request)
+    }
+
+    fn read_verified_recovery(
+        &self,
+        request: &BlobReadRequest,
+    ) -> Result<(BlobReadyReceipt, Vec<u8>, Vec<u8>), BlobError> {
+        request.validate()?;
+        self.ensure_recovery_lease(&request.root_lease)?;
+        self.read_verified_inner(request)
+    }
+
+    fn read_verified_inner(
+        &self,
+        request: &BlobReadRequest,
+    ) -> Result<(BlobReadyReceipt, Vec<u8>, Vec<u8>), BlobError> {
         // The request names a locator but no residency scope; the caller
         // proves the intended scope with the exact metadata digest it holds.
         // Resolution is byte-exact across every stored scope — never a
@@ -4397,6 +4448,9 @@ where
                 let intent: StageIntent = serde_json::from_slice(&bytes)
                     .map_err(|_| BlobError::MetadataPayloadMismatch)?;
                 intent.validate()?;
+                if intent.root_backend_generation != self.platform_backend_generation()? {
+                    return Err(BlobError::StaleFence);
+                }
                 let canonical = serde_json::to_vec(&intent)
                     .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
                 if canonical != bytes {
@@ -4461,6 +4515,7 @@ where
             request: request.clone(),
             revision: 0,
             phase: StageIntentPhase::Reserved,
+            root_backend_generation: self.platform_backend_generation()?,
         };
         let path = Self::stage_intent_path(request)?;
         match self.stage_intent_cas(request, &path, BlobCasState::Missing, &intent) {
@@ -4496,6 +4551,7 @@ where
                 .checked_add(1)
                 .ok_or_else(|| BlobError::PlanGap("stage intent revision overflow".to_owned()))?,
             phase,
+            root_backend_generation: current.root_backend_generation,
         };
         self.stage_intent_cas(
             request,
@@ -4509,6 +4565,21 @@ where
     fn recover_stage_locked(
         &self,
         request: &BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        self.recover_stage_locked_inner(request, false)
+    }
+
+    fn recover_stage_locked_readback(
+        &self,
+        request: &BlobStageRecoveryRequest,
+    ) -> Result<BlobStageRecovery, BlobError> {
+        self.recover_stage_locked_inner(request, true)
+    }
+
+    fn recover_stage_locked_inner(
+        &self,
+        request: &BlobStageRecoveryRequest,
+        recovery_read_only: bool,
     ) -> Result<BlobStageRecovery, BlobError> {
         let Some((intent, _)) = self.read_stage_intent(request)? else {
             return Ok(BlobStageRecovery::Unknown);
@@ -4585,7 +4656,11 @@ where
             expected_ready_receipt_id: receipt_id,
             max_bytes: ready.plaintext_length().max(1),
         };
-        let (observed_ready, plaintext, _) = self.read_verified(&read)?;
+        let (observed_ready, plaintext, _) = if recovery_read_only {
+            self.read_verified_recovery(&read)?
+        } else {
+            self.read_verified(&read)?
+        };
         if observed_ready != ready
             || plaintext.len() as u64 != request.expected_plaintext_length
             || sha256_hex(&plaintext) != request.expected_plaintext_sha256
@@ -4615,8 +4690,11 @@ where
     fn read_process_stream_source_sync(
         &self,
         request: BlobProcessStreamReadbackRequest,
+        current_read: BlobReadRequest,
     ) -> Result<BlobReadChunk, BlobError> {
         request.validate()?;
+        current_read.context.validate_for(eliot_receipts::EffectClass::Read)?;
+        self.ensure_lease(&current_read.root_lease)?;
         let path = WorkScopePath::new(format!(
             "transactions/process-source-{}.intent",
             request.process_source_intent_key()?
@@ -4625,6 +4703,7 @@ where
         let Some((observed, _)) = self.read_stage_intent_at(&path)? else {
             return Err(BlobError::NotFound);
         };
+        let persisted_phase = observed.phase;
         let recovery = observed.request;
         if recovery.process_source_binding != request.process_source_binding
             || recovery.expected_content_hash != request.expected_content_hash
@@ -4633,7 +4712,10 @@ where
         {
             return Err(BlobError::IdempotencyConflict);
         }
-        self.ensure_lease(&recovery.root_lease)?;
+        self.ensure_recovery_lease(&recovery.root_lease)?;
+        if persisted_phase != StageIntentPhase::Dispatched {
+            return Err(BlobError::NotFound);
+        }
         let operation_id = recovery.stage_context.operation.operation_id.as_str();
         let idempotency_key = recovery.stage_context.operation.idempotency_key.as_str();
         let content_idx = content_shard(&request.expected_content_hash);
@@ -4645,7 +4727,17 @@ where
         if current.request != recovery {
             return Err(BlobError::IdempotencyConflict);
         }
-        let ready = match self.recover_stage_locked(&recovery)? {
+        if current.phase != StageIntentPhase::Dispatched {
+            return Err(BlobError::NotFound);
+        }
+        let commit_path = Self::operation_path(&recovery.stage_context, "commit")?;
+        self.contained(&commit_path)?;
+        if self.platform_stat(&commit_path)? == BlobPathState::Missing {
+            return Err(BlobError::ProviderUnavailable(
+                "process source has no durable commit record",
+            ));
+        }
+        let ready = match self.recover_stage_locked_readback(&recovery)? {
             BlobStageRecovery::Ready(ready) => *ready,
             BlobStageRecovery::NotStarted => return Err(BlobError::NotFound),
             BlobStageRecovery::Unknown => {
@@ -4663,8 +4755,8 @@ where
         }
         drop(_guards);
         self.read_sync(&BlobReadRequest {
-            context: recovery.read_context,
-            root_lease: recovery.root_lease,
+            context: current_read.context,
+            root_lease: current_read.root_lease,
             locator: ready.locator().clone(),
             expected_metadata_sha256: ready.metadata_sha256().to_owned(),
             expected_ready_receipt_id: request.ready_receipt_id,
@@ -5516,10 +5608,22 @@ where
 
     fn read_process_stream_source(
         &self,
+        _request: BlobProcessStreamReadbackRequest,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "process-source recovery requires a separate current read authority".to_owned(),
+            ))
+        })
+    }
+
+    fn read_process_stream_source_authorized(
+        &self,
         request: BlobProcessStreamReadbackRequest,
+        current_read: BlobReadRequest,
     ) -> BlobFuture<'_, BlobReadChunk> {
         let core = Arc::clone(&self.core);
-        Box::pin(async move { core.read_process_stream_source_sync(request) })
+        Box::pin(async move { core.read_process_stream_source_sync(request, current_read) })
     }
 
     fn stage_with_recovery(

@@ -8,10 +8,18 @@
 //! serializes bounded contract receipts. Blob contributes one process/root
 //! claim identity; it is not a second store or semantic write path.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use eliot_blob::BlobRootOwner;
+use sha2::{Digest as _, Sha256};
+use eliot_blob::{
+    BlobRootOwner, BlobStoreService,
+    BlobStreamSinkStoreBinding, DpapiUserAeadPort, RleCompressionPort,
+    DpapiUserKeyPort, WindowsBlobPlatformPort,
+};
+use eliot_blob_api::BlobStoreClient;
+use eliot_blob::BlobStoreStreamSink;
 use eliot_contracts::StateFence;
 use eliot_installation::{
     InstallationProfile, ValidatedRuntimeRootLeases, WindowsRuntimeRootLease,
@@ -29,7 +37,13 @@ use eliot_platform::{ClockObservation, PlatformHandle};
 use eliot_platform_windows::WindowsPlatform;
 use eliot_protocol::{
     ClientHello, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange,
-    ProtocolVersion, ServerHello,
+    ProtocolVersion, RequestIdentity, ServerHello,
+};
+use eliot_process::stream_sink::{
+    ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
+    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkOpenRequest, ProcessStreamSinkSession, ProcessStreamSinkTerminal,
+    ProcessStreamSinkUnknownOutcome, ProcessStreamSinkReadback,
 };
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
@@ -60,8 +74,6 @@ use eliot_store_surreal_adapter::{
 use secrecy::SecretString;
 #[cfg(test)]
 use serde::Serialize;
-#[cfg(test)]
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 pub mod boundary_map;
@@ -302,6 +314,14 @@ fn admit_prepared_for_execution(
 pub struct StoreComposition {
     store: SurrealStoreAdapter,
     blob: BlobRootOwner,
+    /// Lazily initialized on the first authenticated Blob demand. The service
+    /// is built once from `blob` (the retained root owner) and then shared by
+    /// all request/session handles. No caller can substitute another root
+    /// owner through this accessor.
+    blob_service: Mutex<Option<Arc<dyn BlobStoreClient>>>,
+    blob_stream_sinks: tokio::sync::Mutex<BTreeMap<(String, String), RetainedBlobStreamSink>>,
+    blob_stream_authority: Mutex<Option<Arc<dyn BlobStreamAuthorityResolver>>>,
+    blob_root_path: PathBuf,
     state_fence: StateFence,
     schema_bootstrap_binding: StoreSchemaBootstrapBinding,
     schema_bootstrap_cache: tokio::sync::Mutex<Option<StoreSchemaBootstrapCache>>,
@@ -315,12 +335,45 @@ pub struct StoreComposition {
     _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
 }
 
+/// Store-side lookup for the already validated, complete owner facts needed
+/// to create a sink binding. Implementations must resolve actual WorkScope,
+/// causal, policy, residency, and key-owner evidence; they must not derive it
+/// from caller JSON. Store fails closed while no independent owner is wired.
+pub trait BlobStreamAuthorityResolver: Send + Sync {
+    /// Resolves the complete binding for one authenticated open identity.
+    fn resolve_open(
+        &self,
+        owner: &BlobRootOwner,
+        identity: &RequestIdentity,
+        request: &ProcessStreamSinkOpenRequest,
+    ) -> Result<Option<BlobStreamSinkStoreBinding>, String>;
+}
+
+struct RetainedBlobStreamSink {
+    capability_ref: String,
+    binding_ref: String,
+    open_request_sha256: String,
+    owner_facts_sha256: String,
+    session: ProcessStreamSinkSession,
+    sink: Arc<BlobStoreStreamSink<Arc<dyn BlobStoreClient>>>,
+}
+
+const MAX_RETAINED_BLOB_STREAM_SINKS: usize = 1024;
+
 impl std::fmt::Debug for StoreComposition {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StoreComposition")
             .field("store", &self.store)
             .field("blob_owner", &self.blob)
+            .field(
+                "blob_service_initialized",
+                &self
+                    .blob_service
+                    .lock()
+                    .map(|service| service.is_some())
+                    .unwrap_or(false),
+            )
             .field("state_fence", &self.state_fence)
             .field("connections", &self.connections)
             .field("health_admission", &self.health_admission)
@@ -405,6 +458,10 @@ impl StoreComposition {
         Ok(Self {
             store,
             blob,
+            blob_service: Mutex::new(None),
+            blob_stream_sinks: tokio::sync::Mutex::new(BTreeMap::new()),
+            blob_stream_authority: Mutex::new(None),
+            blob_root_path: PathBuf::from(config.blob_root.clone()),
             state_fence,
             schema_bootstrap_binding,
             schema_bootstrap_cache: tokio::sync::Mutex::new(None),
@@ -413,6 +470,325 @@ impl StoreComposition {
             store_config_path: PathBuf::from(config.runtime_launch.store_config_path.as_str()),
             _runtime_root_leases: runtime_root_leases,
         })
+    }
+
+    /// Returns the one Blob client for an authenticated stream binding,
+    /// constructing it from this composition's retained root owner on first
+    /// demand. The full receipt context is supplied by the trusted Store
+    /// authority path; this method derives only the owner lease and never
+    /// synthesizes policy, residency, task, causal, or authority fields.
+    ///
+    /// The composition installs the concrete Windows filesystem, versioned
+    /// RLE codec, DPAPI AEAD and durable DPAPI-protected issuer key. This
+    /// overload explicitly refuses GC until independent live-set owners are
+    /// composed; it never substitutes a complete empty set.
+    pub fn blob_client_for_stream_binding(
+        &self,
+        binding: &BlobStreamSinkStoreBinding,
+    ) -> Result<Arc<dyn BlobStoreClient>, String> {
+        BlobStreamSinkStoreBinding::new(
+            binding.root_lease().clone(),
+            binding.stage_context().clone(),
+            binding.read_context().clone(),
+            binding.policy().clone(),
+            binding.residency().clone(),
+        )
+        .map_err(|error| format!("validate authenticated Blob stream binding: {error}"))?;
+        let lease = self
+            .blob
+            .lease_for_request(binding.stage_context().request.clone())
+            .map_err(|error| format!("derive Blob lease from authenticated binding: {error}"))?;
+        if binding.root_lease() != &lease {
+            return Err("Blob stream binding does not match the retained root owner".to_owned());
+        }
+        self.blob_client_for_lease(lease)
+    }
+
+    fn blob_client_for_lease(
+        &self,
+        lease: eliot_blob_api::BlobRootLease,
+    ) -> Result<Arc<dyn BlobStoreClient>, String> {
+        let mut retained = self
+            .blob_service
+            .lock()
+            .map_err(|_| "Blob service composition lock poisoned".to_owned())?;
+        if let Some(client) = retained.as_ref() {
+            return Ok(Arc::clone(client));
+        }
+        let platform = WindowsBlobPlatformPort::new(self.blob_root_path.clone())
+            .map_err(|error| format!("compose Windows Blob filesystem: {error}"))?;
+        let issuer_anchor = platform
+            .load_or_create_issuer_anchor()
+            .map_err(|error| format!("load durable Blob issuer anchor: {error}"))?;
+        let aead_platform = WindowsPlatform::new(self.blob_root_path.clone())
+            .map_err(|error| format!("compose Blob DPAPI provider: {error}"))?;
+        let keys = DpapiUserKeyPort::new(self.blob.owner_id().clone(), 1)
+            .map_err(|error| format!("bind Blob owner key lineage: {error}"))?;
+        let ports = eliot_blob::BlobServicePorts {
+            platform,
+            compression: RleCompressionPort,
+            keys,
+            aead: DpapiUserAeadPort::new(aead_platform),
+            live_sets: eliot_blob::UnavailableBlobLiveSetPort,
+            issuer_anchor,
+        };
+        let service = BlobStoreService::new_with_owner(&self.blob, lease, ports)
+            .map_err(|error| format!("construct owner-bound Blob service: {error}"))?;
+        let client: Arc<dyn BlobStoreClient> = Arc::new(service);
+        *retained = Some(Arc::clone(&client));
+        Ok(client)
+    }
+
+    /// Starts the one Blob owner generation on the first authenticated
+    /// Kernel demand. This validates only root-level request authority; full
+    /// process scope, policy, and residency facts remain required at Open.
+    async fn prepare_blob_process_stream_demand(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+    ) -> Result<bool, String> {
+        validate_session_peer_binding(transport)?;
+        identity
+            .validate()
+            .map_err(|error| format!("invalid Blob demand identity: {error}"))?;
+        if identity.request.state_fence != transport.state_fence {
+            return Err("Blob demand is outside the authenticated session fence".to_owned());
+        }
+        let lease = self
+            .blob
+            .lease_for_request(identity.request.clone())
+            .map_err(|error| format!("derive Store-owned Blob root lease: {error}"))?;
+        let client = self.blob_client_for_lease(lease)?;
+        Ok(client.health().await.is_ok_and(|health| {
+            health.validate().is_ok() && health.ready && health.owner_matches
+        }))
+    }
+
+    /// Reports whether this composition can serve the capability after a
+    /// governed first-demand initialization. Actual ready capture remains
+    /// separately observed by `prepare_blob_process_stream_demand`.
+    pub fn blob_process_stream_supported(&self) -> bool {
+        !self.blob_root_path.as_os_str().is_empty()
+            && self.blob_root_path.is_absolute()
+            && self.blob.owns_service_root(
+                self.blob_root_path
+                    .to_str()
+                    .unwrap_or_default(),
+            )
+    }
+
+    /// Current, capability-specific availability for Store handshake
+    /// negotiation. An uninitialized service or any failed/incomplete health
+    /// vector withholds the capability. This observation never starts the
+    /// generation and must be refreshed for each handshake.
+    pub async fn blob_process_stream_available(&self) -> bool {
+        let client = self
+            .blob_service
+            .lock()
+            .ok()
+            .and_then(|retained| retained.as_ref().map(Arc::clone));
+        let Some(client) = client else {
+            return false;
+        };
+        client.health().await.is_ok_and(|health| {
+            health.validate().is_ok() && health.ready && health.owner_matches
+        })
+    }
+
+    /// Installs the one trusted Store-side authority owner for process stream
+    /// opens. This is a composition-time dependency; EBP callers cannot
+    /// provide or replace it. Missing authority remains explicitly unavailable.
+    pub fn install_blob_stream_authority_resolver(
+        &self,
+        resolver: Arc<dyn BlobStreamAuthorityResolver>,
+    ) -> Result<(), String> {
+        let mut retained = self
+            .blob_stream_authority
+            .lock()
+            .map_err(|_| "Blob stream authority lock poisoned".to_owned())?;
+        if retained.is_some() {
+            return Err("Blob stream authority resolver is already installed".to_owned());
+        }
+        *retained = Some(resolver);
+        Ok(())
+    }
+
+    /// Opens one owner-retained sink after the authenticated Kernel dispatch
+    /// has supplied complete typed owner facts. The JSON request alone cannot
+    /// create a binding: first demand may initialize the one root service,
+    /// but absence of full authority facts then returns typed unavailable
+    /// before retaining a sink session or starting a Blob effect.
+    pub(crate) async fn blob_sink_open(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        capability_ref: &str,
+        request: ProcessStreamSinkOpenRequest,
+    ) -> Result<(String, ProcessStreamSinkSession), ProcessStreamSinkError> {
+        validate_blob_sink_transport(transport, identity, capability_ref)?;
+        request.validate()?;
+        self.prepare_blob_process_stream_demand(transport, identity)
+            .await
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let resolver = self
+            .blob_stream_authority
+            .lock()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+            .as_ref()
+            .cloned();
+        let Some(resolver) = resolver else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        let binding = resolver
+            .resolve_open(&self.blob, identity, &request)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let Some(binding) = binding else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        if binding.stage_context().request != identity.request
+            || binding.read_context().request != identity.request
+        {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
+        let connection_id = transport.connection_id().to_owned();
+        let owner_facts = serde_json::to_vec(&(
+            binding.root_lease(),
+            binding.stage_context(),
+            binding.read_context(),
+            binding.policy(),
+            binding.residency(),
+        ))
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let owner_facts_sha256 = format!("{:x}", Sha256::digest(owner_facts));
+        let mut material = Vec::with_capacity(
+            connection_id.len() + capability_ref.len() + request.open_request_sha256().len() + 2,
+        );
+        material.extend_from_slice(connection_id.as_bytes());
+        material.push(0);
+        material.extend_from_slice(capability_ref.as_bytes());
+        material.push(0);
+        material.extend_from_slice(request.open_request_sha256().as_bytes());
+        let binding_ref = format!("blob-sink-{:x}", Sha256::digest(material));
+        let key = (connection_id.clone(), binding_ref.clone());
+        let mut sinks = self.blob_stream_sinks.lock().await;
+        if let Some(existing) = sinks.get(&key) {
+            if existing.capability_ref != capability_ref
+                || existing.open_request_sha256 != request.open_request_sha256()
+                || existing.owner_facts_sha256 != owner_facts_sha256
+            {
+                return Err(ProcessStreamSinkError::OpenDigestMismatch);
+            }
+            return Ok((existing.binding_ref.clone(), existing.session.clone()));
+        }
+        if sinks.len() >= MAX_RETAINED_BLOB_STREAM_SINKS {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        }
+        let client = self
+            .blob_client_for_stream_binding(&binding)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let sink = Arc::new(BlobStoreStreamSink::new(Arc::clone(&client), binding));
+        let session = sink.open(request.clone()).await?;
+        sinks.insert(
+            key,
+            RetainedBlobStreamSink {
+                capability_ref: capability_ref.to_owned(),
+                binding_ref: binding_ref.clone(),
+                open_request_sha256: session.open_request_sha256().to_owned(),
+                owner_facts_sha256,
+                session: session.clone(),
+                sink,
+            },
+        );
+        Ok((binding_ref, session))
+    }
+
+    pub(crate) async fn blob_sink_append(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        capability_ref: &str,
+        binding_ref: &str,
+        request: ProcessStreamSinkAppend,
+    ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
+        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        sink.append(session, request).await
+    }
+
+    pub(crate) async fn blob_sink_finalize(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        capability_ref: &str,
+        binding_ref: &str,
+        request: ProcessStreamSinkFinalizeRequest,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        sink.finalize(session, request).await
+    }
+
+    pub(crate) async fn blob_sink_abort(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        capability_ref: &str,
+        binding_ref: &str,
+        request: ProcessStreamSinkAbortRequest,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        sink.abort(session, request).await
+    }
+
+    pub(crate) async fn blob_sink_readback(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        capability_ref: &str,
+        binding_ref: &str,
+    ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        sink.readback(session).await
+    }
+
+    pub(crate) async fn blob_sink_reconcile(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        capability_ref: &str,
+        binding_ref: &str,
+        outcome: ProcessStreamSinkUnknownOutcome,
+    ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+        let (sink, session) = self.blob_sink_handle(transport, identity, capability_ref, binding_ref).await?;
+        sink.reconcile(session, outcome).await
+    }
+
+    async fn blob_sink_handle(
+        &self,
+        transport: &StoreEbpSession,
+        identity: &RequestIdentity,
+        capability_ref: &str,
+        binding_ref: &str,
+    ) -> Result<(Arc<BlobStoreStreamSink<Arc<dyn BlobStoreClient>>>, ProcessStreamSinkSession), ProcessStreamSinkError> {
+        validate_blob_sink_transport(transport, identity, capability_ref)?;
+        let sinks = self.blob_stream_sinks.lock().await;
+        let Some(retained) = sinks.get(&(transport.connection_id().to_owned(), binding_ref.to_owned())) else {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        };
+        if retained.capability_ref != capability_ref || retained.binding_ref != binding_ref {
+            return Err(ProcessStreamSinkError::SessionMismatch);
+        }
+        Ok((Arc::clone(&retained.sink), retained.session.clone()))
+    }
+
+    /// Releases only the in-memory stream bindings for one disconnected
+    /// authenticated Store session. Durable Blob stage intents remain owned
+    /// by Blob and are never deleted by transport cleanup.
+    pub(crate) async fn release_blob_stream_session(&self, connection_id: &str) {
+        self.blob_stream_sinks
+            .lock()
+            .await
+            .retain(|(session_id, _), _| session_id != connection_id);
     }
 
     /// Resolves the installation-visible I5.9 compatibility decision for this
@@ -1393,6 +1769,7 @@ pub fn require_semantic_ready_for_pipe(
 pub struct StoreHandshakeIdentity {
     operation_manifest_digest: String,
     blob_root_owner: serde_json::Value,
+    blob_process_stream_supported: bool,
 }
 
 impl StoreHandshakeIdentity {
@@ -1405,7 +1782,17 @@ impl StoreHandshakeIdentity {
         Self {
             operation_manifest_digest: operation_manifest_digest.into(),
             blob_root_owner,
+            blob_process_stream_supported: false,
         }
+    }
+
+    /// Adds the configured process-stream Blob support verdict. This controls
+    /// capability negotiation only; first authenticated demand initializes
+    /// the one retained service and its response separately reports readiness.
+    #[must_use]
+    pub const fn with_blob_process_stream_available(mut self, available: bool) -> Self {
+        self.blob_process_stream_supported = available;
+        self
     }
 }
 
@@ -1450,6 +1837,36 @@ impl StoreEbpSession {
     pub const fn max_frame_bytes(&self) -> usize {
         self.max_frame_bytes
     }
+}
+
+fn validate_blob_sink_transport(
+    transport: &StoreEbpSession,
+    identity: &RequestIdentity,
+    capability_ref: &str,
+) -> Result<(), ProcessStreamSinkError> {
+    validate_session_peer_binding(transport)
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+    identity
+        .validate()
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+    if !transport
+        .capabilities
+        .contains(eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY)
+        || identity.request.state_fence != transport.state_fence
+    {
+        return Err(ProcessStreamSinkError::AdmissionFenced {
+            reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+        });
+    }
+    if capability_ref.is_empty()
+        || capability_ref.len() > 256
+        || capability_ref.chars().any(char::is_control)
+    {
+        return Err(ProcessStreamSinkError::InvalidRequest {
+            reason: "invalid Kernel process-stream capability reference",
+        });
+    }
+    Ok(())
 }
 
 /// Admits the only supported S-03 `ClientHello` over an authenticated pipe
@@ -1557,11 +1974,19 @@ fn admit_handshake_inner(
     if usize::try_from(hello.max_frame).unwrap_or(usize::MAX) > limits.max_frame_bytes {
         return Err("ClientHello max_frame exceeds the bounded transport limit".to_owned());
     }
-    let capabilities: Vec<String> = CAPABILITIES
+    let mut capabilities: Vec<String> = CAPABILITIES
         .iter()
         .filter(|capability| hello.capabilities.iter().any(|value| value == **capability))
         .map(|capability| (*capability).to_owned())
         .collect();
+    if identity.blob_process_stream_supported
+        && hello
+            .capabilities
+            .iter()
+            .any(|value| value == eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY)
+    {
+        capabilities.push(eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY.to_owned());
+    }
     let effects: Vec<String> = EFFECTS.iter().map(|effect| (*effect).to_owned()).collect();
     let server_hello = ServerHello {
         selected_protocol: protocol_version,
@@ -1885,6 +2310,71 @@ pub fn validate_request_frame_with_log(
     }
     enforce_admitted_operation_with_log(&request, events)?;
     Ok(request)
+}
+
+/// Validates the distinct process-stream Blob frame through the same
+/// authenticated session, identity, capability, and bounded replay ledger as
+/// canonical Store requests. The inner Blob dispatcher still parses the
+/// closed operation union after this gate; no generic Store request decoder
+/// or semantic-store path is involved.
+pub fn validate_blob_process_stream_request_frame(
+    session: &mut StoreEbpSession,
+    frame: &Frame,
+) -> Result<RequestIdentity, String> {
+    if frame.protocol_version != session.protocol_version
+        || frame.connection_id != session.connection_id
+        || frame.kind != FrameKind::Request
+        || frame.message_type != MessageType::Execute
+        || frame.encoding_profile != EncodingProfile::JsonV1
+    {
+        return Err("Blob process-stream frame is outside the negotiated Store session".to_owned());
+    }
+    validate_session_peer_binding(session)?;
+    if !session
+        .capabilities
+        .contains(eliot_blob_api::wire::BLOB_PROCESS_STREAM_CAPABILITY)
+    {
+        return Err("Blob process-stream capability was not negotiated".to_owned());
+    }
+    let request_id = frame
+        .request_id
+        .as_ref()
+        .ok_or_else(|| "Blob process-stream frame has no request id".to_owned())?;
+    let identity = frame
+        .request_identity
+        .as_ref()
+        .ok_or_else(|| "Blob process-stream frame has no request identity".to_owned())?;
+    frame.validate().map_err(|error| error.to_string())?;
+    identity.validate().map_err(|error| error.to_string())?;
+    if identity.request.metadata.request_id != *request_id
+        || identity.request.state_fence != session.state_fence
+    {
+        return Err("Blob process-stream identity does not match request or session fence".to_owned());
+    }
+    let ProtocolPayload::Json(payload) = &frame.payload else {
+        return Err("Blob process-stream payload must use JSON v1".to_owned());
+    };
+    let decoded: eliot_blob_api::wire::BlobProcessStreamFrameRequest =
+        serde_json::from_value(payload.clone()).map_err(|error| {
+            format!("invalid closed Blob process-stream frame: {error}")
+        })?;
+    decoded.validate().map_err(|error| error.to_string())?;
+    let bound = BoundIdentity::new(
+        session.connection_id.clone(),
+        session.module_generation.clone(),
+        request_id.to_string(),
+    )
+    .map_err(|error| format!("invalid Blob process-stream request binding: {error}"))?;
+    match session.replay.observe_bound(bound, frame) {
+        Ok(ReplayDisposition::New | ReplayDisposition::Duplicate) => Ok(identity.clone()),
+        Ok(ReplayDisposition::Conflict) => {
+            Err("Blob process-stream request identity conflicts with a prior frame".to_owned())
+        }
+        Err(TransportError::RegistryFull) => {
+            Err("bounded Store transport replay registry is full".to_owned())
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Re-enforces the active generated catalogue on one session-validated

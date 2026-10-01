@@ -116,6 +116,7 @@ mod supervision_authority_key;
 mod tcp_listener_owner;
 mod terminal_containment;
 mod user_owned_leases;
+pub mod blob_store_platform;
 
 use crate::service_registration::{exact_path_text, utf16_text};
 
@@ -3857,6 +3858,7 @@ fn unknown_provider() -> eliot_platform::ProviderError {
 fn provider_from_io(error: &std::io::Error) -> eliot_platform::ProviderError {
     use std::io::ErrorKind;
     let code = match error.kind() {
+        ErrorKind::StorageFull => eliot_platform::ProviderErrorCode::StorageFull,
         ErrorKind::PermissionDenied => eliot_platform::ProviderErrorCode::PermissionDenied,
         ErrorKind::NotFound => eliot_platform::ProviderErrorCode::Unavailable,
         ErrorKind::TimedOut => eliot_platform::ProviderErrorCode::Timeout,
@@ -4131,6 +4133,11 @@ pub(crate) fn flush_directory_handle(_file: &std::fs::File) -> Result<(), u32> {
 }
 
 #[cfg(windows)]
+fn flush_directory(pins: &[std::fs::File]) -> Result<(), u32> {
+    pins.last().map_or(Ok(()), flush_directory_handle)
+}
+
+#[cfg(not(windows))]
 fn flush_directory(pins: &[std::fs::File]) -> Result<(), u32> {
     pins.last().map_or(Ok(()), flush_directory_handle)
 }
