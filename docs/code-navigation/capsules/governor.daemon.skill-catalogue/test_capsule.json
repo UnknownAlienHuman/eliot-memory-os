@@ -39,7 +39,14 @@
       "value": null
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 29
+    "inline_cfg_test_modules": 32,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": [
+        "bins/eliotd/src/tests.rs"
+      ]
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -49,31 +56,45 @@
     },
     "selected_tests": [
       {
+        "path": "bins/eliotd/src/tests.rs",
+        "bytes": 12508,
+        "sha256": "0a4efe566b7e25d655c1a2371797e1514bb9f1f28fae0e98fb7aef0490e4552d",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
         "path": "bins/eliotd/tests/activation_invalid_ticket_wiring.rs",
-        "bytes": 19367,
-        "sha256": "e5149b55af1329a433fbf7780483f7f48074d0df78e6eebb26fb6bbe66071d9c",
+        "bytes": 19401,
+        "sha256": "474a3750bc58385b221989846db577a68fecf78f8721409b52ddf8962f5d9114",
         "test_attributes": 14,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
       },
       {
         "path": "bins/eliotd/tests/activation_resolution_dispatch.rs",
-        "bytes": 27250,
-        "sha256": "1e9d2c0d485fb872f1d3ffc7eff958c66365580b9ead0a3b57ba405f2592d020",
+        "bytes": 27348,
+        "sha256": "5c8a5c28a2414cf876ed14fa61f6301394379c70d0e4dfd56ca8a479cb43e123",
         "test_attributes": 12,
         "inline_cfg_test": true,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
       },
       {
         "path": "bins/eliotd/tests/agent_fabric_wiring.rs",
-        "bytes": 70940,
-        "sha256": "d241a37830a9188d2ebf3fb6050dbccbf25153f6ff95e8f3454309c9ecf19357",
+        "bytes": 71826,
+        "sha256": "da79bdb69aef3d60903cf09d11b2032674a2e2673cc08bf98db094b504eea217",
         "test_attributes": 31,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -81,10 +102,11 @@
       },
       {
         "path": "bins/eliotd/tests/daemon_diagnostics.rs",
-        "bytes": 45282,
-        "sha256": "221125dfb87ad1da5f1bea58bdb05a1bfcd8b715688dd941997084332516b887",
+        "bytes": 45780,
+        "sha256": "bd80b7a6a47aabe7f97a923f5cb1c6393b27910a95123f3d8cd13f9ba82f1bac",
         "test_attributes": 21,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -92,10 +114,11 @@
       },
       {
         "path": "bins/eliotd/tests/epistemic_readback.rs",
-        "bytes": 11445,
-        "sha256": "3e05975b2428bc53d02a78a1c72d317b2dc12eac2924bb2cccbf0c4c47433738",
+        "bytes": 11506,
+        "sha256": "48bcce5493eab4f49e89727250cdfe3d09ac03a4a3bf809dadf16af9d78d9b8d",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -107,14 +130,16 @@
         "sha256": "9a7b9cfdc0c7db830e6cda5169533061a97a9c565d189bdb4eb589897c7bf086",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
         "path": "bins/eliotd/tests/local_read_e2e.rs",
-        "bytes": 19544,
-        "sha256": "47b79fb126c30688abbd7797731401b9266b45448d59c2c36cac0613b909537c",
+        "bytes": 19350,
+        "sha256": "9f4c624fe9113abe3f1ca429dfcca76f02f39bf54003c3b27f329924f67d615c",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -125,6 +150,7 @@
         "sha256": "abbc7277e12cdc538a2023191e507d1682fc32fa2ca8d00a8ce061e9f2930824",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -133,6 +159,7 @@
         "sha256": "4ae75124d12e0309eb97d37c74f5b350eef415f0ed755616a32efbb81badca53",
         "test_attributes": 5,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -144,6 +171,7 @@
         "sha256": "aaec2686a4b9a862635101a6f57a7d97d60145abb1348842041e1e7d314c1bfd",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -152,6 +180,7 @@
         "sha256": "3c8f15369157597613520d907634f7e0125612f4f3aa1055871385402c76f2a9",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       }
     ],
@@ -180,6 +209,7 @@
       "value": null
     },
     "selected_cases": [
+      "bins/eliotd/src/tests.rs",
       "bins/eliotd/tests/activation_invalid_ticket_wiring.rs",
       "bins/eliotd/tests/activation_resolution_dispatch.rs",
       "bins/eliotd/tests/agent_fabric_wiring.rs",
@@ -213,16 +243,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 361,
-    "test_stu": 82278,
+    "test_stu": 86908,
     "nonzero": true
   },
-  "bound_contract_digest": "84c87939522adf7a0e788da9fffe0919331de23adfab6003650be3d175d6d02c",
+  "bound_contract_digest": "a933a8087eca0da7",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -237,20 +263,33 @@
       },
       "package_manifest": {
         "path": "bins/eliotd/Cargo.toml",
-        "sha256": "cae3983df692fb5b9b527363c385ceae667aeb550bec8fa9e4b6a973a4c3c175"
+        "sha256": "710e97442794438631d2344b3f423d6dd82d26b0d00d1cc0ea23deed50cee444"
       },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 79,
-        "sha256": "5e6ea4691e37e5bf977c6f076fea4448f832dd7e03932a3de9f934e39ff0462b"
+      "module_manifest": null
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+      },
+      "physical_source_inventory": {
+        "path_count": 94,
+        "sha256": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "UNRESOLVED_ALLOCATION",
+        "path_count": 94,
+        "sha256": "4c0023db216c9464d8840ec19c6bf08932482b687712f4679a9019f7478a5c41"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "20e8ba1db382bce3087d3981694af3f22540e1855c82ed3390b93903a7c90c92",
+  "artifact_digest": "9595663fa15c52b11c701caa101573c70faadd6f8a4653e6b12300bf3e1041ae",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "20e8ba1db382bce3"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "d204162872ee241f"
   }
 }

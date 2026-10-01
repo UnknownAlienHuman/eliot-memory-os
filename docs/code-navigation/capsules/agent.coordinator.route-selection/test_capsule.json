@@ -39,7 +39,18 @@
       "value": null
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 6
+    "inline_cfg_test_modules": 6,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": [
+        "crates/agent/eliot-agent-coordinator/src/core/admission_normalization_tests.rs",
+        "crates/agent/eliot-agent-coordinator/src/model_control_tests.rs",
+        "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/diversity_tests.rs",
+        "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/tests.rs",
+        "crates/agent/eliot-agent-coordinator/src/tests.rs"
+      ]
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -49,11 +60,68 @@
     },
     "selected_tests": [
       {
+        "path": "crates/agent/eliot-agent-coordinator/src/core/admission_normalization_tests.rs",
+        "bytes": 20695,
+        "sha256": "24ab8a8f140c483db87c06db23871e3d698b8a6c3b2749f9d0c496d19967e052",
+        "test_attributes": 3,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/model_control_tests.rs",
+        "bytes": 20240,
+        "sha256": "b302490f273426d38c2558af4a83acc0ae6f7c6b638df4bc9578b182065a5fae",
+        "test_attributes": 16,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/diversity_tests.rs",
+        "bytes": 14081,
+        "sha256": "11523880360ad009ae8891f2139441296637a7739aeca18673f085da69b6bbe2",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/tests.rs",
+        "bytes": 16770,
+        "sha256": "6ca7cf3e115c06c0d0bb440c60248811592fea9ba3ca24834b3809da09bc3ea5",
+        "test_attributes": 10,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/tests.rs",
+        "bytes": 164741,
+        "sha256": "b655f5894a71b5675941222e0387dbe33fb62f1f085a01faadeffd0e68f9adff",
+        "test_attributes": 61,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
+      },
+      {
         "path": "crates/agent/eliot-agent-coordinator/tests/admission_proof_normalization.rs",
         "bytes": 1801,
         "sha256": "0d2335d7f38d85354c0c409f83db734b0f5586281c2a3df93f1013c2e446bbc7",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -62,14 +130,16 @@
         "sha256": "ce01664d51226e009bbe77f2dac38e2650fa0fa97b5e2a5c9fc342a7f5310fe7",
         "test_attributes": 8,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/tests/coordinator.rs",
-        "bytes": 24574,
-        "sha256": "ec2f255b35494a2d41781003b76b44aab57c5f6b4fa789c45d361573e646bf43",
+        "bytes": 25585,
+        "sha256": "bd7fd1f01e6b8eac019c168b37978c9892fb206eb93a86e524258400d719ce48",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -78,6 +148,7 @@
         "sha256": "d1afd0fad80e1f116f28a5a43434fa0f96a0598ff9f7d45cb0b4623d1db74bca",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -86,6 +157,7 @@
         "sha256": "d22f0097a1f387a166f763fd579ef4be459dcf3a787e894215e706ab7b5a59e9",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
@@ -96,6 +168,7 @@
         "sha256": "201106085f632a47a301034f1a7400c3bdf460569ff7324778a955676782937d",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
@@ -106,16 +179,18 @@
         "sha256": "0d8057e011c551364d694a87fa925794a3b5f9386acf7efe99a520f864a57192",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/tests/swarm_command_candidates.rs",
-        "bytes": 20239,
-        "sha256": "1ba150dafddae80078a486da708ee08a03b362c6408a029915d3aad05c72c78b",
+        "bytes": 20331,
+        "sha256": "d895e4edea1f8afc73aaeb74c5ebc59f7ec388047180f616c9f1f75dab502a28",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -127,6 +202,7 @@
         "sha256": "f305e1c2a5f0586e52b8994d57a681cb249ff8c4d82049d770ac3071d09d5f4d",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -138,6 +214,7 @@
         "sha256": "4f37397c51485a85093fa202edf3d0eeef998c4411b4fa3dfd615df732b38d77",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
@@ -148,13 +225,16 @@
         "sha256": "f669b77b5876ad292183627cefdf2767eb0a07265617d2b2a702d8d456050f2a",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       }
     ],
     "test_attribute_count": 153
   },
   "parser_or_golden_corpus": [],
-  "fake_port_contract_tests": [],
+  "fake_port_contract_tests": [
+    "crates/agent/eliot-agent-coordinator/src/tests.rs"
+  ],
   "real_edge_profiles": {
     "one_hop_consumers": [
       "bins/eliotd",
@@ -168,6 +248,9 @@
       "value": null
     },
     "edge_profile_tests": [
+      "crates/agent/eliot-agent-coordinator/src/model_control_tests.rs",
+      "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/diversity_tests.rs",
+      "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/tests.rs",
       "crates/agent/eliot-agent-coordinator/tests/model_preference_identity.rs",
       "crates/agent/eliot-agent-coordinator/tests/model_registry.rs",
       "crates/agent/eliot-agent-coordinator/tests/model_role_eligibility.rs",
@@ -183,6 +266,8 @@
       "value": null
     },
     "selected_cases": [
+      "crates/agent/eliot-agent-coordinator/src/core/admission_normalization_tests.rs",
+      "crates/agent/eliot-agent-coordinator/src/tests.rs",
       "crates/agent/eliot-agent-coordinator/tests/swarm_command_candidates.rs",
       "crates/agent/eliot-agent-coordinator/tests/swarm_launch_bind.rs"
     ]
@@ -211,16 +296,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 153,
-    "test_stu": 42252,
+    "test_stu": 121462,
     "nonzero": true
   },
-  "bound_contract_digest": "cb6e700d479b6afc5fc92dc3bb99ed04ae4c2c85a49e63d2bf7786cdb963a724",
+  "bound_contract_digest": "c9205280107ee1de",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -237,18 +318,31 @@
         "path": "crates/agent/eliot-agent-coordinator/Cargo.toml",
         "sha256": "a1dd2793d85ddee7c919c210ff42b27d64450c82084cfef1db865a7e6dbf24b7"
       },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 33,
-        "sha256": "70930d56a3fb522088efa387328b3f5cdd6e591a7868514e2d6a6a3846c87813"
+      "module_manifest": null
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+      },
+      "physical_source_inventory": {
+        "path_count": 36,
+        "sha256": "eb5037a39de9c97ad122ffbe142f643826d14de868b127a1937bfe34b9753f46"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "UNRESOLVED_ALLOCATION",
+        "path_count": 36,
+        "sha256": "eb5037a39de9c97ad122ffbe142f643826d14de868b127a1937bfe34b9753f46"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "2683d772fea1327c5053b8adb47bb50ec16430d611930ab392f29fecabc03c61",
+  "artifact_digest": "b3c5b758ecfa540ffa40e54e261c555a81987fa7b089db5604ec04804d508484",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "2683d772fea1327c"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "02a910249c8d9cc6"
   }
 }

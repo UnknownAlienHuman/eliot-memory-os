@@ -43,7 +43,12 @@
       ]
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 0
+    "inline_cfg_test_modules": 0,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -64,6 +69,7 @@
         "sha256": "1fb0d40090ced570ba40ba2f993320baa4da57e585f2ecd0df5bba99533626f3",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       }
     ],
@@ -72,7 +78,9 @@
   "parser_or_golden_corpus": [],
   "fake_port_contract_tests": [],
   "real_edge_profiles": {
-    "one_hop_consumers": [],
+    "one_hop_consumers": [
+      "crates/smart/eliot-context-candidates"
+    ],
     "declared_consumers": {
       "state": "DECLARED",
       "origin": "module.toml|consumers",
@@ -117,13 +125,9 @@
     "test_stu": 1928,
     "nonzero": true
   },
-  "bound_contract_digest": "cd26bd3ca24b7fe45c8a3527e1abab0ab1893adaa85aa6aa98227c884cf2f418",
+  "bound_contract_digest": "a05e32a14a2d9583",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -143,18 +147,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-epistemic-context-provider/module.toml",
         "sha256": "5478d7ee6380cb090721d88ba3daf44cde88c5e5c9166f700716ff6b0d13f041"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
         "path_count": 3,
-        "sha256": "d6cf153f0a5cef0de8d99eb2643da0b56ff49b8ca6788b7a75ebc6a77d7a5c76"
+        "sha256": "4dee2dc695f02fd925c43528adf3b05da2377f0d2e989d29c1e0816b431f0201"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 3,
+        "sha256": "4dee2dc695f02fd925c43528adf3b05da2377f0d2e989d29c1e0816b431f0201"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "bc9b15e946024e20cfc5218d72c425b2789ef73dd70658b8f44f251e0b1e74ab",
+  "artifact_digest": "98028c17b4a4523d65a667da83bc6ac969f83a312b9d7c2b8d5f7581763e32bc",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "bc9b15e946024e20"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "2e75adc023c7e216"
   }
 }

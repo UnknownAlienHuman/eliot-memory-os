@@ -43,7 +43,12 @@
       ]
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 0
+    "inline_cfg_test_modules": 0,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -63,16 +68,7 @@
         "sha256": "1d47adf4782808648f28cb3e267ac807d5e804737df1880d194525503a333785",
         "test_attributes": 48,
         "inline_cfg_test": false,
-        "classes": [
-          "fault_restart_replay"
-        ]
-      },
-      {
-        "path": "crates/smart/eliot-dreamer-episode/tests/support/episode.rs",
-        "bytes": 24739,
-        "sha256": "7c8fc5060bec535d1cc74de1f5bec2ed32cdc7cd63247e9532f6f3d6565a2c06",
-        "test_attributes": 0,
-        "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -100,8 +96,7 @@
       "value": "Return unsupported/inconclusive episode candidate with exact missing evidence; original records remain unchanged."
     },
     "selected_cases": [
-      "crates/smart/eliot-dreamer-episode/tests/episode_candidate.rs",
-      "crates/smart/eliot-dreamer-episode/tests/support/episode.rs"
+      "crates/smart/eliot-dreamer-episode/tests/episode_candidate.rs"
     ]
   },
   "resource_and_serial_groups": {
@@ -128,16 +123,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 48,
-    "test_stu": 28406,
+    "test_stu": 20160,
     "nonzero": true
   },
-  "bound_contract_digest": "bf9e91300c6ea77af0359eafb02a93df4c1a22a8dd488da35ec2eeb137ad0bee",
+  "bound_contract_digest": "b03fbe2bdd2687aa",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -157,18 +148,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-episode/module.toml",
         "sha256": "3d3f6b17fbf5bcc082c09a80dc5af970ba56cdaed795c3a96362c1559dbc2ad7"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
+        "path_count": 6,
+        "sha256": "f9cbb95247d46cc955514101e698fa3ee747fde917b9d82f643277add3b449fc"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 6,
         "sha256": "f9cbb95247d46cc955514101e698fa3ee747fde917b9d82f643277add3b449fc"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "3db0d3fbc4793babb54d6d56efbc34396328becaeb0c549c95aa537d1d22f42f",
+  "artifact_digest": "e6570acc2d77ca9ef73f447b2a9204d1dbc7f7cf93876ccd29cea8a77309e08b",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "3db0d3fbc4793bab"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "16223ac8aaf07d87"
   }
 }

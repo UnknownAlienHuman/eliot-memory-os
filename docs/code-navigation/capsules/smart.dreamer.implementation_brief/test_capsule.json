@@ -48,7 +48,18 @@
       ]
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 0
+    "inline_cfg_test_modules": 0,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": []
+    },
+    "unselected_package_files": [
+      {
+        "path": "crates/smart/eliot-dreamer-implementation-brief/tests/support/mod.rs",
+        "bytes": 22893,
+        "reason": "not reachable from any Cargo target root of this package"
+      }
+    ]
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -72,16 +83,7 @@
         "sha256": "7d20a73ca5a567f27c59bff0b45cd20ea3848301189f3aa3373d379ec1d07ba0",
         "test_attributes": 39,
         "inline_cfg_test": false,
-        "classes": [
-          "fault_restart_replay"
-        ]
-      },
-      {
-        "path": "crates/smart/eliot-dreamer-implementation-brief/tests/support/mod.rs",
-        "bytes": 22893,
-        "sha256": "c4cb7423ac7b1121a7a4cc26003a53c1cb82b7bb7a1c2f4a3d3157bc6960d6a0",
-        "test_attributes": 0,
-        "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -110,8 +112,7 @@
       "value": "Return exact unsupported, mismatch, conflict, partial, missing, failed, skipped, stale, cancelled or bound evidence/gap state; never invent source, infer a higher proof stage or mutate support."
     },
     "selected_cases": [
-      "crates/smart/eliot-dreamer-implementation-brief/tests/implementation_brief.rs",
-      "crates/smart/eliot-dreamer-implementation-brief/tests/support/mod.rs"
+      "crates/smart/eliot-dreamer-implementation-brief/tests/implementation_brief.rs"
     ]
   },
   "resource_and_serial_groups": {
@@ -158,16 +159,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 39,
-    "test_stu": 18005,
+    "test_stu": 10374,
     "nonzero": true
   },
-  "bound_contract_digest": "5956cfaba6c93445812bf7deb1a153175c7cd8d7d925a43f9b0c8a0db9f2d0a3",
+  "bound_contract_digest": "79363a21e439bd5b",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -187,18 +184,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-implementation-brief/module.toml",
         "sha256": "e9a9d46424e89de8b8a3981fedc10509bd90857398413941d4ce4a567252d50d"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
         "path_count": 11,
         "sha256": "7ab229d3b7f44b41a096bebe37c8f4132e05f20c90597103b3c4a5eb2629cabd"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 10,
+        "sha256": "91d692f5082ec0475151c76b86f117aff3e18965270e6a98cc926ca75f62054e"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "c52ffd1983ca7726288bd5493f1e583c442ac69d1c0bb0b0bf6db05fa4bb1d47",
+  "artifact_digest": "ff02a520dd3285212d655af276d073003861e1ed7c7bc64f9e6e24c658a2e199",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "c52ffd1983ca7726"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "27d6463e14ee6d2d"
   }
 }
