@@ -811,10 +811,11 @@ fn optional_claim_privacy_class(
     match claim.get("privacy_class") {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(value) => {
-            let class: PrivacyClass =
-                serde_json::from_value(value.clone()).map_err(|_| NativeWorkerRouteError::Shape {
+            let class: PrivacyClass = serde_json::from_value(value.clone()).map_err(|_| {
+                NativeWorkerRouteError::Shape {
                     field: "privacy_class",
-                })?;
+                }
+            })?;
             Ok(Some(class))
         }
     }

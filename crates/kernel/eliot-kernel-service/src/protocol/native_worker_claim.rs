@@ -690,18 +690,7 @@ impl NativeWorkerClaimRequest {
             });
         }
         self.budget.validate()?;
-        // Harness/swarm legs are owner-published: `None` until the owner
-        // publishes them, shape-only text when present, never invented
-        // here. `privacy_class` is the canonical owner type, so its shape
-        // is enforced at the Deserialize boundary and needs no string arm.
-        for (leg, field) in [
-            (self.visibility.as_deref(), "native_worker_claim.visibility"),
-            (self.swarm_id.as_deref(), "native_worker_claim.swarm_id"),
-        ] {
-            if let Some(text) = leg {
-                validate_wire_text(text, field)?;
-            }
-        }
+        self.validate_optional_owner_legs()?;
         self.state_fence
             .validate()
             .map_err(|_| KernelServiceError::HandshakeMismatch {
@@ -726,6 +715,24 @@ impl NativeWorkerClaimRequest {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "native_worker_claim.binding_digest",
             });
+        }
+        Ok(())
+    }
+
+    /// Validates the optional owner-published legs.
+    ///
+    /// Harness/swarm legs are owner-published: `None` until the owner
+    /// publishes them, shape-only text when present, never invented
+    /// here. `privacy_class` is the canonical owner type, so its shape
+    /// is enforced at the Deserialize boundary and needs no string arm.
+    fn validate_optional_owner_legs(&self) -> Result<(), KernelServiceError> {
+        for (leg, field) in [
+            (self.visibility.as_deref(), "native_worker_claim.visibility"),
+            (self.swarm_id.as_deref(), "native_worker_claim.swarm_id"),
+        ] {
+            if let Some(text) = leg {
+                validate_wire_text(text, field)?;
+            }
         }
         Ok(())
     }
