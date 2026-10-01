@@ -8193,6 +8193,10 @@ impl HostComposition {
     /// Commits the provider's final Phase-B proof after retained-handle
     /// verification. Prepared state alone never resumes activation.
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Phase-B finalize keeps proof, persistence and single-terminal correlation in one fail-closed boundary, as its sibling reconcile does"
+    )]
     pub fn finalize_phase_b_request(
         &mut self,
         intent: &HostPhaseBMaterializationIntent,
@@ -8295,12 +8299,8 @@ impl HostComposition {
         } else {
             host_lifecycle_observe_scm(BOUNDARY_PHASE_B_FINALIZE_UNKNOWN);
             if !resume_terminal_emitted {
-                // Exactly one terminal for this Unknown outcome. When the
-                // inner resume continuation already emitted, this outer
-                // boundary stays disarmed by that propagated owner rather than
-                // duplicating the claim; when it did not, this record carries
-                // the exact `tx`/`effect`/`req` token of the finalize request
-                // whose subordinate records sit above it (I13.11).
+                // One terminal, disarmed when the inner resume owner already
+                // claimed it; otherwise correlated to this request (I13.11).
                 host_lifecycle_observe_terminal_with_correlation(
                     BOUNDARY_PHASE_B_FINALIZE_TERMINAL,
                     &phase_b_terminal_correlation(intent),
