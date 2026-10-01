@@ -539,7 +539,10 @@ impl BoundedSecondPhaseResumeReport {
 /// A refusal from the committed-closure read, a fence disagreement, or any
 /// Governor refusal is a typed failure or a retained pending, never an empty
 /// success.
-#[allow(clippy::too_many_arguments, reason = "the resume carries the admitted owner decision, both retained canonical identities, and the committed closure as one indivisible admission")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the resume carries the admitted owner decision, both retained canonical identities, and the committed closure as one indivisible admission"
+)]
 pub async fn resume_pending_second_phase(
     composition: &mut DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
@@ -569,17 +572,15 @@ pub async fn resume_pending_second_phase(
             canonical_operation_id,
             canonical_request_identity,
             owner.operation(),
-            move |operation_id: String, receipt: ReceiptIdentity| {
-                async move {
-                    link_closure_second_phase_over_transport(
-                        &link_kernel,
-                        &link_fence,
-                        operation_id.as_str(),
-                        &receipt,
-                        &expected_closure,
-                    )
-                    .await
-                }
+            move |operation_id: String, receipt: ReceiptIdentity| async move {
+                link_closure_second_phase_over_transport(
+                    &link_kernel,
+                    &link_fence,
+                    operation_id.as_str(),
+                    &receipt,
+                    &expected_closure,
+                )
+                .await
             },
         )
         .await
@@ -745,30 +746,20 @@ async fn link_closure_second_phase_over_transport(
             )));
         }
     };
-    let commit: GrantClosureReceipt = serde_json::from_value(
-        payload
-            .get("commit")
-            .cloned()
-            .ok_or_else(|| {
-                KernelPortError::Contract("closure link read is missing its commit".to_owned())
-            })?,
-    )
-    .map_err(|error| {
-        KernelPortError::Contract(format!("closure link commit does not decode: {error}"))
-    })?;
-    let linked: ReceiptIdentity = serde_json::from_value(
-        payload
-            .get("second_phase")
-            .cloned()
-            .ok_or_else(|| {
-                KernelPortError::Contract(
-                    "closure link read is missing its second phase".to_owned(),
-                )
-            })?,
-    )
-    .map_err(|error| {
-        KernelPortError::Contract(format!("closure link receipt does not decode: {error}"))
-    })?;
+    let commit: GrantClosureReceipt =
+        serde_json::from_value(payload.get("commit").cloned().ok_or_else(|| {
+            KernelPortError::Contract("closure link read is missing its commit".to_owned())
+        })?)
+        .map_err(|error| {
+            KernelPortError::Contract(format!("closure link commit does not decode: {error}"))
+        })?;
+    let linked: ReceiptIdentity =
+        serde_json::from_value(payload.get("second_phase").cloned().ok_or_else(|| {
+            KernelPortError::Contract("closure link read is missing its second phase".to_owned())
+        })?)
+        .map_err(|error| {
+            KernelPortError::Contract(format!("closure link receipt does not decode: {error}"))
+        })?;
     if linked != *canonical_receipt {
         return Err(KernelPortError::Contract(
             "closure link read-back carries a different canonical receipt".to_owned(),

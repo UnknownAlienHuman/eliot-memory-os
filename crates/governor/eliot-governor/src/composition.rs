@@ -9629,28 +9629,28 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         // pending stricter revocation instead of clearing it.
         let pending_snapshot = closure.authority_receipt.snapshot_id.clone();
         let pending_revocation = closure.authority_receipt.receipt_id.clone();
-        let retain = |phase: CanonicalRevocationPhase,
-                      error: CompositionError,
-                      pending_canonical_revocations: &mut BTreeMap<String, PendingCanonicalRevocation>,
-                      grant_id: &str| {
-            pending_canonical_revocations.insert(
-                grant_id.to_owned(),
-                PendingCanonicalRevocation {
-                    grant_id: grant_id.to_owned(),
-                    snapshot_id: pending_snapshot.clone(),
-                    revocation_id: pending_revocation.clone(),
-                    phase,
-                },
-            );
-            error
-        };
+        let retain =
+            |phase: CanonicalRevocationPhase,
+             error: CompositionError,
+             pending_canonical_revocations: &mut BTreeMap<String, PendingCanonicalRevocation>,
+             grant_id: &str| {
+                pending_canonical_revocations.insert(
+                    grant_id.to_owned(),
+                    PendingCanonicalRevocation {
+                        grant_id: grant_id.to_owned(),
+                        snapshot_id: pending_snapshot.clone(),
+                        revocation_id: pending_revocation.clone(),
+                        phase,
+                    },
+                );
+                error
+            };
         let commit = CanonicalRevocationCommit {
             canonical_operation_id,
             canonical_request_identity,
             operation,
         };
-        if let Err(error) =
-            self.prepare_revocation_transition_for_commit(request, closure, &commit)
+        if let Err(error) = self.prepare_revocation_transition_for_commit(request, closure, &commit)
         {
             return Err(retain(
                 CanonicalRevocationPhase::ClosureReadback,
@@ -9659,10 +9659,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 request.grant_id.as_str(),
             ));
         }
-        if let Err(error) = self.owners.authority.grants.revoke_declared_closure(
-            &request.grant_id,
-            &closure.declaration.affected_grants(),
-        ) {
+        if let Err(error) = self
+            .owners
+            .authority
+            .grants
+            .revoke_declared_closure(&request.grant_id, &closure.declaration.affected_grants())
+        {
             return Err(retain(
                 CanonicalRevocationPhase::ClosureReadback,
                 CompositionError::Owner(error.to_string()),
@@ -9713,22 +9715,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         };
         // The ORIGINAL recorded first-phase operation identity, not a
         // re-derived or freshly minted one.
-        let closure_projection = match link(
-            closure.operation_id.clone(),
-            receipt_identity.clone(),
-        )
-        .await
-        {
-            Ok(projection) => projection,
-            Err(error) => {
-                return Err(retain(
-                    CanonicalRevocationPhase::SecondPhaseLink,
-                    CompositionError::Owner(error.to_string()),
-                    &mut self.pending_canonical_revocations,
-                    request.grant_id.as_str(),
-                ));
-            }
-        };
+        let closure_projection =
+            match link(closure.operation_id.clone(), receipt_identity.clone()).await {
+                Ok(projection) => projection,
+                Err(error) => {
+                    return Err(retain(
+                        CanonicalRevocationPhase::SecondPhaseLink,
+                        CompositionError::Owner(error.to_string()),
+                        &mut self.pending_canonical_revocations,
+                        request.grant_id.as_str(),
+                    ));
+                }
+            };
         if closure_projection.closure().operation_id != closure.operation_id
             || closure_projection.closure().declaration != closure.declaration
             || closure_projection.canonical_receipt() != &receipt_identity
