@@ -395,9 +395,7 @@ fn ecxf_response_ceiling() -> Result<ResponseCeiling, StoreError> {
 /// the same retained admitted budget and is refused when that derivation would
 /// be *weaker* than the retained one, so a page or close can never be served
 /// under a laxer transport envelope than the capture it continues.
-fn require_capture_response_ceiling(
-    state: &SnapshotState,
-) -> Result<ResponseCeiling, StoreError> {
+fn require_capture_response_ceiling(state: &SnapshotState) -> Result<ResponseCeiling, StoreError> {
     let ceiling = capture_response_ceiling(&state.begin)?;
     if ceiling.max_bytes() < state.response_ceiling_bytes {
         return Err(StoreError::InvalidField {
@@ -2219,12 +2217,9 @@ async fn read_enumeration(
     adapter: &SurrealStoreAdapter,
     ceiling: ResponseCeiling,
 ) -> Result<(CapturePoint, Vec<Vec<Map<String, Value>>>), StoreError> {
-    let mut response = run_pinned_snapshot_query(
-        adapter,
-        crate::client::SNAPSHOT_MEMBERS_OPERATION,
-        ceiling,
-    )
-    .await?;
+    let mut response =
+        run_pinned_snapshot_query(adapter, crate::client::SNAPSHOT_MEMBERS_OPERATION, ceiling)
+            .await?;
     let errors = response.take_errors();
     if !errors.is_empty() {
         if errors
@@ -4754,19 +4749,15 @@ pub(crate) async fn read_snapshot_page(
     // because a cancelled observation proves nothing about the source. Only a
     // provider failure that actually returns records an interruption, and it
     // records it under this claim before settling it.
-    let observed = match observe_capture_point(
-        adapter,
-        SNAPSHOT_PAGE_OPERATION,
-        claim.response_ceiling,
-    )
-    .await
-    {
-        Ok(point) => point,
-        Err(error) => {
-            let _ = record_provider_read_failure(&mut claim, &error);
-            return Err(error);
-        }
-    };
+    let observed =
+        match observe_capture_point(adapter, SNAPSHOT_PAGE_OPERATION, claim.response_ceiling).await
+        {
+            Ok(point) => point,
+            Err(error) => {
+                let _ = record_provider_read_failure(&mut claim, &error);
+                return Err(error);
+            }
+        };
     finish_page(&mut claim, &observed, cursor)
 }
 

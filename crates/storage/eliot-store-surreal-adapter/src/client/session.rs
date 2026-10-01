@@ -239,11 +239,10 @@ impl RpcSession {
                     .map_err(|_| AdapterError::ProviderUnavailable)?;
                 match message {
                     Message::Text(text) => {
-                        let response = match ceiling {
-                            Some(ceiling) => {
-                                parse_response_bounded(text.as_str().as_bytes(), ceiling)?
-                            }
-                            None => parse_response(text.as_str())?,
+                        let response = if let Some(ceiling) = ceiling {
+                            parse_response_bounded(text.as_str().as_bytes(), ceiling)?
+                        } else {
+                            parse_response(text.as_str())?
                         };
                         if response.id.as_ref() == Some(&expected_id) {
                             return rpc_result(response);
@@ -254,14 +253,13 @@ impl RpcSession {
                         // is charged against the borrowed slice, so an oversize
                         // binary response is refused before `to_vec`, before
                         // UTF-8 conversion and before the parse tree exists.
-                        let response = match ceiling {
-                            Some(ceiling) => parse_response_bounded(&bytes, ceiling)?,
-                            None => {
-                                let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
-                                    AdapterError::Serialization(error.to_string())
-                                })?;
-                                parse_response(&text)?
-                            }
+                        let response = if let Some(ceiling) = ceiling {
+                            parse_response_bounded(&bytes, ceiling)?
+                        } else {
+                            let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
+                                AdapterError::Serialization(error.to_string())
+                            })?;
+                            parse_response(&text)?
                         };
                         if response.id.as_ref() == Some(&expected_id) {
                             return rpc_result(response);

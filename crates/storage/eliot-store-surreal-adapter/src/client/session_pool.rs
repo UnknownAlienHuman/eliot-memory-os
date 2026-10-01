@@ -635,10 +635,11 @@ impl PooledSession {
         let (statement, bindings, prefix_len) = json_codec::encode_bindings(statement, bindings)?;
         let params = json!([statement, Value::Object(bindings)]);
         let value = match ceiling {
-            Some(ceiling) => self
-                .session()
-                .request_bounded(operation, "query", params, ceiling)
-                .await?,
+            Some(ceiling) => {
+                self.session()
+                    .request_bounded(operation, "query", params, ceiling)
+                    .await?
+            }
             None => self.session().request(operation, "query", params).await?,
         };
         let mut results = RpcResults::from_value(&value)?;

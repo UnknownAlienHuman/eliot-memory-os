@@ -7,10 +7,10 @@
 use std::cell::Cell;
 use std::fmt;
 
+use serde::Deserialize;
 use serde::de::{
     DeserializeSeed, Deserializer, Error as SerdeError, IgnoredAny, MapAccess, SeqAccess, Visitor,
 };
-use serde::Deserialize;
 use serde_json::Value;
 
 use eliot_store_api::StoreError;
@@ -319,12 +319,10 @@ impl<'de> Visitor<'de> for BoundedResponseVisitor<'_> {
                     self.id = Some(access.next_value()?);
                 }
                 "result" => {
-                    self.result = Some(
-                        access.next_value_seed(BoundedResultSeed {
-                            ceiling: self.ceiling,
-                            budget_exceeded: self.budget_exceeded,
-                        })?,
-                    );
+                    self.result = Some(access.next_value_seed(BoundedResultSeed {
+                        ceiling: self.ceiling,
+                        budget_exceeded: self.budget_exceeded,
+                    })?);
                 }
                 "error" => {
                     self.error = Some(access.next_value()?);
@@ -409,7 +407,9 @@ impl<'de> Visitor<'de> for BoundedResultVisitor<'_> {
                 .saturating_sub(statement_charge_bytes(&statement));
             if self.remaining_bytes == 0 {
                 self.budget_exceeded.set(true);
-                return Err(<A::Error as SerdeError>::custom(RESPONSE_BYTE_BUDGET_REFUSAL));
+                return Err(<A::Error as SerdeError>::custom(
+                    RESPONSE_BYTE_BUDGET_REFUSAL,
+                ));
             }
             self.statements.push(statement);
         }
@@ -542,7 +542,9 @@ mod bounded_response_tests {
         let statements = result.as_array().expect("statement list");
         assert_eq!(statements.len(), 1);
         assert_eq!(statements[0]["status"].as_str(), Some("OK"));
-        let rows = statements[0]["result"].as_array().expect("one whole-record row");
+        let rows = statements[0]["result"]
+            .as_array()
+            .expect("one whole-record row");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["event_id"].as_str(), Some("one-row"));
     }
