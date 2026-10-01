@@ -322,10 +322,10 @@ pub fn create_integration_candidate(
 /// Returns the exact candidate carrying `candidate_id`, or
 /// [`IntegrationCandidateError::NotFound`]. The caller supplies the
 /// read-back view; this function interprets nothing beyond identity.
-pub fn read_integration_candidate(
-    candidates: &[IntegrationCandidate],
+pub fn read_integration_candidate<'a>(
+    candidates: &'a [IntegrationCandidate],
     candidate_id: &str,
-) -> Result<&IntegrationCandidate, IntegrationCandidateError> {
+) -> Result<&'a IntegrationCandidate, IntegrationCandidateError> {
     require_text(candidate_id, "candidate_id", MAX_IDENTITY_LEN)?;
     candidates
         .iter()
@@ -356,8 +356,7 @@ pub fn project_integration_queue(
         .cloned()
         .collect();
     queued.sort_by(|a, b| {
-        (a.submitted_at_unix_ms, &a.candidate_id)
-            .cmp(&(b.submitted_at_unix_ms, &b.candidate_id))
+        (a.submitted_at_unix_ms, &a.candidate_id).cmp(&(b.submitted_at_unix_ms, &b.candidate_id))
     });
     Ok(IntegrationQueue {
         target_scope: target_scope.to_owned(),
@@ -557,10 +556,7 @@ fn require_changed_path(path: &str) -> Result<(), IntegrationCandidateError> {
             reason: "must be repo-relative, never absolute",
         });
     }
-    if path
-        .split(['/', '\\'])
-        .any(|segment| segment == "..")
-    {
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
         return Err(IntegrationCandidateError::InvalidField {
             field: "changed_paths",
             reason: "must not escape the target scope",
