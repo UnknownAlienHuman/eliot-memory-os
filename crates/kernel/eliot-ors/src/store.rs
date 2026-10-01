@@ -685,6 +685,25 @@ const BRIDGE_EVENT_PRIVACY_ADMISSION: &str = "admitted";
 /// reason vocabulary shared with the protocol redaction receipt
 /// (`FORBIDDEN_CONTENT_DETECTED` / `DECLARED_OUT_OF_SCOPE`).
 const BRIDGE_EVENT_PRIVACY_REJECTION: &str = "rejected";
+/// Provider-restriction evidence an admitted owner authorization must carry
+/// (issue #1934, W5/AUD1 residual): the provider owner's verdict over these
+/// exact bytes. Only the cleared spelling admits verbatim persistence; any
+/// other value — or its absence on an admitted verdict — withholds the raw
+/// bytes. This leg never comes from a byte scan: it arrives in the Governor
+/// owner's authorization and is re-checked here.
+const BRIDGE_EVENT_PROVIDER_RESTRICTION_CLEARED: &str = "provider_restriction_cleared";
+/// Retention terms an admitted owner authorization must carry (issue #1934,
+/// W5/AUD1 residual): the retention owner's disposition for these exact
+/// bytes. Only the raw-allowed spelling admits verbatim persistence; any
+/// other value — or its absence on an admitted verdict — withholds the raw
+/// bytes.
+const BRIDGE_EVENT_RETENTION_RAW_ALLOWED: &str = "retention_raw_allowed";
+/// Disclosure-decision leg an admitted owner authorization must carry (issue
+/// #1934, AUD1 residual): the Governor `DisclosureDecision` outcome over the
+/// event's closure and recipient, spelled like `DisclosureDecisionKind`.
+/// Only `ALLOW` admits verbatim persistence; `ALLOW_REDACTED` is
+/// redacted-only and every other outcome denies.
+const BRIDGE_EVENT_DISCLOSURE_ALLOW: &str = "ALLOW";
 /// Redaction reason stored when the owner withheld the original bytes as
 /// declared outside its privacy scope. Uses the closed wire reason
 /// vocabulary shared with the protocol redaction receipt.
@@ -3083,6 +3102,19 @@ struct BridgeEventPrivacyAuthorization {
     scope_ref: String,
     source_class: Option<String>,
     recipient_grant: Vec<String>,
+    /// Provider-restriction evidence the Governor owner presented for these
+    /// exact bytes (`None` when the verdict carries no provider leg).
+    /// Verbatim admission requires the cleared spelling; absence withholds.
+    provider_restriction: Option<String>,
+    /// Retention terms the Governor owner presented for these exact bytes
+    /// (`None` when the verdict carries no retention leg). Verbatim
+    /// admission requires the raw-allowed spelling; absence withholds.
+    retention: Option<String>,
+    /// Disclosure-decision leg the Governor owner presented for these exact
+    /// bytes (`None` when the verdict carries no disclosure leg), spelled
+    /// like `DisclosureDecisionKind`. Verbatim admission requires `ALLOW`;
+    /// absence withholds.
+    disclosure: Option<String>,
 }
 
 /// Resolved I7.23 disclosure staging for canonical envelope bytes.
@@ -11571,9 +11603,11 @@ impl RedbRecoveryStore {
     /// source bytes, the scope, and the policy revision
     /// (`privacy_authorization`: `verdict`, `source_sha256`, `scope`,
     /// `policy_revision`, plus the decided evidence `scope_ref`,
-    /// `source_class`, and `recipient_grant`). A presented verdict is
+    /// `source_class`, `recipient_grant`, and the provider-restriction,
+    /// retention, and disclosure legs). A presented verdict is
     /// accepted only when it equals the owner rule's verdict for the staged
-    /// evidence and names the owner's current policy revision; anything else
+    /// evidence, carries provider, retention, and disclosure admission when
+    /// it claims `admitted`, and names the owner's current policy revision; anything else
     /// — including a caller that cannot present an owner verdict for these
     /// exact bytes — gets a rejected disposition, never an inferred
     /// `allowed`. The conservative deny scan still runs inside the stage entry
@@ -11878,9 +11912,11 @@ impl RedbRecoveryStore {
     /// disposition the owner rule would not decide fails here, before any
     /// durable write. Where this owner is binding a stream namespace, the
     /// verdict's scope must equal that namespace bound to the staged scope
-    /// reference. Only an admitted verdict over a clean deny scan stages
-    /// original bytes. Rejection, absent authorization, and a deny-scan hit
-    /// stage the deterministic redacted projection plus its receipt. The scan
+    /// reference. Only an admitted verdict carrying provider, retention, and
+    /// disclosure admission over a clean deny scan stages
+    /// original bytes. Rejection, absent authorization, withholding legs, and
+    /// a deny-scan hit stage the deterministic redacted projection plus its
+    /// receipt. The scan
     /// can deny, and its silence can never allow. A mismatch fails closed
     /// instead of persisting a disputed form.
     ///
@@ -12012,8 +12048,9 @@ impl RedbRecoveryStore {
     /// is an `Err`: a verdict reached about other bytes cannot authorize
     /// these. A verdict decided under another policy revision is an `Err` as
     /// well: only the owner's current rule revision authorizes persistence.
-    /// The decided evidence (`scope_ref`, `source_class`, `recipient_grant`)
-    /// is required so the stage entry can re-resolve the owner verdict for
+    /// The decided evidence (`scope_ref`, `source_class`, `recipient_grant`,
+    /// plus the provider-restriction, retention, and disclosure legs) is
+    /// required so the stage entry can re-resolve the owner verdict for
     /// the staged bytes instead of trusting the presented disposition.
     fn presented_privacy_authorization(
         authorization: Option<&serde_json::Value>,
@@ -12094,6 +12131,47 @@ impl RedbRecoveryStore {
             crate::model::validate_text(class, "privacy_authorization.recipient_grant")?;
             grant.push(class.to_owned());
         }
+        // Provider-restriction, retention, and disclosure legs (issue #1934
+        // W5/AUD1 residuals): optional evidence the Governor owner presents
+        // for these exact bytes. Each is plain text here; the admitted
+        // spellings are enforced at re-verification, so a withheld verdict
+        // can name its withholding without becoming verbatim-admissible.
+        let provider_restriction = match value.get("provider_restriction") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(evidence) => {
+                let evidence = evidence.as_str().ok_or(OrsError::InvalidField {
+                    field: "privacy_authorization.provider_restriction",
+                    reason: "provider-restriction evidence must be text",
+                })?;
+                crate::model::validate_text(
+                    evidence,
+                    "privacy_authorization.provider_restriction",
+                )?;
+                Some(evidence.to_owned())
+            }
+        };
+        let retention = match value.get("retention") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(terms) => {
+                let terms = terms.as_str().ok_or(OrsError::InvalidField {
+                    field: "privacy_authorization.retention",
+                    reason: "retention terms must be text",
+                })?;
+                crate::model::validate_text(terms, "privacy_authorization.retention")?;
+                Some(terms.to_owned())
+            }
+        };
+        let disclosure = match value.get("disclosure") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(decision) => {
+                let decision = decision.as_str().ok_or(OrsError::InvalidField {
+                    field: "privacy_authorization.disclosure",
+                    reason: "disclosure decision must be text",
+                })?;
+                crate::model::validate_text(decision, "privacy_authorization.disclosure")?;
+                Some(decision.to_owned())
+            }
+        };
         Ok(Some(BridgeEventPrivacyAuthorization {
             verdict,
             scope,
@@ -12102,6 +12180,9 @@ impl RedbRecoveryStore {
             scope_ref,
             source_class,
             recipient_grant: grant,
+            provider_restriction,
+            retention,
+            disclosure,
         }))
     }
 
@@ -12114,6 +12195,14 @@ impl RedbRecoveryStore {
     /// `verdict` and `declared_class` must match what the owner decides for
     /// that evidence. A mismatch fails closed before any durable write; the
     /// conservative deny scan still applies separately and can only deny.
+    ///
+    /// Verbatim admission additionally requires the provider-restriction,
+    /// retention, and disclosure legs (issue #1934 W5/AUD1 residuals): an
+    /// `admitted` verdict without cleared provider evidence, raw-allowed
+    /// retention terms, and an `ALLOW` disclosure decision for these exact
+    /// bytes fails here, before any durable write. The `source_class: None`
+    /// leg stays fail-closed withheld by the owner rule above and is never
+    /// upgraded by these legs.
     fn check_bridge_event_owner_verdict(
         grant: &BridgeEventPrivacyAuthorization,
     ) -> Result<(), OrsError> {
@@ -12132,6 +12221,17 @@ impl RedbRecoveryStore {
             return Err(OrsError::InvalidField {
                 field: "privacy_authorization",
                 reason: "presented verdict does not match the owner rule for the staged evidence",
+            });
+        }
+        if grant.verdict == BRIDGE_EVENT_PRIVACY_ADMISSION
+            && (grant.provider_restriction.as_deref()
+                != Some(BRIDGE_EVENT_PROVIDER_RESTRICTION_CLEARED)
+                || grant.retention.as_deref() != Some(BRIDGE_EVENT_RETENTION_RAW_ALLOWED)
+                || grant.disclosure.as_deref() != Some(BRIDGE_EVENT_DISCLOSURE_ALLOW))
+        {
+            return Err(OrsError::InvalidField {
+                field: "privacy_authorization",
+                reason: "admitted verdict lacks provider, retention, or disclosure admission for these bytes",
             });
         }
         Ok(())
