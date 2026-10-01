@@ -2400,12 +2400,19 @@ async fn drive_validated_dispatch_material_inner(
         {
             return Err(TestdError::InvalidBinding);
         }
+        let current_token = store
+            .resolve_blob_process_stream_token_head(
+                &job.job_id,
+                &durable_grant.capability_ref,
+            )?
+            .ok_or(TestdError::InvalidBinding)?;
         let client = blob_client.ok_or(TestdError::InvalidBinding)?;
         let calls = crate::kernel_client::KernelBlobStreamCallSequence::new(
             client,
             &durable_grant.capability_ref,
-            &durable_grant.tokens,
+            &[current_token],
             &job.job_id,
+            store.clone(),
             material.grant.expires_at,
         )
         .map_err(|error| TestdError::Contract(error.to_string()))?;

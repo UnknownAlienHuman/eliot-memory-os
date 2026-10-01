@@ -72,7 +72,8 @@ use eliot_process::{
 use eliot_store_api::{WriteReceipt, WriteReceiptStatus};
 use eliot_testd_core::{
     KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    TestJob, TestdBlobProcessStreamTokenRef, TestdError, TestdTerminalCompletionNotice,
+    TestJob, TestdBlobProcessStreamCallOutcome, TestdBlobProcessStreamReserve,
+    TestdBlobProcessStreamTokenRef, TestdError, TestdStore, TestdTerminalCompletionNotice,
     TestdVerifierDispatchBinding,
     verification_receipt_sha256,
 };
@@ -938,6 +939,7 @@ pub struct KernelBlobStreamCallSequence {
     capability: ProcessStreamSinkCapabilityRef,
     tokens: Arc<Mutex<VecDeque<BlobProcessStreamCallToken>>>,
     job_id: String,
+    store: TestdStore,
     grant_deadline_ms: u64,
 }
 
@@ -949,6 +951,7 @@ impl KernelBlobStreamCallSequence {
         capability_ref: &str,
         tokens: &[TestdBlobProcessStreamTokenRef],
         job_id: &str,
+        store: TestdStore,
         grant_deadline_ms: u64,
     ) -> Result<Self, TestdIpcError> {
         let capability = ProcessStreamSinkCapabilityRef {
@@ -964,7 +967,9 @@ impl KernelBlobStreamCallSequence {
         }
         let mut values = VecDeque::with_capacity(tokens.len());
         for (index, token) in tokens.iter().enumerate() {
-            if token.ordinal as usize != index + 1
+            if token.ordinal == 0
+                || (index > 0
+                    && token.ordinal != tokens[index - 1].ordinal.saturating_add(1))
                 || token.reference.trim().is_empty()
                 || token.reference.len() > 128
                 || token.reference.chars().any(char::is_control)
@@ -986,6 +991,7 @@ impl KernelBlobStreamCallSequence {
             capability,
             tokens: Arc::new(Mutex::new(values)),
             job_id: job_id.to_owned(),
+            store,
             grant_deadline_ms,
         })
     }
@@ -1032,18 +1038,100 @@ impl KernelBlobStreamCallSequence {
                 "Blob operation deadline exceeds its Kernel-issued grant".to_owned(),
             ));
         }
-        let token = self
+        // Keep one lock across token consumption and the authenticated
+        // exchange. Stdout, stderr, and readback share this sequence, so a
+        // successor token can never overtake the operation that issued it.
+        let mut tokens = self
             .tokens
             .lock()
-            .map_err(|_| TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned()))?
+            .map_err(|_| TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned()))?;
+        let token = tokens
             .pop_front()
             .ok_or_else(|| TestdIpcError::Transport("Blob call token sequence exhausted".to_owned()))?;
-        self.client.exchange(
+        let request = BlobProcessStreamKernelRequest::new(
             self.capability.clone(),
-            token,
+            token.clone(),
+            operation.clone(),
+        )
+        .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let operation_sha256 = request.operation_sha256.clone();
+        let call_state = self
+            .store
+            .reserve_blob_process_stream_call(
+                &self.job_id,
+                &self.capability.reference,
+                &token.reference,
+                token.ordinal,
+                &operation_sha256,
+            )
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        if matches!(call_state, TestdBlobProcessStreamReserve::Reserved) {
+            self.store
+                .mark_blob_process_stream_call_dispatched(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    &operation_sha256,
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        }
+        let response = self.client.exchange(
+            self.capability.clone(),
+            token.clone(),
             operation,
             &self.job_id,
-        )
+        )?;
+        let compact_outcome = match &response.outcome {
+            BlobProcessStreamKernelOutcome::Completed { .. } => {
+                let response_bytes = canonical_json_bytes(&response)
+                    .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+                TestdBlobProcessStreamCallOutcome::Completed {
+                    response_sha256: sha256_hex(&response_bytes),
+                    // This is the real retained ORS call-result reference
+                    // echoed in its authenticated token receipt.
+                    response_ref: Some(response.call_token.reference.clone()),
+                }
+            }
+            BlobProcessStreamKernelOutcome::NotStarted { .. } => {
+                TestdBlobProcessStreamCallOutcome::NotStarted
+            }
+            BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+                TestdBlobProcessStreamCallOutcome::Unavailable
+            }
+            BlobProcessStreamKernelOutcome::Unknown { .. } => {
+                TestdBlobProcessStreamCallOutcome::Unknown
+            }
+        };
+        if let Some(next_token) = response.next_call_token.as_ref() {
+            self.store
+                .complete_blob_process_stream_call_and_advance(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    &operation_sha256,
+                    compact_outcome,
+                    TestdBlobProcessStreamTokenRef {
+                        reference: next_token.reference.clone(),
+                        ordinal: next_token.ordinal,
+                    },
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+            tokens.push_back(next_token.clone());
+        } else {
+            self.store
+                .complete_blob_process_stream_call(
+                    &self.job_id,
+                    &self.capability.reference,
+                    &token.reference,
+                    token.ordinal,
+                    &operation_sha256,
+                    compact_outcome,
+                )
+                .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        }
+        Ok(response)
     }
 }
 
