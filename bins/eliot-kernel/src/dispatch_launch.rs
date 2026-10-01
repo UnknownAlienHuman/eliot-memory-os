@@ -127,7 +127,8 @@ use eliot_testd_core::{
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
     ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
     TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
-    StageExecutionKind, TestResourceProfile, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
+    StageExecutionKind, TestResourceProfile, TestdBlobProcessStreamGrant,
+    TestdBlobProcessStreamTokenRef, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
     TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
     issue_process_admission, testd_profile_binding, verification_receipt_sha256,
     verify_envelope_layout_binding,
@@ -759,6 +760,9 @@ struct TestdLaunchOwnerBinding {
     /// Exact stage identity retained in the durable owner row and copied to
     /// the protected dispatch material.
     stage_request: Option<InstrumentStageRequest>,
+    /// Kernel-issued opaque Blob capability and one-use tokens, retained in
+    /// the durable owner row and projected into protected launch material.
+    blob_process_stream_grant: Option<TestdBlobProcessStreamGrant>,
 }
 
 /// Retained launch records. The durable attempt/effect ledger stays the
@@ -1964,6 +1968,7 @@ fn capture_testd_launch_owner_binding(
     let invocation_sha256 = sha256_hex(&invocation_bytes);
     let verifier_dispatch = job.verifier_dispatch.clone();
     let stage_request = job.stage_request.clone();
+    let blob_process_stream_grant = job.blob_process_stream_grant.clone();
     if admission.profile == TESTD_PRODUCTIVE_PROFILE {
         let stage = stage_request.as_ref().ok_or_else(|| {
             DispatchLaunchError::Gate(
@@ -1989,9 +1994,44 @@ fn capture_testd_launch_owner_binding(
         binding
             .validate_for_job(&job)
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
-    } else if verifier_dispatch.is_some() || stage_request.is_some() {
+        let grant = blob_process_stream_grant.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no persisted Kernel Blob stream grant".to_owned(),
+            )
+        })?;
+        grant
+            .validate()
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        let stage_freshness = stage
+            .provider_freshness
+            .as_ref()
+            .ok_or_else(|| DispatchLaunchError::Gate(
+                "productive TestD launch has no provider freshness record".to_owned(),
+            ))?;
+        let tool_observation = job.provider_tool_observation.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no retained provider tool observation".to_owned(),
+            )
+        })?;
+        let environment = job.provider_environment_projection.as_ref().ok_or_else(|| {
+            DispatchLaunchError::Gate(
+                "productive TestD launch has no retained provider environment".to_owned(),
+            )
+        })?;
+        let currentness_bytes = canonical_json_bytes(&(stage_freshness, tool_observation, environment))
+            .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+        if sha256_hex(&currentness_bytes) != grant.currentness_sha256 {
+            return Err(DispatchLaunchError::Gate(
+                "durable TestD Blob grant is bound to different provider currentness material"
+                    .to_owned(),
+            ));
+        }
+    } else if verifier_dispatch.is_some()
+        || stage_request.is_some()
+        || blob_process_stream_grant.is_some()
+    {
         return Err(DispatchLaunchError::Gate(
-            "non-productive TestD launch carries productive stage or verifier bindings"
+            "non-productive TestD launch carries productive stage, verifier, or Blob bindings"
                 .to_owned(),
         ));
     }
@@ -2002,6 +2042,7 @@ fn capture_testd_launch_owner_binding(
         invocation_sha256,
         verifier_dispatch,
         stage_request,
+        blob_process_stream_grant,
     })
 }
 
@@ -2421,6 +2462,7 @@ fn doctor_material_bytes(
 ///   "request": TestdAdmissionAttemptRequest,
 ///   "envelope": TestdAdmissionEnvelope,
 ///   "admission": TestdAdmission,
+///   "blob_stream": {"capability_ref": "opaque", "tokens": []},
 ///   "epoch": EpochId,
 ///   "generation": 1,
 ///   "nonce": "testd-dispatch-<hex>",
@@ -2437,6 +2479,10 @@ fn doctor_material_bytes(
 ///   `operation_id` is the bounded evidence handle the child maps to
 ///   `PresentedAdmission.evidence_ref`, and `cancelled` maps to
 ///   `PresentedAdmission.cancelled`.
+/// * `blob_stream` — productive jobs carry only the opaque capability and
+///   ordered one-use token references copied from the durable TestD owner row;
+///   the launch-grant digest binds this projection and the worker rechecks it
+///   against that row before use. Non-productive profiles carry `null`.
 /// * `epoch` — the live authority epoch (maps to
 ///   `PresentedAdmission.epoch`; never envelope bytes).
 /// * `generation` — the live activation generation (the child proves its
@@ -2451,6 +2497,34 @@ fn doctor_material_bytes(
 /// `ProcessRequest::new`. No executable bytes are taken from caller input:
 /// the child binding (path/digest/workdir) stays composition-pinned like
 /// Doctor.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct TestdMaterialBlobStreamGrant {
+    capability_ref: String,
+    tokens: Vec<TestdBlobProcessStreamTokenRef>,
+}
+
+fn project_testd_blob_stream_grant(
+    grant: &TestdBlobProcessStreamGrant,
+) -> TestdMaterialBlobStreamGrant {
+    TestdMaterialBlobStreamGrant {
+        capability_ref: grant.capability_ref.clone(),
+        tokens: grant.tokens.clone(),
+    }
+}
+
+fn testd_material_identity_digest(
+    admission: &TestdAdmission,
+    blob_stream_grant: Option<&TestdBlobProcessStreamGrant>,
+) -> Result<String, DispatchLaunchError> {
+    let Some(blob_stream_grant) = blob_stream_grant else {
+        return Ok(admission.admission_digest.clone());
+    };
+    let projection = project_testd_blob_stream_grant(blob_stream_grant);
+    let bytes = canonical_json_bytes(&(admission.admission_digest.as_str(), projection))
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    Ok(sha256_hex(&bytes))
+}
+
 fn testd_material_bytes(
     request: &TestdAdmissionAttemptRequest,
     envelope: &TestdAdmissionEnvelope,
@@ -2459,11 +2533,14 @@ fn testd_material_bytes(
     generation: u64,
     nonce: &str,
     grant: &DispatchGrant,
+    blob_stream_grant: Option<&TestdBlobProcessStreamGrant>,
 ) -> Result<Vec<u8>, DispatchLaunchError> {
+    let blob_stream = blob_stream_grant.map(project_testd_blob_stream_grant);
     let body = serde_json::json!({
         "request": request,
         "envelope": envelope,
         "admission": admission,
+        "blob_stream": blob_stream,
         "epoch": epoch,
         "generation": generation,
         "nonce": nonce,
@@ -4698,7 +4775,7 @@ pub fn prepare_testd_launch(
         })?;
     let grant = dispatch_grant_for(
         DispatchedWorkerKind::Testd,
-        &admission.admission_digest,
+        &testd_material_identity_digest(&admission, owner_binding.blob_process_stream_grant.as_ref())?,
         &authority_epoch,
         generation,
         admission.admitted_at_unix_nanos,
@@ -4715,6 +4792,7 @@ pub fn prepare_testd_launch(
         generation.get(),
         &nonce,
         &grant,
+        owner_binding.blob_process_stream_grant.as_ref(),
     );
     let bytes = match bytes {
         Ok(bytes) => bytes,
