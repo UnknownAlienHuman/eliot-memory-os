@@ -1630,7 +1630,14 @@ mod host_lifecycle_boundary_table_tests {
 
     fn lib_source() -> String {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
-        std::fs::read_to_string(&path).expect("tracked lib.rs must be readable")
+        let source = std::fs::read_to_string(&path).expect("tracked lib.rs must be readable");
+        // Self-exclusion: this proof lives in the file it audits, so audit
+        // only the production source above the test module. The assertion
+        // literals below would otherwise match their own spellings and keep
+        // the proof always-red.
+        let marker = "\nmod host_lifecycle_boundary_table_tests {";
+        let end = source.find(marker).expect("test module marker must exist");
+        source[..end].to_owned()
     }
 
     // WORK_UNIT_CASE: 891/1
