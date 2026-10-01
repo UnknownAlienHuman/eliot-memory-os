@@ -36,9 +36,9 @@ use crate::host_identity_observation::{
 };
 use crate::host_recovery::{
     AuditCorrelation, AuditEventKind, BoundaryEvidence, DualAuditRecord,
-    EXISTING_SCM_ADAPTER_GUARANTEE, RecoveryFence, RecoveryOperation, RecoveryScope, RecoveryTarget,
-    begin_recovery_operation, bounded_responsiveness, fence_recovery, read_recovery_budget,
-    read_recovery_operation, record_recovery_audit, record_recovery_budget,
+    EXISTING_SCM_ADAPTER_GUARANTEE, RecoveryFence, RecoveryOperation, RecoveryScope,
+    RecoveryTarget, begin_recovery_operation, bounded_responsiveness, fence_recovery,
+    read_recovery_budget, read_recovery_operation, record_recovery_audit, record_recovery_budget,
 };
 use crate::kernel_gap_reason;
 use crate::observation_coverage::{
@@ -1173,17 +1173,16 @@ fn observe_host_recovery_decision(
     let now_ms = current_unix_ms().unwrap_or(0);
     // No competent attempt can be claimed yet (see the producer seam): stay
     // an explicit uncertainty, never a fabricated timeout.
-    let attempt = match produce_challenge_attempt() {
-        Some(attempt) => attempt,
-        None => {
-            tracing::debug!(
-                event = "watchdog.recovery_decision_attempt_unproduced",
-                observation = "unresolved",
-                seam = "STITCH",
-                "no production challenge-attempt producer on the Host owner contour; refusing to invent one"
-            );
-            ChallengeAttemptOutcome::Uncertain(ChallengeUncertainty::InadequateCoverage)
-        }
+    let attempt = if let Some(attempt) = produce_challenge_attempt() {
+        attempt
+    } else {
+        tracing::debug!(
+            event = "watchdog.recovery_decision_attempt_unproduced",
+            observation = "unresolved",
+            seam = "STITCH",
+            "no production challenge-attempt producer on the Host owner contour; refusing to invent one"
+        );
+        ChallengeAttemptOutcome::Uncertain(ChallengeUncertainty::InadequateCoverage)
     };
     // The contour's own admitted bound for one observation interval. The
     // producer-owned wait itself remains STITCH; this only bounds the recheck
@@ -1198,18 +1197,15 @@ fn observe_host_recovery_decision(
     let verdict = bounded_responsiveness(before, &wait, &attempt, &after);
     // Without the installer loader there is no policy to decide under: trace
     // the seam and stop before any journal write.
-    let policy = match load_installed_recovery_policy() {
-        Some(policy) => policy,
-        None => {
-            tracing::debug!(
-                event = "watchdog.recovery_decision_policy_unavailable",
-                observation = "refused",
-                seam = "STITCH",
-                verdict = ?verdict,
-                "no installation-approved recovery policy on this contour; journaling nothing and refusing effects"
-            );
-            return;
-        }
+    let Some(policy) = load_installed_recovery_policy() else {
+        tracing::debug!(
+            event = "watchdog.recovery_decision_policy_unavailable",
+            observation = "refused",
+            seam = "STITCH",
+            verdict = ?verdict,
+            "no installation-approved recovery policy on this contour; journaling nothing and refusing effects"
+        );
+        return;
     };
     // Durable failure and attempt accounting from the owner's own journal, so
     // exhaustion survives a Watchdog restart and is never invented. One more
@@ -1243,41 +1239,32 @@ fn observe_host_recovery_decision(
         );
         return;
     }
-    let target = match bind_recovery_target(&policy, &after) {
-        Some(target) => target,
-        None => {
-            tracing::debug!(
-                event = "watchdog.recovery_decision_target_unbound",
-                observation = "refused",
-                seam = "STITCH",
-                "fenced target cannot be bound without the generation and Host-issued epoch readbacks; refusing effects"
-            );
-            return;
-        }
+    let Some(target) = bind_recovery_target(&policy, &after) else {
+        tracing::debug!(
+            event = "watchdog.recovery_decision_target_unbound",
+            observation = "refused",
+            seam = "STITCH",
+            "fenced target cannot be bound without the generation and Host-issued epoch readbacks; refusing effects"
+        );
+        return;
     };
-    let evidence = match read_boundary_evidence(&target) {
-        Some(evidence) => evidence,
-        None => {
-            tracing::debug!(
-                event = "watchdog.recovery_decision_evidence_unavailable",
-                observation = "refused",
-                seam = "STITCH",
-                "no fresh boundary readback on this contour; the fence is never reached without one"
-            );
-            return;
-        }
+    let Some(evidence) = read_boundary_evidence(&target) else {
+        tracing::debug!(
+            event = "watchdog.recovery_decision_evidence_unavailable",
+            observation = "refused",
+            seam = "STITCH",
+            "no fresh boundary readback on this contour; the fence is never reached without one"
+        );
+        return;
     };
-    let (correlation, scope) = match correlate_recovery_attempt(&policy, &target) {
-        Some(bound) => bound,
-        None => {
-            tracing::debug!(
-                event = "watchdog.recovery_decision_uncorrelated",
-                observation = "refused",
-                seam = "STITCH",
-                "no stable operation identity or installed-recipe scope on this contour; opening nothing"
-            );
-            return;
-        }
+    let Some((correlation, scope)) = correlate_recovery_attempt(&policy, &target) else {
+        tracing::debug!(
+            event = "watchdog.recovery_decision_uncorrelated",
+            observation = "refused",
+            seam = "STITCH",
+            "no stable operation identity or installed-recipe scope on this contour; opening nothing"
+        );
+        return;
     };
     let audit = DualAuditRecord::new(correlation, AuditEventKind::ChallengeTimeout);
     let open_operation = match read_recovery_operation(database) {
@@ -1326,24 +1313,20 @@ fn observe_host_recovery_decision(
             return;
         }
     };
-    let operation = match RecoveryOperation::begin(
-        audit.correlation.clone(),
-        target,
-        verdict,
-        decision,
-        scope,
-    ) {
-        Ok(operation) => operation,
-        Err(error) => {
-            tracing::debug!(
-                event = "watchdog.recovery_decision_operation_invalid",
-                observation = "refused",
-                reason = %error,
-                "recovery operation is not canonical; opening nothing"
-            );
-            return;
-        }
-    };
+    let operation =
+        match RecoveryOperation::begin(audit.correlation.clone(), target, verdict, decision, scope)
+        {
+            Ok(operation) => operation,
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.recovery_decision_operation_invalid",
+                    observation = "refused",
+                    reason = %error,
+                    "recovery operation is not canonical; opening nothing"
+                );
+                return;
+            }
+        };
     let stored = match begin_recovery_operation(database, None, &operation) {
         Ok(stored) => stored,
         Err(error) => {
@@ -1375,7 +1358,7 @@ fn observe_host_recovery_decision(
             reason = %error,
             "fenced recovery intent is open but its challenge audit could not be journaled"
         ),
-    };
+    }
     if let Err(error) = record_recovery_budget(database, false, Some(now_ms), &policy) {
         tracing::debug!(
             event = "watchdog.recovery_decision_budget_unadvanced",
