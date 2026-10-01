@@ -495,7 +495,7 @@ struct ActivatedMutationDescriptor {
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -659,6 +659,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
         // JSON inside the parameters object, so the bulk bound covers escaping
         // and the enclosing structure without loosening the record's own
         // closed validator.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::AdmitProposedAttempt,
+        transition_classes: &[TransitionClass::TaskControl],
+        maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];
@@ -992,6 +998,10 @@ pub fn validate_transition_against_catalogue(
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 validate_task_contract_acceptance_transition(transition, &command.parameters)?;
             }
+            NamedMutationOperation::AdmitProposedAttempt => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                validate_proposed_attempt_transition(transition, &command.parameters)?;
+            }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);
             }
@@ -1001,6 +1011,26 @@ pub fn validate_transition_against_catalogue(
             }
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_proposed_attempt_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let record = crate::decode_proposed_attempt_record(
+        NamedMutationOperation::AdmitProposedAttempt,
+        parameters,
+    )?;
+    if record.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(record.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "proposed_attempt.task_id",
+            reason: "must match the prepared transition task",
+        });
     }
     Ok(())
 }
