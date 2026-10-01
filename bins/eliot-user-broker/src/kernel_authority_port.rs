@@ -27,6 +27,7 @@ use eliot_security_contracts::NativeResourceSelection;
 use eliot_user_broker_core::{
     AuthorityPort, LaunchGrant, LaunchRequest, PortError, RegistrationFenceReceipt,
     RegistrationFenceRequest, RegistrationGrant, RegistrationReceipt, RegistrationRequest,
+    RegistrationStatus,
 };
 
 use super::SharedKernelClient;
@@ -319,6 +320,141 @@ impl KernelAuthorityPort {
                 PortError::Invalid(format!("operator session token refused: {error}"))
             })?;
         Ok(reply.value)
+    }
+}
+
+/// Typed User Broker evidence bundle for the interactive-maintenance gate
+/// (I14.22 W3, issue #1692).
+///
+/// Every stored field is an output of one existing owner operation on this
+/// same [`AuthorityPort`] transport — the Kernel-issued registration sealed
+/// from `register`, the lease-renewal grant from `heartbeat`, and the launch
+/// grant state from `authorize_launch`. The latest revocation/fence
+/// observation from `fence` rides along as a [`Self::bind`] check input: any
+/// fence record naming this registration denies the bundle. This type performs no Kernel transaction itself and never
+/// substitutes process presence or a copied record: [`Self::bind`] only joins
+/// owner outputs that already name the same registration digest, identity
+/// tuple, broker-local epoch, authority epoch, and fence contour, and that
+/// still cover the observation instant.
+///
+/// The consumer is the maintenance policy gate, which lives outside this
+/// file and therefore joins by STITCH, never by a faked in-file call: the
+/// Governor-side
+/// `crates/governor/eliot-maintenance/src/lib.rs::MaintenanceBrokerEvidence`
+/// and its `authenticated_session_available` predicate feeding
+/// `MaintenanceTriggerInput::user_session_available`, read at
+/// `bins/eliotd/src/maintenance_trigger_evaluator.rs` and enforced by
+/// `MaintenanceController::evaluate_trigger`. This bundle provisions the
+/// broker half of that join; [`Self::authenticated_session_available`]
+/// re-validates lease freshness at use time with the same name so the stitch
+/// point stays exact. No token, credential, or reusable desktop secret is
+/// carried.
+#[derive(Clone, Debug)]
+pub(crate) struct BrokerMaintenanceEvidence {
+    registration: RegistrationReceipt,
+    heartbeat_grant: RegistrationGrant,
+    launch_grant: LaunchGrant,
+}
+
+impl BrokerMaintenanceEvidence {
+    /// Joins the four owner observations into one bound bundle.
+    ///
+    /// The binding equalities mirror the ones the broker owner already
+    /// enforces when it seals a registration, refreshes it, authorizes a
+    /// launch, or validates a fence receipt: same identity tuple, same
+    /// broker-local epoch, same authority epoch, same fence contour, and a
+    /// lease that still covers `observed_at`. Any fence record naming this
+    /// registration denies the bundle, and a fence naming another digest is
+    /// a caller mismatch, never evidence. Every refusal is a typed
+    /// [`PortError`]; a forged digest, epoch, fence, or expiry grants
+    /// nothing.
+    pub(crate) fn bind(
+        registration: &RegistrationReceipt,
+        heartbeat_grant: &RegistrationGrant,
+        launch_grant: &LaunchGrant,
+        fence: Option<&RegistrationFenceReceipt>,
+        observed_at: u64,
+    ) -> Result<Self, PortError> {
+        if observed_at == 0 {
+            return Err(PortError::Invalid(
+                "maintenance broker evidence observation is zero".to_owned(),
+            ));
+        }
+        if registration.status != RegistrationStatus::Active {
+            return Err(PortError::Invalid(
+                "maintenance broker registration is not active".to_owned(),
+            ));
+        }
+        let heartbeat_request = &heartbeat_grant.registration;
+        let same_tuple = heartbeat_request.installation_id == registration.installation_id
+            && heartbeat_request.windows_sid == registration.windows_sid
+            && heartbeat_request.interactive_session_id == registration.interactive_session_id
+            && heartbeat_request.boot_session_id == registration.boot_session_id
+            && heartbeat_request.broker_process_id == registration.broker_process_id;
+        if !same_tuple
+            || heartbeat_grant.user_broker_epoch != registration.user_broker_epoch
+            || !heartbeat_grant
+                .authority_epoch
+                .is_same_authority(&registration.authority_epoch)
+            || heartbeat_grant.fence_id != registration.fence_id
+        {
+            return Err(PortError::Invalid(
+                "heartbeat grant does not bind this broker registration".to_owned(),
+            ));
+        }
+        if observed_at >= registration.expires_at || observed_at >= heartbeat_grant.expires_at {
+            return Err(PortError::Invalid(
+                "broker registration lease is not current".to_owned(),
+            ));
+        }
+        if launch_grant.registration_digest != registration.registration_digest
+            || launch_grant.user_broker_epoch != registration.user_broker_epoch
+            || !launch_grant
+                .authority_epoch
+                .is_same_authority(&registration.authority_epoch)
+            || launch_grant.fence_id != registration.fence_id
+        {
+            return Err(PortError::Invalid(
+                "launch grant does not bind this broker registration".to_owned(),
+            ));
+        }
+        if observed_at >= launch_grant.expires_at {
+            return Err(PortError::Invalid(
+                "broker launch grant is not current".to_owned(),
+            ));
+        }
+        if let Some(fence) = fence {
+            if fence.registration_digest == registration.registration_digest {
+                return Err(PortError::Invalid(
+                    "broker registration is fenced".to_owned(),
+                ));
+            }
+            return Err(PortError::Invalid(
+                "fence receipt does not bind this broker registration".to_owned(),
+            ));
+        }
+        Ok(Self {
+            registration: registration.clone(),
+            heartbeat_grant: heartbeat_grant.clone(),
+            launch_grant: launch_grant.clone(),
+        })
+    }
+
+    /// Whether a current authenticated User Broker session is established.
+    ///
+    /// The bundle only exists after [`Self::bind`] proved the owner join, so
+    /// this re-checks what time can invalidate: the sealed lease, the
+    /// heartbeat renewal, and the launch grant must all still cover
+    /// `observed_at`. A logout, revocation, or expiry between the maintenance
+    /// decision and start/resume is therefore caught here instead of being
+    /// carried forward as a previously valid decision.
+    #[must_use]
+    pub(crate) fn authenticated_session_available(&self, observed_at: u64) -> bool {
+        self.registration.status == RegistrationStatus::Active
+            && observed_at != 0
+            && observed_at < self.registration.expires_at
+            && observed_at < self.heartbeat_grant.expires_at
+            && observed_at < self.launch_grant.expires_at
     }
 }
 
