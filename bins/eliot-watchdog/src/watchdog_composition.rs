@@ -564,6 +564,34 @@ impl WatchdogComposition {
                                 ObservationClass::ProcessIdentity,
                             );
                         }
+                        // I8.2 (#1755 W2): this tick's approved-artifact digest
+                        // is the live sample for the artifact half of the
+                        // ArtifactConfigIdentity channel. The digest is read
+                        // through the retained no-follow image lease and
+                        // hashed, never retained: bytes are event evidence,
+                        // not file contents. A refused probe records no
+                        // sample, so the channel stays UNKNOWN on denial and
+                        // PARTIAL while config identity has no reader — never
+                        // healthy-by-absence. Readiness stays explicitly
+                        // unprobed: a matching digest is integrity evidence,
+                        // not application readiness.
+                        if let Some(digest) = host.observe_approved_artifact(
+                            crate::independent_sensor::MAX_APPROVED_ARTIFACT_DIGEST_BYTES,
+                        ) {
+                            tracing::debug!(
+                                event = "watchdog.artifact_digest_observed",
+                                observation = "observed",
+                                digest = digest.digest(),
+                                bytes = digest.bytes(),
+                                readiness = digest.readiness().as_str(),
+                                "approved artifact digest bound to the retained installation generation"
+                            );
+                            record_coverage_sample(
+                                &coverage,
+                                ObservationChannel::ArtifactConfigIdentity,
+                                ObservationClass::ArtifactDigest,
+                            );
+                        }
                         let admission = match admission.reload() {
                             Ok(admission) => admission,
                             Err(error) => {

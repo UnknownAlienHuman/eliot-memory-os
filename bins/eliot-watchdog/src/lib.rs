@@ -63,6 +63,8 @@ mod diagnostics;
 mod health_projection;
 mod heartbeat_transport;
 mod host_identity_observation;
+mod independent_sensor;
+mod observation_attribution;
 mod observation_coverage;
 mod runtime_manifest_selection;
 mod scm_launch;
@@ -91,6 +93,14 @@ use host_identity_observation::read_host_registration_runtime;
 pub use host_identity_observation::{
     HostIdentityMonitor, HostObservation, HostObservationSource, HostObservationState,
     LiveHostObservationSource,
+};
+pub use independent_sensor::{
+    ApprovedSensorBinding, ArtifactDigestObservation, MAX_APPROVED_ARTIFACT_DIGEST_BYTES,
+    SensorBindingError, SensorProbeError, SensorReadiness, observe_approved_artifact_digest,
+};
+pub use observation_attribution::{
+    AttributionError, EventOrigin, FileChangeEvidence, RegisteredScope, ScopeMembership,
+    TaskAttribution, resolve_scope_membership,
 };
 use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
