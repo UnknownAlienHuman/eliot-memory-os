@@ -3,15 +3,154 @@
 //! opens or authenticates a second transport.
 
 use eliot_blob_api::wire::{
-    PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES, ProcessStreamSourceReadbackRequest,
-    ProcessStreamSourceReadbackResponse,
+    BLOB_PROCESS_STREAM_CAPABILITY, BlobProcessStreamFrameRequest,
+    BlobProcessStreamFrameResponse, BlobProcessStreamOperationRequest,
+    BlobProcessStreamOperationResponse, PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
+    ProcessStreamSinkWireRequest, ProcessStreamSinkWireResponse,
+    ProcessStreamSourceReadbackRequest, ProcessStreamSourceReadbackResponse,
 };
+use eliot_contracts::StateFence;
 use eliot_ipc::DeliveryOutcome;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity};
 
 use super::{EbpCanonicalStoreClient, EbpStoreTransport, StoreClientError};
 
 impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
+    /// Sends one exact operation over the separately negotiated Blob process-stream
+    /// capability, using this client's existing authenticated Store EBP session.
+    ///
+    /// The caller must provide the Kernel-issued per-operation request identity.
+    /// An uncertain frame is never retried here; the server retains the operation
+    /// identity and its exact outcome for a later reconciliation request.
+    pub async fn process_stream_exchange(
+        &self,
+        request: BlobProcessStreamFrameRequest,
+        identity: RequestIdentity,
+    ) -> Result<BlobProcessStreamFrameResponse, StoreClientError> {
+        request
+            .validate()
+            .map_err(|error| StoreClientError::Contract(error.to_string()))?;
+        identity
+            .validate()
+            .map_err(|error| StoreClientError::Contract(error.to_string()))?;
+        if !self.blob_process_stream_capability {
+            return Err(StoreClientError::Contract(format!(
+                "Store did not negotiate {BLOB_PROCESS_STREAM_CAPABILITY}"
+            )));
+        }
+        let (fence, deadline_ms) = match &request.operation {
+            BlobProcessStreamOperationRequest::Sink { request } => {
+                sink_request_identity(request)
+            }
+            BlobProcessStreamOperationRequest::SourceReadback { request } => {
+                (&request.fence, request.deadline_ms)
+            }
+        };
+        if fence != &identity.request.state_fence
+            || fence != &self.requirement.state_fence
+            || deadline_ms != identity.deadline_unix_ms
+        {
+            return Err(StoreClientError::Contract(
+                "Blob process-stream operation is outside the authenticated request fence or deadline"
+                    .to_owned(),
+            ));
+        }
+
+        let request_id = identity.request.metadata.request_id.clone();
+        let frame = Frame {
+            protocol_version: self.protocol_version,
+            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+            connection_id: self.requirement.connection_id.as_str().to_owned(),
+            request_id: Some(request_id.clone()),
+            kind: FrameKind::Request,
+            message_type: MessageType::Execute,
+            request_identity: Some(identity),
+            payload: ProtocolPayload::Json(serde_json::to_value(&request).map_err(|error| {
+                StoreClientError::Contract(format!(
+                    "Blob process-stream request serialization failed: {error}"
+                ))
+            })?),
+            trace_context: Default::default(),
+        };
+        frame
+            .validate()
+            .map_err(|error| StoreClientError::Contract(error.to_string()))?;
+
+        // Keep each request/response pair atomic on the shared connection.
+        let mut transport = self.transport.lock().await;
+        match transport.send_frame(&frame, self.limits).await {
+            Ok(DeliveryOutcome::Delivered) => {}
+            Ok(DeliveryOutcome::UnknownOutcome) | Err(_) => {
+                return Err(StoreClientError::Transport(
+                    "Blob process-stream exchange outcome is unknown".to_owned(),
+                ));
+            }
+        }
+        let response = transport.receive_frame(self.limits).await.map_err(|_| {
+            StoreClientError::Transport("Blob process-stream reply is unknown".to_owned())
+        })?;
+        let decoded = decode_blob_frame_response(
+            &response,
+            self.requirement.connection_id.as_str(),
+            self.protocol_version,
+            &request_id,
+        )?;
+        decoded
+            .validate()
+            .map_err(|error| StoreClientError::Contract(error.to_string()))?;
+        let expected_family_matches = matches!(
+            (&request.operation, &decoded.operation),
+            (
+                BlobProcessStreamOperationRequest::Sink { .. },
+                BlobProcessStreamOperationResponse::Sink { .. }
+            ) | (
+                BlobProcessStreamOperationRequest::SourceReadback { .. },
+                BlobProcessStreamOperationResponse::SourceReadback { .. }
+            )
+        );
+        if !expected_family_matches {
+            return Err(StoreClientError::Contract(
+                "Blob process-stream response operation differs from its request".to_owned(),
+            ));
+        }
+        Ok(decoded)
+    }
+
+    /// Sends one closed sink operation through the separately negotiated Blob
+    /// process-stream capability.
+    pub async fn process_stream_sink_exchange(
+        &self,
+        request: ProcessStreamSinkWireRequest,
+        identity: RequestIdentity,
+    ) -> Result<ProcessStreamSinkWireResponse, StoreClientError> {
+        request
+            .validate()
+            .map_err(|error| StoreClientError::Contract(error.to_string()))?;
+        let response = self
+            .process_stream_exchange(
+                BlobProcessStreamFrameRequest {
+                    wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),
+                    wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_REVISION,
+                    operation: BlobProcessStreamOperationRequest::Sink { request },
+                },
+                identity,
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(StoreClientError::Transport(_)) => {
+                return Ok(ProcessStreamSinkWireResponse::Unknown);
+            }
+            Err(error) => return Err(error),
+        };
+        let BlobProcessStreamOperationResponse::Sink { response } = response.operation else {
+            return Err(StoreClientError::Contract(
+                "Blob sink response had the wrong operation family".to_owned(),
+            ));
+        };
+        Ok(response)
+    }
+
     /// Sends one bounded semantic readback chunk over this client's existing
     /// authenticated Store EBP session.
     ///
@@ -40,48 +179,24 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             ));
         }
 
-        let request_id = identity.request.metadata.request_id.clone();
-        let frame = Frame {
-            protocol_version: self.protocol_version,
-            encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
-            connection_id: self.requirement.connection_id.as_str().to_owned(),
-            request_id: Some(request_id.clone()),
-            kind: FrameKind::Request,
-            message_type: MessageType::Execute,
-            request_identity: Some(identity),
-            payload: ProtocolPayload::Json(
-                serde_json::to_value(&request).map_err(|error| {
-                    StoreClientError::Contract(format!(
-                        "Blob readback request serialization failed: {error}"
-                    ))
-                })?,
-            ),
-            trace_context: Default::default(),
+        let exchange = self
+            .process_stream_exchange(
+                BlobProcessStreamFrameRequest {
+                    wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),
+                    wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_REVISION,
+                    operation: BlobProcessStreamOperationRequest::SourceReadback {
+                        request: request.clone(),
+                    },
+                },
+                identity,
+            )
+            .await;
+        let Ok(exchange) = exchange else {
+            return Ok(ProcessStreamSourceReadbackResponse::Unknown);
         };
-        frame
-            .validate()
-            .map_err(|error| StoreClientError::Contract(error.to_string()))?;
-
-        // Hold the existing connection lock across the whole exchange so a
-        // canonical Store request cannot interleave with its response.
-        let mut transport = self.transport.lock().await;
-        match transport.send_frame(&frame, self.limits).await {
-            Ok(DeliveryOutcome::Delivered) => {}
-            Ok(DeliveryOutcome::UnknownOutcome) | Err(_) => {
-                return Ok(ProcessStreamSourceReadbackResponse::Unknown);
-            }
-        }
-        let response = match transport.receive_frame(self.limits).await {
-            Ok(response) => response,
-            Err(_) => return Ok(ProcessStreamSourceReadbackResponse::Unknown),
-        };
-        let decoded = decode_blob_response(
-            &response,
-            self.requirement.connection_id.as_str(),
-            self.protocol_version,
-            &request_id,
-        );
-        let Ok(decoded) = decoded else {
+        let BlobProcessStreamOperationResponse::SourceReadback { response: decoded } =
+            exchange.operation
+        else {
             return Ok(ProcessStreamSourceReadbackResponse::Unknown);
         };
         if !valid_chunk_response(&request, &decoded) {
@@ -91,12 +206,12 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     }
 }
 
-fn decode_blob_response(
+fn decode_blob_frame_response(
     frame: &Frame,
     expected_connection_id: &str,
     expected_protocol: eliot_protocol::ProtocolVersion,
     expected_request_id: &eliot_contracts::RequestId,
-) -> Result<ProcessStreamSourceReadbackResponse, StoreClientError> {
+) -> Result<BlobProcessStreamFrameResponse, StoreClientError> {
     frame
         .validate()
         .map_err(|error| StoreClientError::Contract(error.to_string()))?;
@@ -119,6 +234,19 @@ fn decode_blob_response(
     };
     serde_json::from_value(payload.clone())
         .map_err(|error| StoreClientError::Contract(error.to_string()))
+}
+
+fn sink_request_identity(request: &ProcessStreamSinkWireRequest) -> (&StateFence, u64) {
+    match request {
+        ProcessStreamSinkWireRequest::Open { fence, deadline_ms, .. }
+        | ProcessStreamSinkWireRequest::Append { fence, deadline_ms, .. }
+        | ProcessStreamSinkWireRequest::Finalize { fence, deadline_ms, .. }
+        | ProcessStreamSinkWireRequest::Abort { fence, deadline_ms, .. }
+        | ProcessStreamSinkWireRequest::Readback { fence, deadline_ms, .. }
+        | ProcessStreamSinkWireRequest::Reconcile { fence, deadline_ms, .. } => {
+            (fence, *deadline_ms)
+        }
+    }
 }
 
 fn valid_chunk_response(
