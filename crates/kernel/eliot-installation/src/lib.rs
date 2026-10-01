@@ -1157,10 +1157,141 @@ pub struct OpenCodeAdapterArtifact {
     pub artifact_path: PlatformHandle,
     /// SHA-256 of the exact staged plugin source bytes.
     pub artifact_digest: PlatformHandle,
+    /// Independent expected native lifecycle event classes decoded from the
+    /// exact signed capability descriptor bytes. This is an installation
+    /// owner manifest, never a caller's list of received events.
+    pub native_event_classes: Vec<String>,
+    /// Independent expected native hook classes decoded from the same exact
+    /// signed descriptor. Runtime observation remains separate evidence.
+    pub native_hook_classes: Vec<String>,
     /// Staged source-issued capability descriptor path.
     pub descriptor_path: PlatformHandle,
     /// SHA-256 of the exact staged capability descriptor bytes.
     pub descriptor_digest: PlatformHandle,
+}
+
+impl OpenCodeAdapterArtifact {
+    /// Validates the independent denominator carried into the signed
+    /// candidate/profile record.
+    pub fn validate_event_manifest(&self) -> Result<(), InstallationError> {
+        let expected_events = [
+            "session.created",
+            "session.compacted",
+            "session.error",
+            "session.idle",
+            "permission.asked",
+            "permission.replied",
+            "file.edited",
+            "todo.updated",
+        ];
+        let expected_hooks = ["tool.execute.before", "tool.execute.after"];
+        if self.native_event_classes.len() != expected_events.len()
+            || self
+                .native_event_classes
+                .iter()
+                .zip(expected_events)
+                .any(|(actual, expected)| actual != expected)
+            || self.native_hook_classes.len() != expected_hooks.len()
+            || self
+                .native_hook_classes
+                .iter()
+                .zip(expected_hooks)
+                .any(|(actual, expected)| actual != expected)
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+
+    /// Parses the owner-issued event denominator from the exact capability
+    /// descriptor bytes and binds them to the admitted descriptor digest.
+    /// Unknown schemas, classes, ordering, or content are refused; this
+    /// manifest cannot be reconstructed from submitted event rows.
+    pub fn event_manifest_from_descriptor(
+        bytes: &[u8],
+        expected_descriptor_digest: &PlatformHandle,
+    ) -> Result<(Vec<String>, Vec<String>), InstallationError> {
+        if sha256_hex(bytes) != expected_descriptor_digest.as_str() {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let descriptor: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            InstallationError::InvalidField {
+                field: "opencode_adapter.descriptor".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        if descriptor.get("schema_version").and_then(serde_json::Value::as_str)
+            != Some("eliot.opencode-plugin-bridge.v1")
+            || descriptor.get("surface").and_then(serde_json::Value::as_str)
+                != Some("integrations/opencode/plugins/eliot.js")
+            || descriptor.get("authority_ceiling").and_then(serde_json::Value::as_str)
+                != Some("candidate_only")
+        {
+            return Err(InstallationError::IdentityConflict);
+        }
+        let passive = descriptor
+            .get("passive_observation")
+            .ok_or(InstallationError::IdentityConflict)?;
+        let events = exact_string_array(
+            passive
+                .get("native_event_classes")
+                .ok_or(InstallationError::IdentityConflict)?,
+            &[
+                "session.created",
+                "session.compacted",
+                "session.error",
+                "session.idle",
+                "permission.asked",
+                "permission.replied",
+                "file.edited",
+                "todo.updated",
+            ],
+            "opencode_adapter.native_event_classes",
+        )?;
+        let hooks = exact_string_array(
+            passive
+                .get("native_hook_classes")
+                .ok_or(InstallationError::IdentityConflict)?,
+            &["tool.execute.before", "tool.execute.after"],
+            "opencode_adapter.native_hook_classes",
+        )?;
+        Ok((events, hooks))
+    }
+
+    /// Revalidates the stored class denominator against the retained exact
+    /// descriptor at the Broker admission boundary.
+    pub fn validate_descriptor_bytes(&self, bytes: &[u8]) -> Result<(), InstallationError> {
+        self.validate_event_manifest()?;
+        let (events, hooks) =
+            Self::event_manifest_from_descriptor(bytes, &self.descriptor_digest)?;
+        if events != self.native_event_classes || hooks != self.native_hook_classes {
+            return Err(InstallationError::IdentityConflict);
+        }
+        Ok(())
+    }
+}
+
+fn exact_string_array(
+    value: &serde_json::Value,
+    expected: &[&str],
+    field: &str,
+) -> Result<Vec<String>, InstallationError> {
+    let values = value
+        .as_array()
+        .ok_or(InstallationError::IdentityConflict)?;
+    if values.len() != expected.len()
+        || values
+            .iter()
+            .zip(expected)
+            .any(|(actual, expected)| actual.as_str() != Some(expected))
+    {
+        return Err(InstallationError::InvalidField {
+            field: field.to_owned(),
+            reason: "descriptor class set differs from the admitted native adapter owner specification"
+                .to_owned(),
+        });
+    }
+    Ok(expected.iter().map(|value| (*value).to_owned()).collect())
 }
 
 /// Strict Phase-B state for the installer-provisioned supervision authority.
@@ -2533,6 +2664,7 @@ impl RuntimeLaunchDescriptor {
         }
         self.validate_canonical_store_arguments()?;
         if let Some(adapter) = &self.opencode_adapter {
+            adapter.validate_event_manifest()?;
             for (path, filename, path_field, digest, digest_field) in [
                 (
                     &adapter.artifact_path,
@@ -2620,6 +2752,7 @@ impl CandidateManifest {
             "manifest.wasm_host_artifact_digest",
         )?;
         if let Some(adapter) = &self.opencode_adapter {
+            adapter.validate_event_manifest()?;
             let immutable_root = lexical_windows_path(
                 &self.runtime_launch.profile_governed_roots.immutable_binaries,
             )

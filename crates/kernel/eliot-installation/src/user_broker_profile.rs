@@ -245,6 +245,7 @@ impl UserBrokerInstallationProfile {
             "user_broker.broker_artifact_sha256",
         )?;
         if let Some(adapter) = &self.opencode_adapter {
+            adapter.validate_event_manifest()?;
             for (path, filename, path_field, digest, digest_field) in [
                 (
                     &adapter.artifact_path,

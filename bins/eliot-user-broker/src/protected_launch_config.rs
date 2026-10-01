@@ -417,6 +417,11 @@ fn load_admitted_installation_profile(
                         .to_owned(),
                 ));
             }
+            if path == &adapter.descriptor_path {
+                adapter
+                    .validate_descriptor_bytes(&artifact_bytes)
+                    .map_err(|error| CompositionError::Launch(error.to_string()))?;
+            }
             adapter_leases.push(artifact_lease);
         }
     }

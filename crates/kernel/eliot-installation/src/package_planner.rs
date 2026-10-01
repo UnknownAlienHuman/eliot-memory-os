@@ -1924,10 +1924,35 @@ impl GenerationPackagePlanner {
         let native_worker_digest = digest_for("eliot-native-worker.exe")?;
         let wasm_host_digest = digest_for("eliot-wasm-host.exe")?;
         let user_broker_digest = digest_for(USER_BROKER_STAGED_ROLE)?;
+        let opencode_event_manifest = if include_opencode_adapter {
+            let descriptor_digest = digest_for(OPENCODE_ADAPTER_ROLES[1].0)?;
+            let descriptor_lease = source
+                .retain_file(OPENCODE_ADAPTER_ROLES[1].0)
+                .map_err(|error| {
+                    InstallationError::Platform(format!(
+                        "retain OpenCode capability descriptor through planning: {error}"
+                    ))
+                })?;
+            let descriptor_bytes = descriptor_lease.read_bounded(256 * 1024).map_err(|error| {
+                InstallationError::Platform(format!(
+                    "read OpenCode capability descriptor lease: {error}"
+                ))
+            })?;
+            Some(OpenCodeAdapterArtifact::event_manifest_from_descriptor(
+                &descriptor_bytes,
+                &descriptor_digest,
+            )?)
+        } else {
+            None
+        };
         let opencode_adapter = if include_opencode_adapter {
+            let (native_event_classes, native_hook_classes) = opencode_event_manifest
+                .ok_or(InstallationError::IdentityConflict)?;
             Some(OpenCodeAdapterArtifact {
                 artifact_path: destination(OPENCODE_ADAPTER_ROLES[0].0)?,
                 artifact_digest: digest_for(OPENCODE_ADAPTER_ROLES[0].0)?,
+                native_event_classes,
+                native_hook_classes,
                 descriptor_path: destination(OPENCODE_ADAPTER_ROLES[1].0)?,
                 descriptor_digest: digest_for(OPENCODE_ADAPTER_ROLES[1].0)?,
             })
