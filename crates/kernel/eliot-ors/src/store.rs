@@ -20080,8 +20080,8 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
-    /// Re-anchors a missing or stale-view drain resume at the certified prefix
-    /// start (issue #2730, audit 5845038022): the scan restarts at
+    /// Re-anchors a missing or stale-view drain resume at the certified window
+    /// (issue #2730, audit 5845038022): the scan restarts at
     /// `after = 0` while an earlier entry already drained and deleted the
     /// certified prefix below the first retained position, so the
     /// `resume + 1` guard would stop forever on the first entry and
@@ -20089,11 +20089,24 @@ impl RedbRecoveryStore {
     /// row and never updated, and a sequence at or below the compacted
     /// boundary is never re-admitted as fresh
     /// (`check_bridge_retained_replay_in` answers the retired disposition
-    /// there), so a leading gap fully covered by the certified compacted
-    /// range of this exact owner incarnation and stream is already-drained
-    /// history: resume past it. A leading gap the certified range does not
-    /// cover keeps the fail-closed resume, so an unexplained hole is never
-    /// skipped and no deletion ever leaves the certified boundary.
+    /// there, keyed on `cursor.last_compacted_sequence`, untouched here),
+    /// so a leading gap below the first retained position inside the
+    /// certified window of this exact owner incarnation and stream is
+    /// already-drained history: resume past it. The stored row is windowed
+    /// per extension (`certify_bridge_compacted_range_in` overwrites it as
+    /// `[caller_start..=end]` chained via `predecessor_end_sequence`, so
+    /// cycle 2 is `{start:65,end:128}`, not cumulative from 1); requiring
+    /// `start <= after + 1` would demand `65 <= 1` forever from cycle 2 on.
+    /// The predicate therefore covers the certified window (`start <= first`
+    /// with `first - 1 <= end`) instead of the stale `after` origin: genesis
+    /// starts at 1 and each extension continues exactly at
+    /// `stored.end + 1`, so `[1..=end]` is contiguously certified by
+    /// induction and any gap below `first` is deleted history from an
+    /// earlier slice. A leading gap the certified range does not cover
+    /// (`first - 1 > end`, wrong owner/incarnation/stream) keeps the
+    /// fail-closed resume, so an unexplained hole is never skipped and no
+    /// deletion ever leaves the certified boundary (the drain still only
+    /// removes `<= compacted` rows whose record and handoff are both gone).
     fn anchor_drain_resume_to_certified_prefix(
         write: &redb::WriteTransaction,
         access: &BridgeStreamAccess,
@@ -20123,7 +20136,7 @@ impl RedbRecoveryStore {
                 range.owner_namespace == access.namespace
                     && range.stream_id == owner.local_stream
                     && range.owner_incarnation == owner.incarnation
-                    && range.start_sequence <= after.saturating_add(1)
+                    && range.start_sequence <= first
                     && first.saturating_sub(1) <= range.end_sequence
             }
             None => false,
