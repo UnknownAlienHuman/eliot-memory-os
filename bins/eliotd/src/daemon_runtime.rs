@@ -4590,6 +4590,26 @@ async fn run_local_read_poll(
     // read can never poison the poller or drop a pair. The composition guard is
     // held only around the read; it never crosses the submit leg.
     //
+    // #1213 Link 2 CORRECTION: the four gates enumerated below were re-read
+    // against the current source, and the claim that this branch is unreachable
+    // for `controlboard.read` is no longer true. Gate 1
+    // (`host_request_route::local_read_admission_from_tool`) now admits it,
+    // gate 2 (`KernelComposition::claim_local_read_pair`) now claims it, gate 3
+    // (`DaemonKernelClient::claim_local_read_pair_async`) now accepts it, and
+    // gate 4 (`submit_claimed_result`) now accepts its capability and applies
+    // the same stricter explicit-lineage requirement as the query lane. All
+    // four moved in one change, so there is no window in which the Kernel hands
+    // this poller a pair gate 3 refuses.
+    //
+    // WHAT IS STILL NOT REACHABLE, precisely: no producer presents a
+    // `controlboard.read` host request. `ADMITTED_TOOL_NAMES`
+    // (`crates/surfaces/eliot-mcp/src/contract.rs`) is a closed eight-name set
+    // that does not carry it, and the Operator's own closed set
+    // (`apps/Eliot.Operator/Protocol/OperatorIntent.cs::LegacyOperatorAdapter::AdmittedTools`)
+    // does not carry it either. The branch below is therefore reachable from
+    // the Kernel admission arm but unreachable from any in-repository caller.
+    // Claiming a production caller here would be false.
+    //
     // NOT REACHABLE AT RUNTIME for `operator.command` (#1187 piece C,
     // re-verified against the current source of both crates). No production
     // `operator.command` pair can reach the predicate below. The shared local-read carrier

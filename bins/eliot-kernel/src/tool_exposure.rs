@@ -54,6 +54,14 @@ fn route_fingerprint(
             ..
         } => format!("{base}:packet:{task_id}:{task_revision}"),
         LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => base,
+        // #1213 Link 2: the control-board read joins the admitted session, the
+        // identity its board view is role-filtered by. Two sessions reading the
+        // board are two routes, so a repeat under one session is never compared
+        // against — or excused by — another session's read. The value comes
+        // from the accepted admission, never caller tool text.
+        LocalReadAdmission::ControlBoardRead { session_id } => {
+            format!("{base}:control-board:{session_id}")
+        }
     }
 }
 
@@ -64,10 +72,20 @@ fn route_fingerprint(
 /// query is broad-search, an exact Skill lifecycle tool is expensive, and a
 /// task-bound campaign packet is effect-capable. A name outside the admitted
 /// set never reaches classification; admission fails closed first.
+///
+/// #1213 Link 2: the control-board read is `Expensive`, like the Skill arm.
+/// `Expensive` and `BroadSearch` are gate-equivalent — both require an intent
+/// and neither requires a durable operation identity — so this is the same
+/// admission strength as the query and Skill arms, not a weaker class. It is
+/// deliberately NOT `EffectCapable`: the board read dispatches no effect, so
+/// claiming that class would both overstate the call and demand a durable
+/// operation identity no producer has any owner-issued source for.
 pub(crate) fn call_class(admission: &LocalReadAdmission) -> ToolCallClass {
     match admission {
         LocalReadAdmission::Query(_) => ToolCallClass::BroadSearch,
-        LocalReadAdmission::Skill => ToolCallClass::Expensive,
+        LocalReadAdmission::Skill | LocalReadAdmission::ControlBoardRead { .. } => {
+            ToolCallClass::Expensive
+        }
         LocalReadAdmission::CampaignPacket { .. } => ToolCallClass::EffectCapable,
     }
 }
@@ -390,6 +408,15 @@ fn admission_source(admission: &LocalReadAdmission) -> String {
     match admission {
         LocalReadAdmission::Query(_) => "local-read-admission:query".to_owned(),
         LocalReadAdmission::Skill => "local-read-admission:skill".to_owned(),
+        // #1213 Link 2: a distinct reference, never the Skill one. The
+        // exposure evidence names the admission it came from, so reusing
+        // `skill` here would record a control-board read as a Skill call. The
+        // admitted session is named for the same reason the campaign packet
+        // names its task identity: this is the identity the read was admitted
+        // under, and an unnamed one would make the owner source ambiguous.
+        LocalReadAdmission::ControlBoardRead { session_id } => {
+            format!("local-read-admission:control-board:{session_id}")
+        }
         LocalReadAdmission::CampaignPacket {
             task_id,
             task_revision,

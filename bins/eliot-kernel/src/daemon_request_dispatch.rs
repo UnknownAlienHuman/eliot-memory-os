@@ -9983,11 +9983,14 @@ impl KernelComposition {
         let selectors = match admission {
             host_request_route::LocalReadAdmission::Query(selectors) => selectors,
             host_request_route::LocalReadAdmission::CampaignPacket { .. }
-            | host_request_route::LocalReadAdmission::Skill => {
+            | host_request_route::LocalReadAdmission::Skill
+            | host_request_route::LocalReadAdmission::ControlBoardRead { .. } => {
                 // `local_read` is the query-only Gateway leg. A campaign
                 // packet has its dedicated claim/compile/result flight; Skill
-                // tools are served by the daemon's Skill dispatcher. Neither
-                // may be reinterpreted as `GetEvidencePack` selectors.
+                // tools are served by the daemon's Skill dispatcher; the
+                // control-board read is served by the daemon's composed
+                // `ControlBoard`. None may be reinterpreted as
+                // `GetEvidencePack` selectors.
                 return Err(TransportError::SessionFenced);
             }
         };

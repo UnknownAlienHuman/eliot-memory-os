@@ -59,7 +59,7 @@ use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
-use eliot_contracts::{BridgeRecoverySelector, RequestId};
+use eliot_contracts::{BridgeRecoverySelector, RequestId, SessionId};
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, KernelHostRequestBinder, KernelServiceState,
@@ -1572,6 +1572,14 @@ impl KernelComposition {
                     self.enqueue_local_read_pair_under_transition(envelope, tool)?;
                     Some("skill")
                 }
+                // #1213 Link 2: the control-board read is a read, so it takes
+                // the same read-only local-read carrier as the query and Skill
+                // lanes and stays exempt from the material-authority rejoin
+                // exactly as they are. Routing carries no visibility input.
+                Ok(LocalReadAdmission::ControlBoardRead { .. }) => {
+                    self.enqueue_local_read_pair_under_transition(envelope, tool)?;
+                    Some("control-board")
+                }
                 Ok(admission @ LocalReadAdmission::CampaignPacket { .. }) => {
                     // A2: the effect-capable (Material) lane re-joins the live
                     // Governor-issued material authority before dispatch. A
@@ -1749,6 +1757,7 @@ impl KernelComposition {
         let lane = match check_local_read_admission(envelope, tool) {
             Ok(LocalReadAdmission::Query(_)) => Some("query"),
             Ok(LocalReadAdmission::Skill) => Some("skill"),
+            Ok(LocalReadAdmission::ControlBoardRead { .. }) => Some("control-board"),
             Ok(LocalReadAdmission::CampaignPacket { .. }) => Some("campaign-packet"),
             Err(_) => match check_local_state_admission(envelope, tool) {
                 Ok(_) => Some("state"),
@@ -3107,7 +3116,9 @@ impl KernelComposition {
     ) -> Result<(), TransportError> {
         let admission = check_local_read_admission(envelope, tool)?;
         match admission {
-            LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {}
+            LocalReadAdmission::Query(_)
+            | LocalReadAdmission::Skill
+            | LocalReadAdmission::ControlBoardRead { .. } => {}
             LocalReadAdmission::CampaignPacket { .. } => {
                 return Err(TransportError::SessionFenced);
             }
@@ -3435,7 +3446,11 @@ impl KernelComposition {
                 // its dedicated queue and no arbitrary tool becomes claimable.
                 if !matches!(
                     check_local_read_admission(envelope, tool),
-                    Ok(LocalReadAdmission::Query(_) | LocalReadAdmission::Skill)
+                    Ok(
+                        LocalReadAdmission::Query(_)
+                            | LocalReadAdmission::Skill
+                            | LocalReadAdmission::ControlBoardRead { .. }
+                    )
                 ) {
                     continue;
                 }
@@ -3858,12 +3873,17 @@ impl KernelComposition {
         let capability = stored.capability_ref.as_str();
         let queue_matches_capability = match queue {
             DaemonReadQueue::LocalRead => {
-                capability == "eliot.query" || is_skill_lifecycle_tool(capability)
+                capability == "eliot.query"
+                    || is_skill_lifecycle_tool(capability)
+                    || capability == CONTROLBOARD_READ_CAPABILITY
             }
             DaemonReadQueue::CampaignPacket => capability == "eliot.packet",
         };
         let lane = match queue {
             DaemonReadQueue::LocalRead if capability == "eliot.query" => "query",
+            DaemonReadQueue::LocalRead if capability == CONTROLBOARD_READ_CAPABILITY => {
+                "control-board"
+            }
             DaemonReadQueue::LocalRead => "skill",
             DaemonReadQueue::CampaignPacket => "campaign-packet",
         };
@@ -3901,7 +3921,13 @@ impl KernelComposition {
         self.audit_observe(AuditEventDraft::result_native_raw_appended(
             session, body, &stored, None, lane,
         ));
-        if capability == "eliot.query" {
+        // #1213 Link 2: the control-board read is a local-read-lane
+        // submission, so it takes the same stricter explicit-lineage
+        // requirement as the query lane rather than the weaker
+        // lineage-optional shape other producers may submit. Its producer
+        // already sets `lineage` on both the bound and the unbound-refusal arm,
+        // so this tightens the gate without inventing a field.
+        if capability == "eliot.query" || capability == CONTROLBOARD_READ_CAPABILITY {
             body.validate_local_read_submission()
                 .map_err(|_| TransportError::SessionFenced)?;
         } else {
@@ -9208,12 +9234,23 @@ pub(crate) struct LocalReadSelectors {
 /// like a query, but it is never converted into an evidence-pack selector.
 /// The four exact Skill lifecycle tools use the local-read carrier while
 /// retaining their original tool bytes for the daemon Skill dispatcher.
+/// `controlboard.read` is the operator board read: it rides the same carrier
+/// for the same reason, and its original tool bytes are retained for the
+/// daemon's composed `ControlBoard` read rather than for a store selector.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum LocalReadAdmission {
     /// A bounded evidence query.
     Query(LocalReadSelectors),
     /// An exact Skill lifecycle tool with a digest-linked envelope.
     Skill,
+    /// The operator control-board read, bound to the admitted session and the
+    /// trusted scope it is read under.
+    ///
+    /// The session is carried because it is the identity the board's access
+    /// resolver filters on, so it is part of what this admission proves rather
+    /// than a label: a pair whose envelope names no session can never be
+    /// role-resolved and is refused here instead of one link downstream.
+    ControlBoardRead { session_id: SessionId },
     /// A task-bound campaign packet with its trusted scope, task, and exact
     /// task revision admitted before it can enter the queue.
     CampaignPacket {
@@ -9228,6 +9265,82 @@ fn is_skill_lifecycle_tool(name: &str) -> bool {
         name,
         "skill.inject" | "skill.display" | "skill.activate" | "skill.execute"
     )
+}
+
+/// Whether one tool name is the operator control-board read capability.
+///
+/// The literal is pinned in this runtime root rather than imported: the broker
+/// that issues the capability is `eliot_user_broker_core::OPERATOR_CAPABILITIES`
+/// and the board projection that consumes it is
+/// `eliot_runtime_status::controlboard_projection`. Neither is a Kernel
+/// dependency, and a third import edge would add one without changing a byte on
+/// the wire. The Kernel does not issue this capability: it only admits a pair
+/// whose presented tool name already equals the Kernel-validated
+/// `envelope.identity.capability`, so this predicate is a route selector and
+/// never a grant.
+const CONTROLBOARD_READ_CAPABILITY: &str = "controlboard.read";
+
+/// Derives the authenticated control-board admission from one linked
+/// envelope+tool pair.
+///
+/// This is the strongest of the local-read arms, and it is deliberately not
+/// the weakest. It runs after the shared invoke-read linkage gate
+/// ([`HostRequestInvokeReadPayload`]), so the envelope shape, the canonical
+/// tool name, the exact tool-name/envelope-capability equality and the
+/// presented-payload digest are already proven before this runs. On top of that
+/// it requires, all of which the query and Skill arms do not all require:
+///
+/// * an exact `controlboard.read` tool name AND exact envelope-capability
+///   equality, the same double binding the query and Skill arms apply;
+/// * a non-blank, control-free `session_id`, because the board read is
+///   role-filtered and the daemon's read intent refuses any envelope whose
+///   session is not the admitted attempt's session — so a sessionless pair is
+///   unresolvable by construction and is refused here, at admission, rather
+///   than one link downstream as an opaque unauthorized;
+/// * the same trusted Kernel-issued scope the query arm requires (work scope
+///   else session — never an MCP argument), because the attempt capability
+///   minted for this pair is scoped and a scopeless pair could be staged only
+///   to fail at claim;
+/// * a closed argument shape: `controlboard.read` declares no selector, so any
+///   argument other than the gate's own `intent` block is refused. A caller
+///   cannot smuggle a `revision`, `fence` or `role` argument that the board
+///   read would silently ignore, which is the same refusal discipline the
+///   query arm applies to `exact_resource_uri`.
+///
+/// Pure: deriving the admission performs no store IO, so every refusal above
+/// happens before any read, claim, or dispatch.
+fn controlboard_read_admission(
+    envelope: &HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<LocalReadAdmission, TransportError> {
+    let object = tool.as_object().ok_or(TransportError::SessionFenced)?;
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(TransportError::SessionFenced)?;
+    if name != CONTROLBOARD_READ_CAPABILITY || envelope.identity.capability != name {
+        return Err(TransportError::SessionFenced);
+    }
+    let session_text = envelope
+        .identity
+        .session_id
+        .as_deref()
+        .filter(|session| !session.trim().is_empty() && !session.chars().any(char::is_control))
+        .ok_or(TransportError::SessionFenced)?;
+    let session_id = SessionId::new(session_text).map_err(|_| TransportError::SessionFenced)?;
+    // The trusted scope is proven and not carried: the board read selects no
+    // store rows, so there is nothing to bind it to, but the scoped attempt
+    // capability minted for this pair is. Proving it here turns a scopeless
+    // pair into an admission refusal instead of a stage-then-fail-at-claim.
+    trusted_local_read_scope(envelope)?;
+    let arguments = object
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TransportError::SessionFenced)?;
+    if arguments.keys().any(|key| key != "intent") {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(LocalReadAdmission::ControlBoardRead { session_id })
 }
 
 /// Derives the closed query selectors from one linked envelope+tool pair.
@@ -9335,6 +9448,13 @@ pub(crate) fn local_read_admission_from_tool(
         name if is_skill_lifecycle_tool(name) && envelope.identity.capability == name => {
             Ok(LocalReadAdmission::Skill)
         }
+        // #1213 Link 2: the operator control-board read. Placed above the
+        // catch-all so the refusal below still covers every unrecognised name,
+        // and it runs through the same invoke-read linkage gate, the same
+        // intent requirement and the same pre-dispatch authorization as the
+        // arms above — `controlboard_read_admission` adds the session binding
+        // and the closed argument shape on top.
+        CONTROLBOARD_READ_CAPABILITY => controlboard_read_admission(envelope, tool),
         _ => Err(TransportError::SessionFenced),
     }?;
     if super::tool_exposure::requires_intent(&admission) {

@@ -2505,7 +2505,15 @@ fn decode_preview_reply(
     match value.get("preview")?.as_str()? {
         "dry_run_preview" => {
             let lane = value.get("lane")?.as_str()?;
-            if !matches!(lane, "query" | "skill" | "campaign-packet" | "state") {
+            // #1213 Link 2: `control-board` joins the closed lane set the
+            // Kernel can answer a dry-run preview for. Without it a previewed
+            // control-board read would decode to `None` here and be reported
+            // as no preview at all, so the Kernel's admitted lane and this
+            // consumer's accepted set must move together.
+            if !matches!(
+                lane,
+                "query" | "skill" | "campaign-packet" | "state" | "control-board"
+            ) {
                 return None;
             }
             Some(OwnerDryRunPreview {

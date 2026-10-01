@@ -100,7 +100,9 @@ impl KernelComposition {
         let admission = check_local_read_admission(envelope, tool)?;
         match admission {
             LocalReadAdmission::CampaignPacket { .. } => {}
-            LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {
+            LocalReadAdmission::Query(_)
+            | LocalReadAdmission::Skill
+            | LocalReadAdmission::ControlBoardRead { .. } => {
                 return Err(TransportError::SessionFenced);
             }
         }

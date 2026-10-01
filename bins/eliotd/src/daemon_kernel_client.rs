@@ -949,10 +949,11 @@ pub fn parse_finish_submit_outcome(
 /// any read or submit touches them. A pair without an attempt fails closed:
 /// absent authority is never invented. This shared parser preserves the
 /// decoded tool shape; [`DaemonKernelClient::claim_local_read_pair_async`]
-/// accepts `eliot.query` and exactly the Skill names recognized by
-/// `eliot_agent_bridge_core::skill_tool_kind`, each only when its name equals
-/// the envelope capability. `eliot.packet` remains on the separate campaign
-/// packet claim.
+/// accepts `eliot.query`, exactly the Skill names recognized by
+/// `eliot_agent_bridge_core::skill_tool_kind`, and exactly the
+/// `controlboard.read` capability literal exported as `CONTROLBOARD_READ_CAPABILITY` (#1213),
+/// each only when its name equals the envelope capability. `eliot.packet`
+/// remains on the separate campaign packet claim.
 pub fn parse_local_read_claimed_pair(
     value: &serde_json::Value,
 ) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
@@ -2630,11 +2631,22 @@ impl DaemonKernelClient {
         Ok(response)
     }
 
-    /// Claims one queued admitted `eliot.query` or Skill pair for the
-    /// outbound local-read poller and local Skill dispatch (issue #1882).
+    /// Claims one queued admitted `eliot.query`, Skill, or `controlboard.read`
+    /// pair for the outbound local-read poller, local Skill dispatch, and the
+    /// composed `ControlBoard` read (issues #1882, #1213).
     /// Skill names are exactly those recognized by
-    /// `eliot_agent_bridge_core::skill_tool_kind`; every pair must have an
-    /// exact tool-name/envelope-capability match.
+    /// `eliot_agent_bridge_core::skill_tool_kind`; the control-board name is
+    /// exactly the `controlboard.read` literal exported as
+    /// `CONTROLBOARD_READ_CAPABILITY`;
+    /// every pair must have an exact tool-name/envelope-capability match.
+    ///
+    /// #1213 Link 2: the Kernel now admits and claims `controlboard.read`, so
+    /// this gate MUST admit it too. Leaving it closed while the Kernel claims
+    /// the pair would hand this poller a pair it refuses, and a refused claim is
+    /// a step failure that `settle_local_read_completion` escalates into a
+    /// failed daemon — a live wrong-shape path, not a refusal. The exact
+    /// capability match keeps this a capability-identity test: it can never be
+    /// true for a pair admitted under another capability.
     ///
     /// Mirrors
     /// [`claim_agent_activation_ticket`](Self::claim_agent_activation_ticket):
@@ -2664,7 +2676,9 @@ impl DaemonKernelClient {
         if pair.as_ref().is_some_and(|(envelope, tool, _)| {
             let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
             !tool_name.is_some_and(|name| {
-                (name == "eliot.query" || eliot_agent_bridge_core::skill_tool_kind(name).is_some())
+                (name == "eliot.query"
+                    || eliot_agent_bridge_core::skill_tool_kind(name).is_some()
+                    || name == super::CONTROLBOARD_READ_CAPABILITY)
                     && envelope.identity.capability == name
             })
         }) {
