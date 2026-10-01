@@ -5692,6 +5692,12 @@ impl BridgeRunner {
     /// Fails closed on non-canonical URIs and on republishing an immutable
     /// URI with different bytes, so a handle always resolves to the exact
     /// bytes its digest names.
+    ///
+    /// Production caller (I7.18 attach-time owner-serve path):
+    /// [`restore_reactive_runtime`](crate::reactive_runtime_composition::restore_reactive_runtime)
+    /// feeds every served snapshot through this call after grammar
+    /// validation, so a published URI is always owner-served and scope-bound
+    /// to the live attach.
     pub fn publish_canonical_resource(
         &mut self,
         uri: &ResourceUri,
@@ -5717,6 +5723,19 @@ impl BridgeRunner {
     /// and `delivery` is the owner's observed delivery state. Only a `FULL`
     /// delivery satisfies a complete-evidence prerequisite (see
     /// [`ToolResultReceipt::check_complete_evidence`]).
+    ///
+    /// STITCH (I7.24 production receipt, issue #1941 AUD2 PARTIAL): the
+    /// production receipt slot withholds until a route owner attests. No
+    /// production path emits a
+    /// [`TokenMeasurementPayload`](eliot_agent_bridge_core::TokenMeasurementPayload)
+    /// (constructors exist only in `route_token_measurement` tests), and no
+    /// production caller feeds payload, admission, and execution binding
+    /// into
+    /// [`AgentBridgeCore::project_produced_tool_result`](eliot_agent_bridge_core::AgentBridgeCore::project_produced_tool_result)
+    /// to populate the invocation receipt slot (that caller is the binary
+    /// `main.rs` delivery recording). Until that leg lands, this entry
+    /// takes only caller-supplied counts and the slot stays empty rather
+    /// than estimating.
     pub fn project_tool_result_receipt(
         &self,
         result_bytes: &[u8],
