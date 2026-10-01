@@ -22,6 +22,23 @@ never safe; missing owner/contract/profile blocks dispatch without blocking
 inventory completion. Unknown/unsupported rows are explicit evidence, never
 empty success.
 
+Freshness and integrity:
+
+- The denominator separates the *scan universe* (tracked source path identity,
+  no bytes) from the *source digest*, which is derived from each row's own
+  exact per-row input digest. An unrelated tracked source file that produces no
+  row therefore cannot invalidate the inventory; a change to a row's span,
+  file, callers, profile, legacy source, rule or owner map always does.
+- ``aggregate_digest`` is the digest of the canonical projection of the
+  rendered artifact text, and ``check`` recomputes it from the stored file
+  itself. Every load-bearing row and allocation field is inside that payload,
+  so a hand edit to an owner, readiness, caller, classification, allocation,
+  profile/limit, fixture or invalidation field fails closed.
+- ``base_sha`` records the commit the writer stood on. It cannot equal the
+  commit that carries the artifact, so it is explicitly classified as
+  informational and outside the proof ceiling; the validated input digests are
+  the evidence. The artifact never appears in its own input universe.
+
 Proof ceiling: SOURCE_INVENTORY_AND_OWNERSHIP_ONLY. Findings remain blocking
 for #710; this artifact never certifies decoder safety, runtime closure,
 product or release acceptance.
@@ -51,8 +68,8 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.serde-boundary-inventory.v1"
-TOOL_VERSION = "0.1.0"
-RULE_REVISION = "929.1"
+TOOL_VERSION = "0.2.0"
+RULE_REVISION = "929.2"
 ISSUE = 929
 OWNED_TOML_REL = (
     "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
@@ -272,6 +289,139 @@ ALLOWED_COMMANDS = (
     ("git", "ls-files"),
     ("git", "rev-parse"),
     ("git", "status"),
+)
+
+# ---------------------------------------------------------------------------
+# Canonical stored payload.
+#
+# Every load-bearing field of the artifact is named exactly once below. The
+# aggregate digest is the digest of the canonical projection of the *stored*
+# bytes, so ``check`` can recompute it from the file itself and reject a hand
+# edit to any owner, caller, classification, readiness, allocation, span,
+# prerequisite, profile/limit, fixture or invalidation field. The projection is
+# derived from the rendered artifact text, so the stored and the freshly
+# generated views cannot drift apart.
+#
+# Only the fields listed in ``CANONICAL_EXCLUDED_FIELDS`` are left out, and
+# the artifact must declare that exclusion itself.
+# ---------------------------------------------------------------------------
+BASE_SHA_SOURCE = "git-rev-parse-HEAD"
+PROVENANCE_AUTHORITY = "informational-observational-outside-proof-ceiling"
+CANONICAL_EXCLUDED_FIELDS = ("base_sha", "base_sha_source")
+
+CANONICAL_HEADER_KEYS = (
+    "schema",
+    "tool_version",
+    "rule_revision",
+    "proof_ceiling",
+    "issue",
+    "denominator_status",
+    "ambiguous_reason",
+    "coverage",
+    "family_readiness",
+    "family_blocked_reason",
+    "safety",
+    "candidate_count",
+    "classified_count",
+    "unknown_count",
+    "unassigned_count",
+    "ready_children",
+    "blocked_children",
+    "denominator_digest",
+)
+CANONICAL_DENOMINATOR_KEYS = (
+    "release_roots",
+    "packages",
+    "targets",
+    "features",
+    "universe_digest",
+    "source_digest",
+    "rule_digest",
+    "owner_map_digest",
+    "profile_digest",
+    "scan_file_count",
+    "rust_version",
+)
+CANONICAL_COUNT_KEYS = ("candidate", "classified", "unknown", "unassigned")
+CANONICAL_PROFILE_KEYS = (
+    "profile_id",
+    "profile_revision",
+    "status",
+    "source",
+    "source_digest",
+    "digest",
+    "acceptance_pr",
+    "acceptance_merge",
+    "acceptance_packet_digest",
+    "corpus_digest",
+    "corpus_cases",
+    "framing",
+    "evidence",
+)
+CANONICAL_LIMIT_KEYS = ("name", "value", "unit", "encoding", "stage", "source")
+CANONICAL_LEGACY_KEYS = ("status", "source", "source_digest", "digest", "evidence")
+CANONICAL_ALLOCATION_KEYS = (
+    "child",
+    "family",
+    "row_count",
+    "source_bytes",
+    "test_bytes",
+    "stu_estimate",
+    "stu_budget",
+    "readiness",
+    "blocked_reason",
+    "source_files",
+    "types",
+    "test_files",
+    "read_only_refs",
+    "requirement_ids",
+    "prerequisites",
+    "write_after",
+    "preparation_before_parser",
+)
+CANONICAL_ROW_KEYS = (
+    "id",
+    "package",
+    "path",
+    "type",
+    "function",
+    "kind",
+    "span_start",
+    "span_end",
+    "span_digest",
+    "digest",
+    "file_digest",
+    "owner",
+    "repair_child",
+    "repair_readiness",
+    "blocked_reason",
+    "safety",
+    "disposition",
+    "build_class",
+    "release_class",
+    "admission",
+    "boundary_evidence",
+    "schema_class",
+    "canonical_impact",
+    "limit_binding",
+    "refusal",
+    "invalidation",
+    "evidence",
+    "deny_unknown_fields",
+    "tag",
+    "untagged",
+    "flatten",
+    "has_alias",
+    "has_default",
+    "remote",
+    "with_helper",
+    "deserialize_with",
+    "value_routing",
+    "helpers",
+    "callers",
+    "fixtures",
+    "decoder_calls",
+    "input_digest",
 )
 
 
@@ -1027,6 +1177,48 @@ def _owner_map_digest() -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _row_input_digest(row: dict, profile: dict, legacy: dict, digest_of) -> str:
+    """Digest exactly the inputs this row's evidence depends on.
+
+    Per-row scoped by construction: the candidate's own scanned span bytes
+    (``span_digest``), the file identity the row is bound to, its recorded
+    caller sources, the accepted profile source only when the row is
+    acquisition-bound, the legacy record source only when the row is a legacy
+    row, and the rule/owner-map revisions that produced its verdict. A tracked
+    source file that contributes no row to this path is not an input here, so
+    it cannot invalidate this row.
+    """
+    caller_inputs = []
+    for ref in sorted({c for c in row.get("callers", []) if c}):
+        target = ref.rsplit(":", 1)[0] if ref.rsplit(":", 1)[-1].isdigit() else ref
+        caller_inputs.append("%s:%s" % (target, digest_of(target)))
+    profile_input = ""
+    if str(row.get("limit_binding", "")).startswith("bridge-profile:"):
+        profile_input = "%s:%s" % (profile.get("source", ""), profile.get("source_digest", ""))
+    legacy_input = ""
+    if row.get("schema_class") == "legacy":
+        legacy_input = "%s:%s" % (legacy.get("source", ""), legacy.get("source_digest", ""))
+    return _sha256_text(
+        json.dumps(
+            {
+                "span_digest": row.get("span_digest", ""),
+                "file_digest": row.get("file_digest", ""),
+                "kind": row.get("kind", ""),
+                "attributes": row.get("attributes", {}),
+                "callers": caller_inputs,
+                "profile": profile_input,
+                "legacy": legacy_input,
+                "fixtures": row.get("fixtures", []),
+                "rule_revision": RULE_REVISION,
+                "owner_map_digest": _owner_map_digest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
 
 
 def _rule_digest() -> str:
@@ -1830,15 +2022,37 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
         rows.append(row)
     rows.sort(key=lambda r: r["id"])
 
-    # Source digest covers exact scanned bytes (artifact excluded by construction).
-    source_entries: list[str] = []
-    for rel in scan_rels:
-        try:
-            digest = _sha256_bytes((root / rel).read_bytes())
-        except OSError:
-            digest = "unreadable"
-        source_entries.append(rel + ":" + digest)
-    source_digest = _sha256_text("\n".join(sorted(source_entries)))
+    # Per-row exact input digest: each row binds only the scanned span it was
+    # produced from, the file identity it records, its recorded callers and the
+    # profile/legacy sources it actually depends on. Cached byte reads keep the
+    # cost bounded regardless of how many rows share a file.
+    byte_digest_cache: dict[str, str] = {}
+
+    def digest_of(rel: str) -> str:
+        cached = byte_digest_cache.get(rel)
+        if cached is None:
+            try:
+                cached = _sha256_bytes((root / rel).read_bytes())
+            except OSError:
+                cached = "unreadable"
+            byte_digest_cache[rel] = cached
+        return cached
+
+    for row in rows:
+        row["input_digest"] = _row_input_digest(row, profile, legacy, digest_of)
+
+    # The scan universe is the set of tracked source paths actually scanned.
+    # It is path identity only (never file content), so an unrelated byte edit
+    # inside an already-scanned file cannot restate the denominator, while
+    # adding or removing a tracked source file does. The artifact itself is not
+    # a *.rs file, so it can never appear in its own input universe.
+    universe_digest = _sha256_text("\n".join(sorted(scan_rels)))
+    # Source digest is derived from the exact per-row input digests rather than
+    # from every tracked Rust file in the workspace, so an unrelated tracked
+    # source file that produces no row cannot invalidate the inventory.
+    source_digest = _sha256_text(
+        "\n".join(sorted("%s:%s" % (r["path"], r["input_digest"]) for r in rows))
+    )
     rule_digest = _rule_digest()
     owner_map_digest = _owner_map_digest()
     profile_digest = str(profile.get("digest", ""))
@@ -1971,19 +2185,10 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
     elif blocked_children:
         family_blocked_reason = "blocked-children: %s" % ",".join(a["child"] for a in blocked_children)
 
-    aggregate = _sha256_text(
-        json.dumps(
-            {
-                "denominator_digest": denominator_digest,
-                "rows": [
-                    {"id": r["id"], "disposition": r["disposition"], "owner": r["owner"], "digest": r["digest"]}
-                    for r in rows
-                ],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    )
+    denominator = dict(denominator_core)
+    denominator["universe_digest"] = universe_digest
+    denominator["scan_file_count"] = len(scan_rels)
+    denominator["rust_version"] = str(meta.get("rust_version", ""))
     header = {
         "schema": SCHEMA,
         "tool_version": TOOL_VERSION,
@@ -1991,6 +2196,9 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
         "proof_ceiling": PROOF_CEILING,
         "issue": ISSUE,
         "base_sha": base_sha,
+        "base_sha_source": BASE_SHA_SOURCE,
+        "provenance_authority": PROVENANCE_AUTHORITY,
+        "canonical_excludes": list(CANONICAL_EXCLUDED_FIELDS),
         "denominator_status": "INCOMPLETE" if ambiguous else "COMPLETE",
         "ambiguous_reason": ambiguous_reason,
         "coverage": "COMPLETE" if not ambiguous else "INCOMPLETE",
@@ -2004,11 +2212,11 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
         "ready_children": len(ready_children),
         "blocked_children": len(blocked_children),
         "denominator_digest": denominator_digest,
-        "aggregate_digest": aggregate,
+        "aggregate_digest": "",
     }
-    return {
+    inventory = {
         "header": header,
-        "denominator": denominator_core,
+        "denominator": denominator,
         "denominator_meta": {
             "release_roots": sorted(default_members),
             "packages": sorted(members),
@@ -2027,10 +2235,92 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
         "rows": rows,
         "allocations": allocations,
     }
+    # The aggregate is the digest of the canonical projection of the rendered
+    # artifact text, so ``check`` recomputes it from the stored file itself and
+    # any hand edit to a load-bearing row or allocation field is rejected.
+    canonical = _canonical_payload(
+        tomllib.loads(_render_toml(inventory).decode("utf-8"))
+    )
+    header["aggregate_digest"] = _payload_digest(canonical)
+    inventory["canonical_payload"] = canonical
+    inventory["rendered_payload"] = _render_toml(inventory)
+    return inventory
 
 
 def _escape_toml_str(value: str) -> str:
     return _toml_str(value)
+
+
+# ---------------------------------------------------------------------------
+# Canonical stored payload.
+#
+# The projection is computed from a *parsed artifact document*, never from an
+# in-memory inventory, so the digest written by ``sync`` and the digest
+# recomputed by ``check`` are produced by exactly the same code over exactly
+# the same bytes. Every load-bearing field is named explicitly; an absent
+# field normalizes to a sentinel instead of silently defaulting, so deleting a
+# line from the artifact is a detectable change.
+#
+# ``aggregate_digest`` itself is excluded (it is the digest of this payload)
+# and ``CANONICAL_EXCLUDED_FIELDS`` are excluded because the artifact declares
+# them as observational, non-authoritative provenance metadata.
+# ---------------------------------------------------------------------------
+ABSENT = "<absent>"
+
+
+def _canon_value(value) -> object:
+    """Normalize one stored TOML value into a stable JSON-comparable form."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return [_canon_value(v) for v in value]
+    if value is None:
+        return ABSENT
+    return str(value)
+
+
+def _canon_record(record, keys) -> dict:
+    mapping = record if isinstance(record, dict) else {}
+    return {key: _canon_value(mapping.get(key, ABSENT)) for key in keys}
+
+
+def _canonical_payload(doc: dict) -> dict:
+    """Project every load-bearing field of an artifact document."""
+    profile_doc = doc.get("profile", {}) or {}
+    limits = []
+    for limit in (profile_doc.get("limits", []) or []):
+        limits.append(_canon_record(limit, CANONICAL_LIMIT_KEYS))
+    limits.sort(key=lambda rec: str(rec.get("name", "")))
+    profile = _canon_record(profile_doc, CANONICAL_PROFILE_KEYS)
+    profile["limits"] = limits
+
+    rows = []
+    for row in (doc.get("candidates", []) or []):
+        rows.append(_canon_record(row, CANONICAL_ROW_KEYS))
+    rows.sort(key=lambda rec: str(rec.get("id", "")))
+
+    allocations = []
+    for alloc in (doc.get("allocations", []) or []):
+        allocations.append(_canon_record(alloc, CANONICAL_ALLOCATION_KEYS))
+    allocations.sort(key=lambda rec: str(rec.get("child", "")))
+
+    return {
+        "header": _canon_record(doc, CANONICAL_HEADER_KEYS),
+        "denominator": _canon_record(doc.get("denominator", {}) or {}, CANONICAL_DENOMINATOR_KEYS),
+        "counts": _canon_record(doc.get("counts", {}) or {}, CANONICAL_COUNT_KEYS),
+        "profile": profile,
+        "legacy": _canon_record(doc.get("legacy", {}) or {}, CANONICAL_LEGACY_KEYS),
+        "allocations": allocations,
+        "rows": rows,
+    }
+
+
+def _payload_digest(payload: dict) -> str:
+    return _sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
 
 
 def _render_toml(inventory: dict) -> bytes:
@@ -2051,6 +2341,12 @@ def _render_toml(inventory: dict) -> bytes:
     lines.append("proof_ceiling = %s" % _escape_toml_str(str(header["proof_ceiling"])))
     lines.append("issue = %d" % int(header["issue"]))
     lines.append("base_sha = %s" % _escape_toml_str(str(header["base_sha"])))
+    lines.append("base_sha_source = %s" % _escape_toml_str(str(header["base_sha_source"])))
+    lines.append("provenance_authority = %s" % _escape_toml_str(str(header["provenance_authority"])))
+    lines.append(
+        "canonical_excludes = [%s]"
+        % ", ".join(_escape_toml_str(v) for v in header["canonical_excludes"])
+    )
     lines.append("denominator_status = %s" % _escape_toml_str(str(header["denominator_status"])))
     lines.append("ambiguous_reason = %s" % _escape_toml_str(str(header.get("ambiguous_reason", ""))))
     lines.append("coverage = %s" % _escape_toml_str(str(header["coverage"])))
@@ -2070,9 +2366,10 @@ def _render_toml(inventory: dict) -> bytes:
     for key in ("release_roots", "packages", "targets", "features"):
         vals = denom.get(key, [])
         lines.append("%s = [%s]" % (key, ", ".join(_escape_toml_str(v) for v in vals)))
-    for key in ("source_digest", "rule_digest", "owner_map_digest", "profile_digest"):
+    for key in ("universe_digest", "source_digest", "rule_digest", "owner_map_digest", "profile_digest"):
         lines.append("%s = %s" % (key, _escape_toml_str(str(denom.get(key, "")))))
-    lines.append("rust_version = %s" % _escape_toml_str(str(meta.get("rust_version", ""))))
+    lines.append("scan_file_count = %d" % int(denom.get("scan_file_count", 0)))
+    lines.append("rust_version = %s" % _escape_toml_str(str(denom.get("rust_version", meta.get("rust_version", "")))))
     lines.append("")
     lines.append("[counts]")
     for key in ("candidate", "classified", "unknown", "unassigned"):
@@ -2148,6 +2445,7 @@ def _render_toml(inventory: dict) -> bytes:
         lines.append("span_digest = %s" % _escape_toml_str(str(row["span_digest"])))
         lines.append("digest = %s" % _escape_toml_str(str(row["digest"])))
         lines.append("file_digest = %s" % _escape_toml_str(str(row.get("file_digest", ""))))
+        lines.append("input_digest = %s" % _escape_toml_str(str(row["input_digest"])))
         lines.append("owner = %s" % _escape_toml_str(str(row["owner"])))
         lines.append("repair_child = %s" % _escape_toml_str(str(row["repair_child"])))
         lines.append("repair_readiness = %s" % _escape_toml_str(str(row["repair_readiness"])))
@@ -2190,7 +2488,9 @@ def artifact_path(root: Path) -> Path:
 def sync_inventory(root: Path) -> tuple[dict, bytes]:
     root = root.resolve()
     inventory = build_inventory(root)
-    payload = _render_toml(inventory)
+    # The written bytes are exactly the bytes the aggregate digest was taken
+    # over, so committing the artifact cannot itself invalidate it.
+    payload = inventory["rendered_payload"]
     target = artifact_path(root)
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -2249,13 +2549,53 @@ def _stored_rows(doc: dict) -> list[dict]:
     return rows
 
 
+def _fresh_canonical_payload(fresh: dict) -> dict:
+    """Canonical projection of the freshly computed inventory.
+
+    Taken from the same rendered bytes ``sync`` would write, so the stored and
+    the fresh views are produced by one code path over identical text.
+    """
+    payload = fresh.get("rendered_payload")
+    if not isinstance(payload, bytes):
+        payload = _render_toml(fresh)
+    return _canonical_payload(tomllib.loads(payload.decode("utf-8")))
+
+
+def _first_difference(stored: dict, current: dict, keys) -> str:
+    """Name the first differing canonical field, or "" when the records agree."""
+    for key in keys:
+        want = stored.get(key)
+        have = current.get(key)
+        if json.dumps(want, sort_keys=True, default=str) != json.dumps(have, sort_keys=True, default=str):
+            return "%s stored=%r current=%r" % (key, want, have)
+    return ""
+
+
 def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
     """Compare fresh compute against the stored artifact; raise on any drift."""
     if doc.get("schema") != SCHEMA:
         raise InventoryError("STALE_RULE", "artifact schema %r != %r" % (doc.get("schema"), SCHEMA))
     if doc.get("rule_revision") != RULE_REVISION:
         raise InventoryError("STALE_RULE", "artifact rule %r != %r" % (doc.get("rule_revision"), RULE_REVISION))
-    for key in ("source_digest", "rule_digest", "owner_map_digest", "profile_digest"):
+    # Provenance is classified, never silently presented as proof: base_sha is
+    # the commit the writer happened to stand on, it cannot equal the commit
+    # that carries the artifact, so it is explicitly informational and outside
+    # the proof ceiling while the validated digests carry the actual evidence.
+    if doc.get("provenance_authority") != PROVENANCE_AUTHORITY:
+        raise InventoryError(
+            "STALE_RULE",
+            "artifact provenance_authority %r != %r" % (doc.get("provenance_authority"), PROVENANCE_AUTHORITY),
+        )
+    if doc.get("base_sha_source") != BASE_SHA_SOURCE:
+        raise InventoryError(
+            "STALE_RULE", "artifact base_sha_source %r != %r" % (doc.get("base_sha_source"), BASE_SHA_SOURCE)
+        )
+    if list(doc.get("canonical_excludes", []) or []) != list(CANONICAL_EXCLUDED_FIELDS):
+        raise InventoryError(
+            "STALE_RULE",
+            "artifact canonical_excludes %r != %r" % (doc.get("canonical_excludes"), list(CANONICAL_EXCLUDED_FIELDS)),
+        )
+    for key in ("universe_digest", "source_digest", "rule_digest", "owner_map_digest", "profile_digest"):
         stored = (doc.get("denominator", {}) or {}).get(key, "")
         current = fresh["denominator"].get(key, "")
         if stored != current:
@@ -2289,16 +2629,52 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
     if fresh_ids - stored_ids:
         extra = sorted(fresh_ids - stored_ids)[:5]
         raise InventoryError("EXTRA_ROWS", "unaccounted candidates missing from artifact: %s" % extra)
-    for rid in sorted(stored_ids):
-        stored = next(r for r in stored_rows if r.get("id") == rid)
-        current = fresh_by_id[rid]
-        if stored.get("digest", "") != current["digest"] or stored.get("disposition", "") != current["disposition"]:
+    # Integrity binding: recompute the canonical digest from the stored TOML
+    # content itself and reject any mismatch with the stored aggregate. This is
+    # what makes a hand edit to an owner, readiness, allocation, caller,
+    # profile/limit, fixture or invalidation field fail closed even when the
+    # row digest and the aggregate string are both left untouched.
+    stored_canonical = _canonical_payload(doc)
+    stored_payload_digest = _payload_digest(stored_canonical)
+    if stored_payload_digest != doc.get("aggregate_digest", ""):
+        raise InventoryError(
+            "HAND_EDIT_OR_DRIFT",
+            "stored payload digest %.16s != stored aggregate_digest %.16s; load-bearing row or "
+            "allocation content was hand-edited" % (stored_payload_digest, str(doc.get("aggregate_digest", ""))),
+        )
+    fresh_canonical = _fresh_canonical_payload(fresh)
+    for section in ("header", "denominator", "counts", "profile", "legacy"):
+        difference = _first_difference(
+            stored_canonical[section], fresh_canonical[section],
+            tuple(fresh_canonical[section].keys()),
+        )
+        if difference:
             raise InventoryError(
-                "HAND_EDIT_OR_DRIFT",
-                "row %s differs (stored digest %.12s disposition %s vs current %.12s %s); hand edits are rejected" % (
-                    rid, stored.get("digest", ""), stored.get("disposition", ""),
-                    current["digest"], current["disposition"],
-                ),
+                "HAND_EDIT_OR_DRIFT", "stored %s differs from current inventory (%s); hand edits are rejected"
+                % (section, difference),
+            )
+    stored_alloc_by_child = {rec["child"]: rec for rec in stored_canonical["allocations"]}
+    fresh_alloc_by_child = {rec["child"]: rec for rec in fresh_canonical["allocations"]}
+    if set(stored_alloc_by_child) != set(fresh_alloc_by_child):
+        raise InventoryError(
+            "HAND_EDIT_OR_DRIFT",
+            "allocation children differ: stored %r vs current %r" % (sorted(stored_alloc_by_child), sorted(fresh_alloc_by_child)),
+        )
+    for child in sorted(stored_alloc_by_child):
+        difference = _first_difference(
+            stored_alloc_by_child[child], fresh_alloc_by_child[child], CANONICAL_ALLOCATION_KEYS
+        )
+        if difference:
+            raise InventoryError(
+                "HAND_EDIT_OR_DRIFT", "allocation %s differs (%s); hand edits are rejected" % (child, difference)
+            )
+    stored_row_by_id = {rec["id"]: rec for rec in stored_canonical["rows"]}
+    fresh_row_by_id = {rec["id"]: rec for rec in fresh_canonical["rows"]}
+    for rid in sorted(stored_ids):
+        difference = _first_difference(stored_row_by_id[rid], fresh_row_by_id[rid], CANONICAL_ROW_KEYS)
+        if difference:
+            raise InventoryError(
+                "HAND_EDIT_OR_DRIFT", "row %s differs (%s); hand edits are rejected" % (rid, difference)
             )
     if doc.get("aggregate_digest") != fresh["header"]["aggregate_digest"]:
         raise InventoryError("HAND_EDIT_OR_DRIFT", "aggregate digest mismatch; artifact was hand-edited or inputs drifted")
