@@ -1576,6 +1576,11 @@ impl ProcessExecutionBinding {
         &self.session_id
     }
 
+    /// Returns the Kernel authority identity bound to this process execution.
+    pub const fn authority_id(&self) -> &DispatchAuthorityId {
+        &self.authority_id
+    }
+
     /// Returns the authenticated state fence.
     pub const fn state_fence(&self) -> &FencingToken {
         &self.state_fence
