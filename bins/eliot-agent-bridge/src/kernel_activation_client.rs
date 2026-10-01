@@ -49,43 +49,31 @@ use crate::SharedTransport;
 /// specialise known reason codes. Catalogue groups: `TASK_SELECTION_REQUIRED` is
 /// request/identity; `AMBIGUOUS_RESULT` / `STALE_STATE_FENCE` is state/conflict;
 /// `DEADLINE_EXCEEDED` is capacity; `UNKNOWN_OUTCOME` is security/recovery.
-/// Exhaustive with no wildcard arm so a future denial code breaks compilation.
-pub(super) fn agent_disposition_for_denial(code: AgentBridgeActivationDenialCode) -> &'static str {
-    use eliot_agent_bridge_core::{
-        ACTIVATION_DISPOSITION_FAILED, ACTIVATION_DISPOSITION_INVALID_REQUEST,
-        ACTIVATION_DISPOSITION_STALE_OR_CONFLICT, ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
-    };
-    match code {
-        AgentBridgeActivationDenialCode::TaskSelectionRequired
-        | AgentBridgeActivationDenialCode::ScopeSelectionRequired => {
-            ACTIVATION_DISPOSITION_INVALID_REQUEST
-        }
-        AgentBridgeActivationDenialCode::ScopeAmbiguous
-        | AgentBridgeActivationDenialCode::StaleFence => ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
-        AgentBridgeActivationDenialCode::NotReady => ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY,
-        AgentBridgeActivationDenialCode::FailedInternal
-        | AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
-            ACTIVATION_DISPOSITION_FAILED
-        }
-    }
+/// The disposition is read from the generated `BRIDGE_DENIAL_PROJECTION`
+/// table keyed by the legacy transport wire; a missing row fails closed at
+/// the caller, never as a fabricated negative.
+pub(super) fn agent_disposition_for_denial(
+    code: AgentBridgeActivationDenialCode,
+) -> Option<&'static str> {
+    eliot_protocol::bridge_denial_projection(code.as_str()).map(|row| row.disposition)
 }
 
 /// Bridge-alias projection from the Kernel↔bridge transport denial code to
 /// the exact I7.20 catalogue `reason_code` carried at the agent face.
 ///
 /// Per `docs/architecture/I07-20-agent-facing-error-contract.md`, legacy
-/// transport names translate only through the bridge-alias mapping and never
-/// create host-specific semantic control enums. Every output below is a
+/// transport names translate only through the generated denial projection
+/// table and never create host-specific semantic control enums. Every output below is a
 /// verbatim member of the I7.20 Appendix D catalogue: `TASK_SELECTION_REQUIRED`
 /// (request/identity), `TASK_SCOPE_INCOMPATIBLE` (request/identity),
 /// `AMBIGUOUS_RESULT` (state/conflict), `DEFERRED_CAPACITY`
 /// (capacity/availability), `STALE_STATE_FENCE` (state/conflict),
 /// `RUNTIME_FAILED` (route/integration), `UNKNOWN_OUTCOME`
-/// (security/recovery). A missing alias fails closed at the caller.
+/// (security/recovery). A missing projection row fails closed at the caller.
 pub(super) fn agent_reason_for_denial(
     code: AgentBridgeActivationDenialCode,
 ) -> Option<&'static str> {
-    eliot_protocol::bridge_reason_code_alias(code.as_str())
+    eliot_protocol::bridge_denial_projection(code.as_str()).map(|row| row.canonical)
 }
 
 /// I7.20 Recovery / Conflict Directive kind for a typed activation denial.
@@ -96,31 +84,17 @@ pub(super) fn agent_reason_for_denial(
 /// auto-selection; `NOT_READY` requires a new ticket on retry; stale fence is
 /// fail-closed; internal failures resolve to the failure capsule. The
 /// Kernel-owned no-result refusal carries no failure capsule (none exists),
-/// so its honest recovery is a new ticket. Exhaustive with no wildcard arm.
-pub(super) fn denial_directive_kind(code: AgentBridgeActivationDenialCode) -> &'static str {
-    use eliot_agent_bridge_core::{
-        ACTIVATION_DIRECTIVE_CANDIDATE_RECOVERY, ACTIVATION_DIRECTIVE_FAILURE_CAPSULE,
-        ACTIVATION_DIRECTIVE_FENCE_CLOSED, ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET,
-    };
-    match code {
-        AgentBridgeActivationDenialCode::TaskSelectionRequired
-        | AgentBridgeActivationDenialCode::ScopeSelectionRequired
-        | AgentBridgeActivationDenialCode::ScopeAmbiguous => {
-            ACTIVATION_DIRECTIVE_CANDIDATE_RECOVERY
-        }
-        AgentBridgeActivationDenialCode::NotReady
-        | AgentBridgeActivationDenialCode::SemanticResolutionUnavailable => {
-            ACTIVATION_DIRECTIVE_RETRY_NEW_TICKET
-        }
-        AgentBridgeActivationDenialCode::StaleFence => ACTIVATION_DIRECTIVE_FENCE_CLOSED,
-        AgentBridgeActivationDenialCode::FailedInternal => ACTIVATION_DIRECTIVE_FAILURE_CAPSULE,
-    }
+/// so its honest recovery is a new ticket. The directive is read from the
+/// generated `BRIDGE_DENIAL_PROJECTION` table; a missing row fails closed at
+/// the caller.
+pub(super) fn denial_directive_kind(code: AgentBridgeActivationDenialCode) -> Option<&'static str> {
+    eliot_protocol::bridge_denial_projection(code.as_str()).map(|row| row.directive)
 }
 
 /// I7.20 agent-facing denial report for one typed wire denial.
 ///
 /// Routes through [`agent_reason_for_denial`]
-/// (catalogue alias), [`agent_disposition_for_denial`], and
+/// (generated denial projection), [`agent_disposition_for_denial`], and
 /// [`denial_directive_kind`], and carries the exact owner-issued `detail`
 /// verbatim: candidate/recovery handles, retry dependency plus observed
 /// revision plus earliest-retry bound, observed fence, or failure handle.
@@ -145,8 +119,12 @@ pub(super) fn denial_report_for(
         agent_reason_for_denial(code)
             .ok_or_else(provider_failure)?
             .to_owned(),
-        agent_disposition_for_denial(code).to_owned(),
-        denial_directive_kind(code).to_owned(),
+        agent_disposition_for_denial(code)
+            .ok_or_else(provider_failure)?
+            .to_owned(),
+        denial_directive_kind(code)
+            .ok_or_else(provider_failure)?
+            .to_owned(),
         operation.to_owned(),
         detail,
     )
