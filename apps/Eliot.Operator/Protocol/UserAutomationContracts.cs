@@ -69,7 +69,9 @@ public sealed record UserAutomationNormalizeScheduleOperation(
         UserAutomationScheduleMirror.RequireNormalizationOccurrenceCount(OccurrenceCount);
     }
 
-    public override bool IsEffect() => false;
+    // Normalization is retained by the Kernel owner with its original request
+    // and receipt. It writes owner state but does not activate the automation.
+    public override bool IsEffect() => true;
 }
 
 /// <summary>Explicitly migrate a legacy immutable revision into a distinct successor.</summary>
@@ -89,7 +91,9 @@ public sealed record UserAutomationMigrateLegacyScheduleOperation(
         UserAutomationScheduleMirror.RequireNormalizationOccurrenceCount(OccurrenceCount);
     }
 
-    public override bool IsEffect() => false;
+    // Migration is retained by the Kernel owner with its original request
+    // and receipt. It writes owner state but does not activate the automation.
+    public override bool IsEffect() => true;
 }
 
 public sealed record UserAutomationCreateOperation(
