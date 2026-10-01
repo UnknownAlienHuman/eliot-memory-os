@@ -173,6 +173,31 @@ fn phase_b_terminal_correlation(
     )
 }
 
+/// Projects a pending activation's own owner-issued identity into the
+/// immutable terminal correlation (F-LOG-HOST-2, #893 D1).
+///
+/// The activation reconcile records of the open operation render
+/// `pending.transaction_id` as their `tx`, so the open terminal binds the same
+/// handle. When the pending activation also carries its Phase-B intent, that
+/// intent is the operation's own `effect`/`request` pair and is bound with it;
+/// a pending activation that never reached Phase-B has no effect/request handle
+/// and the correlation stays explicitly unavailable rather than borrowing one
+/// from a later phase. Pure projection of owner-produced handles, nonsecret
+/// digests only (I15.4).
+#[cfg(windows)]
+fn pending_activation_terminal_correlation(
+    pending: &eliot_installation::PendingActivation,
+) -> host_diagnostics::HostTerminalCorrelation {
+    let Some(intent) = pending.phase_b_intent.as_ref() else {
+        return host_diagnostics::HostTerminalCorrelation::unavailable();
+    };
+    host_diagnostics::HostTerminalCorrelation::bound(
+        pending.transaction_id.as_str(),
+        intent.effect_id.as_str(),
+        intent.request_digest.as_str(),
+    )
+}
+
 /// Projects the owner-issued Phase-B operation identity of one retained
 /// materialization into the immutable terminal correlation (F-LOG-HOST-2, #893
 /// D1).
@@ -7804,6 +7829,14 @@ impl HostComposition {
         }
         #[cfg(windows)]
         if let Some(pending) = composition.registry.pending_activation().cloned() {
+            // The pending activation IS this open operation's subject, and it
+            // carries the owner-issued transaction/effect/request handles the
+            // activation reconcile records below already render as `tx`. Bind
+            // them to the open terminal now, so an open that fails here is
+            // joinable to its own subordinate records instead of emitting a
+            // byte-identical uncorrelated code beside another open's. Absent or
+            // half-populated handles stay explicitly unavailable (I13.11).
+            host_terminal.bind_operation(pending_activation_terminal_correlation(&pending));
             if pending.phase_b_agent_bridge_stage_prepared.is_some()
                 && pending.phase_b_prepared.is_none()
             {
