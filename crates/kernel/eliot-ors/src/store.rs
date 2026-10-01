@@ -58,7 +58,8 @@ mod stop_census;
 pub use stop_census::{StoreStopObligationCensus, StoreStopObligationCounts};
 
 use crate::cutover_ownership::{
-    GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
+    DaemonCutoverOwnership, DaemonCutoverOwnershipReceipt, GenerationCutoverOwnership,
+    GenerationCutoverOwnershipReceipt, StoredCutoverOwnership, StoredDaemonCutoverOwnership,
 };
 use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
@@ -470,6 +471,19 @@ impl OrsStoreIdentity {
 }
 const CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
     TableDefinition::new("ors_cutover_ownership_v1");
+/// Durable Kernel-owned daemon-generation cutover rows (I14.15; issue #1952).
+///
+/// One row per `DaemonCutoverRecord` commit, keyed by the daemon-cutover
+/// identity, holding the prior/candidate daemon generations, the new authority
+/// epoch, the old-daemon proposal fence, the exact staged-operation identities
+/// Kernel already owned, the old in-flight disposition set, the unresolved effect
+/// scopes, and the ORS linearization identity assigned by the single commit
+/// transaction. Owned by the same `RedbRecoveryStore` and written through the
+/// same `persistence_codec` as `CUTOVER_OWNERSHIP`; it is not a second cutover
+/// machine and it grants no authority — it is the durable record an
+/// `eliotd` replacement reads back to fence the old daemon generation.
+const DAEMON_CUTOVER_OWNERSHIP: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_daemon_cutover_ownership_v1");
 /// Durable initial owner of one capability route scope (issue #1872; I5.11,
 /// I14.14).
 ///
@@ -31341,6 +31355,184 @@ impl RedbRecoveryStore {
         write.commit().map_err(storage)?;
         let receipt = GenerationCutoverOwnershipReceipt::from_committed(&committed)?;
         Ok((committed, receipt))
+    }
+
+    /// Stages one daemon-generation cutover candidate before the durable
+    /// linearization point (I14.15: the old daemon submits its in-flight
+    /// disposition set, then Kernel commits `DaemonCutoverRecord`; issue #1952).
+    ///
+    /// The staged candidate is durable but never an active route: reads and
+    /// recovery consult committed rows only, and `commit_daemon_cutover`
+    /// re-reads this exact staged row rather than any presented payload.
+    pub fn stage_daemon_cutover(
+        &self,
+        record: DaemonCutoverOwnership,
+    ) -> Result<DaemonCutoverOwnership, OrsError> {
+        record.validate()?;
+        if record.linearization_record_id.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "daemon_cutover_linearization",
+                reason: "a staged candidate has no linearization identity",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        {
+            let current = write.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+            if let Some(existing) = current.get(record.cutover_id.as_str()).map_err(storage)? {
+                let stored: StoredDaemonCutoverOwnership =
+                    decode_named(existing.value(), "daemon_cutover_ownership")?;
+                if stored.record == record {
+                    return Ok(stored.record);
+                }
+                return Err(OrsError::DuplicateConflict);
+            }
+        }
+        let stored = StoredDaemonCutoverOwnership {
+            operation_order: Self::next_operational_order(&write)?,
+            record: record.clone(),
+        };
+        {
+            let mut current = write.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+            current
+                .insert(record.cutover_id.as_str(), encode(&stored)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(record)
+    }
+
+    /// Commits one staged daemon cutover in a single write transaction (I14.15
+    /// step 8: close old-daemon application admission, commit the new
+    /// route/epoch, old proposal fence and Kernel-owned staged operations, then
+    /// publish the candidate route).
+    ///
+    /// The single `write.commit()` is the durable linearization point: a crash
+    /// before it leaves the old daemon generation authoritative, a crash after it
+    /// reconstructs the candidate generation and its fence from this row. The
+    /// linearization identity is minted HERE from the durable order, never taken
+    /// from a caller payload, so a staged row cannot present a proof it did not
+    /// earn.
+    ///
+    /// Epoch lineage is checked against the ORIGINAL RECORDED committed rows,
+    /// never against the presented record: a candidate that does not name the
+    /// currently committed daemon generation as its prior, or whose epoch does
+    /// not strictly supersede the greatest committed daemon epoch, is refused
+    /// before any mutation. Rollback is therefore another cutover with a newer
+    /// epoch — an old daemon epoch is never revived.
+    pub fn commit_daemon_cutover(
+        &self,
+        cutover_id: &str,
+    ) -> Result<(DaemonCutoverOwnership, DaemonCutoverOwnershipReceipt), OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let staged = {
+            let current = write.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+            let Some(existing) = current.get(cutover_id).map_err(storage)? else {
+                return Err(OrsError::ReservationNotFound);
+            };
+            let stored: StoredDaemonCutoverOwnership =
+                decode_named(existing.value(), "daemon_cutover_ownership")?;
+            stored
+        };
+        if staged.record.linearization_record_id.is_some() {
+            let receipt = DaemonCutoverOwnershipReceipt::from_committed(&staged.record)?;
+            return Ok((staged.record, receipt));
+        }
+        // The daemon route has no scope hash: it is the single `eliotd` route, so its
+        // current authority is the committed row with the GREATEST recorded
+        // epoch. Table iteration order is key order, not epoch order, so the
+        // head is selected by the recorded epoch rather than taken from the last
+        // row read — the difference between an ordered authority and whichever
+        // cutover happens to sort last. `AuthorityEpoch::new` rejects zero, so
+        // `head_epoch`'s initial `0` is a below-every-real-epoch sentinel rather
+        // than a value a stored row can present.
+        let mut head_generation: Option<eliot_contracts::ResourceGeneration> = None;
+        let mut head_epoch: u64 = 0;
+        {
+            let table = write.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+            for row in table.iter().map_err(storage)? {
+                let (key, value) = row.map_err(storage)?;
+                if key.value() == cutover_id {
+                    continue;
+                }
+                let stored: StoredDaemonCutoverOwnership =
+                    decode_named(value.value(), "daemon_cutover_ownership")?;
+                // A staged candidate carries no linearization identity, so it is
+                // evidence of an interrupted attempt and never authority here.
+                if stored.record.linearization_record_id.is_none() {
+                    continue;
+                }
+                let epoch = stored.record.new_epoch.value();
+                if epoch > head_epoch {
+                    head_epoch = epoch;
+                    head_generation = Some(stored.record.candidate_daemon_generation);
+                }
+            }
+        }
+        // The staged record's own prior generation must be the generation the
+        // durable committed row actually installed — read here from ORS, never
+        // from the presented payload — and the new epoch must strictly supersede
+        // the committed one, so rollback is another cutover rather than a revival.
+        // A staged candidate that names a prior generation when no committed row
+        // exists, or names none when one does, cannot be continuing this lineage
+        // and is refused rather than reconciled.
+        match (head_generation, staged.record.prior_daemon_generation) {
+            (Some(installed), Some(prior)) => {
+                if installed != prior || staged.record.new_epoch.value() <= head_epoch {
+                    return Err(OrsError::InvalidEpochLineage);
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => return Err(OrsError::InvalidEpochLineage),
+            (None, None) => {}
+        }
+        let order = Self::next_operational_order(&write)?;
+        let committed = DaemonCutoverOwnership {
+            linearization_record_id: Some(format!("ors:daemon-cutover:{cutover_id}#{order}")),
+            ..staged.record.clone()
+        };
+        committed.validate()?;
+        let stored = StoredDaemonCutoverOwnership {
+            operation_order: order,
+            record: committed.clone(),
+        };
+        {
+            let mut current = write.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+            current
+                .insert(cutover_id, encode(&stored)?.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        let receipt = DaemonCutoverOwnershipReceipt::from_committed(&committed)?;
+        Ok((committed, receipt))
+    }
+
+    /// Returns the committed daemon-cutover rows ordered by their durable
+    /// operation order. A restart rebuilds the daemon route fence from exactly
+    /// this set; staged candidates are excluded so a pre-commit candidate can
+    /// never fence or activate a route.
+    pub fn latest_committed_daemon_cutovers(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<DaemonCutoverOwnership>, OrsError> {
+        if limit == 0 || limit > crate::MAX_RECOVERY_PAGE {
+            return Err(OrsError::InvalidCursorLimit);
+        }
+        let read = self.database.begin_read().map_err(storage)?;
+        let current = read.open_table(DAEMON_CUTOVER_OWNERSHIP).map_err(storage)?;
+        let mut ordered: Vec<(u64, DaemonCutoverOwnership)> = Vec::new();
+        for row in current.iter().map_err(storage)? {
+            let (_, value) = row.map_err(storage)?;
+            let stored: StoredDaemonCutoverOwnership =
+                decode_named(value.value(), "daemon_cutover_ownership")?;
+            if stored.record.linearization_record_id.is_none() {
+                continue;
+            }
+            if ordered.len() == usize::from(limit) {
+                return Err(OrsError::ProjectionLimitExceeded);
+            }
+            ordered.push((stored.operation_order, stored.record));
+        }
+        ordered.sort_by_key(|(order, _)| *order);
+        Ok(ordered.into_iter().map(|(_, record)| record).collect())
     }
 
     /// Records the generation one capability route scope started at, once

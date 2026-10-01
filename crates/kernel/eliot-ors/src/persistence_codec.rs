@@ -41,7 +41,7 @@ use crate::SupervisionLeaseSnapshot;
 use crate::SupervisionLeaseStageReceipt;
 use crate::SupervisionLeaseStageResolution;
 use crate::UnknownCommitRecord;
-use crate::cutover_ownership::StoredCutoverOwnership;
+use crate::cutover_ownership::{StoredCutoverOwnership, StoredDaemonCutoverOwnership};
 use eliot_runtime_contracts::GenerationCutoverState;
 use eliot_runtime_contracts::RuntimeLease;
 use eliot_store_api::{
@@ -872,6 +872,14 @@ impl PersistedValue for crate::StoreRebindReplayRecord {
 
 impl PersistedValue for StoredCutoverOwnership {
     const RECORD_TYPE: &'static str = "cutover_ownership";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate_persisted()
+    }
+}
+
+impl PersistedValue for StoredDaemonCutoverOwnership {
+    const RECORD_TYPE: &'static str = "daemon_cutover_ownership";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate_persisted()

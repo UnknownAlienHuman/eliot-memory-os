@@ -284,6 +284,61 @@ impl OrsGenerationCoordinator {
         outcome
     }
 
+    /// Restores the committed I14.15 daemon-cutover fence before the Kernel can
+    /// accept work (issue #1952).
+    ///
+    /// A `DaemonCutoverRecord` that fenced an old `eliotd` generation must still
+    /// fence it after a restart: without this read the old generation's unstaged
+    /// proposals would become unstale purely because the process restarted, which
+    /// is exactly the race the record exists to close. Only rows the ORS commit
+    /// transaction linearized are read — a staged candidate is never a fence —
+    /// and the retained set is checked as one advancing lineage by the owner's own
+    /// `validate_daemon_cutover_lineage`, so an incoherent stored chain fails
+    /// closed here instead of being adopted as the daemon authority.
+    ///
+    /// The retained rows are then checked against each other, and the fence they
+    /// name is READ here rather than re-derived: this pass establishes that the
+    /// durable daemon-cutover chain is coherent and therefore that an unstaged
+    /// old-daemon proposal is stale after a restart. It deliberately does NOT
+    /// compare the record to the router's `daemon` route: I14.15 commits the
+    /// record and then publishes the candidate route, and the route projection
+    /// carries the global current epoch rather than this record's own, so such a
+    /// comparison would refuse a correctly recorded cutover rather than catch a
+    /// wrong one.
+    ///
+    /// Nothing is inferred: no generation, epoch, fence, or staged-operation
+    /// identity is derived here, and this restores state rather than granting it.
+    /// An ORS database written before the daemon table existed has no committed
+    /// daemon cutover, which is the same fact as an empty set.
+    pub(crate) fn recover_daemon_cutover_ownership(&self) -> Result<(), String> {
+        observe_recovery("kernel.recovery.daemon_cutover_requested", "attempt");
+        let outcome = (|| {
+            let committed = match self
+                .ors
+                .latest_committed_daemon_cutovers(eliot_ors::MAX_RECOVERY_PAGE)
+            {
+                Ok(committed) => committed,
+                Err(error) if is_absent_daemon_cutover_table(&error) => {
+                    observe_recovery("kernel.recovery.daemon_cutover_absent", "empty");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            if committed.is_empty() {
+                observe_recovery("kernel.recovery.daemon_cutover_absent", "empty");
+                return Ok(());
+            }
+            eliot_ors::validate_daemon_cutover_lineage(&committed)
+                .map_err(|error| error.to_string())?;
+            observe_recovery("kernel.recovery.daemon_cutover_restored", "success");
+            Ok(())
+        })();
+        if outcome.is_err() {
+            observe_recovery("kernel.recovery.daemon_cutover_failed", "rejected");
+        }
+        outcome
+    }
+
     pub(crate) fn recover(
         &self,
         generations: &mut GenerationRouter,
@@ -291,7 +346,16 @@ impl OrsGenerationCoordinator {
         policy: &mut ServerHandshakePolicy,
     ) -> Result<(), String> {
         observe_recovery("kernel.recovery.recover_requested", "attempt");
-        let outcome = self.recover_inner(generations, service, policy);
+        // I14.15 (issue #1952): the committed daemon-cutover chain is read back
+        // here, before this recovery reports success. Placing it AFTER
+        // `recover_inner` rather than inside it is deliberate: that function
+        // returns early when no generation cutover exists, and a committed daemon
+        // cutover must be restored on a restart regardless of that, because the
+        // fence it carries is what keeps an old `eliotd` generation's unstaged
+        // proposals stale across the restart.
+        let outcome = self
+            .recover_inner(generations, service, policy)
+            .and_then(|()| self.recover_daemon_cutover_ownership());
         if outcome.is_ok() {
             observe_recovery("kernel.recovery.recover_completed", "success");
         } else {
@@ -485,6 +549,21 @@ fn is_absent_cutover_ownership_table(error: &OrsError) -> bool {
         error,
         OrsError::Storage(message)
             if message.contains("Table 'ors_cutover_ownership_v1' does not exist")
+    )
+}
+
+/// The I14.15 daemon-cutover table is optional for the same reason as
+/// `CUTOVER_OWNERSHIP`: an ORS database written before issue #1952 has no
+/// committed daemon cutover, and an absent table is that same fact. It is
+/// distinct from a present table whose contents fail validation, which stays
+/// terminal in [`OrsGenerationCoordinator::recover_daemon_cutover_ownership`].
+/// The ORS crate exposes the redb absence only through its typed storage message,
+/// so keep this compatibility read local to the Kernel recovery boundary.
+fn is_absent_daemon_cutover_table(error: &OrsError) -> bool {
+    matches!(
+        error,
+        OrsError::Storage(message)
+            if message.contains("Table 'ors_daemon_cutover_ownership_v1' does not exist")
     )
 }
 
