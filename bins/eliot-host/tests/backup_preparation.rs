@@ -454,11 +454,16 @@ fn source_active_and_foreign_destinations_rejected() {
         &parent,
     );
     assert_eq!(foreign.source_installation_id, "install-958-foreign");
-    let planted = parent.join(format!(
-        "dest-{}",
-        derive_destination_id(&foreign.operation_id, &foreign.authority_nonce)
-    ));
-    std::fs::create_dir_all(&planted).expect("plant foreign dir");
+    // The destination path derives from owner-issued evidence, never from
+    // the presented nonce (#2851), so the exact path is read from a first
+    // clean preparation's receipt. The test journal is then wiped for this
+    // operation (fresh request, preexisting root) and foreign content is
+    // planted at that path: the retry must refuse ForeignContent, never
+    // adopt or overwrite the planted bytes.
+    let first = prepare_isolated_destination(&mut journal, &foreign).expect("first prepares");
+    let planted = first.root.clone();
+    journal.intents.remove(&foreign.operation_id);
+    journal.results.remove(&foreign.operation_id);
     std::fs::write(planted.join("foreign-bytes.bin"), b"not-ours").expect("plant file");
     let error = prepare_isolated_destination(&mut journal, &foreign).expect_err("foreign refused");
     assert!(
