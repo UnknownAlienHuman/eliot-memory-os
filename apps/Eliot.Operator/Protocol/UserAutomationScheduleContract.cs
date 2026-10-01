@@ -1559,6 +1559,13 @@ public static class UserAutomationOutcomeClassifier
                 receiptEnvelope,
                 revision,
                 expectedReceiptOperationKind);
+            if (!NormalizationReceiptMatchesRequest(
+                    receiptEnvelope,
+                    expectedReceiptOperationKind,
+                    context))
+            {
+                return false;
+            }
             if (!context.ExpectedOperation.TryGetProperty("revision", out var submittedRevision)
                 || !MatchesSubmittedNormalizationSource(submittedRevision, revisionElement))
             {
@@ -1577,6 +1584,46 @@ public static class UserAutomationOutcomeClassifier
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// The result envelope correlation binds the answer to the submitted
+    /// request, but the carried receipt is a second owner-produced object. A
+    /// correctly correlated response can still contain a receipt from another
+    /// normalization request, so join its operation identity and State Fence
+    /// to the independently retained request context before calling it an
+    /// owner normalization result.
+    /// </summary>
+    private static bool NormalizationReceiptMatchesRequest(
+        JsonElement receiptEnvelope,
+        string expectedOperationKind,
+        UserAutomationResultValidationContext context)
+    {
+        if (!TryGetObject(receiptEnvelope, "core", out var core)
+            || !TryGetObject(core, "operation", out var operation)
+            || !TryReadBoundedText(operation, "operation_id", MaxOperationIdChars, out var operationId)
+            || !string.Equals(operationId, context.ExpectedOperationId, StringComparison.Ordinal)
+            || !TryReadBoundedText(operation, "idempotency_key", MaxIdentityChars, out var idempotencyKey)
+            || !string.Equals(idempotencyKey, context.ExpectedIdempotencyKey, StringComparison.Ordinal)
+            || !TryReadBoundedText(operation, "operation_kind", OperatorScheduleContract.MAX_TEXT_BYTES, out var operationKind)
+            || !string.Equals(operationKind, expectedOperationKind, StringComparison.Ordinal)
+            || !TryGetObject(operation, "state_fence", out var operationFence)
+            || !IsClosedStateFence(operationFence)
+            || context.ExpectedStateFence is not { } expectedStateFence
+            || !SameStateFence(operationFence, expectedStateFence))
+        {
+            return false;
+        }
+
+        return TryReadBoundedText(operation, "request_id", MaxIdentityChars, out var operationRequestId)
+            && TryGetObject(core, "request", out var request)
+            && TryGetObject(request, "metadata", out var metadata)
+            && TryReadBoundedText(metadata, "request_id", MaxIdentityChars, out var requestId)
+            && string.Equals(operationRequestId, requestId, StringComparison.Ordinal)
+            && TryGetObject(request, "state_fence", out var requestFence)
+            && SameStateFence(requestFence, expectedStateFence)
+            && TryGetObject(metadata, "state_fence", out var metadataFence)
+            && SameStateFence(metadataFence, expectedStateFence);
     }
 
     private static bool MatchesSubmittedNormalizationSource(
