@@ -98,7 +98,7 @@ use eliot_protocol::{
 };
 use thiserror::Error;
 
-use crate::maintenance_family_catalog::MaintenanceFamilyDecision;
+use crate::maintenance_family_catalog::{MaintenanceAdmissionBlocker, MaintenanceFamilyDecision};
 
 /// The exact absent owner and the exact condition that reopens one decision.
 ///
@@ -192,12 +192,19 @@ pub enum MaintenanceDispatch {
     /// durable-job port. This arm names that owner and the exact route `eliotd`
     /// does not hold, and admits nothing itself: the record it produces is a
     /// retained admission request, never a claim that a job was admitted or
-    /// started.
+    /// started. The shared admission blockers travel beside the route, so the
+    /// record states the exact missing owners — lease, budget, job wire — and
+    /// not just the family route.
     StartDurableJob {
         /// `path::symbol` of the existing admission owner.
         admission_owner: &'static str,
         /// The exact route `eliotd` does not hold to that owner.
         missing_route: &'static str,
+        /// The shared Durable Job admission blockers that stop this start,
+        /// read from the family decision's own catalog entry rather than
+        /// restated here. Empty states explicitly that no shared blocker
+        /// remains and only the Governor admission and the family route decide.
+        admission_blockers: &'static [MaintenanceAdmissionBlocker],
     },
     /// `SUGGEST`: exactly one Human-board recommendation, and no work started.
     SuggestBoardItem {
@@ -256,6 +263,7 @@ impl MaintenanceDispatch {
             AutomationDecision::Start => Self::StartDurableJob {
                 admission_owner: family_decision.route.target(),
                 missing_route: family_decision.route.missing(),
+                admission_blockers: family_decision.admission_blockers,
             },
             AutomationDecision::Suggest => Self::SuggestBoardItem { gap },
             AutomationDecision::Defer => Self::Defer { gap },
@@ -313,6 +321,7 @@ impl MaintenanceDispatch {
             Self::StartDurableJob {
                 admission_owner,
                 missing_route,
+                ..
             } => MaintenanceDecisionGap {
                 missing_owner: admission_owner,
                 reopen_condition: missing_route,
@@ -330,15 +339,39 @@ impl MaintenanceDispatch {
 
     /// The one line added to the record's summary: the owner that must act and
     /// the observation that reopens the decision.
+    ///
+    /// A start additionally retains the shared admission blockers, so the
+    /// summary states the exact missing lease, budget and job-wire owners
+    /// beside the family route.
     #[must_use]
     pub fn detail(&self) -> String {
         let gap = self.gap();
-        format!(
+        let base = format!(
             "dispatch={dispatch}; missing owner: {owner}; reopens when: {reopen}",
             dispatch = self.wire_name(),
             owner = gap.missing_owner,
             reopen = gap.reopen_condition,
-        )
+        );
+        match self.admission_blockers_text() {
+            Some(blockers) => format!("{base}; admission blocked by: {blockers}"),
+            None => base,
+        }
+    }
+
+    /// The shared Durable Job admission blockers this dispatch retains, when
+    /// it is a start.
+    ///
+    /// Only the start arm carries them: every other arm names its own missing
+    /// owner in [`Self::gap`] instead of the shared admission. `Some` with the
+    /// empty-set rendering states explicitly that no shared blocker remains.
+    #[must_use]
+    pub fn admission_blockers_text(&self) -> Option<String> {
+        match self {
+            Self::StartDurableJob {
+                admission_blockers, ..
+            } => Some(admission_blocker_summary(admission_blockers)),
+            _ => None,
+        }
     }
 
     /// Emits the routing decision for one evaluated trigger, so a reader can
@@ -364,6 +397,14 @@ impl MaintenanceDispatch {
             } => "the owner reported no job identity".to_owned(),
             _ => "unavailable: this dispatch names an owner, not an existing job".to_owned(),
         };
+        // Only the start arm carries the shared admission blockers. The other
+        // arms name their own missing owner in the gap fields above, so the
+        // field is reported as not applicable rather than filled with a
+        // placeholder a reader could mistake for a retained blocker.
+        let admission_blockers = self.admission_blockers_text().unwrap_or_else(|| {
+            "not applicable: this dispatch names its owner, not the shared Durable Job admission"
+                .to_owned()
+        });
         tracing::info!(
             target: "eliotd::diagnostics",
             event = "eliotd.maintenance_dispatch",
@@ -378,8 +419,29 @@ impl MaintenanceDispatch {
             missing_owner = gap.missing_owner,
             reopen_condition = gap.reopen_condition,
             existing_job = %existing_job,
+            admission_blockers = %admission_blockers,
         );
     }
+}
+
+/// Joins the exact missing-owner statements of the shared Durable Job
+/// admission blockers into one inspectable line.
+///
+/// Each statement is the blocker's own [`MaintenanceAdmissionBlocker::as_str`];
+/// only the separator is local. An empty set states explicitly that no shared
+/// blocker remains, so clearing the last blocker cannot render a start as
+/// silently admittable.
+fn admission_blocker_summary(blockers: &[MaintenanceAdmissionBlocker]) -> String {
+    if blockers.is_empty() {
+        return "no shared admission blocker remains: the Governor admission and the family route decide"
+            .to_owned();
+    }
+    blockers
+        .iter()
+        .copied()
+        .map(MaintenanceAdmissionBlocker::as_str)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Owner-supplied durable payload binding for one front-door intake.
