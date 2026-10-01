@@ -1624,6 +1624,24 @@ impl AcpResultEnvelope {
         }
     }
 
+    /// Attempt-binding preservation (issue #2641 W4): the projected result
+    /// carries the envelope attempt as its identity while the observation
+    /// carries the bound attempt, so a foreign-attempt envelope fails closed
+    /// here rather than binding one attempt's outcome to another attempt's
+    /// execution. Typed `==`, same owner error as the assembly pre-check,
+    /// so every projection path preserves the binding.
+    fn check_envelope_attempt_binding(
+        &self,
+        binding: &ProviderExecutionBinding,
+    ) -> Result<(), AcpAdapterError> {
+        if self.attempt_id != binding.attempt_id {
+            return Err(AcpAdapterError::ContractValidation(
+                eliot_agent_api::ContractError::BindingMismatch,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn into_agent_result(
         self,
         route: RouteFingerprint,
@@ -1645,19 +1663,7 @@ impl AcpResultEnvelope {
         if self.operation_id.trim().is_empty() {
             return Err(AcpAdapterError::InvalidInput("operation_id"));
         }
-        // Attempt-binding preservation (issue #2641 W4): the projected
-        // result carries the envelope attempt as its identity while the
-        // observation carries the bound attempt, so a foreign-attempt
-        // envelope must fail closed here rather than bind one attempt's
-        // outcome to another attempt's execution. Typed `==`, same owner
-        // error as the assembly pre-check, so every projection path
-        // (`into_agent_result`, `assemble_candidate_result`, the wire-error
-        // arm of `drain_wire_result`) preserves the binding.
-        if self.attempt_id != binding.attempt_id {
-            return Err(AcpAdapterError::ContractValidation(
-                eliot_agent_api::ContractError::BindingMismatch,
-            ));
-        }
+        self.check_envelope_attempt_binding(binding)?;
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
         // The typed wire code travels beside the outcome, not inside the
         // untrusted prose: it is captured here and rendered only after the
