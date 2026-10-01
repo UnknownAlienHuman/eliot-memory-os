@@ -103,25 +103,16 @@ pub(super) enum TxLane {
     PooledWrite,
 }
 
-/// Provider markers for retryable compare conflicts in the transaction's
-/// admitted allocation and owner-predecessor guards. The causal-parent marker
-/// is retried only after the next attempt rereads the original causal owner
-/// projection; all other semantic/currentness markers remain classified by
+/// Provider markers for retryable global-allocation conflicts and the causal
+/// parent predecessor compare. The causal-parent marker is retried only after
+/// the next attempt rereads the original causal owner projection. Owner-row,
+/// revision, and snapshot conflicts remain exclusively classified by
 /// [`SEMANTIC_CONFLICT_MARKERS`]. Matching is exact sentinel-token equality
 /// (see [`has_marker_token`]), never a substring search over provider prose.
 const ALLOCATION_CONFLICT_MARKERS: &[&str] = &[
     "canonical_fence_cas_conflict",
     "canonical_fence_create_conflict",
     "causal_parent_conflict",
-    "notification_revision_conflict",
-    "reactive_session_conflict",
-    "reactive_snapshot_conflict",
-    "automation_revision_conflict",
-    "automation_current_conflict",
-    "automation_invocation_conflict",
-    "experience_bank_conflict",
-    "experience_feedback_conflict",
-    "learning_record_conflict",
 ];
 
 /// Provider markers proving a deterministic semantic conflict: a stale
