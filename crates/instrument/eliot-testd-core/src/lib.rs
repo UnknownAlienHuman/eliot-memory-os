@@ -3788,9 +3788,13 @@ fn validate_blob_process_stream_outcome(
                 reason: "must be a lowercase SHA-256 digest",
             });
         }
-        if let Some(response_ref) = response_ref {
-            validate_text(response_ref, "blob_stream.response_ref")?;
-        }
+        let Some(response_ref) = response_ref else {
+            return Err(TestdError::Invalid {
+                field: "blob_stream.response_ref",
+                reason: "a completed owner response requires an exact retained response reference",
+            });
+        };
+        validate_text(response_ref, "blob_stream.response_ref")?;
     }
     Ok(())
 }
@@ -4371,6 +4375,15 @@ impl TestdStore {
             }
             (TestdBlobProcessStreamCallState::Completed(existing), Some(outcome))
                 if existing == outcome => return Ok(()),
+            // A protected reconciliation can resolve an earlier Unknown for
+            // this exact logical call. Unknown is explicitly unresolved, so
+            // replacing it with the retained owner outcome does not change
+            // the request binding or authorize another Store dispatch.
+            (TestdBlobProcessStreamCallState::Completed(
+                TestdBlobProcessStreamCallOutcome::Unknown,
+            ), Some(outcome)) => {
+                record.state = TestdBlobProcessStreamCallState::Completed(outcome);
+            }
             _ => return Err(TestdError::InvalidBinding),
         }
         let encoded = serde_json::to_vec(&record)
