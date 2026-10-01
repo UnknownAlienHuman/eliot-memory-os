@@ -535,7 +535,7 @@ impl NormalizedSchedule {
             zone_database_revision: user_automation_zones::PINNED_ZONE_DATABASE_RELEASE.to_owned(),
             occurrences_digest,
         });
-        self.validate_normalization_receipt_envelope(&declared, &envelope, revision)?;
+        self.validate_normalization_receipt_envelope(&declared, envelope, revision)?;
         Ok(declared)
     }
 
@@ -806,7 +806,7 @@ impl NormalizedSchedule {
                         "schedule.expression.utc_instant_resolved_to_gap",
                     ));
                 }
-                _ => {
+                user_automation_zones::LocalClockReality::Unique { .. } => {
                     return Err(UserAutomationError::ZoneEvidence(
                         "schedule.expression.utc_instant_zone_mismatch",
                     ));
@@ -820,7 +820,7 @@ impl NormalizedSchedule {
                 local_text,
                 local_text,
                 format_utc_offset(offset_minutes),
-                format!(
+                format_args!(
                     "{}Z",
                     format_civil_wall_clock(civil_from_unix_seconds(*instant)?)
                 ),
@@ -938,7 +938,7 @@ impl NormalizedSchedule {
                 format_civil_wall_clock(requested_local),
                 format_civil_wall_clock(resolved_local),
                 format_utc_offset(offset_minutes),
-                format!("{}Z", format_civil_wall_clock(instant)),
+                format_args!("{}Z", format_civil_wall_clock(instant)),
                 transition,
                 disposition,
                 source_digest,
@@ -4097,7 +4097,7 @@ impl UserAutomationOperation {
                     revision,
                 )
             }
-            Self::GetContext => Ok(()),
+            Self::GetContext | Self::List { .. } => Ok(()),
             Self::NormalizeSchedule {
                 revision,
                 occurrence_count,
@@ -4113,7 +4113,6 @@ impl UserAutomationOperation {
                 revision.validate_migration_supersedes(previous_revision)?;
                 validate_normalization_occurrence_count(*occurrence_count)
             }
-            Self::List { .. } => Ok(()),
             Self::Status { automation_id }
             | Self::History { automation_id }
             | Self::InspectLastFailure { automation_id } => {
@@ -4143,20 +4142,15 @@ impl UserAutomationOperation {
                     && previous_revision
                         .validate_legacy_for_schedule_migration()
                         .is_ok();
-                if legacy_predecessor {
+                let operation_kind = if legacy_predecessor {
                     revision.validate_normalized_migration_supersedes(previous_revision)?;
-                    if normalization_receipt_envelope.core.operation.operation_kind
-                        != USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
-                    {
-                        return Err(UserAutomationError::ReceiptBinding);
-                    }
+                    USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
                 } else {
                     revision.validate_supersedes(previous_revision)?;
-                    if normalization_receipt_envelope.core.operation.operation_kind
-                        != USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
-                    {
-                        return Err(UserAutomationError::ReceiptBinding);
-                    }
+                    USER_AUTOMATION_NORMALIZATION_OPERATION_KIND
+                };
+                if normalization_receipt_envelope.core.operation.operation_kind != operation_kind {
+                    return Err(UserAutomationError::ReceiptBinding);
                 }
                 revision.schedule.validate_normalization_receipt_envelope(
                     &revision.schedule.normalization_receipt,
