@@ -279,6 +279,26 @@ pub struct OutcomeReceipt {
     pub observed_at_unix_ms: u64,
 }
 
+/// Caller-observed admission conditions for one governed bridge apply. The
+/// three flags the caller proves against the live target and the candidate
+/// environment nest once under `observed_conditions` so the flat request
+/// carries at most two bare bools; every field name inside is unchanged and
+/// every validation reads through the single nesting with identical
+/// fail-closed semantics.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationBridgeObservedConditions {
+    /// Whether the candidate depends on the base it was produced against.
+    /// A moved base marks the candidate stale only when this is true; the
+    /// dependency itself is joined from the queue/dependency projection by
+    /// the caller, never inferred here.
+    pub candidate_depends_on_base: bool,
+    /// Whether the pre-apply verifier passed in the candidate environment.
+    pub pre_apply_verifier_passed: bool,
+    /// Whether the post-apply verifier passed.
+    pub post_apply_verifier_passed: bool,
+}
+
 /// Caller-observed governed-apply input for one lease-holding candidate. The
 /// bridge-apply slice decodes this from its typed request: it proves every
 /// observed set against the live target, runs the declared verifier in the
@@ -297,11 +317,6 @@ pub struct IntegrationBridgeApplyRequest {
     pub lease: IntegrationOwnerLease,
     /// Live base revision of the target at apply time.
     pub current_base_commit: String,
-    /// Whether the candidate depends on the base it was produced against.
-    /// A moved base marks the candidate stale only when this is true; the
-    /// dependency itself is joined from the queue/dependency projection by
-    /// the caller, never inferred here.
-    pub candidate_depends_on_base: bool,
     /// Live State Fence of the target at apply time.
     pub current_fence: StateFence,
     /// Caller-observed changed paths at apply time; must exactly match the
@@ -315,8 +330,9 @@ pub struct IntegrationBridgeApplyRequest {
     /// with the manifest fails closed; the disjoint remainder is the
     /// unrelated dirty work the bridge preserves.
     pub dirty_paths: BTreeSet<String>,
-    /// Whether the pre-apply verifier passed in the candidate environment.
-    pub pre_apply_verifier_passed: bool,
+    /// Caller-observed admission conditions (base dependency and verifier
+    /// outcomes), nested once with unchanged field names.
+    pub observed_conditions: IntegrationBridgeObservedConditions,
     /// Bounded ref naming the pre-apply verifier receipt evidence.
     pub pre_apply_verifier_receipt: String,
     /// Bounded ref naming the candidate worktree/environment the pre-apply
@@ -339,8 +355,6 @@ pub struct IntegrationBridgeApplyRequest {
     /// exactly when the bridge found a semantic conflict; nothing applies
     /// while this is present.
     pub semantic_conflict: Option<IntegrationSemanticConflict>,
-    /// Whether the post-apply verifier passed.
-    pub post_apply_verifier_passed: bool,
     /// Bounded ref naming the post-apply verifier receipt evidence.
     /// Required exactly when a post-apply verifier ran.
     pub post_apply_verifier_receipt: Option<String>,
@@ -582,7 +596,9 @@ pub fn apply_integration_candidate(
             target_scope: request.target_scope.clone(),
         });
     }
-    if candidate.base_commit != request.current_base_commit && request.candidate_depends_on_base {
+    if candidate.base_commit != request.current_base_commit
+        && request.observed_conditions.candidate_depends_on_base
+    {
         return Ok(ApplyOutcome::StaleRecorded {
             stale: Box::new(transition_candidate(
                 candidate,
@@ -633,7 +649,7 @@ pub fn apply_integration_candidate(
             lease_base_commit: lease.base_commit.clone(),
             lease_acquired_at_unix_ms: lease.acquired_at_unix_ms,
             outcome: IntegrationApplyOutcomeKind::ConflictHeld,
-            pre_apply_verifier_passed: request.pre_apply_verifier_passed,
+            pre_apply_verifier_passed: request.observed_conditions.pre_apply_verifier_passed,
             pre_apply_verifier_receipt: request.pre_apply_verifier_receipt.clone(),
             pre_apply_verifier_environment: request.pre_apply_verifier_environment.clone(),
             applied_paths: BTreeSet::new(),
@@ -653,7 +669,7 @@ pub fn apply_integration_candidate(
             )),
         });
     }
-    if !request.pre_apply_verifier_passed {
+    if !request.observed_conditions.pre_apply_verifier_passed {
         let rollback = request
             .rollback
             .clone()
@@ -696,7 +712,7 @@ pub fn apply_integration_candidate(
             reason: "the bridge must preserve all unrelated dirty work",
         });
     }
-    if !request.post_apply_verifier_passed {
+    if !request.observed_conditions.post_apply_verifier_passed {
         let rollback = request
             .rollback
             .clone()
@@ -839,7 +855,7 @@ fn validate_apply_request(
     )?;
     require_path_set(&request.applied_paths, "applied_paths")?;
     require_path_set(&request.preserved_dirty_paths, "preserved_dirty_paths")?;
-    for path in request.preserved_dirty_paths.iter() {
+    for path in &request.preserved_dirty_paths {
         if request.applied_paths.contains(path) {
             return Err(IntegrationApplyError::InvalidField {
                 field: "preserved_dirty_paths",
@@ -868,14 +884,18 @@ fn validate_apply_request(
         require_time(conflict.observed_at_unix_ms, "conflict observed_at_unix_ms")?;
     }
     if request.semantic_conflict.is_some() {
-        if request.post_apply_verifier_passed || request.post_apply_verifier_receipt.is_some() {
+        if request.observed_conditions.post_apply_verifier_passed
+            || request.post_apply_verifier_receipt.is_some()
+        {
             return Err(IntegrationApplyError::InvalidField {
                 field: "post_apply_verifier_receipt",
                 reason: "no post-apply verifier runs on a conflict hold",
             });
         }
-    } else if !request.pre_apply_verifier_passed {
-        if request.post_apply_verifier_passed || request.post_apply_verifier_receipt.is_some() {
+    } else if !request.observed_conditions.pre_apply_verifier_passed {
+        if request.observed_conditions.post_apply_verifier_passed
+            || request.post_apply_verifier_receipt.is_some()
+        {
             return Err(IntegrationApplyError::InvalidField {
                 field: "post_apply_verifier_receipt",
                 reason: "no post-apply verifier runs after a pre-apply failure",
