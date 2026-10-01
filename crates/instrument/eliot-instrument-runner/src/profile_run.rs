@@ -1397,6 +1397,15 @@ impl ProfileAggregate {
                     material.push_str(&sha256_hex(bytes));
                 }
             }
+            if let Some(observation) = &run.last_process_observation {
+                // Nonterminal supervision failures have no reconciled
+                // `ProcessEvidence`, so bind the last exact executor view as
+                // well. For terminal runs this must match the reconciled view;
+                // keeping it in the digest makes that equality reviewable.
+                if let Ok(bytes) = serde_json::to_vec(observation) {
+                    material.push_str(&sha256_hex(bytes));
+                }
+            }
             material.push('\0');
         }
         Self {
@@ -2013,6 +2022,7 @@ impl StageOrchestrator {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
             }
         };
+        let launch_started = Instant::now();
         match runner
             .launch_admitted(&mut binding, &grant, launcher.sink(planned))
             .await
@@ -2042,13 +2052,15 @@ impl StageOrchestrator {
                     runner,
                     &binding,
                     receipt.process.binding(),
+                    launch_started,
                     stage_deadline,
                     poll_interval,
                     cancellation_grace,
                 )
                 .await
                 {
-                    Ok(evidence) => {
+                    Ok(supervised) => {
+                        let evidence = supervised.evidence;
                         let evaluation = evaluator
                             .evaluate_terminal(planned, &receipt, &evidence)
                             .unwrap_or_else(|reason| {
@@ -2064,7 +2076,10 @@ impl StageOrchestrator {
                             evidence.view(),
                         );
                         run.adopt_terminal_evaluation(
-                            terminal_execution_status(&evidence),
+                            terminal_execution_status(
+                                &evidence,
+                                supervised.terminal_observed_before_deadline,
+                            ),
                             &evidence,
                             evaluation,
                             tool,
@@ -2223,11 +2238,11 @@ async fn await_reconciled_terminal<E: ProcessExecutor + 'static>(
     runner: &InstrumentRunner<E>,
     binding: &InstrumentBinding,
     expected_binding: &ProcessExecutionBinding,
+    started: Instant,
     deadline: Duration,
     poll_interval: Duration,
     cancellation_grace: Duration,
-) -> Result<ProcessEvidence, ProcessSupervisionFailure> {
-    let started = Instant::now();
+) -> Result<SupervisedProcessEvidence, ProcessSupervisionFailure> {
     let mut cancellation_started = None;
     let mut cancellation_detail = None;
     let mut last_view = None;
@@ -2249,6 +2264,7 @@ async fn await_reconciled_terminal<E: ProcessExecutor + 'static>(
         }
         last_view = Some(observation.view.clone());
         if observation.view.lifecycle().is_terminal() {
+            let terminal_observed_before_deadline = started.elapsed() < deadline;
             let evidence = match runner.reconcile(binding).await {
                 Ok(evidence) => evidence,
                 Err(error) => {
@@ -2280,7 +2296,10 @@ async fn await_reconciled_terminal<E: ProcessExecutor + 'static>(
                     last_view: Some(evidence.view().clone()),
                 });
             }
-            return Ok(evidence);
+            return Ok(SupervisedProcessEvidence {
+                evidence,
+                terminal_observed_before_deadline,
+            });
         }
         if cancellation_started.is_none() && started.elapsed() >= deadline {
             cancellation_started = Some(Instant::now());
@@ -2318,6 +2337,11 @@ struct ProcessSupervisionFailure {
     last_view: Option<eliot_process::ProcessExecutionView>,
 }
 
+struct SupervisedProcessEvidence {
+    evidence: ProcessEvidence,
+    terminal_observed_before_deadline: bool,
+}
+
 fn retained_tool_identity(
     grant: &InstrumentAdmissionGrant,
     executable: &ResolvedExecutableIdentity,
@@ -2349,12 +2373,19 @@ fn retained_tool_identity(
 
 /// Maps only a reconciled terminal physical observation onto the execution
 /// axis. Parser success remains a separate evaluator result.
-fn terminal_execution_status(process: &ProcessEvidence) -> ExecutionStatus {
+fn terminal_execution_status(
+    process: &ProcessEvidence,
+    terminal_observed_before_deadline: bool,
+) -> ExecutionStatus {
     let view = process.view();
     let exit = view
         .exit()
         .map(|exit| (exit.disposition(), observed_exit_code(exit)));
-    terminal_execution_status_from_observation(view.lifecycle(), exit)
+    terminal_execution_status_from_observation_with_deadline(
+        view.lifecycle(),
+        exit,
+        terminal_observed_before_deadline,
+    )
 }
 
 fn terminal_execution_status_from_observation(
@@ -2388,6 +2419,18 @@ fn terminal_execution_status_from_observation(
     }
 }
 
+fn terminal_execution_status_from_observation_with_deadline(
+    lifecycle: ProcessLifecycle,
+    exit: Option<(ExitDisposition, Option<i32>)>,
+    terminal_observed_before_deadline: bool,
+) -> ExecutionStatus {
+    if !terminal_observed_before_deadline {
+        ExecutionStatus::Unknown
+    } else {
+        terminal_execution_status_from_observation(lifecycle, exit)
+    }
+}
+
 /// Reads the optional exit code from the process contract's serialized view.
 /// `ExitStatus` intentionally exposes disposition without a code accessor.
 fn observed_exit_code(exit: &eliot_process::ExitStatus) -> Option<i32> {
@@ -2417,6 +2460,25 @@ mod terminal_supervision_tests {
                 Some((ExitDisposition::Completed, Some(7))),
             ),
             ExecutionStatus::Failed
+        );
+    }
+
+    #[test]
+    fn zero_exit_observed_after_deadline_is_unknown() {
+        assert_eq!(
+            terminal_execution_status_from_observation(
+                ProcessLifecycle::Exited,
+                Some((ExitDisposition::Completed, Some(0))),
+            ),
+            ExecutionStatus::Succeeded
+        );
+        assert_eq!(
+            terminal_execution_status_from_observation_with_deadline(
+                ProcessLifecycle::Exited,
+                Some((ExitDisposition::Completed, Some(0))),
+                false,
+            ),
+            ExecutionStatus::Unknown
         );
     }
 
