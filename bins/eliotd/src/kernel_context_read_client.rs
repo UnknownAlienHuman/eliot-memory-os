@@ -2456,8 +2456,9 @@ impl KernelContextReadClient {
         // render owner's codec. The input policy was bound above; this binds the
         // output, and a packet that reaches `Ok` cannot be handed over naming a
         // codec the owner never published.
-        require_delivered_context_render_codec(&assembled.view.execution)
-            .map_err(|error| PacketCompositionError::Assembly(Box::new(AssemblyError::from(error))))?;
+        require_delivered_context_render_codec(&assembled.view.execution).map_err(|error| {
+            PacketCompositionError::Assembly(Box::new(AssemblyError::from(error)))
+        })?;
         recheck_packet_headroom(&assembled, recipe, &headroom)?;
         // Release through the owner's own port. The evidence is DISCARDED here
         // for the same pre-existing reason the Context-side release

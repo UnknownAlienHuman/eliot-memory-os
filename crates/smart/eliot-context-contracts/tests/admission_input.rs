@@ -444,8 +444,18 @@ fn delivered_execution_identity_binds_the_owner_issued_serializer() {
     // comparison is a separate relation and not a restatement of it.
     let mut agreeing_measurement = exact_utf8_measurement(&binding());
     agreeing_measurement.serializer_id = "foreign-serializer".to_owned();
+    agreeing_measurement.serializer_version = foreign.serializer_version.clone();
+    agreeing_measurement.serializer_options_digest = foreign.serializer_options_digest.clone();
+    agreeing_measurement.route_id = foreign.route_id.clone();
+    agreeing_measurement.model_id = foreign.model_id.clone();
     let mut agreeing_execution = foreign;
     agreeing_execution.serializer_id = agreeing_measurement.serializer_id.clone();
+    agreeing_execution.serializer_version = agreeing_measurement.serializer_version.clone();
+    agreeing_execution.serializer_options_digest =
+        agreeing_measurement.serializer_options_digest.clone();
+    agreeing_execution.route_id = agreeing_measurement.route_id.clone();
+    agreeing_execution.model_id = agreeing_measurement.model_id.clone();
+    agreeing_execution.measurement_status = agreeing_measurement.status;
     agreeing_execution
         .binds_measurement(&agreeing_measurement)
         .expect("two records written by the same execution agree");
