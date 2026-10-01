@@ -80,8 +80,8 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.serde-boundary-inventory.v1"
-TOOL_VERSION = "0.3.0"
-RULE_REVISION = "929.3"
+TOOL_VERSION = "0.4.0"
+RULE_REVISION = "929.4"
 ISSUE = 929
 OWNED_TOML_REL = (
     "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
@@ -805,6 +805,50 @@ def _serde_flags(attr_text: str) -> dict[str, bool | str]:
     return flags
 
 
+# ``#[cfg(test)] mod NAME { ... }`` with any other attributes in between.
+_CFG_TEST_MOD_RE = re.compile(
+    r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\](?:\s*#\s*\[[^\]]*\]\s*)*mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+)
+
+
+def _block_extent(masked: str, open_brace: int) -> int:
+    """Offset just past the ``}`` closing the block opened at ``open_brace``.
+
+    Balanced over the *masked* text, so braces inside string literals and
+    comments cannot shift the extent. Returns ``len(masked)`` for an
+    unterminated block, which keeps the span open rather than truncating it
+    into a wrong answer.
+    """
+    depth = 0
+    for i in range(open_brace, len(masked)):
+        ch = masked[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return len(masked)
+
+
+# Per-file memo of the exact spans of inline ``#[cfg(test)] mod`` blocks. The
+# scan asks about many offsets in one file and the spans do not depend on the
+# offset, so this is computed once per distinct masked text.
+_CFG_TEST_SPANS: dict[str, tuple[tuple[int, int], ...]] = {}
+
+
+def _cfg_test_module_spans(masked: str) -> tuple[tuple[int, int], ...]:
+    spans = _CFG_TEST_SPANS.get(masked)
+    if spans is None:
+        found: list[tuple[int, int]] = []
+        for match in _CFG_TEST_MOD_RE.finditer(masked):
+            open_brace = masked.index("{", match.end() - 1)
+            found.append((open_brace + 1, _block_extent(masked, open_brace)))
+        spans = tuple(found)
+        _CFG_TEST_SPANS[masked] = spans
+    return spans
+
+
 def _is_test_scope(rel: str, masked: str, offset: int, func: str, mod: str) -> bool:
     if "/tests/" in rel or "/testdata/" in rel or "/testing/" in rel:
         return True
@@ -813,14 +857,31 @@ def _is_test_scope(rel: str, masked: str, offset: int, func: str, mod: str) -> b
         return True
     if mod == "tests":
         return True
-    # Span-level cfg(test): candidate below a cfg(test) marker in the same file.
-    head = masked[:offset]
-    if '#[cfg(test)]' in head.replace(" ", "") or '#[cfg( test )]' in head:
-        # Only treat as test scope when inside the tests module region.
-        cfg_pos = head.replace(" ", "").rfind("#[cfg(test)]")
-        mod_pos = head.rfind("mod tests")
-        if mod_pos >= 0 and mod_pos > cfg_pos - 500:
-            return True
+    # Span-level cfg(test): the candidate is inside the balanced-brace extent of
+    # an inline ``#[cfg(test)] mod`` block in this same file.
+    #
+    # This is containment, not proximity. The previous form asked "is there a
+    # ``mod tests`` within 500 characters above a ``#[cfg(test)]`` anywhere above
+    # the candidate", which is wrong twice over. It compared a ``cfg_pos`` taken
+    # from ``head.replace(" ", "")`` against a ``mod_pos`` taken from ``head`` --
+    # two different coordinate spaces, so the comparison was meaningless. And
+    # "within 500 characters of the marker" says nothing about whether the
+    # candidate is inside the module, so every production item in the file after
+    # a short tests module was labelled test scope. Two measured consequences on
+    # this repository: production ``Deserialize``/``Serialize`` boundaries in
+    # ``crates/surfaces/eliot-cli/src/lib.rs`` (9 rows, e.g.
+    # ``derive:TerminalAgreementReceipt:validate`` at brace depth 1, after the
+    # tests module closed) were recorded ``exact-internal`` / owner
+    # ``test-harness`` / ``NO_REPAIR_REQUIRED``, i.e. exempt from repair, and in
+    # ``crates/kernel/eliot-process/src/stream_sink/mod.rs`` the file-module
+    # declaration ``#[cfg(test)] mod tests;`` -- which has no body in this file
+    # at all -- marked every later production item as test scope. A test-scope
+    # misclassification is a silent coverage escape, so the span is now derived
+    # from the declaration itself.
+    if masked:
+        for start, end in _cfg_test_module_spans(masked):
+            if start <= offset < end:
+                return True
     if func.startswith("test_"):
         return True
     return False
