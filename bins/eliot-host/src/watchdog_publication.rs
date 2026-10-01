@@ -23,10 +23,10 @@ use observation::{decode_watchdog_publication_observation, scan_host_watchdog_pu
 // F-LOG-HOST-4 (#979) publication helpers.
 //
 // Through the #889 facade only
-// (`super::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`super::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// (`super::host_diagnostics::observe_entrypoint_with_detail`), with the sink
+// disposition noted through the shared bounded observer
+// (`super::host_diagnostics::note_event_log_sink_status`, over #984's landed
+// safe port).
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals only — never digests,
@@ -39,13 +39,8 @@ use observation::{decode_watchdog_publication_observation, scan_host_watchdog_pu
 // terminal. A bare `?` on an already-observed inner boundary propagates
 // without a second record.
 #[cfg(windows)]
-fn watchdog_publication_note_event_log_unavailable() {
-    let _ = super::windows_event_log::event_log_sink_status();
-}
-
-#[cfg(windows)]
 fn watchdog_publication_observe(detail: &str) {
-    watchdog_publication_note_event_log_unavailable();
+    super::host_diagnostics::note_event_log_sink_status();
     super::host_diagnostics::observe_entrypoint_with_detail(
         super::host_diagnostics::EntrypointStage::Startup,
         detail,

@@ -29,10 +29,10 @@ pub(super) use inspection::{
 // F-LOG-HOST-4 (#979) service-start observation helpers.
 //
 // Through the #889 facade only
-// (`super::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`super::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// (`super::host_diagnostics::observe_entrypoint_with_detail`), with the sink
+// disposition noted through the shared bounded observer
+// (`super::host_diagnostics::note_event_log_sink_status`, over #984's landed
+// safe port).
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals only — never service
@@ -48,13 +48,8 @@ pub(super) use inspection::{
 // decisions already made by the loop; they add no clock, sleep, retry, or
 // deadline.
 #[cfg(windows)]
-fn watchdog_start_note_event_log_unavailable() {
-    let _ = super::windows_event_log::event_log_sink_status();
-}
-
-#[cfg(windows)]
 fn watchdog_start_observe(detail: &str) {
-    watchdog_start_note_event_log_unavailable();
+    super::host_diagnostics::note_event_log_sink_status();
     super::host_diagnostics::observe_entrypoint_with_detail(
         super::host_diagnostics::EntrypointStage::ScmDispatch,
         detail,

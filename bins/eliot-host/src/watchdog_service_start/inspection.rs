@@ -24,10 +24,10 @@ use super::super::{
 // F-LOG-HOST-4 (#979) inspection helpers.
 //
 // Through the #889 facade only
-// (`super::super::host_diagnostics::observe_entrypoint_with_detail`); the
-// Event Log seam stays typed-Unavailable
-// (`super::super::windows_event_log::event_log_sink_status`), never
-// implemented here (#984 still open).
+// (`super::super::host_diagnostics::observe_entrypoint_with_detail`), with
+// the sink disposition noted through the shared bounded observer
+// (`super::super::host_diagnostics::note_event_log_sink_status`, over #984's
+// landed safe port).
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals only — never service
@@ -40,13 +40,8 @@ use super::super::{
 // terminal. A bare `?` on an already-observed inner boundary propagates
 // without a second record.
 #[cfg(windows)]
-fn watchdog_inspection_note_event_log_unavailable() {
-    let _ = super::super::windows_event_log::event_log_sink_status();
-}
-
-#[cfg(windows)]
 fn watchdog_inspection_observe(detail: &str) {
-    watchdog_inspection_note_event_log_unavailable();
+    super::super::host_diagnostics::note_event_log_sink_status();
     super::super::host_diagnostics::observe_entrypoint_with_detail(
         super::super::host_diagnostics::EntrypointStage::ScmDispatch,
         detail,
