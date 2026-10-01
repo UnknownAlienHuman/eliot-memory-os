@@ -40,6 +40,9 @@
 //! Issue #2561 adds the closed `forward_gap` envelope carrying the existing
 //! typed `CoverageGap`; all record, string, array, scalar, and nesting bounds
 //! remain unchanged.
+//! Issue #2900 adds the private `bind_scope` operator envelope for the
+//! response-sealed pre-scope proof and explicit initial binding body; all
+//! acquisition bounds remain unchanged.
 //!
 //! Issue #4601 closes the separate shipped `hook <event>` acquisition
 //! boundary: `HOOK_INPUT_PROFILE` / `HOOK_INPUT_PROFILE_ID` /
@@ -830,6 +833,7 @@ pub(crate) fn check_request_envelope(
 
 fn check_operation_shape(operation: &str, keys: &[String]) -> Result<(), DecodeReject> {
     let expected: &[&str] = match operation {
+        "bind_scope" => &["op", "correlation_id", "task_input"],
         "attach" | "invoke" | "cancel" => &["op", "request"],
         "dry_run_invoke" | "dry_run_cancel" => &["op", "request"],
         "forward_hook" | "forward_event" => &["op", "event"],

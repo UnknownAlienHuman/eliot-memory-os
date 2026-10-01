@@ -474,6 +474,11 @@ impl KernelTransportOwner {
         // fresh Session. Only a transport failure above (no terminal bytes
         // observed) leaves the one-shot open for one exact retry.
         self.activation_used = true;
+        // Preserve the exact response-sealed proof alongside the original
+        // admitted transport facts. It is usable only by a dedicated explicit
+        // BIND_SCOPE operation and never fills authenticated Session/task
+        // binding slots.
+        self.bind_scope_evidence = response.bind_scope_evidence;
         match response.disposition {
             OpenAgentBridgeActivationDisposition::Denied {
                 reason_code,
