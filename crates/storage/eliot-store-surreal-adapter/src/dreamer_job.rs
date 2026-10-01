@@ -311,10 +311,7 @@ pub(crate) async fn dreamer_job(
             Box::pin(op_record_applicability(adapter, db, ctx, request)).await
         }
         JobOperation::RecordAdmission { .. } => {
-            // Surreal backend has no admission-history writer yet; the
-            // canonical admission validation lives in store-api. Fail
-            // closed rather than mis-recording admission as applicability.
-            Err(AdapterError::Store(StoreError::UnknownOperation))
+            Box::pin(op_record_admission(adapter, db, ctx, request)).await
         }
     }
 }
@@ -914,6 +911,80 @@ fn prepare_applicability_mutation(
         selection_frontier: None,
     };
     Ok((ledger, event, response))
+}
+
+/// Appends one requester-owned admission revision against the durable work
+/// already stored on this job attempt. The operation records the observed
+/// current fence but never rewrites execution state, revision, outcome, or
+/// the prior admission revisions. CAS, exact-replay/conflict and the bounded
+/// history cap mirror `op_record_applicability`; bundle validity is enforced
+/// by `validate_bundle_admission` inside `commit_ledger_mutation`.
+async fn op_record_admission(
+    adapter: &SurrealStoreAdapter,
+    db: &client::RpcTransport,
+    _ctx: &RequestMeta,
+    request: DurableJobRequest,
+) -> Result<DurableJobResponse, AdapterError> {
+    let JobOperation::RecordAdmission { update } = &request.operation else {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    };
+    if request.role != JobRole::Requester {
+        return Err(AdapterError::Store(StoreError::UnknownOperation));
+    }
+    let operation_id = request.request_identity.operation.operation_id.to_string();
+    let op_key = dreamer_operation_row_key(&operation_id);
+    if let Some(replayed) = replay_or_conflict(db, &adapter.config, &op_key, &request).await? {
+        return Ok(replayed);
+    }
+    let Some((row_key, job_row, mut ledger)) = load_ledger(
+        db,
+        &adapter.config,
+        &update.job_id.to_string(),
+        &update.attempt_id.to_string(),
+    )
+    .await?
+    else {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    };
+    let expected_admission_revision = ledger
+        .admission_history
+        .last()
+        .map_or(0, |revision| revision.revision);
+    if update.expected_admission_revision != expected_admission_revision {
+        return Err(AdapterError::Store(StoreError::RevisionConflict));
+    }
+    if ledger.admission_history.len() >= MAX_DREAMER_JOB_HISTORY {
+        return Err(AdapterError::Store(StoreError::PayloadTooLarge));
+    }
+    let admission_revision = expected_admission_revision
+        .checked_add(1)
+        .ok_or(AdapterError::Store(StoreError::PayloadTooLarge))?;
+    let admission = eliot_protocol::dreamer_job::JobAdmissionRevision::from_update(
+        update,
+        &ledger.record,
+        ledger.admission_history.last(),
+        admission_revision,
+    )
+    .map_err(map_durable_error)
+    .map_err(AdapterError::Store)?;
+    let expected_outer = job_row.revision;
+    ledger.admission_history.push(admission);
+    // The projection-mutation shape (cursor advance, mutation identity,
+    // receipt, same-state event, history-echoing response) is identical for
+    // admission and applicability; the bundle validator dispatches on the
+    // operation kind to `validate_bundle_admission`.
+    let (ledger, event, response) = prepare_applicability_mutation(&request, ledger)?;
+    commit_ledger_mutation(
+        db,
+        &adapter.config,
+        &request,
+        &row_key,
+        expected_outer,
+        &ledger,
+        &event,
+        response,
+    )
+    .await
 }
 
 async fn status(
