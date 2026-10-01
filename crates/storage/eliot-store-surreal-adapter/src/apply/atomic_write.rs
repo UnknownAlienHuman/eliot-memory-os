@@ -274,6 +274,12 @@ fn classify_transaction_errors(errors: &[String], operation_id: &str) -> Adapter
         !errors.is_empty(),
         "classification runs only on a non-empty statement-error set"
     );
+    if errors
+        .iter()
+        .any(|error| has_marker_token(error, "automation_normalization_identity_conflict"))
+    {
+        return AdapterError::Store(StoreError::IdentityConflict);
+    }
     if errors.iter().any(|error| is_semantic_conflict(error)) {
         return AdapterError::ProviderConflict;
     }
