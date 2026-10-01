@@ -24,9 +24,13 @@ use crate::{ContextError, ContextInput};
 /// from the values the compiling and rendering cells actually use:
 ///
 /// - the stage is the single whole-unit compile-and-render stage;
-/// - the ordering revision is `eliot_context_assembly::ASSEMBLY_ORDERING_REVISION`,
-///   the revision `assemble_active_view` renders under, read from that crate
-///   rather than restated here;
+/// - the ordering SCHEME revision is `eliot_context_assembly::ASSEMBLY_ORDERING_REVISION`,
+///   the scheme `assemble_active_view` renders under, read from that crate rather
+///   than restated here. The specific role ORDER is no longer a member of this
+///   record because it is no longer the execution owner's to state: the renderer
+///   applies the approved revision's own `layout.role_positions`, so the order is a
+///   function of the recipe and `require_executable` cross-checks only the scheme
+///   under which the recipe's order is applied;
 /// - the repetition treatment is `EXECUTED_REPETITION_POLICY`, which is what
 ///   the renderer does today: project each admitted record once, with
 ///   `AdmittedContextSet::validate` refusing a repeated atom identity;
