@@ -2225,9 +2225,7 @@ impl SealObservationBoundary {
             .map_err(OpenCodeObservationConversionError::Contract)?;
         if envelope.sequence == 0 {
             return Err(OpenCodeObservationConversionError::Contract(
-                ContractError::ZeroLimit {
-                    field: "sequence",
-                },
+                ContractError::ZeroLimit { field: "sequence" },
             ));
         }
         Ok(Self {
@@ -2262,13 +2260,12 @@ pub fn seal_observation_boundary(
     // execution-unit); it reads no cursor or sequence, so one probe lineage
     // selects the terminal event and the real lineage is built afterwards for
     // the observed position.
-    let probe = ProviderObservationLineage::ExecutionUnitObservation(Box::new(
-        ExecutionUnitObservation {
+    let probe =
+        ProviderObservationLineage::ExecutionUnitObservation(Box::new(ExecutionUnitObservation {
             binding: admitted.binding().clone(),
             cursor: seal_observation_cursor(admitted, 1)?,
             sequence: 1,
-        },
-    ));
+        }));
     let terminal_position = events
         .iter()
         .enumerate()
@@ -2300,12 +2297,11 @@ pub fn seal_observation_boundary(
     // identity derivation and the owner record cannot diverge.
     let raw_source_bytes = canonical_json_bytes(terminal)
         .map_err(|error| OpenCodeObservationConversionError::Serialization(error.to_string()))?;
-    let handle =
-        RestrictedRawSourceHandle::new(format!(
-            "{SEAL_OBSERVATION_SOURCE_HANDLE}/{}",
-            admitted.attempt().id.as_str()
-        ))
-        .map_err(OpenCodeObservationConversionError::Contract)?;
+    let handle = RestrictedRawSourceHandle::new(format!(
+        "{SEAL_OBSERVATION_SOURCE_HANDLE}/{}",
+        admitted.attempt().id.as_str()
+    ))
+    .map_err(OpenCodeObservationConversionError::Contract)?;
     let source_digest = QualifiedSourceDigest {
         algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
         digest: serde_json::from_value(Value::String(sha256_hex(&raw_source_bytes))).map_err(
@@ -2321,13 +2317,12 @@ pub fn seal_observation_boundary(
     // copied from a string this module composed. There is no
     // `opencode:{sequence}` format and no hardcoded sequence on this path.
     let cursor = seal_observation_cursor(admitted, sequence)?;
-    let lineage = ProviderObservationLineage::ExecutionUnitObservation(Box::new(
-        ExecutionUnitObservation {
+    let lineage =
+        ProviderObservationLineage::ExecutionUnitObservation(Box::new(ExecutionUnitObservation {
             binding: admitted.binding().clone(),
             cursor: cursor.clone(),
             sequence,
-        },
-    ));
+        }));
     // Derive the identity from the payload the classifier actually produces for
     // this event under this lineage, not from an assumed terminal shape: a
     // guessed payload would mint an `event_id` the envelope cannot reproduce.

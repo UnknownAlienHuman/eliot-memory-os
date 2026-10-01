@@ -5,10 +5,11 @@ use crate::{
     LoopbackEndpoint, LoopbackHttpClient, LoopbackHttpError, ModelSelection, NoAuthorityRunResult,
     OPENCODE_ADMITTED_ATTEMPT_EDGE_CANDIDATE, OPENCODE_ROUTE_RECONCILIATION_REF, OpenCodeEvent,
     OpenCodeObservationConversionError, OpenCodeWireRouteReceipt, PhysicalObservationBody,
-    SEAL_OBSERVATION_SOURCE_EVIDENCE, SealedRouteDisposition, Session, SessionDiff, SessionStatus,
-    SessionStatusMap, SseConnection, SseDecodeError, SseDecoder, SseEvent, SseLimits,
-    UnknownFields, UsageAvailability, UsageTelemetry, bound_session_identity, committed_message_id,
-    seal_observation_boundary, wire_receipt_evidence, wire_route_locator,
+    ProviderCatalog, QuotaAvailability, ReadOnlyRunRequest, RunRequestError, RunStatus,
+    SEAL_OBSERVATION_SOURCE_EVIDENCE, SealObservationBoundary, SealedRouteDisposition, Session,
+    SessionDiff, SessionStatus, SessionStatusMap, SseConnection, SseDecodeError, SseDecoder,
+    SseEvent, SseLimits, UnknownFields, UsageAvailability, UsageTelemetry, bound_session_identity,
+    committed_message_id, seal_observation_boundary, wire_receipt_evidence, wire_route_locator,
 };
 use eliot_agent_api::ExecutionOutcome;
 use eliot_contracts::{ClockReading, ResourceGeneration, StateFence};
@@ -1666,7 +1667,7 @@ impl OpenCodeClient {
 fn seal_route_disposition(
     admitted: &AdmittedOpenCodeAttempt,
     run: &NoAuthorityRunResult,
-) -> Result<SealedRouteDisposition, AdmittedAttemptError> {
+) -> SealedRouteDisposition {
     if run.actual_route.is_observed() {
         let bound_session = bound_session_identity(admitted.binding());
         let session_agrees = match (
@@ -1680,13 +1681,13 @@ fn seal_route_disposition(
         if !session_agrees {
             let (wire_evidence_digest, wire_evidence_ref) =
                 wire_receipt_evidence(&run.actual_route);
-            return Ok(SealedRouteDisposition::RejectedConflict {
+            return SealedRouteDisposition::RejectedConflict {
                 cause: OpenCodeObservationConversionError::Contract(
                     eliot_agent_api::ContractError::BindingMismatch,
                 ),
                 wire_evidence_digest,
                 wire_evidence_ref,
-            });
+            };
         }
     }
     let terminal_ms = run
@@ -1696,7 +1697,7 @@ fn seal_route_disposition(
         .and_then(|completed_at_ms| i64::try_from(completed_at_ms).ok());
     let Some(terminal_ms) = terminal_ms else {
         let (wire_evidence_digest, wire_evidence_ref) = wire_receipt_evidence(&run.actual_route);
-        return Ok(SealedRouteDisposition::UnknownOutcome {
+        return SealedRouteDisposition::UnknownOutcome {
             boundary: None,
             cause: OpenCodeObservationConversionError::InvalidInput(
                 "observed_completed_at_ms".to_owned(),
@@ -1704,7 +1705,7 @@ fn seal_route_disposition(
             wire_evidence_digest,
             wire_evidence_ref,
             reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
-        });
+        };
     };
     let terminal = ClockReading {
         valid_time_ms: Some(terminal_ms),
@@ -1722,7 +1723,7 @@ fn seal_route_disposition(
         Ok(None) => {
             let (wire_evidence_digest, wire_evidence_ref) =
                 wire_receipt_evidence(&run.actual_route);
-            return Ok(SealedRouteDisposition::UnknownOutcome {
+            return SealedRouteDisposition::UnknownOutcome {
                 boundary: None,
                 cause: OpenCodeObservationConversionError::InvalidInput(
                     SEAL_OBSERVATION_SOURCE_EVIDENCE.to_owned(),
@@ -1730,21 +1731,21 @@ fn seal_route_disposition(
                 wire_evidence_digest,
                 wire_evidence_ref,
                 reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
-            });
+            };
         }
         Err(cause) => {
             let (wire_evidence_digest, wire_evidence_ref) =
                 wire_receipt_evidence(&run.actual_route);
-            return Ok(SealedRouteDisposition::UnknownOutcome {
+            return SealedRouteDisposition::UnknownOutcome {
                 boundary: None,
                 cause,
                 wire_evidence_digest,
                 wire_evidence_ref,
                 reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
-            });
+            };
         }
     };
-    match admitted.observe_physical_route(
+    let observation = admitted.observe_physical_route(
         &run.actual_route,
         PhysicalObservationBody {
             usage: run.usage.to_usage_receipt(),
@@ -1756,33 +1757,52 @@ fn seal_route_disposition(
             event_sequence: boundary.sequence,
             cancellation: None,
         },
-    ) {
-        Ok(receipt) => Ok(if receipt.execution_outcome == ExecutionOutcome::Observed {
-            SealedRouteDisposition::Observed(receipt)
-        } else {
-            SealedRouteDisposition::Unobserved(receipt)
-        }),
+    );
+    seal_observed_disposition(observation, &boundary, &run.actual_route)
+}
+
+/// Maps one owner observation onto its sealed disposition.
+///
+/// A transport or contract failure is a CONFLICT against the wire evidence; a
+/// serialization or input failure is an UNKNOWN outcome that keeps the owner
+/// boundary so the #371 owner can still be asked. Neither arm invents a
+/// disposition the owner did not report.
+fn seal_observed_disposition(
+    observation: Result<
+        eliot_agent_api::PhysicalRouteObservationReceipt,
+        OpenCodeObservationConversionError,
+    >,
+    boundary: &SealObservationBoundary,
+    actual_route: &OpenCodeWireRouteReceipt,
+) -> SealedRouteDisposition {
+    match observation {
+        Ok(receipt) => {
+            if receipt.execution_outcome == ExecutionOutcome::Observed {
+                SealedRouteDisposition::Observed(receipt)
+            } else {
+                SealedRouteDisposition::Unobserved(receipt)
+            }
+        }
         Err(cause) => {
-            let (wire_evidence_digest, wire_evidence_ref) =
-                wire_receipt_evidence(&run.actual_route);
+            let (wire_evidence_digest, wire_evidence_ref) = wire_receipt_evidence(actual_route);
             match &cause {
                 OpenCodeObservationConversionError::Wire(_)
                 | OpenCodeObservationConversionError::Contract(_) => {
-                    Ok(SealedRouteDisposition::RejectedConflict {
+                    SealedRouteDisposition::RejectedConflict {
                         cause,
                         wire_evidence_digest,
                         wire_evidence_ref,
-                    })
+                    }
                 }
                 OpenCodeObservationConversionError::Serialization(_)
                 | OpenCodeObservationConversionError::InvalidInput(_) => {
-                    Ok(SealedRouteDisposition::UnknownOutcome {
-                        boundary: Some(boundary),
+                    SealedRouteDisposition::UnknownOutcome {
+                        boundary: Some(boundary.clone()),
                         cause,
                         wire_evidence_digest,
                         wire_evidence_ref,
                         reconciliation_ref: OPENCODE_ROUTE_RECONCILIATION_REF.to_owned(),
-                    })
+                    }
                 }
             }
         }
@@ -1861,7 +1881,7 @@ fn seal_admitted_outcome(
     // conflict does not erase the retained provider output: the candidate
     // still seals below, but under a digest-bound conflict disposition rather
     // than an indistinguishable stronger success.
-    let route = seal_route_disposition(admitted, &run)?;
+    let route = seal_route_disposition(admitted, &run);
     // The disposition summary rides the run extra before sealing, so the
     // candidate `result_digest` binds the final route disposition, its
     // evidence/recovery references, and the #2645 staging columns: a consumer
