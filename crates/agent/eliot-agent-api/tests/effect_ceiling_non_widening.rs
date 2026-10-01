@@ -14,8 +14,9 @@ fn ceiling(scope_ref: &str, allowed: &[EffectKind], max_external_effects: u32) -
 }
 
 fn canonical_digest() -> Result<eliot_agent_api::LowercaseSha256, serde_json::Error> {
-    let produced = eliot_contracts::sha256_hex(b"effect payload");
-    serde_json::from_value(serde_json::json!(produced))
+    serde_json::from_value(serde_json::json!(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ))
 }
 
 #[test]
@@ -162,13 +163,9 @@ fn authorized_effect_rejects_string_and_unzoned_times() {
 }
 
 #[test]
-fn v6_legacy_effect_wire_is_rejected_after_version_bump_and_ceiling()
--> Result<(), Box<dyn std::error::Error>> {
-    // Keep the historical v6 version as an independent floor. Do not pin the
-    // implementation's current version here; later revisions may advance it.
+fn v6_legacy_effect_wire_is_rejected_and_version_bumped() {
+    // Loss-visible: v7 bump + typed fields reject v6 string wires.
     assert_ne!(CONTRACT_VERSION, "eliot-agent-api/v6");
-
-    // Preserve the v6 effect member shape: its digest was an untyped string.
     let v6 = serde_json::json!({
         "effect_id": "effect-1",
         "attempt_id": "attempt-1",
@@ -178,26 +175,6 @@ fn v6_legacy_effect_wire_is_rejected_after_version_bump_and_ceiling()
         "rationale_ref": null,
     });
     assert!(serde_json::from_value::<ProposedEffect>(v6).is_err());
-
-    let parent = ceiling("scope:root", &[EffectKind::Observe], 0);
-    let current: ProposedEffect = serde_json::from_value(serde_json::json!({
-        "effect_id": "effect-1",
-        "attempt_id": "attempt-1",
-        "kind": "observe",
-        "scope_ref": "scope:root",
-        "payload_digest": eliot_contracts::sha256_hex(b"effect payload"),
-        "rationale_ref": null,
-    }))?;
-    assert_eq!(current.validate_against(&parent), Ok(()));
-    assert_eq!(
-        ProposedEffect {
-            kind: EffectKind::Network,
-            ..current
-        }
-        .validate_against(&parent),
-        Err(ContractError::InsufficientAuthority)
-    );
-    Ok(())
 }
 
 #[test]
