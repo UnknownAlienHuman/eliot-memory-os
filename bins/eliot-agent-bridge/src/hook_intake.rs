@@ -25,9 +25,13 @@
 //!
 //! This boundary bounds acquisition only. It does not establish a wall-clock
 //! deadline on a blocking slow stdin producer, so no timeout or interruption is
-//! claimed here. Hook mode keeps its existing legacy task/environment/spool
-//! semantics: bounded input is not authenticated event admission, and this
-//! intake mints no task or session authority.
+//! claimed here: every read here is a plain blocking `read`/`fill_buf`, a byte
+//! bound says nothing about how long a producer may stall, and neither
+//! `idle_timeout_ms` nor `lifetime_timeout_ms` is enforced on this branch. A
+//! producer that never writes and never closes leaves this process blocked.
+//! Hook mode keeps its existing legacy task/environment/spool semantics:
+//! bounded input is not authenticated event admission, and this intake mints no
+//! task or session authority.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -211,26 +215,52 @@ fn hook_runtime_root() -> Result<PathBuf, HookIntakeError> {
 /// UTF-8. Every other disposition is a typed [`HookIntakeError`] raised before
 /// dispatch.
 ///
-/// The ceiling is enforced incrementally by the owner's
-/// [`crate::request_input::read_bounded_record`] with checked arithmetic while
-/// collecting, so acquisition never allocates past
-/// [`HOOK_INPUT_PROFILE`]::`max_record_bytes` and no `String` or
-/// `serde_json::Value` is constructed before the bound has been observed
-/// against THIS input. Dispositions:
+/// # Where the ceiling is compared
+///
+/// The comparison is the owner's, not this function's:
+/// [`crate::request_input::read_bounded_record`] accumulates each buffered
+/// chunk with `checked_add` and refuses the moment the running content total is
+/// GREATER THAN [`HOOK_INPUT_PROFILE`]::`max_record_bytes`. That test is strict,
+/// so the boundary falls exactly as follows:
+///
+/// - content length == `max_record_bytes` is ACCEPTED;
+/// - content length == `max_record_bytes + 1` is REFUSED as
+///   [`HookIntakeError::StdinOversize`];
+/// - the framing byte is excluded from the total (and a single trailing
+///   carriage return is removed as part of CRLF), so an accepted terminated
+///   record may be `max_record_bytes` content bytes plus its terminator.
+///
+/// Because the check runs per chunk, the same boundary holds whether the record
+/// arrives in one read or many. [`ReadOutcome::Record`] is reachable only when
+/// the ceiling held for every chunk of it, so an accepted payload is never a
+/// truncation of a longer record, and no `String` or `serde_json::Value` is
+/// constructed before the bound has been observed against THIS input.
+///
+/// # Framing: exactly one record is the contract
+///
+/// The owner reads exactly one newline-delimited record, so the first terminator
+/// ends the payload. Bytes after that terminator are neither inspected nor
+/// dispatched by this branch, which serves one host hook payload per process.
+/// Two consequences are worth stating rather than leaving accidental: a payload
+/// whose JSON spans an embedded newline (pretty-printed host JSON) is read only
+/// up to that newline and is then refused as
+/// [`HookIntakeError::StdinNotJson`] instead of being partially accepted; and a
+/// host that wrote a second complete JSON document after the first line is
+/// outside this branch's framing contract, and that second document is not
+/// dispatched.
+///
+/// # Dispositions
 ///
 /// - accepted EMPTY input (no bytes at all, or a blank framed record) yields
 ///   empty bytes, preserving the retired facade contract where empty input
 ///   parses as `{}`;
 /// - a within-bound record that is not valid UTF-8 is
-///   [`HookIntakeError::StdinInvalidUtf8`];
+///   [`HookIntakeError::StdinInvalidUtf8`], whether it was terminator-framed or
+///   EOF-final with no trailing newline;
 /// - a record exceeding the ceiling is [`HookIntakeError::StdinOversize`] and
 ///   is rejected without truncation into a valid accepted prefix, without
 ///   dispatch, and with the owner's bounded resynchronization rather than an
 ///   unbounded drain.
-///
-/// Accepted bytes are therefore never merely "shaped right": the ceiling is
-/// compared against this record's exact length by the owner's acquisition
-/// arithmetic before this function returns.
 fn acquire_hook_payload<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<u8>, HookIntakeError> {
     let outcome = read_bounded_record(reader, HOOK_INPUT_PROFILE)
         .map_err(HookIntakeError::StdinUnreadable)?;

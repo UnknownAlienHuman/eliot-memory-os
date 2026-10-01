@@ -151,9 +151,15 @@ pub(crate) const HOOK_INPUT_PROFILE_ID: &str = "eliot.agent-bridge.hook-input.v1
 ///   owner's aggregate-retention row, keeping the acquisition plus retained
 ///   bytes at the accepted ratio of one record plus bounded decoder state.
 /// - `max_json_string_bytes`, `max_container_items`, `max_scalar_values` and
-///   `max_nesting_depth` are reused unchanged from the owner's decode
-///   pre-scan rows so hook decode-stage budget matches the request path instead
-///   of introducing a second scale of numbers.
+///   `max_nesting_depth` are reused unchanged from the owner's decode pre-scan
+///   rows so this profile carries no second scale of numbers. They are NOT
+///   enforced on the hook branch: that branch calls only `read_bounded_record`,
+///   never the owner's `prevalidate_record` / `check_request_envelope` decode
+///   pre-scan. Together with `max_buffered_bytes` and the intrinsic
+///   `validate` / `scratch_budget` checks they are carried for profile-shape
+///   identity, not as hook behaviour. The rows `read_bounded_record` actually
+///   enforces are exactly `max_record_bytes`, `max_oversize_discard_bytes` and
+///   `oversize_disposition`.
 /// - `max_oversize_discard_bytes = 4_194_304` (4 MiB) is reused unchanged from
 ///   the owner's resynchronization row. This is the owner's own Bridge-local
 ///   acquisition decision and NOT I7.2's 4 MiB transport frame default
