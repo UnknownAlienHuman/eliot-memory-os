@@ -20,7 +20,7 @@ use eliot_contracts::{
 };
 use eliot_ipc::{
     AdmissionCoverage, AttemptGate, CapabilityEvidence, ConformanceError, EvidenceTier,
-    FingerprintQuarantine, HostFingerprint, RouteMismatchDisposition, admit_coverage,
+    FingerprintQuarantine, HostFingerprint, RouteFinding, RouteMismatchDisposition, admit_coverage,
     reconcile_attempt_route, require_verified_capability,
 };
 use eliot_protocol::{HandoffCausalLink, HandoffCompleteness, RehydrationBundle, RouteFingerprint};
@@ -218,6 +218,99 @@ fn route_mismatch_marks_candidate_only_invalidates_and_quarantines() {
     assert_eq!(
         ok(admit_coverage(&fresh, &active, SCOPE, NOW, &quarantine)),
         AdmissionCoverage::Verified
+    );
+}
+
+#[test]
+fn quarantine_revalidation_rejects_probe_and_observation_for_different_capabilities() {
+    let active = fingerprint();
+    let probe = ok(CapabilityEvidence::new(
+        &active,
+        EvidenceTier::ConformanceProbe,
+        SCOPE,
+        "tool.exec.probe",
+        LIVE,
+        vec!["probe-run-current".to_owned()],
+        Vec::new(),
+    ));
+    let other_capability_probe = ok(CapabilityEvidence::new(
+        &active,
+        EvidenceTier::ConformanceProbe,
+        SCOPE,
+        "tool.exec.enforced",
+        LIVE,
+        vec!["probe-run-other".to_owned()],
+        Vec::new(),
+    ));
+    let mut quarantine = FingerprintQuarantine::new();
+    ok(quarantine.quarantine(&active.canonical(), "route mismatch"));
+    let mut no_prior_evidence = Vec::new();
+    let matched_route = ok(reconcile_attempt_route(
+        "route-main",
+        Some("route-main"),
+        &mut no_prior_evidence,
+        &mut quarantine,
+        &active,
+        RouteMismatchDisposition::Quarantine,
+    ));
+    let other_capability_observation = ok(matched_route.project_production_observation(
+        &other_capability_probe,
+        &active,
+        "prod-span-other-capability",
+        NOW,
+    ));
+
+    assert_eq!(
+        quarantine.reconcile_with_revalidation(
+            &active,
+            &[probe, other_capability_observation],
+            SCOPE,
+            NOW,
+        ),
+        Err(ConformanceError::CandidateOnlyWhereVerifiedRequired)
+    );
+    assert!(quarantine.is_quarantined(&active.canonical()));
+
+    // A live observation projected from the matching probe still releases it.
+    assert!(ok(quarantine.reconcile_with_revalidation(
+        &active,
+        &full_evidence(),
+        SCOPE,
+        NOW,
+    )));
+    assert!(!quarantine.is_quarantined(&active.canonical()));
+}
+
+#[test]
+fn production_observation_rechecks_original_route_inputs() {
+    let active = fingerprint();
+    let probe = ok(CapabilityEvidence::new(
+        &active,
+        EvidenceTier::ConformanceProbe,
+        SCOPE,
+        "probe",
+        LIVE,
+        vec!["probe-run-7".to_owned()],
+        Vec::new(),
+    ));
+    let mut quarantine = FingerprintQuarantine::new();
+    let mut evidence = Vec::new();
+    let mut mismatch = ok(reconcile_attempt_route(
+        "route-main",
+        Some("route-shadow"),
+        &mut evidence,
+        &mut quarantine,
+        &active,
+        RouteMismatchDisposition::Quarantine,
+    ));
+    assert_eq!(mismatch.finding, RouteFinding::ObservedMismatch);
+
+    // The public summary field is mutable. Changing it cannot turn the
+    // retained original route inputs into a production observation.
+    mismatch.finding = RouteFinding::Matched;
+    assert_eq!(
+        mismatch.project_production_observation(&probe, &active, "forged-span", NOW),
+        Err(ConformanceError::InvalidInput)
     );
 }
 

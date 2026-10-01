@@ -504,26 +504,31 @@ fn verified_on_fingerprint(
             matching
         }
     };
-    let probe = qualified
-        .iter()
-        .any(|item| item.tier() == EvidenceTier::ConformanceProbe);
-    // A caller-selected production label proves nothing was observed; only
-    // the owner projection witnesses production (I7.22).
-    let observation = qualified
-        .iter()
-        .any(|item| item.tier() == EvidenceTier::ProductionObservation && item.production_observed);
-    if !probe || !observation {
+    // The production observation must confirm the exact capability that was
+    // probed. Matching fingerprint and scope alone would let a probe for one
+    // proof ceiling be combined with an observation for another.
+    let has_matching_pair = qualified.iter().any(|probe| {
+        probe.tier() == EvidenceTier::ConformanceProbe
+            && qualified.iter().any(|observation| {
+                observation.tier() == EvidenceTier::ProductionObservation
+                    && observation.production_observed
+                    && observation.proof_ceiling() == probe.proof_ceiling()
+            })
+    });
+    if !has_matching_pair {
         return Err(ConformanceError::CandidateOnlyWhereVerifiedRequired);
     }
-    let live_probe = qualified
-        .iter()
-        .any(|item| item.tier() == EvidenceTier::ConformanceProbe && item.is_live(now_unix_ms));
-    let live_observation = qualified.iter().any(|item| {
-        item.tier() == EvidenceTier::ProductionObservation
-            && item.production_observed
-            && item.is_live(now_unix_ms)
+    let live_matching_pair = qualified.iter().any(|probe| {
+        probe.tier() == EvidenceTier::ConformanceProbe
+            && probe.is_live(now_unix_ms)
+            && qualified.iter().any(|observation| {
+                observation.tier() == EvidenceTier::ProductionObservation
+                    && observation.production_observed
+                    && observation.proof_ceiling() == probe.proof_ceiling()
+                    && observation.is_live(now_unix_ms)
+            })
     });
-    if live_probe && live_observation {
+    if live_matching_pair {
         return Ok(());
     }
     let qualifying_broken = qualified.iter().any(|item| {
@@ -579,6 +584,18 @@ pub struct AttemptRouteOutcome {
     pub invalidated_count: usize,
     /// True when the fingerprint was quarantined by this reconciliation.
     pub quarantined: bool,
+    // Keep the original route inputs private so a caller cannot mutate the
+    // public summary into a production-observation witness.
+    requested_route: String,
+    observed_route: Option<String>,
+}
+
+fn classify_route(requested_route: &str, observed_route: Option<&str>) -> RouteFinding {
+    match observed_route {
+        Some(observed) if observed == requested_route => RouteFinding::Matched,
+        Some(_) => RouteFinding::ObservedMismatch,
+        None => RouteFinding::UnknownRoute,
+    }
 }
 
 /// Reconciles one completed attempt's observed route against its requested
@@ -604,11 +621,7 @@ pub fn reconcile_attempt_route(
         return Err(ConformanceError::InvalidInput);
     }
     mismatched_fingerprint.validate()?;
-    let finding = match observed_route {
-        Some(observed) if observed == requested_route => RouteFinding::Matched,
-        Some(_) => RouteFinding::ObservedMismatch,
-        None => RouteFinding::UnknownRoute,
-    };
+    let finding = classify_route(requested_route, observed_route);
     if finding == RouteFinding::Matched {
         return Ok(AttemptRouteOutcome {
             matches: true,
@@ -616,6 +629,8 @@ pub fn reconcile_attempt_route(
             candidate_only: false,
             invalidated_count: 0,
             quarantined: false,
+            requested_route: requested_route.to_owned(),
+            observed_route: observed_route.map(str::to_owned),
         });
     }
     if finding == RouteFinding::UnknownRoute {
@@ -625,6 +640,8 @@ pub fn reconcile_attempt_route(
             candidate_only: true,
             invalidated_count: 0,
             quarantined: false,
+            requested_route: requested_route.to_owned(),
+            observed_route: observed_route.map(str::to_owned),
         });
     }
     // Only evidence bound to the mismatched fingerprint is dependent on it.
@@ -657,6 +674,8 @@ pub fn reconcile_attempt_route(
         candidate_only: true,
         invalidated_count,
         quarantined,
+        requested_route: requested_route.to_owned(),
+        observed_route: observed_route.map(str::to_owned),
     })
 }
 
@@ -691,7 +710,9 @@ impl AttemptRouteOutcome {
         observed_span: &str,
         now_unix_ms: u64,
     ) -> Result<CapabilityEvidence, ConformanceError> {
-        if self.finding != RouteFinding::Matched {
+        if classify_route(&self.requested_route, self.observed_route.as_deref())
+            != RouteFinding::Matched
+        {
             return Err(ConformanceError::InvalidInput);
         }
         active.validate()?;
