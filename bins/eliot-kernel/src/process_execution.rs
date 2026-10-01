@@ -1780,8 +1780,28 @@ pub(crate) struct ProcessExecutionGateway {
 pub(crate) struct KernelIssuedBlobProcessStreamGrant {
     pub(crate) capability: eliot_blob_api::wire::ProcessStreamSinkCapabilityRef,
     pub(crate) initial_call_token: eliot_blob_api::wire::BlobProcessStreamCallToken,
+    pub(crate) owner_projection: KernelBlobProcessStreamOwnerProjection,
     pub(crate) owner_facts_response:
         eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
+}
+
+/// Exact launch-time owner-facts projection. These digest domains stay
+/// separate; stream-specific ProcessSourceAdmission is added only after the
+/// actual Open request exists.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub(crate) struct KernelBlobProcessStreamOwnerProjection {
+    pub(crate) owner_facts_json: String,
+    pub(crate) owner_facts_sha256: String,
+    pub(crate) process_binding_sha256: String,
+    pub(crate) fence_sha256: String,
+    pub(crate) policy_sha256: String,
+    pub(crate) owner_currentness_sha256: String,
+    pub(crate) work_scope_snapshot_sha256: String,
+    pub(crate) module_catalog_owner_readback_json: String,
+    pub(crate) module_catalog_owner_readback_sha256: String,
+    pub(crate) generation_admission_json: String,
+    pub(crate) generation_admission_sha256: String,
 }
 
 /// Derives the opaque, stable ORS key for one capability ordinal. The value
@@ -3870,6 +3890,43 @@ impl KernelComposition {
                 ));
             }
         };
+        let owner_projection = match &response.outcome {
+            BlobProcessStreamOwnerFactsPullOutcome::Available {
+                owner_facts_json,
+                owner_facts_sha256,
+                policy_sha256,
+                currentness_sha256,
+                work_scope_snapshot_sha256,
+                module_catalog_owner_readback_json,
+                module_catalog_owner_readback_sha256,
+                generation_admission_json,
+                generation_admission_sha256,
+                ..
+            } => {
+                let fence_json = canonical_json_bytes(&response.observed_state_fence)
+                    .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+                KernelBlobProcessStreamOwnerProjection {
+                    owner_facts_json: owner_facts_json.clone(),
+                    owner_facts_sha256: owner_facts_sha256.clone(),
+                    process_binding_sha256: response.process_binding_sha256.clone(),
+                    fence_sha256: sha256_hex(&fence_json),
+                    policy_sha256: policy_sha256.clone(),
+                    owner_currentness_sha256: currentness_sha256.clone(),
+                    work_scope_snapshot_sha256: work_scope_snapshot_sha256.clone(),
+                    module_catalog_owner_readback_json:
+                        module_catalog_owner_readback_json.clone(),
+                    module_catalog_owner_readback_sha256:
+                        module_catalog_owner_readback_sha256.clone(),
+                    generation_admission_json: generation_admission_json.clone(),
+                    generation_admission_sha256: generation_admission_sha256.clone(),
+                }
+            }
+            BlobProcessStreamOwnerFactsPullOutcome::Unavailable { .. } => {
+                return Err(ProcessExecutionError::Unavailable(
+                    "daemon owner-facts pull lacks a verified owner projection".to_owned(),
+                ));
+            }
+        };
         let binding = process
             .expected_execution_binding()
             .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
@@ -3956,6 +4013,7 @@ impl KernelComposition {
         Ok(KernelIssuedBlobProcessStreamGrant {
             capability,
             initial_call_token,
+            owner_projection,
             owner_facts_response: response,
         })
     }
