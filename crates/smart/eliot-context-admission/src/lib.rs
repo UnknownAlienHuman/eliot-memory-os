@@ -386,7 +386,16 @@ fn check_reserved_occupancy(
 /// It is an existing owner record, never a minted placeholder: the recipe's
 /// own invalidation identity when it declared one, otherwise the admission
 /// rule evidence that produced the failure.
-fn headroom_reason_ref(input: &AdmissionInput) -> String {
+///
+/// Both sources are already owner-issued [`eliot_contracts::ArtifactId`]s
+/// (`ContextRecipe::invalidation` and `SafetyFloorIdentity::rule_evidence`),
+/// and `HeadroomRefusal`'s `reason` is that same type, so the owner identity is
+/// COPIED here and never rebuilt. No identifier is constructed at this site, so
+/// `ArtifactId::new` is not called and no reason can fail the identifier's
+/// blank/control-character rules on the way in: the value was validated when its
+/// owner minted it, and re-validating a copy here could only reject an identity
+/// the owner had already admitted.
+fn headroom_reason_ref(input: &AdmissionInput) -> eliot_contracts::ArtifactId {
     input
         .recipe
         .invalidation
@@ -420,20 +429,16 @@ fn headroom_refusal_reason(
 ) -> HeadroomRefusal {
     let reason_ref = headroom_reason_ref(input);
     match error {
-        ContextError::StaleFloor | ContextError::InvalidFence => HeadroomRefusal::Stale {
-            reason: reason_ref,
-        },
+        ContextError::StaleFloor | ContextError::InvalidFence => {
+            HeadroomRefusal::Stale { reason: reason_ref }
+        }
         ContextError::MissingFloor | ContextError::OversizedFloor => HeadroomRefusal::Unavailable {
             dimensions: headroom_limiting_dimensions(headroom.request, headroom.result),
         },
         ContextError::CapacityExceeded | ContextError::Overflow => {
-            HeadroomRefusal::PostRenderOverflow {
-                reason: reason_ref,
-            }
+            HeadroomRefusal::PostRenderOverflow { reason: reason_ref }
         }
-        _ => HeadroomRefusal::IdentityChanged {
-            reason: reason_ref,
-        },
+        _ => HeadroomRefusal::IdentityChanged { reason: reason_ref },
     }
 }
 
