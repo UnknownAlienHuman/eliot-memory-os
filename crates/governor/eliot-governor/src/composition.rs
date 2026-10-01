@@ -2345,9 +2345,9 @@ impl CanonicalVerifierAttemptObservation {
             (&self.run_id, "run_id"),
         ];
         if self.task_revision == 0
-            || text_fields.iter().any(|(value, _)| {
-                value.trim().is_empty() || value.chars().any(char::is_control)
-            })
+            || text_fields
+                .iter()
+                .any(|(value, _)| value.trim().is_empty() || value.chars().any(char::is_control))
             || self.receipt_sha256.len() != 64
             || self
                 .receipt_sha256
@@ -3869,8 +3869,10 @@ impl CanonicalAdmissionOwner {
         let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
             CompositionError::Recovery("canonical owner revision overflow".to_owned())
         })?;
-        let verifier_attempt_observations =
-            append_verifier_attempt_observation(self.snapshot.verifier_attempt_observations.clone(), &fact)?;
+        let verifier_attempt_observations = append_verifier_attempt_observation(
+            self.snapshot.verifier_attempt_observations.clone(),
+            &fact,
+        )?;
         let snapshot = CanonicalAdmissionSnapshot {
             state_fence: self.state_fence.clone(),
             owner_revision,
