@@ -28,7 +28,15 @@
 //! candidate-side CAS anchor to this owner recheck via
 //! [`PreferenceCasExpected::from_candidate_anchor`]. No production publisher
 //! calls this store yet on purpose: the daemon/publication wiring is STITCH
-//! and must arrive with its own review.
+//! and must arrive with its own review. That slice calls
+//! `ModelPreferenceStore::open`, `ModelPreferenceStore::load_model_preferences`,
+//! `ModelPreferenceStore::compare_and_swap_model_preferences`, and
+//! `ModelPreferenceStore::read_publication_receipt` from one daemon
+//! publication-owner module; the edge needs the `eliotd -> eliot-host-state`
+//! manifest dependency first (absent on this base: `bins/eliotd/Cargo.toml`
+//! names no `eliot-host-state` edge and no daemon module calls this store).
+//! Until that slice lands, `read_publication_receipt` (CHECK R4) has no
+//! production caller and the A-02/A-08 receipt readback stays STITCH with it.
 //!
 //! Callers (CHECK R1, audit 5872395796): the policy schema lives at
 //! `crates/agent/eliot-agent-contracts/src/model_preference.rs`
@@ -36,7 +44,12 @@
 //! [`preference_policy_digest`](eliot_agent_contracts::model_preference::preference_policy_digest));
 //! it is re-exported for A-02 consumption at
 //! `crates/agent/eliot-agent-coordinator/src/model_control.rs`
-//! (catalogue-dependent matching stays there). The candidate-side CAS anchor
+//! (catalogue-dependent matching stays there). Production consumers of the
+//! contract (CHECK R1) are `model_control.rs::compile_model_selection`, which
+//! takes `&HumanModelPreferencePolicy` for A-02 candidate compilation, and
+//! `bins/eliotd/src/capability_admission.rs::canonical_required_set`, which
+//! threads the same policy reference through daemon capability admission.
+//! The candidate-side CAS anchor
 //! lives at
 //! `crates/agent/eliot-agent-coordinator/src/swarm_command_candidate.rs`
 //! (`SwarmCommandKind::ReplacePreferencePolicy::{expected_policy_id,
