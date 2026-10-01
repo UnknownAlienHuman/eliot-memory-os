@@ -294,8 +294,8 @@ impl ControlPermit {
     /// evidence: same operation identity, same owner and same epoch tuple.
     /// Changed content never matches; it conflicts instead of replaying.
     #[must_use]
-    pub fn binding_matches(&self, operation_id: &str, owner: &str, epoch: EpochId) -> bool {
-        self.operation_id == operation_id && self.owner == owner && self.epoch == epoch
+    pub fn binding_matches(&self, operation_id: &str, owner: &str, epoch: &EpochId) -> bool {
+        self.operation_id == operation_id && self.owner == owner && self.epoch == *epoch
     }
 
     /// Releases the held slot exactly once, returning bound evidence.
@@ -311,7 +311,7 @@ impl ControlPermit {
             operation_label: self.operation.contract_label().to_owned(),
             operation_id: self.operation_id.clone(),
             owner: self.owner.clone(),
-            epoch: self.epoch,
+            epoch: self.epoch.clone(),
         };
         if let Some(inner) = self.inner.take() {
             let slot = match self.class {
@@ -504,30 +504,33 @@ impl ControlReserve {
     ///
     /// Returns [`KernelError::InvalidField`] when no restart seal is held, or
     /// when the fence has not moved past the seal.
-    pub fn unseal_after_epoch_advance(&self, current: EpochId) -> Result<(), KernelError> {
+    pub fn unseal_after_epoch_advance(&self, current: &EpochId) -> Result<(), KernelError> {
         let mut sealed = self
             .inner
             .sealed_epoch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *sealed {
-            None => Err(KernelError::InvalidField {
-                field: "control_reserve.restart_seal",
-                reason: "no restart seal is held; nothing to reconcile",
-            }),
-            Some(sealed_epoch) if sealed_epoch == current => Err(KernelError::InvalidField {
-                field: "control_reserve.restart_seal",
-                reason: "epoch has not advanced; stale ownership is not fenced, held capacity stays excluded",
-            }),
-            Some(_) => {
-                self.inner.normal_in_flight.store(0, Ordering::Release);
-                self.inner.protected_in_flight.store(0, Ordering::Release);
-                self.inner.emergency_in_flight.store(0, Ordering::Release);
-                *sealed = None;
-                self.inner.restart_sealed.store(false, Ordering::Release);
-                Ok(())
+        match &*sealed {
+            None => {
+                return Err(KernelError::InvalidField {
+                    field: "control_reserve.restart_seal",
+                    reason: "no restart seal is held; nothing to reconcile",
+                });
             }
+            Some(sealed_epoch) if sealed_epoch == current => {
+                return Err(KernelError::InvalidField {
+                    field: "control_reserve.restart_seal",
+                    reason: "epoch has not advanced; stale ownership is not fenced, held capacity stays excluded",
+                });
+            }
+            Some(_) => {}
         }
+        self.inner.normal_in_flight.store(0, Ordering::Release);
+        self.inner.protected_in_flight.store(0, Ordering::Release);
+        self.inner.emergency_in_flight.store(0, Ordering::Release);
+        *sealed = None;
+        self.inner.restart_sealed.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Attempts to acquire one normal-workload permit without blocking.
@@ -1479,7 +1482,7 @@ impl FrontDoor {
     /// when the epoch has not advanced past the seal.
     pub fn reconcile_after_epoch_advance(&self) -> Result<(), KernelError> {
         let current = self.authority.current_epoch();
-        self.reserve.unseal_after_epoch_advance(current)
+        self.reserve.unseal_after_epoch_advance(&current)
     }
 
     /// Returns whether a grant permits an effect without overclaiming proof.
