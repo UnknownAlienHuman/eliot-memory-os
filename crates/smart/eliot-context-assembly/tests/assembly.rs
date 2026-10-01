@@ -2247,7 +2247,13 @@ fn missing_omission_coverage_evidence_is_rejected() {
 
     let value = admitted();
     let context = value.binding.clone();
-    let mut thin_quality = quality(&context);
+    // Built from `quality_for`, so this card names the exact output this
+    // compilation produces and the only thing wrong with it is the missing
+    // twelfth axis. A card carrying placeholder output identities would be
+    // refused by `require_graded_output` instead, which returns the same
+    // `QualityIncomplete` variant and would let this test pass without the
+    // completeness refusal ever happening.
+    let mut thin_quality = quality_for(&value, &recipe(&context));
     thin_quality.results.pop();
     let result = assemble_active_view(
         &value,
@@ -2345,7 +2351,11 @@ fn exact_twelve_quality_dimensions_and_wire_names() {
 fn each_quality_dimension_fails_independently() {
     let value = admitted();
     let context = value.binding.clone();
-    let base = quality(&context);
+    // `quality_for` names the exact output this compilation produces, so the one
+    // failing dimension is the only reason this card is refused. From the
+    // placeholder card the same refusal would arrive earlier, from
+    // `require_graded_output`, for an unrelated reason.
+    let base = quality_for(&value, &recipe(&context));
     assert_eq!(base.results.len(), 12);
     for index in 0..12 {
         let mut failed = base.clone();
@@ -2380,7 +2390,7 @@ fn each_quality_dimension_fails_independently() {
 fn unknown_mandatory_quality_blocks_complete() {
     let value = admitted();
     let context = value.binding.clone();
-    let mut unknown = quality(&context);
+    let mut unknown = quality_for(&value, &recipe(&context));
     unknown.results[0].state = QualityDimensionState::Failed;
     unknown.results[0].failed_invariant = None;
     unknown.results[0].unknown_evidence = vec![id("unknown-evidence")];
@@ -2397,7 +2407,7 @@ fn unknown_mandatory_quality_blocks_complete() {
         Err(AssemblyError::QualityIncomplete(_, _))
     ));
 
-    let mut qualified_unknown = quality(&context);
+    let mut qualified_unknown = quality_for(&value, &recipe(&context));
     qualified_unknown.results[1].unknown_evidence = vec![id("unknown-evidence")];
     let result = assemble_active_view(
         &value,
@@ -2418,7 +2428,7 @@ fn unknown_mandatory_quality_blocks_complete() {
 fn no_scalar_weighted_average_compensation() {
     let value = admitted();
     let context = value.binding.clone();
-    let mut compensated = quality(&context);
+    let mut compensated = quality_for(&value, &recipe(&context));
     for result in compensated.results.iter_mut().skip(1) {
         result.evidence.push(id("extra-evidence"));
     }
@@ -2480,7 +2490,7 @@ fn complete_partial_upstream_material_measurement_stay_distinct() {
     );
     assert!(matches!(upstream, Err(AssemblyError::Incomplete(_))));
 
-    let mut failed_quality = quality(&complete_context);
+    let mut failed_quality = quality_for(&complete_value, &recipe(&complete_context));
     failed_quality.results[0].state = QualityDimensionState::Failed;
     failed_quality.results[0].failed_invariant = Some(id("failed-invariant"));
     failed_quality.results[0].unknown_evidence.clear();
