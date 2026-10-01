@@ -1663,6 +1663,12 @@ async fn run_loop(
     // the next tick, while a claimed observe pair serves through the closed
     // vocabulary and defers through the Kernel defer leg before idling.
     let mut observe_flight = ObserveFlight::Idle;
+    // Issue #2564: the retained `eliot.state` pair has its own claim, preview
+    // and submit flight over the State form of the SAME bounded carrier. It is
+    // never consumed by the query poller and never completes a query claim;
+    // before this flight existed a validated state pair was admitted,
+    // acknowledged and then never claimed, never previewed and never answered.
+    let mut state_flight = StateFlight::Idle;
     // Campaign packets have their own queue, claim, compile, and result
     // flight. They are never consumed by the query poller.
     let mut campaign_packet_flight = CampaignPacketFlight::Idle;
@@ -1833,6 +1839,12 @@ async fn run_loop(
                 // Campaign packets ride the same tick under their own gate and
                 // are never consumed by the query poller.
                 maybe_start_campaign_packet_poll(&kernel, &mut campaign_packet_flight);
+                // Issue #2564: the retained `eliot.state` pair rides the same
+                // tick under its own flight. It is started here, beside the
+                // query poll, so a state pair admitted while a query or packet
+                // read is outstanding is still claimed, previewed by its owners
+                // and answered.
+                maybe_start_state_poll(&kernel, &composition, &mut state_flight);
                 // Task Controller uses a separate queue and attempt type;
                 // start it on the same cadence without sharing the local-read
                 // completion branch.
@@ -1923,6 +1935,12 @@ async fn run_loop(
             }
             observe_completion = next_observe_completion(&mut observe_flight) => {
                 settle_observe_completion(observe_completion, &mut observe_flight)?;
+            }
+            // Issue #2564: the retained state pair settles in its own branch, so
+            // a state preview and its submit never share the query completion
+            // branch and never settle against the wrong carrier form.
+            state_completion = next_state_completion(&mut state_flight) => {
+                settle_state_completion(state_completion, &mut state_flight)?;
             }
             watchdog_export_drain_completion =
                 next_watchdog_export_drain_completion(&mut watchdog_export_drain_flight) => {
@@ -4856,6 +4874,726 @@ async fn submit_local_read_result_idempotent(
             .await
             .map_err(|error| {
                 format!("Kernel local-read result submit: {first_error}; retry: {error}")
+            }),
+    }
+}
+
+/// Bounded record bound for one retained `eliot.state` projection field.
+///
+/// One closed bound for the whole preview, shared by every owner read the
+/// preview performs, so the served answer stays inside the I12.14 4 MiB frame
+/// ceiling. It is a DECLARED bound the store re-validates on its leg, never a
+/// truncation of what an owner returned: a preview that would exceed it is
+/// reported as the owner's own refusal, never as a shortened healthy answer.
+const STATE_PREVIEW_MAX_RECORDS: &str = "8";
+
+/// Issue #2564: the closed capability of the retained `eliot.state` pair.
+///
+/// The daemon-side twin of the Kernel's own `LOCAL_READ_STATE_CAPABILITY`. The
+/// claim gate and the submit gate below both compare against this one string,
+/// so a wire-supplied `form` can never select the lane and no second spelling
+/// of the capability exists in `bins/eliotd`.
+const STATE_PAIR_CAPABILITY: &str = "eliot.state";
+
+/// How one owner-backed state fact resolved.
+///
+/// The three variants are the honest outcomes of an owner read and are never
+/// collapsed into one another. `Observed` is the only arm that carries owner
+/// bytes: `Partial` is a read the owner declined to complete, and
+/// `Unavailable` is a read this leg could not make at all. Neither refusal arm
+/// is ever rendered as a healthy empty preview, and neither is silently
+/// dropped: both travel to the caller as a typed status on the retained body.
+enum StateFactOutcome {
+    /// The owner answered a complete bounded read under the admitted fence.
+    Observed(serde_json::Value),
+    /// The owner answered, but could not complete this fact at this fence.
+    Partial {
+        /// Owner-facing bounded reason for the incompleteness.
+        reason: String,
+    },
+    /// This leg could not reach the owner for this fact.
+    Unavailable {
+        /// Bounded transport/facility reason.
+        reason: String,
+    },
+}
+
+impl StateFactOutcome {
+    /// Projects one fact to its wire member, never dropping the verdict.
+    fn into_json(self, operation: &str) -> serde_json::Value {
+        match self {
+            Self::Observed(payload) => serde_json::json!({
+                "operation": operation,
+                "status": "observed",
+                "payload": payload,
+            }),
+            Self::Partial { reason } => serde_json::json!({
+                "operation": operation,
+                "status": "partial",
+                "reason": reason,
+            }),
+            Self::Unavailable { reason } => serde_json::json!({
+                "operation": operation,
+                "status": "unavailable",
+                "reason": reason,
+            }),
+        }
+    }
+
+    /// Reports whether this fact resolved to owner-backed content.
+    fn is_observed(&self) -> bool {
+        matches!(self, Self::Observed(_))
+    }
+}
+
+/// The exact selectors one admitted `eliot.state` pair is served from.
+///
+/// Both members come from the ADMITTED envelope and the retained tool bytes the
+/// Kernel already validated (`HostRequestInvokeReadPayload::validate` compares
+/// the capability name and the payload sha256); neither is derived from a
+/// wire-supplied carrier form, which is not an identity input at all. The
+/// trusted scope is the Kernel-minted work scope else its session, the same
+/// precedence `trusted_query_scope` and the Kernel's own
+/// `local_state_selectors_from_tool` apply.
+struct StatePairSelectors {
+    /// Trusted admitted scope the preview is read and filtered for.
+    scope: eliot_store_api::ScopeId,
+    /// Exact bounded `include` projection-field list; empty means the default
+    /// projection (authenticated discovery with no field filter).
+    include: Vec<String>,
+}
+
+/// Derives the trusted selectors for one claimed `eliot.state` pair.
+///
+/// Refuses anything the Kernel's own admission gate refuses: a capability other
+/// than the closed state string on either the envelope or the tool bytes, a
+/// non-object `arguments`, a non-array/duplicate/blank/control-bearing
+/// `include` entry, and a missing or blank trusted scope. The envelope/tool
+/// linkage itself is NOT re-derived here; it is proven by running the existing
+/// [`HostRequestInvokeReadPayload::validate`] over the exact retained pair, so
+/// no second implementation of that comparison exists in this leg.
+fn state_pair_selectors(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    tool: &serde_json::Value,
+) -> Result<StatePairSelectors, String> {
+    eliot_protocol::HostRequestInvokeReadPayload {
+        wire_id: eliot_protocol::HOST_REQUEST_INVOKE_READ_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::HostRequestInvokeReadPayload::CONTRACT_VERSION,
+        envelope: envelope.clone(),
+        tool: tool.clone(),
+    }
+    .validate()
+    .map_err(|error| format!("retained state pair is not an admitted invoke-read pair: {error}"))?;
+    if envelope.identity.capability != STATE_PAIR_CAPABILITY {
+        return Err("state pair envelope does not carry the state capability".to_owned());
+    }
+    let object = tool
+        .as_object()
+        .ok_or_else(|| "retained state tool bytes are not an object".to_owned())?;
+    if object.get("name").and_then(serde_json::Value::as_str) != Some(STATE_PAIR_CAPABILITY) {
+        return Err("retained state tool bytes do not name the state capability".to_owned());
+    }
+    let arguments = object
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "retained state tool bytes carry no arguments object".to_owned())?;
+    let include = match arguments.get("include") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut include = Vec::with_capacity(items.len());
+            for item in items {
+                let field = item
+                    .as_str()
+                    .filter(|field| {
+                        !field.trim().is_empty() && !field.chars().any(char::is_control)
+                    })
+                    .ok_or_else(|| "retained state include names a non-field entry".to_owned())?;
+                if !seen.insert(field) {
+                    return Err("retained state include names a field twice".to_owned());
+                }
+                include.push(field.to_owned());
+            }
+            include
+        }
+        Some(_) => return Err("retained state include is not a list".to_owned()),
+    };
+    let scope_text = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
+        .or_else(|| {
+            envelope
+                .identity
+                .session_id
+                .as_deref()
+                .filter(|scope| !scope.trim().is_empty() && !scope.chars().any(char::is_control))
+        })
+        .ok_or_else(|| "retained state pair binds no trusted scope".to_owned())?;
+    let scope = eliot_store_api::ScopeId::new(scope_text.to_owned())
+        .map_err(|error| format!("retained state pair scope is invalid: {error}"))?;
+    Ok(StatePairSelectors { scope, include })
+}
+
+/// Serves one claimed `eliot.state` pair into its submit-leg result body.
+///
+/// The production `eliot.state` serving edge (issue #2564). It performs, under
+/// the retained authenticated Kernel session and the fence RE-READ from the
+/// live client at serve time:
+///
+/// 1. the closed capability/selector derivation over the exact retained pair;
+/// 2. the current attempt-envelope binding (operation handle, scope, epoch,
+///    deadline, facet method), which is never carried forward from admission
+///    but re-read from the claim the Kernel just minted;
+/// 3. the owner-backed bounded reads through the existing Governor
+///    [`ReadService::bound_state`] over the daemon's real read client - the
+///    Task Controller task state, the Problem Owner attention/problems set, and
+///    the epistemic position - each projected to its own typed outcome;
+/// 4. the result body binding, whose class follows the OUTCOME: an
+///    owner-observed preview is an existing-evidence read, and a preview with
+///    any partial or unavailable fact is a retained delivery record so it can
+///    never be read back as a complete healthy answer.
+///
+/// A no-task discovery is a REAL positive result: with no admitted task
+/// binding, only the attention and position facts are read and the response
+/// says so explicitly under `task_selection: "none"` instead of inventing a
+/// task contract or refusing the authenticated request outright.
+async fn serve_local_state_pair(
+    composition: &DaemonComposition,
+    kernel: &Arc<DaemonKernelClient>,
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    tool: &serde_json::Value,
+    attempt: &eliot_protocol::LocalReadAttempt,
+) -> Result<eliot_protocol::HostRequestResultBody, String> {
+    let selectors = state_pair_selectors(envelope, tool)?;
+    // The fence is RE-READ from the live client here, never carried forward
+    // from the admission or the envelope: a state preview read under a fence
+    // that moved after the claim would publish facts from a retired authority.
+    let retained_fence = kernel.kernel_fence();
+    if envelope.state_fence != retained_fence {
+        return Err("daemon state serve fence moved after the claim".to_owned());
+    }
+    attempt
+        .validate()
+        .map_err(|error| format!("state attempt is not bound shape: {error}"))?;
+    if attempt.operation_id != host_request_operation_id(envelope)
+        || attempt.scope_id != selectors.scope.as_str()
+        || attempt.authority_epoch != retained_fence.authority_epoch
+        || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+        || attempt.facet_method != STATE_PAIR_CAPABILITY
+    {
+        return Err("state attempt does not bind the claimed pair".to_owned());
+    }
+    let client = composition
+        .context_read_client(kernel)
+        .map_err(|error| format!("daemon state read composition: {error}"))?;
+    let ctx = state_preview_context(envelope, &retained_fence)?;
+    // The scope revision head is OBSERVED first and becomes the declared
+    // dependency minimum, so a head that moves between the head read and the
+    // fact reads fails closed as the read owner's own stale verdict instead of
+    // being served as current. Nothing is synthesized when no head exists.
+    let scope_key = eliot_store_api::RevisionKey::new(format!(
+        "scope:{}",
+        selectors.scope.as_str()
+    ))
+    .map_err(|error| format!("state scope revision key: {error}"))?;
+    let observed = client
+        .revision_heads(vec![scope_key.clone()])
+        .await
+        .map_err(|error| format!("state scope revision head: {error}"))?;
+    let minimum = observed
+        .iter()
+        .find(|head| head.key == scope_key)
+        .ok_or_else(|| "state scope revision head is not observed".to_owned())?;
+    let mut dependency_revisions = std::collections::BTreeMap::new();
+    dependency_revisions.insert(scope_key, minimum.revision);
+    // The read service is built over the same per-call client AFTER the head
+    // observation, so both the head read and the fact reads below travel the
+    // one authenticated Kernel session under the one re-read fence.
+    let reads = eliot_read::ReadService::new(client);
+
+    // The task fact is read ONLY when the admitted pair actually binds a task.
+    // An authenticated discovery with no selected task is a real positive
+    // result, so it reports the absence as `task_selection: "none"` and reads
+    // the owner-backed selection/intake facts that do not need one.
+    let selected_task = envelope
+        .identity
+        .task_id
+        .as_deref()
+        .filter(|task| !task.trim().is_empty() && !task.chars().any(char::is_control));
+    let task_fact = match selected_task {
+        Some(task_id) => {
+            read_state_fact(
+                &reads,
+                &ctx,
+                eliot_store_api::NamedReadOperation::GetTaskState,
+                Some(selectors.scope.clone()),
+                dependency_revisions.clone(),
+                vec![("task_id", task_id)],
+            )
+            .await
+        }
+        None => StateFactOutcome::Observed(serde_json::Value::Null),
+    };
+
+    // Attention/problems and the epistemic position carry no task binding: an
+    // authenticated discovery reads them exactly like a task-bound request
+    // does, so a no-task preview is a complete selection/intake state rather
+    // than an absence of one.
+    let attention_fact = read_state_fact(
+        &reads,
+        &ctx,
+        eliot_store_api::NamedReadOperation::GetAttentionAndProblems,
+        Some(selectors.scope.clone()),
+        dependency_revisions.clone(),
+        Vec::new(),
+    )
+    .await;
+    let scope_revision_fact = read_state_fact(
+        &reads,
+        &ctx,
+        eliot_store_api::NamedReadOperation::GetScopeRevisionView,
+        Some(selectors.scope.clone()),
+        dependency_revisions,
+        Vec::new(),
+    )
+    .await;
+
+    let task_selection = match selected_task {
+        Some(task_id) => serde_json::json!({ "state": "selected", "task_id": task_id }),
+        None => serde_json::json!({ "state": "none" }),
+    };
+    // A preview is a healthy answer only when every fact it claims was
+    // owner-observed. Any partial or unavailable fact makes the whole preview a
+    // retained record of exactly that, so a caller can never read a degraded
+    // answer as a healthy one. The verdict is computed BEFORE the projections
+    // consume the facts, so the projection can never be what decides it.
+    let complete =
+        task_fact.is_observed() && attention_fact.is_observed() && position_fact.is_observed();
+    let response = serde_json::json!({
+        "capability": STATE_PAIR_CAPABILITY,
+        "scope_id": selectors.scope.as_str(),
+        "include": selectors.include,
+        "task_selection": task_selection,
+        "facts": {
+            "task_state": if selected_task.is_some() {
+                task_fact.into_json("GetTaskState")
+            } else {
+                serde_json::json!({
+                    "operation": "GetTaskState",
+                    "status": "not_applicable",
+                    "reason": "authenticated discovery selected no task",
+                })
+            },
+            "attention": attention_fact.into_json("GetAttentionAndProblems"),
+            "epistemic_position": position_fact.into_json("GetCurrentEpistemicPosition"),
+        },
+        "read_state_fence": retained_fence,
+    });
+    state_result_body(envelope, attempt, response, complete)
+}
+
+/// Performs exactly one owner-backed bounded state read and projects it to its
+/// typed outcome.
+///
+/// Every arm travels the existing [`ReadService::bound_state`] owner path with
+/// the closed `StateRequest` selectors, so the fence, the scope requirement, the
+/// dependency minimums, the parameter catalogue and the conflicting-read
+/// verdict are all the read owner's, not this leg's. A read this leg cannot
+/// complete becomes [`StateFactOutcome::Partial`] when the owner named its own
+/// incompleteness (a stale or conflicting closure) and
+/// [`StateFactOutcome::Unavailable`] when the transport or the facility itself
+/// refused; neither ever becomes an empty payload.
+async fn read_state_fact<K>(
+    reads: &eliot_read::ReadService<K>,
+    ctx: &eliot_contracts::RequestMetadata,
+    operation: eliot_store_api::NamedReadOperation,
+    scope: Option<eliot_store_api::ScopeId>,
+    dependency_revisions: std::collections::BTreeMap<eliot_store_api::RevisionKey, u64>,
+    selectors: Vec<(&str, &str)>,
+) -> StateFactOutcome
+where
+    K: eliot_store_api::CanonicalReadClient,
+{
+    let mut parameters = std::collections::BTreeMap::new();
+    for (key, value) in selectors {
+        parameters.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+    }
+    // The bounded record selector is added only when the OWNER's own parameter
+    // declaration table asks for it. That table is the single authority for each
+    // read's selectors, so this leg keeps no second catalogue: a read that does
+    // not declare `max_records` (the epistemic-position read declares the exact
+    // `position` selector alone) is sent exactly what it declares, and an
+    // extra selector on any read fails closed in the owner rather than here.
+    if eliot_store_api::declared_read_parameters(operation)
+        .iter()
+        .any(|declaration| declaration.name == "max_records")
+    {
+        parameters.insert(
+            "max_records".to_owned(),
+            serde_json::Value::String(STATE_PREVIEW_MAX_RECORDS.to_owned()),
+        );
+    }
+    let parameters = match eliot_read::NamedParameters::from_map(parameters) {
+        Ok(parameters) => parameters,
+        Err(error) => {
+            return StateFactOutcome::Unavailable {
+                reason: format!("state read selectors are not admitted: {error}"),
+            };
+        }
+    };
+    let request = eliot_read::StateRequest {
+        operation,
+        scope_id: scope,
+        consistency: eliot_store_api::ReadConsistency::ExactFence,
+        dependency_revisions,
+        // These owner reads declare no conflict-serialization order head: their
+        // coherence is proven by the observed scope revision head above plus
+        // the admitted request fence. The declaration is explicit so the
+        // resolved identity records the absence instead of leaving the
+        // order-head dimension unstated.
+        ordering: eliot_read::ReadOrderingBinding::without_order_dependency(),
+        parameters,
+        provenance_handles: Vec::new(),
+    };
+    match eliot_read::ReadApi::bound_state(reads, ctx, request).await {
+        Ok(bound) => {
+            if bound.view.operation != operation {
+                return StateFactOutcome::Partial {
+                    reason: "owner answered a different state operation".to_owned(),
+                };
+            }
+            if bound.view.state_fence != ctx.state_fence {
+                return StateFactOutcome::Partial {
+                    reason: "owner answered under a different state fence".to_owned(),
+                };
+            }
+            StateFactOutcome::Observed(bound.view.payload)
+        }
+        // A read whose dependency revisions churned, or whose closure the owner
+        // itself reported as conflicting, is an INCOMPLETE observation the owner
+        // named. It is a typed partial outcome, never a healthy empty payload
+        // and never a silently dropped fact.
+        Err(eliot_read::ReadError::StaleRevision)
+        | Err(eliot_read::ReadError::RevisionChurn)
+        | Err(eliot_read::ReadError::RevisionConflict)
+        | Err(eliot_read::ReadError::OrderingConflict) => StateFactOutcome::Partial {
+            reason: "the read owner could not complete a coherent closure at the admitted fence"
+                .to_owned(),
+        },
+        // A cross-fence answer is the owner's own fence verdict, never a
+        // mismatch this leg repairs or a payload it re-reads.
+        Err(eliot_read::ReadError::FenceMismatch) => StateFactOutcome::Partial {
+            reason: "the read owner refused the admitted state fence".to_owned(),
+        },
+        Err(error) => StateFactOutcome::Unavailable {
+            reason: format!("{error}"),
+        },
+    }
+}
+
+/// Builds the fence-bound read metadata for one retained `eliot.state` preview.
+///
+/// Derived entirely from the admitted pair: the request id carries the exact
+/// operation handle, and the session/task identities are the admitted ones
+/// (both absent for an authenticated discovery with no task). No value is
+/// defaulted from a constant or read from an argument.
+fn state_preview_context(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    fence: &eliot_contracts::StateFence,
+) -> Result<eliot_contracts::RequestMetadata, String> {
+    let operation = host_request_operation_id(envelope);
+    let context = eliot_contracts::RequestMetadata {
+        request_id: eliot_contracts::RequestId::new(format!(
+            "eliotd:state-preview:{}",
+            operation.as_str()
+        ))
+        .map_err(|error| format!("state preview request id: {error}"))?,
+        session_id: envelope
+            .identity
+            .session_id
+            .as_deref()
+            .map(eliot_contracts::SessionId::new)
+            .transpose()
+            .map_err(|error| format!("admitted state session identity: {error}"))?,
+        task_id: envelope
+            .identity
+            .task_id
+            .as_deref()
+            .map(eliot_contracts::TaskId::new)
+            .transpose()
+            .map_err(|error| format!("admitted state task identity: {error}"))?,
+        product_id: eliot_contracts::ProductId::new(SERVICE_NAME)
+            .map_err(|error| format!("state preview product id: {error}"))?,
+        source_id: eliot_contracts::SourceId::new(SERVICE_NAME)
+            .map_err(|error| format!("state preview source id: {error}"))?,
+        state_fence: fence.clone(),
+        clock: eliot_contracts::ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    context
+        .validate()
+        .map_err(|error| format!("state preview request metadata: {error}"))?;
+    Ok(context)
+}
+
+/// Binds one served `eliot.state` preview into its submit-leg result body.
+///
+/// Mirrors the established local-read body contract exactly: the digest is
+/// computed over the [`canonical_json_bytes`] of the exact emitted response,
+/// the operation handle, request digest and attempt are copied from the claimed
+/// pair, and [`HostRequestResultBody::validate`] gates the result before it
+/// leaves this leg. The result class follows the OUTCOME: an
+/// owner-observed preview is an [`HostRequestResultClass::ExistingEvidenceRead`]
+/// of retained owner rows under the admitted attempt, and a preview carrying
+/// any partial or unavailable fact is an
+/// [`HostRequestResultClass::RetainedDeliveryRecord`] - these bytes were
+/// produced and nothing was read completely, so it must never be read back as
+/// complete owner content. Neither class carries a semantic receipt.
+fn state_result_body(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    attempt: &eliot_protocol::LocalReadAttempt,
+    response: serde_json::Value,
+    complete: bool,
+) -> Result<eliot_protocol::HostRequestResultBody, String> {
+    let bytes = eliot_contracts::canonical_json_bytes(&response)
+        .map_err(|error| format!("state preview serialization: {error}"))?;
+    let result_digest = eliot_contracts::sha256_hex(&bytes);
+    let body = eliot_protocol::HostRequestResultBody {
+        wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest: result_digest.clone(),
+        response,
+        attempt: Some(attempt.clone()),
+        lineage: Some(eliot_protocol::HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: None,
+            // Every owner read above ran under the fence re-read at serve time,
+            // so that fence is the exact source fence this preview was read
+            // under and is named here. The per-fact owner revision heads travel
+            // inside the emitted response rather than as a summarized lineage
+            // claim about them.
+            source_revisions: None,
+            source_state_fence: Some(envelope.state_fence.clone()),
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: None,
+            result_class: if complete {
+                eliot_protocol::HostRequestResultClass::ExistingEvidenceRead
+            } else {
+                eliot_protocol::HostRequestResultClass::RetainedDeliveryRecord
+            },
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        }),
+        evidence: None,
+    };
+    body.validate()
+        .map_err(|error| format!("state preview result body shape: {error}"))?;
+    Ok(body)
+}
+
+/// What one settled `eliot.state` poll step produced (issue #2564).
+///
+/// The mirror of [`LocalReadPollOutcome`], kept as its own type because the two
+/// lanes complete against different Kernel arms: a state result presented on
+/// the query submit leg (or the reverse) is refused by the carrier form check,
+/// so the two outcomes are never interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatePollOutcome {
+    /// The state queue was empty; back off until the next tick.
+    IdleBackoff,
+    /// The preview was committed or exact-replayed under the State form.
+    Accepted,
+    /// The fenced attempt expired before its result committed.
+    Expired,
+    /// The attempt was replaced or revoked and was quarantined.
+    StaleAttempt,
+}
+
+/// Completion of one in-flight `eliot.state` step. Claim, preview and submit
+/// share one flight branch so health and shutdown stay pollable while the step
+/// is outstanding; the step handles at most one pair per tick.
+enum StateCompletion {
+    Settled(Result<StatePollOutcome, String>),
+}
+
+struct StateFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = StateCompletion>>>,
+}
+
+/// Sole owner of `eliot.state` poll state in the run loop, mirroring
+/// [`LocalReadFlight`]. `Idle` means no state work is outstanding; `InFlight`
+/// holds the one pending poll step. No second owner and no second concurrent
+/// state step exist.
+enum StateFlight {
+    Idle,
+    InFlight(StateFlightState),
+}
+
+/// Pure tick gate: the state timer starts work only when the flight is idle,
+/// exactly like [`decide_local_read_tick`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_state_tick(flight: &StateFlight) -> StateTickDecision {
+    match flight {
+        StateFlight::Idle => StateTickDecision::StartPoll,
+        StateFlight::InFlight(_) => StateTickDecision::SkipInFlight,
+    }
+}
+
+/// Starts one `eliot.state` claim/preview/submit step (issue #2564).
+fn start_state_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<Box<dyn std::future::Future<Output = StateCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move { StateCompletion::Settled(run_state_poll(&kernel_clone, composition).await) })
+}
+
+/// Starts the `eliot.state` poll step when its flight is idle.
+///
+/// Checked on the same tick as the other pollers, so a retained state pair
+/// never waits behind an activation, a query read or a packet compile. The
+/// flight, not a timer, bounds concurrency: at most one state pair is claimed,
+/// previewed and submitted at a time.
+fn maybe_start_state_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut StateFlight,
+) {
+    if decide_state_tick(flight) == StateTickDecision::StartPoll {
+        *flight = StateFlight::InFlight(StateFlightState {
+            future: start_state_poll(kernel, Arc::clone(composition)),
+        });
+    }
+}
+
+/// Polls the one in-flight `eliot.state` step, pending forever while idle so
+/// health and shutdown stay pollable with no step outstanding.
+async fn next_state_completion(flight: &mut StateFlight) -> StateCompletion {
+    match flight {
+        StateFlight::Idle => std::future::pending::<StateCompletion>().await,
+        StateFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed `eliot.state` poll step back to idle.
+///
+/// Every outcome - a null-claim backoff, an accepted persist, the expected
+/// expiry race, or a stale-attempt quarantine (the next claim mints the
+/// current generation anew) - simply idles until the next tick; only a step
+/// failure fails the daemon closed, exactly like the query leg. A claimed pair
+/// is never silently discarded.
+fn settle_state_completion(
+    completion: StateCompletion,
+    flight: &mut StateFlight,
+) -> Result<(), String> {
+    match completion {
+        StateCompletion::Settled(Ok(outcome)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.state_settled",
+                outcome = state_outcome_name(outcome),
+            );
+            *flight = StateFlight::Idle;
+            Ok(())
+        }
+        StateCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Names one settled `eliot.state` poll outcome for the loop's own record.
+fn state_outcome_name(outcome: StatePollOutcome) -> &'static str {
+    match outcome {
+        StatePollOutcome::IdleBackoff => "idle_backoff",
+        StatePollOutcome::Accepted => "accepted",
+        StatePollOutcome::Expired => "expired",
+        StatePollOutcome::StaleAttempt => "stale_attempt",
+    }
+}
+
+/// Runs one `eliot.state` poll step (issue #2564).
+///
+/// `local_state_claim` for the retained State form (pair plus fenced attempt
+/// capability, or null meaning backoff), then
+/// [`serve_local_state_pair`] for the admitted pair under that attempt, then
+/// `local_state_result` with the returned [`HostRequestResultBody`]. The
+/// Kernel arms are the SAME arms the query leg uses, read and written under the
+/// State carrier form, so a state pair can never be served by the query poller
+/// and a state result can never complete a query claim. Exact replays stay
+/// idempotent by Kernel contract. Any step failure fails the daemon closed, so
+/// a claimed state pair is never silently discarded.
+async fn run_state_poll(
+    kernel: &DaemonKernelClient,
+    composition: SharedComposition,
+) -> Result<StatePollOutcome, String> {
+    // #740: receipt span over the claim/preview/submit poll step. Pair presence
+    // and submit outcome are named; payload bytes never are.
+    let _span = tracing::info_span!("eliotd.state_poll").entered();
+    let pair = kernel
+        .claim_local_state_pair_async()
+        .await
+        .map_err(|error| format!("Kernel state pair claim: {error}"))?;
+    let Some((envelope, tool, attempt)) = pair else {
+        return Ok(StatePollOutcome::IdleBackoff);
+    };
+    // The composition guard is taken only around the per-call read-client
+    // construction and the serve, and the read client it hands out holds no
+    // lock: the bounded owner reads therefore run with no composition guard
+    // held, so no owner await ever crosses a shared lock.
+    let body = {
+        let guard = composition.lock().await;
+        Box::pin(serve_local_state_pair(&guard, kernel, &envelope, &tool, &attempt))
+            .await
+            .map_err(|error| format!("daemon state serve: {error}"))?
+    };
+    match submit_local_state_result_idempotent(kernel, &body).await? {
+        LocalReadSubmitOutcome::Accepted => Ok(StatePollOutcome::Accepted),
+        LocalReadSubmitOutcome::Expired => Ok(StatePollOutcome::Expired),
+        LocalReadSubmitOutcome::StaleAttempt => Ok(StatePollOutcome::StaleAttempt),
+    }
+}
+
+/// Submits one served `eliot.state` result body, retrying once with the
+/// byte-identical body when the first submit fails.
+///
+/// The `eliot.state` twin of [`submit_local_read_result_idempotent`], and the
+/// reason that hole existed: before this step nothing called
+/// [`DaemonKernelClient::submit_local_state_result_async`], so a retained state
+/// pair was admitted, acknowledged and then never answered. The retry is safe
+/// because the Kernel submit leg is exact-replay idempotent for the State form
+/// too - an identical body under the same identity persists once and replays,
+/// never duplicates. Only transport failures retry: `Expired` and
+/// `StaleAttempt` are settled outcomes, so a quarantined capability is never
+/// resubmitted.
+async fn submit_local_state_result_idempotent(
+    kernel: &DaemonKernelClient,
+    body: &eliot_protocol::HostRequestResultBody,
+) -> Result<LocalReadSubmitOutcome, String> {
+    match kernel.submit_local_state_result_async(body).await {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .submit_local_state_result_async(body)
+            .await
+            .map_err(|error| {
+                format!("Kernel state result submit: {first_error}; retry: {error}")
             }),
     }
 }

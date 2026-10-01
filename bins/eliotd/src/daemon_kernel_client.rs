@@ -170,6 +170,16 @@ struct ProviderClaimRowReadWire {
     receipt_digest: String,
 }
 
+/// Closed capability of the retained `eliot.state` pair (issue #2564).
+///
+/// The daemon-side twin of the Kernel's own `LOCAL_READ_STATE_CAPABILITY` in
+/// `bins/eliot-kernel/src/host_request_route.rs`. Both spell the one admitted
+/// capability string; neither derives it from a payload, and the state claim
+/// gate below refuses every pair whose envelope capability or tool name is not
+/// this exact string, so a wire-supplied form can never select the queue.
+#[cfg(windows)]
+const LOCAL_STATE_CAPABILITY: &str = "eliot.state";
+
 /// #791 (W4/W17): the typed detail reported when the daemon's shutdown request
 /// abandons a front-door exchange whose outcome this client cannot observe.
 #[cfg(windows)]
@@ -2721,6 +2731,66 @@ impl DaemonKernelClient {
             .emit();
             return Err(super::DaemonError::Kernel(
                 "Kernel campaign_packet_claim returned a non-packet pair".to_owned(),
+            ));
+        }
+        if let Some((envelope, _, attempt)) = pair.as_ref() {
+            let _ = crate::diagnostics::RequestReceipt::of(
+                envelope.identity.request_id.as_str(),
+                &attempt.operation_id,
+            )
+            .emit();
+        }
+        Ok(pair)
+    }
+
+    /// Claims one queued admitted `eliot.state` pair from the State form of the
+    /// bounded local-read carrier (issue #2564).
+    ///
+    /// Mirrors [`claim_local_read_pair_async`](Self::claim_local_read_pair_async)
+    /// in transport, parser and shape: the call travels as the single-
+    /// `operation`-key `"local_state_claim"` payload, a null `pair` is the
+    /// empty-queue backoff signal rather than an error, and the parsed attempt
+    /// must already bind the envelope operation handle. What differs is the
+    /// closed gate: this leg accepts exactly the retained `eliot.state` pair -
+    /// envelope capability AND tool name both `eliot.state` - and refuses every
+    /// other capability. That refusal is the daemon half of the form binding:
+    /// the Kernel arms answer over the State form only, so a query, Skill or
+    /// packet pair can never arrive here and a state pair can never be consumed
+    /// by the query poller.
+    ///
+    /// Production caller: [`run_state_poll`](super::run_state_poll), the
+    /// bounded `local_state_claim` -> owner preview -> `local_state_result`
+    /// step of the daemon read leg.
+    #[cfg(windows)]
+    pub async fn claim_local_state_pair_async(
+        &self,
+    ) -> Result<
+        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
+        super::DaemonError,
+    > {
+        let value = self
+            .transact_async(
+                "local_state_claim",
+                serde_json::json!({ "operation": "local_state_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let pair = parse_local_read_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
+        if pair.as_ref().is_some_and(|(envelope, tool, _)| {
+            envelope.identity.capability != LOCAL_STATE_CAPABILITY
+                || tool.get("name").and_then(serde_json::Value::as_str) != Some(LOCAL_STATE_CAPABILITY)
+        }) {
+            // Issue #1839: structured route-mismatch evidence for the live
+            // claim, identical to the query and packet claim gates.
+            let _ = crate::diagnostics::RejectionRecord::of(
+                crate::diagnostics::RejectionReason::RouteMismatch,
+                crate::diagnostics::OwningComponent::Kernel,
+                "Kernel local_state_claim returned a non-state pair",
+            )
+            .emit();
+            return Err(super::DaemonError::Kernel(
+                "Kernel local_state_claim returned a pair outside the local-state capability"
+                    .to_owned(),
             ));
         }
         if let Some((envelope, _, attempt)) = pair.as_ref() {

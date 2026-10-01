@@ -57,6 +57,44 @@ revision_key = "startup_readiness_projection.source_revision_heads"
 queue_id = "local_read_claim"
 bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
 
+# Issue #2564: the retained `eliot.state` pair legs. These are the same bounded
+# carrier and the same owner ledger as the query claim above - one claim flight,
+# one pair in flight, one 30 s front-door deadline - read under the State form
+# rather than the Query form, so the state claim is charged through the same
+# per-poll bounded step rather than through a second coordinator. The
+# entrypoints are the one production state poll step and its submit half.
+[[supported_operations]]
+operation = "local_state_claim"
+operation_version = "1.0.0"
+owning_service = "eliotd"
+entrypoint = "bins/eliotd/src/daemon_runtime.rs::start_state_poll"
+crate_closure = [
+  "eliotd",
+  "eliot-contracts",
+  "eliot-protocol",
+  "eliot-store-api",
+]
+
+synchronous_external_calls = []
+# A null claim is a backoff signal and leaves the flight idle. A state pair that
+# cannot produce an owner-backed preview is settled as a typed refusal through
+# the same submit leg, never as an empty healthy preview, so this operation has
+# no success fallback that could stand in for a read.
+fallback_or_degradation = { Handle = { handle_ref = "host_request_result_body" } }
+# #1734 owns profile production; no profile exists for this operation yet.
+hot_path_profile_ref = {}
+
+# The claim is bound to the same retained startup-readiness projection that
+# drives the query poll: the poll is started from the retained projection, never
+# from a freshly discovered module.
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "startup_readiness_projection"
+revision_key = "startup_readiness_projection.source_revision_heads"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_state_claim"
+bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
+
 [[supported_operations]]
 operation = "local_read"
 operation_version = "1.0.0"
@@ -117,6 +155,34 @@ revision_key = "claimed_attempt_state_fence.authority_epoch"
 
 [[supported_operations.queues_and_capacity]]
 queue_id = "local_read_result"
+bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
+
+# Issue #2564: the state submit half. Same owner ledger, same 30 s deadline and
+# same one-in-flight bound as the query submit above; it differs only in that
+# the Kernel binds the submitted body to the State carrier form, so a query
+# result can never complete a state claim and vice versa. The submit is bound to
+# the attempt identity and the fence the claim minted, both re-read at submit.
+[[supported_operations]]
+operation = "local_state_result"
+operation_version = "1.0.0"
+owning_service = "eliotd"
+entrypoint = "bins/eliotd/src/daemon_runtime.rs::submit_local_state_result_idempotent"
+crate_closure = [
+  "eliotd",
+  "eliot-contracts",
+  "eliot-protocol",
+]
+
+synchronous_external_calls = []
+fallback_or_degradation = { RecoveryDirective = { directive_ref = "eliot_runtime_contracts::RecoveryDirective" } }
+hot_path_profile_ref = {}
+
+[[supported_operations.immutable_snapshot_dependencies]]
+snapshot_id = "claimed_attempt_state_fence"
+revision_key = "claimed_attempt_state_fence.authority_epoch"
+
+[[supported_operations.queues_and_capacity]]
+queue_id = "local_state_result"
 bounds = { max_items = 1, max_bytes = 4194304, max_in_flight_items = 1, max_deadline_ms = 30000 }
 
 [[unsupported_operations]]
