@@ -940,10 +940,16 @@ impl InstallationTransaction {
     /// This admits exactly the contour the bounded-start drive persists on a
     /// first-install service-start timeout: stage `RollbackRequired` with the
     /// intent retained, every pre-bootstrap effect durably `Applied`, the
-    /// ordered `Watchdog` then `Host` starts each `Pending`, unconverged
-    /// `IntentCommitted`, or timeout `Unknown`, and the credential/Phase-B
-    /// suffix still `Pending` with no receipts.  Any observed service process
-    /// lineage, any non-timeout `Unknown`, or any applied credential/Phase-B
+    /// ordered `Watchdog` then `Host` starts either unsettled (`Pending`,
+    /// unconverged `IntentCommitted`, or timeout `Unknown`) or, for the
+    /// ordered Watchdog only, an exact transaction-created convergence
+    /// (`Applied`/`CreatedByTransaction` with its recorded registration
+    /// identity, issued-call proof, process lineage, and deadline, proved
+    /// current by the coordinator's authoritative readback), the Host itself
+    /// still unsettled and never running/verified, and the credential/Phase-B
+    /// suffix still `Pending` with no receipts.  Any Host convergence, any
+    /// lineage on an unsettled start, any foreign/mismatched Watchdog
+    /// ownership, any non-timeout `Unknown`, or any applied credential/Phase-B
     /// effect refuses: the transaction stays recovery/quarantine-requiring and
     /// the intent is kept.  The returned indexes are ascending and non-empty;
     /// a forged `RollbackRequired` shape with nothing to reconcile is refused
@@ -1028,7 +1034,12 @@ impl InstallationTransaction {
     /// recovery, returning the unsettled indexes needing readback and the
     /// cursor where the credential/Phase-B suffix begins.  Every unsettled
     /// start is a timeout `Unknown` or an unconverged `IntentCommitted` with
-    /// no observed process lineage; anything else refuses.
+    /// no observed process lineage; the ordered Watchdog alone may instead be
+    /// an exact transaction-created convergence that stays out of the
+    /// unsettled set for the later authoritative readback and the
+    /// exact-effect rollback loop.  A converged Host, any other `Applied`
+    /// start, any lineage on an unsettled start, or any non-timeout `Unknown`
+    /// refuses.
     fn recoverable_timeout_start_run(
         &self,
         first_start: usize,
@@ -1042,48 +1053,78 @@ impl InstallationTransaction {
                 break;
             };
             let progress = &self.effect_progress[cursor];
-            if progress
-                .service_start_proof
-                .as_ref()
-                .is_some_and(|proof| proof.process_lineage.is_some())
-            {
-                return Err(InstallationError::IncompleteObservation(
-                    "timeout recovery refuses an observed service start lineage".to_owned(),
-                ));
-            }
-            match &progress.state {
-                InstallationEffectProgressState::Pending => {
-                    if progress.service_start_proof.is_some()
-                        || progress.service_start_deadline_ms.is_some()
-                    {
-                        return Err(InstallationError::IncompleteObservation(
-                            "timeout recovery refuses a pending start carrying intent".to_owned(),
-                        ));
+            if *role == InstallerServiceRole::Watchdog
+                && matches!(
+                    progress.state,
+                    InstallationEffectProgressState::Applied {
+                        disposition: InstallationEffectDisposition::CreatedByTransaction,
+                        ..
                     }
-                }
-                InstallationEffectProgressState::IntentCommitted { .. } => {
-                    unsettled.push(cursor);
-                }
-                InstallationEffectProgressState::Unknown { pending_ref }
-                    if pending_ref.as_str() == SERVICE_START_TIMEOUT_PENDING_REF =>
-                {
-                    unsettled.push(cursor);
-                }
-                InstallationEffectProgressState::Unknown { .. } => {
+                )
+            {
+                let proof = progress.service_start_proof.as_ref().ok_or_else(|| {
+                    InstallationError::IncompleteObservation(
+                        "timeout recovery requires the transaction-created Watchdog issued-call proof"
+                            .to_owned(),
+                    )
+                })?;
+                if proof.process_lineage.is_none() {
                     return Err(InstallationError::IncompleteObservation(
-                        "timeout recovery refuses a non-timeout unknown service start".to_owned(),
-                    ));
-                }
-                InstallationEffectProgressState::Applied { .. } => {
-                    return Err(InstallationError::IncompleteObservation(
-                        "timeout recovery refuses a converged service start".to_owned(),
-                    ));
-                }
-                InstallationEffectProgressState::NoEffectAborted { .. } => {
-                    return Err(InstallationError::IncompleteObservation(
-                        "timeout recovery refuses a terminal no-effect authority outcome"
+                        "timeout recovery requires the transaction-created Watchdog process lineage"
                             .to_owned(),
                     ));
+                }
+                if progress.service_start_deadline_ms.is_none() {
+                    return Err(InstallationError::IncompleteObservation(
+                        "timeout recovery requires the transaction-created Watchdog start deadline"
+                            .to_owned(),
+                    ));
+                }
+                self.recorded_service_registration_identity(*role)?;
+            } else {
+                if progress
+                    .service_start_proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.process_lineage.is_some())
+                {
+                    return Err(InstallationError::IncompleteObservation(
+                        "timeout recovery refuses an observed service start lineage".to_owned(),
+                    ));
+                }
+                match &progress.state {
+                    InstallationEffectProgressState::Pending => {
+                        if progress.service_start_proof.is_some()
+                            || progress.service_start_deadline_ms.is_some()
+                        {
+                            return Err(InstallationError::IncompleteObservation(
+                                "timeout recovery refuses a pending start carrying intent".to_owned(),
+                            ));
+                        }
+                    }
+                    InstallationEffectProgressState::IntentCommitted { .. } => {
+                        unsettled.push(cursor);
+                    }
+                    InstallationEffectProgressState::Unknown { pending_ref }
+                        if pending_ref.as_str() == SERVICE_START_TIMEOUT_PENDING_REF =>
+                    {
+                        unsettled.push(cursor);
+                    }
+                    InstallationEffectProgressState::Unknown { .. } => {
+                        return Err(InstallationError::IncompleteObservation(
+                            "timeout recovery refuses a non-timeout unknown service start".to_owned(),
+                        ));
+                    }
+                    InstallationEffectProgressState::Applied { .. } => {
+                        return Err(InstallationError::IncompleteObservation(
+                            "timeout recovery refuses a converged service start".to_owned(),
+                        ));
+                    }
+                    InstallationEffectProgressState::NoEffectAborted { .. } => {
+                        return Err(InstallationError::IncompleteObservation(
+                            "timeout recovery refuses a terminal no-effect authority outcome"
+                                .to_owned(),
+                        ));
+                    }
                 }
             }
             start_roles.push(*role);
@@ -2532,14 +2573,17 @@ impl InstallationTransaction {
     /// pending service-start/credential/Phase-B suffix requires no
     /// reconciliation (`reconciled_absent` must be empty).  `RollbackRequired`
     /// is admitted only for the service-start timeout shape persisted by the
-    /// coordinator's bounded-start drive: every non-`Pending` start is a
-    /// timeout `Unknown` or an unconverged `IntentCommitted` with no observed
-    /// process lineage, and `reconciled_absent` must name exactly those
-    /// indexes after the coordinator's readback observed each one `Absent`.
-    /// The reconciled starts return to `Pending` in this same transition so
-    /// the existing exact-effect rollback loop below can run; any other
-    /// `Unknown`, any observed lineage, or any applied credential/Phase-B
-    /// effect keeps the intent and refuses.
+    /// coordinator's bounded-start drive: every unsettled start is a timeout
+    /// `Unknown` or an unconverged `IntentCommitted` with no observed process
+    /// lineage, and `reconciled_absent` must name exactly those indexes after
+    /// the coordinator's readback observed each one `Absent`.  The ordered
+    /// Watchdog alone may instead be an exact transaction-created convergence
+    /// that is kept `Applied` with its issued-call proof and process lineage
+    /// for the existing exact-effect rollback loop below.  The reconciled
+    /// unsettled starts return to `Pending` in this same transition; any other
+    /// `Unknown`, any lineage outside that one Watchdog convergence, a
+    /// converged Host, or any applied credential/Phase-B effect keeps the
+    /// intent and refuses.
     pub(crate) fn prepare_pre_no_return_rollback(
         &mut self,
         abort_evidence: PlatformHandle,
@@ -2594,16 +2638,42 @@ impl InstallationTransaction {
                 });
             }
         }
-        if self.effect_progress.iter().any(|progress| {
-            progress
-                .service_start_proof
-                .as_ref()
-                .is_some_and(|proof| proof.process_lineage.is_some())
-        }) {
-            return Err(InstallationError::IncompleteObservation(
-                "pre-no-return activation rollback refuses an observed service start lineage"
-                    .to_owned(),
-            ));
+        for (effect, progress) in self.installer_effects.iter().zip(&self.effect_progress) {
+            let Some(proof) = progress.service_start_proof.as_ref() else {
+                continue;
+            };
+            if proof.process_lineage.is_none() {
+                continue;
+            }
+            let InstallerEffectPlan::StartService {
+                role: InstallerServiceRole::Watchdog,
+                ..
+            } = effect
+            else {
+                return Err(InstallationError::IncompleteObservation(
+                    "pre-no-return activation rollback refuses an observed service start lineage"
+                        .to_owned(),
+                ));
+            };
+            if !matches!(
+                progress.state,
+                InstallationEffectProgressState::Applied {
+                    disposition: InstallationEffectDisposition::CreatedByTransaction,
+                    ..
+                }
+            ) {
+                return Err(InstallationError::IncompleteObservation(
+                    "pre-no-return activation rollback refuses an observed service start lineage"
+                        .to_owned(),
+                ));
+            }
+            if progress.service_start_deadline_ms.is_none() {
+                return Err(InstallationError::IncompleteObservation(
+                    "pre-no-return activation rollback refuses an observed service start lineage"
+                        .to_owned(),
+                ));
+            }
+            self.recorded_service_registration_identity(InstallerServiceRole::Watchdog)?;
         }
         handle(&abort_evidence, "activation_projection.abort_evidence")?;
         self.completed_stage_refs.push(abort_evidence.clone());
