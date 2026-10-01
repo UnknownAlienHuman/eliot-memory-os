@@ -305,10 +305,7 @@ impl HostIdentityMonitor {
     /// binding or lease there is no sample at all — never a digest of an
     /// unapproved path. Bytes are hashed, never retained.
     #[must_use]
-    pub fn observe_approved_artifact(
-        &mut self,
-        limit: u64,
-    ) -> Option<ArtifactDigestObservation> {
+    pub fn observe_approved_artifact(&mut self, limit: u64) -> Option<ArtifactDigestObservation> {
         let binding = self.sensor_binding.clone()?;
         if let Some((identity, cached)) = self.artifact_digest.clone()
             && cached.installation() == binding.installation()
@@ -444,19 +441,20 @@ impl LiveHostObservationSource {
         // (#1755 W2) that bound artifact samples carry. A manifest whose
         // retained values cannot bind refuses here and is traced: the
         // artifact sensor then issues no sample rather than an unbound one.
-        let sensor_binding =
-            match ApprovedSensorBinding::from_candidate_manifest(&binding.selected_manifest) {
-                Ok(bound) => Some(bound),
-                Err(error) => {
-                    tracing::debug!(
-                        event = "watchdog.sensor_binding_refused",
-                        observation = "unbound",
-                        reason = error.to_string(),
-                        "registry-selected manifest cannot bind sensor samples; artifact observations stay unobserved"
-                    );
-                    None
-                }
-            };
+        let sensor_binding = match ApprovedSensorBinding::from_candidate_manifest(
+            &binding.selected_manifest,
+        ) {
+            Ok(bound) => Some(bound),
+            Err(error) => {
+                tracing::debug!(
+                    event = "watchdog.sensor_binding_refused",
+                    observation = "unbound",
+                    reason = error.to_string(),
+                    "registry-selected manifest cannot bind sensor samples; artifact observations stay unobserved"
+                );
+                None
+            }
+        };
         if let Ok(mut monitor) = source.monitor.lock() {
             monitor.observed_generation =
                 Some(binding.selected_manifest.generation.as_str().to_owned());

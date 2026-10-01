@@ -62,7 +62,9 @@ pub enum AttributionError {
     #[error("attempt identity must be non-empty")]
     EmptyAttemptIdentity,
     /// Scope membership or origin does not authorize task attribution.
-    #[error("event is not attributable to a task: scope membership or origin does not authorize it")]
+    #[error(
+        "event is not attributable to a task: scope membership or origin does not authorize it"
+    )]
     RefusedTaskAttribution,
 }
 
@@ -162,7 +164,10 @@ pub fn resolve_scope_membership(
     if current.iter().any(|scope| path.starts_with(scope.root())) {
         return ScopeMembership::CurrentMember;
     }
-    if historical.iter().any(|scope| path.starts_with(scope.root())) {
+    if historical
+        .iter()
+        .any(|scope| path.starts_with(scope.root()))
+    {
         return ScopeMembership::HistoricalOnly;
     }
     ScopeMembership::OutsideRegistered
@@ -208,9 +213,7 @@ impl EventOrigin {
         process: &ProcessIdentity,
         attempt: &str,
     ) -> Result<Self, AttributionError> {
-        if process.process_id == 0
-            || process.start_time_100ns == 0
-            || process.image_path.is_empty()
+        if process.process_id == 0 || process.start_time_100ns == 0 || process.image_path.is_empty()
         {
             return Err(AttributionError::MissingCorrelation);
         }

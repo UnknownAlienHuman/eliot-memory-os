@@ -228,9 +228,7 @@ pub fn observe_approved_artifact_digest(
     limit: u64,
 ) -> Result<ArtifactDigestObservation, SensorProbeError> {
     if limit == 0 {
-        return Err(SensorProbeError::Inaccessible(
-            "ARTIFACT_READ_LIMIT_ZERO",
-        ));
+        return Err(SensorProbeError::Inaccessible("ARTIFACT_READ_LIMIT_ZERO"));
     }
     lease
         .verify_stable_identity()
@@ -238,15 +236,12 @@ pub fn observe_approved_artifact_digest(
     lease
         .verify_path_identity()
         .map_err(|_| SensorProbeError::Changed("IMAGE_IDENTITY_CHANGED"))?;
-    let bytes =
-        lease
-            .read_bounded(limit)
-            .map_err(|error| match error {
-                ProtectedPathError::SizeExceeded => {
-                    SensorProbeError::Inaccessible("ARTIFACT_OVER_READ_LIMIT")
-                }
-                _ => SensorProbeError::Inaccessible("ARTIFACT_READ_DENIED"),
-            })?;
+    let bytes = lease.read_bounded(limit).map_err(|error| match error {
+        ProtectedPathError::SizeExceeded => {
+            SensorProbeError::Inaccessible("ARTIFACT_OVER_READ_LIMIT")
+        }
+        _ => SensorProbeError::Inaccessible("ARTIFACT_READ_DENIED"),
+    })?;
     // Re-verify after the read: a replacement between the pre-read verify
     // and the read discards the digest instead of binding it.
     lease
