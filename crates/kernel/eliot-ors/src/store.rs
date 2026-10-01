@@ -28482,6 +28482,42 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Replays an already reconciled gap only when every scope retains the
+    /// exact terminal receipt identity written by the original atomic ORS
+    /// disposition. Receipt IDs are labels; the canonical digest is the
+    /// content binding that rejects duplicate-but-changed evidence.
+    fn validate_gap_disposition_replay(
+        write: &redb::WriteTransaction,
+        reconciliation: &SequenceGapReconciliation,
+    ) -> Result<(), OrsError> {
+        let terminals = write.open_table(SCOPE_TERMINALS).map_err(storage)?;
+        for reserved in &reconciliation.scopes {
+            let terminal_key = format!(
+                "{}:{:020}",
+                reserved.scope.as_str(),
+                reserved.reserved_sequence
+            );
+            let terminal = terminals
+                .get(terminal_key.as_str())
+                .map_err(storage)?
+                .ok_or(OrsError::ReconciliationMismatch)?;
+            let terminal: ScopeTerminalReceipt =
+                decode_named(terminal.value(), "sequence_gap_terminal_receipt")?;
+            if terminal.scope != reserved.scope
+                || terminal.reserved_sequence != reserved.reserved_sequence
+                || terminal.disposition != CanonicalDisposition::Rejected
+                || !terminal.gap
+                || terminal.receipt_id.as_str()
+                    != reconciliation.receipt.identity.receipt_id.as_str()
+                || terminal.receipt_sha256
+                    != reconciliation.receipt.identity.canonical_sha256
+            {
+                return Err(OrsError::DuplicateConflict);
+            }
+        }
+        Ok(())
+    }
+
     fn load_record(
         table: &impl ReadableTable<&'static str, &'static str>,
         reservation_id: &crate::OperationIdentity,
@@ -34779,6 +34815,8 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
                 if record.terminal_receipt_id.as_ref().map(OpaqueLabel::as_str)
                     == Some(reconciliation.receipt.identity.receipt_id.as_str())
                 {
+                    sequence_gap_receipt_matches(&reconciliation.receipt, reconciliation)?;
+                    Self::validate_gap_disposition_replay(&write, reconciliation)?;
                     return Ok(record);
                 }
                 return Err(OrsError::DuplicateConflict);

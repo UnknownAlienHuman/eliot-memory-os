@@ -1450,15 +1450,19 @@ impl WriteExecution {
                     error,
                 },
             )),
-            AttemptOutcome::DeadLetter => Some(self.complete_terminal_into(
-                operation_id,
-                CompletionOutcome::DeadLetter,
-                now_ms,
-                |metrics| metrics.dead_lettered += 1,
-                OpExecution::DeadLetter {
-                    operation_id: operation_id.clone(),
-                },
-            )),
+            AttemptOutcome::DeadLetter => {
+                // A provider-side no-effect result is not yet the canonical
+                // DEAD_LETTER receipt plus persisted gap relation. Retain the
+                // operation and its scopes under reconciliation until that
+                // governed Store commit can be read back exactly.
+                match self.mark_unknown(operation_id, 0, now_ms) {
+                    Ok(()) => None,
+                    Err(error) => Some(OpExecution::ExecutionError {
+                        operation_id: operation_id.clone(),
+                        error,
+                    }),
+                }
+            }
             AttemptOutcome::Cancelled => Some(self.complete_cancelled(operation_id, now_ms)),
             AttemptOutcome::Unknown { retry_after_ms } => {
                 match self.mark_unknown(operation_id, retry_after_ms, now_ms) {

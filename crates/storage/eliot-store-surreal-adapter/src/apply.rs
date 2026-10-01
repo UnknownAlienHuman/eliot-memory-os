@@ -959,10 +959,14 @@ fn op_outcome_to_receipt(outcome: &OpExecution) -> Result<WriteReceipt, AdapterE
     match outcome {
         OpExecution::Committed { receipt, .. } => Ok(receipt.as_ref().clone()),
         OpExecution::Rejected { error, .. } => Err(AdapterError::Store(error.clone())),
-        OpExecution::DeadLetter { .. } => Err(AdapterError::Store(StoreError::InvalidField {
-            field: "store.write_disposition",
-            reason: "dead letter with proven non-application",
-        })),
+        // A scheduler dead-letter classification is not itself the immutable
+        // canonical Store receipt required to release ORS. Keep the caller on
+        // the unknown/reconciliation path until the governed receipt and gap
+        // relation have been committed and read back; a deterministic
+        // refusal here would release the still-Eligible reservation.
+        OpExecution::DeadLetter { .. } => {
+            Err(AdapterError::Store(StoreError::MissingReceiptEnvelope))
+        }
         OpExecution::CancelledBeforeEffect { .. } | OpExecution::DrainedWithoutEffect { .. } => {
             Err(AdapterError::Store(StoreError::Unavailable))
         }
@@ -1106,11 +1110,11 @@ fn map_attempt_error(error: AdapterError) -> AttemptOutcome {
             | StoreError::InvalidReceipt
             | StoreError::TransitionDigestMismatch { .. }
             | StoreError::StaleDisposition { .. }
-            | StoreError::ReceiptNotFound
             | StoreError::AutomationContinuation(_)
             | StoreError::PayloadTooLarge => AttemptOutcome::Rejected(store),
             StoreError::Serialization(_) => AttemptOutcome::Cancelled,
             StoreError::MissingReceiptEnvelope
+            | StoreError::ReceiptNotFound
             | StoreError::UnknownOutcome { .. }
             | StoreError::Unavailable
             | StoreError::SnapshotClosePending { .. } => {
