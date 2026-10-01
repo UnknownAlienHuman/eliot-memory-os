@@ -557,9 +557,9 @@ fn launch_06_store_before_kernel() {
     for required in [
         "fn launch_store_then_kernel",
         "host.store-launch requested",
-        "host.store-launch store-ready observed",
+        "host.store-launch store-live observed",
         "host.kernel-launch requested",
-        "host.kernel-launch kernel-ready observed",
+        "host.kernel-launch kernel-launched observed",
     ] {
         assert!(
             sequence.contains(required),
@@ -838,8 +838,8 @@ fn launch_13_deterministic_semantic_fields() {
     for required in [
         "host.scm-launch probe requested",
         "HOST_SCM_TRANSIENT_MAX_INSPECTIONS",
-        "host.store-launch store-ready observed",
-        "host.kernel-launch kernel-ready observed",
+        "host.store-launch store-live observed",
+        "host.kernel-launch kernel-launched observed",
         "host.kernel-activation nonce issued",
         "host.kernel-activation readiness observed",
     ] {
