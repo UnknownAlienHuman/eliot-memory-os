@@ -1756,6 +1756,25 @@ impl CanonicalVerifierPlanBinding {
                 }
             }
         }
+        // Every required test is part of the plan's independent verifier
+        // denominator. If the acceptance join omits one, the finish projection
+        // has no row on which to record that test's absence or failure; it
+        // could otherwise report every acceptance item complete while a
+        // required plan test was never observed. Requiring exact set equality
+        // makes the current plan revision's test inventory fully representable
+        // in the contract acceptance coverage that Finish evaluates.
+        let mapped_test_ids: BTreeSet<_> = self
+            .acceptance_verifier_map
+            .values()
+            .flat_map(BTreeSet::iter)
+            .cloned()
+            .collect();
+        if mapped_test_ids != self.required_test_ids {
+            return Err(CompositionError::Recovery(
+                "canonical verifier plan acceptance joins do not cover its exact required test set"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 }

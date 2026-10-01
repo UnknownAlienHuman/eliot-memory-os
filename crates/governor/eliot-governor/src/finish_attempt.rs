@@ -229,6 +229,26 @@ fn validate_nominated_artifact_bytes(
     Ok(())
 }
 
+/// A caller may nominate the verifier run it expects Finish to use, but the
+/// selector is admitted only when it names the exact current owner run. The
+/// caller list never supplies or narrows the verifier denominator.
+fn validate_nominated_verifier_run_refs(
+    current_run_ref: &str,
+    references: &[String],
+) -> Result<(), FinishAttemptError> {
+    if let Some(reference) = references
+        .iter()
+        .find(|reference| reference.as_str() != current_run_ref)
+    {
+        return Err(FinishAttemptError::Composition(CompositionError::Recovery(
+            format!(
+                "caller-nominated verifier run {reference:?} is not the current task-and-plan-bound executed run"
+            ),
+        )));
+    }
+    Ok(())
+}
+
 /// Pure output of one canonical finish-evidence derivation. The snapshot is
 /// the next owner image; it is committed together with the durable decision.
 struct ProducedFinishEvidence {
@@ -653,7 +673,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         task: &TaskRecord,
         fence: &StateFence,
         plan: &CanonicalPlanBinding,
-        nominated_refs: (&[String], &[String]),
+        nominated_refs: (&[String], &[String], &[String]),
         contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<ProducedFinishEvidence, FinishAttemptError> {
         let (frame_refs, finish_authority_ref) =
@@ -676,6 +696,7 @@ impl<P: ?Sized> GovernorFinishAttempt<'_, P> {
         let (verifier_fact, verifier_run_ref) =
             self.read_current_verifier_fact(task_id, task, plan, fence)?;
         validate_nominated_artifact_bytes(&verifier_fact, nominated_refs.0)?;
+        validate_nominated_verifier_run_refs(&verifier_run_ref, nominated_refs.2)?;
         // This fact has already been rehydrated and validated against the
         // current task, plan, fence, and durable terminal TestD receipt. A
         // failed or partial verifier is still an executed run; its outcome is
@@ -1522,7 +1543,11 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             task,
             &fence,
             &plan,
-            (&draft.artifact_refs, &draft.observation_refs),
+            (
+                &draft.artifact_refs,
+                &draft.observation_refs,
+                &draft.verifier_run_refs,
+            ),
             contract_acceptance_set,
         )?;
         if self
