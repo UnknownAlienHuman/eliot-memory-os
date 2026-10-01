@@ -25,6 +25,11 @@ use std::fmt;
 use eliot_contracts::{EpochId, EpochRelation};
 use thiserror::Error;
 
+use crate::role_lease::{
+    AgentRole, CapabilityContext, DelegatedAuthority, IndependenceDowngrade, RoleLeaseError,
+    RoleTransitionRecord, ScopeBinding, WorkScopePolicy,
+};
+
 /// Maximum retained transport binding continuity observations per session.
 const MAX_TRANSPORT_BINDINGS: usize = 1024;
 
@@ -149,6 +154,17 @@ pub enum SessionLifecycleError {
     /// The continuation state TTL must be a positive duration.
     #[error("continuation state TTL must be positive")]
     InvalidContinuationTtl,
+    /// Role capability compilation, admission or transition failed closed.
+    #[error(transparent)]
+    RoleLease(#[from] RoleLeaseError),
+    /// A role capability admission was attempted while one is already
+    /// admitted for this session; transition instead.
+    #[error("role capability context is already admitted for this session")]
+    RoleCapabilityAlreadyAdmitted,
+    /// A role transition was attempted with no admitted role capability
+    /// context for this session.
+    #[error("no role capability context is admitted for this session")]
+    RoleCapabilityNotAdmitted,
 }
 
 /// The replaceable transport kinds that can bind to one application session.
@@ -233,6 +249,7 @@ pub struct ApplicationSession {
     bound_leases: BTreeMap<String, SessionLease>,
     durable_checkpoints: Vec<DurableWorkCheckpoint>,
     continuation_ttl_ms: Option<u64>,
+    role_capability: Option<CapabilityContext>,
 }
 
 impl ApplicationSession {
@@ -257,6 +274,7 @@ impl ApplicationSession {
             bound_leases: BTreeMap::new(),
             durable_checkpoints: Vec::new(),
             continuation_ttl_ms: None,
+            role_capability: None,
         })
     }
 
@@ -409,6 +427,93 @@ impl ApplicationSession {
         Ok(())
     }
 
+    /// Admits the server-side role capability context for this session.
+    ///
+    /// This is the server admission production caller for
+    /// [`CapabilityContext::admit`] (issue #1943): the I7.21 role default is
+    /// compiled into a server-enforced capability token bound to the exact
+    /// role, scope, task/work item, route, `GovernanceProfile` revision,
+    /// exact `State Fence`, lease epoch and expiry carried by `binding`, and
+    /// narrowed by `WorkScope` policy and delegated authority. The admitted
+    /// context is session-bound: exactly one is live per session, and session
+    /// loss drops it alongside the session-bound leases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionLifecycleError::IllegalTransition`] when the session
+    /// is terminal, [`SessionLifecycleError::RoleCapabilityAlreadyAdmitted`]
+    /// when a context is already admitted, or
+    /// [`SessionLifecycleError::RoleLease`] when compilation fails closed.
+    pub fn admit_role_capability(
+        &mut self,
+        context_id: impl Into<String>,
+        role: AgentRole,
+        binding: ScopeBinding,
+        workscope: &WorkScopePolicy,
+        delegated: &DelegatedAuthority,
+    ) -> Result<(), SessionLifecycleError> {
+        if self.state.is_terminal() {
+            return Err(SessionLifecycleError::IllegalTransition {
+                from: self.state,
+                to: ApplicationSessionState::Active,
+            });
+        }
+        if self.role_capability.is_some() {
+            return Err(SessionLifecycleError::RoleCapabilityAlreadyAdmitted);
+        }
+        let context = CapabilityContext::admit(context_id, role, binding, workscope, delegated)?;
+        self.role_capability = Some(context);
+        Ok(())
+    }
+
+    /// Performs the server-side role transition for this session.
+    ///
+    /// This is the server transition production caller for
+    /// [`CapabilityContext::transition`] (issue #1943): the preceding
+    /// capability context is closed and revoked, a newly scoped context is
+    /// created at `new_binding`'s advanced lease epoch, and the Independence
+    /// Profile is updated, so stronger authority from the previous role is
+    /// never silently retained. A Verifier moving to a mutating role still
+    /// requires the explicit [`IndependenceDowngrade`] record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionLifecycleError::IllegalTransition`] when the session
+    /// is terminal, [`SessionLifecycleError::RoleCapabilityNotAdmitted`]
+    /// when no context was admitted, or
+    /// [`SessionLifecycleError::RoleLease`] when the transition fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn transition_role_capability(
+        &mut self,
+        new_context_id: impl Into<String>,
+        new_role: AgentRole,
+        new_binding: &ScopeBinding,
+        workscope: &WorkScopePolicy,
+        delegated: &DelegatedAuthority,
+        downgrade: Option<IndependenceDowngrade>,
+        now_unix_ms: u64,
+    ) -> Result<RoleTransitionRecord, SessionLifecycleError> {
+        if self.state.is_terminal() {
+            return Err(SessionLifecycleError::IllegalTransition {
+                from: self.state,
+                to: ApplicationSessionState::Active,
+            });
+        }
+        let Some(context) = self.role_capability.as_mut() else {
+            return Err(SessionLifecycleError::RoleCapabilityNotAdmitted);
+        };
+        let record = context.transition(
+            new_context_id,
+            new_role,
+            new_binding,
+            workscope,
+            delegated,
+            downgrade,
+            now_unix_ms,
+        )?;
+        Ok(record)
+    }
+
     /// Records one replaceable transport binding as a continuity observation.
     ///
     /// This is the reconnect path: it appends a continuity observation and
@@ -534,6 +639,15 @@ impl ApplicationSession {
         &self.bound_leases
     }
 
+    /// Returns the admitted server-side role capability context, if any.
+    ///
+    /// Server authorization reads the active token through this context, so
+    /// role authority is enforceable only while the session holds it.
+    #[must_use]
+    pub const fn role_capability(&self) -> Option<&CapabilityContext> {
+        self.role_capability.as_ref()
+    }
+
     /// Returns the durable work checkpoints, in order.
     #[must_use]
     pub fn durable_checkpoints(&self) -> &[DurableWorkCheckpoint] {
@@ -566,6 +680,7 @@ impl ApplicationSession {
         for lease in self.bound_leases.values_mut() {
             lease.revoked = true;
         }
+        self.role_capability = None;
         Ok(())
     }
 
