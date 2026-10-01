@@ -30,6 +30,17 @@
 //! recomputing a fresh digest over what the join already holds, could only
 //! prove that the caller agrees with itself.
 //!
+//! The same rule governs retry authority. A presented
+//! [`OwnerValidatedOperationBinding`] carries the three owner-issued values
+//! read out of the tool owner's own receipt — its operation handle, its
+//! commitment to the request's identity, and its effect class — and it is
+//! compared BY CONTENT against the ones the correlation itself recorded when
+//! the emission was frozen. Existence and width are not evidence: a binding
+//! that merely exists, or whose commitment is the same width, authorizes
+//! nothing. [`reconcile_terminal_event`] refuses a mismatched binding outright
+//! and [`reconcile_deadline_sweep`] drops it, so a correlation can never be
+//! handed replay authority for an operation its owner never issued to it.
+//!
 //! The correlation identity is deliberately NOT an input to this join. A
 //! correlation's recorded digest names the correlation; it says nothing about
 //! which host event belongs to it, so requiring the caller to echo that digest
@@ -67,7 +78,7 @@ use crate::mcp_correlation::{
     Assessment, AssessmentInputs, AssessmentLog, AssessmentRevision, CanonicalDisposition,
     CoverageIndeterminacy, CoverageProof, EliotEmissionObservation, HostTerminalObservation,
     ObservationWindow, OwnerValidatedOperationBinding, PartialObservation, assess_correlation,
-    sha256_hex,
+    identity_commits_to_operation, sha256_hex,
 };
 use crate::mcp_host_observation::{
     HostEventJoinKeys, HostObservationReject, HostOwnerBinding, RecordedInvocation,
@@ -267,6 +278,23 @@ pub enum ReconcileError {
         /// Conflicting event identity.
         event_id: String,
     },
+    /// The presented operation binding does not commit to the operation this
+    /// correlation itself recorded.
+    ///
+    /// A binding is retry authority only for the operation the emission already
+    /// bound. Presenting a binding for any other operation — a different
+    /// handle, a different request commitment, or a different owner effect
+    /// class — is compared by content and refused, so resubmission can never be
+    /// authorized for an operation this correlation never issued. The
+    /// comparison is by content, never by existence: an absent binding matches
+    /// no recorded operation either, and a binding whose commitment merely has
+    /// the same width proves nothing.
+    OperationCommitmentMismatch {
+        /// Operation handle the correlation recorded, when it recorded one.
+        recorded_handle: Option<String>,
+        /// Operation handle the presented binding carries.
+        presented_handle: String,
+    },
     /// The candidate failed host-observation normalization.
     HostRejected(HostObservationReject),
 }
@@ -296,6 +324,14 @@ impl std::fmt::Display for ReconcileError {
                 "host event {event_id} was already accepted for this correlation with \
                  different content"
             ),
+            Self::OperationCommitmentMismatch {
+                recorded_handle,
+                presented_handle,
+            } => write!(
+                formatter,
+                "operation binding names operation {presented_handle}, not the operation this \
+                 correlation recorded ({recorded_handle:?}); it authorizes no recovery"
+            ),
             Self::HostRejected(reason) => {
                 write!(formatter, "host event rejected for correlation: {reason}")
             }
@@ -312,7 +348,8 @@ impl std::error::Error for ReconcileError {
             | Self::NominatedEventNotJournaled { .. }
             | Self::OutOfDeclaredOrder { .. }
             | Self::JournalContentConflict { .. }
-            | Self::PriorEvidenceConflict { .. } => None,
+            | Self::PriorEvidenceConflict { .. }
+            | Self::OperationCommitmentMismatch { .. } => None,
         }
     }
 }
@@ -334,6 +371,11 @@ pub struct TerminalReconcileRequest<'a> {
     /// `None` would let one correlation close once per event.
     pub assessments: &'a AssessmentLog,
     /// Owner-validated operation binding, when a tool owner minted one.
+    ///
+    /// Presented by the owning process, never by a host. It is still checked
+    /// against the operation this correlation recorded, by content, before it
+    /// can authorize anything: a binding read out of the owner's own receipt is
+    /// authority for that one operation and no other.
     pub operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical disposition from canonical evidence only.
     pub canonical: &'a CanonicalDisposition,
@@ -371,7 +413,13 @@ pub struct TerminalReconcileRequest<'a> {
 ///    here, and so the correlation stays pending;
 /// 4. **prior accepted evidence** — the same event identity may not reappear
 ///    for this correlation with any changed content, compared against the
-///    evidence read back out of this correlation's own retained revisions.
+///    evidence read back out of this correlation's own retained revisions;
+/// 5. **owner operation commitment** — a presented operation binding must
+///    commit, by content, to the operation this correlation itself recorded:
+///    the same owner-issued operation handle, the same owner-issued request
+///    commitment, and the same owner effect class. A binding for any other
+///    operation is refused, so no correlation can be handed retry authority
+///    for an operation it never issued.
 ///
 /// Only then is the event assessed, with the owner's live coverage
 /// denominator bounded to the candidate's own journaled sequence. Stale,
@@ -385,6 +433,19 @@ pub fn reconcile_terminal_event(
         return Err(ReconcileError::OwnerUnattached);
     };
     let recorded_digest = request.emission.identity.identity_digest.as_str();
+    // A binding presented at reconcile time is authority only for the operation
+    // the emission itself bound. The three owner-issued values are compared by
+    // content against the ones this correlation recorded when it was frozen, so
+    // a binding for any other operation — or for none — is refused here instead
+    // of authorizing a resubmission this correlation never issued.
+    if let Some(binding) = request.operation_binding
+        && !identity_commits_to_operation(&request.emission.identity, binding)
+    {
+        return Err(ReconcileError::OperationCommitmentMismatch {
+            recorded_handle: request.emission.identity.owner_operation_handle.clone(),
+            presented_handle: binding.operation_handle().to_owned(),
+        });
+    }
     let journaled = journal_binding(inputs.history(), request.candidate)?;
     let owner = owner_binding(bridge, inputs.fingerprint())?;
     // The recorded invocation is read back out of the correlation's own
@@ -524,6 +585,10 @@ pub struct DeadlineSweepRequest<'a> {
     /// Applicable observation deadline admitted by the owner, when one exists.
     pub deadline_unix_ms: Option<u64>,
     /// Owner-validated operation binding, when a tool owner minted one.
+    ///
+    /// Grants nothing unless it commits, by content, to the operation this
+    /// correlation recorded: an unverified binding is dropped rather than
+    /// passed on, so this sweep can never derive replay from it.
     pub operation_binding: Option<&'a OwnerValidatedOperationBinding>,
     /// Canonical disposition from canonical evidence only.
     pub canonical: &'a CanonicalDisposition,
@@ -556,12 +621,19 @@ pub fn reconcile_deadline_sweep(
         required_seq: pending_required_seq(bridge),
     };
     let host = HostTerminalObservation::PartialUnknown(PartialObservation::stdio_boundary());
+    // Same content comparison as the terminal join: a binding that does not
+    // commit to the operation this correlation recorded grants nothing, so the
+    // sweep assesses with no retry authority at all rather than with a binding
+    // for some other operation.
+    let operation_binding = request
+        .operation_binding
+        .filter(|binding| identity_commits_to_operation(&request.emission.identity, binding));
     let assessment_inputs = AssessmentInputs {
         emission: request.emission,
         host: &host,
         window: &window,
         transport_edge: None,
-        operation_binding: request.operation_binding,
+        operation_binding,
         canonical: request.canonical,
         ui_confirmed_stale: false,
     };
