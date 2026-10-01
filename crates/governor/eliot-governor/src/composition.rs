@@ -7020,14 +7020,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// an owner decision.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
+    ///
+    /// The admitted source closure (source set, privacy profile, privacy
+    /// boundary) travels as one `WorkScopeAdmissionAuthority` value, so the
+    /// entry keeps six arguments; the fresh `MATCHED` guard check below still
+    /// runs on the separate source and privacy values.
     pub fn admit_scope_relocation(
         &self,
         receipt: &ScopeRelocationOrAttachReceipt,
         privacy_class: PrivacyClass,
         governing_source_generation: u64,
-        sources: &GoverningSourceSet,
-        privacy: &PrivacyProfile,
-        privacy_boundary: &PrivacyBoundary,
+        authority: &WorkScopeAdmissionAuthority,
         owner_revision: u64,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
@@ -7050,17 +7053,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &fence,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let fresh = ScopeBindingGuard.check(&relocated, &relocated, sources, privacy);
+        let fresh = ScopeBindingGuard.check(
+            &relocated,
+            &relocated,
+            &authority.governing_sources,
+            &authority.privacy_profile,
+        );
         if fresh.disposition != ScopeBindingDisposition::Matched {
             return Err(CompositionError::Recovery(
                 "relocation source closure is not matched for the observed instance".to_owned(),
             ));
         }
-        let admission_authority = WorkScopeAdmissionAuthority {
-            privacy_profile: privacy.clone(),
-            privacy_boundary: privacy_boundary.clone(),
-            governing_sources: sources.clone(),
-        };
+        let admission_authority = authority.clone();
         let snapshot = WorkScopeBindingSnapshot::new_with_authority(
             fence,
             owner_revision,
@@ -7129,13 +7133,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &fence,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let authority = WorkScopeAdmissionAuthority {
+            privacy_profile: privacy.clone(),
+            privacy_boundary: privacy_boundary.clone(),
+            governing_sources: sources.clone(),
+        };
         let bound = self.admit_scope_relocation(
             &receipt,
             privacy_class,
             governing_source_generation,
-            sources,
-            privacy,
-            privacy_boundary,
+            &authority,
             owner_revision,
         )?;
         Ok((receipt, bound))
@@ -7161,20 +7168,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     ///
-    /// Eight arguments are the documented admission evidence (descriptor,
-    /// revision, presented + observed bindings, source set, privacy profile
-    /// and boundary); grouping them would hide the per-leg MATCHED checks
-    /// below, so the arity is allowed here as on the cold-start drive legs.
-    #[allow(clippy::too_many_arguments)]
+    /// The admitted source closure (source set, privacy profile, privacy
+    /// boundary) travels as one `WorkScopeAdmissionAuthority` value, so the
+    /// entry keeps six arguments; the per-leg `MATCHED` checks still run on
+    /// the separate values inside the workscope admission.
     pub fn admit_initial_scope_binding(
         &self,
         descriptor: &WorkScopeDescriptor,
         owner_revision: u64,
         binding: &ScopeBinding,
         observed: &ScopeBinding,
-        sources: &GoverningSourceSet,
-        privacy: &PrivacyProfile,
-        privacy_boundary: &PrivacyBoundary,
+        authority: &WorkScopeAdmissionAuthority,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
@@ -7186,9 +7190,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             &fence,
             binding,
             observed,
-            sources,
-            privacy,
-            privacy_boundary,
+            &authority.governing_sources,
+            &authority.privacy_profile,
+            &authority.privacy_boundary,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
