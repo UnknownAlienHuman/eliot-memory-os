@@ -151,8 +151,9 @@ use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
     BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
-    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidateEvidence, GoverningSourceRole,
-    ManifestEvidence, ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt,
+    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidate,
+    GoverningSourceCandidateEvidence, GoverningSourceRole, ManifestEvidence,
+    ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt, PrecedenceDeclaration,
     ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
     issue_discovery_lease, task_selection_required,
 };
@@ -166,6 +167,79 @@ pub struct ColdStartDiscoveryInput {
     pub lease: DiscoveryReadLease,
     pub key: DiscoveryLeaseKey,
     pub discovery: BootstrapDiscoveryInputs,
+}
+
+/// Closed, caller-declared WorkScope tuple carried by the authenticated
+/// `BIND_SCOPE` Task Controller action. This is input, not owner evidence:
+/// authority over `sources` and `privacy` must still be checked against their
+/// retained owners before any binding is installed.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialWorkScopeBindingRequest {
+    /// The one explicit absolute root Host independently observes.
+    pub explicit_root: PathBuf,
+    /// Original WorkScope descriptor supplied by the authenticated binding
+    /// operation.
+    pub descriptor: WorkScopeDescriptor,
+    /// Resolved binding to check against both descriptor and Host observation.
+    pub binding: ScopeBinding,
+    /// Original governing-source owner value; never synthesized from names.
+    pub sources: GoverningSourceSet,
+    /// Original privacy owner value; never inferred from Host observation.
+    pub privacy: PrivacyProfile,
+    /// Original source candidates, including their claims and exact evidence.
+    pub source_candidates: Vec<GoverningSourceCandidate>,
+    /// Original declared precedence relation; caller proven bindings/contracts
+    /// remain excluded and are recomputed by Governor from current owners.
+    pub declared_precedences: Vec<PrecedenceDeclaration>,
+    /// Original explicit absence reason, when the source model declares one.
+    pub absence_reason_ref: Option<String>,
+    /// Original source-admission deadline, preserved verbatim for owner check.
+    pub admission_deadline: u64,
+}
+
+impl InitialWorkScopeBindingRequest {
+    /// Checks only closed structure and tuple consistency. This deliberately
+    /// does not authorize the source or privacy values; their owner provenance
+    /// remains a separate admission requirement.
+    pub fn validate_for_task_scope(&self, work_scope_id: &str) -> Result<(), String> {
+        if !self.explicit_root.is_absolute() {
+            return Err("explicit_root must be an absolute Host observation selector".to_owned());
+        }
+        self.descriptor
+            .validate()
+            .map_err(|error| format!("WorkScope descriptor is invalid: {error}"))?;
+        self.binding
+            .validate()
+            .map_err(|error| format!("WorkScope binding is invalid: {error}"))?;
+        self.privacy
+            .validate()
+            .map_err(|error| format!("WorkScope privacy profile is invalid: {error}"))?;
+        if self.descriptor.scope_ref != work_scope_id
+            || self.binding.scope.scope_ref != work_scope_id
+            || self.sources.scope_ref != work_scope_id
+        {
+            return Err("WorkScope request does not match the admitted invocation scope".to_owned());
+        }
+        if self.descriptor.scope_ref != self.binding.scope.scope_ref {
+            return Err("WorkScope descriptor and resolved binding disagree".to_owned());
+        }
+        if self.admission_deadline == 0
+            || self.source_candidates.iter().any(|candidate| {
+                candidate.validate().is_err()
+                    || candidate.applicable_scope_ref != work_scope_id
+                    || candidate.applicable_generation != self.binding.scope.generation
+            })
+            || self.declared_precedences.iter().any(|precedence| {
+                precedence.validate().is_err() || precedence.scope_ref != work_scope_id
+            })
+        {
+            return Err("WorkScope source admission inputs are invalid".to_owned());
+        }
+        self.sources
+            .validate_for(&self.binding.scope, &self.privacy)
+            .map_err(|error| format!("WorkScope source/privacy closure is invalid: {error}"))
+    }
 }
 
 const SCAN_DISCLOSURE_OWNER_OPERATION: &str = "scan_disclosure_owner";

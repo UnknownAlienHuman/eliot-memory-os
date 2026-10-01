@@ -6746,6 +6746,15 @@ async fn run_task_controller_poll(
     .map_err(|error| format!("daemon Task Controller preparation: {error}"))?;
     let body = match prepared {
         eliotd::campaign_task_controller::TaskControllerClaimPreparation::Rejected(body) => *body,
+        eliotd::campaign_task_controller::TaskControllerClaimPreparation::BindScope(prepared) => {
+            eliotd::campaign_task_controller::complete_initial_work_scope_binding(
+                kernel.as_ref(),
+                composition.as_ref(),
+                *prepared,
+            )
+            .await
+            .map_err(|error| format!("daemon initial WorkScope binding: {error}"))?
+        }
         eliotd::campaign_task_controller::TaskControllerClaimPreparation::Ready(prepared) => {
             let transition = {
                 let guard = composition.lock().await;

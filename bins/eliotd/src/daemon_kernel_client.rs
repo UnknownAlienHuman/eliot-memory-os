@@ -427,7 +427,10 @@ pub struct TaskControllerClaimedInvocation {
     /// selection without deriving authority from caller-controlled labels.
     pub authenticated_principal: String,
     pub tool: serde_json::Value,
-    pub request_identity: RequestIdentity,
+    /// Owner-derived request metadata used by ordinary Task Controller
+    /// transitions. `BIND_SCOPE` does not invent Product/Source metadata from
+    /// a learning recipe it is forbidden to carry, so it may be absent.
+    pub request_identity: Option<RequestIdentity>,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
 }
@@ -600,14 +603,23 @@ pub fn parse_task_controller_claimed_pair(
         .map(str::to_owned)
         .ok_or_else(|| "Kernel Task Controller claim has no authenticated principal".to_owned())?;
     let tool = decode("tool")?;
-    let request_identity: RequestIdentity = match pair.get("identity") {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?,
-        None => derive_task_controller_request_identity(&invocation, &envelope)?,
+    let request_identity: Option<RequestIdentity> = if invocation.action
+        == eliot_protocol::TaskControllerAction::BindScope
+    {
+        None
+    } else {
+        Some(match pair.get("identity") {
+            Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                format!("Kernel Task Controller identity does not decode: {error}")
+            })?,
+            None => derive_task_controller_request_identity(&invocation, &envelope)?,
+        })
     };
-    request_identity
-        .validate()
-        .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
+    if let Some(identity) = request_identity.as_ref() {
+        identity
+            .validate()
+            .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
+    }
     let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
         .map_err(|error| format!("Kernel Task Controller operation id does not decode: {error}"))?;
     let attempt: TaskControllerAttempt = serde_json::from_value(decode("attempt")?)
@@ -634,9 +646,11 @@ pub fn parse_task_controller_claimed_pair(
                 .work_scope_id
                 .as_deref()
                 .unwrap_or_default()
-        || request_identity.request.state_fence != envelope.state_fence
-        || request_identity.request.metadata.state_fence != envelope.state_fence
-        || request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
+        || request_identity.as_ref().is_some_and(|identity| {
+            identity.request.state_fence != envelope.state_fence
+                || identity.request.metadata.state_fence != envelope.state_fence
+                || identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
+        })
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
         || attempt.task_id != invocation.task_id
@@ -2319,6 +2333,12 @@ impl DaemonKernelClient {
     /// here.
     pub fn kernel_fence(&self) -> eliot_contracts::StateFence {
         self.snapshot.state_fence()
+    }
+
+    /// Returns the digest of the authenticated immutable Kernel snapshot for
+    /// exact owner recovery/write requests.
+    pub(super) fn protected_snapshot_digest(&self) -> &str {
+        self.snapshot.protected_snapshot_digest.as_str()
     }
 
     /// Mints the transport operation binding for one startup evidence
