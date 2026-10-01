@@ -6,9 +6,10 @@ together with `user_automation_zones.rs`. The Operator is NOT a second
 calendar/zone owner: it validates the bounded wire shape and the exact supported
 contract version of what the owner issued, and it never resolves a zone, reads a
 timezone database, or consults ambient Windows locale/timezone data. To keep that
-boundary honest, the grammar constants, the closed disposition vocabulary, the
-owner refusal Display strings and the byte shape of every grammar function the
-mirror reimplements are GENERATED from the Rust source of truth instead of
+boundary honest, the grammar constants, the closed operation/member census, the
+result value discriminators and member census, the closed disposition vocabulary,
+the owner refusal Display strings and the byte shape of every grammar function
+the mirror reimplements are GENERATED from the Rust source of truth instead of
 hand-copied.
 
 Usage:
@@ -110,6 +111,8 @@ PINNED_CONSTANTS = (
     ("MIN_CIVIL_YEAR", USER_AUTOMATION_RS, "int"),
     ("MAX_CIVIL_YEAR", USER_AUTOMATION_RS, "int"),
     ("USER_AUTOMATION_PREFLIGHT_CONTRACT_REVISION", USER_AUTOMATION_RS, "string"),
+    ("USER_AUTOMATION_NORMALIZATION_OPERATION_KIND", USER_AUTOMATION_RS, "string"),
+    ("USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND", USER_AUTOMATION_RS, "string"),
     # The only zone database release this build admits, and the token every
     # owner occurrence record must carry verbatim.
     ("PINNED_ZONE_DATABASE_RELEASE", USER_AUTOMATION_ZONES_RS, "string"),
@@ -128,6 +131,8 @@ PINNED_CONSTANTS = (
 RESULT_SCHEMA_STRUCTS = (
     ("UserAutomationOperatorResultEnvelope", "USER_AUTOMATION_RESULT_ENVELOPE_MEMBERS"),
     ("UserAutomationResultCorrelation", "USER_AUTOMATION_RESULT_CORRELATION_MEMBERS"),
+    ("UserAutomationOperatorContextValue", "USER_AUTOMATION_CONTEXT_VALUE_MEMBERS"),
+    ("UserAutomationNormalizedScheduleValue", "USER_AUTOMATION_NORMALIZED_SCHEDULE_VALUE_MEMBERS"),
     ("UserAutomationOperatorTransitionValue", "USER_AUTOMATION_TRANSITION_VALUE_MEMBERS"),
     ("UserAutomationScheduleInspectionProjection", "USER_AUTOMATION_SCHEDULE_PROJECTION_MEMBERS"),
     ("UserAutomationOccurrenceInspectionProjection", "USER_AUTOMATION_OCCURRENCE_PROJECTION_MEMBERS"),
@@ -161,6 +166,19 @@ RESULT_SCHEMA_STRUCTS = (
     ("RevisionDelta", "USER_AUTOMATION_REVISION_DELTA_MEMBERS"),
     ("OrderingHead", "USER_AUTOMATION_ORDERING_HEAD_MEMBERS"),
     ("PolicyConfigSchemaVersions", "USER_AUTOMATION_POLICY_SCHEMA_MEMBERS"),
+)
+
+# Closed request operation tags and the fields of the operations the Operator
+# constructs directly. These arrays come from the same Rust tagged enum as the
+# result schema above; adding or changing one makes the generated artifact stale
+# at the existing MSBuild parity gate.
+REQUEST_OPERATION_ENUM = (USER_AUTOMATION_RS, "UserAutomationOperation")
+REQUEST_OPERATION_VARIANTS = (
+    ("Create", "USER_AUTOMATION_CREATE_OPERATION_MEMBERS"),
+    ("Edit", "USER_AUTOMATION_EDIT_OPERATION_MEMBERS"),
+    ("NormalizeSchedule", "USER_AUTOMATION_NORMALIZE_SCHEDULE_OPERATION_MEMBERS"),
+    ("MigrateLegacySchedule", "USER_AUTOMATION_MIGRATE_LEGACY_SCHEDULE_OPERATION_MEMBERS"),
+    ("GetContext", "USER_AUTOMATION_GET_CONTEXT_OPERATION_MEMBERS"),
 )
 
 # Owner enum wire tags whose closed values are checked before the Operator
@@ -791,8 +809,10 @@ def _matching_delimiter(text: str, start: int, opening: str, closing: str) -> in
     raise Refused(f"unclosed Rust delimiter {opening!r} in result schema input")
 
 
-def _strip_rust_comments_and_attributes(text: str) -> str:
-    """Remove comments/attributes for type-reference parsing only."""
+def _strip_rust_comments_and_attributes(
+    text: str, *, strip_attributes: bool = True
+) -> str:
+    """Remove comments and, by default, Rust attributes from declaration text."""
     output: list[str] = []
     index = 0
     in_string = False
@@ -840,7 +860,7 @@ def _strip_rust_comments_and_attributes(text: str) -> str:
             output.append(" ")
             index = end
             continue
-        if next_pair == "#[":
+        if next_pair == "#[" and strip_attributes:
             end = _matching_delimiter(text, index + 1, "[", "]")
             output.append(" ")
             index = end + 1
@@ -891,6 +911,21 @@ def _split_top_level(text: str, delimiter: str) -> list[str]:
             braces -= 1
     result.append(text[start:])
     return result
+
+
+def _strip_leading_rust_attributes(text: str) -> tuple[str, bool]:
+    """Remove adjacent leading attributes and report whether any were present."""
+    index = 0
+    found = False
+    while True:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if not text.startswith("#[", index):
+            break
+        closing = _matching_delimiter(text, index + 1, "[", "]")
+        index = closing + 1
+        found = True
+    return text[index:].strip(), found
 
 
 def _declaration_kind(declaration: str, name: str) -> str:
@@ -1364,6 +1399,163 @@ def collect_result_deserializer(lines: list[str], name: str) -> str:
     raise Refused(f"result deserializer {name!r} is absent")
 
 
+def collect_result_outcomes(lines: list[str], name: str) -> list[str]:
+    """Collect the explicit literal outcomes accepted by a closed result decoder."""
+    decoder = _strip_rust_comments_and_attributes(
+        collect_result_deserializer(lines, name)
+    )
+    match = re.search(
+        r'match\s+object\.get\("outcome"\)\s*\.and_then\s*'
+        r'\(\s*serde_json::Value::as_str\s*\)\s*\{',
+        decoder,
+    )
+    if match is None:
+        raise Refused(f"result deserializer {name!r} has no pinned outcome match")
+    opening = decoder.find("{", match.start())
+    closing = _matching_delimiter(decoder, opening, "{", "}")
+    arms = decoder[opening + 1 : closing]
+    literals = list(
+        re.finditer(
+            r'\bSome\s*\(\s*("(?:\\.|[^"\\])*")\s*\)\s*=>\s*'
+            r'("(?:\\.|[^"\\])*")',
+            arms,
+        )
+    )
+    if len(literals) != len(re.findall(r"\bSome\s*\(", arms)):
+        raise Refused(
+            f"result deserializer {name!r} changed its literal outcome mapping"
+        )
+    outcomes: list[str] = []
+    for literal in literals:
+        accepted = decode_rust_string(literal.group(1))
+        selected = decode_rust_string(literal.group(2))
+        if accepted != selected:
+            raise Refused(
+                f"result deserializer {name!r} maps outcome {accepted!r} "
+                f"to unsupported discriminator {selected!r}"
+            )
+        outcomes.append(accepted)
+    if not outcomes or len(set(outcomes)) != len(outcomes):
+        raise Refused(f"result deserializer {name!r} has no unique outcome values")
+    return outcomes
+
+
+def collect_enum_variant_members(
+    lines: list[str], enum_name: str, variant_name: str
+) -> RustResultStruct:
+    """Collect the JSON members carried by one tagged enum operation variant."""
+    declaration = collect_result_declaration(lines, enum_name)
+    code = _strip_rust_comments_and_attributes(declaration, strip_attributes=False)
+    header = re.search(rf"\benum\s+{re.escape(enum_name)}\b", code)
+    if header is None:
+        raise Refused(f"request operation enum {enum_name!r} is absent")
+    opening = code.find("{", header.end())
+    if opening < 0:
+        raise Refused(f"request operation enum {enum_name!r} has no body")
+    closing = _matching_delimiter(code, opening, "{", "}")
+    body = code[opening + 1 : closing]
+    for variant in _split_top_level(body, ","):
+        text, has_variant_attributes = _strip_leading_rust_attributes(variant)
+        variant_match = re.match(r"([A-Z][A-Za-z0-9_]*)\b(.*)", text, re.S)
+        if variant_match is None or variant_match.group(1) != variant_name:
+            continue
+        if has_variant_attributes:
+            raise Refused(
+                f"request operation variant {enum_name}::{variant_name} uses unsupported attributes"
+            )
+        payload = variant_match.group(2).strip()
+        if not payload:
+            return RustResultStruct(
+                f"{enum_name}::{variant_name}", ()
+            )
+        if not payload.startswith("{"):
+            raise Refused(
+                f"request operation {enum_name}::{variant_name} is not a unit or struct variant"
+            )
+        payload_close = _matching_delimiter(payload, 0, "{", "}")
+        if payload[payload_close + 1 :].strip():
+            raise Refused(
+                f"request operation {enum_name}::{variant_name} has trailing syntax"
+            )
+        fields: list[RustResultField] = []
+        for member in _split_top_level(payload[1:payload_close], ","):
+            member, has_attributes = _strip_leading_rust_attributes(member)
+            if not member:
+                continue
+            if has_attributes or "#[" in member:
+                raise Refused(
+                    f"request operation fields in {enum_name}::{variant_name} use unsupported attributes"
+                )
+            parts = _split_top_level(member, ":")
+            if len(parts) < 2:
+                raise Refused(
+                    f"request operation field in {enum_name}::{variant_name} is not a named field"
+                )
+            field_name = parts[0].strip()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", field_name) is None:
+                raise Refused(
+                    f"request operation field in {enum_name}::{variant_name} has an unsupported name"
+                )
+            fields.append(
+                RustResultField(field_name, ":".join(parts[1:]).strip(), True)
+            )
+        return RustResultStruct(f"{enum_name}::{variant_name}", tuple(fields))
+    raise Refused(
+        f"request operation variant {enum_name}::{variant_name} is absent"
+    )
+
+
+def collect_enum_discriminator(lines: list[str], enum_name: str) -> str:
+    """Collect the literal serde tag field for one internally tagged enum."""
+    declaration = collect_result_declaration(lines, enum_name)
+    code = _strip_rust_comments_and_attributes(declaration, strip_attributes=False)
+    header = re.search(rf"\benum\s+{re.escape(enum_name)}\b", code)
+    if header is None:
+        raise Refused(f"request operation enum {enum_name!r} is absent")
+    attributes = code[: header.start()]
+    serde_attributes = re.findall(
+        r"#\s*\[\s*serde\s*\((.*?)\)\s*\]", attributes, re.S
+    )
+    tags = [
+        decode_rust_string(match.group(1))
+        for attribute in serde_attributes
+        for match in re.finditer(
+            r"\btag\s*=\s*((?:\"(?:\\.|[^\"\\])*\"))", attribute
+        )
+    ]
+    if len(tags) != 1 or not tags[0]:
+        raise Refused(
+            f"request operation enum {enum_name!r} must have one literal serde tag"
+        )
+    rename_rules = [
+        decode_rust_string(match.group(1))
+        for attribute in serde_attributes
+        for match in re.finditer(
+            r"\brename_all\s*=\s*((?:\"(?:\\.|[^\"\\])*\"))", attribute
+        )
+    ]
+    if len(rename_rules) != 1 or rename_rules[0] not in {
+        "lowercase",
+        "snake_case",
+        "SCREAMING_SNAKE_CASE",
+        "kebab-case",
+    }:
+        raise Refused(
+            f"request operation enum {enum_name!r} must have one supported literal rename_all rule"
+        )
+    opening = code.find("{", header.end())
+    if opening < 0:
+        raise Refused(f"request operation enum {enum_name!r} has no body")
+    closing = _matching_delimiter(code, opening, "{", "}")
+    for variant in _split_top_level(code[opening + 1 : closing], ","):
+        _text, has_attributes = _strip_leading_rust_attributes(variant)
+        if has_attributes:
+            raise Refused(
+                f"request operation enum {enum_name!r} uses unsupported variant attributes"
+            )
+    return tags[0]
+
+
 def collect_result_enum(lines: list[str], name: str) -> RustResultEnum:
     """Collect enum variants using the serde rename rule on the owner type."""
     header = re.compile(rf"^\s*pub\s+enum\s+{re.escape(name)}\b")
@@ -1516,6 +1708,10 @@ def render_artefact(
     functions: list[RustFunction],
     result_structs: list[tuple[str, str, RustResultStruct]],
     result_enums: list[tuple[str, str, RustResultEnum]],
+    request_operation_discriminator: str,
+    request_operation_kinds: list[str],
+    request_operation_structs: list[tuple[str, RustResultStruct]],
+    result_value_outcomes: list[str],
     digests: dict[str, str],
 ) -> str:
     lines: list[str] = []
@@ -1648,6 +1844,37 @@ def render_artefact(
             add(f"        {csharp_string(variant)},")
         add("    ];")
         add("")
+    add("    /// <summary>Serde discriminator field of `UserAutomationOperation`.</summary>")
+    add(
+        "    public const string USER_AUTOMATION_OPERATION_DISCRIMINATOR = "
+        + csharp_string(request_operation_discriminator)
+        + ";"
+    )
+    add("")
+    add("    /// <summary>Generated serialized kinds of `UserAutomationOperation`.</summary>")
+    add("    public static readonly string[] USER_AUTOMATION_OPERATION_KINDS =")
+    add("    [")
+    for operation_kind in request_operation_kinds:
+        add(f"        {csharp_string(operation_kind)},")
+    add("    ];")
+    add("")
+    for member_constant, schema in request_operation_structs:
+        add(f"    /// <summary>Generated JSON members of `{schema.name}`.</summary>")
+        add(f"    public static readonly string[] {member_constant} =")
+        add("    [")
+        for field in schema.fields:
+            add(f"        {csharp_string(field.name)},")
+        add("    ];")
+        add("")
+    add("    /// <summary>")
+    add("    /// Explicit literal outcomes accepted by the Rust result value deserializer.")
+    add("    /// </summary>")
+    add("    public static readonly string[] USER_AUTOMATION_RESULT_VALUE_OUTCOMES =")
+    add("    [")
+    for outcome in result_value_outcomes:
+        add(f"        {csharp_string(outcome)},")
+    add("    ];")
+    add("")
     add("    /// <summary>")
     add("    /// The closed fold/gap disposition vocabulary, enumerated from the owner's")
     add("    /// own parser rather than listed by hand.")
@@ -1799,6 +2026,34 @@ def build(root: str) -> tuple[str, dict[str, int]]:
         (name, value_constant, collect_result_enum(sources[path], name))
         for path, name, value_constant in RESULT_SCHEMA_ENUMS
     ]
+    request_operation_enum = collect_result_enum(
+        sources[REQUEST_OPERATION_ENUM[0]], REQUEST_OPERATION_ENUM[1]
+    )
+    request_operation_discriminator = collect_enum_discriminator(
+        sources[REQUEST_OPERATION_ENUM[0]], REQUEST_OPERATION_ENUM[1]
+    )
+    request_operation_kinds = list(request_operation_enum.variants)
+    if len(set(request_operation_kinds)) != len(request_operation_kinds):
+        raise Refused("UserAutomationOperation repeats a serialized operation kind")
+    if len(set(REQUEST_OPERATION_VARIANTS)) != len(REQUEST_OPERATION_VARIANTS) or len(
+        {member_constant for _variant, member_constant in REQUEST_OPERATION_VARIANTS}
+    ) != len(REQUEST_OPERATION_VARIANTS):
+        raise Refused("REQUEST_OPERATION_VARIANTS repeats a pinned owner variant")
+    request_operation_structs = [
+        (
+            member_constant,
+            collect_enum_variant_members(
+                sources[REQUEST_OPERATION_ENUM[0]],
+                REQUEST_OPERATION_ENUM[1],
+                variant,
+            ),
+        )
+        for variant, member_constant in REQUEST_OPERATION_VARIANTS
+    ]
+    result_value_outcomes = collect_result_outcomes(
+        sources[USER_AUTOMATION_TRANSITION_RS],
+        "UserAutomationOperatorResultValue",
+    )
     decoder_lines = read_source(os.path.join(root, OPERATOR_RESULT_DECODER_CS))
     decoder_source = "\n".join(decoder_lines)
     pin_pattern = re.compile(
@@ -1867,6 +2122,10 @@ def build(root: str) -> tuple[str, dict[str, int]]:
         functions,
         result_structs,
         result_enums,
+        request_operation_discriminator,
+        request_operation_kinds,
+        request_operation_structs,
+        result_value_outcomes,
         digests,
     ), {
         "constants": len(rendered),
