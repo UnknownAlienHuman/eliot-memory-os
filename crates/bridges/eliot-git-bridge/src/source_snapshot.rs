@@ -1037,3 +1037,168 @@ async fn run_git_async(
     }
     Ok(outcome)
 }
+
+#[cfg(test)]
+mod selected_source_capture_tests {
+    use super::*;
+    use crate::{GitProcessRunError, GitProcessRunFuture, OwnerKind};
+    use std::future::{Future, ready};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    const TREE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BLOB_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SELECTED_PATH: &str = "src/lib.rs";
+    const SELECTED_BYTES: &[u8] = b"pub fn selected() {}\n";
+
+    struct CurrentSourceGitRunner {
+        root: String,
+        archive: Vec<u8>,
+        blob: Vec<u8>,
+    }
+
+    impl AsyncProcessRunner for CurrentSourceGitRunner {
+        fn run_profiled<'a>(
+            &'a self,
+            exe: &'a str,
+            args: &'a [&'a str],
+            _cwd: &'a Path,
+            _stdin: &'a [u8],
+            _profile: &'a GitProcessProfile,
+        ) -> GitProcessRunFuture<'a> {
+            let result = if exe != "git" {
+                Err(GitProcessRunError {
+                    code: "TEST_UNEXPECTED_EXECUTABLE".to_owned(),
+                    detail: exe.to_owned(),
+                })
+            } else {
+                let stdout = match args {
+                    ["rev-parse", "--show-toplevel"] => {
+                        format!("{}\n", self.root).into_bytes()
+                    }
+                    ["read-tree", "HEAD"] | ["add", "--all", "--force"] => Vec::new(),
+                    ["write-tree"] => format!("{TREE_ID}\n").into_bytes(),
+                    ["ls-tree", "-r", "-z", TREE_ID] => {
+                        format!("100644 blob {BLOB_ID}\t{SELECTED_PATH}\0").into_bytes()
+                    }
+                    ["cat-file", "blob", BLOB_ID] => self.blob.clone(),
+                    ["archive", "--format=tar", TREE_ID] => self.archive.clone(),
+                    _ => {
+                        return Box::pin(ready(Err(GitProcessRunError {
+                            code: "TEST_UNEXPECTED_GIT_OPERATION".to_owned(),
+                            detail: args.join(" "),
+                        })));
+                    }
+                };
+                Ok(ProcessOutcome {
+                    code: 0,
+                    stdout,
+                    stderr: Vec::new(),
+                })
+            };
+            Box::pin(ready(result))
+        }
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        let waker = Waker::from(Arc::new(NoopWake));
+        let mut context = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+    }
+
+    fn temp_root() -> (PathBuf, RepoRoot) {
+        let unique = format!(
+            "eliot-source-capture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&path).expect("temporary workspace");
+        let root = RepoRoot::new(&path, OwnerKind::Service).expect("repository root");
+        (path, root)
+    }
+
+    fn runner(root: &Path, blob: &[u8]) -> CurrentSourceGitRunner {
+        CurrentSourceGitRunner {
+            root: fs::canonicalize(root)
+                .expect("canonical workspace")
+                .to_string_lossy()
+                .into_owned(),
+            archive: tar_archive(SELECTED_PATH, blob),
+            blob: blob.to_vec(),
+        }
+    }
+
+    fn tar_archive(path: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut header = [0_u8; 512];
+        header[..path.len()].copy_from_slice(path.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        let size = format!("{:011o}\0", bytes.len());
+        header[124..136].copy_from_slice(size.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[148..156].fill(b' ');
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+        let checksum = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum.as_bytes());
+
+        let mut archive = header.to_vec();
+        archive.extend_from_slice(bytes);
+        archive.resize(512 + bytes.len().div_ceil(512) * 512, 0);
+        archive.extend_from_slice(&[0; 1024]);
+        archive
+    }
+
+    #[test]
+    fn selected_source_snapshot_capture_accepts_exact_owner_readback() {
+        let (path, root) = temp_root();
+        let runner = runner(&path, SELECTED_BYTES);
+        let snapshot = block_on(SourceTreeSnapshot::capture_current_async_for_selected_source(
+            &root,
+            &runner,
+            4096,
+            SELECTED_PATH,
+            SELECTED_BYTES,
+        ))
+        .expect("both Git captures contain the selected owner-observed bytes");
+        assert_eq!(snapshot.tree_id(), TREE_ID);
+        assert!(!snapshot.archive_bytes().is_empty());
+        fs::remove_dir_all(path).expect("remove temporary workspace");
+    }
+
+    #[test]
+    fn selected_source_snapshot_capture_refuses_different_observed_bytes() {
+        let (path, root) = temp_root();
+        let runner = runner(&path, SELECTED_BYTES);
+        let result = block_on(SourceTreeSnapshot::capture_current_async_for_selected_source(
+            &root,
+            &runner,
+            4096,
+            SELECTED_PATH,
+            b"bytes from a different selected-source observation",
+        ));
+        assert!(matches!(
+            result,
+            Err(GitSnapshotError::SelectedSourceMismatch { path }) if path == SELECTED_PATH
+        ));
+        fs::remove_dir_all(path).expect("remove temporary workspace");
+    }
+}
