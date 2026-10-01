@@ -141,6 +141,15 @@ mod slice_8_result_tests {
             candidate_id: format!("{job_id}-candidate-1"),
             kind: "review_required".to_owned(),
             source_handles: vec!["evidence-1".to_owned()],
+            // I9.6 evidence fields. This fixture runs no admitted route: no
+            // screen digest, request digest, result digest, protection finding,
+            // or bound fence exists for it, so every sentence below states that
+            // absence from the fixture's own material rather than naming a
+            // digest or identifier the fixture never produced.
+            support: "handle-only fixture: evidence-1 was admitted as a source handle; no owner screen digest, request digest, or result digest exists for a fixture candidate.".to_owned(),
+            counterevidence: "the owner declared no conflict for evidence-1, so its protection state is unknown rather than cleared; this fixture runs no real admitted route.".to_owned(),
+            scope_and_applicability: "applies to scope scope-slice-8 for this fixture job; proposed mutable target: evidence-1; no state_fence is bound by this fixture candidate.".to_owned(),
+            preservation_report: "no source mutation was performed: fixture candidate over evidence-1 is review_required; no owner protection finding was derived because no real screen ran.".to_owned(),
             proposed_transformation: "Inspect provenance; do not alter the source.".to_owned(),
             uncertainty: "No semantic promotion from a handle-only bundle.".to_owned(),
             rollback: "Discard the candidate.".to_owned(),
