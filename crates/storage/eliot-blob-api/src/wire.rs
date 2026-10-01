@@ -784,7 +784,6 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             owner_facts.validate()?;
             if serde_json::to_string(&owner_facts).ok().as_deref()
                 != Some(owner_facts_json.as_str())
-                || owner_facts_json.len() > 128 * 1024
                 || sha256_hex(owner_facts_json.as_bytes()) != *owner_facts_sha256
                 || owner_facts.work_scope_binding_sha256 != *work_scope_snapshot_sha256
                 || owner_facts.matched_guard_receipt_sha256 != *matched_guard_receipt_sha256
@@ -1555,8 +1554,7 @@ fn validate_canonical_owner_json(
     validate_digest(field, digest)?;
     let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|_| WireValidationError::InvalidField(field))?;
-    if json.len() > 16 * 1024
-        || !matches!(&value, serde_json::Value::Object(_))
+    if !matches!(&value, serde_json::Value::Object(_))
         || serde_json::to_string(&value).as_bytes() != json.as_bytes()
         || sha256_hex(json.as_bytes()) != digest
     {
