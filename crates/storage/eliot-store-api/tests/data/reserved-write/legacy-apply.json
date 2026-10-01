@@ -51,9 +51,9 @@
     ],
     "transition_class": "capture_candidate",
     "requested_effect_ceiling": "CANDIDATE",
-    "admission_contract_set_digest": "f664d1ccb4a789a37b34bca8c2ca97b3a13117c53ab51b8f291da1887a3572a8",
+    "admission_contract_set_digest": "c5a38e6c2dd7f73cff0ab62695136d3322703e06b78855a595c0f08db789948d",
     "operation_manifest_digest": "manifest-991-1",
-    "admission_digest": "f57295f4ced554bcdb94b20ab6d425216dc68c0aa828fadaaf125c618b8f5031",
+    "admission_digest": "adc52b398eac1b646edc2426db2a15fab130027dc6dd5018ab526ab3e7555f8d",
     "mutation_plan_digest": "cd3207fea3533719d0445bc2cd73c9501dea5bb0a1cdd6195dbf13260f744ab6",
     "semantic_source_revisions": [
       "rev-991-1@3"

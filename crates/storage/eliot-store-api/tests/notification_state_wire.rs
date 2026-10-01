@@ -18,7 +18,7 @@ use eliot_store_api::{
     NOTIFY_PARAM_DELIVERY_JSON, NOTIFY_PARAM_MUTATION, NOTIFY_PARAM_NOTIFICATION_ID,
     NOTIFY_PARAM_RECORD_JSON, NOTIFY_PARAM_SOURCE_RECEIPT_JSON, NamedMutationOperation,
     NamedReadOperation, OperationKind, ParameterShape, StoreError, TransitionClass,
-    activated_mutation_operations, activated_read_operations, generated_operation_manifests,
+    activated_mutation_count, activated_read_count, generated_operation_manifests,
     named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
     named_read_operation_name, notification_mutation_request, notification_read_request,
     validate_notification_mutation_params,
@@ -32,7 +32,7 @@ const LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
 /// denominator from the two activated-operation tables keeps the completeness
 /// check exact as operations are activated.
 fn catalogue_entry_count() -> usize {
-    activated_read_operations().len() + activated_mutation_operations().len() + 1
+    activated_read_count() + activated_mutation_count() + 1
 }
 fn fence() -> StateFence {
     StateFence::new(

@@ -18,7 +18,7 @@ use eliot_store_api::{
     AUTOMATION_STATE_RETIRED, DecodedAutomationMutation, EffectClass, MAX_AUTOMATION_PAGE_RECORDS,
     NamedMutationOperation, NamedReadOperation, OperationKind, StoreError, TransitionClass,
     USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME, USER_AUTOMATION_SCOPE,
-    USER_AUTOMATION_STATE_SCHEMA_V1, activated_mutation_operations, activated_read_operations,
+    USER_AUTOMATION_STATE_SCHEMA_V1, activated_mutation_count, activated_read_count,
     automation_create_params, automation_edit_params, automation_mutation_request,
     automation_read_request, automation_run_now_params, automation_state_transition_params,
     decode_automation_mutation, generated_operation_manifests, is_configuration_state_wire,
@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 /// denominator from the two activated-operation tables keeps the completeness
 /// check exact as operations are activated.
 fn catalogue_entry_count() -> usize {
-    activated_read_operations().len() + activated_mutation_operations().len() + 1
+    activated_read_count() + activated_mutation_count() + 1
 }
 
 fn revision_json(automation_id: &str, revision: &str) -> String {

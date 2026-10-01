@@ -19,10 +19,10 @@ use eliot_store_api::{
     NamedReadRequest, OperationIdentity, OperationManifestDigest, OperationManifestSpec,
     OrderingScopeId, ReadConsistency, ScopeId, SecurityContext, StateFence, StoreError,
     StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext, StoreGenesisRequest,
-    StoreMutationDisposition, TransitionClass, activated_mutation_operations,
-    activated_read_operations, canonical_json_bytes, generated_operation_manifests,
-    genesis_manifest, genesis_transition, named_read_operation_name, operation_manifest_set_digest,
-    sha256_hex, supported_admission_contract_set_digest,
+    StoreMutationDisposition, TransitionClass, activated_mutation_count, activated_read_count,
+    canonical_json_bytes, generated_operation_manifests, genesis_manifest, genesis_transition,
+    named_read_operation_name, operation_manifest_set_digest, sha256_hex,
+    supported_admission_contract_set_digest,
 };
 use serde_json::{Value, json};
 
@@ -51,7 +51,7 @@ fn fence() -> StateFence {
 /// activated: a row added to either table without its manifest, or a manifest
 /// generated for an operation that is not activated, both fail here.
 fn catalogue_entry_count() -> usize {
-    activated_read_operations().len() + activated_mutation_operations().len() + 1
+    activated_read_count() + activated_mutation_count() + 1
 }
 
 fn read_request(

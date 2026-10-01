@@ -13,7 +13,7 @@ use eliot_store_api::{
     EffectClass, NamedMutationOperation, NamedReadOperation, OperationKind,
     REACTIVE_LEDGER_CONTRACT_V1, REACTIVE_LEDGER_MUTATION_NAME, REACTIVE_LEDGER_READ_NAME,
     REACTIVE_STATE_SCHEMA_V1, RESOURCE_SNAPSHOT_MUTATION_NAME, RESOURCE_SNAPSHOT_READ_NAME,
-    StoreError, TransitionClass, activated_mutation_operations, activated_read_operations,
+    StoreError, TransitionClass, activated_mutation_count, activated_read_count,
     decode_reactive_mutation, decode_resource_content, encode_resource_content,
     generated_operation_manifests, named_mutation_operation_by_name, named_mutation_operation_name,
     named_read_operation_by_name, named_read_operation_name, reactive_ledger_mutation_request,
@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 /// denominator from the two activated-operation tables keeps the completeness
 /// check exact as operations are activated.
 fn catalogue_entry_count() -> usize {
-    activated_read_operations().len() + activated_mutation_operations().len() + 1
+    activated_read_count() + activated_mutation_count() + 1
 }
 
 fn ledger_json(items: u32) -> String {

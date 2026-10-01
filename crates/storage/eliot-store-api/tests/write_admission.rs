@@ -315,17 +315,17 @@ fn valid_bounded_projection_and_request_round_trip() {
     );
     assert_eq!(
         from_fixture.admission.prepared_transition_digest,
-        "36e6381fc82f40efb8dc1af96111102d1a56d0c2aca604260981bc7b93097e11"
+        "a17746af507f452a29f6b8d8335c30f48a9e619f7b2e4587a5fa3dba0516c326"
     );
     assert_eq!(
         from_fixture.admission.reservation_token_digest,
-        "1b1afae597a9636f14264a2e7b8d8ef2658a849d73d1b462d332ce2f52408641"
+        "93b9fe15bd8e86f76c85bf85a058cdcb40f9b964be4cc24393a880d91d51b278"
     );
     // Issue #18: the frozen transition carries derived (never defaulted)
     // decision/plan digests plus the rendered source revisions.
     assert_eq!(
         from_fixture.transition.admission_digest,
-        "6b273471766dec31fee1ab1db3627bf928ad2e45ae4cd525960fba425235429e"
+        "7cb3f14c0b151b309388d27e51d5892863428e54d10aed766a50660bbea38023"
     );
     assert_eq!(
         from_fixture.transition.mutation_plan_digest,
