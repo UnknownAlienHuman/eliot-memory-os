@@ -13,6 +13,90 @@
 use super::*;
 use eliot_contracts::{EpochId, EpochLineageId};
 
+#[cfg(windows)]
+struct ActivationTestRoot {
+    path: std::path::PathBuf,
+    lease: Option<eliot_platform_windows::UserOwnedRootLease>,
+    original_identity: eliot_platform_windows::FileIdentity,
+}
+
+#[cfg(windows)]
+impl ActivationTestRoot {
+    fn create(name: &str) -> Self {
+        static ROOT_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "eliot-kernel-activation-v2-{name}-{}-{}-{}",
+            std::process::id(),
+            unix_ms(),
+            ROOT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::create_dir(&path).expect("create exclusive activation test root");
+        let lease = eliot_platform_windows::UserOwnedRootLease::open_existing(&path)
+            .expect("retain activation test root");
+        let original_identity = lease.identity();
+        lease
+            .verify_stable_identity()
+            .expect("activation test root handle identity");
+        lease
+            .verify_path_identity()
+            .expect("activation test root path identity");
+        Self {
+            path,
+            lease: Some(lease),
+            original_identity,
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn cleanup(mut self) {
+        self.retire()
+            .expect("retire only the activation test root created by this operation");
+    }
+
+    fn retire(&mut self) -> Result<(), String> {
+        let lease = self
+            .lease
+            .as_ref()
+            .ok_or_else(|| "activation test root lease already released".to_owned())?;
+        if lease.identity() != self.original_identity {
+            return Err("activation test root lease identity changed".to_owned());
+        }
+        lease
+            .verify_stable_identity()
+            .map_err(|error| format!("activation test root handle changed: {error}"))?;
+        lease
+            .verify_path_identity()
+            .map_err(|error| format!("activation test root path changed: {error}"))?;
+        drop(self.lease.take());
+
+        let final_lease = eliot_platform_windows::UserOwnedRootLease::open_existing(&self.path)
+            .map_err(|error| format!("activation test root could not be re-opened: {error}"))?;
+        if final_lease.identity() != self.original_identity {
+            return Err(
+                "activation test root path no longer names its original directory".to_owned(),
+            );
+        }
+        final_lease
+            .verify_path_identity()
+            .map_err(|error| format!("activation test root path changed before cleanup: {error}"))?;
+        drop(final_lease);
+        std::fs::remove_dir_all(&self.path)
+            .map_err(|error| format!("activation test root cleanup failed: {error}"))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ActivationTestRoot {
+    fn drop(&mut self) {
+        let _ = self.retire();
+    }
+}
+
 fn test_epoch(sequence: u64) -> EpochId {
     EpochId::new(
         EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000").expect("lineage"),
@@ -387,89 +471,215 @@ fn activation_host_envelope(
 }
 
 #[cfg(windows)]
+fn activation_bridge_request_frame(
+    receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    name: &str,
+) -> Frame {
+    let request_id = RequestId::new(format!("activation-request-{name}"))
+        .expect("bridge activation request id");
+    let cancellation_id = format!("activation-cancel-{name}");
+    let state_fence = receipt.state_fence.clone();
+    let request: AgentBridgeActivationRequest = serde_json::from_value(serde_json::json!({
+        "wire_id": eliot_protocol::AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_ID,
+        "wire_version": eliot_protocol::AGENT_BRIDGE_ACTIVATION_REQUEST_WIRE_VERSION,
+        "operation": AGENT_BRIDGE_ACTIVATION_OPERATION,
+        "demand_id": format!("activation-demand-{name}"),
+        "connection_id": receipt.connection_id,
+        "attach_kind": "MANAGED",
+        "pre_attach_blind_interval": null,
+        "request_identity": {
+            "request": {
+                "request": {
+                    "metadata": {
+                        "request_id": request_id.as_str(),
+                        "session_id": null,
+                        "task_id": null,
+                        "product_id": eliot_protocol::AGENT_BRIDGE_MODULE_ID,
+                        "source_id": eliot_protocol::AGENT_BRIDGE_MODULE_ID,
+                        "state_fence": state_fence.clone(),
+                        "clock": {
+                            "valid_time_ms": null,
+                            "known_time_ms": null,
+                            "transaction_sequence": null,
+                            "monotonic_ns": null
+                        }
+                    },
+                    "state_fence": state_fence.clone()
+                },
+                "idempotency_key": format!("activation-idempotency-{name}"),
+                "deadline_unix_ms": receipt.activation_deadline_unix_ms,
+                "cancellation_id": cancellation_id
+            }
+        },
+        "peer_admission_receipt_sha256": receipt.receipt_sha256,
+        "request_sha256": ""
+    }))
+    .expect("activation request bound to the admitted bridge receipt")
+    .with_computed_digest()
+    .expect("activation request digest");
+    request
+        .validate_admission(receipt)
+        .expect("activation request matches the admitted bridge receipt");
+
+    let frame = Frame {
+        protocol_version: eliot_protocol::ProtocolVersion::CURRENT,
+        encoding_profile: eliot_protocol::EncodingProfile::JsonV1,
+        connection_id: receipt.connection_id.clone(),
+        request_id: Some(
+            request
+                .request_identity
+                .request
+                .request
+                .metadata
+                .request_id
+                .clone(),
+        ),
+        kind: eliot_protocol::FrameKind::Request,
+        message_type: eliot_protocol::MessageType::Execute,
+        request_identity: Some(request.request_identity.clone()),
+        payload: eliot_protocol::ProtocolPayload::Json(
+            serde_json::to_value(request).expect("activation request payload"),
+        ),
+        trace_context: std::collections::BTreeMap::new(),
+    };
+    frame.validate().expect("valid bridge activation frame");
+    frame
+}
+
+#[cfg(windows)]
+fn activation_daemon_session(kernel: &KernelComposition, name: &str) -> Session {
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let expectation = eliot_platform_windows::current_process_named_pipe_expectation()
+        .expect("current daemon process identity");
+    let pipe_name = format!(
+        r"\\.\pipe\eliot\activation-v2-daemon-{}-{}-{}",
+        name,
+        std::process::id(),
+        unix_ms()
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("daemon session fixture runtime")
+        .block_on(async {
+            let mut server = eliot_ipc::NamedPipeServer::create(&pipe_name, &expectation)
+                .expect("daemon session fixture pipe");
+            let server_expectation = expectation.clone();
+            let server_task = tokio::spawn(async move {
+                server
+                    .wait_for_authenticated_client(
+                        std::time::Duration::from_secs(5),
+                        &server_expectation,
+                    )
+                    .await
+                    .expect("authenticated daemon session peer");
+                server
+            });
+            let _client = eliot_ipc::NamedPipeTransport::connect_authenticated(
+                &pipe_name,
+                std::time::Duration::from_secs(5),
+                &expectation,
+            )
+            .await
+            .expect("authenticated daemon session client");
+            let server = server_task.await.expect("daemon session server task");
+            Session::establish_with_server(
+                ACTIVE_DAEMON_CALLER,
+                server.peer_identity().clone(),
+                &test_client(&policy),
+                &policy,
+            )
+            .expect("authenticated daemon Session")
+            .session
+        })
+}
+
+#[cfg(windows)]
+fn activation_submit_identity(session: &Session) -> RequestIdentity {
+    static SUBMISSION_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let request_id = RequestId::new(format!(
+        "activation-submit-{}-{}",
+        unix_ms(),
+        SUBMISSION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+    .expect("activation submit request id");
+    let state_fence = session.module_generation.state_fence.clone();
+    serde_json::from_value(serde_json::json!({
+        "request": {
+            "request": {
+                "metadata": {
+                    "request_id": request_id.as_str(),
+                    "session_id": null,
+                    "task_id": null,
+                    "product_id": ACTIVE_DAEMON_CALLER,
+                    "source_id": ACTIVE_DAEMON_CALLER,
+                    "state_fence": state_fence.clone(),
+                    "clock": {
+                        "valid_time_ms": null,
+                        "known_time_ms": null,
+                        "transaction_sequence": null,
+                        "monotonic_ns": null
+                    }
+                },
+                "state_fence": state_fence
+            },
+            "idempotency_key": format!("activation-submit-{}", request_id.as_str()),
+            "deadline_unix_ms": unix_ms().saturating_add(60_000),
+            "cancellation_id": format!("activation-submit-cancel-{}", request_id.as_str())
+        }
+    }))
+    .expect("authenticated daemon request identity")
+}
+
+#[cfg(windows)]
+fn submit_activation_result_authenticated(
+    kernel: &KernelComposition,
+    session: &Session,
+    result: eliot_protocol::AgentActivationResolutionResult,
+) -> Result<eliot_protocol::AgentActivationResultAck, TransportError> {
+    let submit = eliot_protocol::AgentActivationResultSubmit::new(result)
+        .expect("valid activation result submit envelope");
+    let identity = activation_submit_identity(session);
+    kernel.submit_agent_activation_result_authenticated(submit, Some(session), Some(&identity))
+}
+
+#[cfg(windows)]
+fn retain_activation_result_for_test(
+    kernel: &KernelComposition,
+    ticket: &AgentActivationResolutionTicket,
+    result: &eliot_protocol::AgentActivationResolutionResult,
+) {
+    let mut pending = kernel
+        .agent_activation_pending
+        .lock()
+        .expect("activation pending lock");
+    kernel
+        .retain_activation_result_durably(
+            &mut pending,
+            ticket,
+            result,
+            AgentActivationResultPhase::AcceptedTerminal,
+        )
+        .expect("retain exact result for the claimed activation ticket");
+    pending.mark_lifecycle(&ticket.ticket_id, AgentActivationLifecycle::Accepted);
+    pending.fifo.retain(|candidate| candidate != &ticket.ticket_id);
+}
+
+#[cfg(windows)]
 fn activation_kernel_with_ticket(
     name: &str,
-    ticket: &AgentActivationResolutionTicket,
-    result: Option<eliot_protocol::AgentActivationResolutionResult>,
-) -> (std::path::PathBuf, KernelComposition) {
-    let root = std::env::temp_dir().join(format!(
-        "eliot-kernel-activation-v2-{name}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&root).expect("test work root");
-    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
-    let entry = activation_v2_entry(ticket);
-    // Keep the persisted claim live through durable result retention. The
-    // previous 1/2/3 timestamps expired long before retain_activation_result_durably
-    // supplied its real wall-clock time, so ORS correctly rejected the fixture.
-    let current_unix_ms = unix_ms();
-    let lifecycle_now = current_unix_ms.min(ticket.kernel_deadline_unix_ms.saturating_sub(2));
-    let claim_expiry = lifecycle_now
-        .saturating_add(60_000)
-        .min(ticket.kernel_deadline_unix_ms);
-    kernel
-        .generation_gateway
-        .ors
-        .stage_activation_ticket(
-            &eliot_ors::ActivationLifecycleRecord {
-                ticket_id: ticket.ticket_id.clone(),
-                ticket_sha256: ticket.ticket_sha256.clone(),
-                ticket_payload: serde_json::to_string(ticket).expect("ticket payload"),
-                activation_request_id: entry
-                    .request
-                    .request_identity
-                    .request
-                    .metadata
-                    .request_id
-                    .as_str()
-                    .to_owned(),
-                activation_request_sha256: entry.request.request_sha256.clone(),
-                connection_id: ticket.connection_id.clone(),
-                state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
-                kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
-                cancellation_id: entry.request.request_identity.cancellation_id.clone(),
-                state: eliot_ors::ActivationLifecycleState::Pending,
-                lifecycle_order: 0,
-                result_sha256: None,
-                claim_owner: None,
-                claim_expires_at_unix_ms: None,
-                successor_of: entry.successor_of.clone(),
-                successor_ticket_id: None,
-                terminal_reason: None,
-            },
-            lifecycle_now,
-        )
-        .expect("stage activation lifecycle");
-    if current_unix_ms < ticket.kernel_deadline_unix_ms {
-        kernel
-            .generation_gateway
-            .ors
-            .claim_activation_ticket(
-                &ticket.ticket_id,
-                "eliotd",
-                lifecycle_now.saturating_add(1),
-                claim_expiry,
-            )
-            .expect("claim activation lifecycle");
-    }
-    {
-        let mut pending = kernel
-            .agent_activation_pending
-            .lock()
-            .expect("pending lock");
-        pending.entries.insert(ticket.ticket_id.clone(), entry);
-        if let Some(result) = result {
-            kernel
-                .retain_activation_result_durably(
-                    &mut pending,
-                    ticket,
-                    &result,
-                    AgentActivationResultPhase::AcceptedTerminal,
-                )
-                .expect("retain activation result");
-        }
-    }
-    (root, kernel)
+) -> (
+    ActivationTestRoot,
+    KernelComposition,
+    AgentActivationResolutionTicket,
+    Session,
+) {
+    activation_kernel_with_live_bridge_ticket(name)
 }
 
 #[cfg(windows)]
@@ -479,20 +689,16 @@ fn activation_kernel_with_ticket(
 )]
 fn activation_kernel_with_live_bridge_ticket(
     name: &str,
-    deadline_after_admission_ms: u64,
 ) -> (
-    std::path::PathBuf,
+    ActivationTestRoot,
     KernelComposition,
     AgentActivationResolutionTicket,
+    Session,
 ) {
-    let root = std::env::temp_dir().join(format!(
-        "eliot-kernel-activation-v2-live-{name}-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&root).expect("test work root");
+    let root = ActivationTestRoot::create(&format!("live-{name}"));
     let kernel_artifact_sha256 = "a".repeat(64);
     let kernel = KernelComposition::new(
-        KernelConfig::new(&root).with_kernel_artifact_sha256(kernel_artifact_sha256.clone()),
+        KernelConfig::new(root.path()).with_kernel_artifact_sha256(kernel_artifact_sha256.clone()),
     )
     .expect("kernel composition");
     let kernel_policy = kernel
@@ -789,70 +995,70 @@ fn activation_kernel_with_live_bridge_ticket(
             (receipt.receipt_sha256, handshake.connection_id)
         });
 
-    // Start the ticket deadline only after the authenticated handshake so a
-    // short-expiry fixture still stages and claims a genuinely live ticket.
-    let deadline = unix_ms().saturating_add(deadline_after_admission_ms);
-    let mut ticket = activation_v2_ticket(name, deadline);
-    ticket.connection_id = connection_id;
-    ticket.peer_admission_receipt_sha256 = receipt_sha256;
-    let ticket = ticket
-        .with_computed_digest()
-        .expect("live bridge ticket digest");
-    let entry = activation_v2_entry(&ticket);
-    let lifecycle_now = unix_ms();
-    let claim_expiry = lifecycle_now
-        .saturating_add(60_000)
-        .min(ticket.kernel_deadline_unix_ms);
-    kernel
-        .generation_gateway
-        .ors
-        .stage_activation_ticket(
-            &eliot_ors::ActivationLifecycleRecord {
-                ticket_id: ticket.ticket_id.clone(),
-                ticket_sha256: ticket.ticket_sha256.clone(),
-                ticket_payload: serde_json::to_string(&ticket).expect("ticket payload"),
-                activation_request_id: entry
-                    .request
-                    .request_identity
-                    .request
-                    .metadata
-                    .request_id
-                    .as_str()
-                    .to_owned(),
-                activation_request_sha256: entry.request.request_sha256.clone(),
-                connection_id: ticket.connection_id.clone(),
-                state_fence: sha256_json(&ticket.state_fence).expect("fence digest"),
-                kernel_deadline_unix_ms: ticket.kernel_deadline_unix_ms,
-                cancellation_id: entry.request.request_identity.cancellation_id.clone(),
-                state: eliot_ors::ActivationLifecycleState::Pending,
-                lifecycle_order: 0,
-                result_sha256: None,
-                claim_owner: None,
-                claim_expires_at_unix_ms: None,
-                successor_of: entry.successor_of.clone(),
-                successor_ticket_id: None,
-                terminal_reason: None,
-            },
-            lifecycle_now,
-        )
-        .expect("stage live activation lifecycle");
-    kernel
-        .generation_gateway
-        .ors
-        .claim_activation_ticket(
-            &ticket.ticket_id,
-            "eliotd",
-            lifecycle_now.saturating_add(1),
-            claim_expiry,
-        )
-        .expect("claim live activation lifecycle");
-    kernel
-        .agent_activation_pending
-        .lock()
-        .expect("pending lock")
-        .entries
-        .insert(ticket.ticket_id.clone(), entry);
-    (root, kernel, ticket)
+    let receipt_frame = kernel
+        .agent_bridge_admission_receipt_frame(&connection_id)
+        .expect("Kernel-authored bridge admission receipt");
+    let receipt = eliot_ipc::decode_agent_bridge_admission_receipt_frame(
+        &receipt_frame,
+        &connection_id,
+    )
+    .expect("decode exact bridge admission receipt");
+    assert_eq!(receipt.receipt_sha256, receipt_sha256);
+    let request_frame = activation_bridge_request_frame(&receipt, name);
+    let request_identity = request_frame
+        .request_identity
+        .clone()
+        .expect("authenticated bridge request identity");
+
+    // Poll the real bridge waiter through enqueue, then cancel only its
+    // waiting future. The ticket and admitted request remain Kernel/ORS-owned
+    // so this fixture can exercise claim, durable result, and host consumers.
+    let ticket = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("activation request fixture runtime")
+        .block_on(async {
+            let response = kernel.await_agent_bridge_activation_response(
+                &connection_id,
+                &request_frame,
+            );
+            tokio::pin!(response);
+            loop {
+                if let Some(ticket) = kernel
+                    .agent_activation_pending
+                    .lock()
+                    .expect("pending activation lock")
+                    .entries
+                    .values()
+                    .find(|entry| entry.request.request_identity == request_identity)
+                    .map(|entry| entry.ticket.clone())
+                {
+                    break ticket;
+                }
+                tokio::select! {
+                    response = &mut response => panic!(
+                        "activation request must stay queued until a result is supplied: {response:?}"
+                    ),
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+        });
+    let eliot_protocol::ProtocolPayload::Json(request_payload) = &request_frame.payload else {
+        panic!("activation request frame must carry JSON");
+    };
+    let request = serde_json::from_value::<AgentBridgeActivationRequest>(request_payload.clone())
+        .expect("typed bridge request");
+    ticket
+        .validate_against(&request, &receipt)
+        .expect("producer ticket joins the exact request and admission receipt");
+
+    let claimed = kernel
+        .claim_agent_activation_ticket("activation-fixture/readiness", "revision-1")
+        .expect("claim through Kernel lifecycle")
+        .expect("one admitted activation ticket");
+    assert_eq!(claimed, ticket, "the normal claim returns the producer ticket");
+    let session = activation_daemon_session(&kernel, name);
+    (root, kernel, ticket, session)
 }
 
 #[cfg(windows)]
@@ -924,20 +1130,16 @@ fn retain_test_activation_result(
 #[cfg(windows)]
 #[test]
 fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
-    let root = std::env::temp_dir().join(format!(
-        "eliot-kernel-activation-rehydrate-{}-{}",
-        std::process::id(),
-        unix_ms()
-    ));
-    std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
+    let root = ActivationTestRoot::create("rehydrate");
+    std::fs::create_dir_all(root.path().join(".eliot")).expect("test ORS directory");
     let ticket = activation_v2_ticket("activation-ticket-rehydrate", activation_test_deadline());
     let result = activation_v2_resolved(&ticket, 1_000);
-    let ors_path = root.join(".eliot").join("kernel-ors.redb");
+    let ors_path = root.path().join(".eliot").join("kernel-ors.redb");
     let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
     retain_test_activation_result(&ors, &ticket, &result);
     drop(ors);
 
-    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("rehydrate kernel");
+    let kernel = KernelComposition::new(KernelConfig::new(root.path())).expect("rehydrate kernel");
     let pending = kernel
         .agent_activation_pending
         .lock()
@@ -993,39 +1195,35 @@ fn activation_result_ledger_rehydrates_without_bridge_state_or_session() {
     );
 
     drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
+    root.cleanup();
 }
 
 #[cfg(windows)]
 #[test]
 fn activation_result_ledger_typed_corruption_fences_startup() {
-    let root = std::env::temp_dir().join(format!(
-        "eliot-kernel-activation-corrupt-{}-{}",
-        std::process::id(),
-        unix_ms()
-    ));
-    std::fs::create_dir_all(root.join(".eliot")).expect("test ORS directory");
+    let root = ActivationTestRoot::create("corrupt");
+    std::fs::create_dir_all(root.path().join(".eliot")).expect("test ORS directory");
     let ticket = activation_v2_ticket("activation-ticket-corrupt", activation_test_deadline());
     let mut result = activation_v2_resolved(&ticket, 1_000);
     result.ticket_sha256 = "e".repeat(64);
-    let ors_path = root.join(".eliot").join("kernel-ors.redb");
+    let ors_path = root.path().join(".eliot").join("kernel-ors.redb");
     let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open ORS");
     retain_test_activation_result(&ors, &ticket, &result);
     drop(ors);
 
-    let Err(error) = KernelComposition::new(KernelConfig::new(&root)) else {
+    let Err(error) = KernelComposition::new(KernelConfig::new(root.path())) else {
         panic!("typed-corrupt retention must fence startup");
     };
     assert!(matches!(error, KernelBuildError::Ors(_)));
-    let _ = std::fs::remove_dir_all(root);
+    root.cleanup();
 }
 
 #[cfg(windows)]
 #[test]
 fn activation_host_request_resolves_canonical_v2_envelope_result() {
-    let ticket = activation_v2_ticket("activation-ticket-v2", activation_test_deadline());
-    let result = activation_v2_resolved(&ticket, 1_000);
-    let (root, kernel) = activation_kernel_with_ticket("canonical", &ticket, Some(result.clone()));
+    let (root, kernel, ticket, _session) = activation_kernel_with_ticket("canonical");
+    let result = activation_v2_resolved(&ticket, unix_ms());
+    retain_activation_result_for_test(&kernel, &ticket, &result);
     let envelope = activation_host_envelope(&ticket, &result.result_sha256, &ticket.connection_id);
     let resolved = kernel
         .host_request_activation_resolution(&envelope)
@@ -1033,15 +1231,14 @@ fn activation_host_request_resolves_canonical_v2_envelope_result() {
     assert_eq!(resolved.result_sha256, result.result_sha256);
     assert!(resolved.resolved_binding().is_some());
     drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
+    root.cleanup();
 }
 
 #[cfg(windows)]
 #[test]
 fn activation_host_request_without_any_result_is_unknown() {
-    let ticket = activation_v2_ticket("activation-ticket-unknown", activation_test_deadline());
-    let probe = activation_v2_resolved(&ticket, 1_000);
-    let (root, kernel) = activation_kernel_with_ticket("unknown", &ticket, None);
+    let (root, kernel, ticket, _session) = activation_kernel_with_ticket("unknown");
+    let probe = activation_v2_resolved(&ticket, unix_ms());
     let envelope = activation_host_envelope(&ticket, &probe.result_sha256, &ticket.connection_id);
     let error = kernel
         .host_request_activation_resolution(&envelope)
@@ -1051,15 +1248,16 @@ fn activation_host_request_without_any_result_is_unknown() {
         "unexpected error: {error:?}"
     );
     drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
+    root.cleanup();
 }
 
 #[cfg(windows)]
 #[test]
 fn activation_host_request_non_resolved_v2_fails_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-negative", activation_test_deadline());
-    let failed = activation_v2_failed(&ticket, 1_000);
-    let (root, kernel) = activation_kernel_with_ticket("negative", &ticket, Some(failed.clone()));
+    let (root, kernel, ticket, session) = activation_kernel_with_ticket("negative");
+    let failed = activation_v2_failed(&ticket, unix_ms());
+    submit_activation_result_authenticated(&kernel, &session, failed.clone())
+        .expect("authenticated daemon submits the exact terminal negative");
     let envelope = activation_host_envelope(&ticket, &failed.result_sha256, &ticket.connection_id);
     let error = kernel
         .host_request_activation_resolution(&envelope)
@@ -1069,15 +1267,15 @@ fn activation_host_request_non_resolved_v2_fails_closed() {
         "unexpected error: {error:?}"
     );
     drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
+    root.cleanup();
 }
 
 #[cfg(windows)]
 #[test]
 fn activation_host_request_wrong_connection_fails_closed() {
-    let ticket = activation_v2_ticket("activation-ticket-conn", activation_test_deadline());
-    let result = activation_v2_resolved(&ticket, 1_000);
-    let (root, kernel) = activation_kernel_with_ticket("connection", &ticket, Some(result.clone()));
+    let (root, kernel, ticket, _session) = activation_kernel_with_ticket("connection");
+    let result = activation_v2_resolved(&ticket, unix_ms());
+    retain_activation_result_for_test(&kernel, &ticket, &result);
     let envelope = activation_host_envelope(&ticket, &result.result_sha256, "other-connection");
     let error = kernel
         .host_request_activation_resolution(&envelope)
@@ -1087,7 +1285,7 @@ fn activation_host_request_wrong_connection_fails_closed() {
         "unexpected error: {error:?}"
     );
     drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
+    root.cleanup();
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,13 +1300,9 @@ fn activation_host_request_wrong_connection_fails_closed() {
 #[cfg(windows)]
 #[test]
 fn activation_host_request_projected_retry_answers_from_retained_result() {
-    let ticket = activation_v2_ticket(
-        "activation-ticket-projected-retry-203",
-        activation_test_deadline(),
-    );
-    let result = activation_v2_resolved(&ticket, 1_000);
-    let (root, kernel) =
-        activation_kernel_with_ticket("projected-retry-203", &ticket, Some(result.clone()));
+    let (root, kernel, ticket, _session) = activation_kernel_with_ticket("projected-retry-203");
+    let result = activation_v2_resolved(&ticket, unix_ms());
+    retain_activation_result_for_test(&kernel, &ticket, &result);
     // Project the bridge leg: the pending entry is consumed but the exact
     // v2 record stays retained for replay/reconcile.
     {
@@ -1142,19 +1336,15 @@ fn activation_host_request_projected_retry_answers_from_retained_result() {
         .expect("projected-then-retried ticket must answer from the known result");
     assert_eq!(resolved.result_sha256, result.result_sha256);
     drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
+    root.cleanup();
 }
 
 #[cfg(windows)]
 #[test]
 fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
-    let ticket = activation_v2_ticket(
-        "activation-ticket-projected-conn-203",
-        activation_test_deadline(),
-    );
-    let result = activation_v2_resolved(&ticket, 1_000);
-    let (root, kernel) =
-        activation_kernel_with_ticket("projected-conn-203", &ticket, Some(result.clone()));
+    let (root, kernel, ticket, _session) = activation_kernel_with_ticket("projected-conn-203");
+    let result = activation_v2_resolved(&ticket, unix_ms());
+    retain_activation_result_for_test(&kernel, &ticket, &result);
     {
         let mut pending = kernel
             .agent_activation_pending
@@ -1171,7 +1361,7 @@ fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
         "unexpected error: {error:?}"
     );
     drop(kernel);
-    let _ = std::fs::remove_dir_all(root);
+    root.cleanup();
 }
 
 #[cfg(windows)]
@@ -1181,9 +1371,9 @@ fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
     reason = "the restart test keeps direct-seed and live-bridge routes side by side"
 )]
 fn activation_terminal_negative_replay_survives_restart_without_pending_entry() {
-    let (no_result_root, no_result_kernel, no_result_ticket) =
-        activation_kernel_with_live_bridge_ticket("activation-ticket-no-result-deadline", 5_000);
-    let no_result = activation_v2_failed(&no_result_ticket, 1_000);
+    let (no_result_root, no_result_kernel, no_result_ticket, no_result_session) =
+        activation_kernel_with_live_bridge_ticket("activation-ticket-no-result-deadline");
+    let no_result = activation_v2_failed(&no_result_ticket, unix_ms());
     let deadline_wait_ms = no_result_ticket
         .kernel_deadline_unix_ms
         .saturating_sub(unix_ms())
@@ -1194,44 +1384,43 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
         "the authenticated fixture must expire before submitting its terminal result"
     );
 
-    let timeout = no_result_kernel
-        .submit_agent_activation_result(
-            eliot_protocol::AgentActivationResultSubmit::new(no_result.clone())
-                .expect("no-result submit"),
-        )
-        .expect_err("a result-less expired ticket must return Timeout");
+    let timeout = submit_activation_result_authenticated(
+        &no_result_kernel,
+        &no_result_session,
+        no_result.clone(),
+    )
+    .expect_err("a result-less expired ticket must return Timeout");
     assert!(
         matches!(timeout, TransportError::Timeout),
         "unexpected no-result deadline error: {timeout:?}"
     );
     drop(no_result_kernel);
-    let restarted_no_result = KernelComposition::new(KernelConfig::new(&no_result_root))
+    let restarted_no_result = KernelComposition::new(KernelConfig::new(no_result_root.path()))
         .expect("restart without a retained result");
-    let unknown_after_restart = restarted_no_result
-        .submit_agent_activation_result(
-            eliot_protocol::AgentActivationResultSubmit::new(no_result.clone())
-                .expect("no-result submit"),
-        )
-        .expect_err("a result-less ticket is not restored as a pending entry");
+    let restarted_no_result_session =
+        activation_daemon_session(&restarted_no_result, "no-result-restart");
+    let unknown_after_restart = submit_activation_result_authenticated(
+        &restarted_no_result,
+        &restarted_no_result_session,
+        no_result.clone(),
+    )
+    .expect_err("a result-less ticket is not restored as a pending entry");
     assert!(
         matches!(unknown_after_restart, TransportError::UnknownRequest),
         "unexpected result-less restart error: {unknown_after_restart:?}"
     );
     drop(restarted_no_result);
-    let _ = std::fs::remove_dir_all(no_result_root);
+    no_result_root.cleanup();
 
-    let (commit_root, commit_kernel, commit_ticket) =
-        activation_kernel_with_live_bridge_ticket(
-            "activation-ticket-negative-commit-restart",
-            300_000,
-        );
-    let commit_failed = activation_v2_failed(&commit_ticket, 1_000);
-    let commit_ack = commit_kernel
-        .submit_agent_activation_result(
-            eliot_protocol::AgentActivationResultSubmit::new(commit_failed.clone())
-                .expect("commit-route result submit"),
-        )
-        .expect("live bridge terminal negative submit");
+    let (commit_root, commit_kernel, commit_ticket, commit_session) =
+        activation_kernel_with_live_bridge_ticket("activation-ticket-negative-commit-restart");
+    let commit_failed = activation_v2_failed(&commit_ticket, unix_ms());
+    let commit_ack = submit_activation_result_authenticated(
+        &commit_kernel,
+        &commit_session,
+        commit_failed.clone(),
+    )
+    .expect("authenticated live bridge terminal negative submit");
     assert_eq!(
         commit_ack.outcome,
         eliot_protocol::AgentActivationResultAckOutcome::Accepted
@@ -1239,8 +1428,9 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     assert_eq!(commit_ack.result, Some(commit_failed.clone()));
     drop(commit_kernel);
 
-    let restarted_commit = KernelComposition::new(KernelConfig::new(&commit_root))
+    let restarted_commit = KernelComposition::new(KernelConfig::new(commit_root.path()))
         .expect("restart after a live bridge terminal negative submit");
+    let restarted_commit_session = activation_daemon_session(&restarted_commit, "commit-restart");
     assert!(
         restarted_commit
             .agent_activation_pending
@@ -1250,12 +1440,12 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
             .is_empty(),
         "commit-route restart must not restore a live pending entry"
     );
-    let commit_replay = restarted_commit
-        .submit_agent_activation_result(
-            eliot_protocol::AgentActivationResultSubmit::new(commit_failed.clone())
-                .expect("exact commit-route replay submit"),
-        )
-        .expect("exact commit-route terminal negative replay after restart");
+    let commit_replay = submit_activation_result_authenticated(
+        &restarted_commit,
+        &restarted_commit_session,
+        commit_failed.clone(),
+    )
+    .expect("exact authenticated terminal negative replay after restart");
     assert_eq!(
         commit_replay.outcome,
         eliot_protocol::AgentActivationResultAckOutcome::Accepted
@@ -1270,35 +1460,32 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
         },
     )
     .expect("changed commit-route terminal negative");
-    let commit_conflict = restarted_commit
-        .submit_agent_activation_result(
-            eliot_protocol::AgentActivationResultSubmit::new(commit_changed)
-                .expect("changed commit-route replay submit"),
-        )
-        .expect_err("changed commit-route replay after restart must conflict");
+    let commit_conflict = submit_activation_result_authenticated(
+        &restarted_commit,
+        &restarted_commit_session,
+        commit_changed,
+    )
+    .expect_err("changed commit-route replay after restart must conflict");
     assert!(
         matches!(commit_conflict, TransportError::IdentityConflict),
         "unexpected commit-route changed replay error: {commit_conflict:?}"
     );
     drop(restarted_commit);
-    let _ = std::fs::remove_dir_all(commit_root);
+    commit_root.cleanup();
 
     let ticket = activation_v2_ticket(
         "activation-ticket-negative-restart",
         activation_test_deadline(),
     );
     let failed = activation_v2_failed(&ticket, 1_000);
-    let retained_root = std::env::temp_dir().join(format!(
-        "eliot-kernel-activation-negative-restart-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(retained_root.join(".eliot")).expect("retained test root");
-    let ors_path = retained_root.join(".eliot").join("kernel-ors.redb");
+    let retained_root = ActivationTestRoot::create("negative-restart");
+    std::fs::create_dir_all(retained_root.path().join(".eliot")).expect("retained test root");
+    let ors_path = retained_root.path().join(".eliot").join("kernel-ors.redb");
     let ors = eliot_ors::RedbRecoveryStore::open(&ors_path).expect("open retained ORS");
     retain_test_activation_result(&ors, &ticket, &failed);
     drop(ors);
 
-    let kernel = KernelComposition::new(KernelConfig::new(&retained_root))
+    let kernel = KernelComposition::new(KernelConfig::new(retained_root.path()))
         .expect("rehydrate terminal negative");
     assert!(
         kernel
@@ -1340,5 +1527,5 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     );
 
     drop(kernel);
-    let _ = std::fs::remove_dir_all(retained_root);
+    retained_root.cleanup();
 }
