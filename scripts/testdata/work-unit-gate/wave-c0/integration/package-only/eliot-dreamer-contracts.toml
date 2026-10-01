@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-578"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 578}
+unit = {value = "T8-A0"}
+mode = "rust-package"
+source_roots = [{value = "crates/smart/eliot-dreamer-contracts/src/lib.rs"}]
+test_roots = [{value = "crates/smart/eliot-dreamer-contracts/src"}, {value = "crates/smart/eliot-dreamer-contracts/tests"}]
+matrix_cases = 78
+proof_ceiling = {value = "package-local"}
+revision = 1
+body_sha256 = "c634d16fc42e41c6372e522f82cf758a84a21b41ef7600d051ff04e6d93681cd"
+matrix_sha256 = "2b646457c145a606e270c121cacb23c46635ff3e722eeefa374a007ea696855b"
+require_workspace_member = false
+package = {name = "eliot-dreamer-contracts"}
+module = {value = "smart.dreamer.contracts"}
+requirements = {source_floor = 1, public_floor = 1, test_floor = 78, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 600000, idle_ms = 120000, output_bytes = 67108864, line_bytes = 1048576, discovery_tests = 78, child_processes = 64}

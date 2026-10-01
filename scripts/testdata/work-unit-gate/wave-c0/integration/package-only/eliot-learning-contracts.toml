@@ -1,0 +1,17 @@
+schema_version = "eliot-work-unit-descriptor-v2"
+identity = {value = "work-unit-590"}
+issue = {repository = {owner = "UnknownAlienHuman", name = "eliot-memory-os"}, number = 590}
+unit = {value = "T8-A0"}
+mode = "rust-package"
+source_roots = [{value = "crates/smart/eliot-learning-contracts/src/lib.rs"}]
+test_roots = [{value = "crates/smart/eliot-learning-contracts/src"}, {value = "crates/smart/eliot-learning-contracts/tests"}]
+matrix_cases = 6
+proof_ceiling = {value = "package-local"}
+revision = 1
+body_sha256 = "d75420312d6f47430f2e94807046e7c01e626df7fdb905d516f41c2743e3a656"
+matrix_sha256 = "42e0a57d10700acca07b25beb883ee5b74ea81b8a229a5de0cd4026a89bfa48e"
+require_workspace_member = false
+package = {name = "eliot-learning-contracts"}
+module = {value = "smart.learning.contracts"}
+requirements = {source_floor = 1, public_floor = 1, test_floor = 6, required_guards = [{value = "bounded"}]}
+bounds = {wall_ms = 600000, idle_ms = 120000, output_bytes = 67108864, line_bytes = 1048576, discovery_tests = 6, child_processes = 64}
