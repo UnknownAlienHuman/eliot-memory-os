@@ -185,7 +185,7 @@ pub use integration_discovery::{
     IntegrationDiscoveryCatalogue, IntegrationDiscoveryCatalogueEntry, MAX_CATALOGUE_FAMILIES,
     ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
     MANAGED_CHANGE_APPROVALS_SCHEMA, MANAGED_CHANGE_APPROVALS_SETTING_KEY,
-    ManagedChangeApproval,
+    ManagedChangeApproval, MAX_MANAGED_CHANGE_APPROVALS,
     admit_installation_survey_and_compile_change, integration_seed_family_ids,
     admit_installation_survey_and_compile_change_on_host, load_accepted_catalogue,
     resolve_bounded_probe, survey_accepted_installation, survey_accepted_installation_on_host,

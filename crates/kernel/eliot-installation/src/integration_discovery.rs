@@ -531,6 +531,9 @@ pub const MANAGED_CHANGE_APPROVALS_SETTING_KEY: &str = "installation.managed_cha
 /// Strict schema marker for the signed managed-change approval set.
 pub const MANAGED_CHANGE_APPROVALS_SCHEMA: &str = "eliot.managed-change-approvals.v1";
 
+/// Maximum independently approved managed changes retained with one publication.
+pub const MAX_MANAGED_CHANGE_APPROVALS: usize = 256;
+
 /// The only value prefix an inline configuration setting may carry. The
 /// configuration owner already uses `literal:` for deterministic values.
 pub const LITERAL_VALUE_PREFIX: &str = "literal:";
@@ -892,6 +895,14 @@ impl ManagedChangeApproval {
             return Err(InstallationError::InvalidField {
                 field: "managed_change_approval".to_owned(),
                 reason: "catalogue revision and approval expiry must be positive".to_owned(),
+            });
+        }
+        if self.approvals.len() > MAX_MANAGED_CHANGE_APPROVALS {
+            return Err(InstallationError::InvalidField {
+                field: "managed_change_approvals.approvals".to_owned(),
+                reason: format!(
+                    "must not exceed {MAX_MANAGED_CHANGE_APPROVALS} owner approvals"
+                ),
             });
         }
         let expected_identity = match self.request.action {

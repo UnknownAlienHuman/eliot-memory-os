@@ -338,26 +338,31 @@ impl SurveyObservationSource for WindowsSurveyObservationSource {
             .known_locations
             .iter()
             .map(|input| {
-                let Some(name) = executable_basename(input) else {
+                let names = executable_basenames(input);
+                if names.is_empty() {
                     return Ok(observation(input.clone(), SurveyStageOutcome::Withheld, None, None));
-                };
+                }
                 let mut matches = Vec::new();
                 let mut denied = false;
                 let mut unreadable = false;
                 for root in &paths {
-                    let candidate = root.join(name);
-                    match std::fs::symlink_metadata(&candidate) {
-                        Ok(metadata)
-                            if metadata.is_file() && !metadata.file_type().is_symlink() =>
-                        {
-                            matches.push(candidate);
+                    for name in &names {
+                        let candidate = root.join(name);
+                        match std::fs::symlink_metadata(&candidate) {
+                            Ok(metadata)
+                                if metadata.is_file() && !metadata.file_type().is_symlink() =>
+                            {
+                                matches.push(candidate);
+                            }
+                            Ok(_) => {}
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+                            {
+                                denied = true;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(_) => unreadable = true,
                         }
-                        Ok(_) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                            denied = true;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(_) => unreadable = true,
                     }
                 }
                 let outcome = match matches.len() {
@@ -382,19 +387,22 @@ impl SurveyObservationSource for WindowsSurveyObservationSource {
         let mut unresolved = Vec::new();
         for location in &entry.known_locations {
             if let Some(path) = absolute_location(location) {
-                if executable_basename(location).is_some() {
+                if !executable_basenames(location).is_empty() {
                     candidates.insert(path.to_path_buf());
                 } else {
                     unresolved.push(location.clone());
                 }
                 continue;
             }
-            if let Some(name) = executable_basename(location) {
+            let names = executable_basenames(location);
+            if !names.is_empty() {
                 unresolved.push(location.clone());
                 for root in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
-                    let candidate = root.join(name);
-                    if std::fs::symlink_metadata(&candidate).is_ok() {
-                        candidates.insert(candidate);
+                    for name in &names {
+                        let candidate = root.join(name);
+                        if std::fs::symlink_metadata(&candidate).is_ok() {
+                            candidates.insert(candidate);
+                        }
                     }
                 }
             } else {
@@ -451,11 +459,26 @@ fn absolute_location(input: &PlatformHandle) -> Option<&Path> {
     path.is_absolute().then_some(path)
 }
 
-fn executable_basename(input: &PlatformHandle) -> Option<&std::ffi::OsStr> {
-    let name = Path::new(input.as_str()).file_name()?;
-    let extension = Path::new(name).extension()?.to_string_lossy();
-    (extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com"))
-        .then_some(name)
+fn executable_basenames(input: &PlatformHandle) -> Vec<std::ffi::OsString> {
+    let Some(name) = Path::new(input.as_str()).file_name() else {
+        return Vec::new();
+    };
+    let extension = Path::new(name)
+        .extension()
+        .map(|value| value.to_string_lossy());
+    match extension.as_deref() {
+        Some(extension)
+            if extension.eq_ignore_ascii_case("exe")
+                || extension.eq_ignore_ascii_case("com") =>
+        {
+            vec![name.to_owned()]
+        }
+        Some(_) => Vec::new(),
+        None => vec![
+            std::ffi::OsString::from(format!("{}.exe", name.to_string_lossy())),
+            std::ffi::OsString::from(format!("{}.com", name.to_string_lossy())),
+        ],
+    }
 }
 
 fn observation(
