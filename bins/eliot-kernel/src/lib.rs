@@ -336,6 +336,7 @@ mod host_request_route;
 mod hot_path_runtime;
 pub mod integration_candidate;
 pub mod integration_lease;
+pub mod integration_owner;
 pub mod kernel_unavailability;
 mod native_worker_lifecycle_route;
 mod native_worker_reconcile_route;
