@@ -479,6 +479,7 @@ fn activation_kernel_with_ticket(
 )]
 fn activation_kernel_with_live_bridge_ticket(
     name: &str,
+    deadline_after_admission_ms: u64,
 ) -> (
     std::path::PathBuf,
     KernelComposition,
@@ -720,7 +721,6 @@ fn activation_kernel_with_live_bridge_ticket(
         declaration: declaration.clone(),
     });
 
-    let deadline = unix_ms().saturating_add(300_000);
     let pipe_name = format!(r"\\.\pipe\eliot\activation-v2-live-{}", std::process::id());
     let (receipt_sha256, connection_id) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -789,6 +789,9 @@ fn activation_kernel_with_live_bridge_ticket(
             (receipt.receipt_sha256, handshake.connection_id)
         });
 
+    // Start the ticket deadline only after the authenticated handshake so a
+    // short-expiry fixture still stages and claims a genuinely live ticket.
+    let deadline = unix_ms().saturating_add(deadline_after_admission_ms);
     let mut ticket = activation_v2_ticket(name, deadline);
     ticket.connection_id = connection_id;
     ticket.peer_admission_receipt_sha256 = receipt_sha256;
@@ -1178,10 +1181,18 @@ fn activation_host_request_projected_retry_wrong_connection_fails_closed() {
     reason = "the restart test keeps direct-seed and live-bridge routes side by side"
 )]
 fn activation_terminal_negative_replay_survives_restart_without_pending_entry() {
-    let no_result_ticket = activation_v2_ticket("activation-ticket-no-result-deadline", 2_000);
+    let (no_result_root, no_result_kernel, no_result_ticket) =
+        activation_kernel_with_live_bridge_ticket("activation-ticket-no-result-deadline", 5_000);
     let no_result = activation_v2_failed(&no_result_ticket, 1_000);
-    let (no_result_root, no_result_kernel) =
-        activation_kernel_with_ticket("no-result-deadline", &no_result_ticket, None);
+    let deadline_wait_ms = no_result_ticket
+        .kernel_deadline_unix_ms
+        .saturating_sub(unix_ms())
+        .saturating_add(1);
+    std::thread::sleep(std::time::Duration::from_millis(deadline_wait_ms));
+    assert!(
+        activation_deadline_expired(unix_ms(), no_result_ticket.kernel_deadline_unix_ms),
+        "the authenticated fixture must expire before submitting its terminal result"
+    );
 
     let timeout = no_result_kernel
         .submit_agent_activation_result(
@@ -1210,7 +1221,10 @@ fn activation_terminal_negative_replay_survives_restart_without_pending_entry() 
     let _ = std::fs::remove_dir_all(no_result_root);
 
     let (commit_root, commit_kernel, commit_ticket) =
-        activation_kernel_with_live_bridge_ticket("activation-ticket-negative-commit-restart");
+        activation_kernel_with_live_bridge_ticket(
+            "activation-ticket-negative-commit-restart",
+            300_000,
+        );
     let commit_failed = activation_v2_failed(&commit_ticket, 1_000);
     let commit_ack = commit_kernel
         .submit_agent_activation_result(
