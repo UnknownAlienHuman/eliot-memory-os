@@ -42,6 +42,8 @@ pub const CONTRACT_NAME: &str = "eliot.storage.blob";
 /// full [`ObjectResidencyKey`]. Wire bytes from `s-04-v1` (hash-only locators)
 /// are rejected, never silently upgraded.
 pub const CONTRACT_VERSION: &str = "s-04-v2";
+/// Provider-neutral upper bound accepted for one plaintext Blob object.
+pub const BLOB_MAX_PLAINTEXT_BYTES: u64 = 32 * 1024 * 1024;
 
 pub mod backup_io;
 pub use backup_io::{
@@ -1181,6 +1183,240 @@ impl<'de> Deserialize<'de> for BlobStageRequest {
         value.validate().map_err(de::Error::custom)?;
         Ok(value)
     }
+}
+
+/// Provider-neutral process source binding retained with a staged source.
+///
+/// The process contract remains outside Blob API: the validated process
+/// adapter supplies its exact serialized binding and policy snapshot. Their
+/// digests make that owner-issued material addressable after restart without
+/// allowing a readback caller to provide Blob lease or receipt context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamSourceBinding {
+    pub process_binding_json: String,
+    pub process_binding_sha256: String,
+    pub stream_kind: String,
+    pub policy_json: String,
+    pub policy_sha256: String,
+}
+
+impl BlobProcessStreamSourceBinding {
+    pub fn validate(&self) -> Result<(), BlobError> {
+        valid_text(&self.process_binding_json, "process_binding_json")?;
+        valid_text(&self.policy_json, "policy_json")?;
+        canonical_sha256(&self.process_binding_sha256, "process_binding_sha256")?;
+        canonical_sha256(&self.policy_sha256, "policy_sha256")?;
+        if self.process_binding_json.len() > 16 * 1024
+            || self.policy_json.len() > 4 * 1024
+            || hex_sha256(self.process_binding_json.as_bytes()) != self.process_binding_sha256
+            || hex_sha256(self.policy_json.as_bytes()) != self.policy_sha256
+            || !matches!(self.stream_kind.as_str(), "STDOUT" | "STDERR")
+            || !serde_json::from_str::<serde_json::Value>(&self.process_binding_json)
+                .is_ok_and(|value| value.is_object())
+            || !serde_json::from_str::<serde_json::Value>(&self.policy_json)
+                .is_ok_and(|value| value.is_object())
+        {
+            return Err(BlobError::InvalidContract(
+                "process source binding is not an exact bounded JSON identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Semantic readback lookup for a process source previously persisted by the
+/// Blob owner. It deliberately contains no Blob lease, receipt context, or
+/// storage path; the owner loads those from its retained stage intent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamReadbackRequest {
+    pub process_source_binding: BlobProcessStreamSourceBinding,
+    pub expected_content_hash: BlobHash,
+    pub expected_plaintext_sha256: String,
+    pub expected_plaintext_length: u64,
+    pub ready_receipt_id: String,
+    pub max_bytes: u64,
+}
+
+impl BlobProcessStreamReadbackRequest {
+    pub fn validate(&self) -> Result<(), BlobError> {
+        self.process_source_binding.validate()?;
+        self.expected_content_hash.validate()?;
+        canonical_sha256(&self.expected_plaintext_sha256, "expected_plaintext_sha256")?;
+        valid_text(&self.ready_receipt_id, "ready_receipt_id")?;
+        if self.expected_plaintext_length > BLOB_MAX_PLAINTEXT_BYTES
+            || self.max_bytes < self.expected_plaintext_length
+            || self.max_bytes > BLOB_MAX_PLAINTEXT_BYTES
+        {
+            return Err(BlobError::InvalidField {
+                field: "max_bytes",
+                reason: "must cover the exact source length and remain within the Blob ceiling",
+            });
+        }
+        Ok(())
+    }
+
+    /// Stable lookup key shared with the stage intent; it contains no
+    /// caller-chosen operation or sink identifier.
+    pub fn process_source_intent_key(&self) -> Result<String, BlobError> {
+        self.validate()?;
+        process_source_intent_key(
+            &self.process_source_binding,
+            &self.expected_content_hash,
+            &self.expected_plaintext_sha256,
+            self.expected_plaintext_length,
+        )
+    }
+}
+
+fn process_source_intent_key(
+    binding: &BlobProcessStreamSourceBinding,
+    content_hash: &BlobHash,
+    plaintext_sha256: &str,
+    plaintext_length: u64,
+) -> Result<String, BlobError> {
+    let material = serde_json::to_vec(&(binding, content_hash, plaintext_sha256, plaintext_length))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+    Ok(hex_sha256(&material))
+}
+
+/// Exact owner-side recovery request for a stage whose response may have
+/// been lost. It carries the original stage identity and byte commitment,
+/// without requiring the caller to retain or resubmit plaintext.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BlobStageRecoveryRequest {
+    pub session_id: String,
+    pub terminal_id: String,
+    pub open_request_sha256: String,
+    pub terminal_command_sha256: String,
+    pub stage_context: BlobReceiptContext,
+    pub read_context: BlobReceiptContext,
+    pub root_lease: BlobRootLease,
+    pub expected_content_hash: BlobHash,
+    pub expected_plaintext_sha256: String,
+    pub expected_plaintext_length: u64,
+    pub policy: BlobPolicyBinding,
+    pub residency: ObjectResidencyKey,
+    pub process_source_binding: BlobProcessStreamSourceBinding,
+    pub expected_ready_receipt_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlobStageRecoveryRequestWire {
+    session_id: String,
+    terminal_id: String,
+    open_request_sha256: String,
+    terminal_command_sha256: String,
+    stage_context: BlobReceiptContext,
+    read_context: BlobReceiptContext,
+    root_lease: BlobRootLease,
+    expected_content_hash: BlobHash,
+    expected_plaintext_sha256: String,
+    expected_plaintext_length: u64,
+    policy: BlobPolicyBinding,
+    residency: ObjectResidencyKey,
+    process_source_binding: BlobProcessStreamSourceBinding,
+    expected_ready_receipt_id: Option<String>,
+}
+
+impl BlobStageRecoveryRequest {
+    /// Stable root-relative owner lookup key for the exact process source.
+    /// The key includes the validated process binding, stream/policy, and
+    /// both plaintext commitments; it is not a caller-supplied sink identity.
+    pub fn process_source_intent_key(&self) -> Result<String, BlobError> {
+        self.validate()?;
+        process_source_intent_key(
+            &self.process_source_binding,
+            &self.expected_content_hash,
+            &self.expected_plaintext_sha256,
+            self.expected_plaintext_length,
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), BlobError> {
+        valid_text(&self.session_id, "session_id")?;
+        valid_text(&self.terminal_id, "terminal_id")?;
+        canonical_sha256(&self.open_request_sha256, "open_request_sha256")?;
+        canonical_sha256(
+            &self.terminal_command_sha256,
+            "terminal_command_sha256",
+        )?;
+        self.stage_context.validate_for(EffectClass::ReversibleMutation)?;
+        self.read_context.validate_for(EffectClass::Read)?;
+        self.root_lease.validate_context(&self.stage_context)?;
+        self.root_lease.validate_context(&self.read_context)?;
+        if self.stage_context.work_scope != self.read_context.work_scope
+            || self.stage_context.task != self.read_context.task
+            || self.stage_context.session != self.read_context.session
+            || self.stage_context.authority.authority_id
+                != self.read_context.authority.authority_id
+            || self.stage_context.authority.authority_owner
+                != self.read_context.authority.authority_owner
+            || self.stage_context.authority.authority_epoch
+                != self.read_context.authority.authority_epoch
+            || self.stage_context.authority.proof_ceiling
+                != self.read_context.authority.proof_ceiling
+            || self.stage_context.authority.state_fence
+                != self.read_context.authority.state_fence
+        {
+            return Err(BlobError::AuthorityRequired(
+                "stage recovery contexts must share the exact owner/session authority",
+            ));
+        }
+        self.policy.validate_for_residency(&self.residency)?;
+        self.process_source_binding.validate()?;
+        self.expected_content_hash.validate()?;
+        canonical_sha256(&self.expected_plaintext_sha256, "expected_plaintext_sha256")?;
+        if self.expected_plaintext_length > BLOB_MAX_PLAINTEXT_BYTES {
+            return Err(BlobError::InvalidField {
+                field: "expected_plaintext_length",
+                reason: "exceeds the canonical plaintext ceiling",
+            });
+        }
+        if let Some(receipt_id) = &self.expected_ready_receipt_id {
+            valid_text(receipt_id, "expected_ready_receipt_id")?;
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for BlobStageRecoveryRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = BlobStageRecoveryRequestWire::deserialize(deserializer)?;
+        let value = Self {
+            session_id: wire.session_id,
+            terminal_id: wire.terminal_id,
+            open_request_sha256: wire.open_request_sha256,
+            terminal_command_sha256: wire.terminal_command_sha256,
+            stage_context: wire.stage_context,
+            read_context: wire.read_context,
+            root_lease: wire.root_lease,
+            expected_content_hash: wire.expected_content_hash,
+            expected_plaintext_sha256: wire.expected_plaintext_sha256,
+            expected_plaintext_length: wire.expected_plaintext_length,
+            policy: wire.policy,
+            residency: wire.residency,
+            process_source_binding: wire.process_source_binding,
+            expected_ready_receipt_id: wire.expected_ready_receipt_id,
+        };
+        value.validate().map_err(de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+/// Owner-authored disposition for same-operation stage recovery. `Unknown`
+/// means the owner could not prove a committed ready object; it never means
+/// that replaying the stage is safe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlobStageRecovery {
+    Ready(Box<BlobReadyReceipt>),
+    /// The persisted owner intent proves no stage transaction/publication
+    /// exists for this exact operation. A caller with the retained exact bytes
+    /// may submit that same operation.
+    NotStarted,
+    Unknown,
 }
 
 /// Bounded read request with exact durable metadata binding.
@@ -3607,6 +3843,44 @@ pub type BlobFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BlobError>> +
 /// caller.
 pub trait BlobStoreClient: Send + Sync {
     fn stage(&self, request: BlobStageRequest) -> BlobFuture<'_, BlobReadyReceipt>;
+    /// Resolves only owner-persisted evidence for the original stage
+    /// identity. A missing commit or unsettled journal is `Unknown`; callers
+    /// must not turn that result into a fresh stage attempt.
+    fn recover_stage(
+        &self,
+        _request: BlobStageRecoveryRequest,
+    ) -> BlobFuture<'_, BlobStageRecovery> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose same-operation stage recovery".to_owned(),
+            ))
+        })
+    }
+    /// Resolves the owner-persisted process binding and reads the exact source
+    /// under the original owner-issued Blob contexts.
+    fn read_process_stream_source(
+        &self,
+        _request: BlobProcessStreamReadbackRequest,
+    ) -> BlobFuture<'_, BlobReadChunk> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose persisted process-source lookup".to_owned(),
+            ))
+        })
+    }
+    /// Submits bytes only after the same owner has durably reserved and
+    /// reconciled the exact process finalization identity.
+    fn stage_with_recovery(
+        &self,
+        _request: BlobStageRequest,
+        _recovery: BlobStageRecoveryRequest,
+    ) -> BlobFuture<'_, BlobReadyReceipt> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose atomic same-operation stage recovery".to_owned(),
+            ))
+        })
+    }
     fn read(&self, request: BlobReadRequest) -> BlobFuture<'_, BlobReadChunk>;
     /// Reads and verifies the original sealed envelope under the same lease,
     /// metadata digest, and ready-receipt identity as `read`.
