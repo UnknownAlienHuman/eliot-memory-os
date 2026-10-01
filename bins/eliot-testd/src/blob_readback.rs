@@ -45,13 +45,22 @@ impl BlobReadbackExchange for KernelBlobStreamCallSequence {
         &'a self,
         request: &'a KernelSourceRequest,
     ) -> BlobReadbackExchangeFuture<'a> {
+        let calls = self.clone();
+        let request = request.clone();
+        let stream = request.stream;
         Box::pin(async move {
-            let response = self
-                .exchange(KernelOperation::SourceReadback {
-                    request: request.clone(),
-                })
-                .map_err(|error| map_ipc_error(error, request.stream))?;
-            Ok(response)
+            match tokio::task::spawn_blocking(move || {
+                calls.exchange(KernelOperation::SourceReadback { request })
+            })
+            .await
+            {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(error)) => Err(map_ipc_error(error, stream)),
+                Err(_) => Err(TestdEvidenceError::SourceUnknownOutcome {
+                    stream,
+                    reason: "the authenticated Kernel readback task ended without a proven result",
+                }),
+            }
         })
     }
 }

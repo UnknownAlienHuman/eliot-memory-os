@@ -1049,12 +1049,13 @@ impl KernelBlobStreamCallSequence {
 
 /// Authenticated provider-neutral process-stream sink backed by the Kernel's
 /// opaque capability and one-use call-token sequence.
+#[derive(Clone)]
 pub struct KernelProcessStreamSinkClient {
     calls: KernelBlobStreamCallSequence,
     /// Exact Store-issued binding references returned by Open, retained only
     /// as a bounded live-session optimization. Restart recovery resolves the
     /// original persisted intent through the Kernel owner path.
-    bindings: Mutex<BTreeMap<String, ProcessStreamSinkBindingRef>>,
+    bindings: Arc<Mutex<BTreeMap<String, ProcessStreamSinkBindingRef>>>,
 }
 
 impl KernelProcessStreamSinkClient {
@@ -1063,7 +1064,7 @@ impl KernelProcessStreamSinkClient {
     pub fn new(calls: KernelBlobStreamCallSequence) -> Self {
         Self {
             calls,
-            bindings: Mutex::new(BTreeMap::new()),
+            bindings: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1265,7 +1266,8 @@ impl ProcessStreamSinkClient for KernelProcessStreamSinkClient {
         &self,
         request: ProcessStreamSinkOpenRequest,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkSession> {
-        Box::pin(std::future::ready(self.open_sync(request)))
+        let client = self.clone();
+        blocking_sink_future(5_000, move || client.open_sync(request))
     }
 
     fn append(
@@ -1273,7 +1275,9 @@ impl ProcessStreamSinkClient for KernelProcessStreamSinkClient {
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkAppend,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkAppendDisposition> {
-        Box::pin(std::future::ready(self.append_sync(session, request)))
+        let budget_ms = request.wait_budget_ms();
+        let client = self.clone();
+        blocking_sink_future(budget_ms, move || client.append_sync(session, request))
     }
 
     fn finalize(
@@ -1281,7 +1285,9 @@ impl ProcessStreamSinkClient for KernelProcessStreamSinkClient {
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkFinalizeRequest,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
-        Box::pin(std::future::ready(self.finalize_sync(session, request)))
+        let budget_ms = request.wait_budget_ms();
+        let client = self.clone();
+        blocking_sink_future(budget_ms, move || client.finalize_sync(session, request))
     }
 
     fn abort(
@@ -1289,14 +1295,17 @@ impl ProcessStreamSinkClient for KernelProcessStreamSinkClient {
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkAbortRequest,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkTerminal> {
-        Box::pin(std::future::ready(self.abort_sync(session, request)))
+        let budget_ms = request.wait_budget_ms();
+        let client = self.clone();
+        blocking_sink_future(budget_ms, move || client.abort_sync(session, request))
     }
 
     fn readback(
         &self,
         session: ProcessStreamSinkSession,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
-        Box::pin(std::future::ready(self.readback_sync(session)))
+        let client = self.clone();
+        blocking_sink_future(2_000, move || client.readback_sync(session))
     }
 
     fn reconcile(
@@ -1304,8 +1313,26 @@ impl ProcessStreamSinkClient for KernelProcessStreamSinkClient {
         session: ProcessStreamSinkSession,
         outcome: ProcessStreamSinkUnknownOutcome,
     ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
-        Box::pin(std::future::ready(self.reconcile_sync(session, outcome)))
+        let client = self.clone();
+        blocking_sink_future(2_000, move || client.reconcile_sync(session, outcome))
     }
+}
+
+fn blocking_sink_future<T, F>(
+    budget_ms: u64,
+    operation: F,
+) -> ProcessStreamSinkFuture<'static, T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ProcessStreamSinkError> + Send + 'static,
+{
+    Box::pin(async move {
+        let blocking = tokio::task::spawn_blocking(operation);
+        match tokio::time::timeout(Duration::from_millis(budget_ms.max(1)), blocking).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(ProcessStreamSinkError::UnknownOutcome),
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -1355,13 +1382,21 @@ fn ensure_binding_ref(
 fn completed_sink_response(
     response: BlobProcessStreamKernelResponse,
 ) -> Result<ProcessStreamSinkWireResponse, ProcessStreamSinkError> {
-    let BlobProcessStreamKernelOutcome::Completed { response, .. } = response.outcome else {
-        return Err(ProcessStreamSinkError::ProviderUnavailable);
-    };
-    let BlobProcessStreamOperationResponse::Sink { response } = response.operation else {
-        return Err(ProcessStreamSinkError::ProviderUnavailable);
-    };
-    Ok(response)
+    match response.outcome {
+        BlobProcessStreamKernelOutcome::Completed { response, .. } => match response.operation {
+            BlobProcessStreamOperationResponse::Sink { response } => Ok(response),
+            BlobProcessStreamOperationResponse::SourceReadback { .. } => {
+                Err(ProcessStreamSinkError::UnknownOutcome)
+            }
+        },
+        BlobProcessStreamKernelOutcome::Unknown { .. } => {
+            Err(ProcessStreamSinkError::UnknownOutcome)
+        }
+        BlobProcessStreamKernelOutcome::NotStarted { .. }
+        | BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+            Err(ProcessStreamSinkError::ProviderUnavailable)
+        }
+    }
 }
 
 fn completed_sink_response_with_terminal(
@@ -1373,18 +1408,27 @@ fn completed_sink_response_with_terminal(
     ),
     ProcessStreamSinkError,
 > {
-    let BlobProcessStreamKernelOutcome::Completed {
-        response,
-        original_terminal_request,
-        ..
-    } = response.outcome
-    else {
-        return Err(ProcessStreamSinkError::ProviderUnavailable);
-    };
-    let BlobProcessStreamOperationResponse::Sink { response } = response.operation else {
-        return Err(ProcessStreamSinkError::ProviderUnavailable);
-    };
-    Ok((response, original_terminal_request.map(|request| *request)))
+    match response.outcome {
+        BlobProcessStreamKernelOutcome::Completed {
+            response,
+            original_terminal_request,
+            ..
+        } => match response.operation {
+            BlobProcessStreamOperationResponse::Sink { response } => {
+                Ok((response, original_terminal_request.map(|request| *request)))
+            }
+            BlobProcessStreamOperationResponse::SourceReadback { .. } => {
+                Err(ProcessStreamSinkError::UnknownOutcome)
+            }
+        },
+        BlobProcessStreamKernelOutcome::Unknown { .. } => {
+            Err(ProcessStreamSinkError::UnknownOutcome)
+        }
+        BlobProcessStreamKernelOutcome::NotStarted { .. }
+        | BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+            Err(ProcessStreamSinkError::ProviderUnavailable)
+        }
+    }
 }
 
 enum TerminalCommand {
@@ -1500,8 +1544,11 @@ fn readback_from_projection(
     }
 }
 
-fn map_sink_ipc_error(_: TestdIpcError) -> ProcessStreamSinkError {
-    ProcessStreamSinkError::ProviderUnavailable
+fn map_sink_ipc_error(error: TestdIpcError) -> ProcessStreamSinkError {
+    match error {
+        TestdIpcError::UnknownOutcome { .. } => ProcessStreamSinkError::UnknownOutcome,
+        _ => ProcessStreamSinkError::ProviderUnavailable,
+    }
 }
 
 fn sink_invalid() -> ProcessStreamSinkError {
