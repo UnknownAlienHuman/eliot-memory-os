@@ -460,6 +460,19 @@ pub const TESTD_LIST_PROFILE: &str = "cargo-nextest-list";
 /// Separately registered dev-fast scoped-run profile: the productive
 /// nextest run with validated scope slots.
 pub const TESTD_SCOPED_PROFILE: &str = "cargo-nextest-scoped";
+/// Complete productive Testd profile denominator, in the profile owner.
+///
+/// The runner imports this list for stage coverage instead of maintaining a
+/// second copy of the set Testd's worker admits.
+pub const PRODUCTIVE_TESTD_PROFILE_NAMES: [&str; 7] = [
+    TESTD_PRODUCTIVE_PROFILE,
+    TESTD_LIST_PROFILE,
+    TESTD_SCOPED_PROFILE,
+    "compiler",
+    "test",
+    "package-verification",
+    "bundle-verification",
+];
 /// Relative program for the admitted probe, resolved through the platform
 /// tool locator at Drive time. Never absolute, never parent traversal.
 pub const TESTD_PROFILE_PROGRAM: &str = "cargo";
@@ -705,16 +718,7 @@ pub fn is_slotted_testd_profile(profile: &str) -> bool {
 /// list/scoped profiles. The harmless probe never qualifies.
 #[must_use]
 pub fn is_productive_testd_profile(profile: &str) -> bool {
-    matches!(
-        profile,
-        TESTD_PRODUCTIVE_PROFILE
-            | TESTD_LIST_PROFILE
-            | TESTD_SCOPED_PROFILE
-            | "compiler"
-            | "test"
-            | "package-verification"
-            | "bundle-verification"
-    )
+    PRODUCTIVE_TESTD_PROFILE_NAMES.contains(&profile)
 }
 
 /// Returns true only for current runner catalog profiles whose process stages
