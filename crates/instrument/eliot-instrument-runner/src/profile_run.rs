@@ -1254,6 +1254,39 @@ impl StageOrchestrator {
     /// receipt, or generation (or an observation that no longer matches the
     /// receipt) refuses as a missing run. Without a live registry the launch
     /// fails closed: a registry-less path admits no external stage.
+    /// Observes the bound executor identity for one invocation.
+    ///
+    /// Machine-observed intent first, then the bridge identity over it;
+    /// either failure refuses the stage before admission.
+    fn observe_bound_identity(
+        invocation: &InstrumentInvocation,
+        process_request: &ProcessRequest,
+        route: &TestExecutionPlaneRoute,
+    ) -> Result<ResolvedExecutableIdentity, Box<InstrumentRun>> {
+        let observed =
+            match ExecutableObservation::observe_from_intent(process_request.intent(), None) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    return Err(Box::new(InstrumentRun::missing(
+                        route,
+                        format!(
+                            "stage admission refused: {}",
+                            AdmissionError::ExecutableMismatch {
+                                detail: error.to_string(),
+                            }
+                        ),
+                    )));
+                }
+            };
+        match bridge_executor_observation(invocation.instrument.as_str(), observed) {
+            Ok(identity) => Ok(identity),
+            Err(error) => Err(Box::new(InstrumentRun::missing(
+                route,
+                format!("stage admission refused: {error}"),
+            ))),
+        }
+    }
+
     async fn launch_one<E: ProcessExecutor + 'static>(
         runner: &InstrumentRunner<E>,
         live: Option<&InstrumentRegistry>,
@@ -1283,26 +1316,9 @@ impl StageOrchestrator {
                 return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
             }
         };
-        let observed =
-            match ExecutableObservation::observe_from_intent(process_request.intent(), None) {
-                Ok(observation) => observation,
-                Err(error) => {
-                    return InstrumentRun::missing(
-                        route,
-                        format!(
-                            "stage admission refused: {}",
-                            AdmissionError::ExecutableMismatch {
-                                detail: error.to_string(),
-                            }
-                        ),
-                    );
-                }
-            };
-        let identity = match bridge_executor_observation(invocation.instrument.as_str(), observed) {
+        let identity = match Self::observe_bound_identity(&invocation, &process_request, route) {
             Ok(identity) => identity,
-            Err(error) => {
-                return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
-            }
+            Err(refusal) => return *refusal,
         };
         let admission = planned
             .stage
@@ -1342,9 +1358,7 @@ impl StageOrchestrator {
         // value is intentional: the gate is the drift check, not the value.
         match live {
             Some(registry) => {
-                if let Err(error) =
-                    submit_admission_snapshot(registry, &planned.stage, &identity)
-                {
+                if let Err(error) = submit_admission_snapshot(registry, &planned.stage, &identity) {
                     return InstrumentRun::missing(
                         route,
                         format!("stage admission refused: {error}"),

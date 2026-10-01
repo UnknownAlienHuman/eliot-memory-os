@@ -499,8 +499,7 @@ fn check_registry_commit_admission(
     }
     if !supply_digest.is_empty() && !is_registry_digest(supply_digest) {
         return Err(CompositionError::Owner(
-            "instrument registry admission pin 'supply_digest' is not a snapshot digest"
-                .to_owned(),
+            "instrument registry admission pin 'supply_digest' is not a snapshot digest".to_owned(),
         ));
     }
     let document: Value = serde_json::from_str(snapshot_json).map_err(|error| {
@@ -510,24 +509,19 @@ fn check_registry_commit_admission(
         .get("generation")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
-            CompositionError::Owner(
-                "instrument registry snapshot carries no generation".to_owned(),
-            )
+            CompositionError::Owner("instrument registry snapshot carries no generation".to_owned())
         })?;
     if generation != registry_generation {
         return Err(CompositionError::Owner(format!(
             "instrument registry snapshot generation {generation} differs from the admitted generation {registry_generation}"
         )));
     }
-    let specs =
-        document
-            .get("specs")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                CompositionError::Owner(
-                    "instrument registry snapshot carries no spec table".to_owned(),
-                )
-            })?;
+    let specs = document
+        .get("specs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CompositionError::Owner("instrument registry snapshot carries no spec table".to_owned())
+        })?;
     let spec_present = specs.iter().any(|row| {
         row.get("kind")
             .and_then(|kind_value| kind_value.get("name"))
@@ -539,15 +533,14 @@ fn check_registry_commit_admission(
             "instrument registry snapshot no longer admits kind '{kind}'"
         )));
     }
-    let receipts =
-        document
-            .get("receipts")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                CompositionError::Owner(
-                    "instrument registry snapshot carries no receipt table".to_owned(),
-                )
-            })?;
+    let receipts = document
+        .get("receipts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CompositionError::Owner(
+                "instrument registry snapshot carries no receipt table".to_owned(),
+            )
+        })?;
     let receipt = receipts
         .iter()
         .find(|row| row.get("instrument").and_then(Value::as_str) == Some(kind));
@@ -556,55 +549,78 @@ fn check_registry_commit_admission(
         (Some(_), true) | (None, false) => Err(CompositionError::Owner(
             "instrument registry snapshot receipt presence differs from the admission".to_owned(),
         )),
-        (Some(row), false) => {
-            let field = |name: &str| {
-                row.get(name).and_then(Value::as_str).ok_or_else(|| {
-                    CompositionError::Owner(format!(
-                        "instrument registry snapshot receipt for '{kind}' carries no '{name}'"
-                    ))
-                })
-            };
-            let executable = field("executable")?;
-            let row_content = field("content_digest")?;
-            let row_spec = field("spec_digest")?;
-            let row_generation =
-                row.get("generation")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        CompositionError::Owner(format!(
-                            "instrument registry snapshot receipt for '{kind}' carries no generation"
-                        ))
-                    })?;
-            let version = row.get("tool_version").and_then(Value::as_str).unwrap_or("");
-            // The registry's exact receipt-digest material (same field order,
-            // same separators): a substituted row fails here even when every
-            // field is individually well-formed.
-            let material = format!(
-                "{kind}\0{executable}\0{row_content}\0{version}\0{row_spec}\0{row_generation}"
-            );
-            if eliot_contracts::sha256_hex(material.as_bytes()) != supply_digest {
-                return Err(CompositionError::Owner(format!(
-                    "instrument registry snapshot receipt for '{kind}' differs from the admitted receipt"
-                )));
-            }
-            if row_content != content_digest {
-                return Err(CompositionError::Owner(format!(
-                    "instrument registry snapshot receipt for '{kind}' names a different executable object than admitted"
-                )));
-            }
-            if row_spec != spec_digest {
-                return Err(CompositionError::Owner(format!(
-                    "instrument registry snapshot receipt for '{kind}' is verified against a different spec than admitted"
-                )));
-            }
-            if registry_executable_file_name(executable_path) != executable.to_ascii_lowercase() {
-                return Err(CompositionError::Owner(format!(
-                    "instrument registry admission names a different executable file than the snapshot receipt for '{kind}'"
-                )));
-            }
-            Ok(())
-        }
+        (Some(row), false) => check_receipt_row_agreement(
+            row,
+            kind,
+            supply_digest,
+            content_digest,
+            spec_digest,
+            executable_path,
+        ),
     }
+}
+
+/// Checks one receipt row against the admitted pins.
+///
+/// The registry's exact receipt-digest material (same field order, same
+/// separators): a substituted row fails here even when every field is
+/// individually well-formed.
+fn check_receipt_row_agreement(
+    row: &Value,
+    kind: &str,
+    supply_digest: &str,
+    content_digest: &str,
+    spec_digest: &str,
+    executable_path: &str,
+) -> Result<(), CompositionError> {
+    let field = |name: &str| {
+        row.get(name).and_then(Value::as_str).ok_or_else(|| {
+            CompositionError::Owner(format!(
+                "instrument registry snapshot receipt for '{kind}' carries no '{name}'"
+            ))
+        })
+    };
+    let executable = field("executable")?;
+    let row_content = field("content_digest")?;
+    let row_spec = field("spec_digest")?;
+    let row_generation = row
+        .get("generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            CompositionError::Owner(format!(
+                "instrument registry snapshot receipt for '{kind}' carries no generation"
+            ))
+        })?;
+    let version = row
+        .get("tool_version")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // The registry's exact receipt-digest material (same field order,
+    // same separators): a substituted row fails here even when every
+    // field is individually well-formed.
+    let material =
+        format!("{kind}\0{executable}\0{row_content}\0{version}\0{row_spec}\0{row_generation}");
+    if eliot_contracts::sha256_hex(material.as_bytes()) != supply_digest {
+        return Err(CompositionError::Owner(format!(
+            "instrument registry snapshot receipt for '{kind}' differs from the admitted receipt"
+        )));
+    }
+    if row_content != content_digest {
+        return Err(CompositionError::Owner(format!(
+            "instrument registry snapshot receipt for '{kind}' names a different executable object than admitted"
+        )));
+    }
+    if row_spec != spec_digest {
+        return Err(CompositionError::Owner(format!(
+            "instrument registry snapshot receipt for '{kind}' is verified against a different spec than admitted"
+        )));
+    }
+    if registry_executable_file_name(executable_path) != executable.to_ascii_lowercase() {
+        return Err(CompositionError::Owner(format!(
+            "instrument registry admission names a different executable file than the snapshot receipt for '{kind}'"
+        )));
+    }
+    Ok(())
 }
 
 /// Reports whether one canonical receipt really committed the named
@@ -828,14 +844,10 @@ pub async fn commit_instrument_registry_snapshot<P: KernelGenerationPort + ?Size
     // agreement runner-side (`launch_plan_live` refuses a plan compiled
     // against a different live digest); it travels with the pin set so the
     // commit caller's pins stay complete and auditable.
-    let parameters = BTreeMap::from([(
-        "snapshot_json".to_owned(),
-        Value::String(snapshot_json),
-    )]);
-    let admitted =
-        decode_instrument_registry_mutation(&parameters).map_err(|error| {
-            CompositionError::Owner(format!("instrument registry parameters: {error}"))
-        })?;
+    let parameters = BTreeMap::from([("snapshot_json".to_owned(), Value::String(snapshot_json))]);
+    let admitted = decode_instrument_registry_mutation(&parameters).map_err(|error| {
+        CompositionError::Owner(format!("instrument registry parameters: {error}"))
+    })?;
     let snapshot_digest = sha256_hex(admitted.as_bytes());
     let operation_id = OperationId::new(instrument_registry_operation_text(&snapshot_digest))
         .map_err(|error| {
