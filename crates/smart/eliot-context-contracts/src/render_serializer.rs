@@ -22,7 +22,10 @@
 //! provider codec or any route configuration.
 //!
 //! I2.16:181 makes a change to the serializer invalidate any qualification, so
-//! the record carries three parts and each is derived rather than declared:
+//! the record carries three parts and each is derived rather than declared.
+//! The three names below are the names the compared records carry; this
+//! record's own storage spells them `id`, `version` and `options_digest`
+//! because the type already carries the prefix:
 //!
 //! - `serializer_id` is the owner contract's own name plus this render's
 //!   stable codec name;
@@ -105,64 +108,68 @@ impl ContextRenderSerializerOptions {
 /// only value that exists is the value the render owner published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextRenderSerializer {
-    serializer_id: String,
-    serializer_version: String,
-    serializer_options_digest: String,
+    id: String,
+    version: String,
+    options_digest: String,
 }
 
 impl ContextRenderSerializer {
     /// Issue the identity of this crate's canonical rendered payload codec.
     fn issue() -> Result<Self, ContextError> {
         Ok(Self {
-            serializer_id: format!("{CONTEXT_CONTRACT_NAME}.canonical-rendered-payload"),
-            serializer_version: CONTEXT_CONTRACT_VERSION.to_string(),
-            serializer_options_digest: canonical_digest(
-                &ContextRenderSerializerOptions::in_force(),
-            )?,
+            id: format!("{CONTEXT_CONTRACT_NAME}.canonical-rendered-payload"),
+            version: CONTEXT_CONTRACT_VERSION.to_string(),
+            options_digest: canonical_digest(&ContextRenderSerializerOptions::in_force())?,
         })
     }
 
     /// Re-prove the ORIGINAL recorded values of this identity.
     ///
-    /// The recorded `serializer_id` and `serializer_version` go through this
-    /// crate's own text validator and the recorded
-    /// `serializer_options_digest` through its own digest validator. No digest
-    /// is recomputed and compared to itself, and no external state is read.
+    /// The recorded `id` and `version` go through this crate's own text
+    /// validator and the recorded `options_digest` through its own digest
+    /// validator. No digest is recomputed and compared to itself, and no
+    /// external state is read.
     pub fn validate(&self) -> Result<(), ContextError> {
-        validate_text(&self.serializer_id, "render_serializer.serializer_id")?;
-        validate_text(
-            &self.serializer_version,
-            "render_serializer.serializer_version",
-        )?;
+        validate_text(&self.id, "render_serializer.serializer_id")?;
+        validate_text(&self.version, "render_serializer.serializer_version")?;
         validate_digest(
-            &self.serializer_options_digest,
+            &self.options_digest,
             "render_serializer.serializer_options_digest",
         )
     }
 
     /// The owner-issued codec identity.
+    ///
+    /// The accessor keeps the `serializer_` prefix because that is the name the
+    /// compared records carry: `SerializedContextMeasurement`,
+    /// `ContextExecutionIdentity`, `MeasurementCompositionProfile` and
+    /// `AssemblyPolicy` all spell their member `serializer_id`. The prefix
+    /// belongs on the type and on those records, so it is not repeated on this
+    /// record's own storage.
     #[must_use]
     pub fn serializer_id(&self) -> &str {
-        &self.serializer_id
+        &self.id
     }
 
     /// The owner-issued codec revision.
     #[must_use]
     pub fn serializer_version(&self) -> &str {
-        &self.serializer_version
+        &self.version
     }
 
     /// The owner-issued digest of the codec options in force.
     #[must_use]
     pub fn serializer_options_digest(&self) -> &str {
-        &self.serializer_options_digest
+        &self.options_digest
     }
 
     /// Require that a record's ORIGINAL three values are this owner's.
     ///
     /// Both sides are the values as recorded. Nothing is recomputed to stand
     /// in for the record under test, so a profile, policy or measurement that
-    /// names another codec is refused rather than re-described.
+    /// names another codec is refused rather than re-described. The three
+    /// parameters keep the `serializer_` prefix because they name the compared
+    /// records' own members, not this record's storage.
     ///
     /// # Errors
     ///
@@ -176,9 +183,9 @@ impl ContextRenderSerializer {
         serializer_options_digest: &str,
     ) -> Result<(), ContextError> {
         self.validate()?;
-        if self.serializer_id != serializer_id
-            || self.serializer_version != serializer_version
-            || self.serializer_options_digest != serializer_options_digest
+        if self.id != serializer_id
+            || self.version != serializer_version
+            || self.options_digest != serializer_options_digest
         {
             return Err(ContextError::IdentityConflict);
         }
