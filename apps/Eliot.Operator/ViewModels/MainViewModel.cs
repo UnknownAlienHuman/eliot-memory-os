@@ -34,7 +34,7 @@ public static class OperatorPageCatalog
         new("sleep_meta", "Sleep and Meta Lab", "Replay, holdout, baseline/candidate comparison and promotion evidence.", true),
         new("agents_routing", "Agents and Routing", "Hosts, capability envelopes, leases, contours and route decisions.", true),
         new("autonomy", "Autonomy Runs", "Bounded contracts, budgets, assignments, tripwires and completion proof.", true),
-        new("user_automation", "User Automation", "Authenticated create, inspect and lifecycle operations over canonical UserAutomation revisions.", false),
+        new("user_automation", "User Automation", "Authenticated schedule normalization and migration, create, inspect and lifecycle operations over canonical UserAutomation revisions.", false),
         new("approvals", "Approvals", "Exact action hash, risk, write set, verifier, rollback and decision receipts.", true),
         new("timeline_operations", "Timeline, Incidents and Operations", "Transitions, receipts, incidents, recovery, backups and logs.", true),
     ];
@@ -42,6 +42,13 @@ public static class OperatorPageCatalog
 
 public sealed class MainViewModel : INotifyPropertyChanged
 {
+    private sealed record OwnerNormalizedScheduleSubmission(
+        UserAutomationScheduleNormalizationOutcome Outcome,
+        UserAutomationRevision Revision,
+        JsonElement RevisionJson,
+        JsonElement NormalizationReceiptEnvelope,
+        JsonElement? MigrationSourceRevisionJson);
+
     /// The owner's own reason code for a State Fence that no longer admits the
     /// submitted revision (I7.20 reason registry, state/conflict class). It is
     /// used verbatim, never invented, and it distinguishes a proven refusal
@@ -81,13 +88,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
     private string _userAutomationId = string.Empty;
     private string _userAutomationRevision = string.Empty;
     private string _userAutomationNonce = string.Empty;
+    private string _userAutomationOccurrenceCount = "1";
     private string _userAutomationRevisionJson = "{}";
     private string _userAutomationPreviousRevisionJson = "{}";
     private string _userAutomationOperation = "list";
+    private OwnerNormalizedScheduleSubmission? _ownerNormalizedScheduleSubmission;
     private bool _includeRetired;
     private string? _graphSelectedRef;
     private int _graphDepth = 1;
     private string _resultPayloadText = string.Empty;
+    private string _userAutomationNormalizationResultJson = string.Empty;
     private string? _nextCursor;
     private string _resultSummary = "No projection loaded.";
     private string _statusTitle = "Disconnected";
@@ -217,12 +227,48 @@ public sealed class MainViewModel : INotifyPropertyChanged
     public string UserAutomationId { get => _userAutomationId; set => Set(ref _userAutomationId, BoundInput(value).Trim()); }
     public string UserAutomationRevision { get => _userAutomationRevision; set => Set(ref _userAutomationRevision, BoundInput(value).Trim()); }
     public string UserAutomationNonce { get => _userAutomationNonce; set => Set(ref _userAutomationNonce, BoundInput(value)); }
-    public string UserAutomationRevisionJson { get => _userAutomationRevisionJson; set => Set(ref _userAutomationRevisionJson, BoundInput(value)); }
-    public string UserAutomationPreviousRevisionJson { get => _userAutomationPreviousRevisionJson; set => Set(ref _userAutomationPreviousRevisionJson, BoundInput(value)); }
+    public string UserAutomationOccurrenceCount
+    {
+        get => _userAutomationOccurrenceCount;
+        set
+        {
+            if (Set(ref _userAutomationOccurrenceCount, BoundInput(value).Trim()))
+            {
+                InvalidateOwnerNormalizationEvidence();
+            }
+        }
+    }
+    public string UserAutomationRevisionJson
+    {
+        get => _userAutomationRevisionJson;
+        set
+        {
+            if (Set(ref _userAutomationRevisionJson, BoundInput(value)))
+            {
+                InvalidateOwnerNormalizationEvidence();
+            }
+        }
+    }
+    public string UserAutomationPreviousRevisionJson
+    {
+        get => _userAutomationPreviousRevisionJson;
+        set
+        {
+            if (Set(ref _userAutomationPreviousRevisionJson, BoundInput(value)))
+            {
+                InvalidateOwnerNormalizationEvidence();
+            }
+        }
+    }
     public string UserAutomationOperation { get => _userAutomationOperation; set => Set(ref _userAutomationOperation, BoundInput(value)); }
     public bool IncludeRetired { get => _includeRetired; set => Set(ref _includeRetired, value); }
     public int GraphDepth { get => _graphDepth; set => Set(ref _graphDepth, Math.Clamp(value, 1, 3)); }
     public string ResultPayloadText { get => _resultPayloadText; private set => Set(ref _resultPayloadText, value); }
+    public string UserAutomationNormalizationResultJson
+    {
+        get => _userAutomationNormalizationResultJson;
+        private set => Set(ref _userAutomationNormalizationResultJson, value);
+    }
     public string ResultSummary { get => _resultSummary; private set => Set(ref _resultSummary, value); }
     public string StatusTitle { get => _statusTitle; private set => Set(ref _statusTitle, value); }
     public string StatusMessage { get => _statusMessage; private set => Set(ref _statusMessage, value); }
@@ -600,53 +646,49 @@ public sealed class MainViewModel : INotifyPropertyChanged
     }
 
     /// Sends one closed UserAutomation operator operation through the existing
-    /// authenticated Governor client. The UI never supplies identity, fence,
+    /// authenticated Governor client. A fresh owner context supplies the
+    /// request's expected State Fence; the UI never supplies principal,
     /// schedule authority, provider credentials, or Store receipt fields.
-    /// Create/edit inputs may omit the normalization receipt; the Store owner
-    /// compiles the schedule and issues that evidence before persistence.
+    /// Create/edit consume only the exact immutable revision and full receipt
+    /// envelope returned by a known owner normalization or migration result.
     public async Task RunUserAutomationAsync()
     {
-        // A create or edit needs a caller-supplied schedule revision. The
-        // Operator checks its closed shape but cannot prove its normalization
-        // provenance; with no revision, it has no schedule data to submit. It
-        // never derives or rewrites an immutable revision in place.
-        if (UserAutomationOperation is "create" or "edit"
+        if ((UserAutomationOperation is "create" or "edit" or "normalize_schedule" or "migrate_legacy_schedule")
             && string.IsNullOrWhiteSpace(UserAutomationRevisionJson))
         {
             var absent = UserAutomationOutcomeClassifier.OwnerAbsent(
                 UserAutomationOperation,
-                "no schedule revision payload was supplied.");
+                "no schedule draft or owner-normalized revision payload was supplied.");
+            SetBanner(absent.Title, absent.Detail, OperatorBannerSeverity.Warning);
+            return;
+        }
+        if ((UserAutomationOperation is "edit" or "migrate_legacy_schedule")
+            && string.IsNullOrWhiteSpace(UserAutomationPreviousRevisionJson))
+        {
+            var absent = UserAutomationOutcomeClassifier.OwnerAbsent(
+                UserAutomationOperation,
+                "the immutable predecessor revision is required for this operation.");
             SetBanner(absent.Title, absent.Detail, OperatorBannerSeverity.Warning);
             return;
         }
 
         UserAutomationOperation operation;
-        UserAutomationScheduleProjection? scheduleProjection = null;
         try
         {
             operation = BuildUserAutomationOperation();
-            scheduleProjection = operation switch
-            {
-                UserAutomationCreateOperation create => create.Revision.Schedule.ReadLocalProjection(allowReceiptFreeDraft: true),
-                UserAutomationEditOperation edit => edit.Revision.Schedule.ReadLocalProjection(allowReceiptFreeDraft: true),
-                _ => null
-            };
             operation.Validate();
         }
         catch (UserAutomationScheduleContractException refusal)
         {
             var refused = UserAutomationOutcomeClassifier.RefusedBeforeSubmission(refusal);
-            SetBanner(
-                refused.Title,
-                AppendLocalProjectionInspection(refused.Detail, scheduleProjection),
-                OperatorBannerSeverity.Warning);
+            SetBanner(refused.Title, refused.Detail, OperatorBannerSeverity.Warning);
             return;
         }
         catch (Exception error) when (error is InvalidOperationException or JsonException)
         {
             SetBanner(
                 "UserAutomation command not sent",
-                AppendLocalProjectionInspection(BoundedRefusalReason(error), scheduleProjection),
+                BoundedRefusalReason(error),
                 OperatorBannerSeverity.Warning);
             return;
         }
@@ -667,23 +709,25 @@ public sealed class MainViewModel : INotifyPropertyChanged
         IsBusy = true;
         NotifyCounts();
         operation.Validate();
+        var cancellationToken = _requestCancellation?.Token ?? CancellationToken.None;
 
         if (!operation.IsEffect())
         {
             try
             {
-                var readRequest = UserAutomationOperatorRequest.Create(operation);
+                var expectedStateFence = await ReadFreshUserAutomationStateFenceAsync(cancellationToken);
+                var readRequest = UserAutomationOperatorRequest.Create(operation, expectedStateFence);
                 var read = await _client.UserAutomationAsync(
                     readRequest,
-                    _requestCancellation?.Token ?? CancellationToken.None);
+                    cancellationToken);
                 ShowUserAutomationResult(action, read, readRequest);
             }
             catch (Exception error)
             {
                 SetBanner(
                     "UserAutomation read failed",
-                    $"The UserAutomation read did not complete ({OperatorFaultReason.ForException(error)}); "
-                    + "a read has no owner effect, so it can be retried once the session is restored.",
+                    $"The UserAutomation context handshake or read did not complete ({OperatorFaultReason.ForException(error)}); "
+                    + "no write was requested, so it can be retried after the owner session is restored.",
                     OperatorBannerSeverity.Error);
             }
             finally
@@ -714,10 +758,26 @@ public sealed class MainViewModel : INotifyPropertyChanged
             return;
         }
 
+        JsonElement expectedWriteFence;
+        try
+        {
+            expectedWriteFence = await ReadFreshUserAutomationStateFenceAsync(cancellationToken);
+        }
+        catch (Exception error)
+        {
+            SetBanner(
+                "Command not sent — fresh owner context unavailable",
+                $"The UserAutomation operation was not sent because the authenticated context handshake did not produce a current State Fence ({OperatorFaultReason.ForException(error)}). Retry after the owner session is restored.",
+                OperatorBannerSeverity.Warning);
+            IsBusy = false;
+            NotifyCounts();
+            return;
+        }
+
         // One prepared request. The same object is journaled and transmitted,
-        // so the retained identity and the wire identity cannot diverge and
-        // the key is minted exactly once.
-        var request = UserAutomationOperatorRequest.Create(operation);
+        // including the exact owner-issued State Fence witness, so recovery
+        // resends the same request without reacquiring context.
+        var request = UserAutomationOperatorRequest.Create(operation, expectedWriteFence);
         request.Validate();
         var pending = new OperatorPendingOperation(
             request.IdempotencyKey,
@@ -744,6 +804,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
         await TransmitUserAutomationAsync(request, pending, action);
     }
 
+    /// Reads the authenticated current State Fence on the existing
+    /// UserAutomation route. This response is an admission witness only; it is
+    /// never displayed as a business result or stored as an operation.
+    private async Task<JsonElement> ReadFreshUserAutomationStateFenceAsync(CancellationToken cancellationToken)
+    {
+        var contextRequest = UserAutomationOperatorRequest.CreateContext();
+        var contextAnswer = await _client.UserAutomationAsync(contextRequest, cancellationToken);
+        return UserAutomationOutcomeClassifier.ReadContextStateFence(contextAnswer, contextRequest);
+    }
+
     /// Transmits one prepared typed UserAutomation request under the identity it
     /// already carries. A first send journals that same request; recovery
     /// resends the retained one unchanged. No identity is minted or renamed
@@ -754,16 +824,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
         OperatorPendingOperation pending,
         string action)
     {
-        // A first structured answer becomes reconcilable under this exact
-        // identity, while an already-unknown phase is preserved: the phase
-        // depends only on the retained record, so it is resolved once and
-        // shared by the normal answer path and the answered-but-cleanup-
-        // limited path below.
-        var unresolvedPhase = pending.Phase is
-            OperatorOperationPhase.UnknownReconciling
-            or OperatorOperationPhase.PossiblyExecuted
-                ? pending.Phase
-                : OperatorOperationPhase.UnknownReconciling;
         try
         {
             var answer = await _client.UserAutomationAsync(
@@ -774,6 +834,11 @@ public sealed class MainViewModel : INotifyPropertyChanged
             // Store, but it does not settle an earlier attempt of the same
             // retained identity. Preserve an already-unknown phase; a first
             // structured answer becomes reconcilable under this exact identity.
+            var unresolvedPhase = pending.Phase is
+                OperatorOperationPhase.UnknownReconciling
+                or OperatorOperationPhase.PossiblyExecuted
+                    ? pending.Phase
+                    : OperatorOperationPhase.UnknownReconciling;
             ReplacePending(pending.OperationId, unresolvedPhase);
             RefreshPendingState();
         }
@@ -787,16 +852,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 $"{action}: {unknown.OperationId} may have executed at stage {unknown.Stage} ({unknown.Message}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
-        catch (OperatorCleanupIncompleteException<JsonElement> cleanup)
+        catch (OperatorCleanupIncompleteException cleanup)
         {
-            // The owner answered, and the settled answer travels on the fault
-            // itself: it is shown through the normal answer path FIRST, so the
-            // result payload, outcome flags and banner reach the operator.
-            // Only then is the local cleanup limitation reported, under the
-            // same identity. The record stays reconcilable, but the answer is
-            // processed, never discarded and never rewritten as unknown.
-            ShowUserAutomationResult(action, cleanup.OwnerAnswer, request);
-            ReplacePending(pending.OperationId, unresolvedPhase);
+            // The owner side is settled: only the local teardown of the
+            // transport that carried it was limited. That is NOT an unknown
+            // owner result, so the record is never promoted to possibly
+            // executed, and it is never compacted either.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
             RefreshPendingState();
             SetBanner(
                 "Owner answered — transport cleanup incomplete",
@@ -857,19 +919,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// Shows one owner answer for a typed UserAutomation operation.
     /// </summary>
     /// <remarks>
-    /// The answer is decoded into a typed outcome instead of being reported as an
-    /// undifferentiated success. A typed Kernel refusal is shown as its own
-    /// actionable reason — unsupported contract version, legacy encoding, stale
-    /// normalization revision, owner unavailability, invalid or moved receipt,
-    /// or semantic rejection —
-    /// and the retained response bytes stay available for exact inspection. When the
-    /// owner answer itself carries the versioned occurrence projection, the zone
-    /// database revision, the resolved instant and offset and the applied fold or
-    /// gap disposition are decoded and displayed as inspection data. A Store
-    /// transition can echo caller-authored revision bytes, so that projection
-    /// alone never proves fresh owner normalization; it is reported as UNVERIFIED
-    /// with a warning. The original bounded response remains available for exact
-    /// inspection.
+    /// The answer is decoded against the exact submitted request context before
+    /// it can be shown as a known result. A typed Kernel refusal is shown as its
+    /// own actionable reason. A normalization result is retained only when the
+    /// shared decoder verifies operation, wire, correlation and the independently
+    /// captured State Fence, and the returned revision parses as the exact V4
+    /// projection; its full original ReceiptEnvelope remains in the raw answer
+    /// and is copied unchanged into Create/Edit.
     /// </remarks>
     private void ShowUserAutomationResult(
         string action,
@@ -879,38 +935,156 @@ public sealed class MainViewModel : INotifyPropertyChanged
         ResultPayloadText = OperatorProjectionGuard.BoundRetainedResult(answer) ?? string.Empty;
         var validationContext = UserAutomationResultValidationContext.FromRequest(request);
         var outcome = UserAutomationOutcomeClassifier.Read(action, answer, validationContext);
+        if ((action is "normalize_schedule" or "migrate_legacy_schedule")
+            && (outcome.Class is UserAutomationOutcomeClass.OwnerAnswered or UserAutomationOutcomeClass.OwnerScheduleNormalized))
+        {
+            if (outcome.ScheduleNormalizationResult is not { } normalized)
+            {
+                ResultSummary = "The owner answered, but no validated schedule normalization result was present. The occurrence projection is unverified and cannot be submitted.";
+                SetBanner("Normalization result unverified", ResultSummary, OperatorBannerSeverity.Warning);
+                return;
+            }
+
+            var expectedOutcome = action == "normalize_schedule"
+                ? UserAutomationScheduleNormalizationOutcome.ScheduleNormalized
+                : UserAutomationScheduleNormalizationOutcome.LegacyScheduleMigrated;
+            if (normalized.Outcome != expectedOutcome)
+            {
+                ResultSummary = "The owner result outcome does not match the submitted normalization or migration operation. No revision or receipt was retained for submission.";
+                SetBanner("Normalization result unverified", ResultSummary, OperatorBannerSeverity.Warning);
+                return;
+            }
+
+            try
+            {
+                var revisionJson = ReadOwnerNormalizationRevisionJson(answer);
+                var projection = normalized.Revision.Schedule.ReadLocalProjection();
+                var requestedCount = request.Operation switch
+                {
+                    UserAutomationNormalizeScheduleOperation normalize => normalize.OccurrenceCount,
+                    UserAutomationMigrateLegacyScheduleOperation migrate => migrate.OccurrenceCount,
+                    _ => (ushort)0
+                };
+                if (requestedCount == 0 || projection.OccurrenceCount != requestedCount)
+                {
+                    throw new InvalidOperationException(
+                        "the owner result occurrence count differs from the exact submitted request");
+                }
+
+                JsonElement? migrationSource = request.Operation is UserAutomationMigrateLegacyScheduleOperation migration
+                    ? JsonSerializer.SerializeToElement(migration.PreviousRevision, OperatorJson.Writer).Clone()
+                    : null;
+                _ownerNormalizedScheduleSubmission = null;
+                UserAutomationNormalizationResultJson = string.Empty;
+                if (revisionJson.GetRawText().Length <= OperatorProtocol.MaxRetainedInputChars)
+                {
+                    UserAutomationRevisionJson = revisionJson.GetRawText();
+                }
+                _ownerNormalizedScheduleSubmission = new OwnerNormalizedScheduleSubmission(
+                    normalized.Outcome,
+                    normalized.Revision,
+                    revisionJson,
+                    normalized.NormalizationReceiptEnvelope.Clone(),
+                    migrationSource);
+                UserAutomationNormalizationResultJson = ResultPayloadText;
+
+                var detail = DescribeOwnerNormalizedSchedule(
+                    outcome.Detail,
+                    normalized.Revision,
+                    projection,
+                    normalized.Outcome);
+                if (revisionJson.GetRawText().Length > OperatorProtocol.MaxRetainedInputChars)
+                {
+                    detail += Environment.NewLine
+                        + "The verified owner projection exceeds the Operator's exact editable-input bound. It is retained for inspection, but cannot be submitted from this form; normalize a new revision with a smaller occurrence count.";
+                }
+                ResultSummary = detail;
+                SetBanner(outcome.Title, detail, OperatorBannerSeverity.Informational);
+                return;
+            }
+            catch (Exception error) when (error is InvalidOperationException or JsonException)
+            {
+                ResultSummary = $"The owner answer could not be verified as a bounded V4 schedule projection ({BoundedRefusalReason(error)}). The raw answer remains available for inspection, but no schedule result can be submitted.";
+                SetBanner("Normalization result unverified", ResultSummary, OperatorBannerSeverity.Warning);
+                return;
+            }
+        }
+
         ResultSummary = outcome.Detail;
         SetBanner(
             outcome.Title,
             outcome.Detail,
             outcome.Class switch
             {
-                UserAutomationOutcomeClass.OwnerAnswered => OperatorBannerSeverity.Informational,
+                UserAutomationOutcomeClass.OwnerAnswered or UserAutomationOutcomeClass.OwnerScheduleNormalized => OperatorBannerSeverity.Informational,
                 _ => OperatorBannerSeverity.Warning
             });
     }
 
+    private static JsonElement ReadOwnerNormalizationRevisionJson(JsonElement answer)
+    {
+        if (answer.ValueKind != JsonValueKind.Object
+            || !answer.TryGetProperty("value", out var value)
+            || value.ValueKind != JsonValueKind.Object
+            || !value.TryGetProperty("revision", out var revision)
+            || revision.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("the known normalization result has no exact revision object");
+        }
+        return revision.Clone();
+    }
+
+    private static string DescribeOwnerNormalizedSchedule(
+        string detail,
+        UserAutomationRevision revision,
+        UserAutomationScheduleProjection projection,
+        UserAutomationScheduleNormalizationOutcome outcome)
+    {
+        var action = outcome switch
+        {
+            UserAutomationScheduleNormalizationOutcome.ScheduleNormalized => "Owner normalized schedule",
+            UserAutomationScheduleNormalizationOutcome.LegacyScheduleMigrated => "Owner migrated legacy schedule into a new immutable revision",
+            _ => throw new InvalidOperationException("unrecognized schedule normalization result")
+        };
+        var occurrences = string.Join(
+            Environment.NewLine,
+            projection.Occurrences.Select((occurrence, index) =>
+                $"owner V4 occurrence {index + 1}: {occurrence.Describe()}"));
+        var schedule = revision.Schedule;
+        var endAt = schedule.EndAt ?? "(none)";
+        return detail
+            + Environment.NewLine
+            + action
+            + "; the full original ReceiptEnvelope is retained for exact Create/Edit submission and remains in the raw JSON answer."
+            + Environment.NewLine
+            + $"schedule kind {schedule.Kind}; expression [{schedule.Expression}]; calendar {schedule.Calendar}; timezone {schedule.Timezone}; fold policy {schedule.DstFold}; gap policy {schedule.DstGap}; start {schedule.StartAt}; end {endAt}."
+            + Environment.NewLine
+            + projection.ContractIdentity()
+            + (occurrences.Length == 0 ? string.Empty : Environment.NewLine + occurrences);
+    }
+
     /// <summary>
-    /// Mints the one typed operation for the selected closed kind.
+    /// Builds the one typed operation for the selected closed kind. A create
+    /// or edit is bound to the exact owner-normalized V4 result retained from
+    /// the Normalize/Migrate action; a typed projection or schedule receipt
+    /// alone is never treated as owner evidence.
     /// </summary>
-    /// <remarks>
-    /// Create and edit both carry a caller-supplied schedule revision through the
-    /// closed profile. An edit carries BOTH the previous and the new revision,
-    /// preserving its supersession lineage. Since this contract has no bound
-    /// owner normalization result or migration route, both create and edit fail
-    /// closed before submission. No revision is rewritten here.
-    /// </remarks>
     private UserAutomationOperation BuildUserAutomationOperation() => UserAutomationOperation switch
     {
-        "create" => new UserAutomationCreateOperation(ParseRevision(UserAutomationRevisionJson)),
+        "create" => BuildOwnerNormalizedCreate(),
         "list" => new UserAutomationListOperation(IncludeRetired),
         "status" => new UserAutomationStatusOperation(RequiredUserAutomationId()),
         "history" => new UserAutomationHistoryOperation(RequiredUserAutomationId()),
         "pause" => new UserAutomationPauseOperation(RequiredUserAutomationId(), RequiredUserAutomationRevision()),
         "resume" => new UserAutomationResumeOperation(RequiredUserAutomationId(), RequiredUserAutomationRevision()),
-        "edit" => new UserAutomationEditOperation(
-            ParseRevision(UserAutomationPreviousRevisionJson),
-            ParseRevision(UserAutomationRevisionJson)),
+        "edit" => BuildOwnerNormalizedEdit(),
+        "normalize_schedule" => new UserAutomationNormalizeScheduleOperation(
+            ParseNormalizationDraft(UserAutomationRevisionJson),
+            ParseOccurrenceCount()),
+        "migrate_legacy_schedule" => new UserAutomationMigrateLegacyScheduleOperation(
+            ParseMigrationSource(UserAutomationPreviousRevisionJson).Revision,
+            ParseNormalizationDraft(UserAutomationRevisionJson),
+            ParseOccurrenceCount()),
         "run_now" => new UserAutomationRunNowOperation(
             RequiredUserAutomationId(),
             RequiredUserAutomationRevision(),
@@ -920,41 +1094,117 @@ public sealed class MainViewModel : INotifyPropertyChanged
         _ => throw new InvalidOperationException("UserAutomation operation is not in the closed operation catalogue.")
     };
 
-    private static string AppendLocalProjectionInspection(
-        string detail,
-        UserAutomationScheduleProjection? projection)
+    private UserAutomationCreateOperation BuildOwnerNormalizedCreate()
     {
-        if (projection is null) return detail;
+        var submission = RequireOwnerNormalizedRevision(UserAutomationRevisionJson);
+        if (submission.Outcome != UserAutomationScheduleNormalizationOutcome.ScheduleNormalized)
+        {
+            throw new InvalidOperationException(
+                "Create requires a known schedule_normalized owner result. A legacy migration result must be submitted as an edit over its exact predecessor.");
+        }
 
-        const int maxPreviewOccurrences = 4;
-        var shownOccurrences = Math.Min(maxPreviewOccurrences, projection.Occurrences.Count);
-        var occurrencePreview = string.Join(
-            Environment.NewLine,
-            projection.Occurrences
-                .Take(shownOccurrences)
-                .Select((occurrence, index) =>
-                    $"supplied V4 occurrence {index + 1}: {occurrence.Describe()}"));
-        var inspection = "Local schedule projection for inspection only; no owner-issued normalization result is bound, so occurrence provenance is unverified."
-            + Environment.NewLine
-            + projection.ContractIdentity();
-        inspection += projection.NormalizationReceipt is { } normalizationReceipt
-            ? Environment.NewLine
-                + "Caller-supplied normalization_receipt (identity and provenance unverified): "
-                + $"receipt_id {normalizationReceipt.ReceiptId}; authority {normalizationReceipt.NormalizerAuthority}; "
-                + $"source_digest {normalizationReceipt.SourceDigest}; "
-                + $"occurrences_digest {normalizationReceipt.OccurrencesDigest}; "
-                + $"zone_database_revision {normalizationReceipt.ZoneDatabaseRevision}."
-            : Environment.NewLine + "No normalization_receipt is available in this projection.";
-        if (occurrencePreview.Length != 0)
+        return new UserAutomationCreateOperation(
+            submission.Revision,
+            submission.NormalizationReceiptEnvelope.Clone());
+    }
+
+    private UserAutomationEditOperation BuildOwnerNormalizedEdit()
+    {
+        var submission = RequireOwnerNormalizedRevision(UserAutomationRevisionJson);
+        UserAutomationRevision previousRevision;
+        if (submission.Outcome == UserAutomationScheduleNormalizationOutcome.LegacyScheduleMigrated)
         {
-            inspection += Environment.NewLine + occurrencePreview;
+            var (previous, _) = ParseMigrationSource(UserAutomationPreviousRevisionJson);
+            var previousWireJson = JsonSerializer.SerializeToElement(previous, OperatorJson.Writer);
+            if (submission.MigrationSourceRevisionJson is not { } expectedPrevious
+                || !JsonElement.DeepEquals(previousWireJson, expectedPrevious))
+            {
+                throw new InvalidOperationException(
+                    "This migration result is bound to a different immutable legacy predecessor; preserve that predecessor and run migration for the selected source.");
+            }
+            previousRevision = previous;
         }
-        if (projection.Occurrences.Count > shownOccurrences)
+        else
         {
-            inspection += Environment.NewLine
-                + $"...{projection.Occurrences.Count - shownOccurrences} further V4 occurrence record(s) remain in the revision.";
+            previousRevision = ParseRevision(UserAutomationPreviousRevisionJson);
         }
-        return detail + Environment.NewLine + inspection;
+
+        return new UserAutomationEditOperation(
+            previousRevision,
+            submission.Revision,
+            submission.NormalizationReceiptEnvelope.Clone());
+    }
+
+    private OwnerNormalizedScheduleSubmission RequireOwnerNormalizedRevision(string value)
+    {
+        var submission = _ownerNormalizedScheduleSubmission
+            ?? throw new InvalidOperationException(
+                "Create/edit requires a known owner-normalized V4 result. Caller-supplied V2/V3/V4 occurrences and schedule receipt projections are unverified; use migrate_legacy_schedule for an existing legacy revision or normalize_schedule for a new draft.");
+        var (_, revisionJson) = ParseRevisionWithJson(value);
+        if (!JsonElement.DeepEquals(revisionJson, submission.RevisionJson))
+        {
+            throw new InvalidOperationException(
+                "The supplied revision differs from the exact immutable owner-normalized result. Re-normalize this new revision; the UI never rewrites an immutable schedule in place.");
+        }
+        return submission;
+    }
+
+    private ushort ParseOccurrenceCount()
+    {
+        if (!ushort.TryParse(
+                UserAutomationOccurrenceCount,
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var count)
+            || count is < 1 or > OperatorScheduleContract.MAX_REFERENCES)
+        {
+            throw new InvalidOperationException(
+                $"occurrence_count must be an explicit integer from 1 to {OperatorScheduleContract.MAX_REFERENCES}.");
+        }
+        return count;
+    }
+
+    private static UserAutomationRevision ParseNormalizationDraft(string value)
+    {
+        var element = ReadRevisionJson(value, "UserAutomation normalization draft");
+        var revision = element.Deserialize<UserAutomationRevision>(OperatorJson.Reader)
+            ?? throw new InvalidOperationException("UserAutomation normalization draft JSON is required.");
+        revision.ValidateForNormalizationSubmission();
+        if (revision.Schedule.NextOccurrences.Count != 0 || revision.Schedule.NormalizationBinding is not null)
+        {
+            throw new InvalidOperationException(
+                "A normalization draft must have an empty next_occurrences array and no caller-supplied normalization_receipt. Use a new revision; immutable owner results are never stripped or rewritten.");
+        }
+        return revision;
+    }
+
+    private static (UserAutomationRevision Revision, JsonElement Json) ParseMigrationSource(string value)
+    {
+        var element = ReadRevisionJson(value, "legacy predecessor UserAutomation revision");
+        var revision = element.Deserialize<UserAutomationRevision>(OperatorJson.Reader)
+            ?? throw new InvalidOperationException("A legacy predecessor revision JSON object is required.");
+        revision.ValidateForMigrationSource();
+        return (revision, element);
+    }
+
+    private static (UserAutomationRevision Revision, JsonElement Json) ParseRevisionWithJson(string value)
+    {
+        var element = ReadRevisionJson(value, "owner-normalized UserAutomation revision");
+        var revision = element.Deserialize<UserAutomationRevision>(OperatorJson.Reader)
+            ?? throw new InvalidOperationException("UserAutomation schedule revision JSON is required.");
+        revision.Validate();
+        return (revision, element);
+    }
+
+    private static JsonElement ReadRevisionJson(string value, string field)
+    {
+        OperatorResponseGuard.ValidateLocalParameter(value, field);
+        using var document = JsonDocument.Parse(value);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException($"{field} must be one JSON object.");
+        }
+        return document.RootElement.Clone();
     }
 
     private string RequiredUserAutomationId()
@@ -970,19 +1220,17 @@ public sealed class MainViewModel : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// Reads one caller-supplied schedule revision into the closed contract type
-    /// and checks its bounded local shape for inspection.
+    /// Reads one owner-normalized V4 or current immutable predecessor into the
+    /// closed contract type and checks its bounded local shape. Legacy sources
+    /// are parsed only through ParseMigrationSource for the explicit migration
+    /// operation.
     /// </summary>
     /// <remarks>
-    /// The payload is READ, never repaired. The closed profile refuses an
-    /// unmapped member, and the schedule mirror refuses the occurrence grammar
-    /// and the exact supported contract version, so a legacy shape-only
-    /// occurrence cannot be submitted as a current revision. Parsing does not
-    /// prove owner normalization provenance. A refusal carries the owner's exact
-    /// sentence and the one action that answers it — for a
-    /// legacy encoding, a fresh owner normalization must be obtained before a
-    /// NEW revision is supplied; this UI does not produce that normalization,
-    /// and an immutable revision is never rewritten in place.
+    /// The payload is READ, never repaired. Create/Edit additionally require an
+    /// exact match to a known owner normalization result and carry its full
+    /// ReceiptEnvelope. A caller-supplied schedule receipt or V4 projection is
+    /// never accepted as evidence. Legacy predecessor bytes remain on the
+    /// separate explicit migration path and are never rewritten in place.
     /// <para>
     /// The exact supported contract version and the pinned zone database release
     /// are read out of the supplied occurrence bytes rather than from a second
@@ -992,18 +1240,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// </para>
     /// </remarks>
     private static UserAutomationRevision ParseRevision(string value)
-    {
-        // This is operator-typed JSON, so apply its independent structural caps
-        // and duplicate-key rejection before allocating the typed revision. The
-        // shared closed reader then rejects unknown fields at every schema level
-        // and matches member names exactly; that is stated once, on
-        // `OperatorJson.Reader`, and is not restated as a local copy here.
-        OperatorResponseGuard.ValidateLocalParameter(value, "user_automation_revision");
-        var revision = JsonSerializer.Deserialize<UserAutomationRevision>(value, OperatorJson.Reader)
-            ?? throw new InvalidOperationException("UserAutomation schedule revision JSON is required.");
-        revision.Validate();
-        return revision;
-    }
+        => ParseRevisionWithJson(value).Revision;
 
     private async Task LoadPageAsync(bool append)
     {
@@ -1277,12 +1514,119 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 : await _client.CommandAsync(
                     envelope,
                     _requestCancellation?.Token ?? CancellationToken.None);
-            // A settled owner answer is processed as the owner outcome even
-            // when the transport that carried it could not finish its local
-            // cleanup: the cleanup catch below delivers the same answer
-            // through this same path, so the journal records the true owner
-            // disposition instead of an unknown one.
-            await ProcessSettledCommandAnswerAsync(pending, receipt, action, cleanup: null);
+            bool accepted;
+            bool executed;
+            bool staleFence;
+            string outcome;
+            string? receiptId;
+            try
+            {
+                var parsed = ReadCommandReceipt(receipt, pending);
+                accepted = parsed.Accepted;
+                executed = parsed.Executed;
+                staleFence = parsed.StaleFence;
+                outcome = parsed.Outcome;
+                receiptId = parsed.ReceiptId;
+            }
+            catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException or JsonException)
+            {
+                // The owner answered but the receipt shape proves nothing:
+                // retain the same identity for reconciliation.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+                RefreshPendingState();
+                SetBanner(
+                    "Unknown outcome — reconcile, do not resubmit",
+                    $"{action}: {pending.OperationId} returned an unreadable receipt; use Reconcile before any retry.",
+                    OperatorBannerSeverity.Warning);
+                return;
+            }
+            if (accepted && executed && receiptId is null)
+            {
+                // The owner claims a durable mutation but proves nothing:
+                // retain the same identity for reconciliation, never resubmit.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+                RefreshPendingState();
+                SetBanner(
+                    "Unknown outcome — reconcile, do not resubmit",
+                    $"{action}: {pending.OperationId} was accepted without a canonical receipt; use Reconcile before any retry.",
+                    OperatorBannerSeverity.Warning);
+                return;
+            }
+            if (accepted && executed)
+            {
+                if (!RemovePending(pending.OperationId, OperatorOperationPhase.Receipted))
+                {
+                    RefreshPendingState();
+                    SetBanner(
+                        "Receipt received — recovery retained",
+                        $"{action}: the owner returned a receipt, but the local journal could not be compacted; reconcile the retained operation after recovery.",
+                        OperatorBannerSeverity.Warning);
+                    return;
+                }
+            }
+            else if (!accepted)
+            {
+                // An owner-bound refusal is terminal and distinct from a
+                // stale-fence answer, which proves the mutation was not
+                // admitted at the current State Fence.
+                var terminal = staleFence ? OperatorOperationPhase.StaleFence : OperatorOperationPhase.Rejected;
+                if (staleFence)
+                {
+                    // The owner PROVED the State Fence moved: the mutation was
+                    // not admitted at the submitted revision. That is a fence
+                    // change this client observed directly, and the retained
+                    // task context carries exactly the revision the owner just
+                    // refused. Rows, selection, cursor, graph focus, task
+                    // context and result payload are dropped HERE, before
+                    // anything can read that revision again. The retained
+                    // operation record is not dependent UI state and is
+                    // compacted by the branch below as usual.
+                    //
+                    // The request that observed the refusal has already
+                    // completed, so no in-flight response can apply state from
+                    // before it; the retained state is dropped without
+                    // cancelling the request token a later command still uses.
+                    ClearRetainedProjectionState(
+                        "The owner refused at the current State Fence; dependent UI state was invalidated before use.");
+                }
+                if (!RemovePending(pending.OperationId, terminal))
+                {
+                    RefreshPendingState();
+                    SetBanner(
+                        "Rejection received — recovery retained",
+                        $"{action}: the owner rejected the command, but the local journal could not be compacted; retain the exact operation for reconciliation.",
+                        OperatorBannerSeverity.Warning);
+                    return;
+                }
+            }
+            else
+            {
+                // An accepted-but-not-yet-executed response is still an
+                // owner-pending effect. Keep it durable and make the UI
+                // reconcile the same identity rather than treating the
+                // provisional answer as a terminal success.
+                ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            }
+            RefreshPendingState();
+            if (executed) await RefreshAsync();
+            var bannerTitle = accepted && !executed
+                ? "Command accepted — reconcile pending owner work"
+                : staleFence
+                    ? "Command refused — stale State Fence"
+                    : accepted
+                        ? "Command accepted"
+                        : "Command rejected";
+            var bannerSeverity = accepted && !executed
+                ? OperatorBannerSeverity.Warning
+                : accepted
+                    ? OperatorBannerSeverity.Success
+                    : OperatorBannerSeverity.Warning;
+            SetBanner(
+                bannerTitle,
+                receiptId is null
+                    ? $"{action}: {outcome}; no durable mutation executed."
+                    : $"{action}: {outcome}; canonical receipt {receiptId}.",
+                bannerSeverity);
         }
         catch (OperatorUnknownOutcomeException unknown)
         {
@@ -1297,15 +1641,18 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 $"{action}: {unknown.OperationId} may have executed at stage {unknown.Stage} ({unknown.Message}); use Reconcile before any retry.",
                 OperatorBannerSeverity.Warning);
         }
-        catch (OperatorCleanupIncompleteException<JsonElement> cleanup)
+        catch (OperatorCleanupIncompleteException cleanup)
         {
-            // The owner side is settled and the settled answer travels on the
-            // fault itself: it is processed through the normal owner-outcome
-            // path FIRST, so the journal records the true owner disposition
-            // (receipted, rejected, or reconcilable) instead of an unknown
-            // one. The local cleanup limitation is reported alongside that
-            // outcome, never as `UnknownReconciling` for the answer.
-            await ProcessSettledCommandAnswerAsync(pending, cleanup.OwnerAnswer, action, cleanup);
+            // The owner side is settled and only the local teardown of the
+            // transport that carried it was limited. That is distinct from an
+            // unknown owner result, so the record is never promoted to possibly
+            // executed, and it is never compacted either.
+            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
+            RefreshPendingState();
+            SetBanner(
+                "Owner answered — transport cleanup incomplete",
+                $"{action}: {cleanup.OperationId} was answered by the Governor, but the local transport cleanup was limited at stage {cleanup.Stage} ({cleanup.Message}); the retained operation stays reconcilable under the same identity.",
+                OperatorBannerSeverity.Warning);
         }
         catch (OperatorRestartRequiredException restart)
         {
@@ -1368,143 +1715,6 @@ public sealed class MainViewModel : INotifyPropertyChanged
             IsBusy = false;
             NotifyCounts();
         }
-    }
-
-    /// Processes one settled, fully-validated owner answer for a typed intent.
-    ///
-    /// The journal update is identical whether the transport that carried the
-    /// answer cleaned up or not: the normal answer path and the
-    /// answered-but-cleanup-limited path share it, so a settled owner outcome
-    /// is never rewritten as unknown because of a local teardown. When the
-    /// answer arrived on a cleanup limitation, that local limitation is noted
-    /// alongside the owner outcome instead of replacing it. The retained
-    /// operation keeps the same identity throughout; only the exact
-    /// owner-bound receipt branches may compact it.
-    private async Task ProcessSettledCommandAnswerAsync(
-        OperatorPendingOperation pending,
-        JsonElement receipt,
-        string action,
-        OperatorCleanupIncompleteException<JsonElement>? cleanup)
-    {
-        // A settled owner outcome is reported exactly as observed; the local
-        // cleanup limitation, when present, is appended as a separate fact so
-        // the banner names both without merging them into one phase.
-        string NoteCleanup(string detail) => cleanup is null
-            ? detail
-            : $"{detail} The local transport cleanup was limited at stage {cleanup.Stage}; the settled owner outcome above stands.";
-        bool accepted;
-        bool executed;
-        bool staleFence;
-        string outcome;
-        string? receiptId;
-        try
-        {
-            var parsed = ReadCommandReceipt(receipt, pending);
-            accepted = parsed.Accepted;
-            executed = parsed.Executed;
-            staleFence = parsed.StaleFence;
-            outcome = parsed.Outcome;
-            receiptId = parsed.ReceiptId;
-        }
-        catch (Exception error) when (error is InvalidOperationException or KeyNotFoundException or JsonException)
-        {
-            // The owner answered but the receipt shape proves nothing:
-            // retain the same identity for reconciliation.
-            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
-            RefreshPendingState();
-            SetBanner(
-                "Unknown outcome — reconcile, do not resubmit",
-                NoteCleanup($"{action}: {pending.OperationId} returned an unreadable receipt; use Reconcile before any retry."),
-                OperatorBannerSeverity.Warning);
-            return;
-        }
-        if (accepted && executed && receiptId is null)
-        {
-            // The owner claims a durable mutation but proves nothing:
-            // retain the same identity for reconciliation, never resubmit.
-            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
-            RefreshPendingState();
-            SetBanner(
-                "Unknown outcome — reconcile, do not resubmit",
-                NoteCleanup($"{action}: {pending.OperationId} was accepted without a canonical receipt; use Reconcile before any retry."),
-                OperatorBannerSeverity.Warning);
-            return;
-        }
-        if (accepted && executed)
-        {
-            if (!RemovePending(pending.OperationId, OperatorOperationPhase.Receipted))
-            {
-                RefreshPendingState();
-                SetBanner(
-                    "Receipt received — recovery retained",
-                    NoteCleanup($"{action}: the owner returned a receipt, but the local journal could not be compacted; reconcile the retained operation after recovery."),
-                    OperatorBannerSeverity.Warning);
-                return;
-            }
-        }
-        else if (!accepted)
-        {
-            // An owner-bound refusal is terminal and distinct from a
-            // stale-fence answer, which proves the mutation was not
-            // admitted at the current State Fence.
-            var terminal = staleFence ? OperatorOperationPhase.StaleFence : OperatorOperationPhase.Rejected;
-            if (staleFence)
-            {
-                // The owner PROVED the State Fence moved: the mutation was
-                // not admitted at the submitted revision. That is a fence
-                // change this client observed directly, and the retained
-                // task context carries exactly the revision the owner just
-                // refused. Rows, selection, cursor, graph focus, task
-                // context and result payload are dropped HERE, before
-                // anything can read that revision again. The retained
-                // operation record is not dependent UI state and is
-                // compacted by the branch below as usual.
-                //
-                // The request that observed the refusal has already
-                // completed, so no in-flight response can apply state from
-                // before it; the retained state is dropped without
-                // cancelling the request token a later command still uses.
-                ClearRetainedProjectionState(
-                    "The owner refused at the current State Fence; dependent UI state was invalidated before use.");
-            }
-            if (!RemovePending(pending.OperationId, terminal))
-            {
-                RefreshPendingState();
-                SetBanner(
-                    "Rejection received — recovery retained",
-                    NoteCleanup($"{action}: the owner rejected the command, but the local journal could not be compacted; retain the exact operation for reconciliation."),
-                    OperatorBannerSeverity.Warning);
-                return;
-            }
-        }
-        else
-        {
-            // An accepted-but-not-yet-executed response is still an
-            // owner-pending effect. Keep it durable and make the UI
-            // reconcile the same identity rather than treating the
-            // provisional answer as a terminal success.
-            ReplacePending(pending.OperationId, OperatorOperationPhase.UnknownReconciling);
-        }
-        RefreshPendingState();
-        if (executed) await RefreshAsync();
-        var bannerTitle = accepted && !executed
-            ? "Command accepted — reconcile pending owner work"
-            : staleFence
-                ? "Command refused — stale State Fence"
-                : accepted
-                    ? "Command accepted"
-                    : "Command rejected";
-        var bannerSeverity = accepted && !executed
-            ? OperatorBannerSeverity.Warning
-            : accepted
-                ? OperatorBannerSeverity.Success
-                : OperatorBannerSeverity.Warning;
-        SetBanner(
-            bannerTitle,
-            NoteCleanup(receiptId is null
-                ? $"{action}: {outcome}; no durable mutation executed."
-                : $"{action}: {outcome}; canonical receipt {receiptId}."),
-            bannerSeverity);
     }
 
     /// Reads one owner-bound command receipt. The receipt is read only when it is
@@ -1987,6 +2197,21 @@ public sealed class MainViewModel : INotifyPropertyChanged
         error is JsonException
             ? OperatorFaultReason.ForException(error)
             : error.Message;
+
+    private void InvalidateOwnerNormalizationEvidence()
+    {
+        if (_ownerNormalizedScheduleSubmission is null
+            && string.IsNullOrEmpty(UserAutomationNormalizationResultJson))
+        {
+            return;
+        }
+
+        _ownerNormalizedScheduleSubmission = null;
+        UserAutomationNormalizationResultJson = string.Empty;
+        ResultPayloadText = string.Empty;
+        ResultSummary = "The schedule draft, predecessor, or requested occurrence count changed after normalization. Run owner normalization or migration again before Create/Edit.";
+        SetBanner("Owner normalization cleared", ResultSummary, OperatorBannerSeverity.Warning);
+    }
 
     private void SetBanner(string title, string message, OperatorBannerSeverity severity)
     {
