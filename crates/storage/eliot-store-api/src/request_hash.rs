@@ -675,9 +675,10 @@ mod tests {
     #[test]
     fn golden_request_hash_is_stable_across_crates() {
         let view = golden_view();
-        // #1925 RE-PIN REQUIRED — the literal below is a deliberate fail-closed
-        // sentinel, NOT a digest. It must be replaced with the value
-        // `canonical_request_hash` actually emits over the current fixture.
+        // #1925 RE-PIN — the literal below is the value
+        // `canonical_request_hash` EMITTED over the current fixture, read off
+        // the owner's own failure output. It was not derived by reading this
+        // file and it was not invented; see the discipline note below.
         //
         // The previously pinned
         // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
@@ -696,7 +697,7 @@ mod tests {
         // as a failing sentinel rather than invented.
         assert_eq!(
             canonical_request_hash(&view).expect("golden hash computes"),
-            "REPIN-REQUIRED-1925-NOT-A-DIGEST"
+            "05cedc381edc6a841ee071f1fd5eaba6c667dac0c14fa4262c94a740aaac51f7"
         );
     }
 

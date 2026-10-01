@@ -67,11 +67,7 @@ pub fn admission_write_intent(leg: &str, subject: &str) -> Option<String> {
     if !is_declared_text(leg) || !is_declared_text(subject) {
         return None;
     }
-    let shape = (
-        ADMISSION_WRITE_INTENT_DOMAIN,
-        leg,
-        subject,
-    );
+    let shape = (ADMISSION_WRITE_INTENT_DOMAIN, leg, subject);
     // `canonical_json_bytes` cannot fail for this tuple of owned strings, so
     // the digest is total; a caller never sees a partially declared intent.
     let bytes = canonical_json_bytes(&shape).ok()?;
@@ -83,8 +79,7 @@ pub fn admission_write_intent(leg: &str, subject: &str) -> Option<String> {
 /// Re-exported from the owning boundary so a Governor leg never names a
 /// version literal of its own: `eliot-canonical` owns the exact supported
 /// revision and refuses any other.
-pub const GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION: u32 =
-    WRITE_ENVELOPE_PROTOCOL_VERSION;
+pub const GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION: u32 = WRITE_ENVELOPE_PROTOCOL_VERSION;
 
 fn is_declared_text(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
