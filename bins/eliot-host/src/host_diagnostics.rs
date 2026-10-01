@@ -571,6 +571,10 @@ impl EntrypointStage {
 /// Observation only: the stage was already decided by its owner before this
 /// call. All macro arguments are precomputed pure values, so a disabled
 /// event evaluates no extra effectful operation.
+///
+/// This bare stage record carries no operation identity: where the site
+/// holds one, prefer [`observe_phase_projection`], whose records correlate
+/// concurrent operations by their identity tuple instead of stage order.
 pub fn observe_entrypoint(stage: EntrypointStage) {
     tracing::info!(
         target: HOST_DIAGNOSTICS_TARGET,
@@ -584,7 +588,9 @@ pub fn observe_entrypoint(stage: EntrypointStage) {
 /// bounded nonsecret detail.
 ///
 /// The detail is truncated before formatting with its honesty record
-/// attached; see [`bound_detail`] for the nonsecret caller contract.
+/// attached; see [`bound_detail`] for the nonsecret caller contract. Like
+/// [`observe_entrypoint`], this bare stage record carries no operation
+/// identity: where the site holds one, prefer [`observe_phase_projection`].
 pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
     let bounded = bound_detail(detail);
     tracing::info!(
@@ -600,9 +606,14 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
 
 /// Records the single terminal error boundary with its exact typed code.
 ///
-/// One underlying failed operation yields exactly one terminal record here;
-/// lower-phase entrypoint observations correlate by stage order, not by a
-/// dedup cache. The code is bounded defensively; the HOST-0 reference call
+/// The bare code record carries no operation identity: one underlying failed
+/// operation yields exactly one terminal record here, and where the failure
+/// site holds the operation's projection, prefer
+/// [`observe_terminal_projection`], which emits the same `host.terminal_error`
+/// event with the shared identity tuple so the terminal correlates to its
+/// operation's phase records under concurrency. There is no dedup cache in
+/// either spelling: exactly-once emission stays with the owner's single
+/// outermost guard. The code is bounded defensively; the HOST-0 reference call
 /// site passes [`HOST_TERMINAL_CODE_CONSOLE_FAILED`], which projects
 /// `HostStopCode::ConsoleFailed` without duplicating its lifecycle ownership
 /// (I07.20, I14.20). Terminal receipt framing (capsule, SCM status, console
@@ -766,12 +777,23 @@ const fn project_host_error_reason(error: &HostError) -> &'static str {
 /// the construction site: the console request kind, the admitted service
 /// operation ([`AdmittedEvent`], shared with the Event Log sink contract),
 /// the launch installation handle and plan generation
-/// ([`HostLaunchOptions`]), the process id, the opened composition running
-/// state, the typed failure reason ([`HostError`] kind only), and the two
-/// console receipt identities (live journal sequence from [`HostState`],
-/// computed terminal exit value). Service ([`crate::SERVICE_NAME`]) and
-/// phase ([`EntrypointStage`]) are stamped on every record; nothing here
-/// creates a lifecycle or authority (I14.20, I01.10).
+/// ([`HostLaunchOptions`]), the operation-bound durable handles when the
+/// site already holds them (transaction, effect, request-digest and fence
+/// identities — the same `tx`/`effect`/`req` handle vocabulary the Phase-B
+/// observation binds per operation, plus the committed activation or
+/// registry-revision fence digest), the process id, the opened composition
+/// running state, the typed failure reason ([`HostError`] kind only), and
+/// the two console receipt identities (live journal sequence from
+/// [`HostState`], computed terminal exit value). Service
+/// ([`crate::SERVICE_NAME`]) and phase ([`EntrypointStage`]) are stamped on
+/// every record; nothing here creates a lifecycle or authority (I14.20,
+/// I01.10).
+///
+/// The transaction/effect/request-digest/fence slots are what keep two
+/// concurrent operations from mixing: records carrying the same operation
+/// identity tuple belong to one operation, and stage order across records is
+/// descriptive only. A site that does not hold a handle leaves it missing
+/// (see below) rather than substituting a caller string or a placeholder.
 ///
 /// Missing identities stay explicitly missing, never guessed: each slot
 /// renders with a `<slot>_missing` flag, and placeholder values (empty
@@ -786,6 +808,10 @@ pub struct HostRequestProjection {
     operation: Option<AdmittedEvent>,
     installation: Option<BoundedField>,
     generation: Option<u64>,
+    transaction: Option<BoundedField>,
+    effect: Option<BoundedField>,
+    request_digest: Option<BoundedField>,
+    fence: Option<BoundedField>,
     process: Option<u32>,
     running: Option<bool>,
     reason: Option<&'static str>,
@@ -874,6 +900,10 @@ impl HostRequestProjection {
             operation: None,
             installation: None,
             generation: None,
+            transaction: None,
+            effect: None,
+            request_digest: None,
+            fence: None,
             process: None,
             running: None,
             reason: None,
@@ -924,6 +954,60 @@ impl HostRequestProjection {
         self
     }
 
+    /// Attaches the transaction handle the owner already bound for this
+    /// operation (Phase-B `transaction_id` vocabulary, `tx`).
+    ///
+    /// Positional backing: call only where the construction site already
+    /// holds the owner's transaction identity for the operation this record
+    /// is about (durable preparation, pending activation, or rebind intent).
+    /// The handle is bounded with truncation honesty; a site that does not
+    /// hold it leaves the slot missing instead of substituting text. The
+    /// caller must pass only nonsecret handle material (digests, never
+    /// authority bytes, paths, SIDs, or error text).
+    #[must_use]
+    pub fn with_transaction_handle(mut self, transaction: &str) -> Self {
+        self.transaction = Some(bound_field(transaction));
+        self
+    }
+
+    /// Attaches the effect handle the owner already bound for this
+    /// operation (Phase-B `effect_id` vocabulary).
+    ///
+    /// Positional backing and nonsecret contract: see
+    /// [`Self::with_transaction_handle`].
+    #[must_use]
+    pub fn with_effect_handle(mut self, effect: &str) -> Self {
+        self.effect = Some(bound_field(effect));
+        self
+    }
+
+    /// Attaches the request-digest handle the owner already bound for this
+    /// operation (Phase-B `request_digest` vocabulary, `req`).
+    ///
+    /// Distinct from [`Self::with_request`], which carries the console
+    /// request kind: this slot carries the durable request identity. A
+    /// console site whose wire carries no digest (the raw line is user
+    /// content) leaves this slot missing; the serving correlation the
+    /// console contour owns stays with that contour, never guessed here.
+    /// Positional backing and nonsecret contract: see
+    /// [`Self::with_transaction_handle`].
+    #[must_use]
+    pub fn with_request_digest(mut self, request_digest: &str) -> Self {
+        self.request_digest = Some(bound_field(request_digest));
+        self
+    }
+
+    /// Attaches the fence digest the owner already bound for this operation
+    /// (committed activation or registry-revision fence).
+    ///
+    /// Positional backing and nonsecret contract: see
+    /// [`Self::with_transaction_handle`].
+    #[must_use]
+    pub fn with_fence_handle(mut self, fence: &str) -> Self {
+        self.fence = Some(bound_field(fence));
+        self
+    }
+
     /// Attaches the live journal sequence from state already in hand for
     /// the wire response. The state is never read for diagnostics: pass
     /// only a snapshot the owner path already computed.
@@ -954,6 +1038,10 @@ impl HostRequestProjection {
 pub fn observe_host_request(projection: &HostRequestProjection) {
     publish_projected_event_log_record(projection);
     let installation = projection.installation.as_ref();
+    let transaction = projection.transaction.as_ref();
+    let effect = projection.effect.as_ref();
+    let request_digest = projection.request_digest.as_ref();
+    let fence = projection.fence.as_ref();
     tracing::info!(
         target: HOST_DIAGNOSTICS_TARGET,
         event = "host.request",
@@ -970,6 +1058,22 @@ pub fn observe_host_request(projection: &HostRequestProjection) {
         installation_missing = installation.is_none(),
         generation = projection.generation.unwrap_or(0),
         generation_missing = projection.generation.is_none(),
+        transaction = transaction.map_or("", BoundedField::text),
+        transaction_bytes = transaction.map_or(0, BoundedField::original_bytes),
+        transaction_truncated = transaction.is_some_and(BoundedField::truncated),
+        transaction_missing = projection.transaction.is_none(),
+        effect = effect.map_or("", BoundedField::text),
+        effect_bytes = effect.map_or(0, BoundedField::original_bytes),
+        effect_truncated = effect.is_some_and(BoundedField::truncated),
+        effect_missing = projection.effect.is_none(),
+        request_digest = request_digest.map_or("", BoundedField::text),
+        request_digest_bytes = request_digest.map_or(0, BoundedField::original_bytes),
+        request_digest_truncated = request_digest.is_some_and(BoundedField::truncated),
+        request_digest_missing = projection.request_digest.is_none(),
+        fence = fence.map_or("", BoundedField::text),
+        fence_bytes = fence.map_or(0, BoundedField::original_bytes),
+        fence_truncated = fence.is_some_and(BoundedField::truncated),
+        fence_missing = projection.fence.is_none(),
         process = projection.process.unwrap_or(0),
         process_missing = projection.process.is_none(),
         running = projection.running.unwrap_or(false),
@@ -981,6 +1085,197 @@ pub fn observe_host_request(projection: &HostRequestProjection) {
         receipt_exit = projection.receipt_exit.unwrap_or(0),
         receipt_exit_missing = projection.receipt_exit.is_none(),
         "host request projection"
+    );
+}
+
+/// Records one operation-bound phase observation keyed by operation identity.
+///
+/// This is the correlated phase emitter the bare stage emitters
+/// ([`observe_entrypoint`], [`observe_entrypoint_with_detail`]) cannot be:
+/// two concurrent operations interleave stage records, so a phase record
+/// carries the full identity bundle of its own [`HostRequestProjection`]
+/// and correlates by that operation identity tuple (operation, installation,
+/// generation, transaction, effect, request-digest, fence, process), never
+/// by stage order. Records sharing the tuple belong to one operation;
+/// stage order across records is descriptive only.
+///
+/// Observation only: every identity was decided or produced by its owner
+/// before this call, the evidence class is rendered unchanged (observed,
+/// admitted, process-started, semantically-ready, durable-committed,
+/// cancelled, failed and unknown stay distinct), and missing slots render
+/// `<slot>_missing` rather than a guessed value. The record goes to stderr
+/// over the shared `tracing` subscriber at `INFO`, so the console-protocol
+/// stdout framing is preserved. All macro arguments are precomputed pure
+/// values, so a disabled event evaluates no extra effectful operation.
+///
+/// There is no second logger and no dedup cache here: at-most-one-terminal
+/// per operation stays with the owner's single outermost guard, and Event
+/// Log admission is not repeated here — a single admission per operation
+/// stays solely with [`observe_host_request`], so this emitter never asks
+/// the sink to record an outcome twice.
+///
+/// Package path, all six links: (1) authoritative producer — the semantic
+/// owner that already produced the identities (Host composition open/stop
+/// contours, launch-options admission, Phase-B preparation record, console
+/// dispatch); (2) immutable input/identity — the platform-handle digests,
+/// generation and process id already held at the construction site, bounded
+/// here, never probed or guessed; (3) production caller — `lib.rs`
+/// `host_lifecycle_observe_identity` and the `main.rs` console dispatch
+/// contours, named but not wired in this turn (their adoption is the
+/// #985-oracle/#891-leaf ceiling; this turn provides the facade symbols);
+/// (4) effect and adoption — one bounded stderr `tracing` record, sink
+/// outcome never changing results; (5) persisted owner result — the
+/// HostState journal sequence, terminal exit and durable fence/receipts,
+/// owned and persisted by HostState/journal/registry and projected
+/// read-only here (diagnostics persist nothing: that absence names its
+/// ceiling, the owner journal); (6) ordinary read/status/cancel/restart
+/// consumer — the console Status reader, Stop/cancel path and
+/// kernel-restart reconcile, which decide from owner state, never from
+/// diagnostic records. No link is a wrapper returning Missing and no slot
+/// carries `None` in place of owner data: a missing slot is the positive
+/// statement that the site does not hold the fact.
+pub fn observe_phase_projection(projection: &HostRequestProjection) {
+    let installation = projection.installation.as_ref();
+    let transaction = projection.transaction.as_ref();
+    let effect = projection.effect.as_ref();
+    let request_digest = projection.request_digest.as_ref();
+    let fence = projection.fence.as_ref();
+    tracing::info!(
+        target: HOST_DIAGNOSTICS_TARGET,
+        event = "host.phase",
+        service = crate::SERVICE_NAME,
+        phase = projection.phase.as_str(),
+        evidence = projection.evidence.as_str(),
+        request = projection.request.map_or("", HostConsoleRequest::as_str),
+        request_missing = projection.request.is_none(),
+        operation = projection.operation.map_or("", AdmittedEvent::as_str),
+        operation_missing = projection.operation.is_none(),
+        installation = installation.map_or("", BoundedField::text),
+        installation_bytes = installation.map_or(0, BoundedField::original_bytes),
+        installation_truncated = installation.is_some_and(BoundedField::truncated),
+        installation_missing = installation.is_none(),
+        generation = projection.generation.unwrap_or(0),
+        generation_missing = projection.generation.is_none(),
+        transaction = transaction.map_or("", BoundedField::text),
+        transaction_bytes = transaction.map_or(0, BoundedField::original_bytes),
+        transaction_truncated = transaction.is_some_and(BoundedField::truncated),
+        transaction_missing = projection.transaction.is_none(),
+        effect = effect.map_or("", BoundedField::text),
+        effect_bytes = effect.map_or(0, BoundedField::original_bytes),
+        effect_truncated = effect.is_some_and(BoundedField::truncated),
+        effect_missing = projection.effect.is_none(),
+        request_digest = request_digest.map_or("", BoundedField::text),
+        request_digest_bytes = request_digest.map_or(0, BoundedField::original_bytes),
+        request_digest_truncated = request_digest.is_some_and(BoundedField::truncated),
+        request_digest_missing = projection.request_digest.is_none(),
+        fence = fence.map_or("", BoundedField::text),
+        fence_bytes = fence.map_or(0, BoundedField::original_bytes),
+        fence_truncated = fence.is_some_and(BoundedField::truncated),
+        fence_missing = projection.fence.is_none(),
+        process = projection.process.unwrap_or(0),
+        process_missing = projection.process.is_none(),
+        running = projection.running.unwrap_or(false),
+        running_missing = projection.running.is_none(),
+        reason = projection.reason.unwrap_or(""),
+        reason_missing = projection.reason.is_none(),
+        receipt_sequence = projection.receipt_sequence.unwrap_or(0),
+        receipt_sequence_missing = projection.receipt_sequence.is_none(),
+        receipt_exit = projection.receipt_exit.unwrap_or(0),
+        receipt_exit_missing = projection.receipt_exit.is_none(),
+        "host phase projection"
+    );
+}
+
+/// Records the single terminal error boundary for the operation the
+/// projection identifies, with the same operation identity as its phase
+/// records.
+///
+/// One underlying failed operation yields exactly one terminal record, and
+/// that terminal correlates to its operation's phase records by the shared
+/// identity tuple (operation, installation, generation, transaction, effect,
+/// request-digest, fence, process) — not by stage order, so one injected
+/// nested failure gives exactly one terminal with the same
+/// return/receipt/cleanup correlation under concurrency. The code is the
+/// same bounded observation vocabulary as [`observe_terminal_error`]
+/// (the HOST-0 reference call site passes
+/// [`HOST_TERMINAL_CODE_CONSOLE_FAILED`], which projects
+/// `HostStopCode::ConsoleFailed` without duplicating its lifecycle
+/// ownership). The projection's evidence is rendered unchanged; this
+/// function never remaps it and never decides terminal-ness: exactly-once
+/// emission stays with the owner's single outermost guard (the `lib.rs`
+/// terminal guard, the console contour), and there is no second logger and
+/// no dedup cache here. Terminal receipt framing (capsule, SCM status,
+/// console exit code) is untouched and still owns the process exit.
+///
+/// Package path, all six links: (1) authoritative producer — the failing
+/// operation's owner contour, which already produced the outcome and the
+/// identities; (2) immutable input/identity — the handles already held at
+/// the failure site, bounded here, never probed or guessed; (3) production
+/// caller — `lib.rs` `host_lifecycle_observe_terminal` and the `main.rs`
+/// console failure contour, named but not wired in this turn (their
+/// adoption is the #985-oracle/#891-leaf ceiling; this turn provides the
+/// facade symbol); (4) effect and adoption — one bounded stderr `tracing`
+/// `ERROR` record sharing the `host.terminal_error` event, sink outcome
+/// never changing results; (5) persisted owner result — the durable
+/// receipt/cleanup disposition owned and persisted by the owner (journal,
+/// fence, SCM status), projected read-only here; (6) ordinary
+/// read/status/cancel/restart consumer — console Status, Stop/cancel and
+/// restart reconcile, deciding from owner state, never from this record.
+/// No link is a wrapper returning Missing and no slot carries `None` in
+/// place of owner data.
+pub fn observe_terminal_projection(projection: &HostRequestProjection, code: &str) {
+    let bounded = bound_field(code);
+    let installation = projection.installation.as_ref();
+    let transaction = projection.transaction.as_ref();
+    let effect = projection.effect.as_ref();
+    let request_digest = projection.request_digest.as_ref();
+    let fence = projection.fence.as_ref();
+    tracing::error!(
+        target: HOST_DIAGNOSTICS_TARGET,
+        event = "host.terminal_error",
+        code = bounded.text(),
+        code_bytes = bounded.original_bytes(),
+        code_truncated = bounded.truncated(),
+        service = crate::SERVICE_NAME,
+        phase = projection.phase.as_str(),
+        evidence = projection.evidence.as_str(),
+        request = projection.request.map_or("", HostConsoleRequest::as_str),
+        request_missing = projection.request.is_none(),
+        operation = projection.operation.map_or("", AdmittedEvent::as_str),
+        operation_missing = projection.operation.is_none(),
+        installation = installation.map_or("", BoundedField::text),
+        installation_bytes = installation.map_or(0, BoundedField::original_bytes),
+        installation_truncated = installation.is_some_and(BoundedField::truncated),
+        installation_missing = installation.is_none(),
+        generation = projection.generation.unwrap_or(0),
+        generation_missing = projection.generation.is_none(),
+        transaction = transaction.map_or("", BoundedField::text),
+        transaction_bytes = transaction.map_or(0, BoundedField::original_bytes),
+        transaction_truncated = transaction.is_some_and(BoundedField::truncated),
+        transaction_missing = projection.transaction.is_none(),
+        effect = effect.map_or("", BoundedField::text),
+        effect_bytes = effect.map_or(0, BoundedField::original_bytes),
+        effect_truncated = effect.is_some_and(BoundedField::truncated),
+        effect_missing = projection.effect.is_none(),
+        request_digest = request_digest.map_or("", BoundedField::text),
+        request_digest_bytes = request_digest.map_or(0, BoundedField::original_bytes),
+        request_digest_truncated = request_digest.is_some_and(BoundedField::truncated),
+        request_digest_missing = projection.request_digest.is_none(),
+        fence = fence.map_or("", BoundedField::text),
+        fence_bytes = fence.map_or(0, BoundedField::original_bytes),
+        fence_truncated = fence.is_some_and(BoundedField::truncated),
+        fence_missing = projection.fence.is_none(),
+        process = projection.process.unwrap_or(0),
+        process_missing = projection.process.is_none(),
+        running = projection.running.unwrap_or(false),
+        running_missing = projection.running.is_none(),
+        reason = projection.reason.unwrap_or(""),
+        reason_missing = projection.reason.is_none(),
+        receipt_sequence = projection.receipt_sequence.unwrap_or(0),
+        receipt_sequence_missing = projection.receipt_sequence.is_none(),
+        receipt_exit = projection.receipt_exit.unwrap_or(0),
+        receipt_exit_missing = projection.receipt_exit.is_none(),
+        "host terminal error"
     );
 }
 
