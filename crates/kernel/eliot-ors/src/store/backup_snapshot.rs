@@ -915,8 +915,8 @@ struct DispositionedTable {
 /// and there it comes from redb, not from this file.
 ///
 /// Counted against `store.rs`, `store/restore_journal.rs` and `status.rs` at the
-/// time of writing: 75 distinct declared tables, of which 46 back a dispositioned
-/// row family and 29 are explicit source-bound exclusions.
+/// time of writing: 77 distinct declared tables, of which 46 back a dispositioned
+/// row family and 31 are explicit source-bound exclusions.
 /// `row_family_denominator` carries 43 families and every one of them is now bound
 /// to a table by this census.
 ///
@@ -934,7 +934,7 @@ struct DispositionedTable {
 /// in this issue. Until it exists, a table added to `store.rs` is on the author.
 ///
 /// Split in four so no half can grow past the point where a reader stops
-/// checking it: 46 table-backed tables and 28 source-bound exclusions.
+/// checking it: 46 table-backed tables and 31 source-bound exclusions.
 fn dispositioned_tables() -> Vec<DispositionedTable> {
     let mut tables = family_backed_tables();
     tables.extend(source_bound_exclusions());
@@ -969,7 +969,7 @@ fn excluded(
     }
 }
 
-/// The 45 tables that back a dispositioned row family.
+/// The 46 tables that back a dispositioned row family.
 fn family_backed_tables() -> Vec<DispositionedTable> {
     let mut tables = canonical_family_tables();
     tables.extend(supervision_and_replay_family_tables());
@@ -1535,7 +1535,7 @@ fn purge_ledger_exclusions() -> Vec<DispositionedTable> {
 ///    advertise a quarantined import path for a table that has no family and
 ///    therefore no import path.
 ///
-/// Cost is one `list_tables` plus a 71-entry linear scan, both bounded and both
+/// Cost is one `list_tables` plus a 77-entry linear scan, both bounded and both
 /// independent of store size: it is a schema census, not a data scan. It runs
 /// once per export entrypoint and once per quarantined import, never per page.
 ///
