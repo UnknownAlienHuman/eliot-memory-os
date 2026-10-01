@@ -714,15 +714,20 @@ struct KernelRoute {
 /// (the only path the adapter admits for reserved writes); `Receipt`
 /// reconciles by identity. `Apply` panics: the canonical route under test
 /// never falls back to unreserved writes.
+///
+/// Every handshake field is projected from the same
+/// `HostStoreBootstrapRequirement` the real client admits with, including
+/// the authenticated peer principal tuple the requirement carries (#4652).
+/// The responder therefore cannot announce a principal, connection,
+/// authority, artifact or config identity the client does not expect.
 async fn serve_store_route(
     mut server: NamedPipeServer,
-    connection_id: String,
-    artifact_hash: String,
-    config_hash: String,
+    requirement: HostStoreBootstrapRequirement,
     adapter: Arc<SurrealStoreAdapter>,
     reserved_sends: Arc<AtomicUsize>,
 ) {
     let limits = TransportLimits::default();
+    let connection_id = requirement.connection_id.as_str().to_owned();
     let frame = server
         .receive_frame(limits)
         .await
@@ -734,7 +739,16 @@ async fn serve_store_route(
     );
     let hello = ServerHello {
         selected_protocol: ProtocolVersion::CURRENT,
-        session_principal_binding: "sconc994-route-store-session".to_owned(),
+        // The Store must announce the exact authenticated peer identity the
+        // Host requirement admitted. This is the same projection the real
+        // client validator reconstructs in `decode_server_hello`, so a stale
+        // or retyped principal here is refused by production code, never
+        // accommodated by the fixture.
+        session_principal_binding: format!(
+            "sid={};session={}",
+            requirement.expected_peer_sid.as_str(),
+            requirement.expected_peer_session_id
+        ),
         allowed_capabilities: eliot_store_api::CAPABILITIES
             .iter()
             .map(|value| (*value).to_owned())
@@ -744,13 +758,13 @@ async fn serve_store_route(
             .map(|value| (*value).to_owned())
             .collect(),
         config_snapshot: json!({
-            "config_hash": config_hash,
-            "artifact_hash": artifact_hash,
+            "config_hash": requirement.approved_config_hash.as_str(),
+            "artifact_hash": requirement.approved_artifact_hash.as_str(),
         }),
         heartbeat_ms: 1_000,
         control_channel: "sconc994-route-control".to_owned(),
         rejection_reason: None,
-        authority_epoch: epoch(1),
+        authority_epoch: requirement.authority_epoch().clone(),
     };
     server
         .send_frame(
@@ -884,15 +898,14 @@ async fn kernel_route(case: &str, adapter: Arc<SurrealStoreAdapter>) -> KernelRo
         approved_config_hash: PlatformHandle::new("b".repeat(64)).expect("config"),
         timeout_ms: 30_000,
     };
-    let artifact = requirement.approved_artifact_hash.as_str().to_owned();
-    let config = requirement.approved_config_hash.as_str().to_owned();
-    let connection_id = requirement.connection_id.as_str().to_owned();
     let reserved_sends = Arc::new(AtomicUsize::new(0));
+    // ONE source for the handshake identity: the responder answers from the
+    // very same requirement the client admits with, so the announced
+    // authenticated peer principal can never drift from the approved
+    // connection/authority/artifact/config identity (#4652).
     let server_task = tokio::spawn(serve_store_route(
         server,
-        connection_id,
-        artifact,
-        config,
+        requirement.clone(),
         adapter,
         Arc::clone(&reserved_sends),
     ));
