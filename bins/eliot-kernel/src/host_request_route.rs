@@ -3208,12 +3208,16 @@ impl KernelComposition {
     /// (daemon-leg memory only — the durable ORS record is untouched). A full
     /// queue of claimed/in-flight attempts returns backpressure rather than
     /// silently stealing a live attempt.
+    ///
+    /// Returns the admitted carrier FORM so a caller that must not complete the
+    /// other lane's attempt can tell which shape it just queued; the real
+    /// enqueue is under the transition read and reports the form it admitted.
     #[cfg(test)]
     pub(crate) fn enqueue_local_read_pair(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
+    ) -> Result<LocalReadPairKind, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         self.enqueue_local_read_pair_under_transition(envelope, tool)
     }
@@ -10935,6 +10939,7 @@ mod invoke_read_tool_tests {
             local_read_tool: None,
             local_read_held_bytes: 0,
             local_read_attempt: LocalReadAttemptState::default(),
+            local_read_pair_kind: None,
             observe_envelope: None,
             observe_tool: None,
             observe_reservation: None,
@@ -10969,6 +10974,7 @@ mod invoke_read_tool_tests {
             &envelope,
             &tool,
             bytes,
+            LocalReadPairKind::Query,
             LocalReadAttemptState::default(),
         );
         row
@@ -11137,6 +11143,7 @@ mod invoke_read_tool_tests {
             &envelope,
             &tool,
             13,
+            LocalReadPairKind::Query,
             LocalReadAttemptState::default(),
         );
         assert_eq!(
