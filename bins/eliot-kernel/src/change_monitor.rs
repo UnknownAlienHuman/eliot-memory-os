@@ -1457,6 +1457,29 @@ pub(crate) fn hydrate_ledger_sidecar_if_empty() -> Result<bool, ChangeMonitorErr
     Ok(true)
 }
 
+/// Validates one durable gap-marker witness with the same shape live
+/// ingress enforces (issue #1824 W3): the required operation plus the
+/// optional session/lease/attempt references. Markers recorded before
+/// witness correlation carry none.
+fn validate_witness_shape(witness: &UnresolvedTransitionWitness) -> Result<(), ChangeMonitorError> {
+    if !text(&witness.operation) {
+        return Err(ChangeMonitorError::SidecarCorrupt);
+    }
+    for reference in [
+        witness.session.as_ref(),
+        witness.action_lease.as_ref(),
+        witness.attempt_receipt.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !text(reference) {
+            return Err(ChangeMonitorError::SidecarCorrupt);
+        }
+    }
+    Ok(())
+}
+
 fn validate_imported_ledger(ledger: &KernelChangeLedger) -> Result<(), ChangeMonitorError> {
     for entry in ledger.hints.values() {
         validate_hint(&entry.hint).map_err(|_| ChangeMonitorError::SidecarCorrupt)?;
@@ -1514,21 +1537,7 @@ fn validate_imported_ledger(ledger: &KernelChangeLedger) -> Result<(), ChangeMon
         // live ingress enforces; markers recorded before witness
         // correlation carry none.
         if let Some(witness) = &unknown.witness {
-            if !text(&witness.operation) {
-                return Err(ChangeMonitorError::SidecarCorrupt);
-            }
-            for reference in [
-                witness.session.as_ref(),
-                witness.action_lease.as_ref(),
-                witness.attempt_receipt.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if !text(reference) {
-                    return Err(ChangeMonitorError::SidecarCorrupt);
-                }
-            }
+            validate_witness_shape(witness)?;
         }
         for digest in [&unknown.before_digest, &unknown.after_digest]
             .into_iter()
