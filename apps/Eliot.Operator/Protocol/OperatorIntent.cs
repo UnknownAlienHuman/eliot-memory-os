@@ -175,7 +175,10 @@ public static class LegacyOperatorAdapter
     ///
     /// 1. A current-owner ControlBoard read route is served on the Operator
     ///    pipe and this client consumes it. It is not served today:
-    ///    `git grep "controlboard.status" -- apps/` matches nothing.
+    ///    `git grep "controlboard.status" -- apps/
+    ///    ':!apps/Eliot.Operator/Protocol/OperatorIntent.cs'` matches nothing.
+    ///    The exclusion is required: this comment is itself in `apps/`, so the
+    ///    unexcluded command matches only this line.
     /// 2. The consumed page carries an owner-issued State Fence that this
     ///    client validates, replacing the `owner_unissued` constant
     ///    (`OperatorResponseBounds.cs:151`). The current owner already computes

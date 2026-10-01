@@ -667,17 +667,18 @@ public sealed record UserAutomationOperatorRequest(
         // unknown `kind`, but that is a different claim: a decoded request
         // whose `operation` member is `null` reaches this method with nothing
         // in front of it, and `DeriveIdempotencyKey` does not stand in front
-        // either — its `ArgumentNullException.ThrowIfNull` at :195 refuses a
+        // either — its `ArgumentNullException.ThrowIfNull` at :610 refuses a
         // caller-supplied argument, never a decoded request record. A
         // `NullReferenceException` is not an `InvalidOperationException`, so
-        // the fault would escape `MainViewModel.cs:473` and
-        // `OperatorPendingOperationJournal.cs:495`, which both filter on
+        // the fault would escape the `catch` at `MainViewModel.cs:566` and the
+        // one at `OperatorPendingOperationJournal.cs:527`, which both filter on
         // `JsonException or InvalidOperationException`, instead of the
         // withheld, still-reconciling outcome they are written to produce.
         // Refused by name here, one fixed sentence over the wire member,
         // exactly as `create`, `edit` and `UserAutomationRevision` refuse
         // theirs. This fires before the journal's own
-        // `Request.Operation.IsEffect()` at :486, so that second dereference
+        // `Request.Operation.IsEffect()` at
+        // `OperatorPendingOperationJournal.cs:518`, so that second dereference
         // is covered by the same refusal. This adds no bound, no wire member
         // and no digest input: `DeriveIdempotencyKey` digests
         // `JsonSerializer.Serialize(operation, OperatorJson.Writer)`, which
