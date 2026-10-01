@@ -600,9 +600,11 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
             &[unresolved_projection],
             &[artifact("ref")?]
         ),
-        Err(eliot_learning_contracts::LearningContractError::ScopeMismatch {
-            field: "slot.requirement.depends_on"
-        })
+        Err(
+            eliot_learning_contracts::LearningContractError::ScopeMismatch {
+                field: "slot.requirement.depends_on"
+            }
+        )
     ));
 
     // The `slot.depends_on` label bound is reached only once the dependency
@@ -615,8 +617,7 @@ fn duplicate_slot_and_changed_shared_lineage_fail_closed() -> TestResult {
         vec![1, 1],
         OmissionPolicy::RequiredSlots,
     )?;
-    let oversized_identity =
-        SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?);
+    let oversized_identity = SlotId::from_artifact(artifact(&"d".repeat(MAX_LABEL_BYTES + 1))?);
     oversized_dependency.slots[1].slot_id = oversized_identity.clone();
     oversized_dependency.slots[0].requirement = SlotRequirement::Conditional {
         depends_on: oversized_identity,
