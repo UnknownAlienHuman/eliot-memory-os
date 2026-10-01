@@ -176,7 +176,8 @@ pub use agent_fabric::{
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
     PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
     SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    daemon_coordinator_config, plan_candidate, prepare_swarm_definition_admission_candidate,
+    admit_swarm_definition_candidate, begin_swarm_execution_candidate, daemon_coordinator_config,
+    launch_swarm_child_candidate, plan_candidate, prepare_swarm_definition_admission_candidate,
     prereq_ports,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
@@ -3311,6 +3312,88 @@ impl DaemonComposition {
         let config = daemon_coordinator_config()
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         prepare_swarm_definition_admission_candidate(&config, proposal, maps)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Admits one prepared swarm definition through the Governor admission owner
+    /// on the admitted daemon path (issue #1699).
+    ///
+    /// Readiness gates the call; admission delegates to
+    /// [`admit_swarm_definition_candidate`], so the production caller and the
+    /// wired tests share one implementation. The Governor-issued admission
+    /// receipt and the injected receipt verifier travel as caller-supplied
+    /// ports: nothing is minted here, no durable write occurs, and nothing is
+    /// launched. Launch stays with the existing injected
+    /// admission/activation/dispatch ports.
+    pub fn agent_fabric_admit_swarm_definition(
+        &self,
+        prep: &eliot_agent_coordinator::SwarmDefinitionAdmissionPrep,
+        proposal: &eliot_swarm::SwarmPlanProposal,
+        maps: &eliot_swarm::SealedIndependentMaps,
+        admission_receipt: eliot_receipts::ReceiptEnvelope,
+        verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+    ) -> Result<eliot_swarm::AdmittedSwarmPlan, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_admit_swarm_definition").entered();
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        admit_swarm_definition_candidate(&config, prep, proposal, maps, admission_receipt, verifier)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Begins provider-owned P3 execution for one admitted swarm plan through
+    /// the injected A-02 activation port on the admitted daemon path (issue
+    /// #1699).
+    ///
+    /// Readiness gates the call; activation delegates to
+    /// [`begin_swarm_execution_candidate`], so the production caller and the
+    /// wired tests share one implementation. The route provider and receipt
+    /// verifier travel as caller-supplied injected ports: this performs no
+    /// durable write and starts no process.
+    pub fn agent_fabric_begin_swarm_execution(
+        &self,
+        plan: &eliot_swarm::AdmittedSwarmPlan,
+        a02: Option<&dyn eliot_swarm::AgentRouteProvider>,
+        verifier: Option<&dyn eliot_swarm::ReceiptVerificationPort>,
+    ) -> Result<eliot_swarm::ExecutionState, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_begin_swarm_execution").entered();
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        begin_swarm_execution_candidate(&config, plan, a02, verifier)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Dispatches one sealed swarm child through the existing injected
+    /// dispatch ports on the admitted daemon path (issue #1699).
+    ///
+    /// Readiness gates the call; dispatch delegates to
+    /// [`launch_swarm_child_candidate`], so the production caller and the
+    /// wired tests share one implementation. The store and executor travel as
+    /// caller-supplied injected ports that pin the owner-side feeding seam:
+    /// the returned intent is candidate-only, and persisting it through the
+    /// owner-side append path BEFORE calling the executor stays with the
+    /// Kernel writer owner. This performs no store append, no executor call,
+    /// and no scheduler step.
+    pub fn agent_fabric_launch_swarm_child(
+        &self,
+        plan: &eliot_swarm::AdmittedSwarmPlan,
+        attachment: &eliot_swarm::durable_dispatch::DurableJobAttachment,
+        inputs: eliot_swarm::adapter_launch::SealedChildInputs<'_>,
+        store: &dyn eliot_swarm::durable_work::DurableWorkStore,
+        executor: &dyn eliot_swarm::durable_work::WorkExecutor,
+    ) -> Result<eliot_swarm::adapter_launch::SealedChildLaunch, DaemonError> {
+        let _span = tracing::info_span!("eliotd.fabric_launch_swarm_child").entered();
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(DaemonError::Composition(CompositionError::NotReady));
+        }
+        let config = daemon_coordinator_config()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        launch_swarm_child_candidate(&config, plan, attachment, inputs, store, executor)
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
