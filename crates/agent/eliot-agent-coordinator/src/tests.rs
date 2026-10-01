@@ -114,7 +114,13 @@ fn fixture_schema_identity(label: &str) -> eliot_contracts::ContractIdentity {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
+    // I3.6 requires staffing and route mix to follow current policy. This fixture
+    // uses the explicit genesis policy revision; it does not stand in for live
+    // policy evidence (`docs/architecture/I03-06-model-route-and-portfolio-policy.md`).
+    StateFence {
+        policy_revision: Some(PolicyRevision::genesis()),
+        ..StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
+    }
 }
 
 fn full_fence() -> StateFence {
