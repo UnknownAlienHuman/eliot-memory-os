@@ -69,6 +69,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const AUTOMATION_NORMALIZATION_ENTRIES: &str = "entries";
+
 use super::{
     UserAutomationMutationResult, UserAutomationReadResult, UserAutomationServiceError,
     UserAutomationServiceRequest, UserAutomationStoreOutcome, UserAutomationStorePort,
@@ -299,7 +301,7 @@ impl<C> CanonicalUserAutomationStore<C> {
         validate_named_response(request, &response)?;
         let entries = response
             .payload
-            .get(eliot_store_api::AUTOMATION_PAGE_REVISIONS)
+            .get(AUTOMATION_NORMALIZATION_ENTRIES)
             .and_then(Value::as_array)
             .ok_or(StoreError::InvalidField {
                 field: "automation.normalization_records",
