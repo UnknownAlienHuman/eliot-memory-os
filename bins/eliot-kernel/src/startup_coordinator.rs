@@ -1070,7 +1070,7 @@ impl StartupCoordinator {
             watchdog_epoch,
             heartbeat_proof,
             observed_at_ms,
-            progress_frontier,
+            progress_frontier: _,
             valid_for_ms,
         } = observation;
         if valid_for_ms == 0 {
@@ -1146,14 +1146,14 @@ impl StartupCoordinator {
             incarnation: incarnation.clone(),
             watchdog_epoch: watchdog_epoch.clone(),
             transport_descriptor_digest: heartbeat_proof.transport_descriptor_digest.clone(),
-            highest_readiness_sequence: progress_frontier,
+            highest_readiness_sequence: heartbeat_proof.readiness_sequence,
         });
         self.current_supervision_observation = Some(WatchdogSupervisionObservation {
             incarnation,
             candidate_digest,
             state_fence,
             watchdog_epoch,
-            progress_frontier,
+            progress_frontier: heartbeat_proof.readiness_sequence,
             heartbeat_proof,
             observed_at_ms,
             valid_for_ms,
