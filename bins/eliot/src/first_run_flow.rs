@@ -22,16 +22,21 @@
 //! decisions without persisting them and `setup show` reports the compiled
 //! defaults, which keeps every displayed default inspectable and
 //! reversible (W6) through the same CLI path once a state file is
-//! configured.
+//! configured. Board durability (W5/AC2) follows the same path: when the
+//! variable is set, `setup recommend` loads the retained Human-board entries
+//! at entry from the sibling `<stem>.board.json` file and saves after
+//! insert, so a deduplicated recommendation persists across invocations;
+//! when unset, the board lives for the invocation only.
 
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
 use eliot_config::Setting;
 use eliot_config::first_run::{
-    FirstRunAutomation, FirstRunDecision, FirstRunInput, FirstRunRole, RecommendationBoard,
-    RouteKind, RouteSelection, apply_automation_update, apply_update, decide_first_run,
-    describe_defaults, parse_kind, parse_role, recommend_when_automation_disabled, to_settings,
+    FirstRunAutomation, FirstRunDecision, FirstRunInput, FirstRunRole, HumanBoardRecommendation,
+    RecommendationBoard, RouteKind, RouteSelection, apply_automation_update, apply_update,
+    decide_first_run, describe_defaults, parse_kind, parse_role,
+    recommend_when_automation_disabled, to_settings,
 };
 use eliot_config::initial_snapshot::{
     InitialSnapshotIdentity, PrivacyChoice, prepare_initial_snapshot_payload,
@@ -132,6 +137,11 @@ pub const SETUP_STATE_PATH_ENV: &str = "ELIOT_SETUP_STATE_PATH";
 /// the canonical `Setting` payload verbatim; any other schema is rejected.
 const SETUP_STATE_SCHEMA: &str = "eliot.first-run-decision/1";
 
+/// Schema marker for the CLI-owned board-state document. The document wraps
+/// the retained Human-board recommendations verbatim; any other schema is
+/// rejected.
+const BOARD_STATE_SCHEMA: &str = "eliot.first-run-board/1";
+
 /// CLI-owned setup-state document: the canonical `Setting` persistence
 /// payload produced by [`to_settings`], verbatim.
 #[derive(Debug, Deserialize)]
@@ -139,6 +149,15 @@ const SETUP_STATE_SCHEMA: &str = "eliot.first-run-decision/1";
 struct SetupStateDocument {
     schema: String,
     settings: Vec<Setting>,
+}
+
+/// CLI-owned board-state document: the Human-board recommendations retained
+/// across `setup recommend` invocations, verbatim.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoardStateDocument {
+    schema: String,
+    recommendations: Vec<HumanBoardRecommendation>,
 }
 
 /// Resolves the CLI-owned setup-state path. `None` means persistence is not
@@ -306,6 +325,53 @@ fn save_stored_decision(path: &Path, decision: &FirstRunDecision, owner_ref: &st
     let encoded = serde_json::to_string_pretty(&document).context("encode stored setup state")?;
     std::fs::write(path, encoded)
         .map_err(|error| anyhow::anyhow!("write stored setup state: {error}"))?;
+    Ok(())
+}
+
+/// Derives the CLI-owned board-state path from the configured setup-state
+/// path: the same directory, `<stem>.board.json`. Board durability is only
+/// configured through [`SETUP_STATE_PATH_ENV`]; no second location is
+/// invented.
+fn board_state_path(state_path: &Path) -> PathBuf {
+    let stem = state_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    state_path.with_file_name(format!("{stem}.board.json"))
+}
+
+/// Loads the retained Human-board entries. An absent file means no entries
+/// are retained yet; a present-but-invalid file fails closed rather than
+/// silently starting from an empty board.
+fn load_stored_board(path: &Path) -> Result<Vec<HumanBoardRecommendation>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(anyhow::anyhow!("read stored board state: {error}")),
+    };
+    let document: BoardStateDocument = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("stored board state is not valid JSON: {error}"))?;
+    if document.schema != BOARD_STATE_SCHEMA {
+        anyhow::bail!("stored board state schema is not {BOARD_STATE_SCHEMA}");
+    }
+    Ok(document.recommendations)
+}
+
+/// Persists the retained Human-board entries verbatim.
+fn save_stored_board(path: &Path, recommendations: &[HumanBoardRecommendation]) -> Result<()> {
+    let document = serde_json::json!({
+        "schema": BOARD_STATE_SCHEMA,
+        "recommendations": recommendations,
+    });
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| anyhow::anyhow!("create stored board state dir: {error}"))?;
+    }
+    let encoded = serde_json::to_string_pretty(&document).context("encode stored board state")?;
+    std::fs::write(path, encoded)
+        .map_err(|error| anyhow::anyhow!("write stored board state: {error}"))?;
     Ok(())
 }
 
@@ -503,7 +569,11 @@ pub fn run_setup_set(args: &SetupSetArgs) -> Result<i32> {
 }
 
 /// Runs `setup recommend`: with automation disabled, stores one deduplicated
-/// Human-board recommendation and starts no job.
+/// Human-board recommendation and starts no job. When `ELIOT_SETUP_STATE_PATH`
+/// is configured, the retained entries are loaded at entry from the sibling
+/// board-state file and saved after insert, so a recommendation persists
+/// across invocations and a repeat trigger deduplicates against the retained
+/// entries; otherwise the board lives for the invocation only.
 pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
     let automation = parse_automation(&args.automation)?;
     if args.family.trim().is_empty() || args.scope.trim().is_empty() {
@@ -517,7 +587,24 @@ pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
     ) else {
         anyhow::bail!("automation mode permits the governed job path; no board recommendation");
     };
+    let state_path = setup_state_path()?;
+    let board_path = state_path.as_deref().map(board_state_path);
+    let mut retained: Vec<HumanBoardRecommendation> = match &board_path {
+        Some(path) => load_stored_board(path)?,
+        None => Vec::new(),
+    };
     let mut board = RecommendationBoard::new();
+    // Every ORIGINAL retained entry re-enters through the owner dedup rule,
+    // so a hand-edited file can only ever select recommendations the owner
+    // itself admits; a duplicate or rejected entry fails closed here.
+    for stored in &retained {
+        let admitted = board
+            .insert_dedup(stored)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !admitted {
+            anyhow::bail!("stored board state carries a duplicate entry");
+        }
+    }
     let is_new = board
         .insert_dedup(&recommendation)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -529,6 +616,12 @@ pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
     if is_new_again {
         anyhow::bail!("deduplicated board admitted a duplicate entry");
     }
+    if is_new {
+        retained.push(recommendation.clone());
+    }
+    if let Some(path) = &board_path {
+        save_stored_board(path, &retained)?;
+    }
     println!(
         "{}",
         serde_json::json!({
@@ -536,6 +629,7 @@ pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
             "admits_job": admits_job,
             "board_entries": board.len(),
             "is_new": is_new,
+            "state": state_receipt(state_path.as_ref()),
         })
     );
     Ok(0)
