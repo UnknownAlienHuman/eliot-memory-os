@@ -86,10 +86,6 @@ async fn dispatch_blob_process_stream_sink(
         serde_json::to_value(value).map_err(|_| Response::Unknown)
     }
 
-    fn binding_ref(binding: &eliot_blob_api::wire::ProcessStreamSinkBindingRef) -> &str {
-        &binding.binding_ref
-    }
-
     fn same_fence(observed: &StateFence, identity: &eliot_protocol::RequestIdentity) -> bool {
         observed == &identity.request.state_fence
     }
@@ -179,15 +175,7 @@ async fn dispatch_blob_process_stream_sink(
                 )
                 .await
             {
-                Ok((binding_ref, session)) => Response::Opened {
-                    binding: eliot_blob_api::wire::ProcessStreamSinkBindingRef {
-                        binding_ref,
-                        session_id: session.session_id().as_str().to_owned(),
-                        source_id: session.source_id().as_str().to_owned(),
-                        terminal_id: session.terminal_id().as_str().to_owned(),
-                        open_request_sha256: session.open_request_sha256().to_owned(),
-                    },
-                },
+                Ok((binding, _session)) => Response::Opened { binding },
                 Err(error) => failure(error),
             }
         }
@@ -210,7 +198,7 @@ async fn dispatch_blob_process_stream_sink(
                     transport,
                     identity,
                     &capability.reference,
-                    binding_ref(&binding),
+                    &binding,
                     append,
                 )
                 .await
@@ -243,7 +231,7 @@ async fn dispatch_blob_process_stream_sink(
                     transport,
                     identity,
                     &capability.reference,
-                    binding_ref(&binding),
+                    &binding,
                     finalize,
                 )
                 .await
@@ -290,7 +278,7 @@ async fn dispatch_blob_process_stream_sink(
                     transport,
                     identity,
                     &capability.reference,
-                    binding_ref(&binding),
+                    &binding,
                     abort,
                 )
                 .await
@@ -318,7 +306,7 @@ async fn dispatch_blob_process_stream_sink(
                     transport,
                     identity,
                     &capability.reference,
-                    binding_ref(&binding),
+                    &binding,
                 )
                 .await
             {
@@ -350,7 +338,7 @@ async fn dispatch_blob_process_stream_sink(
                     transport,
                     identity,
                     &capability.reference,
-                    binding_ref(&binding),
+                    &binding,
                     outcome,
                 )
                 .await
@@ -421,6 +409,18 @@ async fn dispatch_blob_process_stream(
                 }
             };
             BlobProcessStreamOperationResponse::SourceReadback {
+                response: Box::new(response),
+            }
+        }
+        BlobProcessStreamOperationRequest::VerificationStageSource { request } => {
+            let request = *request;
+            let response = composition
+                .verification_stage_source(transport, identity, request.clone())
+                .await?;
+            response
+                .validate_for_request(&request)
+                .map_err(|error| error.to_string())?;
+            BlobProcessStreamOperationResponse::VerificationStageSource {
                 response: Box::new(response),
             }
         }

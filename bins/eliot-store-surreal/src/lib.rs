@@ -17,11 +17,13 @@ use eliot_blob::{
     DpapiUserAeadPort, DpapiUserKeyPort, RleCompressionPort, WindowsBlobPlatformPort,
 };
 use eliot_blob_api::wire::{
-    BlobProcessStreamVerifiedOwnerFacts, ProcessStreamSourceReadbackRequest,
-    ProcessStreamSourceReadbackReady, ProcessStreamSourceReadbackResponse,
+    BlobProcessStreamVerifiedOwnerFacts, ProcessStreamSinkBindingRef,
+    ProcessStreamSourceReadbackRequest, ProcessStreamSourceReadbackReady,
+    ProcessStreamSourceReadbackResponse,
 };
 use eliot_blob_api::{
-    BlobHash, BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding, BlobStoreClient,
+    BlobHash, BlobPolicyBinding, BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding,
+    BlobReceiptContext, BlobStoreClient, ObjectResidencyKey,
 };
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_installation::{
@@ -54,6 +56,8 @@ use eliot_store_api::blob_process_source_admission::{
     BlobProcessSourceAdmissionReadback, blob_process_source_admission_read_request,
     decode_blob_process_source_admission_readback,
 };
+use eliot_receipts::EffectClass;
+use eliot_store_api::{NamedReadOperation, PolicyOwnerSnapshotReadResult, ReadConsistency};
 use eliot_store_api::{
     BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
     CanonicalSnapshotPort, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
@@ -158,6 +162,7 @@ pub use connection_manager::{
     StoreConnectionManager, UnknownWriteGate, classify_receipt_lookup, decide_replay,
     default_store_transaction_limit, default_store_transaction_limit_usize,
 };
+mod verification_stage_owner;
 mod adapter_materialization;
 pub use adapter_materialization::materialize_adapter_config;
 use adapter_materialization::{resolve_credential, resolve_provider_bootstrap_credential};
@@ -364,7 +369,6 @@ pub struct StoreComposition {
     /// generation on later demands.
     blob_service_root_lease: Mutex<Option<eliot_blob_api::BlobRootLease>>,
     blob_stream_sinks: tokio::sync::Mutex<BTreeMap<(String, String), RetainedBlobStreamSink>>,
-    blob_stream_authority: Mutex<Option<Arc<dyn BlobStreamAuthorityResolver>>>,
     blob_root_path: PathBuf,
     state_fence: StateFence,
     schema_bootstrap_binding: StoreSchemaBootstrapBinding,
@@ -379,42 +383,399 @@ pub struct StoreComposition {
     _runtime_root_leases: ValidatedRuntimeRootLeases<WindowsRuntimeRootLease>,
 }
 
-/// Store-side lookup for the already validated, complete owner facts needed
-/// to create a sink binding. Implementations must resolve actual WorkScope,
-/// causal, policy, residency, and key-owner evidence; they must not derive it
-/// from caller JSON. Store fails closed while no independent owner is wired.
-pub trait BlobStreamAuthorityResolver: Send + Sync {
-    /// Resolves the complete binding for one authenticated open identity.
-    fn resolve_open(
-        &self,
-        owner: &BlobRootOwner,
-        identity: &RequestIdentity,
-        request: &ProcessStreamSinkOpenRequest,
-        owner_facts: &BlobProcessStreamVerifiedOwnerFacts,
-        source_admission: &BlobProcessSourceAdmissionReadback,
-        source_admission_receipt: &WriteReceipt,
-    ) -> Result<Option<BlobStreamSinkStoreBinding>, String>;
-
-    /// Resolves fresh current read authority for one immutable-source
-    /// readback. Implementations may not depend on the in-memory sink map or
-    /// reuse the lease retained at Open; the Blob owner independently resolves
-    /// the durable original stage intent and ready receipt.
-    fn resolve_readback(
-        &self,
-        owner: &BlobRootOwner,
-        identity: &RequestIdentity,
-        request: &ProcessStreamSourceReadbackRequest,
-    ) -> Result<Option<BlobStreamSinkStoreBinding>, String>;
-}
-
 struct RetainedBlobStreamSink {
     capability_ref: String,
-    binding_ref: String,
+    binding: ProcessStreamSinkBindingRef,
+    store_binding: BlobStreamSinkStoreBinding,
     open_request_sha256: String,
     owner_facts_sha256: String,
     binding_context_sha256: String,
     session: ProcessStreamSinkSession,
     sink: Arc<BlobStoreStreamSink<Arc<dyn BlobStoreClient>>>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct BlobProcessPolicyOwnerValue {
+    schema: String,
+    policy: BlobPolicyBinding,
+    residency: ObjectResidencyKey,
+}
+
+const BLOB_PROCESS_POLICY_SCHEMA: &str = "eliot.blob.process-policy.v1";
+const BLOB_PROCESS_POLICY_SETTING: &str = "blob.process.policy";
+const BLOB_PROCESS_POLICY_LITERAL_PREFIX: &str = "literal:eliot.blob.process-policy.v1:";
+
+fn binding_context_from_owner_facts(
+    owner: &BlobRootOwner,
+    identity: &RequestIdentity,
+    request: &ProcessStreamSinkOpenRequest,
+    owner_facts: &BlobProcessStreamVerifiedOwnerFacts,
+    policy: BlobPolicyBinding,
+    residency: ObjectResidencyKey,
+) -> Result<BlobStreamSinkStoreBinding, String> {
+    owner_facts
+        .validate()
+        .map_err(|error| format!("invalid Blob owner-facts projection: {error}"))?;
+    let work_scope: eliot_receipts::WorkScopeBinding =
+        serde_json::from_str(&owner_facts.work_scope_receipt_binding_json)
+            .map_err(|error| format!("invalid receipt-grade WorkScope binding: {error}"))?;
+    let task = owner_facts
+        .task_binding_json
+        .as_deref()
+        .map(serde_json::from_str::<eliot_receipts::TaskBinding>)
+        .transpose()
+        .map_err(|error| format!("invalid task binding: {error}"))?;
+    let session = owner_facts
+        .session_binding_json
+        .as_deref()
+        .map(serde_json::from_str::<eliot_receipts::SessionBinding>)
+        .transpose()
+        .map_err(|error| format!("invalid session binding: {error}"))?;
+    let operation_json = owner_facts
+        .stage_operation_binding_json
+        .as_deref()
+        .ok_or_else(|| "source owner facts lack the admitted Stage operation".to_owned())?;
+    let authority_json = owner_facts
+        .stage_authority_binding_json
+        .as_deref()
+        .ok_or_else(|| "source owner facts lack the Stage authority".to_owned())?;
+    let causal_json = owner_facts
+        .stage_causal_binding_json
+        .as_deref()
+        .ok_or_else(|| "source owner facts lack the Stage causal parent".to_owned())?;
+    let operation: eliot_receipts::OperationBinding = serde_json::from_str(operation_json)
+        .map_err(|error| format!("invalid Stage operation binding: {error}"))?;
+    let authority: eliot_receipts::AuthorityBinding = serde_json::from_str(authority_json)
+        .map_err(|error| format!("invalid Stage authority binding: {error}"))?;
+    let causal: eliot_receipts::CausalBinding = serde_json::from_str(causal_json)
+        .map_err(|error| format!("invalid Stage causal binding: {error}"))?;
+    let request_binding: eliot_receipts::RequestBinding =
+        serde_json::from_value(serde_json::to_value(&identity.request).map_err(|error| {
+            format!("encode authenticated request binding: {error}")
+        })?)
+        .map_err(|error| format!("decode receipt request binding: {error}"))?;
+    if work_scope.state_fence != identity.request.state_fence
+        || work_scope.product_id != identity.request.metadata.product_id
+        || work_scope.resource_generation != identity.request.state_fence.resource_generation
+        || task.as_ref().map(|task| &task.task_id) != identity.request.metadata.task_id.as_ref()
+        || session.as_ref().map(|session| &session.session_id)
+            != identity.request.metadata.session_id.as_ref()
+        || operation.request_id != request_binding.metadata.request_id
+        || operation.state_fence != identity.request.state_fence
+        || authority.state_fence != identity.request.state_fence
+        || causal.state_fence != identity.request.state_fence
+    {
+        return Err("Stage receipt bindings differ from the authenticated WorkScope/request".to_owned());
+    }
+    let stage_context = BlobReceiptContext {
+        work_scope,
+        task,
+        session,
+        causal,
+        request: request_binding,
+        operation,
+        authority,
+    };
+    stage_context
+        .validate_for(EffectClass::ReversibleMutation)
+        .map_err(|error| format!("invalid Stage receipt context: {error}"))?;
+    let root_lease = owner
+        .lease_for_request(stage_context.request.clone())
+        .map_err(|error| format!("derive Store-owned Blob root lease: {error}"))?;
+    let process_binding_bytes = canonical_json_bytes(request.binding())
+        .map_err(|error| format!("canonical process execution binding failed: {error}"))?;
+    let process_binding_json = String::from_utf8(process_binding_bytes.clone())
+        .map_err(|error| format!("process binding is not UTF-8: {error}"))?;
+    let process_binding_sha256 = sha256_hex(&process_binding_bytes);
+    let process_policy_bytes = canonical_json_bytes(request.policy())
+        .map_err(|error| format!("canonical process policy failed: {error}"))?;
+    let process_policy_json = String::from_utf8(process_policy_bytes.clone())
+        .map_err(|error| format!("process policy is not UTF-8: {error}"))?;
+    let source_binding = BlobProcessStreamSourceBinding {
+        process_binding_json,
+        process_binding_sha256,
+        stream_kind: match request.stream() {
+            eliot_process::ProcessStreamKind::Stdout => "STDOUT",
+            eliot_process::ProcessStreamKind::Stderr => "STDERR",
+        }
+        .to_owned(),
+        policy_json: process_policy_json,
+        policy_sha256: sha256_hex(&process_policy_bytes),
+    };
+    let binding = BlobStreamSinkStoreBinding::new(
+        root_lease,
+        stage_context,
+        None,
+        policy,
+        residency,
+    )
+    .map_err(|error| format!("construct Stage-only Store Blob binding: {error}"))?;
+    request.validate().map_err(|error| format!("invalid Open request: {error}"))?;
+    source_binding
+        .validate()
+        .map_err(|error| format!("invalid process source binding: {error}"))?;
+    Ok(binding)
+}
+
+fn binding_ref_commitment(
+    capability_ref: &str,
+    binding: &ProcessStreamSinkBindingRef,
+) -> Result<String, String> {
+    let bytes = canonical_json_bytes(&(
+        capability_ref,
+        &binding.work_scope_ref,
+        &binding.process_binding_sha256,
+        &binding.session_id,
+        &binding.source_id,
+        &binding.terminal_id,
+        &binding.open_request_sha256,
+    ))
+    .map_err(|error| format!("encode sink binding commitment: {error}"))?;
+    Ok(format!("blob-sink-{}", sha256_hex(&bytes)))
+}
+
+/// Resolves an owner-reported uncertain append only from the exact append
+/// bytes supplied by the authenticated Append operation. The first Open is
+/// rebuilt from fresh Store owner facts and must match Blob's durable Stage
+/// Open before this function can submit those bytes again.
+async fn recover_uncertain_process_stream_append(
+    client: &dyn BlobStoreClient,
+    resume: eliot_blob_api::BlobProcessStreamStageResumeRequest,
+    expected_open: eliot_blob_api::BlobProcessStreamStageOpenRequest,
+    retry: &ProcessStreamSinkAppend,
+    uncertain_session_id: &str,
+    uncertain_sequence: u64,
+    uncertain_commitment: &str,
+) -> Result<eliot_blob_api::BlobProcessStreamStageSnapshot, ProcessStreamSinkError> {
+    let byte_length = usize::try_from(retry.byte_length())
+        .map_err(|_| ProcessStreamSinkError::MismatchedReplay)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_length)
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+    bytes.extend_from_slice(retry.bytes());
+    let append = eliot_blob_api::BlobProcessStreamStageAppendRequest {
+        session_id: expected_open.session_id.clone(),
+        source_id: expected_open.source_id.clone(),
+        terminal_id: expected_open.terminal_id.clone(),
+        open_request_sha256: expected_open.open_request_sha256.clone(),
+        sequence: retry.sequence(),
+        offset: retry.offset(),
+        bytes,
+        chunk_sha256: retry.sha256().to_owned(),
+    };
+    append
+        .validate()
+        .map_err(|_| ProcessStreamSinkError::MismatchedReplay)?;
+    let commitment = append
+        .request_commitment_sha256()
+        .map_err(|_| ProcessStreamSinkError::MismatchedReplay)?;
+    if expected_open.session_id != uncertain_session_id
+        || append.sequence != uncertain_sequence
+        || commitment != uncertain_commitment
+    {
+        return Err(ProcessStreamSinkError::MismatchedReplay);
+    }
+
+    let validate_snapshot = |snapshot: &eliot_blob_api::BlobProcessStreamStageSnapshot,
+                             expected_receipt: Option<&eliot_blob_api::BlobProcessStreamStageAppendReceipt>| {
+        snapshot
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::IntegrityFailure {
+                reason: "Blob owner returned an invalid durable stream snapshot".to_owned(),
+            })?;
+        if snapshot.session != expected_open {
+            return Err(ProcessStreamSinkError::IntegrityFailure {
+                reason: "durable Blob Stage Open differs from current Store owner facts".to_owned(),
+            });
+        }
+        let sequence = usize::try_from(append.sequence)
+            .map_err(|_| ProcessStreamSinkError::MismatchedReplay)?;
+        let receipt = snapshot
+            .append_receipts
+            .get(sequence)
+            .ok_or(ProcessStreamSinkError::MismatchedReplay)?;
+        receipt
+            .validate_for(&expected_open, &append)
+            .map_err(|_| ProcessStreamSinkError::MismatchedReplay)?;
+        if expected_receipt.is_some_and(|expected| expected != receipt) {
+            return Err(ProcessStreamSinkError::MismatchedReplay);
+        }
+        Ok(())
+    };
+
+    // This owner Open compares the complete original Stage operation,
+    // authority, root lease, and all session limits against its durable record.
+    // It either proves the exact append has settled or returns the same exact
+    // pending-append identity; no request echo is treated as evidence.
+    match client.open_process_stream_stage(expected_open.clone()).await {
+        Ok(snapshot) => {
+            validate_snapshot(&snapshot, None)?;
+            return Ok(snapshot);
+        }
+        Err(eliot_blob_api::BlobError::UnknownStreamAppendOutcome {
+            session_id,
+            sequence,
+            request_commitment_sha256,
+        }) if session_id == expected_open.session_id
+            && sequence == append.sequence
+            && request_commitment_sha256 == commitment => {}
+        Err(eliot_blob_api::BlobError::UnknownStreamAppendOutcome { .. }) => {
+            return Err(ProcessStreamSinkError::MismatchedReplay);
+        }
+        Err(_) => return Err(ProcessStreamSinkError::ProviderUnavailable),
+    }
+
+    // The only allowed write is the caller's byte-identical Append under its
+    // original session, sequence, offset, and commitment.
+    let owner_receipt = client
+        .append_process_stream_stage(append.clone())
+        .await
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+    owner_receipt
+        .validate_for(&expected_open, &append)
+        .map_err(|_| ProcessStreamSinkError::MismatchedReplay)?;
+    let snapshot = client
+        .resume_process_stream_stage(resume)
+        .await
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+    validate_snapshot(&snapshot, Some(&owner_receipt))?;
+    Ok(snapshot)
+}
+
+fn validate_committed_blob_owner_receipt(
+    receipt: &WriteReceipt,
+    operation_id: &str,
+    expected_identity: &RequestIdentity,
+) -> Result<(), String> {
+    receipt
+        .validate()
+        .map_err(|error| format!("invalid committed Blob owner receipt: {error}"))?;
+    let envelope = receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| format!("Blob owner receipt has no immutable envelope: {error}"))?;
+    if receipt.status != WriteReceiptStatus::Committed
+        || receipt.operation_id.as_str() != operation_id
+        || receipt.state_fence != expected_identity.request.state_fence
+        || receipt.idempotency_key != expected_identity.idempotency_key
+        || envelope.core.operation.operation_id != receipt.operation_id
+        || envelope.core.operation.idempotency_key != expected_identity.idempotency_key
+        || envelope.core.request.metadata != expected_identity.request.metadata
+        || envelope.core.request.state_fence != expected_identity.request.state_fence
+    {
+        return Err("Blob owner receipt does not prove its exact committed owner transition".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_stable_blob_owner_facts(
+    pending: &BlobProcessStreamVerifiedOwnerFacts,
+    current: &BlobProcessStreamVerifiedOwnerFacts,
+) -> Result<(), String> {
+    current
+        .validate()
+        .map_err(|error| format!("invalid fresh source-read owner facts: {error}"))?;
+    if pending.work_scope_binding_json != current.work_scope_binding_json
+        || pending.work_scope_binding_sha256 != current.work_scope_binding_sha256
+        || pending.work_scope_receipt_binding_json != current.work_scope_receipt_binding_json
+        || pending.work_scope_receipt_binding_sha256 != current.work_scope_receipt_binding_sha256
+        || pending.matched_guard_receipt_json != current.matched_guard_receipt_json
+        || pending.matched_guard_receipt_sha256 != current.matched_guard_receipt_sha256
+        || pending.canonical_source_receipt_json != current.canonical_source_receipt_json
+        || pending.canonical_source_receipt_sha256 != current.canonical_source_receipt_sha256
+        || pending.policy_json != current.policy_json
+        || pending.policy_sha256 != current.policy_sha256
+        || pending.residency_json != current.residency_json
+        || pending.residency_sha256 != current.residency_sha256
+        || pending.task_binding_json != current.task_binding_json
+        || pending.task_binding_sha256 != current.task_binding_sha256
+        || pending.session_binding_json != current.session_binding_json
+        || pending.session_binding_sha256 != current.session_binding_sha256
+    {
+        return Err("fresh read owner facts changed the original source/policy binding".to_owned());
+    }
+    Ok(())
+}
+
+fn fresh_blob_read_context(
+    identity: &RequestIdentity,
+    stage_binding: &BlobStreamSinkStoreBinding,
+    owner_facts: &BlobProcessStreamVerifiedOwnerFacts,
+    ready_receipt: &WriteReceipt,
+) -> Result<BlobReceiptContext, String> {
+    let operation_json = owner_facts
+        .read_operation_binding_json
+        .as_deref()
+        .ok_or_else(|| "fresh owner facts lack a Read operation".to_owned())?;
+    let authority_json = owner_facts
+        .read_authority_binding_json
+        .as_deref()
+        .ok_or_else(|| "fresh owner facts lack Read authority".to_owned())?;
+    let causal_json = owner_facts
+        .read_causal_binding_json
+        .as_deref()
+        .ok_or_else(|| "fresh owner facts lack Read causal binding".to_owned())?;
+    let operation: eliot_receipts::OperationBinding = serde_json::from_str(operation_json)
+        .map_err(|error| format!("invalid fresh Read operation binding: {error}"))?;
+    let authority: eliot_receipts::AuthorityBinding = serde_json::from_str(authority_json)
+        .map_err(|error| format!("invalid fresh Read authority: {error}"))?;
+    let causal: eliot_receipts::CausalBinding = serde_json::from_str(causal_json)
+        .map_err(|error| format!("invalid fresh Read causal binding: {error}"))?;
+    let request: eliot_receipts::RequestBinding = serde_json::from_value(
+        serde_json::to_value(&identity.request)
+            .map_err(|error| format!("encode current Read request: {error}"))?,
+    )
+    .map_err(|error| format!("decode current Read request: {error}"))?;
+    let stage = stage_binding.stage_context();
+    let ready_envelope = ready_receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| format!("Ready CAS receipt has no envelope: {error}"))?;
+    if operation.effect != EffectClass::Read
+        || authority.allowed_effect != EffectClass::Read
+        || operation.request_id != request.metadata.request_id
+        || operation.state_fence != identity.request.state_fence
+        || authority.state_fence != identity.request.state_fence
+        || causal.state_fence != identity.request.state_fence
+        || stage.work_scope != serde_json::from_str(&owner_facts.work_scope_receipt_binding_json)
+            .map_err(|error| format!("fresh receipt-grade WorkScope is invalid: {error}"))?
+        || stage.task
+            != owner_facts
+                .task_binding_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| format!("fresh task binding is invalid: {error}"))?
+        || stage.session
+            != owner_facts
+                .session_binding_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| format!("fresh session binding is invalid: {error}"))?
+        || stage.authority.authority_id != authority.authority_id
+        || stage.authority.authority_owner != authority.authority_owner
+        || stage.authority.authority_epoch != authority.authority_epoch
+        || stage.authority.proof_ceiling != authority.proof_ceiling
+        || stage.authority.state_fence != authority.state_fence
+        || causal.parent_receipt_id.as_ref()
+            != Some(&ready_envelope.identity.receipt_id)
+    {
+        return Err("fresh Read context differs from the exact WorkScope, Ready receipt, or authority".to_owned());
+    }
+    let context = BlobReceiptContext {
+        work_scope: stage.work_scope.clone(),
+        task: stage.task.clone(),
+        session: stage.session.clone(),
+        causal,
+        request,
+        operation,
+        authority,
+    };
+    context
+        .validate_for(EffectClass::Read)
+        .map_err(|error| format!("fresh Blob Read context is invalid: {error}"))?;
+    Ok(context)
 }
 
 const MAX_RETAINED_BLOB_STREAM_SINKS: usize = 1024;
@@ -535,7 +896,6 @@ impl StoreComposition {
             blob_service: Mutex::new(None),
             blob_service_root_lease: Mutex::new(None),
             blob_stream_sinks: tokio::sync::Mutex::new(BTreeMap::new()),
-            blob_stream_authority: Mutex::new(None),
             blob_root_path: PathBuf::from(config.blob_root.clone()),
             state_fence,
             schema_bootstrap_binding,
@@ -564,7 +924,7 @@ impl StoreComposition {
         BlobStreamSinkStoreBinding::new(
             binding.root_lease().clone(),
             binding.stage_context().clone(),
-            binding.read_context().clone(),
+            binding.read_context().cloned(),
             binding.policy().clone(),
             binding.residency().clone(),
         )
@@ -701,22 +1061,330 @@ impl StoreComposition {
             .is_ok_and(|health| health.validate().is_ok() && health.ready && health.owner_matches)
     }
 
-    /// Installs the one trusted Store-side authority owner for process stream
-    /// opens. This is a composition-time dependency; EBP callers cannot
-    /// provide or replace it. Missing authority remains explicitly unavailable.
-    pub fn install_blob_stream_authority_resolver(
+    /// Re-reads the fixed Policy owner through the activated Store named-read
+    /// surface, then compares its exact selected setting with the typed policy
+    /// and residency carried by the independently validated source owner facts.
+    pub(super) async fn validate_current_blob_policy_owner(
         &self,
-        resolver: Arc<dyn BlobStreamAuthorityResolver>,
-    ) -> Result<(), String> {
-        let mut retained = self
-            .blob_stream_authority
-            .lock()
-            .map_err(|_| "Blob stream authority lock poisoned".to_owned())?;
-        if retained.is_some() {
-            return Err("Blob stream authority resolver is already installed".to_owned());
+        identity: &RequestIdentity,
+        owner_facts: &BlobProcessStreamVerifiedOwnerFacts,
+    ) -> Result<(BlobPolicyBinding, ObjectResidencyKey), String> {
+        owner_facts
+            .validate()
+            .map_err(|error| format!("invalid Blob source owner facts: {error}"))?;
+        let response = self
+            .named(NamedReadRequest {
+                operation: NamedReadOperation::GetPolicyOwnerSnapshot,
+                scope_id: None,
+                consistency: ReadConsistency::ExactFence,
+                state_fence: identity.request.state_fence.clone(),
+                parameters: BTreeMap::new(),
+            })
+            .await
+            .map_err(|error| format!("fresh Policy owner named read failed: {error}"))?;
+        response
+            .validate()
+            .map_err(|error| format!("invalid Policy owner named read: {error}"))?;
+        if response.operation != NamedReadOperation::GetPolicyOwnerSnapshot
+            || response.state_fence != identity.request.state_fence
+        {
+            return Err("Policy owner named read changed its operation or fence".to_owned());
         }
-        *retained = Some(resolver);
+        let owner: PolicyOwnerSnapshotReadResult = serde_json::from_value(response.payload)
+            .map_err(|error| format!("invalid typed Policy owner result: {error}"))?;
+        owner
+            .validate(&identity.request.state_fence)
+            .map_err(|error| format!("Policy owner result failed exact-fence validation: {error}"))?;
+        let PolicyOwnerSnapshotReadResult::Bound { record } = owner else {
+            return Err("current Policy owner row is absent".to_owned());
+        };
+        if record.schema != OWNER_SNAPSHOT_SCHEMA
+            || record.state_fence != identity.request.state_fence
+            || record.value_digest != sha256_hex(&record.payload)
+        {
+            return Err("current Policy owner row has a foreign schema, fence, or digest".to_owned());
+        }
+        let snapshot: serde_json::Value = serde_json::from_slice(&record.payload)
+            .map_err(|error| format!("current Policy owner payload is invalid: {error}"))?;
+        if snapshot.get("state_fence") != Some(
+            &serde_json::to_value(&identity.request.state_fence)
+                .map_err(|error| format!("encode Policy fence: {error}"))?,
+        ) || snapshot.get("revision").and_then(serde_json::Value::as_u64) != Some(record.revision)
+        {
+            return Err("current Policy snapshot revision, digest, or fence differs".to_owned());
+        }
+        let policy_snapshot = snapshot
+            .get("snapshot")
+            .ok_or_else(|| "Policy owner has no embedded snapshot".to_owned())?;
+        let policy_snapshot_digest = canonical_json_bytes(policy_snapshot)
+            .map_err(|error| format!("canonical embedded Policy snapshot encoding failed: {error}"))?;
+        if snapshot.get("policy_digest").and_then(serde_json::Value::as_str)
+            != Some(sha256_hex(&policy_snapshot_digest).as_str())
+        {
+            return Err("current Policy owner digest does not cover its embedded snapshot".to_owned());
+        }
+        if policy_snapshot.get("state_fence")
+            != Some(
+                &serde_json::to_value(&identity.request.state_fence)
+                    .map_err(|error| format!("encode embedded Policy fence: {error}"))?,
+            )
+        {
+            return Err("embedded Config Policy snapshot has a stale fence".to_owned());
+        }
+        let owner_ref = policy_snapshot
+            .get("policy_owner")
+            .and_then(|value| value.get("owner_ref"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Config Policy owner reference is absent".to_owned())?;
+        let settings = policy_snapshot
+            .get("settings")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "Config Policy settings are absent".to_owned())?;
+        let mut selected = settings.iter().filter(|setting| {
+            setting.get("key").and_then(serde_json::Value::as_str)
+                == Some(BLOB_PROCESS_POLICY_SETTING)
+        });
+        let setting = selected
+            .next()
+            .ok_or_else(|| "current Config Policy has no Blob process policy".to_owned())?;
+        if selected.next().is_some()
+            || setting.get("owner_ref").and_then(serde_json::Value::as_str) != Some(owner_ref)
+        {
+            return Err("current Blob policy setting is ambiguous or owned by another principal".to_owned());
+        }
+        let literal = setting
+            .get("value_ref")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.strip_prefix(BLOB_PROCESS_POLICY_LITERAL_PREFIX))
+            .ok_or_else(|| "current Blob policy setting is not the closed literal form".to_owned())?;
+        let selected_value: BlobProcessPolicyOwnerValue = serde_json::from_str(literal)
+            .map_err(|error| format!("current Blob policy literal is invalid: {error}"))?;
+        let selected_bytes = canonical_json_bytes(&selected_value)
+            .map_err(|error| format!("canonical Blob policy encoding failed: {error}"))?;
+        if selected_value.schema != BLOB_PROCESS_POLICY_SCHEMA
+            || selected_bytes != literal.as_bytes()
+        {
+            return Err("current Blob policy literal is not canonical v1".to_owned());
+        }
+        let facts_policy: BlobPolicyBinding = serde_json::from_str(&owner_facts.policy_json)
+            .map_err(|error| format!("typed owner-facts Blob policy is invalid: {error}"))?;
+        let facts_residency: ObjectResidencyKey =
+            serde_json::from_str(&owner_facts.residency_json)
+                .map_err(|error| format!("typed owner-facts residency is invalid: {error}"))?;
+        if canonical_json_bytes(&facts_policy)
+            .map_err(|error| format!("canonical owner-facts policy encoding failed: {error}"))?
+            != owner_facts.policy_json.as_bytes()
+            || canonical_json_bytes(&facts_residency)
+                .map_err(|error| format!("canonical owner-facts residency encoding failed: {error}"))?
+                != owner_facts.residency_json.as_bytes()
+            || selected_value.policy != facts_policy
+            || selected_value.residency != facts_residency
+        {
+            return Err("current Policy owner selection differs from the source owner facts".to_owned());
+        }
+        facts_policy
+            .validate_for_residency(&facts_residency)
+            .map_err(|error| format!("current Blob policy/residency is invalid: {error}"))?;
+        Ok((facts_policy, facts_residency))
+    }
+
+    /// Independently re-reads the fixed WorkScope owner row and requires an
+    /// exact byte/digest/fence match with the source-owner projection.
+    pub(super) async fn validate_current_blob_work_scope(
+        &self,
+        identity: &RequestIdentity,
+        admission: &eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmission,
+        owner_facts: &BlobProcessStreamVerifiedOwnerFacts,
+    ) -> Result<(), String> {
+        let work_scope_key = RecoveryRecordKey::new("owner", "work_scope")
+            .map_err(|error| format!("WorkScope owner key is invalid: {error}"))?;
+        let scope_owner = self
+            .store
+            .recovery(StoreRecoveryRequest {
+                contract_version: eliot_store_api::CONTRACT_VERSION,
+                state_fence: identity.request.state_fence.clone(),
+                records: vec![work_scope_key.clone()],
+                include_receipts: false,
+                include_jobs: false,
+            })
+            .await
+            .map_err(|error| format!("fresh WorkScope owner recovery read failed: {error}"))?;
+        scope_owner
+            .validate()
+            .map_err(|error| format!("invalid fresh WorkScope owner result: {error}"))?;
+        let scope_record = scope_owner
+            .owner_records
+            .iter()
+            .find(|record| record.record_key() == work_scope_key)
+            .ok_or_else(|| "fresh WorkScope owner row is absent".to_owned())?;
+        let scope_value: serde_json::Value = serde_json::from_slice(&scope_record.payload)
+            .map_err(|error| format!("fresh WorkScope row is not valid JSON: {error}"))?;
+        let facts_scope: serde_json::Value = serde_json::from_str(&owner_facts.work_scope_binding_json)
+            .map_err(|error| format!("owner facts WorkScope JSON is invalid: {error}"))?;
+        let facts_source: serde_json::Value = serde_json::from_str(&owner_facts.canonical_source_receipt_json)
+            .map_err(|error| format!("owner facts source receipt JSON is invalid: {error}"))?;
+        let facts_guard: serde_json::Value = serde_json::from_str(&owner_facts.matched_guard_receipt_json)
+            .map_err(|error| format!("owner facts guard receipt JSON is invalid: {error}"))?;
+        if scope_record.schema != OWNER_SNAPSHOT_SCHEMA
+            || scope_record.state_fence != identity.request.state_fence
+            || scope_record.revision != admission.work_scope_owner_revision
+            || scope_record.value_digest != admission.work_scope_owner_digest
+            || sha256_hex(owner_facts.work_scope_binding_json.as_bytes())
+                != owner_facts.work_scope_binding_sha256
+            || owner_facts.work_scope_binding_json.as_bytes() != scope_record.payload.as_slice()
+            || scope_value != facts_scope
+            || scope_value.get("guard_receipt") != Some(&facts_guard)
+            || scope_value.get("source_admission") != Some(&facts_source)
+        {
+            return Err("current WorkScope owner differs from the admitted source facts".to_owned());
+        }
+        let scope_binding: eliot_receipts::WorkScopeBinding =
+            serde_json::from_str(&owner_facts.work_scope_receipt_binding_json)
+                .map_err(|error| format!("receipt-grade WorkScope binding is invalid: {error}"))?;
+        if scope_binding.state_fence != identity.request.state_fence
+            || scope_binding.product_id != identity.request.metadata.product_id
+            || scope_binding.resource_generation != identity.request.state_fence.resource_generation
+        {
+            return Err("WorkScope binding differs from the authenticated request product/fence".to_owned());
+        }
         Ok(())
+    }
+
+    async fn resolve_committed_blob_owner_receipt(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &str,
+        expected_identity_json: &str,
+    ) -> Result<WriteReceipt, String> {
+        let expected_identity: RequestIdentity = serde_json::from_str(expected_identity_json)
+            .map_err(|error| format!("invalid persisted Blob owner request identity: {error}"))?;
+        expected_identity
+            .validate()
+            .map_err(|error| format!("invalid persisted Blob owner request identity: {error}"))?;
+        if expected_identity.request.state_fence != identity.request.state_fence {
+            return Err("persisted Blob owner receipt belongs to another current fence".to_owned());
+        }
+        let mut parameters = BTreeMap::new();
+        parameters.insert("operation_id".to_owned(), serde_json::json!(operation_id));
+        let response = self
+            .named(NamedReadRequest {
+                operation: NamedReadOperation::ResolveWriteReceipt,
+                scope_id: None,
+                consistency: ReadConsistency::ExactFence,
+                state_fence: identity.request.state_fence.clone(),
+                parameters,
+            })
+            .await
+            .map_err(|error| format!("fresh Blob owner receipt lookup failed: {error}"))?;
+        response
+            .validate()
+            .map_err(|error| format!("invalid Blob owner receipt lookup: {error}"))?;
+        if response.operation != NamedReadOperation::ResolveWriteReceipt
+            || response.state_fence != identity.request.state_fence
+        {
+            return Err("Blob owner receipt lookup changed operation or fence".to_owned());
+        }
+        let receipt: Option<WriteReceipt> = serde_json::from_value(response.payload)
+            .map_err(|error| format!("invalid typed Blob owner receipt result: {error}"))?;
+        let receipt = receipt.ok_or_else(|| "exact Blob owner WriteReceipt is absent".to_owned())?;
+        validate_committed_blob_owner_receipt(&receipt, operation_id, &expected_identity)?;
+        Ok(receipt)
+    }
+
+    async fn load_current_blob_source_owner(
+        &self,
+        identity: &RequestIdentity,
+        binding: &ProcessStreamSinkBindingRef,
+    ) -> Result<
+        (
+            BlobProcessSourceAdmissionReadback,
+            BlobProcessStreamVerifiedOwnerFacts,
+            WriteReceipt,
+            Option<WriteReceipt>,
+            BlobPolicyBinding,
+            ObjectResidencyKey,
+        ),
+        String,
+    > {
+        binding
+            .validate()
+            .map_err(|error| format!("invalid Store sink binding selectors: {error}"))?;
+        let identity_axes = BlobProcessSourceAdmissionIdentity {
+            work_scope_ref: binding.work_scope_ref.clone(),
+            session_id: binding.session_id.clone(),
+            source_id: binding.source_id.clone(),
+            process_binding_sha256: binding.process_binding_sha256.clone(),
+        };
+        identity_axes
+            .validate()
+            .map_err(|error| format!("invalid process source selector: {error}"))?;
+        let named = blob_process_source_admission_read_request(
+            &identity_axes,
+            &identity.request.state_fence,
+        )
+        .map_err(|error| format!("build current source-admission read: {error}"))?;
+        let response = self
+            .named(named)
+            .await
+            .map_err(|error| format!("fresh source-admission owner read failed: {error}"))?;
+        let readback = decode_blob_process_source_admission_readback(
+            &response,
+            &identity_axes,
+            &identity.request.state_fence,
+        )
+        .map_err(|error| format!("invalid current source-admission owner read: {error}"))?;
+        let admission = &readback.admission;
+        let owner_facts: BlobProcessStreamVerifiedOwnerFacts =
+            serde_json::from_str(&admission.owner_facts_json)
+                .map_err(|error| format!("invalid retained Stage owner facts: {error}"))?;
+        owner_facts
+            .validate()
+            .map_err(|error| format!("invalid retained Stage owner facts: {error}"))?;
+        self.validate_current_blob_work_scope(identity, admission, &owner_facts)
+            .await?;
+        let (policy, residency) = self
+            .validate_current_blob_policy_owner(identity, &owner_facts)
+            .await?;
+        let pending_receipt = self
+            .resolve_committed_blob_owner_receipt(
+                identity,
+                &admission.pending_operation_id,
+                &admission.pending_request_identity_json,
+            )
+            .await?;
+        let ready_receipt = if let Some(ready) = &admission.ready {
+            let ready_identity: RequestIdentity = serde_json::from_str(&ready.ready_request_identity_json)
+                .map_err(|error| format!("invalid persisted Ready request identity: {error}"))?;
+            ready_identity
+                .validate()
+                .map_err(|error| format!("invalid persisted Ready request identity: {error}"))?;
+            let receipt = self
+                .resolve_committed_blob_owner_receipt(
+                    identity,
+                    &ready.ready_operation_id,
+                    &ready.ready_request_identity_json,
+                )
+                .await?;
+            let ready_blob: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
+                .map_err(|error| format!("invalid inert Blob Ready receipt: {error}"))?;
+            let ready_receipt_id = ready_blob
+                .get("receipt")
+                .and_then(|value| value.get("identity"))
+                .and_then(|value| value.get("receipt_id"))
+                .and_then(serde_json::Value::as_str);
+            if ready_receipt_id.is_none()
+                || ready_blob.get("plaintext_sha256").and_then(serde_json::Value::as_str)
+                    != Some(ready.whole_source_sha256.as_str())
+                || ready_blob.get("plaintext_length").and_then(serde_json::Value::as_u64)
+                    != Some(ready.whole_source_byte_length)
+            {
+                return Err("Ready source commitment differs from its inert Blob receipt".to_owned());
+            }
+            Some(receipt)
+        } else {
+            None
+        };
+        Ok((readback, owner_facts, pending_receipt, ready_receipt, policy, residency))
     }
 
     async fn validate_blob_process_source_open_admission(
@@ -728,7 +1396,12 @@ impl StoreComposition {
         readback_sha256: &str,
         receipt_json: &str,
         receipt_sha256: &str,
-    ) -> Result<(BlobProcessSourceAdmissionReadback, WriteReceipt), String> {
+    ) -> Result<(
+        BlobProcessSourceAdmissionReadback,
+        WriteReceipt,
+        BlobPolicyBinding,
+        ObjectResidencyKey,
+    ), String> {
         identity
             .validate()
             .map_err(|error| format!("invalid authenticated Open identity: {error}"))?;
@@ -869,54 +1542,23 @@ impl StoreComposition {
                 "supplied source admission differs from the current Store owner".to_owned(),
             );
         }
-
-        let work_scope_key = RecoveryRecordKey::new("owner", "work_scope")
-            .map_err(|error| format!("WorkScope owner key is invalid: {error}"))?;
-        let scope_owner = self
-            .store
-            .recovery(StoreRecoveryRequest {
-                contract_version: eliot_store_api::CONTRACT_VERSION,
-                state_fence: identity.request.state_fence.clone(),
-                records: vec![work_scope_key.clone()],
-                include_receipts: false,
-                include_jobs: false,
-            })
-            .await
-            .map_err(|error| format!("fresh WorkScope owner recovery read failed: {error}"))?;
-        scope_owner
-            .validate()
-            .map_err(|error| format!("invalid fresh WorkScope owner result: {error}"))?;
-        let scope_record = scope_owner
-            .owner_records
-            .iter()
-            .find(|record| record.record_key() == work_scope_key)
-            .ok_or_else(|| "fresh WorkScope owner row is absent".to_owned())?;
-        let owner_facts_scope_bytes = owner_facts.work_scope_binding_json.as_bytes();
-        let scope_value: serde_json::Value = serde_json::from_slice(&scope_record.payload)
-            .map_err(|error| format!("fresh WorkScope row is not valid JSON: {error}"))?;
-        let facts_scope: serde_json::Value =
-            serde_json::from_str(&owner_facts.work_scope_binding_json)
-                .map_err(|error| format!("owner facts WorkScope JSON is invalid: {error}"))?;
-        let facts_source: serde_json::Value =
-            serde_json::from_str(&owner_facts.canonical_source_receipt_json)
-                .map_err(|error| format!("owner facts source receipt JSON is invalid: {error}"))?;
-        let facts_guard: serde_json::Value =
-            serde_json::from_str(&owner_facts.matched_guard_receipt_json)
-                .map_err(|error| format!("owner facts guard receipt JSON is invalid: {error}"))?;
-        if scope_record.schema != OWNER_SNAPSHOT_SCHEMA
-            || scope_record.revision != admission.work_scope_owner_revision
-            || scope_record.value_digest != admission.work_scope_owner_digest
-            || sha256_hex(owner_facts_scope_bytes) != owner_facts.work_scope_binding_sha256
-            || owner_facts_scope_bytes != scope_record.payload.as_slice()
-            || scope_value != facts_scope
-            || scope_value.get("guard_receipt") != Some(&facts_guard)
-            || scope_value.get("source_admission") != Some(&facts_source)
-        {
-            return Err(
-                "current WorkScope row differs from the admitted owner-facts projection".to_owned(),
-            );
+        let resolved_receipt = self
+            .resolve_committed_blob_owner_receipt(
+                identity,
+                &admission.pending_operation_id,
+                &admission.pending_request_identity_json,
+            )
+            .await?;
+        if resolved_receipt != supplied_receipt {
+            return Err("supplied Pending receipt differs from the Store's exact receipt read".to_owned());
         }
-        Ok((readback, supplied_receipt))
+
+        self.validate_current_blob_work_scope(identity, admission, owner_facts)
+            .await?;
+        let (policy, residency) = self
+            .validate_current_blob_policy_owner(identity, owner_facts)
+            .await?;
+        Ok((readback, supplied_receipt, policy, residency))
     }
 
     /// Opens one owner-retained sink after the authenticated Kernel dispatch
@@ -935,13 +1577,13 @@ impl StoreComposition {
         source_admission_write_receipt_json: &str,
         source_admission_write_receipt_sha256: &str,
         request: ProcessStreamSinkOpenRequest,
-    ) -> Result<(String, ProcessStreamSinkSession), ProcessStreamSinkError> {
+    ) -> Result<(ProcessStreamSinkBindingRef, ProcessStreamSinkSession), ProcessStreamSinkError> {
         validate_blob_sink_transport(transport, identity, capability_ref)?;
         request.validate()?;
         owner_facts
             .validate()
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let (source_admission, source_admission_receipt) = self
+        let (source_admission, source_admission_receipt, policy, residency) = self
             .validate_blob_process_source_open_admission(
                 identity,
                 &request,
@@ -953,34 +1595,29 @@ impl StoreComposition {
             )
             .await
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let binding = binding_context_from_owner_facts(
+            &self.blob,
+            identity,
+            &request,
+            owner_facts,
+            policy,
+            residency,
+        )
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let pending_envelope = source_admission_receipt
+            .require_reconciliation_envelope()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        if binding.stage_context().causal.parent_receipt_id.as_ref()
+            != Some(&pending_envelope.identity.receipt_id)
+        {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
         self.prepare_blob_process_stream_demand(transport, identity)
             .await
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let resolver = self
-            .blob_stream_authority
-            .lock()
-            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
-            .as_ref()
-            .cloned();
-        let Some(resolver) = resolver else {
-            return Err(ProcessStreamSinkError::ProviderUnavailable);
-        };
-        let binding = resolver
-            .resolve_open(
-                &self.blob,
-                identity,
-                &request,
-                owner_facts,
-                &source_admission,
-                &source_admission_receipt,
-            )
-            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let Some(binding) = binding else {
-            return Err(ProcessStreamSinkError::ProviderUnavailable);
-        };
-        if binding.stage_context().request != identity.request
-            || binding.read_context().request != identity.request
-        {
+        if binding.stage_context().request != identity.request {
             return Err(ProcessStreamSinkError::AdmissionFenced {
                 reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
             });
@@ -988,7 +1625,7 @@ impl StoreComposition {
         let connection_id = transport.connection_id().to_owned();
         let owner_facts_bytes = canonical_json_bytes(owner_facts)
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let owner_facts_sha256 = format!("{:x}", Sha256::digest(owner_facts_bytes));
+        let owner_facts_sha256 = sha256_hex(&owner_facts_bytes);
         let binding_context = serde_json::to_vec(&(
             binding.root_lease(),
             binding.stage_context(),
@@ -998,26 +1635,32 @@ impl StoreComposition {
         ))
         .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         let binding_context_sha256 = format!("{:x}", Sha256::digest(binding_context));
-        let mut material = Vec::with_capacity(
-            connection_id.len() + capability_ref.len() + request.open_request_sha256().len() + 2,
-        );
-        material.extend_from_slice(connection_id.as_bytes());
-        material.push(0);
-        material.extend_from_slice(capability_ref.as_bytes());
-        material.push(0);
-        material.extend_from_slice(request.open_request_sha256().as_bytes());
-        let binding_ref = format!("blob-sink-{:x}", Sha256::digest(material));
-        let key = (connection_id.clone(), binding_ref.clone());
+        let mut binding_ref = ProcessStreamSinkBindingRef {
+            binding_ref: String::new(),
+            work_scope_ref: source_admission.admission.identity.work_scope_ref.clone(),
+            process_binding_sha256: source_admission.admission.process_binding_sha256.clone(),
+            session_id: request.session_id().as_str().to_owned(),
+            source_id: request.source_id().as_str().to_owned(),
+            terminal_id: request.terminal_id().as_str().to_owned(),
+            open_request_sha256: request.open_request_sha256().to_owned(),
+        };
+        binding_ref.binding_ref = binding_ref_commitment(capability_ref, &binding_ref)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        binding_ref
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let key = (connection_id.clone(), binding_ref.binding_ref.clone());
         let mut sinks = self.blob_stream_sinks.lock().await;
         if let Some(existing) = sinks.get(&key) {
             if existing.capability_ref != capability_ref
+                || existing.binding != binding_ref
                 || existing.open_request_sha256 != request.open_request_sha256()
                 || existing.owner_facts_sha256 != owner_facts_sha256
                 || existing.binding_context_sha256 != binding_context_sha256
             {
                 return Err(ProcessStreamSinkError::OpenDigestMismatch);
             }
-            return Ok((existing.binding_ref.clone(), existing.session.clone()));
+            return Ok((existing.binding.clone(), existing.session.clone()));
         }
         if sinks.len() >= MAX_RETAINED_BLOB_STREAM_SINKS {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
@@ -1031,7 +1674,8 @@ impl StoreComposition {
             key,
             RetainedBlobStreamSink {
                 capability_ref: capability_ref.to_owned(),
-                binding_ref: binding_ref.clone(),
+                binding: binding_ref.clone(),
+                store_binding: binding,
                 open_request_sha256: session.open_request_sha256().to_owned(),
                 owner_facts_sha256,
                 binding_context_sha256,
@@ -1047,11 +1691,18 @@ impl StoreComposition {
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
         capability_ref: &str,
-        binding_ref: &str,
+        binding: &ProcessStreamSinkBindingRef,
         request: ProcessStreamSinkAppend,
     ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
-        let (sink, session) = self
-            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+        request.validate()?;
+        let (sink, session, _) = self
+            .blob_sink_handle(
+                transport,
+                identity,
+                capability_ref,
+                binding,
+                Some(&request),
+            )
             .await?;
         sink.append(session, request).await
     }
@@ -1061,11 +1712,11 @@ impl StoreComposition {
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
         capability_ref: &str,
-        binding_ref: &str,
+        binding: &ProcessStreamSinkBindingRef,
         request: ProcessStreamSinkFinalizeRequest,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
-        let (sink, session) = self
-            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+        let (sink, session, _) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding, None)
             .await?;
         sink.finalize(session, request).await
     }
@@ -1079,12 +1730,12 @@ impl StoreComposition {
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
         capability_ref: &str,
-        binding_ref: &str,
+        binding: &ProcessStreamSinkBindingRef,
         request: ProcessStreamSinkFinalizeRequest,
     ) -> Result<(ProcessStreamSinkTerminal, Option<String>, Option<String>), ProcessStreamSinkError>
     {
-        let (sink, session) = self
-            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+        let (sink, session, _) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding, None)
             .await?;
         let terminal = sink.finalize(session.clone(), request).await?;
         if terminal.state() != eliot_process::stream_sink::ProcessStreamSinkState::CompleteSource {
@@ -1104,11 +1755,11 @@ impl StoreComposition {
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
         capability_ref: &str,
-        binding_ref: &str,
+        binding: &ProcessStreamSinkBindingRef,
         request: ProcessStreamSinkAbortRequest,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
-        let (sink, session) = self
-            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+        let (sink, session, _) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding, None)
             .await?;
         sink.abort(session, request).await
     }
@@ -1118,10 +1769,10 @@ impl StoreComposition {
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
         capability_ref: &str,
-        binding_ref: &str,
+        binding: &ProcessStreamSinkBindingRef,
     ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
-        let (sink, session) = self
-            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+        let (sink, session, _) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding, None)
             .await?;
         sink.readback(session).await
     }
@@ -1161,54 +1812,148 @@ impl StoreComposition {
                 reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
             });
         }
-        let resolver = self
-            .blob_stream_authority
-            .lock()
-            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
-            .as_ref()
-            .cloned();
-        let Some(resolver) = resolver else {
+        let (current_admission, pending_facts, _pending_receipt, ready_receipt, policy, residency) =
+            self.load_current_blob_source_owner(identity, &request.binding)
+                .await
+                .map_err(|_| ProcessStreamSinkError::AdmissionFenced {
+                    reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+                })?;
+        let admission = &current_admission.admission;
+        let Some(ready) = admission.ready.as_ref() else {
             return Ok(ProcessStreamSourceReadbackResponse::Unknown);
         };
-        let current = resolver
-            .resolve_readback(&self.blob, identity, &request)
+        let Some(ready_receipt) = ready_receipt.as_ref() else {
+            return Ok(ProcessStreamSourceReadbackResponse::Unknown);
+        };
+        let supplied_readback: BlobProcessSourceAdmissionReadback =
+            serde_json::from_str(&request.process_source_admission_readback_json)
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let supplied_readback_bytes = canonical_json_bytes(&supplied_readback)
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        let Some(current) = current else {
-            return Ok(ProcessStreamSourceReadbackResponse::Unknown);
-        };
+        if String::from_utf8(supplied_readback_bytes.clone())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+            != request.process_source_admission_readback_json
+            || sha256_hex(&supplied_readback_bytes)
+                != request.process_source_admission_readback_sha256
+            || supplied_readback != current_admission
+            || supplied_readback.admission.phase != BlobProcessSourceAdmissionPhase::Ready
+            || supplied_readback.admission.owner_revision != 2
+        {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
+        let supplied_ready_receipt: WriteReceipt =
+            serde_json::from_str(&request.source_admission_write_receipt_json)
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let supplied_ready_receipt_bytes = canonical_json_bytes(&supplied_ready_receipt)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        if String::from_utf8(supplied_ready_receipt_bytes.clone())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+            != request.source_admission_write_receipt_json
+            || sha256_hex(&supplied_ready_receipt_bytes)
+                != request.source_admission_write_receipt_sha256
+            || &supplied_ready_receipt != ready_receipt
+        {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
+        validate_stable_blob_owner_facts(&pending_facts, &request.owner_facts)
+            .map_err(|_| ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            })?;
+        self.validate_current_blob_work_scope(identity, admission, &request.owner_facts)
+            .await
+            .map_err(|_| ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            })?;
+        let (fresh_policy, fresh_residency) = self
+            .validate_current_blob_policy_owner(identity, &request.owner_facts)
+            .await
+            .map_err(|_| ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            })?;
+        let ready_blob: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let ready_receipt_id = ready_blob
+            .get("receipt")
+            .and_then(|value| value.get("identity"))
+            .and_then(|value| value.get("receipt_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        let ready_locator_hash = ready_blob
+            .get("locator")
+            .and_then(|value| value.get("hash"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        if request.expected_sha256 != ready.whole_source_sha256
+            || request.expected_byte_length != ready.whole_source_byte_length
+            || request.ready_receipt_ref != ready_receipt_id
+            || request.locator != format!("blob:{ready_locator_hash}")
+            || fresh_policy != policy
+            || fresh_residency != residency
+        {
+            return Err(ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            });
+        }
+        let (sink, session, stage_binding) = self
+            .blob_sink_handle(
+                transport,
+                identity,
+                &request.capability.reference,
+                &request.binding,
+                None,
+            )
+            .await?;
+        drop(sink);
         let process_binding: ProcessExecutionBinding =
             serde_json::from_str(request.process_binding_json.as_str())
                 .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_process_binding_bytes = canonical_json_bytes(session.binding())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_policy_bytes = canonical_json_bytes(session.policy())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         if process_binding.job_id().to_string() != request.job_id
             || process_binding.operation_id().to_string() != request.operation_id
             || process_binding.process_tree_id().to_string() != request.process_tree_id
+            || process_binding != *session.binding()
+            || request.stream != session.stream()
+            || request.process_binding_sha256 != request.binding.process_binding_sha256
+            || sha256_hex(&expected_process_binding_bytes) != request.process_binding_sha256
+            || String::from_utf8(expected_process_binding_bytes)
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+                != request.process_binding_json
+            || session.policy() != &request.policy
+            || String::from_utf8(expected_policy_bytes.clone())
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+                != request.policy_json
+            || sha256_hex(&expected_policy_bytes) != request.policy_sha256
         {
             return Err(ProcessStreamSinkError::AdmissionFenced {
                 reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
             });
         }
-        if current.read_context().request != identity.request
-            || current.read_context().request.state_fence != request.fence
-        {
-            return Err(ProcessStreamSinkError::AdmissionFenced {
-                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
-            });
-        }
+        let current_read_context = fresh_blob_read_context(
+            identity,
+            &stage_binding,
+            &request.owner_facts,
+            ready_receipt,
+        )
+        .map_err(|_| ProcessStreamSinkError::AdmissionFenced {
+            reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+        })?;
         let fresh_lease = self
             .blob
             .lease_for_request(identity.request.clone())
             .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        if current.root_lease() != &fresh_lease {
-            return Err(ProcessStreamSinkError::AdmissionFenced {
-                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
-            });
-        }
         BlobStreamSinkStoreBinding::new(
             fresh_lease.clone(),
-            current.stage_context().clone(),
-            current.read_context().clone(),
-            current.policy().clone(),
-            current.residency().clone(),
+            stage_binding.stage_context().clone(),
+            Some(current_read_context.clone()),
+            policy.clone(),
+            residency.clone(),
         )
         .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
         let Some(content_hash) = request.locator.strip_prefix("blob:") else {
@@ -1244,7 +1989,7 @@ impl StoreComposition {
         let readback = match client
             .read_process_stream_source_authorized_context(
                 source_request,
-                current.read_context().clone(),
+                current_read_context.clone(),
                 fresh_lease,
             )
             .await
@@ -1332,11 +2077,11 @@ impl StoreComposition {
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
         capability_ref: &str,
-        binding_ref: &str,
+        binding: &ProcessStreamSinkBindingRef,
         outcome: ProcessStreamSinkUnknownOutcome,
     ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
-        let (sink, session) = self
-            .blob_sink_handle(transport, identity, capability_ref, binding_ref)
+        let (sink, session, _) = self
+            .blob_sink_handle(transport, identity, capability_ref, binding, None)
             .await?;
         sink.reconcile(session, outcome).await
     }
@@ -1346,25 +2091,299 @@ impl StoreComposition {
         transport: &StoreEbpSession,
         identity: &RequestIdentity,
         capability_ref: &str,
-        binding_ref: &str,
+        binding: &ProcessStreamSinkBindingRef,
+        retry_append: Option<&ProcessStreamSinkAppend>,
     ) -> Result<
         (
             Arc<BlobStoreStreamSink<Arc<dyn BlobStoreClient>>>,
             ProcessStreamSinkSession,
+            BlobStreamSinkStoreBinding,
         ),
         ProcessStreamSinkError,
     > {
         validate_blob_sink_transport(transport, identity, capability_ref)?;
-        let sinks = self.blob_stream_sinks.lock().await;
-        let Some(retained) =
-            sinks.get(&(transport.connection_id().to_owned(), binding_ref.to_owned()))
-        else {
-            return Err(ProcessStreamSinkError::ProviderUnavailable);
-        };
-        if retained.capability_ref != capability_ref || retained.binding_ref != binding_ref {
+        binding
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::SessionMismatch)?;
+        if binding_ref_commitment(capability_ref, binding)
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+            != binding.binding_ref
+        {
             return Err(ProcessStreamSinkError::SessionMismatch);
         }
-        Ok((Arc::clone(&retained.sink), retained.session.clone()))
+        let (readback, owner_facts, pending_receipt, ready_receipt, policy, residency) = self
+            .load_current_blob_source_owner(identity, binding)
+            .await
+            .map_err(|_| ProcessStreamSinkError::AdmissionFenced {
+                reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+            })?;
+        let admission = &readback.admission;
+        let open_request: ProcessStreamSinkOpenRequest =
+            serde_json::from_str(&admission.open_request_json)
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        open_request.validate()?;
+        let process_binding_bytes = canonical_json_bytes(open_request.binding())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        if admission.identity.work_scope_ref != binding.work_scope_ref
+            || admission.identity.session_id != binding.session_id
+            || admission.identity.source_id != binding.source_id
+            || admission.process_binding_sha256 != binding.process_binding_sha256
+            || admission.process_binding_json.as_bytes() != process_binding_bytes.as_slice()
+            || admission.open_request_sha256 != binding.open_request_sha256
+            || open_request.session_id().as_str() != binding.session_id
+            || open_request.source_id().as_str() != binding.source_id
+            || open_request.terminal_id().as_str() != binding.terminal_id
+            || open_request.open_request_sha256() != binding.open_request_sha256
+            || sha256_hex(&process_binding_bytes) != binding.process_binding_sha256
+        {
+            return Err(ProcessStreamSinkError::SessionMismatch);
+        }
+        let key = (
+            transport.connection_id().to_owned(),
+            binding.binding_ref.clone(),
+        );
+        if let Some(retained) = self.blob_stream_sinks.lock().await.get(&key) {
+            if retained.capability_ref != capability_ref
+                || retained.binding != *binding
+                || retained.open_request_sha256 != binding.open_request_sha256
+                || retained.store_binding.policy() != &policy
+                || retained.store_binding.residency() != &residency
+            {
+                return Err(ProcessStreamSinkError::SessionMismatch);
+            }
+            return Ok((
+                Arc::clone(&retained.sink),
+                retained.session.clone(),
+                retained.store_binding.clone(),
+            ));
+        }
+
+        // The in-memory map is only a cache. Reopen the original durable
+        // owner session by its full selector tuple after the fresh Store owner
+        // and Policy checks above; the returned stage context is the owner's
+        // persisted original identity, never a caller echo or a new operation.
+        self.prepare_blob_process_stream_demand(transport, identity)
+            .await
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let client = self
+            .blob_service
+            .lock()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+            .as_ref()
+            .cloned()
+            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        let resume = eliot_blob_api::BlobProcessStreamStageResumeRequest {
+            session_id: binding.session_id.clone(),
+            source_id: binding.source_id.clone(),
+            terminal_id: binding.terminal_id.clone(),
+            open_request_sha256: binding.open_request_sha256.clone(),
+        };
+        let expected_store_binding = binding_context_from_owner_facts(
+            &self.blob,
+            identity,
+            &open_request,
+            &owner_facts,
+            policy.clone(),
+            residency.clone(),
+        )
+        .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_session =
+            ProcessStreamSinkSession::from_open_request(open_request.clone())?;
+        let expected_stage_open = BlobStoreStreamSink::new(
+            Arc::clone(&client),
+            expected_store_binding.clone(),
+        )
+        .durable_stage_open_request(&expected_session)?;
+        let snapshot = match client.resume_process_stream_stage(resume.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(eliot_blob_api::BlobError::UnknownStreamAppendOutcome {
+                session_id,
+                sequence,
+                request_commitment_sha256,
+            }) => {
+                let retry = retry_append.ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                if admission.ready.is_some() || ready_receipt.is_some() {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "Ready source admission cannot contain an unresolved append".to_owned(),
+                    });
+                }
+                let snapshot = recover_uncertain_process_stream_append(
+                    client.as_ref(),
+                    resume,
+                    expected_stage_open.clone(),
+                    retry,
+                    &session_id,
+                    sequence,
+                    &request_commitment_sha256,
+                )
+                .await?;
+
+                // A resolved append is not enough to reattach. Confirm that
+                // its Pending owner row, canonical WorkScope, Policy owner,
+                // and exact committed Pending receipt are still current.
+                let (
+                    fresh_readback,
+                    fresh_owner_facts,
+                    fresh_pending_receipt,
+                    fresh_ready_receipt,
+                    fresh_policy,
+                    fresh_residency,
+                ) = self
+                    .load_current_blob_source_owner(identity, binding)
+                    .await
+                    .map_err(|_| ProcessStreamSinkError::AdmissionFenced {
+                        reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+                    })?;
+                if fresh_readback != readback
+                    || fresh_owner_facts != owner_facts
+                    || fresh_pending_receipt != pending_receipt
+                    || fresh_ready_receipt.is_some()
+                    || fresh_policy != policy
+                    || fresh_residency != residency
+                {
+                    return Err(ProcessStreamSinkError::AdmissionFenced {
+                        reason: eliot_process::stream_sink::ProcessStreamSinkFenceReason::StaleOrRevoked,
+                    });
+                }
+                snapshot
+            }
+            Err(_) => return Err(ProcessStreamSinkError::ProviderUnavailable),
+        };
+        snapshot
+            .validate()
+            .map_err(|_| ProcessStreamSinkError::IntegrityFailure {
+                reason: "Blob owner returned an invalid durable stream snapshot".to_owned(),
+            })?;
+        if snapshot.session != expected_stage_open {
+            return Err(ProcessStreamSinkError::IntegrityFailure {
+                reason: "durable Blob Stage Open differs from current Store owner facts".to_owned(),
+            });
+        }
+        let stored = &snapshot.session;
+        let stored_process_binding: ProcessExecutionBinding =
+            serde_json::from_str(&stored.process_source_binding.process_binding_json)
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_process_binding: ProcessExecutionBinding =
+            serde_json::from_str(&admission.process_binding_json)
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let stage_operation: eliot_receipts::OperationBinding =
+            owner_facts.stage_operation_binding_json.as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        let stage_authority: eliot_receipts::AuthorityBinding =
+            owner_facts.stage_authority_binding_json.as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        let stage_causal: eliot_receipts::CausalBinding =
+            owner_facts.stage_causal_binding_json.as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_work_scope: eliot_receipts::WorkScopeBinding =
+            serde_json::from_str(&owner_facts.work_scope_receipt_binding_json)
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_task: Option<eliot_receipts::TaskBinding> = owner_facts
+            .task_binding_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_session: Option<eliot_receipts::SessionBinding> = owner_facts
+            .session_binding_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_policy_bytes = canonical_json_bytes(open_request.policy())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let expected_policy_json = String::from_utf8(expected_policy_bytes.clone())
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let pending_envelope = pending_receipt
+            .require_reconciliation_envelope()
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let stored_binding = &stored.process_source_binding;
+        if stored.session_id != binding.session_id
+            || stored.source_id != binding.source_id
+            || stored.terminal_id != binding.terminal_id
+            || stored.open_request_sha256 != binding.open_request_sha256
+            || stored.policy != policy
+            || stored.residency != residency
+            || stored_process_binding != expected_process_binding
+            || stored_binding.process_binding_sha256 != binding.process_binding_sha256
+            || stored_binding.policy_json != expected_policy_json
+            || stored_binding.policy_sha256 != sha256_hex(&expected_policy_bytes)
+            || stored_binding.stream_kind
+                != match open_request.stream() {
+                    eliot_process::ProcessStreamKind::Stdout => "STDOUT",
+                    eliot_process::ProcessStreamKind::Stderr => "STDERR",
+                }
+            || stored.stage_context.operation != stage_operation
+            || stored.stage_context.authority != stage_authority
+            || stored.stage_context.causal != stage_causal
+            || stored.stage_context.work_scope != expected_work_scope
+            || stored.stage_context.task != expected_task
+            || stored.stage_context.session != expected_session
+            || stored.stage_context.request.state_fence != identity.request.state_fence
+            || stored.stage_context.causal.parent_receipt_id.as_ref()
+                != Some(&pending_envelope.identity.receipt_id)
+            || stored.root_lease
+                != self
+                    .blob
+                    .lease_for_request(stored.stage_context.request.clone())
+                    .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?
+        {
+            return Err(ProcessStreamSinkError::IntegrityFailure {
+                reason: "durable Blob stage identity differs from current Store owner facts".to_owned(),
+            });
+        }
+        if let Some(ready) = &admission.ready {
+            let Some(terminal) = snapshot.terminal.as_ref() else {
+                return Err(ProcessStreamSinkError::EvidenceInvariant {
+                    reason: "Ready source admission has no durable Blob terminal".to_owned(),
+                });
+            };
+            if terminal.ready_receipt_json.as_deref() != Some(ready.blob_ready_receipt_json.as_str())
+                || terminal.ready_receipt_sha256.as_deref()
+                    != Some(ready.blob_ready_receipt_sha256.as_str())
+                || ready_receipt.is_none()
+            {
+                return Err(ProcessStreamSinkError::EvidenceInvariant {
+                    reason: "durable Blob terminal differs from the current Ready owner row".to_owned(),
+                });
+            }
+        }
+        let recovered_binding = expected_store_binding;
+        let sink = Arc::new(BlobStoreStreamSink::new(Arc::clone(&client), recovered_binding.clone()));
+        let session = sink.open(open_request).await?;
+        let owner_facts_sha256 = sha256_hex(
+            &canonical_json_bytes(&owner_facts)
+                .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?,
+        );
+        let binding_context_sha256 = sha256_hex(
+            &canonical_json_bytes(&(
+                recovered_binding.root_lease(),
+                recovered_binding.stage_context(),
+                recovered_binding.read_context(),
+                recovered_binding.policy(),
+                recovered_binding.residency(),
+            ))
+            .map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?,
+        );
+        let retained = RetainedBlobStreamSink {
+            capability_ref: capability_ref.to_owned(),
+            binding: binding.clone(),
+            store_binding: recovered_binding.clone(),
+            open_request_sha256: session.open_request_sha256().to_owned(),
+            owner_facts_sha256,
+            binding_context_sha256,
+            session: session.clone(),
+            sink: Arc::clone(&sink),
+        };
+        let mut sinks = self.blob_stream_sinks.lock().await;
+        if sinks.len() >= MAX_RETAINED_BLOB_STREAM_SINKS {
+            return Err(ProcessStreamSinkError::ProviderUnavailable);
+        }
+        sinks.insert(key, retained);
+        Ok((sink, session, recovered_binding))
     }
 
     /// Releases only the in-memory stream bindings for one disconnected
@@ -3059,6 +4078,415 @@ mod tests {
     use eliot_runtime_contracts::{
         HealthVector, ModuleContract, ModuleGeneration, ModuleGenerationState,
     };
+
+    struct PendingAppendTestOwner {
+        open: eliot_blob_api::BlobProcessStreamStageOpenRequest,
+        pending: eliot_blob_api::BlobProcessStreamStageAppendRequest,
+        receipt: Option<eliot_blob_api::BlobProcessStreamStageAppendReceipt>,
+        open_calls: usize,
+        append_calls: usize,
+    }
+
+    impl PendingAppendTestOwner {
+        fn unknown(&self) -> eliot_blob_api::BlobError {
+            eliot_blob_api::BlobError::UnknownStreamAppendOutcome {
+                session_id: self.pending.session_id.clone(),
+                sequence: self.pending.sequence,
+                request_commitment_sha256: self
+                    .pending
+                    .request_commitment_sha256()
+                    .expect("valid pending append commitment"),
+            }
+        }
+
+        fn snapshot(
+            &self,
+        ) -> Result<eliot_blob_api::BlobProcessStreamStageSnapshot, eliot_blob_api::BlobError>
+        {
+            let receipt = self.receipt.clone().ok_or_else(|| self.unknown())?;
+            Ok(eliot_blob_api::BlobProcessStreamStageSnapshot {
+                session: self.open.clone(),
+                append_receipts: vec![receipt],
+                preview_bytes: self.pending.bytes[..self
+                    .pending
+                    .bytes
+                    .len()
+                    .min(self.open.max_preview_bytes as usize)]
+                    .to_vec(),
+                sha256: self.pending.chunk_sha256.clone(),
+                next_sequence: self.pending.sequence + 1,
+                next_offset: self.pending.bytes.len() as u64,
+                terminal: None,
+            })
+        }
+    }
+
+    struct PendingAppendTestClient {
+        state: Mutex<PendingAppendTestOwner>,
+    }
+
+    fn unused_blob_result<T>() -> eliot_blob_api::BlobFuture<'static, T> {
+        Box::pin(async {
+            Err(eliot_blob_api::BlobError::PlanGap(
+                "unused method in pending-append test client".to_owned(),
+            ))
+        })
+    }
+
+    impl BlobStoreClient for PendingAppendTestClient {
+        fn stage(
+            &self,
+            _request: eliot_blob_api::BlobStageRequest,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::BlobReadyReceipt> {
+            unused_blob_result()
+        }
+
+        fn open_process_stream_stage(
+            &self,
+            request: eliot_blob_api::BlobProcessStreamStageOpenRequest,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::BlobProcessStreamStageSnapshot> {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("test owner lock");
+                state.open_calls += 1;
+                if request != state.open {
+                    return Err(eliot_blob_api::BlobError::IntegrityMismatch);
+                }
+                state.snapshot()
+            })
+        }
+
+        fn append_process_stream_stage(
+            &self,
+            request: eliot_blob_api::BlobProcessStreamStageAppendRequest,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::BlobProcessStreamStageAppendReceipt>
+        {
+            Box::pin(async move {
+                let mut state = self.state.lock().expect("test owner lock");
+                state.append_calls += 1;
+                if request != state.pending {
+                    return Err(eliot_blob_api::BlobError::IntegrityMismatch);
+                }
+                if let Some(receipt) = &state.receipt {
+                    return Ok(receipt.clone());
+                }
+                let byte_length = request.bytes.len() as u64;
+                let receipt = eliot_blob_api::BlobProcessStreamStageAppendReceipt {
+                    session_key_sha256: state
+                        .open
+                        .session_key_sha256()?,
+                    request_commitment_sha256: request.request_commitment_sha256()?,
+                    sequence: request.sequence,
+                    offset: request.offset,
+                    byte_length,
+                    chunk_sha256: request.chunk_sha256.clone(),
+                    prefix_sha256: request.chunk_sha256.clone(),
+                    next_sequence: request.sequence + 1,
+                    next_offset: request.offset + byte_length,
+                };
+                state.receipt = Some(receipt.clone());
+                Ok(receipt)
+            })
+        }
+
+        fn resume_process_stream_stage(
+            &self,
+            request: eliot_blob_api::BlobProcessStreamStageResumeRequest,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::BlobProcessStreamStageSnapshot> {
+            Box::pin(async move {
+                let state = self.state.lock().expect("test owner lock");
+                if request.session_id != state.open.session_id
+                    || request.source_id != state.open.source_id
+                    || request.terminal_id != state.open.terminal_id
+                    || request.open_request_sha256 != state.open.open_request_sha256
+                {
+                    return Err(eliot_blob_api::BlobError::IntegrityMismatch);
+                }
+                state.snapshot()
+            })
+        }
+
+        fn read(
+            &self,
+            _request: eliot_blob_api::BlobReadRequest,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::BlobReadChunk> {
+            unused_blob_result()
+        }
+
+        fn read_sealed(
+            &self,
+            _request: eliot_blob_api::BlobReadRequest,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::SealedBlobRead> {
+            unused_blob_result()
+        }
+
+        fn reachability(
+            &self,
+            _request: eliot_blob_api::BlobReachabilityRequest,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::BlobReachabilityView> {
+            unused_blob_result()
+        }
+
+        fn gc(
+            &self,
+            _request: eliot_blob_api::BlobGcRequest,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::BlobGcReceipt> {
+            unused_blob_result()
+        }
+
+        fn health(
+            &self,
+        ) -> eliot_blob_api::BlobFuture<'_, eliot_blob_api::BlobHealth> {
+            unused_blob_result()
+        }
+    }
+
+    fn stage_open_for_pending_append() -> eliot_blob_api::BlobProcessStreamStageOpenRequest {
+        let fence = serde_json::json!({
+            "authority_epoch": {
+                "lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                "sequence": 4
+            },
+            "resource_generation": 1,
+            "task_revision": null,
+            "policy_revision": null,
+            "integration_revision": null
+        });
+        let metadata = serde_json::json!({
+            "request_id": "stream-request-recovery",
+            "session_id": null,
+            "task_id": null,
+            "product_id": "product-stream",
+            "source_id": "source-stream",
+            "state_fence": fence,
+            "clock": {
+                "valid_time_ms": 1,
+                "known_time_ms": 1,
+                "transaction_sequence": null,
+                "monotonic_ns": 1
+            }
+        });
+        let fence = metadata["state_fence"].clone();
+        let context: BlobReceiptContext = serde_json::from_value(serde_json::json!({
+            "work_scope": {
+                "scope_id": "scope-stream",
+                "product_id": "product-stream",
+                "resource_generation": 1,
+                "state_fence": fence
+            },
+            "task": null,
+            "session": null,
+            "causal": {
+                "state_fence": fence,
+                "transaction_sequence": 1,
+                "parent_receipt_id": null,
+                "predecessor_receipt_ids": []
+            },
+            "request": {
+                "metadata": metadata,
+                "state_fence": fence
+            },
+            "operation": {
+                "operation_id": "stream-op-recovery",
+                "request_id": "stream-request-recovery",
+                "idempotency_key": "idem-recovery",
+                "operation_kind": "blob-process-stream-test",
+                "effect": "REVERSIBLE_MUTATION",
+                "state_fence": fence
+            },
+            "authority": {
+                "authority_id": "authority-stream",
+                "authority_owner": "test-owner",
+                "authority_epoch": fence["authority_epoch"],
+                "state_fence": fence,
+                "allowed_effect": "REVERSIBLE_MUTATION",
+                "proof_ceiling": "OBSERVED_EXTERNAL_EFFECT"
+            }
+        }))
+        .expect("valid Stage context fixture");
+        let root_lease = eliot_blob_api::BlobRootLease {
+            root_id: PlatformHandle::new("test-blob-root").expect("root handle"),
+            owner_id: BlobId::new("test-blob-owner").expect("owner id"),
+            lease_id: BlobId::new("test-blob-lease").expect("lease id"),
+            root_generation: 1,
+            fence_binding: context.request.clone(),
+        };
+        let policy: BlobPolicyBinding = serde_json::from_value(serde_json::json!({
+            "privacy_class": "PRIVATE",
+            "retention_class": "TASK",
+            "policy_ref": "policy-stream-test",
+            "instruction_taint": "DATA_ONLY",
+            "effect_ceiling": "CANDIDATE_ONLY"
+        }))
+        .expect("valid policy fixture");
+        let residency: ObjectResidencyKey = serde_json::from_value(serde_json::json!({
+            "scope_domain_id": "scope-stream-test",
+            "access_domain_id": "access-stream-test",
+            "confidentiality_domain_id": "conf-stream-test",
+            "encryption_key_domain_id": "process-stream-test-key",
+            "retention_domain_id": "retention-stream-test",
+            "erasure_domain_id": "erasure-stream-test",
+            "content_digest": {
+                "algorithm": "blake3",
+                "version": 1,
+                "digest": "0".repeat(64)
+            }
+        }))
+        .expect("valid residency fixture");
+        let process_binding_json = "{}".to_owned();
+        let policy_json = "{}".to_owned();
+        eliot_blob_api::BlobProcessStreamStageOpenRequest {
+            session_id: "session-recovery".to_owned(),
+            source_id: "source-recovery".to_owned(),
+            terminal_id: "terminal-recovery".to_owned(),
+            open_request_sha256: sha256_hex(b"open-recovery"),
+            stage_context: context,
+            root_lease,
+            policy,
+            residency,
+            process_source_binding: BlobProcessStreamSourceBinding {
+                process_binding_json: process_binding_json.clone(),
+                process_binding_sha256: sha256_hex(process_binding_json.as_bytes()),
+                stream_kind: "STDOUT".to_owned(),
+                policy_json: policy_json.clone(),
+                policy_sha256: sha256_hex(policy_json.as_bytes()),
+            },
+            max_bytes: 8,
+            max_chunk_bytes: 8,
+            max_chunks: 4,
+            max_preview_bytes: 8,
+        }
+    }
+
+    fn pending_append_for(
+        open: &eliot_blob_api::BlobProcessStreamStageOpenRequest,
+        bytes: &[u8],
+    ) -> eliot_blob_api::BlobProcessStreamStageAppendRequest {
+        eliot_blob_api::BlobProcessStreamStageAppendRequest {
+            session_id: open.session_id.clone(),
+            source_id: open.source_id.clone(),
+            terminal_id: open.terminal_id.clone(),
+            open_request_sha256: open.open_request_sha256.clone(),
+            sequence: 0,
+            offset: 0,
+            bytes: bytes.to_vec(),
+            chunk_sha256: sha256_hex(bytes),
+        }
+    }
+
+    fn futures_ready<T>(future: impl std::future::Future<Output = T>) -> T {
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Pin::from(Box::new(future));
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    fn pending_append_test_client(
+        open: eliot_blob_api::BlobProcessStreamStageOpenRequest,
+        pending: eliot_blob_api::BlobProcessStreamStageAppendRequest,
+    ) -> PendingAppendTestClient {
+        PendingAppendTestClient {
+            state: Mutex::new(PendingAppendTestOwner {
+                open,
+                pending,
+                receipt: None,
+                open_calls: 0,
+                append_calls: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn store_restart_recovers_only_the_exact_pending_append_bytes() {
+        let open = stage_open_for_pending_append();
+        let pending = pending_append_for(&open, b"known");
+        let commitment = pending
+            .request_commitment_sha256()
+            .expect("pending append commitment");
+        let client = pending_append_test_client(open.clone(), pending);
+        let retry = ProcessStreamSinkAppend::from_bytes(0, 0, b"known".to_vec(), 1);
+        let snapshot = futures_ready(recover_uncertain_process_stream_append(
+            &client,
+            eliot_blob_api::BlobProcessStreamStageResumeRequest {
+                session_id: open.session_id.clone(),
+                source_id: open.source_id.clone(),
+                terminal_id: open.terminal_id.clone(),
+                open_request_sha256: open.open_request_sha256.clone(),
+            },
+            open.clone(),
+            &retry,
+            &open.session_id,
+            0,
+            &commitment,
+        ))
+        .expect("exact pending append recovers after restart");
+        assert_eq!(snapshot.session, open);
+        assert_eq!(snapshot.next_sequence, 1);
+        assert_eq!(snapshot.next_offset, 5);
+        assert_eq!(snapshot.sha256, sha256_hex(b"known"));
+        let owner = client.state.lock().expect("test owner lock");
+        assert_eq!(owner.open_calls, 1, "recovery checks original durable Open");
+        assert_eq!(owner.append_calls, 1, "recovery retries the exact Append once");
+    }
+
+    #[test]
+    fn store_restart_refuses_altered_bytes_and_a_foreign_session() {
+        let open = stage_open_for_pending_append();
+        let pending = pending_append_for(&open, b"known");
+        let commitment = pending
+            .request_commitment_sha256()
+            .expect("pending append commitment");
+        let client = pending_append_test_client(open.clone(), pending);
+        let altered = ProcessStreamSinkAppend::from_bytes(0, 0, b"other".to_vec(), 1);
+        let altered_result = futures_ready(recover_uncertain_process_stream_append(
+            &client,
+            eliot_blob_api::BlobProcessStreamStageResumeRequest {
+                session_id: open.session_id.clone(),
+                source_id: open.source_id.clone(),
+                terminal_id: open.terminal_id.clone(),
+                open_request_sha256: open.open_request_sha256.clone(),
+            },
+            open.clone(),
+            &altered,
+            &open.session_id,
+            0,
+            &commitment,
+        ));
+        assert!(matches!(
+            altered_result,
+            Err(ProcessStreamSinkError::MismatchedReplay)
+        ));
+
+        let exact_retry = ProcessStreamSinkAppend::from_bytes(0, 0, b"known".to_vec(), 1);
+        let foreign_session_result = futures_ready(recover_uncertain_process_stream_append(
+            &client,
+            eliot_blob_api::BlobProcessStreamStageResumeRequest {
+                session_id: open.session_id.clone(),
+                source_id: open.source_id.clone(),
+                terminal_id: open.terminal_id.clone(),
+                open_request_sha256: open.open_request_sha256.clone(),
+            },
+            open.clone(),
+            &exact_retry,
+            "foreign-session",
+            0,
+            &commitment,
+        ));
+        assert!(matches!(
+            foreign_session_result,
+            Err(ProcessStreamSinkError::MismatchedReplay)
+        ));
+        let owner = client.state.lock().expect("test owner lock");
+        assert_eq!(owner.open_calls, 0, "invalid retry selectors cause no owner operation");
+        assert_eq!(owner.append_calls, 0, "invalid retries cannot append bytes");
+    }
 
     fn handle(value: impl Into<String>) -> PlatformHandle {
         PlatformHandle::new(value).expect("valid test handle")
