@@ -8,8 +8,11 @@
 //! Governor-observed currentness (`governor_route_revision` /
 //! `governor_capacity_revision`, resolved by the daemon from its live
 //! Governor view), the claiming-worker generation, and the fence digest
-//! (wire contour `eliot-kernel-provider-capability/v2`). No signing,
-//! no tokens, no cached `Verified` marker, no user
+//! (wire contour `eliot-kernel-provider-capability/v2`). The same
+//! authenticated path also serves one read-only claim-row projection
+//! (`PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION`): the sealed durable
+//! row fields under one exact claim identity, with no presented values to
+//! echo. No signing, no tokens, no cached `Verified` marker, no user
 //! authentication: every call re-queries ORS and the live authority epoch,
 //! so restore always observes fresh owner evidence.
 //!
@@ -62,9 +65,25 @@ use std::sync::{Arc, Mutex};
 pub(crate) const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str =
     "native_worker.provider_capability.verify";
 
-/// Returns true for the provider-capability operation owned here.
+/// Reads the sealed durable claim-row projection bound to one exact claim
+/// identity (issue #1108, A4/A5 daemon row source).
+///
+/// Daemon-target operation for the later daemon caller
+/// (`bins/eliotd/src/daemon_kernel_client.rs`: a new
+/// `load_provider_claim_row_async` over `transact_async`, feeding
+/// `OwnerLoadedClaimRow::new` plus `AdmittedProviderFactory::new` in
+/// `crates/agent/eliot-agent-coordinator/src/admitted_provider.rs`). The
+/// request carries only the claim identity; every projected field is loaded
+/// from the Kernel-held ORS row, never echoed from presented values, so the
+/// reply is genuine owner evidence (I15.2), not a tautology. Read-only:
+/// mints no row, caches no verdict.
+pub(crate) const PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION: &str =
+    "native_worker.provider_capability.claim_row.read";
+
+/// Returns true for the provider-capability operations owned here.
 pub(crate) fn is_provider_capability_operation(operation: &str) -> bool {
     operation == PROVIDER_CAPABILITY_VERIFY_OPERATION
+        || operation == PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION
 }
 
 /// Maximum length of a bounded presented identity field, in UTF-8 bytes.
@@ -357,6 +376,54 @@ impl ProviderCapabilityContext {
         }
         Ok(())
     }
+
+    /// Projects the sealed durable claim-row fields bound to one exact claim
+    /// identity (issue #1108, A4/A5 daemon row source).
+    ///
+    /// Loads the row by exact claim identity through the same
+    /// `ors.load_native_worker_claim` path as [`ProviderCapabilityContext::verify`]
+    /// (unknown identities stay `UnknownClaim`) and returns the unsealed
+    /// projection body; the dispatch path seals it with
+    /// [`seal_capability_receipt`]. Every body field comes from the loaded
+    /// row — claim, attempt, operation, binding and executable digests,
+    /// claiming-worker generation, fence digest — never from presented
+    /// values: the request carries only the claim identity, so echoing
+    /// presented values as loaded ones is impossible by construction. The
+    /// row is returned verbatim (including a zero generation or a stale
+    /// admission epoch): freshness and generation gates stay with the
+    /// verifier and the downstream factory, which fail closed on the exact
+    /// loaded evidence. Read-only: mints no row, caches no verdict.
+    pub fn read_claim_row(
+        &self,
+        claim_id: &str,
+    ) -> Result<serde_json::Value, ProviderCapabilityRouteError> {
+        let claim_identity = OperationIdentity::new(claim_id).map_err(|_| {
+            ProviderCapabilityRouteError::Session("claim identity is malformed".to_owned())
+        })?;
+        let row = self
+            .ors
+            .load_native_worker_claim(&claim_identity)
+            .map_err(|_| {
+                ProviderCapabilityRouteError::Store(
+                    "durable claim record is unavailable".to_owned(),
+                )
+            })?
+            .ok_or_else(|| {
+                ProviderCapabilityRouteError::UnknownClaim(bounded_identity(claim_id))
+            })?;
+        Ok(serde_json::json!({
+            "kind": "native_worker_provider_capability_claim_row",
+            "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "claim_id": row.claim_id.as_str(),
+            "attempt_id": row.attempt_id.as_str(),
+            "operation_id": row.operation_id.as_str(),
+            "binding_digest": row.binding_digest.as_str(),
+            "executable_binding_digest": row.executable_binding_digest.as_str(),
+            "worker_generation": row.worker_generation,
+            "fence_digest": row.fence_digest.as_str(),
+            "read_at_unix_ms": unix_ms(),
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -431,9 +498,9 @@ impl KernelComposition {
     /// gate; those gates are re-checked here so direct callers cannot bypass
     /// them. Per-call session authentication, the ORS lookup, the fresh
     /// live-epoch query, and the owner delegation live in
-    /// [`ProviderCapabilityContext::verify`]. This route serves verification
-    /// only and claims no claim-row read operation, so a never-admitted row
-    /// has no projection path here.
+    /// [`ProviderCapabilityContext::verify`]; the claim-row read branch
+    /// reuses the same session/fence gates and the same ORS claim-resolution
+    /// path through [`ProviderCapabilityContext::read_claim_row`].
     pub(crate) fn dispatch_provider_capability_frame(
         &self,
         session: &Session,
@@ -481,12 +548,17 @@ impl KernelComposition {
             .get("operation")
             .and_then(serde_json::Value::as_str)
             .ok_or(TransportError::SessionFenced)?;
-        if operation != PROVIDER_CAPABILITY_VERIFY_OPERATION {
+        if operation != PROVIDER_CAPABILITY_VERIFY_OPERATION
+            && operation != PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION
+        {
             return Err(TransportError::SessionFenced);
         }
-        let receipt = self
-            .handle_provider_capability_verify(session, &payload)
-            .map_err(ProviderCapabilityRouteError::into_transport)?;
+        let receipt = if operation == PROVIDER_CAPABILITY_VERIFY_OPERATION {
+            self.handle_provider_capability_verify(session, &payload)
+        } else {
+            self.handle_provider_capability_claim_row_read(session, &payload)
+        }
+        .map_err(ProviderCapabilityRouteError::into_transport)?;
         let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, receipt)?;
         frame.request_id = Some(request_id);
         frame
@@ -582,6 +654,48 @@ impl KernelComposition {
             "fence_digest": fence_digest,
             "verified_at_unix_ms": unix_ms(),
         });
+        seal_capability_receipt(body)
+    }
+
+    /// Reads the sealed durable claim-row projection for one exact claim
+    /// identity (issue #1108, A4/A5 daemon row source).
+    ///
+    /// The request carries only `wire_version` plus `claim_id`: every
+    /// projected field is loaded from the Kernel-held ORS row by
+    /// [`ProviderCapabilityContext::read_claim_row`], never echoed from
+    /// presented values. Session authentication, the session fence join, and
+    /// the ORS claim-resolution path are the existing ones (dispatch gates
+    /// above plus [`KernelComposition::provider_capability_for_session`]).
+    /// Unknown identities fail closed as `UnknownRequest`; malformed
+    /// identities, session/fence failures, and store failures fail closed as
+    /// `SessionFenced`. Read-only: mints no row, admits nothing.
+    ///
+    /// Reply contract (sealed with `receipt_digest`, same envelope as the
+    /// verify receipt): `kind` is
+    /// `native_worker_provider_capability_claim_row`, `wire_version` is
+    /// [`PROVIDER_CAPABILITY_WIRE_VERSION`], then the exact durable fields
+    /// `claim_id`, `attempt_id`, `operation_id`, `binding_digest`,
+    /// `executable_binding_digest`, `worker_generation`, `fence_digest`
+    /// (shaped for `OwnerLoadedClaimRow::new`), plus `read_at_unix_ms`.
+    fn handle_provider_capability_claim_row_read(
+        &self,
+        session: &Session,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, ProviderCapabilityRouteError> {
+        let wire_version = payload
+            .get("wire_version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ProviderCapabilityRouteError::Session("capability wire version".to_owned())
+            })?;
+        if wire_version != PROVIDER_CAPABILITY_WIRE_VERSION {
+            return Err(ProviderCapabilityRouteError::Session(
+                "capability wire version".to_owned(),
+            ));
+        }
+        let claim_id = require_capability_text(payload, "claim_id", MAX_CAPABILITY_TEXT_LEN)?;
+        let context = self.provider_capability_for_session(session)?;
+        let body = context.read_claim_row(&claim_id)?;
         seal_capability_receipt(body)
     }
 }
