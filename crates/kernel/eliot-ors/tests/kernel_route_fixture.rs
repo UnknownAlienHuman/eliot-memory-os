@@ -17,8 +17,8 @@ use std::num::NonZeroU64;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_ors::{
     ExpectedOrderingHead, OpaqueLabel, OperationalRecoveryStore, OrsError, RecoveryAccessClass,
-    RecoveryCursor, RecoveryEnvelopeContext, RecoveryPayloadEnvelope, RedbRecoveryStore,
-    RecoveryWriteBinding, ReservationRequest, ReservationState, ScopeReservationRequest,
+    RecoveryCursor, RecoveryEnvelopeContext, RecoveryPayloadEnvelope, RecoveryWriteBinding,
+    RedbRecoveryStore, ReservationRequest, ReservationState, ScopeReservationRequest,
     StateFenceSnapshot,
     test_support::{KernelRouteStoreFixture, kernel_fixture_dir, kernel_route_writer_epoch},
 };
@@ -38,10 +38,9 @@ fn reservation_request(tag: &str) -> ReservationRequest {
     let writer_epoch =
         kernel_route_writer_epoch(LINEAGE_2031, 1).expect("2031 writer epoch builds");
     let snapshot = StateFenceSnapshot::capture(&fence(), 1).expect("2031 fence snapshot captures");
-    let operation_id = OpaqueLabel::new(format!("op-2031-{tag}"))
-        .expect("2031 operation label");
-    let reservation_id = OpaqueLabel::new(format!("reservation-2031-{tag}"))
-        .expect("2031 reservation label");
+    let operation_id = OpaqueLabel::new(format!("op-2031-{tag}")).expect("2031 operation label");
+    let reservation_id =
+        OpaqueLabel::new(format!("reservation-2031-{tag}")).expect("2031 reservation label");
     let visibility = OpaqueLabel::new("owner-only").expect("2031 visibility label");
     let access_class = RecoveryAccessClass {
         privacy: PrivacyClass::Private,
