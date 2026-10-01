@@ -18,18 +18,24 @@
 //! to the retained generation, never restoration of old state.
 //!
 //! The upstream package itself is never touched: staging records the
-//! caller-observed identity line, it does not install anything.
+//! caller-observed identity line together with the caller-attested
+//! upstream artifact digest, it does not install anything. Every staged value
+//! is stamped with the bridge declaration revision, so a declaration-schema
+//! change is a new admission rather than a silent update.
 //!
 //! Wiring: the crate root declares `mod generation;` and re-exports this
-//! sequence. `LspBridge::stage_generation` feeds staged values built from
-//! `lsp_application_obligations().supported_operations`, the launch path
-//! records dispatched operation identities in the ledger, and the
-//! composition owner holding the `AdmittedLine` supplies the canary verdict
-//! and performs the switch.
+//! sequence. `LspBridge::stage_generation` and `LspBridge::load_admitted` feed
+//! staged values built from `lsp_application_obligations().supported_operations`,
+//! the launch path records dispatched operation identities in the
+//! ledger, and the composition owner holding the `AdmittedLine` supplies the
+//! canary verdict and performs the switch. The pre-exposure compatibility
+//! check refuses route, declaration-revision, and operation-set drift, and
+//! `AdmittedLine::check_bound` gates caller-presented declarations against
+//! the live generation before status is projected.
 
 use thiserror::Error;
 
-use super::parse_version_output;
+use super::{LSP_DECLARATION_REVISION, is_artifact_digest, parse_version_output};
 
 /// Typed failures of the generation update sequence.
 ///
@@ -49,6 +55,24 @@ pub enum GenerationError {
     UpstreamIdentity {
         /// Original parser failure detail.
         detail: String,
+    },
+    /// A caller-attested upstream artifact digest was not 64 hexadecimal
+    /// characters. An unattested or malformed artifact binding is refused
+    /// before anything is staged.
+    #[error("upstream artifact digest has an unexpected shape: {detail}")]
+    ArtifactDigestShape {
+        /// Stable detail naming the rejected input.
+        detail: String,
+    },
+    /// The presented declaration names a different upstream artifact
+    /// (identity line or digest) than the live generation. Artifacts are never
+    /// substituted silently under the same declaration.
+    #[error("presented artifact '{presented}' does not match live artifact '{live}'")]
+    ArtifactMismatch {
+        /// Artifact identity named by the presented declaration.
+        presented: String,
+        /// Artifact identity recorded on the live generation.
+        live: String,
     },
     /// The staged route executable differs from the admitted one. No
     /// provider is ever substituted under the same operation.
@@ -92,12 +116,15 @@ pub enum GenerationError {
     },
 }
 
-/// One admitted upstream generation: route, observed upstream identity, and
+/// One admitted upstream generation: route, observed upstream identity,
+/// caller-attested upstream artifact digest, declaration revision, and
 /// the exact admitted operation set snapshotted from the bridge declaration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveGeneration {
     route_executable: String,
     upstream_version_line: String,
+    upstream_artifact_digest: String,
+    declaration_revision: u64,
     admitted_operations: Vec<String>,
 }
 
@@ -112,6 +139,18 @@ impl ActiveGeneration {
     #[must_use]
     pub fn upstream_version_line(&self) -> &str {
         &self.upstream_version_line
+    }
+
+    /// Returns the caller-attested upstream artifact digest bound at staging.
+    #[must_use]
+    pub fn upstream_artifact_digest(&self) -> &str {
+        &self.upstream_artifact_digest
+    }
+
+    /// Returns the bridge declaration revision this generation was staged under.
+    #[must_use]
+    pub fn declaration_revision(&self) -> u64 {
+        self.declaration_revision
     }
 
     /// Returns the admitted operation snapshot bound to this generation.
@@ -129,6 +168,8 @@ impl ActiveGeneration {
 pub struct StagedGeneration {
     route_executable: String,
     upstream_version_line: String,
+    upstream_artifact_digest: String,
+    declaration_revision: u64,
     admitted_operations: Vec<String>,
 }
 
@@ -140,20 +181,27 @@ impl StagedGeneration {
     /// `lsp_application_obligations().supported_operations`), so the
     /// declaration and the generation cannot drift apart. The upstream
     /// identity line is validated through the original analyzer identity
-    /// parser and stored in its parsed form.
+    /// parser and stored in its parsed form, and
+    /// `upstream_artifact_digest` is the caller-attested digest of the bound
+    /// upstream artifact (64 hexadecimal characters): both are recorded,
+    /// never installed or probed through dispatch. The staged value is
+    /// stamped with the current bridge declaration revision.
     ///
     /// # Errors
     ///
     /// Returns [`GenerationError::BlankField`] on blank inputs or an empty
-    /// operation set, or [`GenerationError::UpstreamIdentity`] when the
+    /// operation set, [`GenerationError::ArtifactDigestShape`] on a malformed
+    /// artifact digest, or [`GenerationError::UpstreamIdentity`] when the
     /// identity line is not an exact analyzer version line.
     pub fn stage(
         route_executable: impl Into<String>,
         upstream_version_line: impl Into<String>,
+        upstream_artifact_digest: impl Into<String>,
         admitted_operations: &[&str],
     ) -> Result<Self, GenerationError> {
         let route_executable = route_executable.into();
         let upstream_version_line = upstream_version_line.into();
+        let upstream_artifact_digest = upstream_artifact_digest.into();
         if route_executable.trim().is_empty() {
             return Err(GenerationError::BlankField {
                 field: "route_executable",
@@ -162,6 +210,16 @@ impl StagedGeneration {
         if upstream_version_line.trim().is_empty() {
             return Err(GenerationError::BlankField {
                 field: "upstream_version_line",
+            });
+        }
+        if upstream_artifact_digest.trim().is_empty() {
+            return Err(GenerationError::BlankField {
+                field: "upstream_artifact_digest",
+            });
+        }
+        if !is_artifact_digest(&upstream_artifact_digest) {
+            return Err(GenerationError::ArtifactDigestShape {
+                detail: "upstream_artifact_digest must be 64 hexadecimal characters".to_owned(),
             });
         }
         if admitted_operations.is_empty() {
@@ -177,6 +235,8 @@ impl StagedGeneration {
         Ok(Self {
             route_executable,
             upstream_version_line: parsed,
+            upstream_artifact_digest,
+            declaration_revision: LSP_DECLARATION_REVISION,
             admitted_operations: admitted_operations
                 .iter()
                 .map(|operation| (*operation).to_owned())
@@ -194,6 +254,18 @@ impl StagedGeneration {
     #[must_use]
     pub fn upstream_version_line(&self) -> &str {
         &self.upstream_version_line
+    }
+
+    /// Returns the staged upstream artifact digest.
+    #[must_use]
+    pub fn upstream_artifact_digest(&self) -> &str {
+        &self.upstream_artifact_digest
+    }
+
+    /// Returns the bridge declaration revision stamped at staging.
+    #[must_use]
+    pub fn declaration_revision(&self) -> u64 {
+        self.declaration_revision
     }
 
     /// Returns the staged admitted operation snapshot.
@@ -319,6 +391,8 @@ impl AdmittedLine {
             current: ActiveGeneration {
                 route_executable: staged.route_executable,
                 upstream_version_line: staged.upstream_version_line,
+                upstream_artifact_digest: staged.upstream_artifact_digest,
+                declaration_revision: staged.declaration_revision,
                 admitted_operations: staged.admitted_operations,
             },
             retained: None,
@@ -339,10 +413,10 @@ impl AdmittedLine {
 
     /// Validates contract/protocol compatibility before route exposure.
     ///
-    /// The route executable and the admitted operation set must match
-    /// exactly. The upstream identity line is intentionally not compared:
-    /// it is the update payload, while compatibility is about contract and
-    /// protocol identity.
+    /// The route executable, the bridge declaration revision, and the
+    /// admitted operation set must match exactly. The upstream identity line
+    /// and artifact digest are intentionally not compared: they are the update
+    /// payload, while compatibility is about contract and protocol identity.
     ///
     /// # Errors
     ///
@@ -356,6 +430,14 @@ impl AdmittedLine {
             return Err(GenerationError::RouteMismatch {
                 staged: staged.route_executable.clone(),
                 admitted: self.current.route_executable.clone(),
+            });
+        }
+        if staged.declaration_revision != self.current.declaration_revision {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "staged declaration revision {} does not match live revision {}",
+                    staged.declaration_revision, self.current.declaration_revision
+                ),
             });
         }
         if staged.admitted_operations != self.current.admitted_operations {
@@ -401,6 +483,8 @@ impl AdmittedLine {
             ActiveGeneration {
                 route_executable: staged.route_executable,
                 upstream_version_line: staged.upstream_version_line,
+                upstream_artifact_digest: staged.upstream_artifact_digest,
+                declaration_revision: staged.declaration_revision,
                 admitted_operations: staged.admitted_operations,
             },
         );
@@ -425,6 +509,7 @@ impl AdmittedLine {
             return Err(GenerationError::NoRetainedGeneration);
         };
         if retained.route_executable != self.current.route_executable
+            || retained.declaration_revision != self.current.declaration_revision
             || retained.admitted_operations != self.current.admitted_operations
         {
             return Err(GenerationError::OperationsMismatch {
@@ -438,6 +523,66 @@ impl AdmittedLine {
         }
         let regressed = std::mem::replace(&mut self.current, retained);
         self.retained = Some(regressed);
+        Ok(())
+    }
+
+    /// Gates a caller-presented declaration against the live generation.
+    ///
+    /// The revision, route, upstream identity line, upstream artifact digest,
+    /// and admitted-operation snapshot must all match the live generation
+    /// exactly. A declaration for another artifact, another revision, or
+    /// another operation set binds nothing here: the gate refuses before any
+    /// route is exposed, creating no authority, no operation identity, and
+    /// no task decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::RouteMismatch`],
+    /// [`GenerationError::OperationsMismatch`], or
+    /// [`GenerationError::ArtifactMismatch`] without changing the line.
+    pub fn check_bound(
+        &self,
+        revision: u64,
+        route_executable: &str,
+        upstream_version_line: &str,
+        upstream_artifact_digest: &str,
+        admitted_operations: &[String],
+    ) -> Result<(), GenerationError> {
+        if route_executable != self.current.route_executable {
+            return Err(GenerationError::RouteMismatch {
+                staged: route_executable.to_owned(),
+                admitted: self.current.route_executable.clone(),
+            });
+        }
+        if revision != self.current.declaration_revision {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "presented declaration revision {revision} does not match live revision {}",
+                    self.current.declaration_revision
+                ),
+            });
+        }
+        if admitted_operations != self.current.admitted_operations.as_slice() {
+            return Err(GenerationError::OperationsMismatch {
+                detail: format!(
+                    "presented declaration admits {} operations, live generation admits {}",
+                    admitted_operations.len(),
+                    self.current.admitted_operations.len()
+                ),
+            });
+        }
+        if upstream_version_line != self.current.upstream_version_line {
+            return Err(GenerationError::ArtifactMismatch {
+                presented: upstream_version_line.to_owned(),
+                live: self.current.upstream_version_line.clone(),
+            });
+        }
+        if upstream_artifact_digest != self.current.upstream_artifact_digest {
+            return Err(GenerationError::ArtifactMismatch {
+                presented: upstream_artifact_digest.to_owned(),
+                live: self.current.upstream_artifact_digest.clone(),
+            });
+        }
         Ok(())
     }
 
