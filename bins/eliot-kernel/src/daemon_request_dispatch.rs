@@ -3562,35 +3562,36 @@ impl KernelComposition {
                     if payload.as_object().is_none_or(|object| object.len() != 1) {
                         return Err(TransportError::SessionFenced);
                     }
-                    self.claim_owner_decision(session).map(|claimed| match claimed {
-                        // Projected field by field rather than serialized whole,
-                        // and the two fields left off are named: `identity` is the
-                        // admitted `RequestIdentity` this daemon never presented
-                        // and cannot re-verify (it is the Kernel's own proof that
-                        // the entry was admitted under a fence), and `held_bytes`
-                        // is this queue's own capacity charge, which is the
-                        // Kernel's ledger and not a fact about the decision. The
-                        // four projected fields are the whole decision, and
-                        // `bins/eliotd`'s closed view refuses any fifth rather
-                        // than reading a field it has no use for.
-                        Some(entry) => serde_json::json!({
-                            "status": "known",
-                            "value": {
-                                "decision": {
-                                    "brief_id": entry.brief_id,
-                                    "decision": entry.decision,
-                                    "note": entry.note,
-                                    "principal": entry.principal,
+                    self.claim_owner_decision(session)
+                        .map(|claimed| match claimed {
+                            // Projected field by field rather than serialized whole,
+                            // and the two fields left off are named: `identity` is the
+                            // admitted `RequestIdentity` this daemon never presented
+                            // and cannot re-verify (it is the Kernel's own proof that
+                            // the entry was admitted under a fence), and `held_bytes`
+                            // is this queue's own capacity charge, which is the
+                            // Kernel's ledger and not a fact about the decision. The
+                            // four projected fields are the whole decision, and
+                            // `bins/eliotd`'s closed view refuses any fifth rather
+                            // than reading a field it has no use for.
+                            Some(entry) => serde_json::json!({
+                                "status": "known",
+                                "value": {
+                                    "decision": {
+                                        "brief_id": entry.brief_id,
+                                        "decision": entry.decision,
+                                        "note": entry.note,
+                                        "principal": entry.principal,
+                                    },
                                 },
-                            },
-                            "recovery": null,
-                        }),
-                        None => serde_json::json!({
-                            "status": "known",
-                            "value": { "decision": null },
-                            "recovery": null,
-                        }),
-                    })
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "decision": null },
+                                "recovery": null,
+                            }),
+                        })
                 }
                 #[cfg(not(windows))]
                 {

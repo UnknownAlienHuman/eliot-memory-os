@@ -865,10 +865,15 @@ pub struct DurableRepeatedVerifierFailure {
 ///
 /// No row is skipped and none is defaulted past, so a set this function accepts
 /// contains only records an owner committed.
-fn restored_learning_deltas(rows: &[Value]) -> Result<Vec<StoredLearningDelta>, LearningClosureError> {
+fn restored_learning_deltas(
+    rows: &[Value],
+) -> Result<Vec<StoredLearningDelta>, LearningClosureError> {
     let mut restored = Vec::with_capacity(rows.len());
     for row in rows {
-        let handle = row.get("handle").and_then(Value::as_str).unwrap_or_default();
+        let handle = row
+            .get("handle")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let refused = |detail: String| {
             LearningClosureError::Canonical(format!(
                 "durable learning-delta row {handle}: {detail}"

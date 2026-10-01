@@ -88,7 +88,7 @@
 //! receipt.
 
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_contracts::{OperationId, StateFence};
+use eliot_contracts::{OperationId, StateFence, sha256_hex};
 use eliot_learning_delta::{LearningDeltaError, StoredLearningDelta};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
@@ -109,11 +109,32 @@ use crate::learning_admission::{LearningAdmissionPermit, verify_learning_admissi
 /// Validates the record first (`record.validate()?`, which enforces the
 /// admitted-disposition receipt rule); binds kind `Delta`, the
 /// `delta_artifact` handle, the canonical JSON of the record document, and
-/// the already-hex64 `delta_digest`; threads the caller-supplied opaque
-/// owner `scope_digest`/`fence_digest` refs through untouched; then asserts
-/// the built output travels the named operation via
+/// the SHA-256 of those EXACT bytes as the presented `record_digest`; threads
+/// the caller-supplied opaque owner `scope_digest`/`fence_digest` refs through
+/// untouched; then asserts the built output travels the named operation via
 /// `reject_direct_learning_write` (defense in depth: our own output must
 /// pass our own guard) before returning.
+///
+/// # Why the presented digest is the digest of the DOCUMENT, not `delta_digest`
+///
+/// `record_digest` is the durable row's revision identity: the store keys rows
+/// by `(record_kind, handle, record_digest)` and every reader re-proves the
+/// served document against the digest presented with it — see
+/// [`crate::observed_closure_from_durable_rows`], which refuses any row whose
+/// `sha256_hex(record_json)` does not equal its presented `record_digest`.
+///
+/// `delta_digest` is a DIFFERENT digest with a different domain: it is the
+/// canonical closure binding over `(campaign_id, attempt_id,
+/// consequential_boundary, strategy_fingerprint, disposition, evidence_refs)`
+/// only (`learning_delta_integration::store_attempt_close`). It deliberately
+/// excludes the document's own remaining fields, so presenting it as
+/// `record_digest` means no correctly published row can ever satisfy the
+/// reader's own re-proof: the durable learning-delta read refuses every row
+/// this owner commits, and the improvement intake can never observe a committed
+/// closure or a retained repeated-verifier-failure marker across a restart.
+/// Both digests remain meaningful and neither is discarded — `delta_digest`
+/// stays inside the document (and is what the brief cites as the record's own
+/// lineage digest), and the record-level identity is the document digest.
 pub fn learning_record_mutation_request_for_delta(
     record: &StoredLearningDelta,
     scope_digest: &str,
@@ -121,19 +142,20 @@ pub fn learning_record_mutation_request_for_delta(
     idempotency_key: String,
 ) -> Result<NamedMutationRequest, LearningDeltaError> {
     record.validate()?;
-    let record_json = String::from_utf8(canonical_json_bytes(record).map_err(|_| {
-        LearningDeltaError::InvalidInput {
+    let record_bytes =
+        canonical_json_bytes(record).map_err(|_| LearningDeltaError::InvalidInput {
             field: "stored.record_json",
-        }
-    })?)
-    .map_err(|_| LearningDeltaError::InvalidInput {
-        field: "stored.record_json",
-    })?;
+        })?;
+    let record_json =
+        String::from_utf8(record_bytes.clone()).map_err(|_| LearningDeltaError::InvalidInput {
+            field: "stored.record_json",
+        })?;
+    let record_digest = sha256_hex(&record_bytes);
     let request = learning_record_mutation_request(learning_record_commit_params(
         LearningRecordKind::Delta,
         record.delta_artifact.as_str().to_owned(),
         record_json,
-        record.delta_digest.clone(),
+        record_digest,
         scope_digest.to_owned(),
         fence_digest.to_owned(),
         idempotency_key,
