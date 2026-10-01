@@ -307,9 +307,7 @@ impl StoreRequest {
                 }
                 Ok(())
             }
-            Self::WriteWorkScopeOwner { context, request } => {
-                request.validate_for_context(context)
-            }
+            Self::WriteWorkScopeOwner { context, request } => request.validate_for_context(context),
             Self::Apply {
                 context,
                 transition,
@@ -1259,10 +1257,9 @@ impl StoreResponse {
                     .map(|_| ())
                     .map_err(StoreWireError::Store)
             }
-            Self::WorkScopeOwner { response } => response
-                .record
-                .validate()
-                .map_err(StoreWireError::Store),
+            Self::WorkScopeOwner { response } => {
+                response.record.validate().map_err(StoreWireError::Store)
+            }
             Self::Failure { failure } => failure
                 .validate()
                 .map_err(|error| StoreWireError::Invalid(error.to_string())),

@@ -29,8 +29,7 @@ use eliot_store_api::{
     RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
     StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
     StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, TransitionClass, WriteReceipt,
-    decode_erasure_surfaces, generated_operation_manifests,
-    operation_manifest_set_digest,
+    decode_erasure_surfaces, generated_operation_manifests, operation_manifest_set_digest,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -178,7 +177,9 @@ async fn write_work_scope_owner_direct(
     })
     .as_object()
     .cloned()
-    .ok_or_else(|| AdapterError::Serialization("WorkScope owner bindings are not an object".to_owned()))?;
+    .ok_or_else(|| {
+        AdapterError::Serialization("WorkScope owner bindings are not an object".to_owned())
+    })?;
     let write_result = client::query(
         db,
         &adapter.config,

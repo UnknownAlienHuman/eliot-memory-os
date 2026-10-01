@@ -133,8 +133,8 @@ use eliot_workscope::{
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
     WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
     WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
-    evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
-    rebind_with_receipt, observed_scope_binding,
+    evaluate_material_request, issue_resolution_receipt, observed_scope_binding,
+    produce_attach_receipt, rebind_with_receipt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

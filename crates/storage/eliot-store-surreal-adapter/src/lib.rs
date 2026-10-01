@@ -56,13 +56,12 @@ use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalSnapshotPort, CanonicalStoreClient,
     CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME, NamedOperationManifest,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta,
-    ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, SnapshotBeginRequest,
-    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, ResourceGeneration,
-    StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt,
-    generated_operation_manifests, operation_manifest_set_digest,
+    OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
+    ResourceGeneration, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
