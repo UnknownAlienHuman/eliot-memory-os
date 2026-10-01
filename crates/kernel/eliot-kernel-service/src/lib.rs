@@ -25,6 +25,7 @@ pub use commit_recovery::{
     PausedScopeSnapshot, classify_commit_receipt, paused_ordering_scope_view,
     paused_scopes_snapshot, receipt_evidence_digest, recover_commit,
 };
+mod canonical_store_startup_join;
 mod capacity_evidence;
 mod contract_rejection_gate;
 mod doctor;
@@ -269,6 +270,11 @@ pub use store_write_reservation::{
     recovery_page, reserve_for_transition, unresolved_reservations, writer_epoch_for_fence,
     writer_epoch_for_fence_from_epoch,
 };
+pub use canonical_store_startup_join::join_canonical_store_startup_readiness;
+// The Host-owned operational halves the canonical-store startup join consumes.
+// Re-exported here so the Kernel startup path names the exact Host record
+// types without a second edge to the Host journal owner.
+pub use eliot_host_state::{ImmutableProcessManifest, ManagedDependencyRecord};
 pub use store_write_status::{
     CanonicalStoreWriteStatus, CanonicalStoreWriteStatusRefusal,
     project_canonical_store_write_status,

@@ -27,6 +27,8 @@ use crate::kernel_diagnostics::{
 #[cfg(windows)]
 use eliot_contracts::ResourceGeneration;
 #[cfg(windows)]
+use eliot_contracts::EpochTransition;
+#[cfg(windows)]
 use eliot_platform::PlatformHandle;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -44,9 +46,15 @@ use eliot_ipc::NamedPipeTransport;
 #[cfg(windows)]
 use eliot_kernel_core::RouteScope;
 #[cfg(windows)]
-use eliot_kernel_service::{EbpCanonicalStoreClient, StoreClientError};
+use eliot_kernel_service::{
+    CanonicalStoreWriteStatus, EbpCanonicalStoreClient, ImmutableProcessManifest,
+    KernelServiceError, ManagedDependencyRecord, StoreClientError,
+    join_canonical_store_startup_readiness,
+};
 #[cfg(windows)]
 use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
+#[cfg(windows)]
+use eliot_store_api::StoreSemanticReadiness;
 #[cfg(windows)]
 use std::fmt;
 
@@ -775,6 +783,62 @@ impl KernelComposition {
             );
             Err(KernelBuildError::StoreAlreadyConnected)
         }
+    }
+
+    /// I1.11 step 5 startup join (issue #1887 W-startup): waits for both
+    /// canonical-store evidence categories before enabling canonical writes.
+    ///
+    /// The Host start/reuse request for the canonical-store Job Object travels
+    /// the existing bootstrap/handoff path (`install_store_bootstrap` /
+    /// `connect_canonical_store`); this is the wait that follows it. `record`
+    /// is the current Host-managed dependency observation for the admitted
+    /// store process and `semantic` is the store bridge's current typed
+    /// version/schema/transaction receipt for that same observation; the
+    /// required manifest, process generation, artifact/config hashes and Job
+    /// Object/PID lineage refs name the exact admitted lineage both halves
+    /// must describe. Both halves must be the authenticated current
+    /// observations, never retained or reconstructed values.
+    ///
+    /// The join is evaluated through
+    /// `eliot_kernel_service::join_canonical_store_startup_readiness`, and
+    /// the I1.11 step 5 probe is recorded only when the join reports
+    /// [`CanonicalStoreWriteStatus::Ready`]. Any refusal records nothing, so
+    /// normal canonical writes stay closed through the existing
+    /// `StoreSchemaProbe` startup gate. This starts no process and runs no
+    /// probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the startup gate cannot be read or
+    /// recorded. A refused join is data, not an error: it is returned as
+    /// `Ok` carrying the refusing status.
+    #[cfg(windows)]
+    pub(crate) fn record_canonical_store_startup_join(
+        &self,
+        record: &ManagedDependencyRecord,
+        required_process_manifest: &ImmutableProcessManifest,
+        required_process_generation: &EpochTransition,
+        required_artifact_hash: &PlatformHandle,
+        required_config_hash: &PlatformHandle,
+        required_pid_job_lineage_refs: &[PlatformHandle],
+        semantic: &StoreSemanticReadiness,
+    ) -> Result<CanonicalStoreWriteStatus, KernelServiceError> {
+        let status = join_canonical_store_startup_readiness(
+            record,
+            required_process_manifest,
+            required_process_generation,
+            required_artifact_hash,
+            required_config_hash,
+            required_pid_job_lineage_refs,
+            semantic,
+        );
+        if status == CanonicalStoreWriteStatus::Ready {
+            // I1.11 step 5: independent canonical-store readiness/schema
+            // probes. Reached only through the exact current two-owner join
+            // above, never from process liveness or pipe availability alone.
+            self.record_startup_evidence(5)?;
+        }
+        Ok(status)
     }
 }
 
