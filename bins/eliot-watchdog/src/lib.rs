@@ -82,6 +82,11 @@ pub mod watchdog_fallback_composition;
 mod watchdog_fallback_envelope;
 mod watchdog_publication_readback;
 mod watchdog_spool;
+// The canonical signals ingress binds and serves the real Windows named pipe, so
+// it exists only where that adapter does. Nothing here substitutes a transport on
+// any other target: this product's Watchdog contour is Windows-only.
+#[cfg(windows)]
+mod watchdog_signals_server;
 
 pub use diagnostics::install_subscriber;
 
@@ -180,8 +185,8 @@ pub use backup_control::{
     BackupControlHandle, BackupControlRegistration, MAX_BACKUP_CONTROL_HANDLES,
     MAX_RETAINED_BACKUP_OPERATIONS, WatchdogBackupAdmission, WatchdogBackupChannelOutcome,
     WatchdogBackupRequest, accepted_watchdog_backup_methods, register_backup_control,
-    resolve_accepted_method, start_backup_control, stop_backup_control,
-    verify_registration_is_complete,
+    release_shared_backup_control, resolve_accepted_method, start_backup_control,
+    stop_backup_control, verify_registration_is_complete,
 };
 pub use heartbeat_transport::{
     FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
@@ -211,6 +216,12 @@ pub use watchdog_composition::{
     WatchdogAuthorityState, WatchdogBackupPort, WatchdogComposition, WatchdogReadiness,
 };
 pub use watchdog_config::WatchdogConfig;
+#[cfg(windows)]
+pub use watchdog_signals_server::{
+    RECOGNIZED_WITHOUT_OWNER_METHOD, SignalsDestinationClaim, SignalsFenceIdentity,
+    SignalsRestoreReconcile, SignalsServiceBootstrapClaim, WatchdogSignalsError,
+    WatchdogSignalsOutcome, WatchdogSignalsServer, watchdog_signals_pipe,
+};
 pub use watchdog_fallback_composition::{
     ControlLossFallbackBinding, FallbackCompositionError, FallbackMintInput,
     FallbackPublishEffects, FallbackPublishReceipt, LiveFallbackEffects,
@@ -365,7 +376,12 @@ pub struct IndependentKernelSensor {
     /// production sensors; `None` for test-constructed sensors, which carry no
     /// protected leases. Export identities always come from the stored fields
     /// below so both contours export identically.
-    _runtime_binding: Option<WatchdogRuntimeBinding>,
+    ///
+    /// It is also the ACTIVE half of an isolated-restore isolation proof: the
+    /// owner-bound backup port holds a clone of exactly this admission, so an
+    /// import is compared against the installation this process actually runs
+    /// under and never against a caller-supplied "active" identity.
+    runtime_binding: Option<Arc<WatchdogRuntimeBinding>>,
     /// Owning installation bound at construction, from the retained binding's
     /// selected manifest in production or explicit in tests.
     installation_id: String,
@@ -474,7 +490,13 @@ impl IndependentKernelSensor {
             .runtime_launch
             .authority_generation
             .value();
-        let backup_port = owner_backup_port(&spool, &installation_id, watchdog_generation)?;
+        let active_runtime_binding = Arc::new(binding.clone());
+        let backup_port = owner_backup_port(
+            &spool,
+            &installation_id,
+            watchdog_generation,
+            Some(Arc::clone(&active_runtime_binding)),
+        )?;
         let epoch_lineage = binding
             .selected_manifest
             .runtime_launch
@@ -499,7 +521,7 @@ impl IndependentKernelSensor {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
             backup_port,
-            _runtime_binding: Some(binding),
+            runtime_binding: Some(active_runtime_binding),
             installation_id,
             watchdog_generation,
             epoch_lineage,
@@ -532,7 +554,13 @@ impl IndependentKernelSensor {
             .runtime_launch
             .authority_generation
             .value();
-        let backup_port = owner_backup_port(&spool, &installation_id, watchdog_generation)?;
+        let active_runtime_binding = Arc::new(binding.clone());
+        let backup_port = owner_backup_port(
+            &spool,
+            &installation_id,
+            watchdog_generation,
+            Some(Arc::clone(&active_runtime_binding)),
+        )?;
         let epoch_lineage = binding
             .selected_manifest
             .runtime_launch
@@ -552,7 +580,7 @@ impl IndependentKernelSensor {
             watchdog: Mutex::new(None),
             spool,
             backup_port,
-            _runtime_binding: Some(binding),
+            runtime_binding: Some(active_runtime_binding),
             installation_id,
             watchdog_generation,
             epoch_lineage,
@@ -817,13 +845,17 @@ impl IndependentKernelSensor {
         let epoch_lineage =
             eliot_contracts::EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
                 .map_err(|error| SpoolError::InvalidLease(error.to_string()))?;
-        let backup_port = owner_backup_port(&spool, installation_id, watchdog_generation)?;
+        // This contour retains no installer-approved admission, so the port is
+        // bound with no ACTIVE installation at all: an isolated import through it
+        // refuses rather than comparing the destination against any claimed
+        // "active" identity.
+        let backup_port = owner_backup_port(&spool, installation_id, watchdog_generation, None)?;
         let admission_ordinal = Self::admission_ordinal_seed(&spool, watchdog_generation);
         Ok(Self {
             watchdog: Mutex::new(Some(watchdog)),
             spool,
             backup_port,
-            _runtime_binding: None,
+            runtime_binding: None,
             installation_id: installation_id.to_owned(),
             watchdog_generation,
             epoch_lineage,
@@ -1449,6 +1481,10 @@ impl KernelWatchdogPort for IndependentKernelSensor {
         Some(Arc::clone(&self.backup_port))
     }
 
+    fn active_runtime_binding(&self) -> Option<Arc<WatchdogRuntimeBinding>> {
+        self.runtime_binding.as_ref().map(Arc::clone)
+    }
+
     fn reconcile_intents(
         self: Arc<Self>,
         lease: VerifiedSupervisionLease,
@@ -1654,6 +1690,19 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
         None
     }
 
+    /// This port's own retained ACTIVE installation admission, when it has one.
+    ///
+    /// The ACTIVE half of an isolated-restore isolation proof must come from the
+    /// installation this owner was itself admitted under, never from a request.
+    /// A port with no retained admission returns `None`, which makes an import
+    /// refuse instead of comparing a destination against a claimed "active"
+    /// identity. Granting nothing: it is the already-retained admission, not a
+    /// new authority, and it is reached only from the owner-bound backup port
+    /// this composition already holds.
+    fn active_runtime_binding(&self) -> Option<Arc<WatchdogRuntimeBinding>> {
+        None
+    }
+
     /// One bounded measurement of this port's own retained observation bank and
     /// the owner identities bound to it, for the I8.18 health projection.
     ///
@@ -1681,6 +1730,7 @@ fn owner_backup_port(
     spool: &Arc<WatchdogSpool>,
     installation_id: &str,
     watchdog_generation: u64,
+    active_runtime_binding: Option<Arc<WatchdogRuntimeBinding>>,
 ) -> Result<Arc<WatchdogBackupPort>, SpoolError> {
     // I8.2 (#1755 W1/W5): the per-interval coverage cell is created once here,
     // beside the owner-bound port, and shared with the composition that
@@ -1695,6 +1745,7 @@ fn owner_backup_port(
         watchdog_generation,
         WatchdogSpoolBackupLimits::default(),
         coverage,
+        active_runtime_binding,
     )?))
 }
 

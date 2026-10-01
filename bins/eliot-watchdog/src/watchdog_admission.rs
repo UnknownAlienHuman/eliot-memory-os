@@ -88,6 +88,19 @@ impl WatchdogRuntimeBinding {
     pub fn approved_host_image(&self) -> &Path {
         &self.approved_host_image
     }
+
+    /// Returns the immutable `eliot-kernel.exe` image of this approved
+    /// generation, read out of the retained manifest.
+    ///
+    /// This is the ONLY accepted client image for the canonical Watchdog signals
+    /// pipe. It is the same installer-approved generation whose registry, service
+    /// approvals, and artifact digests admitted this process, so the pipe's
+    /// authenticated peer is compared against one installation's own approved
+    /// lineage rather than against a path a caller presented.
+    #[must_use]
+    pub fn approved_kernel_image(&self) -> &Path {
+        Path::new(self.selected_manifest.kernel_executable_path.as_str())
+    }
 }
 
 impl FileWatchdogAdmission {

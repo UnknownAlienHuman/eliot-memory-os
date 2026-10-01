@@ -204,6 +204,13 @@ pub(super) fn run_watchdog(
     // point below, so no registration outlives the supervised lifetime and no
     // exit path skips the release.
     //
+    // #2569 BK4: the SAME started handle then owns the one canonical
+    // `EliotPipeName::watchdog_signals` server, supervised one-for-one on this
+    // composition's own runtime. Listener cancellation and the registration
+    // release are therefore both on this path, and both happen after
+    // `run_until_shutdown` has already cancelled and joined every owned task —
+    // so the release point sees a listener that has really stopped.
+    //
     // Placement is deliberate: readiness is already published and SCM is already
     // `RUNNING` above, so a refusal here can never block readiness, delay
     // start, or keep the service from reaching its supervised lifetime. The
@@ -214,7 +221,9 @@ pub(super) fn run_watchdog(
     let shutdown = runtime.block_on(composition.run_until_shutdown());
     // Unconditional and before the only fallible step below, so the normal
     // return, the task-failure return, and the externally requested stop all
-    // release the registration exactly once.
+    // release the registration exactly once. `run_until_shutdown` has already
+    // cancelled and joined every owned task, so the listener stopped here is a
+    // listener that really released its pipe handle.
     release_supervision_backup_control(backup_control);
     let shutdown = shutdown.map_err(|error| format!("{error:?}"))?;
     #[cfg(windows)]
@@ -234,6 +243,26 @@ pub(super) fn run_watchdog(
     Ok(())
 }
 
+/// One live backup-control registration and, where the canonical signals
+/// transport exists, the one lifecycle-owned listener that dispatches through it.
+///
+/// The listener and the registration share ONE handle. That is what keeps the
+/// lifecycle exact: a listener can never outlive its registration, a registration
+/// can never be released while a listener still dispatches through it, and the
+/// release path below is the single place either is released.
+struct SupervisionBackupControl {
+    /// The started, owner-bound registration every admitted request dispatches
+    /// through.
+    handle: Arc<eliot_watchdog::BackupControlHandle>,
+    /// The one canonical `EliotPipeName::watchdog_signals` server, or `None` when
+    /// this process could not admit one.
+    ///
+    /// A refusal leaves the registration live and dispatchable from inside this
+    /// process only; it never substitutes a stand-in server.
+    #[cfg(windows)]
+    signals_listener: Option<eliot_watchdog::WatchdogSignalsServer>,
+}
+
 /// Registers and starts Watchdog backup control on the live composition.
 ///
 /// This is a real production caller, not a probe: it calls the composition's
@@ -246,11 +275,10 @@ pub(super) fn run_watchdog(
 /// caller runs this after readiness is published and after SCM reports
 /// `RUNNING`, so declining backup control cannot delay or block startup. The
 /// typed reason is traced in full, and supervision continues with exactly the
-/// behaviour it had before, because this function creates no listener, task,
-/// slot, or authority on either the admitted or the refused path.
+/// behaviour it had before.
 fn start_supervision_backup_control(
     composition: &WatchdogComposition,
-) -> Option<eliot_watchdog::BackupControlHandle> {
+) -> Option<SupervisionBackupControl> {
     let mut handle = match composition.register_backup_control() {
         Ok(handle) => handle,
         Err(error) => {
@@ -279,6 +307,7 @@ fn start_supervision_backup_control(
         );
         return None;
     }
+    let handle = Arc::new(handle);
     tracing::info!(
         event = "watchdog.backup_control_admitted",
         observation = "admitted",
@@ -287,27 +316,75 @@ fn start_supervision_backup_control(
         owner_generation = handle.owner_generation(),
         "watchdog backup control registered and started against the live owner spool"
     );
-    Some(handle)
+    // #2569 BK4: the canonical signals listener is started from this SAME started
+    // registration, on this composition's own one-for-one supervised runtime, so
+    // a listener failure restarts only the listener and can never stop or
+    // quarantine supervision.
+    #[cfg(windows)]
+    let signals_listener = {
+        match eliot_watchdog::WatchdogSignalsServer::start(composition, Arc::clone(&handle)) {
+            Ok(listener) => {
+                tracing::info!(
+                    event = "watchdog.signals_listener_bound",
+                    observation = "admitted",
+                    served_pipe = listener.pipe(),
+                    owner_spool_high_water = listener.owner_spool_high_water(),
+                    "watchdog canonical signals listener is bound to the canonical watchdog signals pipe"
+                );
+                Some(listener)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    event = "watchdog.signals_listener_refused",
+                    observation = "unavailable",
+                    reason_code = "SIGNALS_LISTENER_REFUSED",
+                    detail = truncate_failure_detail(&error.to_string()).as_str(),
+                    "watchdog continues without the canonical signals listener; supervision is unchanged"
+                );
+                None
+            }
+        }
+    };
+    Some(SupervisionBackupControl {
+        handle,
+        #[cfg(windows)]
+        signals_listener,
+    })
 }
 
-/// Releases one started backup-control registration on the shutdown path.
+/// Releases the canonical signals listener and one started backup-control
+/// registration on the shutdown path.
 ///
-/// Idempotent for a `None` input: the caller may hold no registration at all
-/// when registration was refused. The released slot and the owner sequences
-/// observed while it was live are both reported, so a reader can see that the
-/// registration was released rather than merely dropped.
-fn release_supervision_backup_control(handle: Option<eliot_watchdog::BackupControlHandle>) {
-    let Some(handle) = handle else {
+/// Idempotent for a `None` input: the caller may hold no registration at all when
+/// registration was refused. Cancellation of the real listener happens first, and
+/// the released slot plus the owner sequences observed while it was live are both
+/// reported, so a reader can see that both were released rather than merely
+/// dropped.
+fn release_supervision_backup_control(control: Option<SupervisionBackupControl>) {
+    let Some(control) = control else {
         return;
     };
-    let slot = handle.registration_slot();
-    let owner_spool_high_water = handle.owner_spool_high_water();
-    let _released = eliot_watchdog::stop_backup_control(handle);
+    #[cfg(windows)]
+    let served_pipe = match &control.signals_listener {
+        Some(listener) => {
+            // Cancellation only: the listener never owns the registration, so the
+            // release below stays the single release point.
+            listener.cancel();
+            Some(listener.pipe())
+        }
+        None => None,
+    };
+    #[cfg(not(windows))]
+    let served_pipe: Option<&str> = None;
+    let slot = control.handle.registration_slot();
+    let owner_spool_high_water = control.handle.owner_spool_high_water();
+    eliot_watchdog::release_shared_backup_control(&control.handle);
     tracing::info!(
         event = "watchdog.backup_control_released",
         observation = "released",
         registration_slot = slot,
         owner_spool_high_water = owner_spool_high_water,
+        served_pipe = served_pipe.unwrap_or("none"),
         "watchdog backup control registration released on the shutdown path"
     );
 }
