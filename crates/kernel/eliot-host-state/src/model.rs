@@ -1323,14 +1323,17 @@ pub struct DrainRecord {
     pub drain_generation: EpochTransition,
     pub state: DrainState,
     pub evidence_refs: Vec<PlatformHandle>,
-    /// Attempt link of a re-armed pre-commit drain, set on exactly one edge:
+    /// Attempt link of a re-armed pre-commit drain, set on exactly two edges:
     /// the `Cancelled -> Requested` successor inside the same
     /// `drain_generation` (Implementation I1.5: "A new observable-use trigger
     /// received before the durable drain linearization point cancels drain and
     /// returns the same generation to `ACTIVE` after readiness revalidation";
-    /// the re-armed drain stays inside that same generation). The value is the
-    /// exact record checksum of the `Cancelled` predecessor this attempt
-    /// re-arms, so the projection keeps exactly one `DrainRecord` and still
+    /// the re-armed drain stays inside that same generation), and the
+    /// `Requested -> Draining` continuation of that re-armed attempt. The
+    /// first value is the exact record checksum of the `Cancelled`
+    /// predecessor this attempt re-arms; the second value is the exact
+    /// record checksum of the re-armed `Requested` record the continuation
+    /// continues, so the projection keeps exactly one `DrainRecord` and still
     /// distinguishes attempt N from attempt N+1. Every other drain edge
     /// continues the current attempt and carries `None`.
     ///

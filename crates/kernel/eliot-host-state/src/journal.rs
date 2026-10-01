@@ -690,7 +690,7 @@ fn apply(
             state.clean_marker = None;
         }
         HostStateRecord::Drain(next) => {
-            // One attempt link exists per drain attempt, and it is checked
+            // Attempt links exist per drain attempt, and they are checked
             // before the transition law, exactly as the `CutoverIntent` arm
             // checks its `expected_predecessor`. The projection keeps exactly
             // one `DrainRecord`, so without this the reducer cannot tell
@@ -702,6 +702,14 @@ fn apply(
             //    (that edge is a re-arm, so the link is mandatory) and a
             //    mismatching link is an identity conflict, never a silent
             //    re-arm of some other attempt;
+            //  * the `Requested -> Draining` continuation of a re-armed
+            //    attempt is admitted only when it names the exact record
+            //    checksum of the re-armed `Requested` record it continues.
+            //    An absent link is a typed refusal and a mismatching link is
+            //    an identity conflict, so a restarted process cannot
+            //    substitute a generic continuation (fresh operation and fresh
+            //    evidence) for the durable attempt. A first attempt carries
+            //    no re-arm link, so its link-less continuation stays legal;
             //  * every other drain edge continues the current attempt, so an
             //    unexpected link there is an identity conflict as well.
             // `drain_transition` below keeps ownership of the
@@ -712,7 +720,24 @@ fn apply(
                     (current.state, next.state),
                     (DrainState::Cancelled, DrainState::Requested)
                 );
+                let rearm_continuation = matches!(
+                    (current.state, next.state),
+                    (DrainState::Requested, DrainState::Draining)
+                ) && current.expected_predecessor.is_some();
                 if rearm {
+                    let Some(predecessor) = next.expected_predecessor.as_deref() else {
+                        return Err(JournalError::IllegalTransition {
+                            machine: "drain",
+                            from: format!("{:?}", current.state),
+                            to: format!("{:?}::without-expected-predecessor", next.state),
+                        });
+                    };
+                    let current_checksum =
+                        record_checksum(&HostStateRecord::Drain(current.clone()))?;
+                    if predecessor != current_checksum {
+                        return Err(JournalError::IdempotencyConflict);
+                    }
+                } else if rearm_continuation {
                     let Some(predecessor) = next.expected_predecessor.as_deref() else {
                         return Err(JournalError::IllegalTransition {
                             machine: "drain",
