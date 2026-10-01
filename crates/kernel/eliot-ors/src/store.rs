@@ -27294,6 +27294,26 @@ impl RedbRecoveryStore {
         Ok((store, record.installed_identity()?))
     }
 
+    /// Opens ORS for one Host-authenticated installation with the
+    /// composition-owned canonical/readback authenticator, preserving the
+    /// same installation binding and durable object-generation checks as
+    /// [`Self::open_for_installation`].
+    ///
+    /// This is the only ORS-owned seam through which a production
+    /// installation-scoped composition can reach a bound provider. It binds
+    /// no evidence itself: `evidence` must be a composition-supplied
+    /// authenticator that really validates every requested ordering head, and
+    /// the caller-created-receipt path never bypasses it. The two entry points
+    /// above keep `RejectUnboundEvidence` and continue to fail closed.
+    pub fn open_for_installation_with_evidence(
+        path: impl AsRef<Path>,
+        installation_id: &str,
+        evidence: Arc<dyn CanonicalEvidenceProvider>,
+    ) -> Result<(Self, OrsStoreIdentity), OrsError> {
+        let (store, record) = Self::open_inner(path, evidence, Some(installation_id))?;
+        Ok((store, record.installed_identity()?))
+    }
+
     /// Opens ORS with the composition-owned canonical/readback authenticator.
     pub fn open_with_evidence(
         path: impl AsRef<Path>,
