@@ -2093,7 +2093,12 @@ fn committed_erasure_receipt() -> eliot_store_api::WriteReceipt {
         reason: "user requested deletion".to_owned(),
         requester: "user:test".to_owned(),
         approval_refs: vec!["approval-user-1".to_owned()],
-        admission_contract_set_digest: "b".repeat(64),
+        // Erasure admission binds the contract set actually supported by the
+        // store API (issue #1927, `ErasureAdmissionRequest::validate`), so the
+        // fixture derives the digest instead of pinning a placeholder literal
+        // that the current in-force binding refuses as `ManifestMismatch`.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("supported admission contract set digest"),
         operation_manifest_digest: set_digest,
         security: eliot_store_api::SecurityContext::default(),
         event_projection_relation_intents: eliot_store_api::EventProjectionRelationIntents {

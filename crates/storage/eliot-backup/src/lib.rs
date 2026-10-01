@@ -1444,10 +1444,17 @@ impl RestorePlan {
         if self.steps != expected_restore_steps(bundle)
             || self.restored_fence.source_state_fence != bundle.export_fence.state_fence
             || self.target.validate().is_err()
-            || self.restored_fence.validate().is_err()
         {
             return Err(BackupError::PlanMismatch);
         }
+        // A non-advancing (active) destination lineage is refused with its own
+        // typed failure, not flattened into the generic plan mismatch: the
+        // restored Authority Epoch must be strictly newer than every observed
+        // value (A13.7), and `RestoredFence::validate` already distinguishes
+        // that refusal from a plan/bundle disagreement. It runs before the
+        // proposal/fence agreement check below so the lineage reason is never
+        // masked by the consistency mismatch a forged fence also carries.
+        self.restored_fence.validate()?;
         // A hand-constructed or decoded plan cannot combine a target from one
         // request with the fence of another: the compiled target proposal and
         // the restored fence must agree exactly (issue #949).
@@ -1722,16 +1729,15 @@ fn validate_journal_record(
     if completed_phases > phases.len() {
         return Err(BackupError::RestorePhaseMismatch);
     }
-    if matches!(record.phase, RestorePhase::Pending) {
-        if completed_phases != 0 || !matches!(record.state, RestoreJournalState::Ready) {
-            return Err(BackupError::RestorePhaseMismatch);
-        }
-    } else if !matches!(record.state, RestoreJournalState::Completed) {
-        let index = phase_index(phases, &record.phase)?;
-        if index != completed_phases {
-            return Err(BackupError::RestorePhaseMismatch);
-        }
-    }
+    // The recorded state is validated before the phase/counter arithmetic.
+    // A state that contradicts the intent/receipt it carries is a corrupt
+    // journal whatever its counters say, and reporting it as a phase mismatch
+    // would mask the corruption behind arithmetic the record never earned:
+    // no coordinator write path produces, for example, a persisted receipt
+    // with no persisted intent. Both orders still refuse; this one names the
+    // actual defect. The out-of-order phase case below is unaffected because a
+    // `Ready` record with no intent/receipt passes the shape check first and
+    // then fails on the phase index.
     match record.state {
         RestoreJournalState::Ready => {
             if record.intent.is_some() || record.receipt.is_some() || record.final_receipt.is_some()
@@ -1804,6 +1810,16 @@ fn validate_journal_record(
             validate_resumed_intent(transaction, record)?;
         }
     }
+    if matches!(record.phase, RestorePhase::Pending) {
+        if completed_phases != 0 || !matches!(record.state, RestoreJournalState::Ready) {
+            return Err(BackupError::RestorePhaseMismatch);
+        }
+    } else if !matches!(record.state, RestoreJournalState::Completed) {
+        let index = phase_index(phases, &record.phase)?;
+        if index != completed_phases {
+            return Err(BackupError::RestorePhaseMismatch);
+        }
+    }
     Ok(())
 }
 
@@ -1846,6 +1862,14 @@ fn validate_resumed_intent(
 /// restored fence, the exact stored effect receipt, the class proof level, and
 /// `canonical_only` as the requested class requires, with no cutover and no
 /// operational readiness (I5.13: cutover requires separate authority).
+///
+/// The re-derived comparison runs first so a stored receipt that is not the
+/// receipt this executor issues for this transaction is reported as the
+/// journal mismatch it is — including one whose proof level is inflated past
+/// the requested class ceiling, which otherwise surfaces as the weaker
+/// standalone defect of the same receipt and hides the binding that actually
+/// failed. The owner validator still runs on every receipt that passes, so no
+/// resumed row is returned unvalidated.
 fn validate_resumed_final_receipt(
     plan: &RestorePlan,
     bundle: &BackupBundle,
@@ -1853,7 +1877,6 @@ fn validate_resumed_final_receipt(
     effect_receipt: &RestoreEffectReceipt,
     final_receipt: &RestoreReceipt,
 ) -> Result<(), BackupError> {
-    final_receipt.validate()?;
     if final_receipt.receipt_id != restore_receipt_id(plan)
         || final_receipt.bundle_sha256 != transaction.bundle_sha256
         || final_receipt.plan_id != plan.plan_id
@@ -1867,6 +1890,7 @@ fn validate_resumed_final_receipt(
     {
         return Err(BackupError::RestoreJournalMismatch);
     }
+    final_receipt.validate()?;
     Ok(())
 }
 
@@ -2618,6 +2642,14 @@ impl RestoreEvidence {
                 .is_same_authority(&plan.restored_fence.authority_epoch)
             || self.resource_generation != plan.restored_fence.resource_generation
         {
+            return Err(BackupError::FinalizeEvidenceMismatch);
+        }
+        // Finalize evidence is bound to this transaction identity, not merely
+        // to a plan-shaped archive: evidence carrying another transaction's
+        // id is a replay from a different restore and proves nothing about
+        // this one (I5.19 receipts are bound to the operation identity that
+        // produced them).
+        if self.provenance.transaction_id != plan.transaction()?.transaction_id {
             return Err(BackupError::FinalizeEvidenceMismatch);
         }
         if self.provenance.plan_id != plan.plan_id

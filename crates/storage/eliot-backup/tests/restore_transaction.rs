@@ -563,8 +563,11 @@ impl FakeTarget {
         self
     }
 
+    /// Number of successful dispatches of one named phase. `applies` records
+    /// the stable `RestorePhase` identity of every effect, so the named count
+    /// reads the call log where those names live.
     fn apply_count(&self, call: &str) -> usize {
-        self.applies
+        self.calls
             .iter()
             .filter(|name| name.as_str() == call)
             .count()
@@ -717,7 +720,11 @@ struct CasLog {
 
 #[derive(Clone, Debug, Default)]
 struct JournalFaults {
-    all_cas: bool,
+    /// Cancels the first attempted CAS and then behaves. A cancellation is one
+    /// aborted journal write, not a permanently broken store: the coordinator
+    /// that persisted no intent must be able to retry cleanly, which a
+    /// permanently failing journal could never demonstrate.
+    all_cas_once: bool,
     state_once: Option<RestoreJournalState>,
     state_always: Option<RestoreJournalState>,
     expected_revision_once: Option<u64>,
@@ -789,7 +796,8 @@ impl RestoreJournalPort for FakeJournal {
         if next.journal_key != journal_key || current != expected_revision {
             return Err(BackupError::RestoreJournalCasConflict);
         }
-        if inner.faults.all_cas {
+        if inner.faults.all_cas_once {
+            inner.faults.all_cas_once = false;
             return Err(BackupError::RestoreJournalCasConflict);
         }
         if inner.faults.state_always == Some(next.state) {
@@ -1853,7 +1861,7 @@ fn cancellation_before_and_after_possible_effect_keeps_reconciliation_without_ro
 
     let mut cancelled_early = FakeTarget::new(&bundle, &plan);
     let mut early_journal = FakeJournal::with_faults(JournalFaults {
-        all_cas: true,
+        all_cas_once: true,
         ..JournalFaults::default()
     });
     assert_eq!(
