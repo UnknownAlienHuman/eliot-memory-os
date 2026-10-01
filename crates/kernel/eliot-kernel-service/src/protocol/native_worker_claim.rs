@@ -695,10 +695,7 @@ impl NativeWorkerClaimRequest {
         // here. `privacy_class` is the canonical owner type, so its shape
         // is enforced at the Deserialize boundary and needs no string arm.
         for (leg, field) in [
-            (
-                self.visibility.as_deref(),
-                "native_worker_claim.visibility",
-            ),
+            (self.visibility.as_deref(), "native_worker_claim.visibility"),
             (self.swarm_id.as_deref(), "native_worker_claim.swarm_id"),
         ] {
             if let Some(text) = leg {
