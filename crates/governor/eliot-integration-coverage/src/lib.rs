@@ -497,10 +497,11 @@ impl IntegrationCoverageProfile {
     }
 
     /// Builds an unverified profile from one authenticated Kernel/ORS
-    /// observation. The fixed [`ALL_EVENTS`] set is independent of returned
-    /// rows. Since the current ORS bridge stream does not prove native
-    /// lifecycle classes or an expected-class denominator, every logical
-    /// event remains explicitly unavailable with unknown completeness.
+    /// observation. The fixed [`ALL_EVENTS`] set and the closed OpenCode
+    /// adapter event manifest are independent of returned rows. A retained
+    /// original row counts only when its Broker-issued process binding agrees
+    /// with the exact active admission tuple. Such a row is observation only;
+    /// no hook observation proves effect or enforcement.
     pub fn from_authority_observation(
         observation: &GovernorAuthorityObservation,
         active_fingerprint: impl Into<String>,
@@ -508,9 +509,7 @@ impl IntegrationCoverageProfile {
         let fingerprint = active_fingerprint.into();
         validate_text(&fingerprint, "coverage.fingerprint")?;
 
-        let mut profile_gaps = vec![
-            "No source-issued native I7.16 event-class manifest or independent expected-event denominator was included in this observation.".to_owned(),
-        ];
+        let mut profile_gaps = Vec::new();
         let (mut source, source_gaps, source_record_count) =
             summarize_source_readback(&observation.source)?;
         profile_gaps.extend(source_gaps);
@@ -532,6 +531,15 @@ impl IntegrationCoverageProfile {
                 "Current adapter admission is unavailable; the prior Governor fingerprint is retained only for degradation.".to_owned(),
             );
         }
+        let native_observations = match (&observation.adapter, &observation.source) {
+            (Some(adapter), SourceReadback::Available { streams, .. }) => {
+                collect_opencode_observations(adapter, streams, &mut profile_gaps)
+            }
+            _ => BTreeMap::new(),
+        };
+        profile_gaps.push(
+            "Coverage is unverified and runtime completeness is unknown until native event observations are joined to a complete interval and matching effect evidence.".to_owned(),
+        );
         match &observation.watchdog {
             EvidenceAvailability::Available { evidence } => evidence.validate()?,
             EvidenceAvailability::Unavailable { reason } => {
@@ -549,18 +557,35 @@ impl IntegrationCoverageProfile {
 
         let events = ALL_EVENTS
             .into_iter()
-            .map(|event| EventCoverage {
-                event,
-                disposition: EventDisposition::Unavailable,
-                ordering: DispatchOrdering::Unknown,
-                completeness: EventCompleteness::Unknown,
-                proof_ceiling: "Original retained ORS envelope, owner, cursor, and gap evidence only; native hook class and pre-action application proof absent.".to_owned(),
-                source: format!(
-                    "{source} No explicitly typed original native event source was joined for {event:?}.",
-                ),
-                gaps: vec![format!(
-                    "No original retained row is proven to represent the {event:?} native lifecycle/effect event."
-                )],
+            .map(|event| {
+                let native = native_observations.get(&event);
+                EventCoverage {
+                    event,
+                    disposition: native.map_or(
+                        EventDisposition::Unavailable,
+                        |_| EventDisposition::Observed,
+                    ),
+                    ordering: native.map_or(DispatchOrdering::Unknown, |evidence| evidence.ordering),
+                    completeness: EventCompleteness::Unknown,
+                    proof_ceiling: "Original non-redacted ORS envelope joined to the exact active Broker-admitted OpenCode process, descriptor, profile, executable, and closed native event manifest; observation only, with no matching effect receipt or complete runtime interval.".to_owned(),
+                    source: match native {
+                        Some(evidence) => format!(
+                            "{source} Broker-bound original native class {} observed in {} retained ORS row(s).",
+                            evidence.native_class, evidence.rows,
+                        ),
+                        None => format!(
+                            "{source} No original retained Broker-bound native class was observed for {event:?}.",
+                        ),
+                    },
+                    gaps: vec![match native {
+                        Some(_) => format!(
+                            "Runtime completeness and effect matching for {event:?} are unavailable; the bounded ORS observation does not prove every occurrence or its resulting effect."
+                        ),
+                        None => format!(
+                            "No original retained Broker-bound row is proven to represent the {event:?} native lifecycle/effect event."
+                        ),
+                    }],
+                }
             })
             .collect();
 
@@ -570,7 +595,7 @@ impl IntegrationCoverageProfile {
             events,
             completeness: EventCompleteness::Unknown,
             proof_ceiling: format!(
-                "Original Kernel/ORS source readback ({source_record_count} rows) only; no verified native-host conformance or independent ALL_EVENTS denominator."
+                "Original Kernel/ORS source readback ({source_record_count} rows) and exact admitted native event manifest only; no verified native-host conformance, complete interval, or matched effects."
             ),
             source,
             gaps: profile_gaps,
@@ -652,6 +677,160 @@ impl IntegrationCoverageProfile {
             validate_text(gap, "coverage.gaps.item")?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NativeEventEvidence {
+    native_class: String,
+    ordering: DispatchOrdering,
+    rows: usize,
+}
+
+const OPENCODE_NATIVE_EVENTS: [&str; 8] = [
+    "session.created",
+    "session.compacted",
+    "session.error",
+    "session.idle",
+    "permission.asked",
+    "permission.replied",
+    "file.edited",
+    "todo.updated",
+];
+const OPENCODE_NATIVE_HOOKS: [&str; 2] = ["tool.execute.before", "tool.execute.after"];
+
+fn collect_opencode_observations(
+    adapter: &AdapterAdmissionIdentity,
+    streams: &[ObservationStreamReadback],
+    gaps: &mut Vec<String>,
+) -> BTreeMap<LogicalEvent, NativeEventEvidence> {
+    let mut observed = BTreeMap::new();
+    for record in streams.iter().flat_map(|stream| &stream.page.records) {
+        if record.redacted {
+            gaps.push(format!(
+                "ORS event {} was redacted; its normalized projection is not original native event evidence.",
+                record.event_id,
+            ));
+            continue;
+        }
+        let envelope: serde_json::Value = match serde_json::from_str(&record.normalized_projection_bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                gaps.push(format!(
+                    "ORS event {} normalized original envelope was not valid JSON.",
+                    record.event_id,
+                ));
+                continue;
+            }
+        };
+        let Some(payload) = envelope
+            .pointer("/payload_or_blob_ref/inline/Json")
+            .or_else(|| envelope.get("native_payload"))
+        else {
+            continue;
+        };
+        let Some(binding) = payload.get("opencode_process_binding") else {
+            continue;
+        };
+        if !binding_matches_admission(binding, adapter) {
+            gaps.push(format!(
+                "ORS event {} carried no matching exact active Broker process/adapter binding.",
+                record.event_id,
+            ));
+            continue;
+        }
+        let manifest_matches = json_string_array_matches(
+            binding.get("native_event_classes"),
+            &OPENCODE_NATIVE_EVENTS,
+        ) && json_string_array_matches(
+            binding.get("native_hook_classes"),
+            &OPENCODE_NATIVE_HOOKS,
+        );
+        if !manifest_matches {
+            gaps.push(format!(
+                "ORS event {} did not carry the exact closed manifest from the admitted OpenCode adapter descriptor.",
+                record.event_id,
+            ));
+            continue;
+        }
+        let Some(native_class) = payload.get("event_kind").and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if !OPENCODE_NATIVE_EVENTS.contains(&native_class)
+            && !OPENCODE_NATIVE_HOOKS.contains(&native_class)
+        {
+            gaps.push(format!(
+                "ORS event {} native class was outside the admitted OpenCode manifest.",
+                record.event_id,
+            ));
+            continue;
+        }
+        let Some((logical, ordering)) = map_opencode_native_event(native_class) else {
+            // The independent native denominator includes classes that do
+            // not establish any one of the ten logical I7.16 axes.
+            continue;
+        };
+        let evidence = observed.entry(logical).or_insert_with(|| NativeEventEvidence {
+            native_class: native_class.to_owned(),
+            ordering,
+            rows: 0,
+        });
+        evidence.rows = evidence.rows.saturating_add(1);
+        if evidence.native_class != native_class {
+            evidence.native_class = format!("{} and {native_class}", evidence.native_class);
+        }
+        if evidence.ordering != ordering {
+            evidence.ordering = DispatchOrdering::Unknown;
+        }
+    }
+    observed
+}
+
+fn json_string_array_matches(value: Option<&serde_json::Value>, expected: &[&str]) -> bool {
+    value
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|actual| {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.as_str() == Some(*expected))
+        })
+}
+
+fn binding_matches_admission(
+    binding: &serde_json::Value,
+    adapter: &AdapterAdmissionIdentity,
+) -> bool {
+    binding.get("process_id").and_then(serde_json::Value::as_u64).unwrap_or(0) > 0
+        && binding
+            .get("process_start_time_100ns")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        && binding.get("introduction_digest").and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty())
+        && binding.get("launch_nonce").and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty())
+        && binding.get("adapter_descriptor_sha256").and_then(serde_json::Value::as_str)
+            == Some(adapter.descriptor_sha256.as_str())
+        && binding.get("installation_profile_sha256").and_then(serde_json::Value::as_str)
+            == Some(adapter.profile_sha256.as_str())
+        && binding.get("executable_sha256").and_then(serde_json::Value::as_str)
+            == Some(adapter.executable_sha256.as_str())
+        && binding.get("image_path").and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty())
+        && binding.get("adapter_artifact_sha256").and_then(serde_json::Value::as_str).is_some_and(|v| !v.is_empty())
+}
+
+fn map_opencode_native_event(native_class: &str) -> Option<(LogicalEvent, DispatchOrdering)> {
+    match native_class {
+        "session.created" => Some((LogicalEvent::SessionStart, DispatchOrdering::PostDispatch)),
+        "tool.execute.before" => Some((LogicalEvent::PreToolUse, DispatchOrdering::PreDispatch)),
+        "tool.execute.after" => Some((LogicalEvent::PostToolUse, DispatchOrdering::PostDispatch)),
+        "permission.asked" | "permission.replied" => {
+            Some((LogicalEvent::PermissionRequest, DispatchOrdering::Unknown))
+        }
+        "session.compacted" => Some((LogicalEvent::PostCompact, DispatchOrdering::PostDispatch)),
+        _ => None,
     }
 }
 
