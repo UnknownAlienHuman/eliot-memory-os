@@ -2471,8 +2471,8 @@ impl ProcessStreamSinkWireResponse {
                 {
                     validate_optional_canonical_owner_json_pair(
                         "blob_ready_receipt",
-                        blob_ready_receipt_json.as_ref(),
-                        blob_ready_receipt_sha256.as_ref(),
+                        blob_ready_receipt_json,
+                        blob_ready_receipt_sha256,
                     )?;
                 }
                 Ok(())
