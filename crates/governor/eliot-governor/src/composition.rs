@@ -134,7 +134,7 @@ use eliot_workscope::{
     WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
     WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
     evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
-    rebind_with_receipt,
+    rebind_with_receipt, observed_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -7840,20 +7840,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Admits the initial binding for a newly resolved scope (issue #1787,
     /// bootstrap-constructor entry).
     ///
-    /// Used when no retained owner exists yet: the bootstrap caller supplies
-    /// the described scope, the binding it actually read, the current
-    /// observation, and the source closure that authenticates it. Admission
-    /// mints the owner only after descriptor agreement, clear identity legs,
-    /// and a fresh `MATCHED` guard check at the retained fence. Persist the
-    /// minted owner with [`Self::install_admitted_work_scope_owner`]. Live
-    /// status: no production caller. `git grep -n admit_initial_scope_binding`
-    /// returns only this definition and one intra-doc link in
-    /// [`Self::install_admitted_work_scope_owner`]'s own doc. The nearest live
-    /// rebind entry is [`Self::admit_observed_scope_attach`], reached from the
-    /// daemon scope-attach ingress and persisting through the same
-    /// installer; no bootstrap ingress supplies the described scope this entry
-    /// requires. Whether one is wired to it or this entry is retired is an
-    /// owner decision.
+    /// Used when no retained owner exists yet: the authenticated explicit
+    /// binding caller supplies the original descriptor and resolved binding,
+    /// the mechanically observed resources from the independent Host probe,
+    /// and the original source/privacy closure. The observed binding is
+    /// derived here from the Host observation; callers cannot satisfy the
+    /// independent-observation check by copying the proposed binding.
+    /// Admission mints the owner only after descriptor agreement, clear
+    /// identity legs, and a fresh `MATCHED` guard check at the retained fence.
+    /// Install the minted owner with [`Self::install_admitted_work_scope_owner`].
+    /// The observed resources must come from the independent Host observation
+    /// for that request.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     pub fn admit_initial_scope_binding(
@@ -7861,7 +7858,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         descriptor: &WorkScopeDescriptor,
         owner_revision: u64,
         binding: &ScopeBinding,
-        observed: &ScopeBinding,
+        observed: &ObservedScopeResources,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
@@ -7869,19 +7866,26 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let fence = self.snapshot.state_fence();
+        let observed_binding = observed_scope_binding(
+            binding,
+            observed,
+            binding.privacy_class,
+            binding.governing_source_generation,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         admit_initial_binding(
             descriptor,
             owner_revision,
             &fence,
             binding,
-            observed,
+            &observed_binding,
             sources,
             privacy,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
-    /// Persists an admitted `WorkScope` owner as the retained binding
+    /// Installs an admitted `WorkScope` owner as the in-memory binding
     /// (issue #1787, rebind/attach persistence).
     ///
     /// Installs the owner minted by [`Self::admit_scope_relocation`],
@@ -7891,7 +7895,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the binding on every identity field, and the binding generation equals
     /// the fence generation, so the same operation is admitted afterwards
     /// only with that instance identity and generation fence. Anything else
-    /// fails without touching the retained binding.
+    /// fails without touching the retained binding. This is not durable
+    /// recovery publication; the caller must retain and read back the exact
+    /// returned snapshot through the Kernel owner store before acknowledging
+    /// the binding.
     pub fn install_admitted_work_scope_owner(
         &mut self,
         owner: WorkScopeBindingOwner,
@@ -8353,12 +8360,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Produces immutable task-selection evidence from the exact unique active
     /// owner selection and the `TaskContract` acceptance record at that fence.
     ///
+    /// The explicit Task Controller scope-binding action uses this before the
+    /// first `WorkScope` owner exists: it proves that the authenticated task,
+    /// principal, session and scope are still the unique live owner selection,
+    /// then reads and validates the original task acceptance set. This is
+    /// owner evidence for source-authority admission, not permission to skip
+    /// the later observed-scope and source/privacy checks.
+    ///
     /// The `WorkLease` is the selection source and its linked `WorkItem` is the
     /// retained evidence handle. Both are returned by the same validated
     /// coordination read that joins the authenticated principal/session to
     /// the task and `WorkScope`. The owner's recorded acceptance digest is
     /// copied verbatim; it is never recomputed from caller data or a task id.
-    async fn issue_task_selection_evidence_for_binding(
+    pub async fn issue_task_selection_evidence_for_binding(
         &self,
         now: u64,
         authenticated_identity: (&str, &str),
