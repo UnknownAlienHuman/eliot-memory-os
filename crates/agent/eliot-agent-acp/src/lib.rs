@@ -1852,9 +1852,11 @@ pub struct AcpWireResultIds {
 /// `eliot-agent-coordinator::AgentCoordinator::submit_result` (candidate
 /// intake only, never Finish authority).
 ///
-/// STITCH (#370 W29/A21): the future live caller feeds one real received
-/// ACP message with its admitted wire identities; BLOCKED-BY the
-/// native-worker provider-runtime driver (no production caller exists).
+/// LIVE CALLER (issues #228 W2/W5, #2641 W4/AUD3): [`AcpWire::receive_result`]
+/// is the in-crate production caller: it feeds one real received ACP message
+/// with its admitted wire identities. End-to-end hookup from the
+/// native-worker provider-runtime driver (which owns the transport and the
+/// receiving-owner identities) is still BLOCKED-BY that driver slice.
 /// Forbidden: a synthetic or test-only message to manufacture a caller.
 ///
 /// # Errors
@@ -2174,6 +2176,51 @@ impl<T: AcpTransport> AcpWire<T> {
             };
             let frames = self.codec.feed(&chunk)?;
             self.pending.extend(frames);
+        }
+    }
+
+    /// Receives one complete JSON-RPC message on the live wire and drains it
+    /// into a provider-neutral candidate result (issue #2641 W4/AUD3/AUD6):
+    /// the in-crate production caller of [`drain_wire_result`].
+    ///
+    /// Receiving-owner lookup: `ids` carries the owner-issued
+    /// operation/attempt/session identities the drained message answers (this
+    /// crate never mints them); they travel unchanged into
+    /// [`drain_wire_result`], so `recovery_ref` resolves to the exact
+    /// unmodified owner-issued `operation_id`, never to sanitized display
+    /// prose. A typed wire failure code travels beside the prose through
+    /// [`AcpResultOutcome::Failed`] and is rendered only after sanitization,
+    /// so default-deny keeps distinct codes distinct instead of merging them
+    /// into one generic result.
+    ///
+    /// A transport close before completion stays an explicit
+    /// [`AcpOutcome::Unknown`] naming the receiving owner's operation: this
+    /// path never fabricates a result, never proves failure or no-effect,
+    /// and never turns `UNKNOWN_OUTCOME` into success. A blank owner
+    /// operation identity fails closed before any byte is read.
+    pub async fn receive_result(
+        &mut self,
+        ids: AcpWireResultIds,
+        route: RouteFingerprint,
+        binding: &ProviderExecutionBinding,
+        admission: &AdmittedRouteReceipt,
+    ) -> Result<AcpOutcome<AgentResult>, AcpAdapterError> {
+        if ids.operation_id.trim().is_empty() {
+            return Err(AcpAdapterError::InvalidInput("operation_id"));
+        }
+        match self.receive().await? {
+            AcpOutcome::Completed(message) => {
+                let result = drain_wire_result(&message, ids, route, binding, admission)?;
+                Ok(AcpOutcome::Completed(result))
+            }
+            AcpOutcome::Unknown(unknown) => Ok(AcpOutcome::Unknown(AcpUnknownOutcome {
+                operation_id: ids.operation_id,
+                reason: unknown.reason,
+                session_id: ids.session_id,
+            })),
+            AcpOutcome::Unavailable { operation, reason } => {
+                Ok(AcpOutcome::Unavailable { operation, reason })
+            }
         }
     }
 }
