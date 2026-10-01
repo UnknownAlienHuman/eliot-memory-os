@@ -114,7 +114,7 @@ use crate::commit_recovery::{
     resolve_open_record, verify_dreamer_canonical_request_hash, verify_receipt_binding,
     verify_retained_binding, verify_terminal_evidence,
 };
-use crate::store_client::DreamerCommitEvidence;
+use crate::store_client::{DreamerCommitEvidence, ReservedWriteSendFault};
 use crate::store_write_reservation::{
     CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
@@ -1471,22 +1471,35 @@ impl KernelStoreGateway {
     /// ```text
     /// reserve (no lease held) -> eligible (no lease held) ->
     /// normal admission lease -> revalidate generation/fence ->
-    /// project -> single send ->
-    ///   Ok(Committed)   -> begin_execute_after_send -> reconcile -> Finalized
-    ///   Ok(not-applied) -> begin_execute_after_send -> reconcile -> Released (+gap)
-    ///   Err(unknown)    -> begin_execute_after_send -> mark_unknown -> Reconciling
-    ///   Err(refused)    -> release the still-Eligible token
+    /// project -> single send, classified by the Store owner ->
+    ///   Ok(receipt)                            -> begin_execute_after_send ->
+    ///                                           reconcile -> Finalized/Released (+gap)
+    ///   Err(possible effect: the owner cannot
+    ///       prove the mutation was not applied) -> begin_execute_after_send ->
+    ///                                           mark_unknown -> Reconciling
+    ///   Err(refused: the owner proved
+    ///       the mutation was not applied)      -> release the still-Eligible token
     /// ```
+    ///
+    /// The release arm is closed on the OWNER's evidence, never on a rendered
+    /// string and never on the error variant alone: the same `StoreError` is
+    /// projected both from a refusal raised before the send and from a
+    /// contract fault observed after a reply was decoded
+    /// (`IdentityConflict`, `InvalidReceipt`, and the owner's unknown-outcome
+    /// marker all appear on both sides). `ReservedWriteSendFault` is that
+    /// evidence, so a misbound or wrong-kind reply, a denied or internal-defect
+    /// answer, and a lost or unbound answer all keep the reservation for exact
+    /// reconciliation of the ORIGINAL operation identity instead of freeing a
+    /// scope whose first effect may already be committed.
     ///
     /// Queued work holds no admission lease, Kernel lock, provider permit, or
     /// protected-control resource while awaiting eligibility: the lease is
     /// acquired only for the bounded send window, and the service lock is
     /// never held across ORS or network work. Cancellation after execution
     /// starts is rejected by the owner (see [`Self::cancel_reserved`]);
-    /// `begin_execute_after_send` runs only after the single send resolves
-    /// with the typed [`ResolvedSendOutcome`] evidence, so a refused
-    /// backend never strands an `Executing` reservation without receipt
-    /// evidence.
+    /// `begin_execute_after_send` is the owner's only advance past `Eligible`,
+    /// so a refused backend never strands an `Executing` reservation without
+    /// receipt evidence.
     pub async fn apply_reserved(
         &self,
         context: &RequestMetadata,
@@ -1561,7 +1574,7 @@ impl KernelStoreGateway {
         .map_err(|error| error.to_string())?;
         let outcome = self
             .store
-            .apply_reserved_write(submission.into_request())
+            .send_reserved_write(submission.into_request())
             .await;
         match outcome {
             Ok(receipt) => {
@@ -1582,25 +1595,28 @@ impl KernelStoreGateway {
                 drop(lease);
                 Ok(receipt)
             }
-            Err(StoreError::MissingReceiptEnvelope) => {
-                // Still unknown after possible submission: preserve
-                // `Executing`/`Reconciling` identity until exact Store receipt
-                // reconciliation. Never a blind retry, never a release.
+            // The Store owner's evidence does not prove the request was not
+            // issued, so the effect may already be committed. The typed
+            // contract fault stays visible to the caller, and the reservation
+            // keeps `Executing`/`Reconciling` identity for the ORIGINAL
+            // operation until exact Store receipt reconciliation: never a
+            // blind retry, never a release, never a second effect.
+            Err(ReservedWriteSendFault::PossibleEffect(fault)) => {
                 let post_send = ResolvedSendOutcome::after_resolved_send(&sealed.token);
                 begin_execute_after_send(&owner, &sealed.token, &post_send)
                     .map_err(|error| error.to_string())?;
                 mark_unknown_outcome(&owner, &sealed.token).map_err(|error| error.to_string())?;
                 drop(lease);
                 Err(format!(
-                    "reserved write outcome unknown for operation {operation_id}: reconciling; reconcile by exact Store receipt"
+                    "reserved write outcome unknown for operation {operation_id}: {}; reconciling; reconcile by exact Store receipt",
+                    fault.error()
                 ))
             }
-            Err(error) => {
-                // Deterministic refusal: the Store owner proves no effect, so
-                // the still-`Eligible` token releases cleanly and nothing
-                // orphans.
+            // The Store owner proved the mutation was not applied, so the
+            // still-`Eligible` token releases cleanly and nothing orphans.
+            Err(ReservedWriteSendFault::Refused(fault)) => {
                 let refusal =
-                    refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
+                    refuse_determinate_reserved_write(&owner, &sealed.token, fault.error(), &operation_id);
                 drop(lease);
                 Err(refusal)
             }

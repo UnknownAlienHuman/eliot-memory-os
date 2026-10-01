@@ -579,6 +579,174 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             Err(error) => Err(DreamerCommitEvidence::Refused(error.into_store_error())),
         }
     }
+
+    /// Applies one sealed reserved-write request through the existing
+    /// authenticated Store path, classified on this client's own evidence about
+    /// whether a reply was received and what it said (issue #1925).
+    ///
+    /// This is the single production implementation of the reserved-write send;
+    /// [`CanonicalStoreClient::apply_reserved_write`] delegates to it and
+    /// projects the fault onto the closed `StoreError` ceiling, so there is
+    /// exactly one wire operation and exactly one owner of the effect-boundary
+    /// classification. The Kernel Store gateway consumes this method directly,
+    /// because `StoreError` cannot carry the two facts a reserved write needs
+    /// at once: the typed contract fault, and whether the Store owner proved
+    /// the request was never issued.
+    ///
+    /// The classification never parses prose and invents no new failure
+    /// variant. It reads the two evidence surfaces this client already owns:
+    /// which `match` arm produced the answer (only a decoded
+    /// `StoreResponse` proves a reply arrived), and
+    /// `RequestFailure::proves_no_effect` for the refusal contours the Store
+    /// owner stated. Anything else is a possible effect, so the caller
+    /// preserves the operation for exact-receipt reconciliation instead of
+    /// freeing its reserved ordering scope.
+    pub(crate) async fn send_reserved_write(
+        &self,
+        request: ReservedWriteRequest,
+    ) -> Result<WriteReceipt, ReservedWriteSendFault> {
+        request.validate().map_err(ReservedWriteSendFault::refused)?;
+        request
+            .context
+            .validate()
+            .map_err(StoreError::Foundation)
+            .map_err(ReservedWriteSendFault::refused)?;
+        self.validate_requirement_fence(&request.context.state_fence)
+            .map_err(ReservedWriteSendFault::refused)?;
+        self.validate_requirement_fence(&request.transition.state_fence)
+            .map_err(ReservedWriteSendFault::refused)?;
+        self.validate_requirement_fence(&request.admission.state_fence)
+            .map_err(ReservedWriteSendFault::refused)?;
+        // Production fault hook (issue #2030): same contract as
+        // `apply_prepared` — validation first, pre-commit crash with zero
+        // provider effects, post-commit loss discarding the observed
+        // receipt into unknown.
+        let fault = self.take_fault();
+        if fault == StoreClientFault::PreCommitCrash {
+            // The hook reports the pre-existing non-retryable unknown marker,
+            // not a refusal, so it never claims a not-issued result.
+            return Err(ReservedWriteSendFault::possible_effect(
+                StoreError::MissingReceiptEnvelope,
+            ));
+        }
+        let idempotency_key = request.transition.identity.idempotency_key.clone();
+        let result = self
+            .execute_raw(
+                StoreRequest::ReservedWrite {
+                    request: request.clone(),
+                },
+                Some(&request.context),
+                &idempotency_key,
+            )
+            .await;
+        match result {
+            Ok(StoreResponse::Transaction { receipt }) => {
+                // Post-commit response loss (issue #2030, 994/12) is
+                // evaluated immediately after the canonical commit, before
+                // receipt validation: the commit is durable but the
+                // observed answer is dropped into unknown so the caller
+                // reconciles the exact admitted identity instead of
+                // observing success. A committed-but-unusable (misbound or
+                // malformed) receipt therefore takes the
+                // unknown/reconciliation path rather than surfacing a
+                // typed validation failure for a write that committed.
+                if fault == StoreClientFault::PostCommitResponseLoss {
+                    return Err(ReservedWriteSendFault::possible_effect(
+                        StoreError::MissingReceiptEnvelope,
+                    ));
+                }
+                // A misbound or malformed receipt observed after the single
+                // send is a typed receipt-validation failure for the caller
+                // to reconcile — never success, never an adopted peer
+                // identity, and never a second wire operation. The reply was
+                // decoded, so the effect may already be committed and this
+                // arm can never release a reserved order.
+                self.validate_reserved_write_receipt(&request, &receipt)
+                    .map_err(ReservedWriteSendFault::possible_effect)?;
+                Ok(receipt)
+            }
+            // Once the reserved write has crossed the transport boundary, a
+            // valid response of the wrong kind is itself a typed contract
+            // defect. It is preserved as an error with no second send, no
+            // retry under a new identity, and no fallback to ordinary
+            // `Apply`. A reply was decoded, so it is a possible effect.
+            Ok(_) => Err(ReservedWriteSendFault::possible_effect(
+                StoreError::InvalidReceipt,
+            )),
+            // Unknown outcomes (transport loss, a peer `Unknown`, or a typed
+            // unknown-outcome failure already bound to the admitted operation
+            // by the `ReservedWrite` exchange arm) project to the typed
+            // unknown-outcome error with no second wire operation. Every
+            // other typed failure keeps its `into_store_error` projection
+            // unchanged, and the refusal proof is read from the owner's own
+            // answer rather than from the projected variant.
+            Err(failure) => {
+                let proved_no_effect = failure.proves_no_effect();
+                let error = failure.into_store_error();
+                Err(if proved_no_effect {
+                    ReservedWriteSendFault::refused(error)
+                } else {
+                    ReservedWriteSendFault::possible_effect(error)
+                })
+            }
+        }
+    }
+}
+
+/// The owner's classification of one reserved-write send that produced no
+/// usable receipt (issue #1925).
+///
+/// A reserved write needs two facts that the closed `StoreError` ceiling cannot
+/// carry together: the typed contract fault, preserved unchanged in
+/// [`Self::error`], and whether the Store owner proved the request was never
+/// issued. The distinction is load-bearing rather than cosmetic: a refusal may
+/// release its reserved ordering scope, while a possible effect must stay
+/// reserved and be reconciled by the ORIGINAL operation identity, because
+/// releasing it would let a second effect commit under a scope whose first
+/// effect may already be committed.
+///
+/// Construction is closed to the client that owns the send: both constructors
+/// are private, so no other module can decide this boundary by assertion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReservedWriteSendFault {
+    /// The Store owner proved the request was not issued, so the still-`Eligible`
+    /// reserved order can be released with the typed refusal preserved.
+    Refused(StoreError),
+    /// The effect boundary may have been crossed: a reply was decoded and
+    /// unusable, or no reply was obtainable. The reservation stays reserved and
+    /// reconciles by exact identity.
+    PossibleEffect(StoreError),
+}
+
+impl ReservedWriteSendFault {
+    /// Classifies a refusal raised before the request left this client.
+    fn refused(error: StoreError) -> Self {
+        Self::Refused(error)
+    }
+
+    /// Classifies an answer that leaves the effect unresolved.
+    fn possible_effect(error: StoreError) -> Self {
+        Self::PossibleEffect(error)
+    }
+
+    /// Returns the owner's typed contract fault, unchanged.
+    pub(crate) fn error(&self) -> &StoreError {
+        match self {
+            Self::Refused(error) | Self::PossibleEffect(error) => error,
+        }
+    }
+
+    /// Projects the fault onto the closed transport-boundary `StoreError`.
+    ///
+    /// The classification never collapses into the error: the typed contract
+    /// fault is returned exactly as the client produced it, so every existing
+    /// caller of [`CanonicalStoreClient::apply_reserved_write`] observes the
+    /// unchanged answer and no state becomes newly retryable.
+    fn into_store_error(self) -> StoreError {
+        match self {
+            Self::Refused(error) | Self::PossibleEffect(error) => error,
+        }
+    }
 }
 
 /// Renders durable Dreamer commit evidence onto the transport-boundary
@@ -719,68 +887,21 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
     /// wrong-kind response returns the typed contract error, and an unknown
     /// outcome returns the typed unknown-outcome error — never success and
     /// never a second wire operation after `execute_raw`.
+    ///
+    /// The boundary projection is deliberately blind to the effect-boundary
+    /// classification: the closed trait carries no such field, so the typed
+    /// contract fault is returned exactly as the client produced it and no
+    /// state becomes newly retryable. The Kernel Store gateway, which owns the
+    /// reserved ordering scope, calls
+    /// [`EbpCanonicalStoreClient::send_reserved_write`] directly so it keeps
+    /// the owner's no-effect proof instead of inferring it from the variant.
     async fn apply_reserved_write(
         &self,
         request: ReservedWriteRequest,
     ) -> Result<WriteReceipt, StoreError> {
-        request.validate()?;
-        request.context.validate().map_err(StoreError::Foundation)?;
-        self.validate_requirement_fence(&request.context.state_fence)?;
-        self.validate_requirement_fence(&request.transition.state_fence)?;
-        self.validate_requirement_fence(&request.admission.state_fence)?;
-        // Production fault hook (issue #2030): same contract as
-        // `apply_prepared` — validation first, pre-commit crash with zero
-        // provider effects, post-commit loss discarding the observed
-        // receipt into unknown.
-        let fault = self.take_fault();
-        if fault == StoreClientFault::PreCommitCrash {
-            return Err(StoreError::MissingReceiptEnvelope);
-        }
-        let idempotency_key = request.transition.identity.idempotency_key.clone();
-        let result = self
-            .execute_raw(
-                StoreRequest::ReservedWrite {
-                    request: request.clone(),
-                },
-                Some(&request.context),
-                &idempotency_key,
-            )
-            .await;
-        match result {
-            Ok(StoreResponse::Transaction { receipt }) => {
-                // Post-commit response loss (issue #2030, 994/12) is
-                // evaluated immediately after the canonical commit, before
-                // receipt validation: the commit is durable but the
-                // observed answer is dropped into unknown so the caller
-                // reconciles the exact admitted identity instead of
-                // observing success. A committed-but-unusable (misbound or
-                // malformed) receipt therefore takes the
-                // unknown/reconciliation path rather than surfacing a
-                // typed validation failure for a write that committed.
-                if fault == StoreClientFault::PostCommitResponseLoss {
-                    return Err(StoreError::MissingReceiptEnvelope);
-                }
-                // A misbound or malformed receipt observed after the single
-                // send is a typed receipt-validation failure for the caller
-                // to reconcile — never success, never an adopted peer
-                // identity, and never a second wire operation.
-                self.validate_reserved_write_receipt(&request, &receipt)?;
-                Ok(receipt)
-            }
-            // Once the reserved write has crossed the transport boundary, a
-            // valid response of the wrong kind is itself a typed contract
-            // defect. It is preserved as an error with no second send, no
-            // retry under a new identity, and no fallback to ordinary
-            // `Apply`.
-            Ok(_) => Err(StoreError::InvalidReceipt),
-            // Unknown outcomes (transport loss, a peer `Unknown`, or a typed
-            // unknown-outcome failure already bound to the admitted operation
-            // by the `ReservedWrite` exchange arm) project to the typed
-            // unknown-outcome error with no second wire operation. Every
-            // other typed failure keeps its `into_store_error` projection
-            // unchanged.
-            Err(error) => Err(error.into_store_error()),
-        }
+        self.send_reserved_write(request)
+            .await
+            .map_err(ReservedWriteSendFault::into_store_error)
     }
 
     async fn recovery(

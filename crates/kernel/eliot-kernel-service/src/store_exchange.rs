@@ -123,6 +123,41 @@ impl RequestFailure {
         }
     }
 
+    /// Reports whether this failure carries the owner's own proof that the
+    /// admitted request was never issued, so a reserved ordering scope can be
+    /// released instead of preserved for reconciliation.
+    ///
+    /// This is the only evidence about the effect boundary that survives to the
+    /// caller: a `StoreError` cannot express it, because the same variant is
+    /// projected from both a refusal that preceded the send and a contract
+    /// fault observed after a reply was received. The rule is closed and
+    /// fails safe — anything not named here is a possible effect:
+    ///
+    /// - [`Self::Store`] is the local pre-send fence refusal; for a write
+    ///   family the frame has not been built, so nothing was issued;
+    /// - [`Self::Failure`] proves no effect only when the Store owner answered
+    ///   with a determinate refusal contour. `UnknownOutcome`, `Denied`,
+    ///   `InternalDefect`, `Unavailable`, `Backpressured`,
+    ///   `DeadlineExceeded` and `MigrationRequired` say nothing about whether a
+    ///   mutation applied, so they stay possible effects;
+    /// - [`Self::Unknown`] is transport loss, an unbound reply, or a decode
+    ///   defect: the effect boundary may have been crossed;
+    /// - [`Self::Contract`] is a local framing/contract defect, and the same
+    ///   variant is also constructed from the post-decode response validation
+    ///   arm, so it proves nothing about the effect boundary.
+    pub(super) fn proves_no_effect(&self) -> bool {
+        match self {
+            Self::Store(_) => true,
+            Self::Failure(failure) => matches!(
+                failure.disposition,
+                StoreFailureDisposition::DeterministicRejection
+                    | StoreFailureDisposition::Unsupported
+                    | StoreFailureDisposition::Conflict
+            ),
+            Self::Contract(_) | Self::Unknown { .. } => false,
+        }
+    }
+
     /// Reports whether this failure is a typed unknown-outcome failure bound
     /// to the admitted operation. Callers reconcile exactly that operation via
     /// `receipt_exact`/`reconcile_genesis` and never adopt a peer identity.
