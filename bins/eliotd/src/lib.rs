@@ -967,9 +967,13 @@ fn blocked_port(
     }
 }
 
-/// Polls the shared solo queue without retaining the composition mutex during
-/// authenticated Kernel verification. The queue helper clones one intake
-/// under a short synchronous lock, then awaits with only owned inputs.
+/// Polls the shared solo queue through the verified async drive. The queue
+/// helper clones one intake plus the expected revisions under a short
+/// synchronous lock, then drives: the verified seam borrows the composition
+/// across its bounded owner IO (sole-path session-half resolution and
+/// capability construction on `&DaemonComposition`), and both the drive
+/// adopt and the queue adopt revalidate the consumed task/route/admission/
+/// fence revisions before dequeuing, leaving a moved head queued.
 pub async fn solo_poll_queue_async(
     composition: &Arc<tokio::sync::Mutex<DaemonComposition>>,
     kernel: &Arc<DaemonKernelClient>,
