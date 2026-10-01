@@ -169,8 +169,7 @@ pub(super) fn load_durable_runtime_restarts(
                 )
             })?;
         if is_restart_budget_entry(file_name) {
-            host_restart_observe("host.restart budget not adopted observed");
-            continue;
+            host_restart_observe("host.restart budget not adopted observed"); continue;
         }
         let pending_digest = file_name
             .strip_suffix(".pending.json")
