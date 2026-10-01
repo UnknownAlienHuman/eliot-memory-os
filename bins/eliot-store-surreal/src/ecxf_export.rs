@@ -43,6 +43,86 @@
 //! owner did not observe. Nothing is defaulted, no fence member is filled in,
 //! and no package is written. This command reports that refusal and exits
 //! nonzero; it never reports success over an incomplete view.
+//!
+//! # WHY NO SUCCESS PROJECTION IS WRITTEN HERE (#2569)
+//!
+//! The refusal above is a measured property of the store's own evidence, not a
+//! missing line of code in this module, and the distinction decides whether a
+//! later change may close it. Both halves are re-measured against
+//! `origin/main@24cd860f4`:
+//!
+//! * `observed_capture_gaps`
+//!   (`crates/storage/eliot-store-surreal-adapter/src/backup_snapshot.rs:839`)
+//!   derives its first three entries from the schema owner — `captures_scope_column`
+//!   over `admitted_generation_ddl`, plus `captures_purge_ledger` and
+//!   `captures_blob_residency` — so those three close on a generation that
+//!   supplies the evidence, with no edit to that list. It then appends five
+//!   entries unconditionally at lines 856-862
+//!   (`ExternalSourceIdentityEvidenceUnavailable`,
+//!   `SourceExportReceiptUnavailable`, `StoreResourceGenerationUnavailable`,
+//!   `SourceAdapterIdentityUnavailable`, `ExportProfileUnavailable`),
+//!   deriving them from no observation.
+//! * `capture_completeness` (`backup_snapshot.rs:2278`) maps that non-empty list
+//!   to `SnapshotCompleteness::Partial`, and `prove_coherent_boundary`
+//!   (`crates/storage/eliot-backup/src/ecxf_export.rs:431`, which is where that
+//!   proof now lives) refuses any view that is not complete *before* it reads a
+//!   single member.
+//!
+//! So no assignment in `coherent_export` can return `Ok` on any input, and the
+//! other three gaps cannot be closed from this binary either: they derive from
+//! the admitted generation's own baseline and from the vendor census, both of
+//! which live in the adapter.
+//!
+//! Writing the success projection anyway is the one move forbidden here. Four
+//! members have no source anywhere in the store — `store_generation` (the
+//! identifier does not appear in the adapter crate at all),
+//! `architecture_source_digest`, `normative_pair_identity_receipt_digest` and
+//! `export_receipt` — and three more have no captured class: `purge_ledger`
+//! (the adapter's only `PurgeLedgerEntry` reader is `backup_restore.rs:2359`,
+//! a different owner on the restore path), `blobs` and
+//! `reachable_blob_residency_keys`. Filling them would mean an empty string, an
+//! empty vector or a synthesised digest in a field `eliot-ecxf` then validates,
+//! which publishes a manifest whose fence nobody observed. An earlier attempt at
+//! exactly that is preserved on the unmerged branch
+//! `fix/1871-export-package-members-W3k5` (`c362f4cb0`), where those members
+//! were `String::new()` and `Vec::new()`; `fix/1871-export-reachable-command-W3k6`
+//! (`fb860c9a3`) withdrew the projection again once the independent
+//! reachability read was found to refuse on its own census. Neither branch is on
+//! `main` and neither is ported here.
+//!
+//! Closing this needs the missing evidence to be *observed and carried*, not
+//! this module to project harder. One earlier version of this refusal
+//! over-stated the case by claiming the store had no adapter identity of its own:
+//! `ADAPTER_NAME` is a real declared value
+//! (`crates/storage/eliot-store-surreal-adapter/src/config.rs:22`) and is
+//! available. It is not enough on its own, because a build constant of the
+//! running binary is not an observation of the source store, and because the
+//! four members above still have no source.
+//!
+//! # THE OBSERVED MEMBERS STILL DO NOT TYPE-CHECK AGAINST THE SOURCE VIEW
+//!
+//! Independent of the gap list, the capture and the exporter disagree on two
+//! member types, so a projection is owed here before any refusal can lift.
+//! `EcxfSourceCapture` carries `events: Vec<CanonicalEvent>` and
+//! `projections: Vec<ProjectionPublicationRecord>`
+//! (`backup_snapshot.rs:268` and `:271`), while `CoherentSourceExport` declares
+//! both as `Vec<CanonicalRecord>`
+//! (`crates/storage/eliot-backup/src/ecxf_export.rs:205` and `:207`). No owner
+//! performs that conversion on `main`: `git grep` for a projection from
+//! `CanonicalEvent` to `CanonicalRecord` returns only the *reverse* read in
+//! `prove_event_range_against_store`
+//! (`crates/storage/eliot-backup/src/ecxf_export.rs:576`), which decodes a
+//! `CanonicalRecord` payload back into the store owner's `CanonicalEvent`.
+//!
+//! That reverse read does fix the forward projection's contract, so it is
+//! recorded rather than guessed: a projected event record's payload must be the
+//! canonical JSON of the owner's own `CanonicalEvent`, because that is the only
+//! payload the exporter will accept back. Its `record_id` is the event identity
+//! and its `record_type` is the adapter's own class token for that member
+//! (`"canonical-event"`, `backup_snapshot.rs:586`; the projection analogue is
+//! `"projection-record"`, `:595`). Building that projection is deliberately not
+//! done here while this arm still refuses: it would have no caller, and an
+//! uncalled conversion is the shim this repository forbids.
 
 use std::path::{Path, PathBuf};
 
@@ -142,6 +222,16 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
         // empty collection or a synthesized digest, and a fence member filled
         // that way is worse than the refusal, because it would publish a
         // manifest whose fence nobody observed.
+        //
+        // This is the measured blocker recorded in the module docs under
+        // "WHY NO SUCCESS PROJECTION IS WRITTEN HERE": the owner's gap list is
+        // never empty, because `observed_capture_gaps` appends five gaps
+        // unconditionally, so `capture_completeness` always yields `Partial` and
+        // `prove_coherent_boundary` refuses any such view before reading a
+        // member. This arm therefore cannot return `Ok` on any input, and the
+        // members a projection would still owe have no source in the store.
+        // Closing it means observing and carrying that evidence, not filling
+        // these fields in.
         Err(BackupError::UnobservedSourceMember {
             member: unobserved_member(&capture),
         })
@@ -163,10 +253,21 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
 /// would have had to supply. `StoreResourceGenerationUnavailable` names
 /// `store_generation` rather than `state_fence.resource_generation` because the
 /// fence's resource generation is the generation relevant to one decision, not
-/// the store's own. An owner that declares no gap at all has still not
-/// established the observed completeness itself, so that case names
-/// `completeness` — a source-view field whose counterpart in the fence is
-/// `consistent`, deliberately not the same word.
+/// the store's own. `SourceAdapterIdentityUnavailable` names `source_adapter`
+/// because that gap covers the adapter's identity *and* its version, and the
+/// identity is the member a reader acts on first; `source_adapter_version` has
+/// no separate gap to name it after.
+///
+/// The empty-list arm is the one case this mapping cannot describe. An owner
+/// that declares no gap has, by its own `capture_completeness` derivation, also
+/// declared `SnapshotCompleteness::Complete` — the two fields are derived from
+/// the same list and are deliberately not independent. Naming a member there
+/// would report a refusal over an owner verdict that says the opposite, so the
+/// arm names `completeness`, the one source-view field whose counterpart in the
+/// fence is `consistent`. Reaching it requires a generation that closes all
+/// eight gaps, which the five unconditional entries in
+/// `observed_capture_gaps` currently prevent; it names the member a projection
+/// would still owe rather than claiming the owner observed nothing.
 fn unobserved_member(capture: &EcxfSourceCapture) -> &'static str {
     match capture.missing_evidence.first() {
         Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => "scope_id",
