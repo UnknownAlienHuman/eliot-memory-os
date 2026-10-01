@@ -2170,9 +2170,6 @@ pub struct CodeCortexPacketView {
 #[serde(deny_unknown_fields)]
 pub struct TokenBudgetReport {
     pub max_tokens: usize,
-    /// Legacy numeric projection of the packet's unvalidated Source Token Unit
-    /// (STU) estimate for planning; it is never an observed token count or proof
-    /// that a route budget fits.
     pub estimated_tokens: usize,
     pub truncated: bool,
     pub sections_truncated: Vec<String>,

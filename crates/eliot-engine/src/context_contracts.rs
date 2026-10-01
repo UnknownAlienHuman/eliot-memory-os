@@ -177,8 +177,8 @@ impl PacketBudgetDecision {
         // Read the original owner projection from the exact validated packet
         // bytes. Supplements and return metadata are separate planning costs,
         // not a claim that separately rounded parts measure the whole envelope.
-        let packet: eliot_types::ContextPacketL3 = serde_json::from_slice(serialized)
-            .map_err(|_| ContextError::IdentityConflict)?;
+        let packet: eliot_types::ContextPacketL3 =
+            serde_json::from_slice(serialized).map_err(|_| ContextError::IdentityConflict)?;
         let legacy_total = packet
             .token_budget_report
             .estimated_tokens

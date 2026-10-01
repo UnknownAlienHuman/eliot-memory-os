@@ -73,9 +73,6 @@ pub struct PacketQualityReport {
     pub task_id: String,
     pub revision_fence: MemoryRevision,
     pub structured_bytes: usize,
-    /// Legacy numeric compatibility projection of the canonical, unvalidated
-    /// #704 STU estimate for the exact serialized packet. It is not an observed
-    /// tokenizer count and never proves that a route budget fits.
     pub estimated_tokens: usize,
     pub task_frame_present: bool,
     pub current_truth_coverage: f32,

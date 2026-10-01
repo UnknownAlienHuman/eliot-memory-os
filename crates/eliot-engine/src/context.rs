@@ -2901,11 +2901,8 @@ fn adjudicate_post_quality_packet_stu(
     // that a Decision Safety Floor fits, and it never changes membership.
     let packet_stu = usize::try_from(stu_estimate.value)
         .map_err(|_| EngineError::from(ContextError::Overflow))?;
-    let estimated_tokens = total_surface_estimate(
-        packet_stu,
-        supplement_tokens,
-        budget_metadata_tokens,
-    )?;
+    let estimated_tokens =
+        total_surface_estimate(packet_stu, supplement_tokens, budget_metadata_tokens)?;
     if estimated_tokens > max_tokens {
         let mut section_tokens = packet_section_accounting(packet)?;
         section_tokens.insert("returned_supplements".to_owned(), supplement_tokens);
