@@ -2210,11 +2210,11 @@ impl KernelContextReadClient {
     /// hands them back on every path. The owner-issued `headroom_result` is no
     /// longer accepted as proof on its own: it is proved against the held
     /// permits before the selection and the permits are revalidated against the
-    /// live owner across it. The revalidation clock is read inside this composition,
-    /// at the revalidation itself, rather than supplied by the caller: a
-    /// caller-supplied reading can predate the work it is meant to bound.
-    /// taken after the selection, so the revalidation is an observation rather
-    /// than a restatement of the pre-selection one.
+    /// live owner across it. The revalidation clock is read inside this
+    /// composition, at the revalidation itself, rather than supplied by the
+    /// caller: a caller-supplied reading can predate the work it is meant to
+    /// bound, so it would restate the pre-selection clock instead of observing
+    /// the instant after the selection.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
