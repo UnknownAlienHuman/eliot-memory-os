@@ -590,8 +590,16 @@ mod cue_composition_tests {
         ROLE_AFFORDANCES, ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION,
         ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME, RoleAcquisition,
     };
+    use eliot_contracts::{ProductId, RequestId, SourceId};
     use eliot_cue_contracts::Digest;
-    use eliot_store_api::{RevisionHead, RevisionKey, ScopeId, ScopeRevisionView};
+    use eliot_read::{
+        BranchEnvironmentScope, FreshnessPolicy, NamedParameters, QueryIntent, QueryMode,
+        QueryRequest, ReadApi, ReadOrderingBinding, ReadService, RequiredAssurance, TimeScope,
+    };
+    use eliot_store_api::{
+        CanonicalReadClient, NamedReadRequest, NamedReadResponse, RevisionHead, RevisionKey,
+        ScopeId, ScopeRevisionView,
+    };
 
     type ProofResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -709,15 +717,198 @@ mod cue_composition_tests {
         Ok(())
     }
 
+    /// Minimal in-test canonical read client for the cue role.
+    ///
+    /// `ReadIdentity` has private fields and exactly one constructor — the
+    /// `ReadService` engine — so a fixture cannot mint one by hand: the
+    /// `identity` a `Complete`/`KnownEmpty` role must carry (see
+    /// [`crate::context_inputs::RoleAcquisition::identity`]) has to come from
+    /// the real read owner. This double answers the one closed cue read and
+    /// derives every response field from the request through the shared store
+    /// validation and catalogue gate, so the identity it produces is the one
+    /// the production engine would produce.
+    struct CueReadTableClient {
+        fence: StateFence,
+        payload: Value,
+    }
+
+    impl CanonicalReadClient for CueReadTableClient {
+        async fn revision_heads(
+            &self,
+            keys: Vec<RevisionKey>,
+        ) -> Result<Vec<RevisionHead>, eliot_store_api::StoreError> {
+            Ok(keys
+                .into_iter()
+                .map(|key| RevisionHead {
+                    key,
+                    revision: 1,
+                    state_fence: self.fence.clone(),
+                })
+                .collect())
+        }
+
+        async fn execute_named(
+            &self,
+            request: NamedReadRequest,
+        ) -> Result<NamedReadResponse, eliot_store_api::StoreError> {
+            request.validate()?;
+            if request.operation != NamedReadOperation::GetUnderstandingProjectionInputs {
+                return Err(eliot_store_api::StoreError::UnknownOperation);
+            }
+            // The same pre-dispatch catalogue gate the production adapters apply.
+            request.validate_against_catalogue(&eliot_store_api::generated_operation_manifests()?)?;
+            if request.state_fence != self.fence {
+                return Err(eliot_store_api::StoreError::FenceMismatch);
+            }
+            Ok(NamedReadResponse {
+                operation: request.operation,
+                state_fence: self.fence.clone(),
+                revision_heads: vec![RevisionHead {
+                    key: RevisionKey::new(format!("scope:{}", request.scope_id.ok_or(
+                        eliot_store_api::StoreError::InvalidField {
+                            field: "scope_id",
+                            reason: "projection-inputs read requires scope_id",
+                        },
+                    )?.as_str()))?,
+                    revision: 1,
+                    state_fence: self.fence.clone(),
+                }],
+                payload: self.payload.clone(),
+            })
+        }
+    }
+
+    /// Drives an immediately-ready future; this crate takes no executor
+    /// dependency and the in-test client performs no I/O.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut pinned = Box::pin(future);
+        loop {
+            match pinned.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    /// Reads the cue role through the real read owner so the fixture carries a
+    /// genuine `ReadIdentity` and the matching observed scope revision head.
+    ///
+    /// `cue_source_revision` requires both (`cue_composition.rs:329-381`): the
+    /// role's disposition, its read identity and the before/after scope heads
+    /// must agree on one exact cue-scope revision. #1144
+    /// (`crates/governor/eliot-read/src/lib.rs:1084-1110`, the `ReadIdentity`
+    /// closure) made that binding load-bearing and simultaneously narrowed
+    /// `RoleAcquisition::identity` to "`None` exactly when the role is not
+    /// `Complete` or `KnownEmpty`"
+    /// (`crates/governor/eliot-governor/src/context_inputs.rs:319-325`), so a
+    /// `KnownEmpty`/`Complete` cue role without an identity is now a fixture
+    /// that cannot satisfy its own documented shape.
+    fn cue_role(
+        fence: &StateFence,
+        scope: &ScopeId,
+        cue_state: ProjectionState,
+    ) -> ProofResult<RoleAcquisition> {
+        let cue_payload = match &cue_state {
+            ProjectionState::KnownEmpty => Some(Value::Null),
+            ProjectionState::Complete => Some(serde_json::json!([])),
+            _ => None,
+        };
+        // Only a role the read owner actually served carries an identity; a
+        // degraded role is produced by the failing read itself, which is exactly
+        // the documented "`None` when the role is not Complete or KnownEmpty".
+        if cue_payload.is_none() {
+            return Ok(RoleAcquisition {
+                operation: NamedReadOperation::GetUnderstandingProjectionInputs,
+                state: cue_state,
+                payload: None,
+                revision_heads: Vec::new(),
+                identity: None,
+            });
+        }
+        // The read owner classifies a bare `null` payload as an `Unknown`
+        // outcome, never a successful empty result
+        // (`crates/governor/eliot-read/src/lib.rs:2217-2219`), so the store
+        // double serves the closed zero-record payload the real owner adapters
+        // return. `decoded_bindings` reads the retained role payload, which for
+        // an authoritative empty cue is the explicit null
+        // (`cue_composition.rs:427-429`), so the null stays on the role while
+        // the identity and observed heads come from the real engine.
+        let client = CueReadTableClient {
+            fence: fence.clone(),
+            payload: serde_json::json!([]),
+        };
+        let reads = ReadService::new(client);
+        let scope_key = format!("scope:{}", scope.as_str());
+        let bound = block_on(reads.bound_query(
+            &RequestMetadata {
+                request_id: RequestId::new("request-cue-1")?,
+                session_id: None,
+                task_id: None,
+                product_id: ProductId::new("product-cue")?,
+                source_id: SourceId::new("source-cue")?,
+                state_fence: fence.clone(),
+                clock: eliot_contracts::ClockReading::default(),
+            },
+            QueryRequest {
+                intent: QueryIntent {
+                    mode: QueryMode::ContextReconstruction,
+                    time_scope: TimeScope::DeclaredFence,
+                    branch_environment_scope: BranchEnvironmentScope::RequestScope,
+                    freshness_policy: FreshnessPolicy::ExactFence,
+                    required_assurance: RequiredAssurance::InputReconstructionOnly,
+                },
+                operation: NamedReadOperation::GetUnderstandingProjectionInputs,
+                scope_id: Some(scope.clone()),
+                consistency: ReadConsistency::ExactFence,
+                dependency_revisions: BTreeMap::from([(RevisionKey::new(scope_key.clone())?, 1)]),
+                ordering: ReadOrderingBinding::without_order_dependency(),
+                parameters: NamedParameters::from_map(BTreeMap::from([
+                    ("selector".to_owned(), Value::String("selector-a".to_owned())),
+                    ("max_records".to_owned(), Value::String("8".to_owned())),
+                ]))?,
+                provenance_handles: Vec::new(),
+            },
+        ))?;
+        // The identity must be one the engine actually resolved for this scope
+        // and fence; assert that here rather than trusting the double, because
+        // every assertion in this module is downstream of it.
+        assert_eq!(bound.identity.scope_id(), Some(scope));
+        assert_eq!(bound.identity.state_fence(), fence);
+        assert_eq!(
+            bound.identity.operation(),
+            NamedReadOperation::GetUnderstandingProjectionInputs
+        );
+        Ok(RoleAcquisition {
+            operation: NamedReadOperation::GetUnderstandingProjectionInputs,
+            state: cue_state,
+            payload: cue_payload,
+            revision_heads: bound.view.revision_heads,
+            identity: Some(bound.identity),
+        })
+    }
+
+    fn scope_revision_head(
+        scope: &str,
+        fence: &StateFence,
+    ) -> ProofResult<RevisionHead> {
+        Ok(RevisionHead {
+            key: RevisionKey::new(format!("scope:{scope}"))?,
+            revision: 1,
+            state_fence: fence.clone(),
+        })
+    }
+
     fn role_inputs(cue_state: ProjectionState) -> ProofResult<SevenRoleInputs> {
         let fence = test_fence()?;
+        let scope = ScopeId::new("scope-a")?;
+        let cue = cue_role(&fence, &scope, cue_state)?;
+        let head = scope_revision_head(scope.as_str(), &fence)?;
         let heads = ScopeRevisionView {
-            scope_id: ScopeId::new("scope-a")?,
-            revision_heads: vec![RevisionHead {
-                key: RevisionKey::new("scope:scope-a")?,
-                revision: 1,
-                state_fence: fence.clone(),
-            }],
+            scope_id: scope.clone(),
+            revision_heads: vec![head],
             ordering_heads: Vec::new(),
             state_fence: fence.clone(),
         };
@@ -731,13 +922,8 @@ mod cue_composition_tests {
             revision_heads: Vec::new(),
             identity: None,
         };
-        let cue_payload = match &cue_state {
-            ProjectionState::KnownEmpty => Some(Value::Null),
-            ProjectionState::Complete => Some(serde_json::json!([])),
-            _ => None,
-        };
         Ok(SevenRoleInputs {
-            scope_id: ScopeId::new("scope-a")?,
+            scope_id: scope,
             state_fence: fence,
             clock: eliot_contracts::ClockReading::default(),
             heads_before: heads.clone(),
@@ -747,13 +933,7 @@ mod cue_composition_tests {
             problem_readback: None,
             epistemic: unavailable(),
             epistemic_readback: None,
-            cue: RoleAcquisition {
-                operation: eliot_store_api::NamedReadOperation::GetUnderstandingProjectionInputs,
-                state: cue_state,
-                payload: cue_payload,
-                revision_heads: Vec::new(),
-                identity: None,
-            },
+            cue,
             negative_memory: unavailable(),
             evidence: unavailable(),
             affordances: unavailable(),
