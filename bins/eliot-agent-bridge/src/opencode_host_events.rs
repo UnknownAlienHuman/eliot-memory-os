@@ -142,11 +142,21 @@ where
 ///
 /// The User Broker mints introductions; the bridge composition installs
 /// the current one here with [`BridgeIntroductionStore::install`] (which
-/// retires the replaced entry), retires out-of-band revocations with
-/// [`BridgeIntroductionStore::revoke`], and refreshes live session facts
-/// with [`BridgeIntroductionStore::observe_session`]. Rotation, listener
-/// death, bridge restart, logout, and revocation invalidate the old
-/// introduction here before another request is admitted.
+/// retires the replaced entry), refreshes the broker-observed session facts
+/// with [`BridgeIntroductionStore::observe_session`], and retires the route
+/// with [`BridgeIntroductionStore::revoke`] and
+/// [`BridgeIntroductionStore::clear`] when the serving life ends.
+///
+/// Rotation, listener death, bridge restart, logout, and revocation
+/// invalidate the old introduction before another request is admitted
+/// through three live checks that need no supervisor: the installed
+/// introduction's own issue/expiry window, the live revocation set, and
+/// `BridgeHostEventAdmission`'s owner-state join, which re-proves the
+/// introduction's Authority Epoch, `StateFence` nonce and bridge generation
+/// against this process's live attach binding on every admitted event and
+/// every committed decision. A foreign or stale listener cannot inherit the
+/// route because the socket is bound exclusively on the port the
+/// introduction pins and the ingress join refuses any other port.
 #[derive(Clone, Debug, Default)]
 pub struct BridgeIntroductionStore {
     current: Option<OpenCodeBridgeIntroduction>,
@@ -171,19 +181,6 @@ impl BridgeIntroductionStore {
         if let Some(previous) = self.current.replace(introduction) {
             self.revoked.insert(previous.revocation_id);
         }
-    }
-
-    /// Rotates to a new introduction and refreshes the live session facts
-    /// together. Runs on the bridge thread between requests: the replaced
-    /// introduction is revoked by [`BridgeIntroductionStore::install`]
-    /// before the new facts admit traffic under the new generation.
-    pub fn rotate(
-        &mut self,
-        introduction: OpenCodeBridgeIntroduction,
-        facts: OpenCodeSessionFacts,
-    ) {
-        self.install(introduction);
-        self.observe_session(facts);
     }
 
     /// Retires one revocation id. Revoked introductions fail closed even
@@ -342,11 +339,15 @@ fn bridge_failure(error: &BridgeError) -> HostEventAdmissionFailure {
 /// owner-state join rules.
 pub struct BridgeHostEventAdmission<'runner> {
     runner: &'runner mut BridgeRunner,
-    /// Effect decisions this admission already committed, keyed by their exact
-    /// operation identity. The stored record is what a `Duplicate` from the
-    /// route's own ORS replay returns, so the handler compares the presented
-    /// request against the record that was actually persisted rather than
-    /// against a recomputed one.
+    /// Process-local **cache** of the effect decisions this admission already
+    /// committed, keyed by their exact operation identity.
+    ///
+    /// This is a cache and never the authority: it spares one route round trip
+    /// when the same process serves a retry. The authority is always the
+    /// owner's durable record: the route's own ORS idempotency answers
+    /// `Duplicate` only when the presented envelope is byte-identical to the
+    /// stored durable one, so that answer — not this map — is what reconciles a
+    /// retry that crossed a bridge restart.
     committed_decisions: BTreeMap<String, EffectDecisionRecord>,
 }
 
@@ -581,15 +582,6 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
             // content under the same identity.
             return Err(HostEventAdmissionError::conflict(String::new()));
         }
-        if matches!(disposition, EventDisposition::Duplicate) {
-            // The route proves this exact content is already durable, but the
-            // record it holds is not readable here. Refuse rather than
-            // re-evaluate: an unreconcilable duplicate must not become a second
-            // decision.
-            return Err(HostEventAdmissionError::of(
-                HostEventAdmissionFailure::Unavailable,
-            ));
-        }
         if !matches!(
             phase,
             AckPhase::Durable | AckPhase::Normalized | AckPhase::Applied
@@ -598,6 +590,18 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
                 HostEventAdmissionFailure::Unavailable,
             ));
         }
+        // The owner's durable record is the authority on both outcomes.
+        //
+        // `Conflict` above is the determined changed-content refusal. A
+        // `Duplicate` here is the opposite proof: the route compares the stored
+        // row's envelope digest, sequence, producer, generation, authority
+        // epoch and privacy legs against these exact presented bytes and
+        // answers `Duplicate` only when they all agree, so the presented record
+        // *is* the durable record. That is what reconciles a retry whose
+        // response was lost across a bridge restart: one durable event, one
+        // durable decision, no second write, and the handler compares the
+        // presented content against the record the owner actually holds rather
+        // than against this process's cache.
         self.committed_decisions
             .insert(event_id.clone(), record.clone());
         Ok(decision_receipt(

@@ -5072,6 +5072,11 @@ pub const OPENCODE_BOOTSTRAP_PIPE_NAME: &str = r"\\.\pipe\eliot\opencode\one-sho
 /// Operator handoff TTL: a ticket is a single first-contact authenticator,
 /// not a reconnect token or durable credential.
 pub const OPENCODE_BOOTSTRAP_TTL_MS: u64 = 5_000;
+/// Maximum bytes of one short-lived `OpenCode` route credential. The minted
+/// value is an opaque 64-character lowercase hex token, so this bound is a
+/// shape check that refuses an oversized or empty secret before it is ever
+/// stored or resolved.
+pub const MAX_OPENCODE_ROUTE_CREDENTIAL_BYTES: usize = 128;
 
 /// Exact `OpenCode` process binding carried by one bridge introduction.
 ///
@@ -5197,6 +5202,87 @@ pub struct OpenCodeSessionFacts {
     pub bridge_generation: Generation,
     pub launch_nonce: String,
     pub executable_digest: String,
+}
+
+/// Closed wire shape of the broker-observed session facts (issue #2898,
+/// step 7).
+///
+/// Only the physical owner composes it, and it is read back through
+/// [`OpenCodeSessionFactsProjection::facts`], which refuses a zero
+/// generation rather than admitting a bare scalar as a typed
+/// [`Generation`](eliot_process::Generation).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeSessionFactsProjection {
+    pub installation_id: String,
+    pub windows_sid: String,
+    pub interactive_session_id: String,
+    pub broker_generation: u64,
+    pub bridge_generation: u64,
+    pub launch_nonce: String,
+    pub executable_digest: String,
+}
+
+impl OpenCodeSessionFactsProjection {
+    /// Rebuilds the typed broker-observed facts.
+    pub fn facts(&self) -> Result<OpenCodeSessionFacts, BrokerError> {
+        Ok(OpenCodeSessionFacts {
+            installation_id: self.installation_id.clone(),
+            windows_sid: self.windows_sid.clone(),
+            interactive_session_id: self.interactive_session_id.clone(),
+            broker_generation: Generation::new(self.broker_generation)
+                .map_err(|_| BrokerError::InvalidField("projection.broker_generation"))?,
+            bridge_generation: Generation::new(self.bridge_generation)
+                .map_err(|_| BrokerError::InvalidField("projection.bridge_generation"))?,
+            launch_nonce: self.launch_nonce.clone(),
+            executable_digest: self.executable_digest.clone(),
+        })
+    }
+}
+
+/// Exact child environment name carrying the versioned, broker-minted
+/// introduction one bridge process serves, together with the
+/// broker-observed session facts it was minted under (issue #2898, step 2).
+///
+/// This is a materialized child projection of exactly one
+/// [`OpenCodeBridgeIntroduction`], never ambient configuration: the bridge
+/// re-validates the introduction's own digest and window at read time and
+/// re-proves its Authority Epoch, `StateFence` nonce and bridge generation
+/// against its live attach binding before any request is admitted, so an
+/// environment entry a human typed cannot reach the route.
+pub const OPENCODE_BRIDGE_ENV_INTRODUCTION: &str = "ELIOT_OPENCODE_BRIDGE_INTRODUCTION";
+
+/// One bridge-process launch projection of the current `OpenCode`
+/// introduction (issue #2898, steps 2 and 7).
+///
+/// The broker composes both halves together at mint, so the projection is a
+/// single closed value: the introduction, and the broker-observed session
+/// facts the introduction is probed against. Neither half is derived from the
+/// other at read time, and neither is a second identity store.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeBridgeProcessProjection {
+    /// The current broker-minted introduction this bridge process serves.
+    pub introduction: OpenCodeBridgeIntroduction,
+    /// The broker-observed facts observed when that introduction was minted.
+    pub session_facts: OpenCodeSessionFactsProjection,
+}
+
+impl OpenCodeBridgeProcessProjection {
+    /// Revalidates the projection at `now_ms` and returns the typed
+    /// broker-observed facts the serving process must observe.
+    ///
+    /// The introduction is revalidated (version, shape, window, digest
+    /// binding) and the facts must join it through the introduction's own
+    /// [`OpenCodeBridgeIntroduction::probe_current_session`], so a projection
+    /// that pairs an introduction with another launch's facts is refused here
+    /// rather than at the first request.
+    pub fn facts(&self, now_ms: u64) -> Result<OpenCodeSessionFacts, BrokerError> {
+        self.introduction.validate(now_ms)?;
+        let facts = self.session_facts.facts()?;
+        self.introduction.probe_current_session(&facts)?;
+        Ok(facts)
+    }
 }
 
 fn validate_opencode_endpoint(value: &str) -> Result<(), BrokerError> {
@@ -5617,6 +5703,83 @@ pub trait OpenCodeSecretBoundary {
     fn resolve_secret(&self, handle: &SecretRef) -> Result<Box<str>, Self::Error>;
 }
 
+/// The physical owner's live `OpenCode` route credential table
+/// (issue #2898, step 3).
+///
+/// This is the implementation of [`OpenCodeSecretBoundary`] the serving side
+/// of the route actually holds: the process that owns the physical launch
+/// mints one short-lived credential per generation, keeps only its opaque
+/// [`SecretRef`] in the introduction, and resolves the bytes here. Rotation
+/// [`OpenCodeRouteCredentials::retire`]s the replaced handle in the same step
+/// that installs the new introduction, so a rotated credential stops resolving
+/// the moment its generation is replaced, and a handle this table never issued
+/// resolves nothing.
+///
+/// The table holds the bytes in the owner's own address space only. It is
+/// never serialized, never projected into a non-secret launch map, and never
+/// written to a durable registration, command line, log, route profile or model
+/// context.
+#[derive(Clone, Debug, Default)]
+pub struct OpenCodeRouteCredentials {
+    live: BTreeMap<(String, String), Box<str>>,
+    retired: BTreeSet<(String, String)>,
+}
+
+impl OpenCodeRouteCredentials {
+    /// Creates an empty table: nothing resolves until
+    /// [`OpenCodeRouteCredentials::issue`] runs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mints one short-lived credential and returns its opaque handle.
+    ///
+    /// The bytes go straight to the physical owner; the introduction carries
+    /// only the returned [`SecretRef`]. A handle already retired by an earlier
+    /// generation is never reissued, so a rotated credential cannot be
+    /// resurrected under its old identity.
+    pub fn issue(
+        &mut self,
+        provider: &str,
+        key: &str,
+        credential: Box<str>,
+    ) -> Result<SecretRef, BrokerError> {
+        let handle = SecretRef::new(provider, key)
+            .map_err(|_| BrokerError::InvalidField("route_credential.provider"))?;
+        if credential.is_empty() || credential.len() > MAX_OPENCODE_ROUTE_CREDENTIAL_BYTES {
+            return Err(BrokerError::InvalidField("route_credential.secret"));
+        }
+        let identity = (handle.provider().to_owned(), handle.key().to_owned());
+        if self.retired.contains(&identity) {
+            return Err(BrokerError::StaleLease);
+        }
+        self.live.insert(identity, credential);
+        Ok(handle)
+    }
+
+    /// Retires one handle so its credential stops resolving immediately.
+    pub fn retire(&mut self, handle: &SecretRef) {
+        let identity = (handle.provider().to_owned(), handle.key().to_owned());
+        self.live.remove(&identity);
+        self.retired.insert(identity);
+    }
+}
+
+impl OpenCodeSecretBoundary for OpenCodeRouteCredentials {
+    type Error = BrokerError;
+
+    fn resolve_secret(&self, handle: &SecretRef) -> Result<Box<str>, BrokerError> {
+        self.live
+            .get(&(
+                handle.provider().to_owned(),
+                handle.key().to_owned(),
+            ))
+            .map(|credential| Box::<str>::from(credential.as_ref()))
+            .ok_or(BrokerError::StaleLease)
+    }
+}
+
 /// The User Broker's current `OpenCode` bridge introductions and their
 /// generation/revocation state (issue #2898, steps 3 and 14).
 ///
@@ -5741,10 +5904,10 @@ impl OpenCodeBridgeIntroductionRegistry {
 /// expiring, single-use tickets. The authority is bound to exactly one
 /// introduction (digest, endpoint, server identity, generations, session,
 /// process binding); a request naming any other introduction is denied, and
-/// a redeemed or expired ticket can never be reused. Peer authentication
-/// and the one-use credential yield are the pipe transport's job behind this
-/// redemption — this crate holds no Windows, process, or credential
-/// implementation.
+/// a redeemed or expired ticket can never be reused. Peer authentication is
+/// the pipe transport's job behind this redemption; the credential yield is
+/// this crate's [`OpenCodeRouteCredentials`] boundary, which holds no Windows
+/// or process implementation.
 #[derive(Clone, Debug)]
 pub struct OpenCodeBootstrapAuthority {
     introduction_digest: String,

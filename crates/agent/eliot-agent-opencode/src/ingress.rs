@@ -786,12 +786,18 @@ pub struct HostEventAdmissionReceipt {
     pub fence_id: String,
     /// Bridge generation bound from current owner state.
     pub bridge_generation: u64,
-    /// Stored effect decision when the route answered this operation identity
-    /// as an already-admitted replay (issue #2898, step 10). `Some` only when
-    /// the route's own ORS idempotency proved this exact operation identity
-    /// already holds a persisted decision; the returned value is that stored
-    /// record, which the handler compares by content against the decision this
-    /// request would produce.
+    /// Stored effect decision when this admission already committed one for
+    /// this exact operation identity (issue #2898, step 10).
+    ///
+    /// This is a process-local cache of what the owner already holds, not the
+    /// authority: it spares one durable round trip when the same process
+    /// serves a retry. The authority is always the owner's durable record,
+    /// which reconciles a retry that crossed a bridge restart through the
+    /// route's own idempotency answer on
+    /// [`HostEventAdmission::commit_decision`]. The returned record is what
+    /// the handler compares by content against the decision this request would
+    /// produce, so a changed effect, scope, fence, generation or policy
+    /// revision under one identity is a determined conflict.
     pub replayed_decision: Option<EffectDecisionRecord>,
 }
 
