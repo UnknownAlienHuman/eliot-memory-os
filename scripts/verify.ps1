@@ -740,19 +740,49 @@ if ($profileReceipt.profile -ne $expectedRoute) {
     [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: alias '$verificationRouteAlias' issued a receipt for route '$($profileReceipt.profile)', not '$expectedRoute'.")
     exit 1
 }
+# The receipt's OWN normalized outcome is a mandatory gate result, not a field
+# this script reports alongside a verdict it never took. Before this check the
+# value was read at exactly two places - the VERIFY_PROFILE_REVISION summary
+# lines - and compared against nothing: `profileReceipt.outcome` never reached
+# `$overall` (line 1036), which is computed solely from the gate table and the
+# harness state. So a run whose admitted route aggregated FAIL,
+# MISSING_REQUIRED, UNKNOWN or PARTIAL - a route that did not verify - still
+# executed all selected gates, and if those gates passed, this script exited 0
+# and reported `VERIFY_RESULT: PASS` over a receipt that recorded a non-PASS
+# profile outcome. That is the same shape as the #943 empty-profile class the
+# owner named: a value the run carried, printed, and never decided on.
+#
+# The refusal is here rather than folded into `$overall` because the receipt is
+# ADMISSION evidence, exactly like the route check above it: a route that could
+# not admit produces no usable admission, and no gate should be reported as
+# having run under one. It is fail-closed and it never weakens anything - it can
+# only turn a would-be PASS into a refusal.
+#
+# The comparison is over the receipt's own `outcome` field, not over the
+# resolver's exit code. The two agree by construction (`run()` returns
+# `EXIT_PASS` if and only if `receipt.outcome.is_pass()`,
+# src/bin/eliot-profile-resolver.rs), but the exit code is deliberately NOT the
+# discriminator anywhere else in this script - it is identical for a parity
+# refusal and for an ordinary non-PASS aggregate, which is why the parity guard
+# below keys on the resolver's `PARITY_*` verdict line instead. Reading the
+# receipt keeps this check independent of the resolver's exit plumbing, and
+# `AggregateOutcome` serializes `rename_all = "SCREAMING_SNAKE_CASE"`
+# (crates/instrument/eliot-instrument-runner/src/verification_profile.rs), so the
+# ONLY spelling that means PASS on the wire is exactly `PASS`. The comparison is
+# that one literal, not a permissive list: `Partial`, `PARTIAL`, `Fail`,
+# `MissingRequired`, `Unknown`, an absent field, and any future or misspelled
+# value are all refused, because a value this script does not recognise is
+# evidence it cannot interpret, and evidence it cannot interpret is never a
+# pass.
+if ([string]$profileReceipt.outcome -cne 'PASS') {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_RECEIPT_REFUSED: the shared resolver issued a VerificationProfileReceipt for route '$($profileReceipt.profile)' revision $($profileReceipt.profile_revision) whose normalized outcome is '$($profileReceipt.outcome)', which is not PASS. That is the admitted profile's own verdict: a route that aggregated FAIL, MISSING_REQUIRED, UNKNOWN or PARTIAL did not verify, so it is nonpassing whatever the gate table reports, and no gate result below may be reported as a PASS under it. The receipt is retained at '$profileReceiptPath' as the evidence of what was actually observed.")
+    exit 1
+}
 # A receipt the shared owner issued is trusted as admission evidence; nothing
-# here recomputes or second-guesses it. The resolver's exit code and the
-# receipt's normalized outcome are the SAME decision over the SAME receipt
-# value: `eliot-profile-resolver` returns exit 0 if and only if
-# `receipt.outcome.is_pass()` (src/bin/eliot-profile-resolver.rs run()), and it
-# writes that exact receipt to `--receipt-out` before choosing the exit. A
-# non-PASS outcome with a zero exit is therefore impossible by construction, so
-# there is no "disagreement" branch to warn on here: adding one would be a check
-# that can never fire. A genuinely non-PASS outcome arrives as a nonzero
-# resolver exit, is surfaced verbatim in the VERIFY_PROFILE_ALIAS and
-# VERIFY_PROFILE_REVISION lines below, and fails the run through the profile's
-# own nonpass policy; a route that could not be admitted at all issues no
-# receipt and is refused above.
+# here recomputes or second-guesses it. What IS decided above is only that the
+# outcome it recorded is PASS, which the check immediately above now enforces -
+# previously this comment claimed that outcome "fails the run through the
+# profile's own nonpass policy" while no such policy existed.
 Write-Host "VERIFY_PROFILE_REVISION: $($profileReceipt.profile)@$($profileReceipt.profile_revision) schema=$($profileReceipt.schema.schema)@$($profileReceipt.schema.version) outcome=$($profileReceipt.outcome)"
 foreach ($identity in @($profileReceipt.tool_identities)) {
     Write-Host "VERIFY_PROFILE_TOOL: $($identity.stage_id) instrument=$($identity.instrument) executable=$($identity.executable) sha256=$($identity.executable_digest)"
