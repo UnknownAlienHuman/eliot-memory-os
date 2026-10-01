@@ -2357,6 +2357,16 @@ fn no_store_clock_transcript_provider_mutation_path() -> TestResult {
         "Store",
         "Model",
         "std::time",
+        // The lowercase `clock` word appears in this file's own prose about a
+        // caller-supplied `generated_at_ms`, so the bare word cannot be banned.
+        // These are the SPECIFIC clock-reading identifiers it stood in for: the
+        // libc entry points and the `CLOCK_*` domain constants they take.
+        "clock_gettime",
+        "clock_getres",
+        "clock_nanosleep",
+        "clock_reading",
+        "CLOCK_MONOTONIC",
+        "CLOCK_REALTIME",
         "Clock",
         "Cell<",
         "RefCell",

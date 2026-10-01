@@ -1677,34 +1677,6 @@ fn omission_fixture(
     (view, input, context, policy(SemanticOutcome::Benefit))
 }
 
-/// Re-bind the slot payload digests a view carries in its source manifest after
-/// the fixture mutated a payload, keeping the view's own bindings consistent.
-fn rebind_slot_digest(view: &mut eliot_learning_contracts::CampaignLearningStateView) {
-    let bound: Vec<(eliot_learning_contracts::SlotId, String)> = view
-        .slots
-        .iter()
-        .map(|slot| {
-            (
-                slot.slot_id.clone(),
-                slot.canonical_digest().expect("slot canonical digest"),
-            )
-        })
-        .collect();
-    for resolution in &mut view.provenance.source_resolutions {
-        let Some(reference) = resolution.reference.as_mut() else {
-            continue;
-        };
-        for projection in &mut reference.slot_projection_digests {
-            if let Some((_, digest)) = bound
-                .iter()
-                .find(|(slot_id, _)| *slot_id == projection.slot_id)
-            {
-                projection.digest = digest.clone();
-            }
-        }
-    }
-}
-
 fn two_change_input(
     tag: &str,
 ) -> (
