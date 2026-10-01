@@ -2106,6 +2106,9 @@ mod tests {
                 state_fence: fence.clone(),
                 wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
                 executable_binding: Some(join),
+                visibility: None,
+                privacy_class: None,
+                swarm_id: None,
                 binding_digest: String::new(),
             }
             .with_computed_digest(),

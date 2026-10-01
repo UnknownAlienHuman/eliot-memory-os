@@ -368,6 +368,9 @@ fn test_claim_request(
         authority_epoch: test_epoch(1),
         state_fence: fence,
         executable_binding: Some(test_executable_join()),
+        visibility: None,
+        privacy_class: None,
+        swarm_id: None,
         binding_digest: String::new(),
         request_digest: String::new(),
     };

@@ -6609,6 +6609,9 @@ mod tests {
             authority_epoch: test_epoch(1),
             state_fence: native_live_fence(),
             executable_binding: Some(native_executable_join_for(claim_id, operation_id)),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
             binding_digest: String::new(),
             request_digest: String::new(),
         };

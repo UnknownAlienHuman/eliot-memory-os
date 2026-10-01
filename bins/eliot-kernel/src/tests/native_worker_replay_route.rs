@@ -243,6 +243,9 @@ fn test_claim_request(
         authority_epoch: live.clone(),
         state_fence: fence.clone(),
         executable_binding: Some(join),
+        visibility: None,
+        privacy_class: None,
+        swarm_id: None,
         binding_digest: String::new(),
         request_digest: String::new(),
     };
