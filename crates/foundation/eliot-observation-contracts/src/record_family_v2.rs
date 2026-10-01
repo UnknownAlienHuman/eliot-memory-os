@@ -233,6 +233,33 @@ impl RecordFamilyPayloadV2 {
     pub const fn is_journal_control(&self) -> bool {
         matches!(self, Self::JournalControlAudit(_))
     }
+
+    /// Returns the event payload the v2 record describes for every family that
+    /// carries one.
+    ///
+    /// Ordinary exact families expose their field-complete `core`; the
+    /// journal-control and generic-ambiguous variants expose their `event`.
+    /// [`Self::CoverageGap`] is exact from the gap alone and never carries an
+    /// event on either representation, so it has no event surface at all.
+    pub fn event(&self) -> Option<&ObservationEventCore> {
+        match self {
+            Self::Audit(value) => Some(&value.core),
+            Self::Telemetry(value) => Some(&value.core),
+            Self::Change(value) => Some(&value.core),
+            Self::Maintenance(value) => Some(&value.core),
+            Self::JournalControlAudit(value) => Some(&value.event),
+            Self::AmbiguousOrdinary(value) => Some(&value.event),
+            Self::CoverageGap(_) => None,
+        }
+    }
+
+    /// Returns the complete gap the v2 record describes, when it is a gap.
+    pub fn gap(&self) -> Option<&CoverageGap> {
+        match self {
+            Self::CoverageGap(value) => Some(&value.gap),
+            _ => None,
+        }
+    }
 }
 
 /// Deterministic first-pass classification of one v2 envelope.
@@ -333,10 +360,27 @@ impl ObservationRecordEnvelopeV2 {
 /// where the contract requires it.  Used at both submission and receipt/
 /// persisted-replay validation; any contradiction fails closed before admission
 /// or rebuild.
+///
+/// Equal labels are not evidence of one observation, so the shared payload is
+/// also compared **by value**: the v1 `event` must equal the v2 payload's own
+/// event (`Audit`/`Telemetry`/`Change`/`Maintenance` `core`, or the
+/// `JournalControlAudit`/`AmbiguousOrdinary` `event`), and for a coverage gap
+/// the complete v1 `coverage_gap` must equal the v2 `gap`.  Both types derive
+/// `Eq`/`PartialEq`, so every shared field — event identity, producer trace,
+/// scope, task binding, observed delta, baseline, evidence/raw handles,
+/// coverage/blind intervals, privacy/retention/disclosure, importance, dedup
+/// key, and each gap field — is compared at once rather than through selected
+/// labels.  Family fields that exist only in v2 (`audit_action`, `capture_mode`,
+/// `sample_count`, `raw_evidence_handle`, `change_operation`,
+/// `origin_confidence`, `state_fence`, `maintenance_action`, `trigger_ref`,
+/// `MaintenanceRecord::result`) stay additional evidence: they are neither
+/// discarded nor fabricated into v1.  Neither side is rewritten to match the
+/// other; a mismatch is a typed [`RecordFamilyContractError::ShapeConflict`].
 pub fn check_v1_v2_coherence(
     v1: &ObservationRecordEnvelope,
     v2: &ObservationRecordEnvelopeV2,
 ) -> Result<(), RecordFamilyContractError> {
+    v1.validate()?;
     v2.validate()?;
     if v1.record_id != v2.record_id() {
         return Err(RecordFamilyContractError::ShapeConflict {
@@ -377,7 +421,27 @@ pub fn check_v1_v2_coherence(
             }
         }
     }
-    Ok(())
+    // The two representations must describe one observation, not one label.
+    if let Some(gap) = v2.payload.gap() {
+        return match v1.coverage_gap.as_ref() {
+            Some(v1_gap) if v1_gap == gap => Ok(()),
+            _ => Err(RecordFamilyContractError::ShapeConflict {
+                reason: "v1/v2 coverage gap payload mismatch",
+            }),
+        };
+    }
+    let v2_event = v2
+        .payload
+        .event()
+        .ok_or(RecordFamilyContractError::ShapeConflict {
+            reason: "v2 record-family payload carries neither event nor gap",
+        })?;
+    match v1.event.as_ref() {
+        Some(v1_event) if v1_event == v2_event => Ok(()),
+        _ => Err(RecordFamilyContractError::ShapeConflict {
+            reason: "v1/v2 event payload mismatch",
+        }),
+    }
 }
 
 /// Explicit exactness ceiling for one v1 import.

@@ -494,23 +494,25 @@ impl ObservationSubmission {
         {
             return Err(GovernorObservationError::InsufficientDurability);
         }
-        let task_ref = self
-            .record
-            .event
+        // With a field-complete v2 payload the accepted event is the one the
+        // coherence check bound by value to the v1 record, so task/scope
+        // selection is never derived from one side in isolation.
+        let (task_ref, work_scope_ref) = self
+            .record_v2
             .as_ref()
-            .and_then(|event| event.affected_scope.task_ref.as_deref());
+            .and_then(|record_v2| record_v2.payload.event())
+            .or(self.record.event.as_ref())
+            .map(|event| {
+                (
+                    event.affected_scope.task_ref.as_deref(),
+                    event.affected_scope.work_scope.as_str(),
+                )
+            })
+            .unwrap_or_default();
         match (task_ref, &self.task_selection) {
             (Some(task_ref), Some(selection)) => {
                 selection.validate()?;
-                if selection.task_ref != task_ref
-                    || selection.work_scope_ref
-                        != self
-                            .record
-                            .event
-                            .as_ref()
-                            .map(|event| event.affected_scope.work_scope.as_str())
-                            .unwrap_or_default()
-                {
+                if selection.task_ref != task_ref || selection.work_scope_ref != work_scope_ref {
                     return Err(GovernorObservationError::TaskScopeIncompatible);
                 }
             }
