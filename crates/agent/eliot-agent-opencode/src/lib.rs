@@ -54,9 +54,12 @@ pub use ingress::{
     REASON_IDENTITY_CONFLICT, REASON_INVALID_ARGUMENT, REASON_POLICY_DENIED,
     REASON_PROTOCOL_INCOMPATIBLE, REASON_ROUTE_UNAVAILABLE, REASON_SCOPE_CONFLICT,
     REASON_STALE_AUTHORITY_EPOCH, REASON_STALE_STATE_FENCE, REASON_STORAGE_BACKPRESSURE,
-    UnconfiguredActionGate, authority_epoch_text, classify_decision_replay, effect_request_hash,
-    encode_host_event_response, handle_host_event, parse_http_head, response_commitment,
-    response_commitment_message, verify_response_commitment,
+    BootstrapIdentityFields, HOST_EVENTS_CHALLENGE_HEADER, HOST_EVENTS_CHALLENGE_LENGTH,
+    HOST_EVENTS_IDENTITY_VERSION, UnconfiguredActionGate, authority_epoch_text,
+    bootstrap_identity_message, bootstrap_identity_proof, classify_decision_replay,
+    effect_request_hash, encode_bootstrap_identity, encode_host_event_response, handle_host_event,
+    parse_http_head, response_commitment, response_commitment_message,
+    verify_bootstrap_identity_proof, verify_response_commitment,
 };
 pub use pilot::{
     opencode_equal_stack_comparison, opencode_pilot_observation,
