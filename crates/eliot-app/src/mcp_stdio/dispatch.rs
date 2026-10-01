@@ -299,6 +299,12 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
     } else if let Some(eliot_engine::PacketCompileError::HardCeiling(details)) =
         error.downcast_ref::<eliot_engine::PacketCompileError>()
     {
+        // 783/16: `section_tokens` is the engine's own per-section accounting
+        // over exact serialized bytes. The app republishes those recorded values
+        // with their unit and status; it never re-sums, re-rounds or estimates
+        // them, so a section figure cannot drift from the aggregate the same
+        // operation recorded.
+        let section_measurements = recorded_section_wire(&details.section_tokens);
         error_response_with_data(
             id,
             -32602,
@@ -309,6 +315,7 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
                 "hard_ceiling_tokens": details.hard_ceiling_tokens,
                 "mandatory_floor_tokens": details.mandatory_floor_tokens,
                 "section_tokens": details.section_tokens,
+                "section_measurements": section_measurements,
                 "expansion_handles": details.expansion_handles,
             }),
         )
@@ -318,6 +325,12 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
         section_tokens,
     }) = error.downcast_ref::<eliot_engine::EngineError>()
     {
+        // 783/15, 783/16: `estimated_tokens` is the engine's recorded
+        // `PacketBudgetDecision::estimated_tokens` and `section_tokens` is its
+        // recorded per-section accounting. Both are republished verbatim under
+        // an explicit unit/status; the app recomputes neither and has no `/4`,
+        // character-count or minimum-one rule of its own on this path.
+        let section_measurements = recorded_section_wire(section_tokens);
         error_response_with_data(
             id,
             -32602,
@@ -326,7 +339,10 @@ fn dispatch_error_response(id: &Value, error: &anyhow::Error) -> Value {
                 "code": "PACKET_FLOOR_EXCEEDS_BUDGET",
                 "max_tokens": max_tokens,
                 "estimated_tokens": estimated_tokens,
+                "estimated_tokens_measurement":
+                    recorded_planning_wire("stu_estimate", Some(u64::try_from(*estimated_tokens).unwrap_or(u64::MAX))),
                 "section_tokens": section_tokens,
+                "section_measurements": section_measurements,
             }),
         )
     } else {
