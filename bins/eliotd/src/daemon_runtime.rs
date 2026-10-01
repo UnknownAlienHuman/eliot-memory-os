@@ -5659,15 +5659,7 @@ async fn observe_host_workspace(
             &retained.policy_origin,
             unix_ms(SystemTime::now())?,
         )?;
-        let current_value = current
-            .canonical_value()
-            .map_err(|error| format!("current Observe owner binding: {error}"))?;
-        let retained_value = binding
-            .canonical_value()
-            .map_err(|error| format!("retained Observe owner binding: {error}"))?;
-        if current_value != retained_value {
-            return Err("Observe owners changed before Host scope observation".to_owned());
-        }
+        require_same_observe_owner_binding(&current, binding, "before")?;
         let scope = &binding.work_scope_binding;
         let locator = match (selection, &retained.policy_origin) {
             (Some(owner), _) => guard.activation_workspace_locator_for_selection(owner),
@@ -5704,15 +5696,19 @@ async fn observe_host_workspace(
     };
     let source_closure = if let Some(selection) = selection.as_ref() {
         let (sources, privacy) = selection.source_closure();
-        (sources.clone(), privacy.clone())
+        Some((sources.clone(), privacy.clone()))
     } else {
         let owner = eliot_workscope::WorkScopeBindingOwner::from_snapshot(
             binding.work_scope_binding.clone(),
         )
         .map_err(|error| format!("Observe retained WorkScope owner recovery: {error}"))?;
-        owner
-            .read_current_source_closure(&retained.state_fence)
-            .map_err(|error| format!("Observe retained WorkScope source closure: {error}"))?
+        match owner.read_current_source_closure(&retained.state_fence) {
+            Ok(source_closure) => Some(source_closure),
+            Err(eliot_workscope::WorkScopeError::SourceClosureUnavailable) => None,
+            Err(error) => {
+                return Err(format!("Observe retained WorkScope source closure: {error}"));
+            }
+        }
     };
     let observed =
         eliotd::task_binding_admission::observe_explicit_workspace(&root, &retained.state_fence)
@@ -5727,28 +5723,60 @@ async fn observe_host_workspace(
             &retained.policy_origin,
             unix_ms(SystemTime::now())?,
         )?;
-        let current_value = current
-            .canonical_value()
-            .map_err(|error| format!("current Observe owner binding: {error}"))?;
-        let retained_value = binding
-            .canonical_value()
-            .map_err(|error| format!("retained Observe owner binding: {error}"))?;
-        if current_value != retained_value {
-            return Err("Observe owners changed during Host scope observation".to_owned());
-        }
+        require_same_observe_owner_binding(&current, binding, "during")?;
     }
-    if !matches!(
+    admit_observe_scope_guard(
+        &binding.work_scope_binding.binding,
+        &observed,
+        source_closure
+            .as_ref()
+            .map(|(sources, privacy)| (sources, privacy)),
+        selection.is_some(),
+    )?;
+    Ok(observed)
+}
+
+fn require_same_observe_owner_binding(
+    current: &ObservationCaptureOwnerBinding,
+    retained: &ObservationCaptureOwnerBinding,
+    boundary: &str,
+) -> Result<(), String> {
+    let current_value = current
+        .canonical_value()
+        .map_err(|error| format!("current Observe owner binding: {error}"))?;
+    let retained_value = retained
+        .canonical_value()
+        .map_err(|error| format!("retained Observe owner binding: {error}"))?;
+    if current_value != retained_value {
+        return Err(format!("Observe owners changed {boundary} Host scope observation"));
+    }
+    Ok(())
+}
+
+fn admit_observe_scope_guard(
+    expected: &eliot_workscope::ScopeBinding,
+    observed: &eliot_workscope::ObservedScopeResources,
+    source_closure: Option<(
+        &eliot_governor::GoverningSourceSet,
+        &eliot_governor::PrivacyProfile,
+    )>,
+    task_bound: bool,
+) -> Result<(), String> {
+    let matched = matches!(
         eliotd::task_binding_admission::scope_guard_disposition(
-            &binding.work_scope_binding.binding,
-            &observed,
-            Some((&source_closure.0, &source_closure.1)),
+            expected,
+            observed,
+            source_closure,
             eliot_workscope::GuardTrigger::CanonicalWrite,
         ),
         Ok(eliot_workscope::ScopeBindingDisposition::Matched)
-    ) {
-        return Err("Observe fresh Host scope does not match the retained WorkScope".to_owned());
+    );
+    // Without task selection, every non-MATCHED disposition stays on the
+    // existing cold-unbound capture path; it grants no task-relative effect.
+    if matched || !task_bound {
+        return Ok(());
     }
-    Ok(observed)
+    Err("Observe fresh Host scope does not match the retained WorkScope".to_owned())
 }
 
 async fn revalidate_observe_selection(
