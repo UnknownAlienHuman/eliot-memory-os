@@ -41,6 +41,15 @@
 //! typed `CoverageGap`; all record, string, array, scalar, and nesting bounds
 //! remain unchanged.
 //!
+//! Issue #4601 closes the separate shipped `hook <event>` acquisition
+//! boundary: `HOOK_INPUT_PROFILE` / `HOOK_INPUT_PROFILE_ID` /
+//! `HOOK_INPUT_LIMIT_TABLE` publish the bounded raw-input profile for that
+//! branch by referencing the accepted rows of `REQUEST_INPUT_PROFILE` above.
+//! It adds no new numeric limit, no second reader, and no second framing
+//! scheme: the hook branch is enforced by the same `read_bounded_record` /
+//! `ReadOutcome` owner, and the #977 eight-operation Request grammar, its
+//! limits, dispositions and redaction are unchanged.
+//!
 //! Time bounds (`idle_timeout_ms`, `lifetime_timeout_ms`) are declared here so
 //! the profile is complete, but they are NOT enforced on blocking stdin by
 //! this slice: a byte / work bound on returned chunks does not prove a
@@ -116,6 +125,80 @@ pub(crate) const REQUEST_INPUT_PROFILE: RequestInputProfile = RequestInputProfil
     lifetime_timeout_ms: 86_400_000,
     oversize_disposition: OversizeDisposition::DiscardThroughTerminator,
 };
+
+/// Stable identity of the shipped lifecycle-hook intake input profile.
+pub(crate) const HOOK_INPUT_PROFILE_ID: &str = "eliot.agent-bridge.hook-input.v1";
+
+/// Accepted bounded raw-input profile for the shipped `hook <event>` branch
+/// (issue #4601).
+///
+/// The source owner of this profile is the accepted versioned finite raw-input
+/// profile above: `REQUEST_INPUT_PROFILE` (`eliot.agent-bridge.request-input.v1`,
+/// controller-accepted v1 preparation baseline at PR #2314 merge
+/// `52941612f53450da3b0cd5f06f82067b6421b02a`), which owns
+/// `read_bounded_record` and `ReadOutcome`. No second acquisition mechanism is
+/// introduced here; `HOOK_INPUT_PROFILE` is a `RequestInputProfile` value so the
+/// hook boundary reuses that owner and is enforced by the same bounded reader.
+///
+/// Published hook values and why they are these values:
+///
+/// - `max_record_bytes = 1_048_576` (1 MiB) is reused unchanged from the
+///   owner's `max_record_bytes` row (limit table: "1_048_576 bytes, NEW
+///   Bridge-local (#977, v1), acquisition"). A host hook payload is one JSON
+///   document, so it occupies exactly one record; narrowing it further would be
+///   an unreviewed new number, and widening it would weaken the owner.
+/// - `max_buffered_bytes = 2_097_152` (2 MiB) is reused unchanged from the
+///   owner's aggregate-retention row, keeping the acquisition plus retained
+///   bytes at the accepted ratio of one record plus bounded decoder state.
+/// - `max_json_string_bytes`, `max_container_items`, `max_scalar_values` and
+///   `max_nesting_depth` are reused unchanged from the owner's decode
+///   pre-scan rows so hook decode-stage budget matches the request path instead
+///   of introducing a second scale of numbers.
+/// - `max_oversize_discard_bytes = 4_194_304` (4 MiB) is reused unchanged from
+///   the owner's resynchronization row. This is the owner's own Bridge-local
+///   acquisition decision and NOT I7.2's 4 MiB transport frame default
+///   (limit table note: "I7.2's 4 MiB frame default is NOT reused as the
+///   Bridge stdin-line limit"). Resynchronizing through the terminator is
+///   bounded so an unterminated over-limit stream cannot drain without limit.
+/// - `oversize_disposition = DiscardThroughTerminator` is the owner's declared
+///   recovery policy, so an over-limit hook stream is bounded and then
+///   rejected fail-closed rather than drained.
+///
+/// Rows that belong to the request dispatch loop
+/// (`max_requests_per_process`, `max_consecutive_invalid_records`) and to
+/// undeclared time bounds (`idle_timeout_ms`, `lifetime_timeout_ms`) are carried
+/// at the owner's accepted values to keep the profile shape identical, but they
+/// are not hook behaviour: the hook branch serves exactly one record per
+/// process, and — exactly as the owner documents for itself — a byte bound
+/// proves no wall-clock deadline on a blocking slow stdin producer.
+///
+/// I7.2's 4 MiB frame default, the 64 KiB hot-response figure, the 256 KiB
+/// structured-response ceiling, and `eliot_protocol::MAX_FRAME_BYTES` are
+/// deliberately NOT used as hook input limits: a transport frame, an outer JSON
+/// record and a decoded body are distinct budgets.
+pub(crate) const HOOK_INPUT_PROFILE: RequestInputProfile = RequestInputProfile {
+    max_record_bytes: REQUEST_INPUT_PROFILE.max_record_bytes,
+    max_buffered_bytes: REQUEST_INPUT_PROFILE.max_buffered_bytes,
+    max_json_string_bytes: REQUEST_INPUT_PROFILE.max_json_string_bytes,
+    max_container_items: REQUEST_INPUT_PROFILE.max_container_items,
+    max_scalar_values: REQUEST_INPUT_PROFILE.max_scalar_values,
+    max_nesting_depth: REQUEST_INPUT_PROFILE.max_nesting_depth,
+    max_requests_per_process: REQUEST_INPUT_PROFILE.max_requests_per_process,
+    max_consecutive_invalid_records: REQUEST_INPUT_PROFILE.max_consecutive_invalid_records,
+    max_oversize_discard_bytes: REQUEST_INPUT_PROFILE.max_oversize_discard_bytes,
+    idle_timeout_ms: REQUEST_INPUT_PROFILE.idle_timeout_ms,
+    lifetime_timeout_ms: REQUEST_INPUT_PROFILE.lifetime_timeout_ms,
+    oversize_disposition: REQUEST_INPUT_PROFILE.oversize_disposition,
+};
+
+/// Complete limit/source/version table for the shipped lifecycle-hook input
+/// profile (issue #4601).
+///
+/// Every row is the accepted `eliot.agent-bridge.request-input.v1` value
+/// referenced through [`HOOK_INPUT_PROFILE`]; the hook branch publishes no new
+/// numeric limit and borrows no transport/response cap. See that constant's
+/// doc comment for the per-row source basis.
+pub(crate) const HOOK_INPUT_LIMIT_TABLE: &str = "eliot.agent-bridge.hook-input.v1 limits";
 
 /// Intrinsic profile defect detected before stdin acquisition begins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
