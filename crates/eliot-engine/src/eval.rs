@@ -10,14 +10,15 @@ use eliot_types::{
     EvalIntegrityFingerprintSet, EvalMeasurementKind, EvalMeasurementResult, EvalMeasurementSpec,
     EvalRegressionGateProfile, EvalRegressionSeverity, EvalRiskCoverage, EvalRun, EvalRunId,
     EvalRunProfile, EvalRunStatus, EvalSuite, EvalSuiteId, EvalTrendDirection, EvalTrendReport,
-    EvalVerdict, EvalVerdictId, EvalVerdictStatus, ExperimentalMetaPolicyCandidate,
-    ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState, HarnessExperimentRecord,
-    HarnessExperimentRecordId, LifecycleStatus, MetaCandidateChangeClass, MetaExperimentDecision,
-    MetaIsolationFence, MetaIsolationRejectionRecord, MetaPolicyAuthorization,
-    MetaPolicyExecutionAction, MetaPolicyExecutionReceipt, ProjectId, ReplayCaseStatus, ReplayRun,
-    ReplayRunStatus, ReplaySetRole, ReplayThresholdPolicyV1, SealedReplaySetRecord,
-    SemanticCommand, TaintClass, TaskId, ToolObservationRecordCommand, Visibility, WriteId,
-    WriteReceiptRef,
+    EvalVerdict, EvalVerdictId, EvalVerdictStatus, EvaluationIntegrityReceipt,
+    EvaluationIntegrityReceiptBody,
+    EvaluationIntegrityStatus, ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload,
+    ExperimentalMetaPolicyState, HarnessExperimentRecord, HarnessExperimentRecordId,
+    LifecycleStatus, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
+    MetaIsolationRejectionRecord, MetaPolicyAuthorization, MetaPolicyExecutionAction,
+    MetaPolicyExecutionReceipt, ProjectId, ReplayCaseStatus, ReplayRun, ReplayRunStatus,
+    ReplaySetRole, ReplayThresholdPolicyV1, SealedReplaySetRecord, SemanticCommand, TaintClass,
+    TaskId, ToolObservationRecordCommand, Visibility, WriteId, WriteReceiptRef,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -766,85 +767,6 @@ impl EvalDatasetManifestService {
     }
 }
 
-/// The validity state of the engine-local I18.47 receipt projection.
-///
-/// This is deliberately separate from `EvalCaseStatus`: a structural case
-/// result can be useful for harness wiring while still being unable to claim
-/// measured runtime behavior.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum EvaluationIntegrityStatus {
-    Measured,
-    Inconclusive,
-    Unknown,
-    Stale,
-}
-
-/// Engine-local projection of the canonical `EvaluationIntegrityReceipt`.
-///
-/// The current `EvalCase` API supplies declarations and fixture metadata, but
-/// no runtime artifact, effect trace, independent oracle, or second route.
-/// This projection therefore remains `INCONCLUSIVE` at the explicit
-/// `STRUCTURAL_ONLY` proof ceiling. It is an in-memory advisory projection for
-/// the existing eval result path; `EvalCaseResult` does not retain it, so it is
-/// not `ProductProof` or a durable canonical receipt.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct EvaluationIntegrityReceipt {
-    pub receipt_id: String,
-    pub property: String,
-    pub product_identity: String,
-    pub oracle_owner: String,
-    pub acceptance_relation: String,
-    pub task_subset: Vec<String>,
-    pub sampling_procedure: String,
-    pub model_fingerprint: String,
-    pub harness_fingerprint: String,
-    pub tools_fingerprint: String,
-    pub evaluator_fingerprint: String,
-    pub environment_fingerprint: String,
-    pub budget_fingerprint: String,
-    pub visible_inputs: Vec<String>,
-    pub worker_visible_inputs: Vec<String>,
-    pub evaluator_visible_inputs: Vec<String>,
-    pub human_visible_inputs: Vec<String>,
-    pub reference_leakage_checks: Vec<String>,
-    pub contamination_checks: Vec<String>,
-    pub evidence_family: String,
-    pub source_independence: Vec<String>,
-    pub shared_lineage_limits: Vec<String>,
-    pub raw_result_refs: Vec<String>,
-    pub aggregation_method: String,
-    pub excluded_trials: Vec<String>,
-    pub limits: Vec<String>,
-    pub counter_metrics: Vec<String>,
-    pub known_shortcuts: Vec<String>,
-    pub invalidation_conditions: Vec<String>,
-    pub production_role: String,
-    pub measurement_role: String,
-    pub optimization_feedback_role: String,
-    pub mutation_survivors: Vec<String>,
-    pub historical_escapes: Vec<String>,
-    pub ood_set: Vec<String>,
-    pub false_pass_evidence: Vec<String>,
-    pub false_fail_evidence: Vec<String>,
-    pub actual_route: String,
-    pub requested_route: String,
-    pub resource_fingerprint: String,
-    pub oracle_dependencies: Vec<String>,
-    pub effective_independent_evidence_n: u64,
-    pub collusion_shared_lineage_limits: Vec<String>,
-    pub second_route_or_human_disposition: String,
-    pub budget_equivalence_ledger: String,
-    pub complexity_economics_delta: String,
-    pub assertability: String,
-    pub ground_truth_origin: String,
-    pub artifact_binding: Vec<String>,
-    pub observed_artifact_refs: Vec<String>,
-    pub unobserved_measurement_kinds: Vec<EvalMeasurementKind>,
-    pub status: EvaluationIntegrityStatus,
-    pub proof_ceiling: String,
-}
-
 pub struct EvalRunnerService;
 
 impl EvalRunnerService {
@@ -1079,11 +1001,11 @@ impl EvalMeasurementService {
                 .observed
                 .starts_with(NOT_YET_IMPLEMENTED_OBSERVATION_PREFIX)
         });
-        let integrity_not_measured = receipt.status != EvaluationIntegrityStatus::Measured;
+        let integrity_not_measured = receipt.status() != EvaluationIntegrityStatus::Measured;
         if integrity_not_measured {
             errors.push(format!(
                 "evaluation integrity receipt is {:?}; case cannot claim a measured result",
-                receipt.status
+                receipt.status()
             ));
         }
         let status = if integrity_not_measured || not_implemented {
@@ -1103,6 +1025,7 @@ impl EvalMeasurementService {
             errors,
             duration_ms: 0,
             integrity_fingerprints: Some(current_eval_fingerprints(&case.project_id)),
+            evaluation_integrity_receipt: Some(receipt),
         }
     }
 
@@ -1155,7 +1078,7 @@ impl EvalMeasurementService {
             assertability,
             ground_truth_origin,
         ) = Self::receipt_disposition_fields();
-        EvaluationIntegrityReceipt {
+        EvaluationIntegrityReceipt::inconclusive(EvaluationIntegrityReceiptBody {
             receipt_id,
             property: case.description.clone(),
             product_identity: eval_product_identity(&case.project_id),
@@ -1208,9 +1131,8 @@ impl EvalMeasurementService {
             artifact_binding: vec![case.fixture_ref.clone()],
             observed_artifact_refs: Vec::new(),
             unobserved_measurement_kinds,
-            status: EvaluationIntegrityStatus::Inconclusive,
             proof_ceiling: STRUCTURAL_ONLY_PROOF_CEILING.to_owned(),
-        }
+        })
     }
 
     /// Distinct measurement kinds whose results carry no runtime observation.
@@ -2955,7 +2877,47 @@ fn case_result_has_measurement_evidence(result: &EvalCaseResult) -> bool {
             .any(|measurement| !measurement.passed),
         _ => false,
     };
+    let receipt_matches_result =
+        result
+            .evaluation_integrity_receipt
+            .as_ref()
+            .is_some_and(|receipt| {
+                let Some(fingerprints) = result.integrity_fingerprints.as_ref() else {
+                    return false;
+                };
+                receipt.status() == EvaluationIntegrityStatus::Measured
+                    && receipt.body.proof_ceiling != STRUCTURAL_ONLY_PROOF_CEILING
+                    && receipt
+                        .body
+                        .observed_artifact_refs
+                        .iter()
+                        .any(|reference| !reference.trim().is_empty())
+                    && !receipt.body.artifact_binding.is_empty()
+                    && receipt
+                        .body
+                        .artifact_binding
+                        .iter()
+                        .all(|reference| !reference.trim().is_empty())
+                    && !receipt.body.evidence_family.starts_with("structural-fixture:")
+                    && receipt.body.unobserved_measurement_kinds.is_empty()
+                    && receipt.body.task_subset == [result.eval_case_id.to_string()]
+                    && receipt.body.product_identity == fingerprints.product_identity
+                    && receipt.body.harness_fingerprint == fingerprints.harness_fingerprint
+                    && receipt.body.evaluator_fingerprint == fingerprints.evaluator_fingerprint
+                    && receipt.body.environment_fingerprint == fingerprints.environment_fingerprint
+                    && receipt.body.actual_route == fingerprints.actual_route
+                    && receipt.body.requested_route == fingerprints.requested_route
+                    && receipt.body.acceptance_relation == fingerprints.acceptance_relation
+                    && receipt.body.oracle_owner == fingerprints.oracle_owner
+                    && receipt.body.raw_result_refs
+                        == result
+                            .measurements
+                            .iter()
+                            .map(|measurement| measurement.measurement_id.clone())
+                            .collect::<Vec<_>>()
+            });
     outcome_matches_measurements
+        && receipt_matches_result
         && !result.measurements.is_empty()
         && result.measurements.iter().all(|measurement| {
             !measurement.observed.trim().is_empty()

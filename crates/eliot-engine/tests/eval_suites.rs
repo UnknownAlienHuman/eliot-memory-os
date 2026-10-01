@@ -199,6 +199,40 @@ fn declaration_only_cases_do_not_emit_measured_failure_clusters() {
 }
 
 #[test]
+fn fabricated_measurements_cannot_override_the_retained_integrity_receipt() {
+    let (_, _, _, _, mut run, _) = artifacts();
+    let mut result = run.case_results.remove(0);
+    for measurement in &mut result.measurements {
+        measurement.passed = true;
+        measurement.observed = "fabricated runtime observation".to_owned();
+        measurement.evidence_refs = vec!["fabricated:measurement-evidence".to_owned()];
+    }
+    result.status = EvalCaseStatus::Passed;
+    let retained_receipt = result
+        .evaluation_integrity_receipt
+        .as_ref()
+        .expect("the evaluator retains its original integrity receipt");
+    assert_eq!(
+        retained_receipt.status(),
+        eliot_types::EvaluationIntegrityStatus::Inconclusive
+    );
+    run.case_results = vec![result];
+    run.status = EvalRunStatus::Completed;
+
+    let verdict = EvalVerdictService::verdict(&run);
+    assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
+    assert!(verdict.failure_clusters.is_empty());
+
+    let mut forged_receipt_run = serde_json::to_value(&run).expect("run serializes");
+    let receipt = &mut forged_receipt_run["case_results"][0]["evaluation_integrity_receipt"];
+    receipt["status"] = serde_json::json!("MEASURED");
+    receipt["body"]["raw_result_refs"] = serde_json::json!(["forged:measurement"]);
+    receipt["body"]["observed_artifact_refs"] =
+        serde_json::json!(["forged:runtime-artifact"]);
+    assert!(serde_json::from_value::<EvalRun>(forged_receipt_run).is_err());
+}
+
+#[test]
 fn benchmark_integrity_detects_checksum_mismatch() {
     let (_, suite, manifest, _, _, _) = artifacts();
     let receipt = EvalDatasetManifestService::checksum_mismatch(&suite, &manifest);
@@ -272,6 +306,20 @@ fn structural_block_observation_does_not_promote_a_declaration_only_case() {
             .starts_with("structural self-check: runner gate blocked")
     );
     assert!(observation.evidence_refs.is_empty());
+    let receipt = result
+        .evaluation_integrity_receipt
+        .as_ref()
+        .expect("runner retains the original integrity receipt");
+    assert_eq!(
+        receipt.status(),
+        eliot_types::EvaluationIntegrityStatus::Inconclusive
+    );
+    assert_eq!(receipt.body.raw_result_refs.len(), result.measurements.len());
+    let decoded = serde_json::from_value::<eliot_types::EvaluationIntegrityReceipt>(
+        serde_json::to_value(receipt).expect("receipt serializes"),
+    )
+    .expect("original inconclusive receipt remains readable");
+    assert_eq!(&decoded, receipt);
     assert_eq!(result.status, EvalCaseStatus::NotYetImplemented);
     assert_eq!(verdict.status, EvalVerdictStatus::Inconclusive);
 }

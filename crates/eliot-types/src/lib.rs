@@ -185,8 +185,10 @@ pub use eval::{
     EvalIntegrityFingerprintSet, EvalMeasurementKind, EvalMeasurementResult, EvalMeasurementSpec,
     EvalRegressionGateProfile, EvalRegressionSeverity, EvalRiskCoverage, EvalRun, EvalRunProfile,
     EvalRunStatus, EvalSuite, EvalTrendDirection, EvalTrendReport, EvalVerdict, EvalVerdictStatus,
-    ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload, ExperimentalMetaPolicyState,
-    HarnessExperimentRecord, MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
+    EvaluationIntegrityReceipt, EvaluationIntegrityReceiptBody, EvaluationIntegrityStatus,
+    ExperimentalMetaPolicyCandidate, ExperimentalMetaPolicyPayload,
+    ExperimentalMetaPolicyState, HarnessExperimentRecord,
+    MetaCandidateChangeClass, MetaExperimentDecision, MetaIsolationFence,
     MetaIsolationRejectionRecord, MetaPolicyAuthorization, MetaPolicyExecutionAction,
     MetaPolicyExecutionReceipt, ReplayEvaluationIntegrityReceipt, ReplayThresholdPolicyV1,
 };

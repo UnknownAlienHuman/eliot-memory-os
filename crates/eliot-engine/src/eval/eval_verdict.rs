@@ -23,7 +23,7 @@ pub struct EvalVerdictService;
 
 struct CaseCoverageFacts {
     has_no_cases: bool,
-    has_unobserved_pass: bool,
+    has_unmeasured_outcome: bool,
     all_passed: bool,
 }
 
@@ -47,22 +47,25 @@ struct EvalVerdictFacts {
 impl EvalVerdictFacts {
     fn from_run(run: &EvalRun) -> Self {
         let has_no_cases = run.case_results.is_empty();
-        let has_unobserved_pass = run.case_results.iter().any(|result| {
-            result.status == EvalCaseStatus::Passed
-                && (result.measurements.is_empty()
-                    || result.measurements.iter().any(|measurement| {
-                        !measurement.passed
-                            || measurement.observed.trim().is_empty()
-                            || measurement.observed.starts_with("not yet implemented:")
-                            || measurement.evidence_refs.is_empty()
-                            || measurement
-                                .evidence_refs
-                                .iter()
-                                .any(|reference| reference.trim().is_empty())
-                    }))
+        let has_unmeasured_outcome = run.case_results.iter().any(|result| {
+            matches!(
+                result.status,
+                EvalCaseStatus::Passed | EvalCaseStatus::Failed
+            ) && (result.measurements.is_empty()
+                || result.measurements.iter().any(|measurement| {
+                    !measurement.passed
+                        || measurement.observed.trim().is_empty()
+                        || measurement.observed.starts_with("not yet implemented:")
+                        || measurement.evidence_refs.is_empty()
+                        || measurement
+                            .evidence_refs
+                            .iter()
+                            .any(|reference| reference.trim().is_empty())
+                })
+                || !super::case_result_has_measurement_evidence(result))
         });
         let all_passed = !has_no_cases
-            && !has_unobserved_pass
+            && !has_unmeasured_outcome
             && run
                 .case_results
                 .iter()
@@ -101,7 +104,7 @@ impl EvalVerdictFacts {
         Self {
             coverage: CaseCoverageFacts {
                 has_no_cases,
-                has_unobserved_pass,
+                has_unmeasured_outcome,
                 all_passed,
             },
             case_statuses: CaseStatusFacts {
@@ -130,7 +133,7 @@ impl EvalVerdictFacts {
             | EvalRunStatus::BlockedUnsafeProfile => EvalVerdictStatus::Blocked,
             _ if self.case_statuses.has_blocked_case => EvalVerdictStatus::Blocked,
             _ if self.coverage.has_no_cases => EvalVerdictStatus::Inconclusive,
-            _ if self.coverage.has_unobserved_pass => EvalVerdictStatus::Inconclusive,
+            _ if self.coverage.has_unmeasured_outcome => EvalVerdictStatus::Inconclusive,
             _ if self.provenance.has_stale_case => EvalVerdictStatus::Inconclusive,
             _ if self.provenance.has_unknown_case => EvalVerdictStatus::Inconclusive,
             EvalRunStatus::Completed | EvalRunStatus::Failed
@@ -152,9 +155,9 @@ impl EvalVerdictFacts {
                     .to_owned(),
             );
         }
-        if self.coverage.has_unobserved_pass {
+        if self.coverage.has_unmeasured_outcome {
             reasons.push(
-                "at least one Passed result lacks complete observed measurement evidence; a status claim alone cannot produce PASS"
+                "at least one outcome lacks a matching measured integrity receipt; status and evidence-reference claims alone cannot produce a verdict"
                     .to_owned(),
             );
         }
@@ -211,11 +214,16 @@ impl EvalVerdictService {
     }
 
     pub fn failure_clusters(run: &EvalRun) -> Vec<EvalFailureCluster> {
+        let current = super::current_eval_fingerprints(&run.project_id);
         run.case_results
             .iter()
             .filter(|result| {
                 result.status == EvalCaseStatus::Failed
                     && super::case_result_has_measurement_evidence(result)
+                    && matches!(
+                        &result.integrity_fingerprints,
+                        Some(recorded) if recorded == &current
+                    )
             })
             .map(|result| EvalFailureCluster {
                 eval_failure_cluster_id: EvalFailureClusterId::new_v7(),

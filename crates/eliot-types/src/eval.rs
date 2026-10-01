@@ -2,7 +2,7 @@ use crate::{
     EvalCaseId, EvalDatasetManifestId, EvalFailureClusterId, EvalRunId, EvalSuiteId, EvalVerdictId,
     HarnessExperimentRecordId, ProjectId, TaskId, WriteReceiptRef,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
 
@@ -221,6 +221,128 @@ pub struct EvalCaseResult {
     /// alone never grants measured validity.
     #[serde(default)]
     pub integrity_fingerprints: Option<EvalIntegrityFingerprintSet>,
+    /// Original evaluation-integrity receipt retained with the observations.
+    /// Missing receipts are unknown provenance and cannot support measured
+    /// evaluation claims.
+    #[serde(default)]
+    pub evaluation_integrity_receipt: Option<EvaluationIntegrityReceipt>,
+}
+
+/// Measured-validity state of an evaluation integrity receipt (I18.47).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum EvaluationIntegrityStatus {
+    Measured,
+    Inconclusive,
+    Unknown,
+    Stale,
+}
+
+/// Immutable body of an evaluation-integrity receipt (I18.47).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationIntegrityReceiptBody {
+    pub receipt_id: String,
+    pub property: String,
+    pub product_identity: String,
+    pub oracle_owner: String,
+    pub acceptance_relation: String,
+    pub task_subset: Vec<String>,
+    pub sampling_procedure: String,
+    pub model_fingerprint: String,
+    pub harness_fingerprint: String,
+    pub tools_fingerprint: String,
+    pub evaluator_fingerprint: String,
+    pub environment_fingerprint: String,
+    pub budget_fingerprint: String,
+    pub visible_inputs: Vec<String>,
+    pub worker_visible_inputs: Vec<String>,
+    pub evaluator_visible_inputs: Vec<String>,
+    pub human_visible_inputs: Vec<String>,
+    pub reference_leakage_checks: Vec<String>,
+    pub contamination_checks: Vec<String>,
+    pub evidence_family: String,
+    pub source_independence: Vec<String>,
+    pub shared_lineage_limits: Vec<String>,
+    pub raw_result_refs: Vec<String>,
+    pub aggregation_method: String,
+    pub excluded_trials: Vec<String>,
+    pub limits: Vec<String>,
+    pub counter_metrics: Vec<String>,
+    pub known_shortcuts: Vec<String>,
+    pub invalidation_conditions: Vec<String>,
+    pub production_role: String,
+    pub measurement_role: String,
+    pub optimization_feedback_role: String,
+    pub mutation_survivors: Vec<String>,
+    pub historical_escapes: Vec<String>,
+    pub ood_set: Vec<String>,
+    pub false_pass_evidence: Vec<String>,
+    pub false_fail_evidence: Vec<String>,
+    pub actual_route: String,
+    pub requested_route: String,
+    pub resource_fingerprint: String,
+    pub oracle_dependencies: Vec<String>,
+    pub effective_independent_evidence_n: u64,
+    pub collusion_shared_lineage_limits: Vec<String>,
+    pub second_route_or_human_disposition: String,
+    pub budget_equivalence_ledger: String,
+    pub complexity_economics_delta: String,
+    pub assertability: String,
+    pub ground_truth_origin: String,
+    pub artifact_binding: Vec<String>,
+    pub observed_artifact_refs: Vec<String>,
+    pub unobserved_measurement_kinds: Vec<EvalMeasurementKind>,
+    pub proof_ceiling: String,
+}
+
+/// Original evaluation-integrity receipt retained by an evaluated case.
+///
+/// The current owner can produce only `INCONCLUSIVE` receipts. A measured
+/// receipt requires a future independent producer and cannot be constructed
+/// through the current API or admitted by deserialization.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EvaluationIntegrityReceipt {
+    pub body: EvaluationIntegrityReceiptBody,
+    status: EvaluationIntegrityStatus,
+}
+
+impl EvaluationIntegrityReceipt {
+    pub fn inconclusive(body: EvaluationIntegrityReceiptBody) -> Self {
+        Self {
+            body,
+            status: EvaluationIntegrityStatus::Inconclusive,
+        }
+    }
+
+    pub fn status(&self) -> EvaluationIntegrityStatus {
+        self.status
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedEvaluationIntegrityReceipt {
+    body: EvaluationIntegrityReceiptBody,
+    status: EvaluationIntegrityStatus,
+}
+
+impl<'de> Deserialize<'de> for EvaluationIntegrityReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let receipt = SerializedEvaluationIntegrityReceipt::deserialize(deserializer)?;
+        if receipt.status == EvaluationIntegrityStatus::Measured {
+            return Err(serde::de::Error::custom(
+                "measured evaluation receipt has no admitted independent producer",
+            ));
+        }
+        Ok(Self {
+            body: receipt.body,
+            status: receipt.status,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
