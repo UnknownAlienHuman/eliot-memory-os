@@ -756,6 +756,7 @@ dependencies = [
  "eliot-receipts",
  "eliot-runtime",
  "eliot-runtime-contracts",
+ "eliot-store-api",
  "eliot-types",
  "eliot-user-broker-core",
  "eliot-workscope",
