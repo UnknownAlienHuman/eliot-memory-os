@@ -453,18 +453,18 @@ fn duplicate_outcome_identifier_is_a_typed_rejection() -> TestResult {
         "a duplicate outcome id must be refused with a TYPED error"
     );
 
-    // And it is the DUPLICATE refusal, not the coverage one. An EMPTY outcome
-    // vector leaves every member untriaged, which is INCOMPLETE COVERAGE, not a
-    // contradiction: it is refused as a verdict on a receipt the caller can read
-    // (so the per-member outcomes survive for routing), and never as this typed
-    // error. The two faults are therefore distinguishable by RESULT type, not only
-    // by variant.
+    // And it is the DUPLICATE refusal, not the coverage one. Dropping the second
+    // outcome for `duplicated_id` leaves that member covered exactly once and the
+    // OTHER member untriaged, which is INCOMPLETE COVERAGE, not a contradiction:
+    // it is refused as a verdict on a receipt the caller can read (so the per-member
+    // outcomes survive for routing), and never as this typed error. The two faults
+    // are therefore distinguishable by RESULT type, not only by variant.
     //
-    // The vector must be EMPTY rather than a one-element subset. Keeping the
-    // single member would leave coverage COMPLETE, so `Satisfied` would be the
-    // correct verdict and this assertion would be demanding a refusal the owner
-    // has no reason to give.
-    let subset: Vec<(String, PerEntryOutcome)> = Vec::new();
+    // The vector keeps `duplicated_id` rather than being empty. An empty vector
+    // would leave BOTH members untriaged, which is a strictly weaker statement
+    // than the one under test: here the duplicated member is FULLY and correctly
+    // covered and the refusal is attributable solely to the member nobody triaged.
+    let subset = vec![(duplicated_id.clone(), PerEntryOutcome::Imported)];
     let incomplete = destination.reconcile_backup_import(&import, &snapshot, &subset, NOW_MS)?;
     assert!(
         matches!(
