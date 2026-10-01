@@ -1152,6 +1152,12 @@ impl KernelBlobStreamCallSequence {
             // A current token with an existing call row has already been
             // consumed or reserved. Recover only that exact retained result;
             // never bind the token to this newly constructed semantic body.
+            if existing.operation_sha256 != operation_sha256 {
+                return Err(TestdIpcError::Contract(
+                    "the current Blob token is already bound to a different exact operation"
+                        .to_owned(),
+                ));
+            }
             return self.reconcile_exact(
                 BlobProcessStreamCallToken {
                     reference: existing.token_ref,
