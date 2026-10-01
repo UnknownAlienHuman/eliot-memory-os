@@ -18,11 +18,11 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_ors::{
     ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
     ColdStartReadinessTerminalDisposition, OrsError, SCAN_DISCLOSURE_RECORD_TYPE,
-    ScanDisclosureOrsRecord, ScanDisclosureReadFailure, ScanDisclosureRecordOwner,
-    ScanDisclosureRecordState, ScanDisclosureStageOutcome,
+    ScanDisclosureOrsRecord, ScanDisclosureReadFailure, ScanDisclosureQuarantineRecord,
+    ScanDisclosureRecordOwner, ScanDisclosureRecordState, ScanDisclosureStageOutcome,
 };
 use eliot_workscope::{
-    LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX, LooseScanQuarantine,
+    LOOSE_SCAN_DISCLOSURE_PREFIX, LOOSE_SCAN_DISCLOSURE_SUFFIX,
     SCAN_DISCLOSURE_SCHEMA_VERSION, ScanDisclosureOwnerBinding, ScanDisclosureReceipt,
     ScanDisclosureStore, ScanReceiptDiagnosticView, ScanReceiptHandle, ScanReceiptRetention,
     ScanRetentionPolicy, WorkScopeError, quarantine_loose_scan_disclosure,
@@ -264,6 +264,18 @@ pub struct InstallationScanDisclosureStore {
     owner: Arc<dyn ScanDisclosureRecordOwner>,
 }
 
+/// Opaque owner handle for bytes retained in the legacy quarantine family.
+/// It is deliberately not a [`ScanReceiptHandle`] and carries no promotion
+/// operation or decoded scan receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanDisclosureQuarantineHandle {
+    pub quarantine_ref: String,
+    pub file_name: String,
+    pub content_sha256: String,
+    pub owner_ref: String,
+    pub writer_receipt_ref: String,
+}
+
 impl InstallationScanDisclosureStore {
     /// Binds the adapter to the admitted contour and durable owner.
     ///
@@ -299,31 +311,26 @@ impl InstallationScanDisclosureStore {
         ScanReceiptDiagnosticView::project(handle)
     }
 
-    /// Quarantines one loose `scan-disclosure-*.json` capture without
-    /// adopting it.
+    /// Durably quarantines one bounded loose `scan-disclosure-*.json` capture.
     ///
-    /// The filename shape is classified and the content is bound to it: the
-    /// retired loose implementation named captures
-    /// `scan-disclosure-<sha256-of-canonical-bytes>.json`, so bytes that do
-    /// not reproduce the filename digest are refused as corrupt or
-    /// substituted content rather than quarantined as a matching capture. A
-    /// digest match still proves nothing about owner provenance: even
-    /// self-consistent bytes stay quarantined for the migration owner
-    /// instead of becoming readable evidence, and the bytes are never
-    /// decoded as a receipt.
+    /// Exact original bytes are retained in a distinct ORS quarantine row and
+    /// read back before this returns. Matching the old content-addressed name
+    /// proves only byte consistency; neither a match nor valid JSON proves
+    /// historical producer ownership. Bytes are never decoded and this path
+    /// cannot produce a [`ScanReceiptHandle`].
     ///
     /// # Errors
     ///
-    /// Returns an error when the filename is blank or does not carry the
-    /// retired loose-capture shape, when the content is empty, or when the
-    /// content digest does not reproduce the filename segment.
+    /// Returns an error when the filename is not one exact legacy basename or
+    /// when its original bytes exceed the quarantine bound.
     pub fn quarantine_loose_capture(
         &self,
         file_name: &str,
         bytes: &[u8],
-    ) -> Result<LooseScanQuarantine, WorkScopeError> {
-        let proof = quarantine_loose_scan_disclosure(file_name)?;
-        if bytes.is_empty() {
+    ) -> Result<ScanDisclosureQuarantineHandle, WorkScopeError> {
+        self.contour.validate()?;
+        quarantine_loose_scan_disclosure(file_name)?;
+        if file_name.contains('/') || file_name.contains('\\') {
             return Err(WorkScopeError::ScanReceiptCorrupt);
         }
         let stem = file_name
@@ -331,10 +338,63 @@ impl InstallationScanDisclosureStore {
             .and_then(|rest| rest.strip_suffix(LOOSE_SCAN_DISCLOSURE_SUFFIX))
             .filter(|stem| stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .ok_or(WorkScopeError::ScanReceiptCorrupt)?;
-        if sha256_hex(bytes) != stem.to_ascii_lowercase() {
+        if bytes.len() > eliot_ors::MAX_SCAN_DISCLOSURE_QUARANTINE_BYTES {
             return Err(WorkScopeError::ScanReceiptCorrupt);
         }
-        Ok(proof)
+        let _filename_matches_content = sha256_hex(bytes) == stem.to_ascii_lowercase();
+        let content_sha256 = sha256_hex(bytes);
+        let mut record = ScanDisclosureQuarantineRecord {
+            contract_version: eliot_ors::CONTRACT_VERSION,
+            quarantine_key: String::new(),
+            request_hash: String::new(),
+            installation_id: self.contour.installation_id.clone(),
+            ors_generation: self.contour.ors_generation,
+            file_name: file_name.to_owned(),
+            original_bytes: bytes.to_vec(),
+            content_sha256,
+            writer_receipt: String::new(),
+        };
+        record.quarantine_key = record
+            .expected_key()
+            .map_err(|_| WorkScopeError::ScanReceiptInaccessible)?;
+        record.request_hash = record
+            .expected_request_hash()
+            .map_err(|_| WorkScopeError::ScanReceiptInaccessible)?;
+        record.writer_receipt = format!(
+            "ors:{}:{}:{}:{}",
+            self.contour.ors_object_ref,
+            self.contour.ors_generation,
+            record.quarantine_key,
+            record.request_hash
+        );
+        record
+            .validate()
+            .map_err(|_| WorkScopeError::ScanReceiptCorrupt)?;
+        let stored = self
+            .owner
+            .retain_scan_disclosure_quarantine(&record)
+            .map_err(|error| conflict_error(&error))?;
+        if !stored.same_binding(&record) {
+            return Err(WorkScopeError::ScanIdentityConflict);
+        }
+        let readback = self
+            .owner
+            .load_scan_disclosure_quarantine(&record.quarantine_key)
+            .map_err(|error| read_error(&error))?
+            .ok_or(WorkScopeError::ScanReceiptInaccessible)?;
+        if !readback.same_binding(&record) {
+            return Err(WorkScopeError::ScanIdentityConflict);
+        }
+        Ok(ScanDisclosureQuarantineHandle {
+            quarantine_ref: record.quarantine_key,
+            file_name: record.file_name,
+            content_sha256: record.content_sha256,
+            owner_ref: format!(
+                "ors:{}:{}",
+                self.contour.ors_object_ref, self.contour.ors_generation
+            ),
+            writer_receipt_ref: record.writer_receipt,
+        })
     }
 
     /// Writer receipt binding one commit to this contour and write identity.
