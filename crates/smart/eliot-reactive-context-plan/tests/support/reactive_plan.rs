@@ -539,6 +539,21 @@ pub fn reseal_context_view(
     let mut measurement = active_seed.measurement.clone();
     measurement.envelope_digest.clone_from(&rendered_digest);
     measurement.rendered_utf8_bytes = rendered_payload_bytes.len() as u64;
+    // The scorecard's output binding is a third owner-issued record naming the
+    // exact output it graded, and `ActiveUnderstandingView::validate` /
+    // `validate_against` compare both of its digests against values recomputed
+    // from the admitted records (`view.rs` compares `output.rendered_digest`
+    // against `canonical_output_digest` and `output.admitted_digest` against
+    // `AdmittedContextSet::canonical_payload_digest`). A reseal that moves the
+    // admitted records therefore has to move the card with them, exactly as it
+    // moves the economy receipt above; leaving the seed card in place is a card
+    // graded against a different output, which the packet refuses with
+    // `QualityIncomplete`. `output.evidence_revisions` is deliberately left
+    // alone: that comparison runs claimed-subset-of-observed, so a packet that
+    // legitimately gained a source is still gradeable by the seed card.
+    let mut quality = active_seed.quality.clone();
+    quality.output.admitted_digest = admitted.canonical_payload_digest().expect("reseal admitted");
+    quality.output.rendered_digest.clone_from(&rendered_digest);
     // The execution identity states the revisions that produced the delivered
     // bytes; `ActiveUnderstandingView::validate` cross-checks it against the
     // measurement recorded beside it, so a fixture must describe the same one.
@@ -553,7 +568,7 @@ pub fn reseal_context_view(
     };
     let active = eliot_context_contracts::ActiveUnderstandingView::assemble(
         &admitted,
-        active_seed.quality.clone(),
+        quality,
         measurement,
         execution,
         rendered_digest,
