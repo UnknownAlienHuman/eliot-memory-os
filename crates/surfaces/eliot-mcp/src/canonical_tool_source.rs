@@ -14,6 +14,24 @@ impl CanonicalToolSource for SemanticRegistry {
         self.resolve(canonical_name, CANONICAL_DEFINITION_VERSION)
             .is_ok()
     }
+
+    /// Live semantic-profile version for one canonical method (issue #1944
+    /// A3).
+    ///
+    /// Resolves the profile from this registry on every call — the same live
+    /// owner and the same `(canonical_name, CANONICAL_DEFINITION_VERSION)`
+    /// key the dispatch path re-resolves per request in
+    /// `validate_tool_request_owner` — and reports its `profile_version`, so
+    /// the admitted-vs-live comparison in the refresh reconcile fires on a
+    /// pure profile-version edit while the definition version stands still.
+    /// Never a cached copy, never a literal: a profile-version move is
+    /// visible on the next call. An unresolvable name reports no profile
+    /// data (`None`); absence itself stays the membership port's decision.
+    fn semantic_profile_version(&self, canonical_name: &str) -> Option<String> {
+        self.resolve(canonical_name, CANONICAL_DEFINITION_VERSION)
+            .ok()
+            .map(|profile| profile.profile_version.clone())
+    }
 }
 
 #[cfg(test)]
