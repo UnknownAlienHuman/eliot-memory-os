@@ -939,6 +939,31 @@ pub struct ReviewBlockerEscalation {
 /// ambiguity never silently attaches to the most similar fragment. Statuses
 /// that cannot attach carry `current: None`; the retained item keeps that
 /// explicit status instead of being refused.
+/// Resolves one ordered resolution tier: exactly one match attaches with the
+/// tier status, several matches mean ambiguous with no target attached.
+fn resolve_tier_match(
+    matched: &[usize],
+    candidates: &[ReviewCandidate],
+    status: AnchorResolutionStatus,
+    candidate_count: u32,
+) -> Option<ReviewResolution> {
+    if matched.len() == 1 {
+        return Some(ReviewResolution {
+            status,
+            current: Some(candidates[matched[0]].anchor.clone()),
+            candidate_count,
+        });
+    }
+    if matched.len() > 1 {
+        return Some(ReviewResolution {
+            status: AnchorResolutionStatus::Ambiguous,
+            current: None,
+            candidate_count,
+        });
+    }
+    None
+}
+
 pub fn resolve_review_anchor(
     original: &ReviewAnchor,
     candidates: &[ReviewCandidate],
@@ -959,16 +984,6 @@ pub fn resolve_review_anchor(
         )?;
     }
     let candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
-    let attached = |status: AnchorResolutionStatus, current: &ReviewAnchor| ReviewResolution {
-        status,
-        current: Some(current.clone()),
-        candidate_count,
-    };
-    let unattached = |status: AnchorResolutionStatus| ReviewResolution {
-        status,
-        current: None,
-        candidate_count,
-    };
     // Tier 1: full-identity match.
     let exact: Vec<usize> = candidates
         .iter()
@@ -976,14 +991,13 @@ pub fn resolve_review_anchor(
         .filter(|(_, candidate)| candidate.anchor == *original)
         .map(|(index, _)| index)
         .collect();
-    if exact.len() == 1 {
-        return Ok(attached(
-            AnchorResolutionStatus::Exact,
-            &candidates[exact[0]].anchor,
-        ));
-    }
-    if exact.len() > 1 {
-        return Ok(unattached(AnchorResolutionStatus::Ambiguous));
+    if let Some(resolution) = resolve_tier_match(
+        &exact,
+        candidates,
+        AnchorResolutionStatus::Exact,
+        candidate_count,
+    ) {
+        return Ok(resolution);
     }
     // Tier 2: same target triple, different location.
     let moved: Vec<usize> = candidates
@@ -994,14 +1008,13 @@ pub fn resolve_review_anchor(
         })
         .map(|(index, _)| index)
         .collect();
-    if moved.len() == 1 {
-        return Ok(attached(
-            AnchorResolutionStatus::Moved,
-            &candidates[moved[0]].anchor,
-        ));
-    }
-    if moved.len() > 1 {
-        return Ok(unattached(AnchorResolutionStatus::Ambiguous));
+    if let Some(resolution) = resolve_tier_match(
+        &moved,
+        candidates,
+        AnchorResolutionStatus::Moved,
+        candidate_count,
+    ) {
+        return Ok(resolution);
     }
     // Tier 3: same location under the same target identity, changed
     // revision or digest.
@@ -1015,14 +1028,13 @@ pub fn resolve_review_anchor(
         })
         .map(|(index, _)| index)
         .collect();
-    if modified.len() == 1 {
-        return Ok(attached(
-            AnchorResolutionStatus::Modified,
-            &candidates[modified[0]].anchor,
-        ));
-    }
-    if modified.len() > 1 {
-        return Ok(unattached(AnchorResolutionStatus::Ambiguous));
+    if let Some(resolution) = resolve_tier_match(
+        &modified,
+        candidates,
+        AnchorResolutionStatus::Modified,
+        candidate_count,
+    ) {
+        return Ok(resolution);
     }
     // Tier 4: content-plus-structural fingerprint match.
     let fingerprinted: Vec<usize> = candidates
