@@ -12007,7 +12007,7 @@ impl HostComposition {
         generation: &PlatformHandle,
         disposition: HostBranchDisposition,
         now: std::time::Instant,
-    ) -> Result<HostBranchDisposition, HostError> {
+    ) -> HostBranchDisposition {
         let supervised_system_service = self
             .registry
             .generations()
@@ -12021,7 +12021,7 @@ impl HostComposition {
         if supervised_system_service
             && !self.persist_supervised_degraded_activation(generation, disposition, now)
         {
-            return Ok(HostBranchDisposition::ReadinessDegraded);
+            return HostBranchDisposition::ReadinessDegraded;
         }
         // The durable activation fence above is written BEFORE this
         // observation, so a failure here cannot leave a supervised contour
@@ -12032,9 +12032,9 @@ impl HostComposition {
         {
             self.readiness_gate
                 .fail(None, readiness_failure_kind(&error), now);
-            return Ok(HostBranchDisposition::ReadinessDegraded);
+            return HostBranchDisposition::ReadinessDegraded;
         }
-        Ok(disposition)
+        disposition
     }
 
     #[cfg(windows)]
@@ -12057,7 +12057,7 @@ impl HostComposition {
             return Err(error);
         }
         if disposition != HostBranchDisposition::LiveAwaitingReadiness {
-            return self.reconcile_non_live_branch_readiness_at(generation, disposition, now);
+            return Ok(self.reconcile_non_live_branch_readiness_at(generation, disposition, now));
         }
         // F-LOG-HOST-1: readiness is claimed only with authenticated proof.
         // Degraded vs ready preserved; liveness alone never becomes ready.
