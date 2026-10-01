@@ -272,6 +272,13 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         LocalReadSubmitDisposition::StaleAttempt(observation) => {
             panic!("current attempt must persist, got stale: {observation:?}")
         }
+        // Issue #2565 AUD14: the local-read leg reaches `submit_claimed_result`
+        // and never `submit_observe_result`, the sole constructor of this
+        // variant, so it cannot occur here. Panicking rather than fabricating a
+        // record keeps the existing expectation that a current attempt persists.
+        LocalReadSubmitDisposition::PossibleEffectRetained(_) => {
+            panic!("the local-read leg must never retain a possible effect")
+        }
     };
     assert_eq!(persisted.state, HostRequestState::ResultReceived);
     assert_eq!(
@@ -308,6 +315,12 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         LocalReadSubmitDisposition::Persisted(record) => record,
         LocalReadSubmitDisposition::StaleAttempt(observation) => {
             panic!("exact replay must stay idempotent, got stale: {observation:?}")
+        }
+        // Issue #2565 AUD14: unreachable on the local-read leg for the same
+        // reason as the arm above — only the observe leg constructs this
+        // variant — so an exact replay here is always the retained record.
+        LocalReadSubmitDisposition::PossibleEffectRetained(_) => {
+            panic!("exact replay must never retain a possible effect")
         }
     };
     assert_eq!(
@@ -482,6 +495,12 @@ fn governed_stale_then_current(
         LocalReadSubmitDisposition::Persisted(_) => {
             panic!("a superseded attempt must never persist")
         }
+        // Issue #2565 AUD14: the local-read leg cannot produce this variant, so
+        // a superseded attempt here is stale and nothing else. The arm refuses
+        // rather than admitting a possible effect that this path never retains.
+        LocalReadSubmitDisposition::PossibleEffectRetained(_) => {
+            panic!("a superseded local-read attempt must never retain a possible effect")
+        }
     }
     let waiter = waiter_record(kernel, envelope);
     assert!(
@@ -502,6 +521,12 @@ fn governed_stale_then_current(
         }
         LocalReadSubmitDisposition::StaleAttempt(observation) => {
             panic!("the current attempt must persist, got stale: {observation:?}")
+        }
+        // Issue #2565 AUD14: unreachable on the local-read leg, which reaches
+        // only `submit_claimed_result`. Refusing keeps the existing expectation
+        // that a rival's current attempt is the one that persists.
+        LocalReadSubmitDisposition::PossibleEffectRetained(_) => {
+            panic!("the current local-read attempt must never retain a possible effect")
         }
     }
     assert!(
@@ -552,6 +577,13 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
         }
         LocalReadSubmitDisposition::Persisted(_) => {
             panic!("a revoked attempt must never persist")
+        }
+        // Issue #2565 AUD14: unreachable on the local-read leg, which reaches
+        // only `submit_claimed_result`. Refusing keeps the existing expectation
+        // that a revoked attempt projects as unclaimed and never as anything
+        // that took effect.
+        LocalReadSubmitDisposition::PossibleEffectRetained(_) => {
+            panic!("a revoked local-read attempt must never retain a possible effect")
         }
     }
     let waiter = waiter_record(kernel, &revoked);
