@@ -52,7 +52,7 @@
 //! the caller must not read as exhaustive coverage.
 
 use crate::{
-    MAX_RECOVERY_PAGE, OperationIdentity, OpaqueLabel, OperationalRecoveryStore, OrsError,
+    MAX_RECOVERY_PAGE, OpaqueLabel, OperationIdentity, OperationalRecoveryStore, OrsError,
     RecoveryProblem, ReservationState,
 };
 
