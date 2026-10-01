@@ -5,8 +5,10 @@
 //! [`HostEventAdmission`](eliot_agent_opencode::HostEventAdmission) by
 //! building the `EventEnvelope` from the validated submission plus live
 //! owner state (attach binding task/fence/epoch/generation) and submitting
-//! it through the bridge's existing `forward_event` operation; gaps go
-//! through the existing `forward_gap` operation. No HTTP-private event
+//! it through the bridge's existing event-forward operations. Restricted
+//! callback bytes remain a separate sidecar and their native identity fields
+//! must agree with the normalized event before forwarding. Gaps go through
+//! the existing `forward_gap` operation. No HTTP-private event
 //! journal exists: durability, idempotency, handoff, and reconciliation
 //! stay with ORS behind the same route every other bridge event uses.
 //!
@@ -444,6 +446,17 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
         envelope
             .validate()
             .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
+        if submission
+            .restricted_source_bytes
+            .as_deref()
+            .is_some_and(|source| {
+                !restricted_source_matches_normalized_event(source, &submission.envelope_json)
+            })
+        {
+            return Err(HostEventAdmissionError::of(
+                HostEventAdmissionFailure::Unavailable,
+            ));
+        }
         let envelope_digest = canonical_json_bytes(&envelope)
             .map(|canonical| sha256_hex(&canonical))
             .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
@@ -640,6 +653,148 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
             .forward_gap(&coverage)
             .map_err(|error| HostEventAdmissionError::of(bridge_failure(&error)))?;
         Ok(())
+    }
+}
+
+/// Confirms that identity fields present in the original callback are the
+/// same fields projected into the normalized event before its raw sidecar is
+/// sent to Kernel. Fields absent from the callback are not inferred from
+/// caller metadata.
+fn restricted_source_matches_normalized_event(
+    source_bytes: &[u8],
+    normalized: &serde_json::Value,
+) -> bool {
+    let Ok(source) = serde_json::from_slice::<serde_json::Value>(source_bytes) else {
+        return false;
+    };
+    let Ok(canonical) = canonical_json_bytes(&source) else {
+        return false;
+    };
+    if !source.is_object() || canonical.as_slice() != source_bytes {
+        return false;
+    }
+
+    let event = source
+        .get("event")
+        .filter(|value| value.is_object())
+        .unwrap_or(&source);
+    let properties = event.get("properties");
+
+    let first_text = |values: &[Option<&serde_json::Value>]| {
+        values
+            .iter()
+            .filter_map(|value| value.and_then(serde_json::Value::as_str))
+            .find(|value| !value.trim().is_empty())
+    };
+    let first_u64 = |values: &[Option<&serde_json::Value>]| {
+        values
+            .iter()
+            .filter_map(|value| value.and_then(serde_json::Value::as_u64))
+            .find(|value| *value > 0)
+    };
+
+    let vendor_kind = first_text(&[event.get("type")]);
+    let native_id = first_text(&[
+        event.get("id"),
+        event.get("eventID"),
+        event.get("eventId"),
+        properties.and_then(|value| value.get("id")),
+        properties.and_then(|value| value.get("eventID")),
+        properties.and_then(|value| value.get("eventId")),
+        properties.and_then(|value| value.get("messageID")),
+        properties.and_then(|value| value.get("messageId")),
+        source.get("callID"),
+        source.get("callId"),
+        source.get("toolCallID"),
+        source.get("toolCallId"),
+    ]);
+    let native_sequence = first_u64(&[
+        event.get("sequence"),
+        event.get("seq"),
+        properties.and_then(|value| value.get("sequence")),
+        properties.and_then(|value| value.get("seq")),
+    ]);
+    let native_emitted_at = first_text(&[
+        event.get("emitted_at"),
+        event.get("timestamp"),
+        event.get("time"),
+        properties.and_then(|value| value.get("emitted_at")),
+        properties.and_then(|value| value.get("timestamp")),
+    ]);
+
+    vendor_kind.is_none_or(|value| {
+        normalized
+            .get("vendor_event_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some(value)
+    }) && native_id.is_none_or(|value| {
+        normalized
+            .get("native_event_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(value)
+    }) && native_sequence.is_none_or(|value| {
+        normalized
+            .get("native_sequence")
+            .and_then(serde_json::Value::as_u64)
+            == Some(value)
+    }) && native_emitted_at.is_none_or(|value| {
+        normalized
+            .get("native_emitted_at")
+            .and_then(serde_json::Value::as_str)
+            == Some(value)
+    })
+}
+
+#[cfg(test)]
+mod issue_1935_restricted_source_binding_tests {
+    use super::restricted_source_matches_normalized_event;
+    use eliot_contracts::canonical_json_bytes;
+    use serde_json::json;
+
+    #[test]
+    fn issue_1935_restricted_source_accepts_matching_native_identity() {
+        let source = json!({
+            "event": {
+                "type": "session.idle",
+                "id": "native-event-7",
+                "sequence": 7,
+                "timestamp": "2026-10-01T12:00:00Z"
+            }
+        });
+        let bytes = canonical_json_bytes(&source).expect("canonical callback source");
+        let normalized = json!({
+            "vendor_event_kind": "session.idle",
+            "native_event_id": "native-event-7",
+            "native_sequence": 7,
+            "native_emitted_at": "2026-10-01T12:00:00Z"
+        });
+
+        assert!(restricted_source_matches_normalized_event(
+            &bytes,
+            &normalized
+        ));
+    }
+
+    #[test]
+    fn issue_1935_restricted_source_refuses_substituted_native_identity() {
+        let source = json!({
+            "event": {
+                "type": "session.deleted",
+                "id": "foreign-event-8",
+                "sequence": 8
+            }
+        });
+        let bytes = canonical_json_bytes(&source).expect("canonical callback source");
+        let normalized = json!({
+            "vendor_event_kind": "session.idle",
+            "native_event_id": "native-event-7",
+            "native_sequence": 7
+        });
+
+        assert!(!restricted_source_matches_normalized_event(
+            &bytes,
+            &normalized
+        ));
     }
 }
 
