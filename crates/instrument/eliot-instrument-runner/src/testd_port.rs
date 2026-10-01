@@ -31,7 +31,6 @@ use eliot_instrument_dotnet::CONTRACT_ID as DOTNET_ADAPTER;
 use eliot_instrument_nextest::NEXTEST_INSTRUMENT as NEXTEST_ADAPTER;
 use eliot_instrument_rustc::RUSTC_INSTRUMENT as RUSTC_ADAPTER;
 use eliot_instrument_rustfmt::RUSTFMT_INSTRUMENT as RUSTFMT_ADAPTER;
-use eliot_instrument_scip::SCIP_INSTRUMENT as SCIP_ADAPTER;
 
 use crate::registry::{RegistryEntry, RegistryError};
 
@@ -166,15 +165,16 @@ pub fn testd_dispatchable(kind: InstrumentKind) -> bool {
 /// Whether one retained ready adapter owns this exact typed stage lane.
 ///
 /// The adapter/kind table mirrors [`ProviderRegistry::ready`](crate::ProviderRegistry::ready)
-/// and the adapters' existing launch validation. In particular, SCIP Inspect
-/// is decoder-only, while Dotnet Inspect is a process lane; Lint has no entry.
+/// and the adapters' existing launch validation. Dotnet Inspect is a process
+/// lane. SCIP is decoder-only but remains refused until a governed consumer
+/// can resolve and verify its exact stored input lineage; Lint has no entry.
 pub fn adapter_stage_dispatchable(
     adapter: &str,
     kind: InstrumentKind,
     execution: StageExecutionKind,
 ) -> bool {
     use InstrumentKind::{Build, Format, Inspect, Test, Verify};
-    use StageExecutionKind::{DecoderOnly, Process};
+    use StageExecutionKind::Process;
 
     match (adapter, kind, execution) {
         (CARGO_ADAPTER, Build | Test, Process) => true,
@@ -182,7 +182,6 @@ pub fn adapter_stage_dispatchable(
         (RUSTFMT_ADAPTER, Format, Process) => true,
         (NEXTEST_ADAPTER, Test, Process) => true,
         (DOTNET_ADAPTER, Build | Test | Verify | Inspect, Process) => true,
-        (SCIP_ADAPTER, Inspect, DecoderOnly) => true,
         _ => false,
     }
 }
