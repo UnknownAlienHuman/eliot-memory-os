@@ -1116,6 +1116,16 @@ impl StageOrchestrator {
     /// receipt into the dispatch permit, and revalidates that same object at
     /// use: the sealed request must name the exact file the owner hashed,
     /// never an unrelated `PATH` resolution that happens to share a name.
+    ///
+    /// The grant's sealed argv is compared to the admitted VERIFICATION
+    /// command, not to the admitted fixed `argument_template`. Those are
+    /// deliberately different fields: `argument_template` bounds what a
+    /// caller's `InstrumentInvocation.arguments` may be (empty for every
+    /// builtin) and is never argv, while `verification_command` is the argv the
+    /// stage actually runs. Comparing the grant's argv against the empty
+    /// template refused every verification stage at use, which is the same
+    /// unbound-argv defect seen from the other side: the check never asked
+    /// whether the sealed argv was the one the profile admitted.
     fn grant_at_use_skew_reason(
         route: &TestExecutionPlaneRoute,
         stage: &AdmittedStage,
@@ -1133,10 +1143,21 @@ impl StageOrchestrator {
         if grant.spec_digest != stage.spec_digest
             || grant.parser.as_str() != stage.parser.as_str()
             || grant.parser_generation != stage.parser_generation
-            || grant.arguments != stage.argument_template
+            || grant.arguments != stage.verification_command
         {
             return Some(
                 "stage admission refused: grant differs from the admitted stage".to_owned(),
+            );
+        }
+        // The argv that actually reached the sealed request must be the same
+        // admitted command the grant sealed. This is the check that makes the
+        // recorded identity an argv/tool identity and not an executable-bytes
+        // identity: without it, a stage could be sealed with one argv and
+        // receipted under a grant naming another.
+        if process_request.argv() != stage.verification_command.as_slice() {
+            return Some(
+                "stage admission refused: sealed request argv differs from the admitted verification command"
+                    .to_owned(),
             );
         }
         let admitted_supply = stage
