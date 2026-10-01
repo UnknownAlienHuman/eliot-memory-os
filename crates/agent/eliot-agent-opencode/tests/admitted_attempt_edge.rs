@@ -84,9 +84,15 @@ async fn admitted_happy_path_seals_replay_stable_candidate()
 
     let first_digest = parts.edge.attempt_digest()?;
     assert_eq!(parts.edge.attempt_digest()?, first_digest);
-    let resealed = AdmittedAttemptCandidate::seal(&parts.edge, &outcome.run)?;
+    // #2902 binds the current typed route disposition into both the run's
+    // result digest and the candidate artifact. Replaying a seal therefore
+    // uses the retained disposition from the same outcome, not the legacy
+    // low-level seal's `None` default.
+    let mut resealed = AdmittedAttemptCandidate::seal(&parts.edge, &outcome.run)?;
+    resealed.route_disposition = Some(outcome.route.clone());
     assert_eq!(resealed.compute_digest()?, candidate.compute_digest()?);
     assert_eq!(resealed, *candidate);
+    assert_eq!(candidate.route_disposition.as_ref(), Some(&outcome.route));
 
     let wire = serde_json::to_value(candidate)?;
     let keys: BTreeSet<String> = wire
@@ -101,6 +107,7 @@ async fn admitted_happy_path_seals_replay_stable_candidate()
             "admitted_route_digest".to_owned(),
             "attempt_id".to_owned(),
             "authority".to_owned(),
+            "route_disposition".to_owned(),
             "result_digest".to_owned(),
             "status".to_owned(),
         ])
