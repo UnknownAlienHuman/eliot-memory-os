@@ -73,8 +73,7 @@ pub const TESTD_ADMISSION_OPERATION: &str = "eliot.kernel.testd-admission";
 pub const TESTD_ADMISSION_OPERATION_VERSION: u16 = 1;
 /// Authenticated receipt-publication operation on the same TestD Kernel
 /// session used for admission.
-pub const TESTD_TERMINAL_COMPLETION_OPERATION: &str =
-    "eliot.kernel.testd-terminal-completion";
+pub const TESTD_TERMINAL_COMPLETION_OPERATION: &str = "eliot.kernel.testd-terminal-completion";
 /// Version of the TestD terminal-completion wire.
 pub const TESTD_TERMINAL_COMPLETION_OPERATION_VERSION: u16 = 1;
 /// Advertisement for the testd admission operation: inert until the dispatch
@@ -734,10 +733,8 @@ impl KernelTestdIpcClient {
                         .validate()
                         .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
                     let expected_operation = format!("{}/verifier-execution", binding.operation_id);
-                    let expected_idempotency = format!(
-                        "{}:verifier-execution",
-                        identity.idempotency_key
-                    );
+                    let expected_idempotency =
+                        format!("{}:verifier-execution", identity.idempotency_key);
                     if receipt.status != WriteReceiptStatus::Committed
                         || receipt.operation_id.as_str() != expected_operation
                         || receipt.idempotency_key != expected_idempotency

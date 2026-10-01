@@ -7,7 +7,9 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::{ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes};
+use eliot_contracts::{
+    ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes,
+};
 pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
     ExecutionStatus, InstrumentInvocation, InstrumentKind, VerificationRun,
@@ -91,14 +93,13 @@ pub const TESTD_PRODUCTIVE_PROFILE_PROGRAM: &str = "cargo-nextest";
 /// Fixed argv for the admitted probe. No caller slot exists.
 pub const TESTD_PROFILE_ARGV: &[&str] = &["--version"];
 /// Fixed machine-readable argv for the productive nextest profile.
-pub const TESTD_PRODUCTIVE_PROFILE_ARGV: &[&str] =
-    &[
-        "run",
-        "--message-format",
-        "libtest-json-plus",
-        "--message-format-version",
-        "0.1",
-    ];
+pub const TESTD_PRODUCTIVE_PROFILE_ARGV: &[&str] = &[
+    "run",
+    "--message-format",
+    "libtest-json-plus",
+    "--message-format-version",
+    "0.1",
+];
 /// Exact environment required by nextest 0.9.143's experimental libtest JSON
 /// reporter. The value is owner-registered and is never read from ambient
 /// process state.
@@ -206,23 +207,29 @@ impl TestdExecutableBinding {
                 reason: "the registered profile takes fixed argv; caller arguments are refused",
             });
         }
-        let expected_environment: Vec<(String, String)> = if self.profile == TESTD_PRODUCTIVE_PROFILE
-        {
-            TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let expected_environment: Vec<(String, String)> =
+            if self.profile == TESTD_PRODUCTIVE_PROFILE {
+                TESTD_PRODUCTIVE_PROFILE_ENVIRONMENT
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         if self.env_allowlist != expected_environment {
             return Err(TestdError::Invalid {
                 field: "env_allowlist",
                 reason: "the admitted profile takes only its registered environment bindings",
             });
         }
-        let (wall_timeout_ms, cpu_time_ms, memory_bytes, stdout_bytes, stderr_bytes, max_descendants) =
-            profile_limits(&self.profile);
+        let (
+            wall_timeout_ms,
+            cpu_time_ms,
+            memory_bytes,
+            stdout_bytes,
+            stderr_bytes,
+            max_descendants,
+        ) = profile_limits(&self.profile);
         if self.wall_timeout_ms != wall_timeout_ms
             || self.cpu_time_ms != cpu_time_ms
             || self.memory_bytes != memory_bytes
@@ -454,6 +461,8 @@ fn is_binding_digest(value: &str) -> bool {
 const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_jobs_v1");
 const EVENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_events_v1");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("testd_meta_v1");
+const ADMITTED_IDENTITIES: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("testd_admitted_identities_v1");
 
 /// Persistent daemon failures.
 #[derive(Debug, Error)]
@@ -546,6 +555,10 @@ pub struct ProcessAdmission {
     pub job_id: String,
     pub operation_id: String,
     pub process_tree_id: String,
+    /// Process session identity retained from the owner-issued intent so the
+    /// worker can reproduce the same productive invocation digest.
+    #[serde(default)]
+    pub session_id: String,
     pub generation: u64,
     pub authority_epoch: EpochId,
     pub invocation_digest: String,
@@ -557,6 +570,7 @@ impl ProcessAdmission {
             job_id: request.job_id().as_str().to_owned(),
             operation_id: request.operation_id().as_str().to_owned(),
             process_tree_id: request.process_tree_id().as_str().to_owned(),
+            session_id: request.session_id().as_str().to_owned(),
             generation: request.generation().get(),
             authority_epoch: request.fence().authority_epoch().clone(),
             invocation_digest: request.invocation_digest().to_owned(),
@@ -950,12 +964,11 @@ impl TestdSourceObservation {
     /// digest. Any unavailable or oversized observation fails closed.
     pub fn capture(repository_root: impl AsRef<Path>) -> Result<Self, TestdError> {
         const MAX_GIT_OUTPUT: usize = 64 * 1024 * 1024;
-        let repository_root = std::fs::canonicalize(repository_root).map_err(|_| {
-            TestdError::Invalid {
+        let repository_root =
+            std::fs::canonicalize(repository_root).map_err(|_| TestdError::Invalid {
                 field: "source_observation.repository_root",
                 reason: "source root cannot be canonicalized",
-            }
-        })?;
+            })?;
         if !repository_root.is_dir() {
             return Err(TestdError::Invalid {
                 field: "source_observation.repository_root",
@@ -1009,7 +1022,7 @@ impl TestdSourceObservation {
                 })
         };
         let top_level = decode_text(
-            run_git(&["rev-parse", "--show-toplevel"] )?,
+            run_git(&["rev-parse", "--show-toplevel"])?,
             "source_observation.repository_root",
         )?;
         let observed_root = std::fs::canonicalize(top_level).map_err(|_| TestdError::Invalid {
@@ -1023,7 +1036,7 @@ impl TestdSourceObservation {
             });
         }
         let branch = decode_text(
-            run_git(&["rev-parse", "--abbrev-ref", "HEAD"] )?,
+            run_git(&["rev-parse", "--abbrev-ref", "HEAD"])?,
             "source_observation.branch",
         )?;
         let branch = if branch == "HEAD" {
@@ -1032,7 +1045,7 @@ impl TestdSourceObservation {
             branch
         };
         let commit = decode_text(
-            run_git(&["rev-parse", "--verify", "HEAD^{commit}"] )?,
+            run_git(&["rev-parse", "--verify", "HEAD^{commit}"])?,
             "source_observation.commit",
         )?;
         let status = run_git(&["status", "--porcelain=v2", "-z", "--untracked-files=all"])?;
@@ -1057,7 +1070,10 @@ impl TestdSourceObservation {
             let relative_path = Path::new(&relative);
             if relative_path.is_absolute()
                 || relative_path.components().any(|component| {
-                    matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
                 })
             {
                 return Err(TestdError::Invalid {
@@ -1170,9 +1186,7 @@ impl TestdVerifierDispatchBinding {
             .as_ref()
             .map(|revision| revision.value())
             .ok_or(TestdError::InvalidBinding)?;
-        if self.operation_id.trim().is_empty()
-            || self.operation_id.chars().any(char::is_control)
-        {
+        if self.operation_id.trim().is_empty() || self.operation_id.chars().any(char::is_control) {
             return Err(TestdError::InvalidBinding);
         }
         if metadata != &job.invocation.request
@@ -1189,13 +1203,15 @@ impl TestdVerifierDispatchBinding {
         }
         let plan_value: serde_json::Value = serde_json::from_str(&self.canonical_plan_json)
             .map_err(|_| TestdError::InvalidBinding)?;
-        let canonical = canonical_json_bytes(&plan_value)
-            .map_err(|_| TestdError::InvalidBinding)?;
+        let canonical =
+            canonical_json_bytes(&plan_value).map_err(|_| TestdError::InvalidBinding)?;
         let canonical_text =
             String::from_utf8(canonical.clone()).map_err(|_| TestdError::InvalidBinding)?;
         if canonical_text != self.canonical_plan_json
             || sha256_hex(&canonical) != self.canonical_plan_sha256
-            || plan_value.get("task_id").and_then(serde_json::Value::as_str)
+            || plan_value
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
                 != Some(task_id.as_str())
         {
             return Err(TestdError::InvalidBinding);
@@ -1204,8 +1220,8 @@ impl TestdVerifierDispatchBinding {
             .get("verifier")
             .and_then(serde_json::Value::as_object)
             .ok_or(TestdError::InvalidBinding)?;
-        let invocation = serde_json::to_value(&job.invocation)
-            .map_err(|_| TestdError::InvalidBinding)?;
+        let invocation =
+            serde_json::to_value(&job.invocation).map_err(|_| TestdError::InvalidBinding)?;
         for field in [
             "instrument",
             "kind",
@@ -1259,7 +1275,10 @@ impl TestdVerifierDispatchBinding {
         if planned_id != evaluator
             || planned_scope != declared_scope
             || !is_binding_digest(config_hash)
-            || plan_value.get("work_scope_id").and_then(serde_json::Value::as_str).is_none()
+            || plan_value
+                .get("work_scope_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
         {
             return Err(TestdError::InvalidBinding);
         }
@@ -1282,6 +1301,181 @@ pub struct TestdTerminalPublication {
     pub receipt_sha256: String,
     #[serde(default)]
     pub committed_receipt_json: Option<String>,
+}
+
+/// Kernel-front-door payload for creating one productive verifier job.
+///
+/// The authenticated `RequestIdentity` is deliberately carried by the
+/// enclosing Kernel frame, not by this payload. The Kernel owner persists
+/// that frame identity beside the durable job before exposing it as a
+/// pending dispatch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdVerifierJobSubmission {
+    pub job_id: String,
+    pub project_id: String,
+    pub invocation: InstrumentInvocation,
+    pub target_roots: TargetRoots,
+    pub priority: i32,
+}
+
+/// Authenticated Kernel owner-submit operation for one productive verifier.
+/// The transport identity is carried by the enclosing Kernel frame; this
+/// payload contains only the Governor-resolved project/source binding, the
+/// typed invocation, and owner-observed tool material.
+pub const TESTD_OWNER_SUBMIT_OPERATION: &str = "eliot.kernel.testd-owner-submit";
+/// Current TestD owner operation wire revision.
+pub const TESTD_OWNER_WIRE_VERSION: u16 = 1;
+
+/// Governor-resolved input to the Kernel-owned productive TestD owner.
+/// `source_root` is the TaskContract WorkScope result; `project_id` is an
+/// opaque project identity and is never interpreted as a filesystem path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdOwnerJobSubmission {
+    pub project_id: String,
+    pub invocation: InstrumentInvocation,
+    pub source_root: String,
+}
+
+impl TestdOwnerJobSubmission {
+    pub fn validate(&self) -> Result<(), TestdError> {
+        validate_text(&self.project_id, "project_id")?;
+        validate_text(&self.source_root, "source_root")?;
+        self.invocation
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if self.invocation.kind != InstrumentKind::Test
+            || self.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            || !self.invocation.arguments.is_empty()
+        {
+            return Err(TestdError::Invalid {
+                field: "invocation",
+                reason: "productive submission requires the registered TestD profile and no caller arguments",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Owner-observed installed tool identities and exact process environment
+/// needed to reconstruct the registered productive ProcessIntent. The
+/// Kernel rereads every executable and validates every environment binding
+/// before it issues a process request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdProcessToolIntent {
+    pub observation: TestdToolObservation,
+}
+
+/// Typed request for the authenticated Kernel owner-submit operation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdOwnerSubmitRequest {
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub submission: TestdOwnerJobSubmission,
+    pub process_tool: TestdProcessToolIntent,
+    pub request_digest: String,
+}
+
+impl TestdOwnerSubmitRequest {
+    /// Computes the request digest over all caller-presented inert terms.
+    pub fn with_computed_digest(mut self) -> Result<Self, TestdError> {
+        self.request_digest = self.compute_request_digest()?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Validates the closed operation, typed submission, tool observation,
+    /// and canonical request digest. Filesystem facts are re-read by Kernel
+    /// immediately before permit issuance.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.wire_id != TESTD_OWNER_SUBMIT_OPERATION
+            || self.wire_version != TESTD_OWNER_WIRE_VERSION
+        {
+            return Err(TestdError::Invalid {
+                field: "owner_submit.wire",
+                reason: "unsupported TestD owner-submit wire",
+            });
+        }
+        self.submission.validate()?;
+        self.process_tool.observation.validate()?;
+        validate_text(&self.request_digest, "owner_submit.request_digest")?;
+        if self.request_digest != self.compute_request_digest()? {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    fn compute_request_digest(&self) -> Result<String, TestdError> {
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            wire_id: &'a str,
+            wire_version: u16,
+            submission: &'a TestdOwnerJobSubmission,
+            process_tool: &'a TestdProcessToolIntent,
+        }
+        let bytes = eliot_contracts::canonical_json_bytes(&Canonical {
+            wire_id: &self.wire_id,
+            wire_version: self.wire_version,
+            submission: &self.submission,
+            process_tool: &self.process_tool,
+        })
+        .map_err(|_| TestdError::GrantDigestSerialization)?;
+        Ok(eliot_contracts::sha256_hex(&bytes))
+    }
+}
+
+/// Durable Kernel owner result for one idempotent productive submission.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdOwnerSubmitResponse {
+    pub job_id: String,
+    pub operation_id: String,
+    pub authority_epoch: EpochId,
+    pub generation: u64,
+    pub payload_digest: String,
+}
+
+impl TestdVerifierJobSubmission {
+    pub fn validate(&self) -> Result<(), TestdError> {
+        validate_text(&self.job_id, "job_id")?;
+        validate_text(&self.project_id, "project_id")?;
+        self.invocation
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if self.invocation.kind != InstrumentKind::Test
+            || self.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            || !self.invocation.arguments.is_empty()
+        {
+            return Err(TestdError::Invalid {
+                field: "invocation",
+                reason: "productive submission requires the registered TestD profile and no caller arguments",
+            });
+        }
+        self.target_roots.validate()
+    }
+}
+
+/// A queued productive job joined to the exact authenticated identity saved
+/// by its Kernel owner. This is the only pending-dispatch projection exposed
+/// to the daemon planner.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdPendingVerifierDispatch {
+    pub job: TestJob,
+    pub request_identity: RequestIdentity,
+}
+
+/// Complete durable owner input for publishing one productive verifier fact.
+/// The daemon receives this projection through the authenticated Kernel
+/// owner route and never opens the TestD database itself.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdTerminalCompletionEvidence {
+    pub job: TestJob,
+    pub request_identity: RequestIdentity,
 }
 
 /// Contract spelling used by the test-execution-plane boundary.
@@ -1490,11 +1684,176 @@ impl TestdToolObservation {
     /// Stable diagnostic identity derived only from the observed nextest
     /// executable, never from the evaluator contract version.
     pub fn nextest_identity(&self) -> String {
-        format!(
-            "path={};sha256={}",
-            self.nextest_path, self.nextest_sha256
-        )
+        format!("path={};sha256={}", self.nextest_path, self.nextest_sha256)
     }
+}
+
+impl TestdProcessToolIntent {
+    /// Revalidates the tool observation and closed child environment against
+    /// the Kernel-selected target/cache roots, then returns the exact
+    /// non-inheriting process environment projection.
+    pub fn validate_for_roots(
+        &self,
+        target_root: &str,
+        cache_root: &str,
+    ) -> Result<eliot_process::EnvironmentProjection, TestdError> {
+        self.observation.validate()?;
+        let nextest = validate_canonical_tool_file(&self.observation.nextest_path)?;
+        if nextest
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !name.eq_ignore_ascii_case(TESTD_PRODUCTIVE_PROFILE_PROGRAM))
+        {
+            return Err(TestdError::Invalid {
+                field: "process_tool.nextest_path",
+                reason: "productive executable does not match the registered cargo-nextest profile",
+            });
+        }
+        let cargo = validate_canonical_tool_file(&self.observation.cargo_path)?;
+        let rustc = validate_canonical_tool_file(&self.observation.rustc_path)?;
+        for (path, expected) in [
+            (&nextest, self.observation.nextest_sha256.as_str()),
+            (&cargo, self.observation.cargo_sha256.as_str()),
+            (&rustc, self.observation.rustc_sha256.as_str()),
+        ] {
+            let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
+                field: "process_tool.executable",
+                reason: "owner-observed tool cannot be reread before admission",
+            })?;
+            if eliot_contracts::sha256_hex(&bytes) != expected {
+                return Err(TestdError::Invalid {
+                    field: "process_tool.executable",
+                    reason: "owner-observed tool bytes changed before admission",
+                });
+            }
+        }
+
+        let cargo_home = validate_canonical_tool_directory(cache_root)?;
+        let target = validate_canonical_tool_directory(target_root)?;
+        if cargo_home != target {
+            return Err(TestdError::Invalid {
+                field: "process_tool.target_root",
+                reason: "productive target and cache roots must be the same canonical directory",
+            });
+        }
+        let cargo_bin = cargo.parent().ok_or(TestdError::InvalidBinding)?;
+        let toolchain_root = cargo_bin.parent().ok_or(TestdError::InvalidBinding)?;
+        let toolchain_catalog = toolchain_root.parent().ok_or(TestdError::InvalidBinding)?;
+        let rustup_home = toolchain_catalog
+            .parent()
+            .ok_or(TestdError::InvalidBinding)?;
+        if cargo_bin.file_name().and_then(|name| name.to_str()) != Some("bin")
+            || toolchain_root.file_name().and_then(|name| name.to_str())
+                != Some(self.observation.selected_toolchain.as_str())
+            || toolchain_catalog.file_name().and_then(|name| name.to_str()) != Some("toolchains")
+            || rustc.parent() != Some(cargo_bin)
+        {
+            return Err(TestdError::Invalid {
+                field: "process_tool.toolchain",
+                reason: "cargo and rustc do not belong to the selected Rustup toolchain",
+            });
+        }
+        let rustup_home = validate_canonical_tool_directory(
+            rustup_home.to_str().ok_or(TestdError::InvalidBinding)?,
+        )?;
+        let expected_dirs: BTreeSet<PathBuf> = [&nextest, &cargo, &rustc]
+            .into_iter()
+            .filter_map(|path| path.parent().map(Path::to_path_buf))
+            .collect();
+        let path_value = std::env::join_paths(&expected_dirs).map_err(|_| TestdError::Invalid {
+            field: "process_tool.PATH",
+            reason: "observed tool directories cannot be composed into PATH",
+        })?;
+        let path_value = path_value.to_string_lossy().into_owned();
+        let values = BTreeMap::from([
+            (
+                "NEXTEST_EXPERIMENTAL_LIBTEST_JSON".to_owned(),
+                "1".to_owned(),
+            ),
+            (
+                "ELIOT_TESTD_NEXTEST_SHA256".to_owned(),
+                self.observation.nextest_sha256.clone(),
+            ),
+            ("CARGO".to_owned(), self.observation.cargo_path.clone()),
+            ("RUSTC".to_owned(), self.observation.rustc_path.clone()),
+            (
+                "ELIOT_TESTD_CARGO_SHA256".to_owned(),
+                self.observation.cargo_sha256.clone(),
+            ),
+            (
+                "ELIOT_TESTD_RUSTC_SHA256".to_owned(),
+                self.observation.rustc_sha256.clone(),
+            ),
+            ("CARGO_HOME".to_owned(), cache_root.to_owned()),
+            (
+                "RUSTUP_HOME".to_owned(),
+                rustup_home.to_string_lossy().into_owned(),
+            ),
+            (
+                "ELIOT_TESTD_TOOLCHAIN".to_owned(),
+                self.observation.selected_toolchain.clone(),
+            ),
+            ("PATH".to_owned(), path_value),
+            ("CARGO_TARGET_DIR".to_owned(), target_root.to_owned()),
+        ]);
+
+        eliot_process::EnvironmentProjection::new(
+            values,
+            Vec::new(),
+            eliot_process::EnvironmentInheritance::None,
+        )
+        .map_err(|error| TestdError::Contract(error.to_string()))
+    }
+}
+
+fn validate_canonical_tool_file(path: &str) -> Result<PathBuf, TestdError> {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(TestdError::Invalid {
+            field: "process_tool.path",
+            reason: "tool path must be absolute and traversal-free",
+        });
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| TestdError::Invalid {
+        field: "process_tool.path",
+        reason: "tool path cannot be canonicalized",
+    })?;
+    if canonical != path || !canonical.is_file() {
+        return Err(TestdError::Invalid {
+            field: "process_tool.path",
+            reason: "tool path must name an existing canonical file",
+        });
+    }
+    Ok(canonical)
+}
+
+fn validate_canonical_tool_directory(path: &str) -> Result<PathBuf, TestdError> {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(TestdError::Invalid {
+            field: "process_tool.directory",
+            reason: "tool directory must be absolute and traversal-free",
+        });
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| TestdError::Invalid {
+        field: "process_tool.directory",
+        reason: "tool directory cannot be canonicalized",
+    })?;
+    if canonical != path || !canonical.is_dir() {
+        return Err(TestdError::Invalid {
+            field: "process_tool.directory",
+            reason: "tool directory must be an existing canonical directory",
+        });
+    }
+    Ok(canonical)
 }
 
 /// Candidate verification receipt accepted by the canonical finish boundary.
@@ -1646,9 +2005,10 @@ impl VerificationReceipt {
         {
             return Err(TestdError::InvalidBinding);
         }
-        if let (Some(start), Some(finish)) =
-            (self.started_at.known_time_ms, self.finished_at.known_time_ms)
-            && finish < start
+        if let (Some(start), Some(finish)) = (
+            self.started_at.known_time_ms,
+            self.finished_at.known_time_ms,
+        ) && finish < start
         {
             return Err(TestdError::InvalidBinding);
         }
@@ -2049,6 +2409,11 @@ impl TestdStore {
             drop(write.open_table(META).map_err(database)?);
             write.commit().map_err(database)?;
         }
+        // Additive owner table for authenticated task identity. Existing
+        // stores migrate idempotently without rewriting job payloads.
+        let write = db.begin_write().map_err(database)?;
+        drop(write.open_table(ADMITTED_IDENTITIES).map_err(database)?);
+        write.commit().map_err(database)?;
         Ok(Self {
             database: Arc::new(db),
             retry,
@@ -2067,7 +2432,7 @@ impl TestdStore {
                 serde_json::from_slice(value.value())
                     .map(Some)
                     .map_err(|error| TestdError::Corrupt(error.to_string()))
-        })
+            })
     }
 
     /// Attaches the exact Governor request and current plan before a
@@ -2078,6 +2443,16 @@ impl TestdStore {
         job_id: &str,
         binding: TestdVerifierDispatchBinding,
         now: u64,
+    ) -> Result<TestJob, TestdError> {
+        self.bind_verifier_dispatch_inner(job_id, binding, now, None)
+    }
+
+    fn bind_verifier_dispatch_inner(
+        &self,
+        job_id: &str,
+        binding: TestdVerifierDispatchBinding,
+        now: u64,
+        expected_identity: Option<&RequestIdentity>,
     ) -> Result<TestJob, TestdError> {
         validate_text(job_id, "job_id")?;
         if now == 0 {
@@ -2096,6 +2471,19 @@ impl TestdStore {
             serde_json::from_slice::<TestJob>(value.value())
                 .map_err(|error| TestdError::Corrupt(error.to_string()))?
         };
+        if let Some(expected_identity) = expected_identity {
+            let identities = write.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+            let admitted = identities
+                .get(job_id)
+                .map_err(database)?
+                .map(|value| serde_json::from_slice::<RequestIdentity>(value.value()))
+                .transpose()
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if admitted.as_ref() != Some(expected_identity) {
+                return Err(TestdError::InvalidBinding);
+            }
+            drop(identities);
+        }
         binding.validate_for_job(&job)?;
         if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE {
             return Err(TestdError::Invalid {
@@ -2114,12 +2502,10 @@ impl TestdStore {
         }
         job.verifier_dispatch = Some(binding);
         job.updated_at_ms = now;
-        let encoded = serde_json::to_vec(&job)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         let mut table = write.open_table(JOBS).map_err(database)?;
-        table
-            .insert(job_id, encoded.as_slice())
-            .map_err(database)?;
+        table.insert(job_id, encoded.as_slice()).map_err(database)?;
         drop(table);
         append_event(
             &write,
@@ -2132,6 +2518,166 @@ impl TestdStore {
         )?;
         write.commit().map_err(database)?;
         Ok(job)
+    }
+
+    /// Persists the exact RequestIdentity taken from the authenticated
+    /// Kernel frame before the daemon can bind a verifier plan or dispatch
+    /// the productive job. Exact retries are idempotent; changed identity
+    /// under the same durable job id conflicts.
+    pub fn bind_admitted_request_identity(
+        &self,
+        job_id: &str,
+        identity: RequestIdentity,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        validate_text(job_id, "job_id")?;
+        identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if now == 0 {
+            return Err(TestdError::Invalid {
+                field: "request_identity",
+                reason: "identity time must be non-zero",
+            });
+        }
+        let write = self.database.begin_write().map_err(database)?;
+        let mut job = {
+            let table = write.open_table(JOBS).map_err(database)?;
+            let value = table
+                .get(job_id)
+                .map_err(database)?
+                .ok_or_else(|| TestdError::Corrupt("job not found".to_owned()))?;
+            serde_json::from_slice::<TestJob>(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        let metadata = &identity.request.metadata;
+        let task_revision = identity
+            .request
+            .state_fence
+            .task_revision
+            .as_ref()
+            .map(|revision| revision.value());
+        if job.job_id != job_id
+            || job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            || metadata.task_id.is_none()
+            || task_revision.is_none_or(|revision| revision == 0)
+            || metadata != &job.invocation.request
+            || identity.request.state_fence != job.invocation.request.state_fence
+            || job.process.operation_id != job.invocation.request.request_id.as_str()
+            || !job
+                .process
+                .authority_epoch
+                .is_same_authority(&identity.request.state_fence.authority_epoch)
+            || job.process.generation != identity.request.state_fence.resource_generation.value()
+            || job.state != JobState::Queued
+            || job.attempts != 0
+            || job.lease.is_some()
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let admitted_identity = {
+            let table = write.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+            table
+                .get(job_id)
+                .map_err(database)?
+                .map(|value| serde_json::from_slice::<RequestIdentity>(value.value()))
+                .transpose()
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?
+        };
+        if let Some(existing) = admitted_identity {
+            if existing == identity {
+                return Ok(job);
+            }
+            return Err(TestdError::JobConflict(job_id.to_owned()));
+        }
+        if job.verifier_dispatch.is_some() {
+            return Err(TestdError::InvalidBinding);
+        }
+        {
+            let mut table = write.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+            let encoded = serde_json::to_vec(&identity)
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            table.insert(job_id, encoded.as_slice()).map_err(database)?;
+        }
+        job.updated_at_ms = now;
+        {
+            let mut table = write.open_table(JOBS).map_err(database)?;
+            let encoded =
+                serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            table.insert(job_id, encoded.as_slice()).map_err(database)?;
+        }
+        append_event(
+            &write,
+            &job,
+            Some(JobState::Queued),
+            JobState::Queued,
+            "authenticated-request-identity",
+            now,
+            Some("request identity retained from authenticated Kernel frame".to_owned()),
+        )?;
+        write.commit().map_err(database)?;
+        Ok(job)
+    }
+
+    /// Requires the verifier binding to reuse the exact authenticated
+    /// identity persisted at job admission. The legacy binding method stays
+    /// available for non-production fixtures; the Kernel owner uses this
+    /// stricter entry.
+    pub fn bind_verifier_dispatch_for_admitted_identity(
+        &self,
+        job_id: &str,
+        binding: TestdVerifierDispatchBinding,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        let identity = binding.request_identity.clone();
+        self.bind_verifier_dispatch_inner(job_id, binding, now, Some(&identity))
+    }
+
+    /// Returns stable, bounded queued productive jobs that have an admitted
+    /// RequestIdentity but still need their canonical verifier binding.
+    pub fn pending_verifier_dispatches(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<TestdPendingVerifierDispatch>, TestdError> {
+        if limit == 0 || limit > 64 {
+            return Err(TestdError::Invalid {
+                field: "verifier_dispatch.limit",
+                reason: "must be between one and 64",
+            });
+        }
+        let read = self.database.begin_read().map_err(database)?;
+        let jobs = read.open_table(JOBS).map_err(database)?;
+        let identities = read.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+        let mut pending = Vec::new();
+        for item in jobs.iter().map_err(database)? {
+            let (key, value) = item.map_err(database)?;
+            let job: TestJob = serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            let job_id = key.value();
+            if job.job_id != job_id {
+                return Err(corrupt("durable job key conflicts with record"));
+            }
+            if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+                || job.state != JobState::Queued
+                || job.attempts != 0
+                || job.lease.is_some()
+                || job.verifier_dispatch.is_some()
+            {
+                continue;
+            }
+            let Some(value) = identities.get(job_id).map_err(database)? else {
+                continue;
+            };
+            let request_identity: RequestIdentity = serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            pending.push(TestdPendingVerifierDispatch {
+                job,
+                request_identity,
+            });
+        }
+        pending.sort_by(|left, right| left.job.job_id.cmp(&right.job.job_id));
+        pending.truncate(limit);
+        Ok(pending)
     }
 
     /// Persists the real source identity before the first productive claim.
@@ -2178,12 +2724,10 @@ impl TestdStore {
         }
         job.source_observation_before = Some(observation);
         job.updated_at_ms = now;
-        let encoded = serde_json::to_vec(&job)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         let mut table = write.open_table(JOBS).map_err(database)?;
-        table
-            .insert(job_id, encoded.as_slice())
-            .map_err(database)?;
+        table.insert(job_id, encoded.as_slice()).map_err(database)?;
         drop(table);
         append_event(
             &write,
@@ -2231,7 +2775,10 @@ impl TestdStore {
             serde_json::from_slice::<TestJob>(value.value())
                 .map_err(|error| TestdError::Corrupt(error.to_string()))?
         };
-        let terminal = matches!(job.state, JobState::Succeeded | JobState::Failed | JobState::Cancelled);
+        let terminal = matches!(
+            job.state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        );
         let Some(binding) = job.verifier_dispatch.as_ref() else {
             return Err(TestdError::InvalidBinding);
         };
@@ -2243,7 +2790,10 @@ impl TestdStore {
         if !terminal
             || job.lease.is_some()
             || job.process.generation != generation
-            || !job.process.authority_epoch.is_same_authority(authority_epoch)
+            || !job
+                .process
+                .authority_epoch
+                .is_same_authority(authority_epoch)
             || job.process.operation_id.as_str() != operation_id
             || verification_receipt_sha256(receipt)? != receipt_sha256
         {
@@ -2260,12 +2810,10 @@ impl TestdStore {
             committed_receipt_json: None,
         });
         job.updated_at_ms = now;
-        let encoded = serde_json::to_vec(&job)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         let mut table = write.open_table(JOBS).map_err(database)?;
-        table
-            .insert(job_id, encoded.as_slice())
-            .map_err(database)?;
+        table.insert(job_id, encoded.as_slice()).map_err(database)?;
         drop(table);
         append_event(
             &write,
@@ -2316,6 +2864,71 @@ impl TestdStore {
         Ok(pending)
     }
 
+    /// Returns complete, identity-joined productive terminal evidence for
+    /// the daemon's governed verifier-fact publisher. Every entry must still
+    /// be pending its canonical WriteReceipt; worker exit alone is excluded.
+    pub fn pending_terminal_completion_evidence(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<TestdTerminalCompletionEvidence>, TestdError> {
+        if limit == 0 || limit > 64 {
+            return Err(TestdError::Invalid {
+                field: "terminal_publication.limit",
+                reason: "must be between one and 64",
+            });
+        }
+        let read = self.database.begin_read().map_err(database)?;
+        let jobs = read.open_table(JOBS).map_err(database)?;
+        let identities = read.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+        let mut pending = Vec::new();
+        for item in jobs.iter().map_err(database)? {
+            let (key, value) = item.map_err(database)?;
+            let job: TestJob = serde_json::from_slice(value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if job.job_id != key.value() {
+                return Err(corrupt("durable job key conflicts with record"));
+            }
+            let Some(publication) = job.terminal_publication.as_ref() else {
+                continue;
+            };
+            if publication.committed_receipt_json.is_some()
+                || !matches!(
+                    job.state,
+                    JobState::Succeeded | JobState::Failed | JobState::Cancelled
+                )
+                || job.lease.is_some()
+            {
+                continue;
+            }
+            let Some(binding) = job.verifier_dispatch.as_ref() else {
+                continue;
+            };
+            binding.validate_for_job(&job)?;
+            let Some(identity_value) = identities.get(job.job_id.as_str()).map_err(database)?
+            else {
+                continue;
+            };
+            let request_identity: RequestIdentity = serde_json::from_slice(identity_value.value())
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            if request_identity != binding.request_identity
+                || verification_receipt_sha256(
+                    job.verification_receipt
+                        .as_ref()
+                        .ok_or(TestdError::InvalidBinding)?,
+                )? != publication.receipt_sha256
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+            pending.push(TestdTerminalCompletionEvidence {
+                job,
+                request_identity,
+            });
+        }
+        pending.sort_by(|left, right| left.job.job_id.cmp(&right.job.job_id));
+        pending.truncate(limit);
+        Ok(pending)
+    }
+
     /// Stores the exact serialized canonical WriteReceipt after the daemon
     /// publisher has returned from its committed owner boundary.
     pub fn record_terminal_publication_receipt(
@@ -2337,7 +2950,8 @@ impl TestdStore {
         }
         let receipt_value: serde_json::Value = serde_json::from_str(&committed_receipt_json)
             .map_err(|_| TestdError::InvalidBinding)?;
-        let canonical = canonical_json_bytes(&receipt_value).map_err(|_| TestdError::InvalidBinding)?;
+        let canonical =
+            canonical_json_bytes(&receipt_value).map_err(|_| TestdError::InvalidBinding)?;
         if String::from_utf8(canonical.clone()).map_err(|_| TestdError::InvalidBinding)?
             != committed_receipt_json
         {
@@ -2368,12 +2982,10 @@ impl TestdStore {
         }
         publication.committed_receipt_json = Some(committed_receipt_json);
         job.updated_at_ms = now;
-        let encoded = serde_json::to_vec(&job)
-            .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+        let encoded =
+            serde_json::to_vec(&job).map_err(|error| TestdError::Corrupt(error.to_string()))?;
         let mut table = write.open_table(JOBS).map_err(database)?;
-        table
-            .insert(job_id, encoded.as_slice())
-            .map_err(database)?;
+        table.insert(job_id, encoded.as_slice()).map_err(database)?;
         drop(table);
         append_event(
             &write,
@@ -2400,8 +3012,33 @@ impl TestdStore {
         priority: i32,
         at_ms: u64,
     ) -> Result<TestJob, TestdError> {
-        let job_id = job_id.into();
-        let project_id = project_id.into();
+        self.submit_inner(
+            job_id.into(),
+            project_id.into(),
+            invocation,
+            permit,
+            target_roots,
+            priority,
+            at_ms,
+            None,
+        )
+    }
+
+    /// Shared transaction for legacy submissions and authenticated productive
+    /// submissions. When identity is present, the job row and its exact
+    /// authenticated RequestIdentity become visible in the same redb commit.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_inner(
+        &self,
+        job_id: String,
+        project_id: String,
+        invocation: InstrumentInvocation,
+        permit: ProcessAdmissionPermit,
+        target_roots: TargetRoots,
+        priority: i32,
+        at_ms: u64,
+        identity: Option<RequestIdentity>,
+    ) -> Result<TestJob, TestdError> {
         validate_text(&job_id, "job_id")?;
         validate_text(&project_id, "project_id")?;
         invocation
@@ -2444,6 +3081,33 @@ impl TestdStore {
         {
             return Err(TestdError::InvalidBinding);
         }
+        if let Some(identity) = &identity {
+            identity
+                .validate()
+                .map_err(|_| TestdError::InvalidBinding)?;
+            let task_revision = identity
+                .request
+                .state_fence
+                .task_revision
+                .as_ref()
+                .map(|revision| revision.value());
+            if invocation.profile != TESTD_PRODUCTIVE_PROFILE
+                || identity.request.metadata.task_id.is_none()
+                || task_revision.is_none_or(|revision| revision == 0)
+                || identity.request.metadata != invocation.request
+                || identity.request.state_fence != invocation.request.state_fence
+                || job_id != process.job_id().as_str()
+                || process.operation_id().as_str() != invocation.request.request_id.as_str()
+                || !process
+                    .fence()
+                    .authority_epoch()
+                    .is_same_authority(&identity.request.state_fence.authority_epoch)
+                || process.generation().get()
+                    != identity.request.state_fence.resource_generation.value()
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
         let mut target_roots = target_roots;
         target_roots.allowed_contour_root = grant.contour_root.clone();
         target_roots.validate()?;
@@ -2458,9 +3122,65 @@ impl TestdStore {
                 .map(|value| serde_json::from_slice::<TestJob>(value.value()))
         };
         if let Some(existing) = existing {
-            let existing = existing.map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            let mut existing = existing.map_err(|error| TestdError::Corrupt(error.to_string()))?;
             if existing.payload_digest != digest {
                 return Err(TestdError::JobConflict(job_id));
+            }
+            if let Some(identity) = identity {
+                let retained = {
+                    let table = write.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+                    table
+                        .get(job_id.as_str())
+                        .map_err(database)?
+                        .map(|value| serde_json::from_slice::<RequestIdentity>(value.value()))
+                        .transpose()
+                        .map_err(|error| TestdError::Corrupt(error.to_string()))?
+                };
+                match retained {
+                    Some(retained) if retained == identity => return Ok(existing),
+                    Some(_) => return Err(TestdError::JobConflict(job_id)),
+                    None => {
+                        if existing.state != JobState::Queued
+                            || existing.attempts != 0
+                            || existing.lease.is_some()
+                            || existing.verifier_dispatch.is_some()
+                        {
+                            return Err(TestdError::InvalidBinding);
+                        }
+                        {
+                            let mut table =
+                                write.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+                            let encoded = serde_json::to_vec(&identity)
+                                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                            table
+                                .insert(job_id.as_str(), encoded.as_slice())
+                                .map_err(database)?;
+                        }
+                        existing.updated_at_ms = at_ms;
+                        {
+                            let encoded = serde_json::to_vec(&existing)
+                                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+                            let mut table = write.open_table(JOBS).map_err(database)?;
+                            table
+                                .insert(job_id.as_str(), encoded.as_slice())
+                                .map_err(database)?;
+                        }
+                        append_event(
+                            &write,
+                            &existing,
+                            Some(JobState::Queued),
+                            JobState::Queued,
+                            "authenticated-request-identity",
+                            at_ms,
+                            Some(
+                                "request identity retained from authenticated Kernel frame"
+                                    .to_owned(),
+                            ),
+                        )?;
+                        write.commit().map_err(database)?;
+                        return Ok(existing);
+                    }
+                }
             }
             return Ok(existing);
         }
@@ -2509,9 +3229,62 @@ impl TestdStore {
             .insert(job_id.as_str(), encoded.as_slice())
             .map_err(database)?;
         drop(table);
+        let has_identity = identity.is_some();
+        if let Some(identity) = identity {
+            let encoded = serde_json::to_vec(&identity)
+                .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+            let mut table = write.open_table(ADMITTED_IDENTITIES).map_err(database)?;
+            table
+                .insert(job_id.as_str(), encoded.as_slice())
+                .map_err(database)?;
+            drop(table);
+        }
         append_event(&write, &job, None, JobState::Queued, "submit", at_ms, None)?;
+        if has_identity {
+            append_event(
+                &write,
+                &job,
+                Some(JobState::Queued),
+                JobState::Queued,
+                "authenticated-request-identity",
+                at_ms,
+                Some("request identity retained from authenticated Kernel frame".to_owned()),
+            )?;
+        }
         write.commit().map_err(database)?;
         Ok(job)
+    }
+
+    /// Kernel-owner productive submission. The one-shot process permit is
+    /// consumed into the durable job, then the authenticated frame identity
+    /// is retained before the job can be returned to a dispatch poller.
+    pub fn submit_productive_verifier(
+        &self,
+        submission: TestdVerifierJobSubmission,
+        identity: RequestIdentity,
+        permit: ProcessAdmissionPermit,
+        now: u64,
+    ) -> Result<TestJob, TestdError> {
+        submission.validate()?;
+        identity
+            .validate()
+            .map_err(|_| TestdError::InvalidBinding)?;
+        if now == 0
+            || identity.request.metadata != submission.invocation.request
+            || identity.request.state_fence != submission.invocation.request.state_fence
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        self.submit_inner(
+            submission.job_id,
+            submission.project_id,
+            submission.invocation,
+            permit,
+            submission.target_roots,
+            submission.priority,
+            now,
+            Some(identity),
+        )
     }
 
     /// Claims the oldest ready head of a project, with priority as a tie-breaker.
@@ -3309,11 +4082,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Hashes the canonical durable finish receipt used by the authenticated
 /// TestD terminal notification.
-pub fn verification_receipt_sha256(
-    receipt: &VerificationReceipt,
-) -> Result<String, TestdError> {
-    let bytes = canonical_json_bytes(receipt)
-        .map_err(|error| TestdError::Corrupt(error.to_string()))?;
+pub fn verification_receipt_sha256(receipt: &VerificationReceipt) -> Result<String, TestdError> {
+    let bytes =
+        canonical_json_bytes(receipt).map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(sha256_hex(&bytes))
 }
 
