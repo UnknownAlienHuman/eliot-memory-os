@@ -329,6 +329,26 @@ pub enum ExhaustionDisposition {
     CostAndQuotaExceeded { window_ids: Vec<String> },
 }
 
+impl ExhaustionDisposition {
+    /// Whether this Governor-issued disposition refuses new paid work (issue #1912 W3).
+    ///
+    /// Pure predicate over the already-accounted disposition: only
+    /// [`Self::WithinEnvelope`] permits new paid starts; every exceeded leg
+    /// refuses. Mints no ledger and re-derives no usage: the [`BudgetLedger`]
+    /// already accounts committed plus capacity-holding reservations into
+    /// this value, and the worker contour refuses against the owner's
+    /// verdict rather than re-accounting cost locally (A14.7).
+    #[must_use]
+    pub fn refuses_new_paid_work(&self) -> bool {
+        match self {
+            Self::WithinEnvelope => false,
+            Self::CostExceeded
+            | Self::QuotaExceeded { .. }
+            | Self::CostAndQuotaExceeded { .. } => true,
+        }
+    }
+}
+
 /// Request to reserve budget for one exact canonical operation and route.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReservationRequest {
@@ -496,6 +516,19 @@ impl BudgetLedger {
             self.committed_quota_units,
             self.reserved_quota_units,
         )
+    }
+
+    /// Whether the ledger's current checked disposition refuses new paid work
+    /// (issue #1912 W3).
+    ///
+    /// Governor-side accounting predicate: reads the single [`BudgetLedger`]
+    /// disposition (committed plus capacity-holding reservations) and reports
+    /// whether the owner must refuse new paid starts. Creates no second
+    /// ledger and takes no reservation: callers refuse against this verdict
+    /// instead of spending budget the owner already exhausted.
+    pub fn refuses_new_paid_work(&self) -> Result<bool, BudgetError> {
+        self.exhaustion_disposition()
+            .map(|disposition| disposition.refuses_new_paid_work())
     }
 
     /// Stages an inactive reservation, or returns the exact prior receipt on an
