@@ -111,8 +111,13 @@
 //! staged payload keeps a durable [`eliot_ors::RecoveryProblem`] and stays
 //! available for disposition; nothing is decoded, re-hashed, defaulted to
 //! plaintext, or deleted, and an unresolved reservation is never retried or
-//! force-released. It runs whether or not a producer exists, because the ORS
-//! rows it reads outlive the process that wrote them.
+//! force-released. The producer is the live canonical write route: the Kernel
+//! Store `apply` route in `bins/eliot-kernel/src/daemon_request_dispatch.rs`
+//! observes the exact ordering heads, calls [`gateway_seed`], and enters
+//! `KernelStoreGateway::apply_reserved`, so the envelopes this pass enumerates
+//! are the ones the product actually stages. The pass still outlives the
+//! process that wrote them: a crash after staging and before the receipt leaves
+//! exactly these rows for it.
 //!
 //! ## Send ordering (no orphaned tokens)
 //!
@@ -144,9 +149,9 @@ use eliot_ors::{
     CanonicalDisposition, CanonicalReconciliation, CanonicalScopeObservation, EpochIdentity,
     EpochLineage, ExpectedOrderingHead, OpaqueLabel, OperationIdentity as OrsOperationIdentity,
     OperationalRecoveryStore, RecoveryAccessClass, RecoveryCursor, RecoveryEnvelopeContext,
-    RecoveryOwner, RecoveryPage, RecoveryPayloadEnvelope, RedbRecoveryStore, ReservationRecord,
-    ReservationRequest, ReservationState, ScopeReservationRequest, StateFenceSnapshot,
-    WriterReservationToken,
+    RecoveryOwner, RecoveryPage, RecoveryPayload, RecoveryPayloadEnvelope, RecoveryWriteBinding,
+    RedbRecoveryStore, ReservationRecord, ReservationRequest, ReservationState,
+    ScopeReservationRequest, StateFenceSnapshot, WriterReservationToken,
 };
 use eliot_platform::SecretReference;
 use eliot_receipts::ReceiptDispositionKind;
@@ -431,11 +436,25 @@ pub struct ReservationSeed {
     pub key_name: String,
     /// Visibility label preserved without interpretation.
     pub visibility: String,
-    /// Owner creation time in Unix milliseconds.
+    /// Owner creation time in Unix milliseconds. Read from the request's own
+    /// admitted clock observation, never from a fresh wall read at the call
+    /// site, so the staged time and the time the request was admitted under are
+    /// the same fact.
     pub created_at_ms: i64,
     /// Owner known time in Unix milliseconds; must not precede creation.
     pub known_at_ms: i64,
-    /// Owner expiry time in Unix milliseconds; must follow creation.
+    /// Owner cleanup horizon in Unix milliseconds; must follow creation.
+    ///
+    /// `I5.2` bounds this value's MEANING and not its length: "`expires_at` is
+    /// a cleanup horizon only after a terminal reconciliation/disposition;
+    /// unresolved operations, unknown external effects and active checkpoints
+    /// cannot expire automatically." The structural owner of that rule is ORS,
+    /// which refuses a nonterminal expiry outright (`OrsError::UnsafeExpiry` in
+    /// `RedbRecoveryStore::expire`), so whatever ordered time the caller
+    /// supplies, an unresolved reservation can never be dropped by the clock
+    /// here. No document names a duration, so a composition with no
+    /// owner-measured retention deadline supplies the encoding of "no
+    /// automatic horizon" and reserves nothing extra.
     pub expires_at_ms: i64,
     /// Complete observed head set covering the admitted transition scopes.
     pub heads: Vec<ObservedHead>,
@@ -708,6 +727,84 @@ fn admitted_instruction_taint(transition: &PreparedTransition) -> InstructionTai
         .unwrap_or(InstructionTaint::CommandLike)
 }
 
+/// Binds the admitted write identity of one staged canonical write to the
+/// envelope that stages it (I5.2 `operation_or_checkpoint_id`, I5.5 envelope
+/// identity, I5.6 step 13).
+///
+/// The retained identity is the same triple an exact replay and a startup
+/// read-back resolve by: the admitted `operation_id` (the envelope key, read
+/// back off the envelope rather than restated), the admitted `idempotency_key`
+/// whose hash ORS keys its write-idempotency index by, and the stable
+/// `write_intent_id` that survives a typed correction. ORS requires this
+/// binding on a canonical write reservation — `ReservationRequest::validate`
+/// and `persist_new_reservation` both fail closed without it — so an envelope
+/// that stages a canonical write and omits it is not stageable at all.
+///
+/// Every value the envelope already recorded is read back off that envelope:
+/// its contract version, operation key, access aggregate, epoch lineage, fence
+/// snapshot, retention times, and the protected payload's own recorded digest,
+/// length and key reference. No digest is recomputed here and no identity is
+/// invented: `RecoveryPayloadEnvelope::with_write_binding` re-runs the owner's
+/// `validate` over the joined value, so a binding that disagrees with the
+/// envelope it names is refused before `stage_and_reserve`.
+fn admitted_write_binding(
+    envelope: &RecoveryPayloadEnvelope,
+    transition: &PreparedTransition,
+    transition_digest: &str,
+) -> Result<RecoveryWriteBinding, ReservationWriteError> {
+    let operation_id = transition.identity.operation_id.as_str().to_owned();
+    let admission = |detail: String| ReservationWriteError::Admission {
+        operation_id: operation_id.clone(),
+        detail,
+    };
+    let RecoveryPayload::Encrypted { key, .. } = &envelope.payload else {
+        return Err(admission(
+            "a canonical write reservation must stage its encrypted payload".to_owned(),
+        ));
+    };
+    Ok(RecoveryWriteBinding {
+        write_envelope_protocol_version: transition.write_envelope_protocol_version,
+        recovery_envelope_contract_version: envelope.contract_version,
+        recovery_access_class: envelope.privacy_and_visibility_class.clone(),
+        payload_created_at_ms: envelope.created_at_ms,
+        payload_known_at_ms: envelope.known_at_ms,
+        payload_expires_at_ms: envelope.expires_at_ms,
+        operation_id: envelope.operation_or_checkpoint_id.clone(),
+        write_intent_id: OpaqueLabel::new(transition.write_intent_id.as_str()).map_err(|error| {
+            admission(format!("admitted write intent is not a usable label: {error}"))
+        })?,
+        idempotency_key: OpaqueLabel::new(transition.identity.idempotency_key.as_str()).map_err(
+            |error| admission(format!("admitted idempotency key is not a usable label: {error}")),
+        )?,
+        canonical_request_sha256: transition.identity.canonical_request_hash.clone(),
+        prepared_transition_sha256: transition_digest.to_owned(),
+        ordering_scopes: transition
+            .ordering_scopes
+            .iter()
+            .map(|scope| {
+                OpaqueLabel::new(scope.as_str()).map_err(|error| {
+                    admission(format!(
+                        "admitted ordering scope {} is not a usable label: {error}",
+                        scope.as_str()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        admission_contract_set_digest: transition.admission_contract_set_digest.clone(),
+        operation_manifest_digest: OpaqueLabel::new(transition.operation_manifest_digest.as_str())
+            .map_err(|error| {
+                admission(format!(
+                    "admitted operation-manifest digest is not a usable label: {error}"
+                ))
+            })?,
+        authority_epoch: envelope.authority_epoch.clone(),
+        state_fence: envelope.state_fence.clone(),
+        protected_payload_sha256: envelope.payload_sha256.clone(),
+        protected_payload_length: envelope.payload_length,
+        payload_key_reference: key.clone(),
+    })
+}
+
 /// Atomically reserves every admitted scope through the actual ORS operation,
 /// or none.
 ///
@@ -728,6 +825,15 @@ fn admitted_instruction_taint(transition: &PreparedTransition) -> InstructionTai
 /// composition's fixed staging floor, not a per-transition admitted class —
 /// [`eliot_security_contracts::PrivacyClass`] declares no severity order, so no
 /// reduction over the admitted per-source classes is derivable here.
+///
+/// The staged envelope also carries the admitted write identity
+/// ([`admitted_write_binding`]): operation id, idempotency key, write intent,
+/// canonical request digest, prepared-transition digest, complete ordering-scope
+/// set, admission contract-set digest, operation-manifest identity, the bound
+/// epoch/fence, and the protected payload's own recorded digest, length and key
+/// reference. That binding is what makes the staged record a recoverable
+/// canonical write rather than opaque bytes, and it is the identity ORS indexes
+/// so an exact retry or a startup read-back reconciles to this same operation.
 pub fn reserve_for_transition(
     owner: &CompositionReservation,
     seed: &ReservationSeed,
@@ -792,7 +898,19 @@ pub fn reserve_for_transition(
         seed.payload_bytes.clone(),
     )
     .map_err(ReservationWriteError::Ors)?;
+    // The staged envelope must carry the admitted write identity beside its
+    // opaque bytes: `ReservationRequest::validate` refuses a canonical write
+    // reservation whose envelope has no `write_binding`, and ORS keys its
+    // write-idempotency index by that binding's admitted `idempotency_key`, so
+    // an exact retry and a startup read-back resolve to this same operation.
+    // The binding is built from the envelope's OWN recorded values and the
+    // admitted transition, and `with_write_binding` re-runs the owner's own
+    // `validate` over the joined pair before `stage_and_reserve` is reached.
     let transition_digest = prepared_transition_digest(transition)?;
+    let write_binding = admitted_write_binding(&envelope, transition, &transition_digest)?;
+    let envelope = envelope
+        .with_write_binding(write_binding)
+        .map_err(ReservationWriteError::Ors)?;
     let mut scopes: Vec<ScopeReservationRequest> = seed
         .heads
         .iter()
@@ -1375,19 +1493,13 @@ pub fn recovery_page(
 /// never downgrades the envelope to the root-transition-only
 /// `RecoveryPayload::CanonicalRequest` variant.
 ///
-/// This producer has no production caller, and that is recorded rather than
-/// worked around: the only route that consumes a seed is
-/// `KernelStoreGateway::apply_reserved`, which no live route reaches, and
-/// `ReservationSeed { .. }` is constructed nowhere else in production. It is
-/// kept honest here so that when the reserved route becomes reachable the
-/// producer is already correct rather than a refusal. The four searched
-/// negatives that keep the route unreachable — the Store's uninstalled
-/// reserved-write execution generation, the unadvertised
-/// `CAPABILITY_RESERVED_WRITE`, the missing production source for
-/// [`ObservedHead::expected_head_digest`], and ORS's unbound
-/// `CanonicalEvidenceProvider` — are each cited with file and line at the live
-/// canonical write call site in
-/// `bins/eliot-kernel/src/daemon_request_dispatch.rs`.
+/// This producer is called on the live canonical write route: the Kernel Store
+/// `apply` route in `bins/eliot-kernel/src/daemon_request_dispatch.rs` builds
+/// the observed head set through
+/// `KernelStoreGateway::observe_reserved_write_heads` and hands the result here
+/// before entering `KernelStoreGateway::apply_reserved`, which is the only
+/// consumer of a seed. `ReservationSeed { .. }` is constructed nowhere else in
+/// production, so this function remains the single payload producer.
 pub fn gateway_seed(
     platform: &eliot_platform_windows::WindowsPlatform,
     transition: &PreparedTransition,
