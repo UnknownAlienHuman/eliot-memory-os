@@ -39,6 +39,8 @@ pub const TEST_PROFILE: &str = "test";
 pub const BUILTIN_PROFILE_REVISION: u64 = 1;
 /// Stable wire name of the package verification route.
 pub const PACKAGE_VERIFICATION_ROUTE: &str = "package-verification";
+/// Stable wire name of the package-scoped compile-only verification route.
+pub const PACKAGE_VERIFICATION_COMPILE_ONLY_ROUTE: &str = "package-verification-compile-only";
 /// Stable wire name of the bundle verification route.
 pub const BUNDLE_VERIFICATION_ROUTE: &str = "bundle-verification";
 /// Spec revision shipped for every builtin [`InstrumentSpec`].
@@ -1253,6 +1255,50 @@ pub fn package_verification_profile() -> Result<InstrumentProfile, ProfileError>
     )
 }
 
+/// Builds the package-scoped compile-only profile used by Quick and
+/// MergeCompile. The closed graph binds the admitted Cargo build and format
+/// specs only; it contains no test or nextest stage.
+///
+/// # Errors
+///
+/// Returns [`ProfileError`] when a builtin literal fails validation or the
+/// declared graph is not a DAG.
+pub fn package_verification_compile_only_profile() -> Result<InstrumentProfile, ProfileError> {
+    let dag = StageDag::build(
+        PACKAGE_VERIFICATION_COMPILE_ONLY_ROUTE,
+        vec![
+            StageDecl::new(
+                "package-compile".to_owned(),
+                ContractId::new(CARGO_CONTRACT_NAME)?,
+                InstrumentKind::Build,
+                Vec::new(),
+                true,
+                true,
+            )?,
+            StageDecl::new(
+                "package-format".to_owned(),
+                ContractId::new(RUSTFMT_INSTRUMENT)?,
+                InstrumentKind::Format,
+                Vec::new(),
+                true,
+                true,
+            )?,
+        ],
+    )?;
+    InstrumentProfile::new(
+        PACKAGE_VERIFICATION_COMPILE_ONLY_ROUTE.to_owned(),
+        BUILTIN_PROFILE_REVISION,
+        BUILTIN_SPEC_VERSION,
+        vec![InstrumentKind::Build, InstrumentKind::Format],
+        dag,
+        ProfileScopeClasses::new(
+            ADMITTED_WORKTREE_CLASS.to_owned(),
+            ISOLATED_PROCESS_CLASS.to_owned(),
+            ADMITTED_SCOPE_CLASS.to_owned(),
+        )?,
+    )
+}
+
 /// Builds the versioned `bundle-verification` profile (issue #1914 W1).
 ///
 /// I18.21's parity contract makes the local and the CI result of one named
@@ -1316,6 +1362,8 @@ pub fn bundle_verification_profile() -> Result<InstrumentProfile, ProfileError> 
 /// carries no command, no shell string, no executable path, and no environment
 /// selection: it names exactly one admitted profile revision and nothing else.
 pub const PACKAGE_VERIFICATION_ALIAS: &str = "package-verification";
+/// Alias naming the package-scoped compile-only route at its shipped revision.
+pub const PACKAGE_VERIFICATION_COMPILE_ONLY_ALIAS: &str = "package-verification-compile-only";
 /// Alias naming the bundle-verification route at its shipped revision.
 pub const BUNDLE_VERIFICATION_ALIAS: &str = "bundle-verification";
 
@@ -1342,7 +1390,7 @@ pub struct ProfileAlias {
 ///
 /// The table is a `const` slice of a fixed element type, so it cannot grow at
 /// runtime, take caller data, or be extended by a stringly-typed lookup. It
-/// admits exactly the two versioned verification routes and nothing else: an
+/// admits exactly the three versioned verification routes and nothing else: an
 /// alias outside this slice is refused with
 /// [`ProfileError::UnknownAlias`], never normalized, trimmed, case-folded, or
 /// mapped to a neighbouring route. There is no default alias and no
@@ -1353,6 +1401,11 @@ pub const PROFILE_ALIASES: &[ProfileAlias] = &[
     ProfileAlias {
         alias: PACKAGE_VERIFICATION_ALIAS,
         profile: PACKAGE_VERIFICATION_ROUTE,
+        revision: BUILTIN_PROFILE_REVISION,
+    },
+    ProfileAlias {
+        alias: PACKAGE_VERIFICATION_COMPILE_ONLY_ALIAS,
+        profile: PACKAGE_VERIFICATION_COMPILE_ONLY_ROUTE,
         revision: BUILTIN_PROFILE_REVISION,
     },
     ProfileAlias {
@@ -1520,9 +1573,10 @@ impl InstrumentRegistry {
     /// verification routes of issue #1914.
     ///
     /// This is the one registry a local entrypoint and CI both admit, so the
-    /// `package-verification` and `bundle-verification` routes resolve to the
-    /// same exact revision, digest, and stage DAG on either side. A route that
-    /// is missing here is missing on both sides together, never only in CI.
+    /// `package-verification`, `package-verification-compile-only`, and
+    /// `bundle-verification` routes resolve to the same exact revision, digest,
+    /// and stage DAG on either side. A route that is missing here is missing
+    /// on both sides together, never only in CI.
     ///
     /// `receipts` are the caller-attested executable supply-chain receipts.
     /// A receipt is validated against the admitted spec digest at exactly this
@@ -1548,6 +1602,7 @@ impl InstrumentRegistry {
                 compiler_profile()?,
                 test_profile()?,
                 package_verification_profile()?,
+                package_verification_compile_only_profile()?,
                 bundle_verification_profile()?,
             ],
             generation,
@@ -2099,6 +2154,131 @@ impl<'a> InstrumentProfileResolver<'a> {
             registry_digest,
             resolution_digest,
         })
+    }
+}
+
+#[cfg(test)]
+mod compile_only_profile_tests {
+    use super::*;
+
+    // WORK_UNIT_CASE: 1914/V2/profile-positive
+    // ACCEPTANCE_CASE: Quick/MergeCompile route to a closed Build+Format graph.
+    #[test]
+    fn compile_only_alias_resolves_exact_build_and_format_graph() {
+        let registry = InstrumentRegistry::with_verification_route_profiles(1, Vec::new())
+            .expect("builtin verification registry should admit its routes");
+        let profile = admitted_profile_for_alias(
+            PACKAGE_VERIFICATION_COMPILE_ONLY_ALIAS,
+            &registry,
+        )
+        .expect("the compile-only alias should resolve its admitted revision");
+
+        assert_eq!(profile.name, PACKAGE_VERIFICATION_COMPILE_ONLY_ROUTE);
+        assert_eq!(profile.revision, BUILTIN_PROFILE_REVISION);
+        assert_eq!(profile.spec_revision, BUILTIN_SPEC_VERSION);
+        assert_eq!(profile.kinds.len(), 2);
+        assert!(profile.admits_kind(InstrumentKind::Build));
+        assert!(profile.admits_kind(InstrumentKind::Format));
+        assert!(!profile.admits_kind(InstrumentKind::Test));
+
+        let stages: Vec<_> = profile.dag.iter().collect();
+        assert_eq!(
+            stages
+                .iter()
+                .map(|stage| stage.stage_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["package-compile", "package-format"]
+        );
+        let compile = stages
+            .iter()
+            .find(|stage| stage.stage_id == "package-compile")
+            .expect("compile stage should be present");
+        assert_eq!(compile.spec.as_str(), CARGO_CONTRACT_NAME);
+        assert_eq!(compile.kind, InstrumentKind::Build);
+        assert!(compile.required && compile.external);
+        assert!(compile.depends_on.is_empty());
+
+        let format = stages
+            .iter()
+            .find(|stage| stage.stage_id == "package-format")
+            .expect("format stage should be present");
+        assert_eq!(format.spec.as_str(), RUSTFMT_INSTRUMENT);
+        assert_eq!(format.kind, InstrumentKind::Format);
+        assert!(format.required && format.external);
+        assert!(format.depends_on.is_empty());
+
+        let compiled = ProfileCompiler::new(&registry)
+            .compile_exact(&profile.name, profile.revision)
+            .expect("the closed route should compile against its admitted builtin specs");
+        let compiled_build = compiled
+            .stages
+            .iter()
+            .find(|stage| stage.stage_id == "package-compile")
+            .expect("the compiled route should retain its build stage");
+        assert_eq!(compiled_build.profile_revision, BUILTIN_PROFILE_REVISION);
+        assert_eq!(compiled_build.spec.as_str(), CARGO_CONTRACT_NAME);
+        assert_eq!(compiled_build.executable, "cargo");
+        assert_eq!(compiled_build.schema.as_str(), CARGO_CONTRACT_NAME);
+        assert_eq!(
+            compiled_build.verification_command,
+            vec![
+                "build".to_owned(),
+                "--message-format=json".to_owned(),
+                "--locked".to_owned(),
+                "--all-targets".to_owned(),
+            ]
+        );
+        let compiled_format = compiled
+            .stages
+            .iter()
+            .find(|stage| stage.stage_id == "package-format")
+            .expect("the compiled route should retain its format stage");
+        assert_eq!(compiled_format.profile_revision, BUILTIN_PROFILE_REVISION);
+        assert_eq!(compiled_format.spec.as_str(), RUSTFMT_INSTRUMENT);
+        assert_eq!(compiled_format.executable, "cargo");
+        assert_eq!(compiled_format.schema.as_str(), RUSTFMT_INSTRUMENT);
+        assert_eq!(
+            compiled_format.verification_command,
+            vec![
+                "fmt".to_owned(),
+                "--all".to_owned(),
+                "--".to_owned(),
+                "--check".to_owned(),
+            ]
+        );
+        let compiled_stages: Vec<_> = compiled.stages.iter().collect();
+        assert_eq!(compiled_stages.len(), 2);
+        assert!(compiled_stages.iter().all(|stage| stage.stage_id != "package-test"));
+
+        let review = registry
+            .admitted(PACKAGE_VERIFICATION_ROUTE, BUILTIN_PROFILE_REVISION)
+            .expect("the stronger Review route should remain admitted");
+        assert!(review.admits_kind(InstrumentKind::Test));
+        let review_test = review
+            .dag
+            .iter()
+            .find(|stage| stage.stage_id == "package-test")
+            .expect("Review should retain its package-test stage");
+        assert_eq!(review_test.spec.as_str(), NEXTEST_INSTRUMENT);
+    }
+
+    // WORK_UNIT_CASE: 1914/V2/profile-refusal
+    // ACCEPTANCE_CASE: the closed alias table refuses a case-mismatched name.
+    #[test]
+    fn compile_only_alias_refuses_unlisted_name() {
+        let registry = InstrumentRegistry::with_verification_route_profiles(1, Vec::new())
+            .expect("builtin verification registry should admit its routes");
+        let error = admitted_profile_for_alias(
+            "Package-verification-compile-only",
+            &registry,
+        )
+        .expect_err("the closed alias lookup must not normalize caller text");
+
+        assert!(matches!(
+            error,
+            ProfileError::UnknownAlias { alias }
+                if alias == "Package-verification-compile-only"
+        ));
     }
 }
 

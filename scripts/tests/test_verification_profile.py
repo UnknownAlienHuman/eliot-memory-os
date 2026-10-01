@@ -27,6 +27,7 @@ contracts; all other cases are unchanged.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -432,6 +433,16 @@ function Get-StrVal([object]$node) {
     }
     return $null
 }
+function Get-NumVal([object]$node) {
+    if ($node -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+        $node.Value -is [ValueType]) { return $node.Value }
+    if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) {
+        $inner = $node.PipelineElements[0].Expression
+        if ($inner -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+            $inner.Value -is [ValueType]) { return $inner.Value }
+    }
+    return $null
+}
 $tok = $null; $err = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('__PS_PATH__', [ref]$tok, [ref]$err)
 $rows = @()
@@ -457,7 +468,66 @@ if ($blocks.Count -gt 0) {
         $paramInfos += @{ name = $p.Name.VariablePath.UserPath; validateset = @($sets) }
     }
 }
-@{ errors = @($err).Count; params = $paramInfos; steps = $rows } | ConvertTo-Json -Depth 6 -Compress
+$routeAliasAssignments = @($ast.FindAll({
+    param($q)
+    $q -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $q.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+    $q.Left.VariablePath.UserPath -eq 'verificationRouteAliases' -and
+    $q.Right -is [System.Management.Automation.Language.HashtableAst]
+}, $true))
+$routeAliases = @{}
+if ($routeAliasAssignments.Count -eq 1) {
+    foreach ($kv in $routeAliasAssignments[0].Right.KeyValuePairs) {
+        $key = Get-StrVal $kv.Item1
+        $value = Get-StrVal $kv.Item2
+        if ($null -ne $key -and $null -ne $value) { $routeAliases[$key] = $value }
+    }
+}
+$routeRevisionAssignments = @($ast.FindAll({
+    param($q)
+    $q -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $q.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+    $q.Left.VariablePath.UserPath -eq 'verificationRouteRevisions' -and
+    $q.Right -is [System.Management.Automation.Language.HashtableAst]
+}, $true))
+$routeRevisions = @{}
+if ($routeRevisionAssignments.Count -eq 1) {
+    foreach ($kv in $routeRevisionAssignments[0].Right.KeyValuePairs) {
+        $key = Get-StrVal $kv.Item1
+        $value = Get-NumVal $kv.Item2
+        if ($null -ne $key -and $null -ne $value) { $routeRevisions[$key] = [long]$value }
+    }
+}
+$expectedRouteAssignments = @($ast.FindAll({
+    param($q)
+    $q -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $q.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+    $q.Left.VariablePath.UserPath -eq 'expectedRoute'
+}, $true))
+$expectedRouteSource = if ($expectedRouteAssignments.Count -eq 1) {
+    $expectedRouteAssignments[0].Right.Extent.Text
+} else { $null }
+$expectedRouteRevisionAssignments = @($ast.FindAll({
+    param($q)
+    $q -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $q.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+    $q.Left.VariablePath.UserPath -eq 'expectedRouteRevision'
+}, $true))
+$expectedRouteRevisionSource = if ($expectedRouteRevisionAssignments.Count -eq 1) {
+    $expectedRouteRevisionAssignments[0].Right.Extent.Text
+} else { $null }
+$routeGuardNodes = @($ast.FindAll({
+    param($q)
+    $q -is [System.Management.Automation.Language.IfStatementAst] -and
+    $q.Clauses.Count -gt 0 -and
+    $q.Clauses[0].Item1.Extent.Text -match 'profileReceipt\.profile'
+}, $true))
+$routeGuard = if ($routeGuardNodes.Count -eq 1) { $routeGuardNodes[0].Extent.Text } else { $null }
+@{ errors = @($err).Count; params = $paramInfos; steps = $rows;
+   route_aliases = $routeAliases; route_revisions = $routeRevisions;
+   expected_route_source = $expectedRouteSource;
+   expected_route_revision_source = $expectedRouteRevisionSource;
+   route_guard = $routeGuard } | ConvertTo-Json -Depth 6 -Compress
 """
 
 
@@ -486,6 +556,54 @@ def ps_profile_table(ps_path: pathlib.Path) -> dict:
     except OSError:
         pass
     return data
+
+
+def run_powershell_script(script: str) -> subprocess.CompletedProcess[str]:
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    return subprocess.run(["pwsh", "-NoProfile", "-EncodedCommand", encoded],
+                          cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=120)
+
+
+def isolated_clippy_gate_script(command: str, changed_path: str) -> str:
+    manifest = REPO_ROOT / "crates" / "sample-crate" / "Cargo.toml"
+    manifest_escaped = str(manifest).replace("'", "''")
+    metadata = json.dumps({"packages": [{
+        "name": "sample-crate",
+        "id": "sample-crate 0.1.0 (path+file:///fixture)",
+        "manifest_path": str(manifest),
+    }]})
+    metadata_b64 = base64.b64encode(metadata.encode("utf-8")).decode("ascii")
+    repo = str(REPO_ROOT).replace("'", "''")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$repoRoot = '{repo}'
+$script:verifyMetadataJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{metadata_b64}'))
+$script:verifyDenominatorWorkspacePackages = @([pscustomobject]@{{
+    package_id = 'sample-crate 0.1.0'
+    manifest_path = '{manifest_escaped}'
+    targets = @('lib:sample-crate')
+}})
+$script:verifyDenominatorStandaloneManifests = @('standalone/demo/Cargo.toml')
+$script:verifyDenominatorExcludedManifests = @('crates/excluded/Cargo.toml')
+$env:MERGE_COMPILE_BASE_SHA = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+$script:changedPath = '{changed_path}'
+function git {{
+    if ($args.Count -gt 0 -and $args[0] -eq 'diff') {{
+        $global:LASTEXITCODE = 0
+        return $script:changedPath
+    }}
+    throw "unexpected git invocation: $args"
+}}
+function cargo {{
+    [Console]::Out.WriteLine('MOCK_CARGO_ARGS:' + ($args -join '|'))
+    $global:LASTEXITCODE = 0
+}}
+$gateCommand = __GATE_COMMAND__
+$global:LASTEXITCODE = 0
+& $gateCommand
+[Console]::Out.WriteLine("GATE_EXIT=$LASTEXITCODE")
+"""
+    return script.replace("__GATE_COMMAND__", command)
 
 
 def parse_justfile(text: str) -> dict[str, dict[str, object]]:
@@ -1080,6 +1198,114 @@ class TestVerificationProfile(unittest.TestCase):
         self.assertIn("cargo fmt --check", cmd)
         self.assertIn("metadata.packages", cmd)
         self.assertIn("$batchSize", cmd)
+
+    # -- compile-only route and bounded MergeCompile Clippy -----------------
+    def test_1914_v2_route_positive(self) -> None:
+        # WORK_UNIT_CASE: 1914/V2/profile-positive
+        # ACCEPTANCE_CASE: Quick and MergeCompile select compile-only; Review keeps tests.
+        table = ps_profile_table(VERIFY_PS1)
+        self.assertEqual(table["errors"], 0)
+        self.assertEqual(table["route_aliases"], {
+            "Quick": "package-verification-compile-only",
+            "Review": "package-verification",
+            "MergeCompile": "package-verification-compile-only",
+        })
+        self.assertEqual(table["route_revisions"], {
+            "Quick": 1,
+            "Review": 1,
+            "MergeCompile": 1,
+        })
+        self.assertEqual(table["expected_route_source"], "$verificationRouteAlias")
+        self.assertEqual(table["expected_route_revision_source"], "$verificationRouteRevision")
+        self.assertIn("$profileReceipt.profile -cne $expectedRoute", table["route_guard"] or "")
+        self.assertIn("$profileReceipt.profile_revision", table["route_guard"] or "")
+
+        positive = f"""
+$ErrorActionPreference = 'Stop'
+$verificationRouteAlias = 'package-verification-compile-only'
+$verificationRouteRevision = [long]1
+$expectedRoute = $verificationRouteAlias
+$expectedRouteRevision = $verificationRouteRevision
+$profileReceipt = [pscustomobject]@{{ profile = 'package-verification-compile-only'; profile_revision = 1 }}
+{table['route_guard']}
+[Console]::Out.WriteLine('AFTER_ROUTE_GUARD')
+"""
+        accepted = run_powershell_script(positive)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr[-2000:])
+        self.assertIn("AFTER_ROUTE_GUARD", accepted.stdout)
+
+    def test_1914_v2_route_refuses_wrong_receipt(self) -> None:
+        # WORK_UNIT_CASE: 1914/V2/profile-refusal
+        # ACCEPTANCE_CASE: a receipt for Review cannot admit the compile-only alias.
+        table = ps_profile_table(VERIFY_PS1)
+        guard = table["route_guard"]
+        self.assertIsInstance(guard, str, "receipt route guard missing from verify.ps1")
+        refusal_cases = (
+            ("wrong-route", "package-verification", 1),
+            ("wrong-revision", "package-verification-compile-only", 2),
+        )
+        for case, route, revision in refusal_cases:
+            script = f"""
+$ErrorActionPreference = 'Stop'
+$verificationRouteAlias = 'package-verification-compile-only'
+$expectedRoute = $verificationRouteAlias
+$expectedRouteRevision = [long]1
+$profileReceipt = [pscustomobject]@{{ profile = '{route}'; profile_revision = {revision} }}
+{guard}
+[Console]::Out.WriteLine('AFTER_ROUTE_GUARD')
+"""
+            proc = run_powershell_script(script)
+            self.assertNotEqual(proc.returncode, 0, f"{case} receipt was accepted")
+            self.assertIn("VERIFY_PROFILE_ADMISSION_REFUSED", proc.stderr)
+            self.assertNotIn("AFTER_ROUTE_GUARD", proc.stdout)
+
+    def test_3004_v2_changed_package_clippy_positive(self) -> None:
+        # WORK_UNIT_CASE: 3004/MergeCompile/clippy-positive
+        # ACCEPTANCE_CASE: a proven changed package runs bounded Clippy with --no-deps.
+        table = ps_profile_table(VERIFY_PS1)
+        gate = next((r for r in table["steps"] if r["name"] == "cargo-clippy-changed"), None)
+        self.assertIsNotNone(gate, "changed-package Clippy gate missing from verify.ps1")
+        proc = run_powershell_script(
+            isolated_clippy_gate_script(gate["command"] or "", "crates/sample-crate/src/lib.rs"))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        receipt_line = next(
+            (line for line in proc.stdout.splitlines()
+             if line.startswith("VERIFY_DENOMINATOR_RECEIPT: ")), None)
+        self.assertIsNotNone(receipt_line, "bounded Clippy emitted no denominator receipt")
+        receipt = json.loads(receipt_line.split(": ", 1)[1])
+        self.assertEqual(receipt["clippy_scope"], "changed")
+        self.assertEqual([item["package_name"] for item in receipt["changed_package_selection"]],
+                         ["sample-crate"])
+        self.assertEqual(receipt["workspace_packages"][0]["package_id"], "sample-crate 0.1.0")
+        self.assertEqual(receipt["standalone_manifests"], ["standalone/demo/Cargo.toml"])
+        self.assertEqual(receipt["excluded_manifests"], ["crates/excluded/Cargo.toml"])
+        self.assertIn("VERIFY_CLIPPY_SELECTION: scope=changed package=sample-crate", proc.stdout)
+        self.assertIn(
+            "MOCK_CARGO_ARGS:clippy|--locked|-p|sample-crate|--all-targets|--no-deps",
+            proc.stdout,
+        )
+
+    def test_3004_v2_unprovable_clippy_scope_refuses(self) -> None:
+        # WORK_UNIT_CASE: 3004/MergeCompile/clippy-refusal
+        # ACCEPTANCE_CASE: an unmappable root change records denominators and launches no Clippy.
+        table = ps_profile_table(VERIFY_PS1)
+        gate = next((r for r in table["steps"] if r["name"] == "cargo-clippy-changed"), None)
+        self.assertIsNotNone(gate, "changed-package Clippy gate missing from verify.ps1")
+        proc = run_powershell_script(isolated_clippy_gate_script(gate["command"] or "", "README.md"))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        receipt_line = next(
+            (line for line in proc.stdout.splitlines()
+             if line.startswith("VERIFY_DENOMINATOR_RECEIPT: ")), None)
+        self.assertIsNotNone(receipt_line, "refused Clippy scope emitted no denominator receipt")
+        receipt = json.loads(receipt_line.split(": ", 1)[1])
+        self.assertEqual(receipt["clippy_scope"], "refused")
+        self.assertEqual(receipt["workspace_packages"][0]["package_id"], "sample-crate 0.1.0")
+        self.assertEqual(receipt["standalone_manifests"], ["standalone/demo/Cargo.toml"])
+        self.assertEqual(receipt["excluded_manifests"], ["crates/excluded/Cargo.toml"])
+        self.assertIn("VERIFY_CLIPPY_SELECTION_REFUSED", proc.stderr)
+        self.assertIn("GATE_EXIT=1", proc.stdout)
+        self.assertNotIn("MOCK_CARGO_ARGS:", proc.stdout,
+                         "unproven package scope launched Clippy")
 
 
 

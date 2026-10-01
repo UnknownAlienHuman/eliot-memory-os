@@ -250,8 +250,8 @@ $allGates = @(
             # warnings are reported, and this profile claims no workspace lint
             # cleanliness and uses no `-D warnings` oracle. Changed files map
             # to packages by longest manifest-directory prefix from locked
-            # metadata; root-wide inputs or an unmappable candidate widen the
-            # scope to the full workspace. The receipt records this same mapping.
+            # metadata. If the complete changed-package scope cannot be proven,
+            # the receipt records the failed mapping and Clippy is not launched.
             if ([string]::IsNullOrWhiteSpace($script:verifyMetadataJson)) {
                 $script:verifyMetadataJson = (cargo metadata --locked --no-deps --format-version 1 | Out-String)
             }
@@ -281,8 +281,8 @@ $allGates = @(
                 $clippyDiffRaw = (git diff --name-only $clippyBase HEAD | Out-String)
                 $clippyDiffExit = $LASTEXITCODE
                 if ($clippyDiffExit -ne 0) {
-                    $clippyRootWide += 'change-set command failed; widened to workspace'
-                    $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = 'change-set command failed; widened to workspace' }
+                    $clippyRootWide += 'change-set command failed; package selection unprovable'
+                    $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = 'change-set command failed; package selection unprovable' }
                 } else {
                     $clippyChanged = @($clippyDiffRaw -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
                     if ($clippyChanged.Count -eq 0) {
@@ -301,7 +301,7 @@ $allGates = @(
                         }
                         if ($null -eq $clippyMatched) {
                             $clippyRootWide += "root-wide input: $clippyFile"
-                            $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $clippyFile; reason = 'no workspace manifest-directory prefix matched; widened to workspace' }
+                            $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $clippyFile; reason = 'no workspace manifest-directory prefix matched; package selection unprovable' }
                         } else {
                             $clippyName = $clippyPackageByDir[$clippyMatched]
                             if (-not $clippySelected.ContainsKey($clippyName)) {
@@ -324,7 +324,7 @@ $allGates = @(
                 foreach ($clippyName in $clippyOrdered) {
                     $packageIds = @($clippyMetadata.packages | Where-Object { $_.name -eq $clippyName } | ForEach-Object { [string]$_.id } | Sort-Object)
                     if ($packageIds.Count -ne 1) {
-                        $fallbackReason = "selected package name '$clippyName' matched $($packageIds.Count) cargo metadata package IDs; widened to workspace"
+                        $fallbackReason = "selected package name '$clippyName' matched $($packageIds.Count) Cargo metadata package IDs; package selection unprovable"
                         $clippyRootWide += $fallbackReason
                         $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = $fallbackReason }
                         continue
@@ -336,9 +336,9 @@ $allGates = @(
                     }
                 }
             )
-            $clippyScope = if ($clippyRootWide.Count -gt 0 -or $clippySelected.Count -eq 0) { 'workspace' } else { 'changed' }
+            $clippyScope = if ($clippyRootWide.Count -gt 0 -or $clippySelected.Count -eq 0 -or $changedPackageSelection.Count -ne $clippySelected.Count) { 'refused' } else { 'changed' }
             if ($clippySelected.Count -eq 0) {
-                $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = 'no changed workspace package mapped; widened to workspace' }
+                $clippyRootWideInputs += [pscustomobject][ordered]@{ path = $null; reason = 'no changed workspace package mapped; package selection unprovable' }
             }
             $denominatorReceipt = [pscustomobject][ordered]@{
                 workspace_packages = @($script:verifyDenominatorWorkspacePackages)
@@ -352,14 +352,13 @@ $allGates = @(
             $receiptJson = $denominatorReceipt | ConvertTo-Json -Depth 8 -Compress
             [Console]::Out.WriteLine("VERIFY_DENOMINATOR_RECEIPT: $receiptJson")
 
-            if ($clippyRootWide.Count -gt 0 -or $clippySelected.Count -eq 0) {
+            if ($clippyScope -eq 'refused') {
                 foreach ($clippyReason in $clippyRootWide) {
-                    Write-Host "VERIFY_CLIPPY_SELECTION: scope=workspace reason=$clippyReason"
+                    Write-Host "VERIFY_CLIPPY_SELECTION: scope=refused reason=$clippyReason"
                 }
-                if ($clippySelected.Count -eq 0) {
-                    Write-Host 'VERIFY_CLIPPY_SELECTION: scope=workspace reason=no changed workspace package mapped'
-                }
-                cargo clippy --locked --workspace --all-targets --no-deps
+                [Console]::Error.WriteLine('VERIFY_CLIPPY_SELECTION_REFUSED: directly changed package scope could not be proven; Clippy was not launched.')
+                $global:LASTEXITCODE = 1
+                return
             } else {
                 foreach ($clippyName in $clippyOrdered) {
                     Write-Host "VERIFY_CLIPPY_SELECTION: scope=changed package=$clippyName reasons=$($clippySelected[$clippyName] -join ';')"
@@ -556,20 +555,27 @@ if ($selectedGates.Count -eq 0) {
 # only consults a resolver somebody remembered to install.
 #
 # The PowerShell profiles map onto the admitted verification route:
-# Quick and Review are package-scoped source verification, MergeCompile is
-# package-scoped compile-only verification. The mapping is declared here, once,
-# as data — not as a command list — and the resolver refuses any alias outside
-# the closed table it owns.
+# Quick and MergeCompile use the closed package compile-only route, while
+# Review retains the stronger package verification route with its test stage.
+# The alias and pinned revision are declared here as data — not as command
+# lists — and the resolver refuses any alias outside the closed table it owns.
 $verificationRouteAliases = @{
-    'Quick'        = 'package-verification'
+    'Quick'        = 'package-verification-compile-only'
     'Review'       = 'package-verification'
-    'MergeCompile' = 'package-verification'
+    'MergeCompile' = 'package-verification-compile-only'
+}
+$verificationRouteRevisions = @{
+    'Quick'        = 1
+    'Review'       = 1
+    'MergeCompile' = 1
 }
 $verificationRouteAlias = $verificationRouteAliases[$Profile]
-if ([string]::IsNullOrWhiteSpace($verificationRouteAlias)) {
+if ([string]::IsNullOrWhiteSpace($verificationRouteAlias) -or
+    $null -eq $verificationRouteRevisions[$Profile]) {
     [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: PowerShell profile '$Profile' names no admitted verification route alias.")
     exit 1
 }
+$verificationRouteRevision = [long]$verificationRouteRevisions[$Profile]
 
 # Declared CI-only environment dependencies (I18.21:10, "CI-specific
 # environment differences are explicit profile dependencies"). Every
@@ -731,13 +737,27 @@ try {
     [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: the issued receipt at '$profileReceiptPath' is not canonical JSON ($($_.Exception.Message)).")
     exit 1
 }
-# The receipt must name the route the alias pins, at the revision the resolver
-# admitted. Anything else means the receipt this run would report does not
-# describe the profile it selected, so it is refused here instead of being
-# printed into the summary as if it did.
-$expectedRoute = if ($verificationRouteAlias -eq 'bundle-verification') { 'bundle-verification' } else { 'package-verification' }
-if ($profileReceipt.profile -ne $expectedRoute) {
-    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: alias '$verificationRouteAlias' issued a receipt for route '$($profileReceipt.profile)', not '$expectedRoute'.")
+# The receipt must name the exact route and revision selected for this
+# PowerShell profile. The resolver independently pins the alias through its
+# closed table; this wrapper check binds the issued receipt back to the selected
+# profile/revision pair before any gate can run.
+$expectedRoute = $verificationRouteAlias
+$expectedRouteRevision = $verificationRouteRevision
+$observedRouteRevision = $profileReceipt.profile_revision
+$observedRouteRevisionIsInteger = $observedRouteRevision -is [byte] -or
+    $observedRouteRevision -is [sbyte] -or
+    $observedRouteRevision -is [int16] -or
+    $observedRouteRevision -is [uint16] -or
+    $observedRouteRevision -is [int32] -or
+    $observedRouteRevision -is [uint32] -or
+    $observedRouteRevision -is [int64] -or
+    $observedRouteRevision -is [uint64]
+$routeRevisionMatches = $false
+if ($observedRouteRevisionIsInteger) {
+    $routeRevisionMatches = [decimal]$observedRouteRevision -eq [decimal]$expectedRouteRevision
+}
+if ($profileReceipt.profile -cne $expectedRoute -or -not $routeRevisionMatches) {
+    [Console]::Error.WriteLine("VERIFY_PROFILE_ADMISSION_REFUSED: alias '$verificationRouteAlias' issued route '$($profileReceipt.profile)' revision '$observedRouteRevision', not '$expectedRoute' revision '$expectedRouteRevision'.")
     exit 1
 }
 # The receipt's OWN normalized outcome is a mandatory gate result, not a field
