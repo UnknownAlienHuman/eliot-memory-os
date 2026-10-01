@@ -171,31 +171,135 @@ pub(super) fn append_policy_owner_statement(
                 reason: "missing required parameter",
             }))
     };
-    let expected_revision = text_param("expected_policy_revision")?
-        .parse::<u64>()
-        .map_err(|_| {
-            AdapterError::Store(StoreError::InvalidField {
-                field: "policy.owner_revision",
-                reason: "expected revision must be a decimal revision",
+    let optional_text = |name: &'static str| {
+        command
+            .parameters
+            .get(name)
+            .map(|value| {
+                value.as_str().ok_or(AdapterError::Store(StoreError::InvalidField {
+                    field: "operation.parameter",
+                    reason: "optional policy parameter must be text",
+                }))
             })
-        })?;
-    let expected_value_digest = text_param("expected_policy_digest")?;
-    if expected_revision == 0 {
-        return Err(AdapterError::Store(StoreError::InvalidField {
-            field: "policy.owner_revision",
-            reason: "Policy updates require a fresh named read of the existing owner row",
-        }));
-    }
-    if expected_value_digest.len() != 64
-        || expected_value_digest
-            .bytes()
-            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err(AdapterError::Store(StoreError::InvalidField {
-            field: "policy.owner_digest",
-            reason: "expected digest must be lowercase SHA-256",
-        }));
-    }
+            .transpose()
+    };
+    let expected_state = text_param("expected_policy_state")?;
+    let (expected_revision, expected_value_digest, create_if_absent) = match expected_state {
+        "physical_absence" => {
+            if optional_text("expected_policy_revision")?.is_some()
+                || optional_text("expected_policy_digest")?.is_some()
+            {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.expected_state",
+                    reason: "physical absence cannot use revision or digest sentinels",
+                }));
+            }
+            let response_json = optional_text("absence_read_response_json")?.ok_or(
+                AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "physical absence requires its exact named-read response",
+                }),
+            )?;
+            let response_sha = optional_text("absence_read_response_sha256")?.ok_or(
+                AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.absence_read_response_sha256",
+                    reason: "physical absence requires its response digest",
+                }),
+            )?;
+            if response_sha.len() != 64
+                || response_sha.bytes().any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                || eliot_store_api::sha256_hex(response_json.as_bytes()) != response_sha
+            {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.absence_read_response_sha256",
+                    reason: "must bind the exact absence named-read response",
+                }));
+            }
+            let response_value: Value = serde_json::from_str(response_json).map_err(|_| {
+                AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be a canonical named-read response",
+                })
+            })?;
+            if eliot_store_api::canonical_json_bytes(&response_value)
+                .map_err(|error| AdapterError::Serialization(error.to_string()))?
+                != response_json.as_bytes()
+            {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be canonical JSON",
+                }));
+            }
+            let response: eliot_store_api::NamedReadResponse =
+                serde_json::from_value(response_value).map_err(|_| {
+                    AdapterError::Store(StoreError::InvalidField {
+                        field: "policy.absence_read_response_json",
+                        reason: "must be a closed named-read response",
+                    })
+                })?;
+            if response.operation != eliot_store_api::NamedReadOperation::GetPolicyOwnerSnapshot
+                || response.state_fence != transition.state_fence
+            {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must be the policy owner read under the transition fence",
+                }));
+            }
+            let absence: eliot_store_api::PolicyOwnerSnapshotReadResult =
+                serde_json::from_value(response.payload).map_err(|_| {
+                    AdapterError::Store(StoreError::InvalidField {
+                        field: "policy.absence_read_response_json",
+                        reason: "must carry the typed policy-owner result",
+                    })
+                })?;
+            absence.validate(&transition.state_fence).map_err(AdapterError::Store)?;
+            if !matches!(absence, eliot_store_api::PolicyOwnerSnapshotReadResult::Absent { .. }) {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.absence_read_response_json",
+                    reason: "must prove physical policy-row absence",
+                }));
+            }
+            (None, None, true)
+        }
+        "existing" => {
+            if optional_text("absence_read_response_json")?.is_some()
+                || optional_text("absence_read_response_sha256")?.is_some()
+            {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.expected_state",
+                    reason: "existing-row CAS cannot carry absence proof",
+                }));
+            }
+            let revision = text_param("expected_policy_revision")?.parse::<u64>().map_err(|_| {
+                AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.owner_revision",
+                    reason: "expected revision must be a decimal revision",
+                })
+            })?;
+            if revision == 0 {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.owner_revision",
+                    reason: "Policy CAS requires a nonzero named-read revision",
+                }));
+            }
+            let digest = text_param("expected_policy_digest")?;
+            if digest.len() != 64
+                || digest.bytes().any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(AdapterError::Store(StoreError::InvalidField {
+                    field: "policy.owner_digest",
+                    reason: "expected digest must be lowercase SHA-256",
+                }));
+            }
+            (Some(revision), Some(digest.to_owned()), false)
+        }
+        _ => {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "policy.expected_state",
+                reason: "must select physical_absence or existing",
+            }));
+        }
+    };
     let snapshot_json = text_param("snapshot_json")?;
     if snapshot_json.is_empty() || snapshot_json.len() > eliot_store_api::MAX_RECOVERY_RECORD_BYTES
     {
@@ -223,12 +327,21 @@ pub(super) fn append_policy_owner_statement(
             reason: "must be a canonical JSON object",
         }));
     }
-    let next_revision = expected_revision.checked_add(1).ok_or({
-        AdapterError::Store(StoreError::InvalidField {
-            field: "policy.owner_revision",
-            reason: "revision overflow",
-        })
-    })?;
+    let next_revision = match expected_revision {
+        Some(revision) => revision.checked_add(1).ok_or({
+            AdapterError::Store(StoreError::InvalidField {
+                field: "policy.owner_revision",
+                reason: "revision overflow",
+            })
+        })?,
+        None if create_if_absent => 1,
+        None => {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "policy.owner_revision",
+                reason: "existing-row update omitted its exact revision",
+            }));
+        }
+    };
     let key = eliot_store_api::RecoveryRecordKey::new("owner", "policy")
         .map_err(AdapterError::Store)?;
     let key_json = eliot_store_api::canonical_json_bytes(&key)
@@ -264,6 +377,7 @@ pub(super) fn append_policy_owner_statement(
         "policy_expected_value_digest".to_owned(),
         json!(expected_value_digest),
     );
+    bindings.insert("policy_create_if_absent".to_owned(), json!(create_if_absent));
     bindings.insert("policy_owner_record".to_owned(), Value::Object(record));
     Ok(())
 }

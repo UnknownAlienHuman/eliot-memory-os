@@ -4150,18 +4150,26 @@ pub struct PolicyOwner {
     signed_initial_config_envelope_sha256: Option<String>,
 }
 
-/// Exact result of a fresh named read of `owner/policy`. `Empty` is a durable
-/// empty owner row with its original Store revision and digest; it is never
-/// used for a missing row or an unavailable named read.
+/// Exact result of a fresh named read of `owner/policy`. Physical absence is
+/// represented only by the private sealed state retaining the authenticated
+/// named-read response; `Empty` remains a durable row with its original Store
+/// revision and digest.
 #[derive(Clone, Debug)]
-pub enum PolicyOwnerSnapshotReadback {
+pub struct PolicyOwnerSnapshotReadback {
+    state: PolicyOwnerSnapshotReadbackState,
+    /// Exact authenticated response to the fixed Policy named read. Kept
+    /// private so callers cannot manufacture an absence predecessor.
+    named_read_response: eliot_store_api::NamedReadResponse,
+}
+
+#[derive(Clone, Debug)]
+enum PolicyOwnerSnapshotReadbackState {
+    /// Successful fixed-key query returned no physical Policy row.
+    Absent,
     /// Existing canonical empty row returned by the exact named read.
     Empty {
-        /// Fence returned by Store.
         state_fence: StateFence,
-        /// Non-zero durable owner revision.
         owner_revision: u64,
-        /// SHA-256 of the exact canonical empty-row payload.
         value_digest: String,
     },
     /// Existing bound signed Policy owner row.
@@ -4251,31 +4259,43 @@ pub fn prepare_initial_policy_owner_snapshot(
                 .to_owned(),
         ));
     }
-    let (expected_revision, expected_digest, state_fence) = match owner_readback {
-        PolicyOwnerSnapshotReadback::Empty {
+    let (expected_state, expected_revision, expected_digest, state_fence) =
+        match &owner_readback.state {
+        PolicyOwnerSnapshotReadbackState::Absent => (
+            "physical_absence",
+            None,
+            None,
+            &identity.request.metadata.state_fence,
+        ),
+        PolicyOwnerSnapshotReadbackState::Empty {
             state_fence,
             owner_revision,
             value_digest,
-        } => (owner_revision, value_digest, state_fence),
-        PolicyOwnerSnapshotReadback::Bound(_) => {
+        } => ("existing", Some(owner_revision), Some(value_digest), state_fence),
+        PolicyOwnerSnapshotReadbackState::Bound(_) => {
             return Err(CompositionError::Provider(
                 "initial signed Policy snapshot cannot replace a bound Policy owner".to_owned(),
             ));
         }
     };
-    if *state_fence != identity.request.metadata.state_fence || *expected_revision == 0 {
+    if *state_fence != identity.request.metadata.state_fence
+        || expected_revision.is_some_and(|revision| *revision == 0)
+    {
         return Err(CompositionError::Provider(
-            "Policy owner CAS predecessor is not a current non-zero named empty row".to_owned(),
+            "Policy owner CAS predecessor is not a current named owner read".to_owned(),
         ));
     }
-    if !is_sha256(expected_digest) {
+    if expected_digest.is_some_and(|digest| !is_sha256(digest)) {
         return Err(CompositionError::Provider(
             "Policy owner CAS digest is not a lowercase SHA-256".to_owned(),
         ));
     }
-    let next_revision = expected_revision.checked_add(1).ok_or_else(|| {
-        CompositionError::Provider("Policy owner revision overflow".to_owned())
-    })?;
+    let next_revision = match expected_revision {
+        Some(revision) => revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Provider("Policy owner revision overflow".to_owned())
+        })?,
+        None => 1,
+    };
     let snapshot = signed.payload.snapshot.clone();
     snapshot
         .validate()
@@ -4301,13 +4321,32 @@ pub fn prepare_initial_policy_owner_snapshot(
     .map_err(|error| CompositionError::Provider(error.to_string()))?;
     let mut parameters = BTreeMap::new();
     parameters.insert(
-        "expected_policy_revision".to_owned(),
-        serde_json::Value::String(expected_revision.to_string()),
+        "expected_policy_state".to_owned(),
+        serde_json::Value::String(expected_state.to_owned()),
     );
-    parameters.insert(
-        "expected_policy_digest".to_owned(),
-        serde_json::Value::String(expected_digest.clone()),
-    );
+    if let (Some(revision), Some(digest)) = (expected_revision, expected_digest) {
+        parameters.insert(
+            "expected_policy_revision".to_owned(),
+            serde_json::Value::String(revision.to_string()),
+        );
+        parameters.insert(
+            "expected_policy_digest".to_owned(),
+            serde_json::Value::String(digest.clone()),
+        );
+    } else {
+        let read_bytes = canonical_json_bytes(&owner_readback.named_read_response)
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        let read_json = String::from_utf8(read_bytes.clone())
+            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+        parameters.insert(
+            "absence_read_response_json".to_owned(),
+            serde_json::Value::String(read_json),
+        );
+        parameters.insert(
+            "absence_read_response_sha256".to_owned(),
+            serde_json::Value::String(sha256_hex(&read_bytes)),
+        );
+    }
     parameters.insert(
         "snapshot_json".to_owned(),
         serde_json::Value::String(owner_json),
@@ -5970,84 +6009,101 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 "Policy owner read requested under a stale State Fence".to_owned(),
             ));
         }
-        let reply = self
+        let named_read_response = self
             .kernel
-            .named_read(KernelNamedReadRequest {
-                owner: RecoveryOwner::Policy,
+            .store_named_read(eliot_store_api::NamedReadRequest {
+                operation: eliot_store_api::NamedReadOperation::GetPolicyOwnerSnapshot,
+                scope_id: None,
+                consistency: eliot_store_api::ReadConsistency::ExactFence,
                 state_fence: expected_state_fence.clone(),
-                protected_snapshot_digest: self.snapshot.protected_snapshot_digest.clone(),
+                parameters: BTreeMap::new(),
             })
-            .map_err(|error| CompositionError::Recovery(error.to_string()))?
-            .ok_or_else(|| {
-                CompositionError::Recovery(
-                    "Kernel named read omitted the Policy owner; absence is not proven".to_owned(),
-                )
-            })?;
-        if reply.owner != RecoveryOwner::Policy
-            || reply.state_fence != *expected_state_fence
-            || reply.revision == 0
-            || reply.schema != OWNER_SNAPSHOT_SCHEMA
-            || reply.payload.is_empty()
-            || reply.payload.len() > MAX_OWNER_SNAPSHOT_BYTES
-            || !is_sha256(&reply.value_digest)
-            || sha256_hex(&reply.payload) != reply.value_digest
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if named_read_response.operation
+            != eliot_store_api::NamedReadOperation::GetPolicyOwnerSnapshot
+            || named_read_response.state_fence != *expected_state_fence
         {
             return Err(CompositionError::Recovery(
-                "Kernel Policy owner read has an invalid owner, fence, revision, schema, or digest"
+                "Kernel Policy named read has an invalid operation, fence, or revision heads"
                     .to_owned(),
             ));
         }
-
-        if serde_json::from_slice::<PolicyOwnerSnapshot>(&reply.payload).is_ok() {
-            let current = PolicyOwner::recover(&reply, expected_state_fence)?;
-            let Some(semantic) = self.owners.policy.as_ref() else {
-                return Err(CompositionError::Recovery(
-                    "fresh Store Policy owner read exists without a retained semantic owner"
-                        .to_owned(),
-                ));
-            };
-            if current.revision() != semantic.revision()
-                || current.canonical_digest() != semantic.canonical_digest()
-                || current.snapshot_digest() != semantic.snapshot_digest()
-                || current.snapshot() != semantic.snapshot()
-                || current.signed_initial_config_envelope()
-                    != semantic.signed_initial_config_envelope()
-            {
-                return Err(CompositionError::Recovery(
-                    "fresh Store Policy owner read differs from the canonical Governor owner"
-                        .to_owned(),
-                ));
+        let result: eliot_store_api::PolicyOwnerSnapshotReadResult =
+            serde_json::from_value(named_read_response.payload.clone()).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "Kernel Policy named read returned an invalid typed result: {error}"
+                ))
+            })?;
+        result
+            .validate(expected_state_fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let state = match result {
+            eliot_store_api::PolicyOwnerSnapshotReadResult::Absent { .. } => {
+                if self.owners.policy.is_some() {
+                    return Err(CompositionError::Recovery(
+                        "physical Policy row absence conflicts with the retained semantic owner"
+                            .to_owned(),
+                    ));
+                }
+                PolicyOwnerSnapshotReadbackState::Absent
             }
-            return Ok(PolicyOwnerSnapshotReadback::Bound(current));
-        }
-
-        let empty: EmptyOwnerSnapshot = serde_json::from_slice(&reply.payload).map_err(|error| {
-            CompositionError::Recovery(format!(
-                "Kernel Policy owner payload is neither a bound nor empty snapshot: {error}"
-            ))
-        })?;
-        empty.validate(expected_state_fence)?;
-        if empty.revision != reply.revision {
-            return Err(CompositionError::Recovery(
-                "empty Policy snapshot revision differs from its fresh Store owner revision"
-                    .to_owned(),
-            ));
-        }
-        let canonical = canonical_json_bytes(&empty).map_err(|error| {
-            CompositionError::Recovery(format!(
-                "empty Policy owner snapshot cannot be canonically encoded: {error}"
-            ))
-        })?;
-        if canonical != reply.payload || self.owners.policy.is_some() {
-            return Err(CompositionError::Recovery(
-                "fresh Store Policy empty row is noncanonical or conflicts with the retained semantic owner"
-                    .to_owned(),
-            ));
-        }
-        Ok(PolicyOwnerSnapshotReadback::Empty {
-            state_fence: reply.state_fence,
-            owner_revision: reply.revision,
-            value_digest: reply.value_digest,
+            eliot_store_api::PolicyOwnerSnapshotReadResult::Bound { record } => {
+                let reply = KernelNamedReadReply {
+                    owner: RecoveryOwner::Policy,
+                    state_fence: record.state_fence.clone(),
+                    revision: record.revision,
+                    schema: record.schema.clone(),
+                    payload: record.payload.clone(),
+                    value_digest: record.value_digest.clone(),
+                };
+                if let Ok(empty) = serde_json::from_slice::<EmptyOwnerSnapshot>(&reply.payload) {
+                    empty.validate(expected_state_fence)?;
+                    let canonical = canonical_json_bytes(&empty).map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "empty Policy owner snapshot cannot be canonically encoded: {error}"
+                        ))
+                    })?;
+                    if canonical != reply.payload
+                        || empty.revision != reply.revision
+                        || self.owners.policy.is_some()
+                    {
+                        return Err(CompositionError::Recovery(
+                            "fresh Store Policy empty row is noncanonical or conflicts with the retained semantic owner"
+                                .to_owned(),
+                        ));
+                    }
+                    PolicyOwnerSnapshotReadbackState::Empty {
+                        state_fence: reply.state_fence,
+                        owner_revision: reply.revision,
+                        value_digest: reply.value_digest,
+                    }
+                } else {
+                    let current = PolicyOwner::recover(&reply, expected_state_fence)?;
+                    let Some(semantic) = self.owners.policy.as_ref() else {
+                        return Err(CompositionError::Recovery(
+                            "fresh Store Policy owner read exists without a retained semantic owner"
+                                .to_owned(),
+                        ));
+                    };
+                    if current.revision() != semantic.revision()
+                        || current.canonical_digest() != semantic.canonical_digest()
+                        || current.snapshot_digest() != semantic.snapshot_digest()
+                        || current.snapshot() != semantic.snapshot()
+                        || current.signed_initial_config_envelope()
+                            != semantic.signed_initial_config_envelope()
+                    {
+                        return Err(CompositionError::Recovery(
+                            "fresh Store Policy owner read differs from the canonical Governor owner"
+                                .to_owned(),
+                        ));
+                    }
+                    PolicyOwnerSnapshotReadbackState::Bound(current)
+                }
+            }
+        };
+        Ok(PolicyOwnerSnapshotReadback {
+            state,
+            named_read_response,
         })
     }
 

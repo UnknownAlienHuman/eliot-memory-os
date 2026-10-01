@@ -19,7 +19,8 @@ use eliot_store_api::{
     CanonicalValidationSnapshot, EVIDENCE_PACK_MAX_RECORDS, ExactJsonBytes,
     FencedProjectionPublication, NamedReadOperation, NamedReadRequest, NamedReadResponse,
     OperationId, OrderingHead, OrderingScopeId, PAYLOAD_AUTHORITY_VERSION, PayloadEncoding,
-    PayloadSource, ProjectionPublicationRecord, RevisionHead, RevisionKey, ScopeId,
+    PayloadSource, PolicyOwnerSnapshotReadResult, ProjectionPublicationRecord, RecoveryRecord,
+    RecoveryRecordKey, RevisionHead, RevisionKey, ScopeId,
     ScopeRevisionView, StateFence, StoreError, WriteReceipt, WriteReceiptStatus,
     audit_heads_digest, generated_operation_manifests, named_mutation_operation_name,
 };
@@ -410,6 +411,9 @@ async fn named_read_payload(
         NamedReadOperation::GetBlobProcessSourceAdmission => {
             blob_process_source_admission_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetPolicyOwnerSnapshot => {
+            policy_owner_snapshot_payload(db, &adapter.config, state_fence).await
+        }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
@@ -424,6 +428,43 @@ const READ_BLACKBOARD_ITEM_HEAD: &str = "SELECT VALUE { namespace: namespace, ke
 const READ_TASK_CONTRACT_ACCEPTANCE_RECORD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $acceptance_namespace AND key = $acceptance_key LIMIT 1;";
 
 const READ_BLOB_PROCESS_SOURCE_ADMISSION: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blob_process_source_namespace AND key = $blob_process_source_key LIMIT 1;";
+
+const READ_POLICY_OWNER_SNAPSHOT: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = 'owner' AND key = 'policy' LIMIT 2;";
+
+async fn policy_owner_snapshot_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let mut response = client::query(
+        db,
+        config,
+        "read.policy_owner_snapshot",
+        READ_POLICY_OWNER_SNAPSHOT,
+        Map::new(),
+    )
+    .await?;
+    let rows = take_vec::<RecoveryRecord>(&mut response, 0)?;
+    let record_key = RecoveryRecordKey::new("owner", "policy").map_err(AdapterError::Store)?;
+    let result = match rows.as_slice() {
+        [] => PolicyOwnerSnapshotReadResult::Absent { record_key },
+        [record] => {
+            record.validate().map_err(AdapterError::Store)?;
+            if record.record_key() != record_key
+                || record.schema != eliot_store_api::OWNER_SNAPSHOT_SCHEMA
+                || record.state_fence != *state_fence
+            {
+                return Err(AdapterError::Store(StoreError::InvalidReceipt));
+            }
+            PolicyOwnerSnapshotReadResult::Bound {
+                record: record.clone(),
+            }
+        }
+        _ => return Err(AdapterError::Store(StoreError::IdentityConflict)),
+    };
+    result.validate(state_fence).map_err(AdapterError::Store)?;
+    to_value(&result)
+}
 
 async fn blob_process_source_admission_payload(
     db: &client::RpcTransport,
