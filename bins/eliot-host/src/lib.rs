@@ -1916,7 +1916,7 @@ mod host_lifecycle_boundary_table_tests {
         let bytes = capture
             .bytes
             .lock()
-            .unwrap_or_else(|_| std::io::Error::other("record capture poisoned"))
+            .expect("record capture is poisoned only by a panicking writer")
             .clone();
         String::from_utf8_lossy(&bytes).into_owned()
     }
@@ -2703,8 +2703,8 @@ mod host_lifecycle_boundary_table_tests {
         assert_ne!(draining.event, commit.event);
         assert_ne!(requested.event, commit.event);
         assert_eq!(
-            requested.owner_state, "manifest/branch/pending",
-            "drain.requested must record the pre-linearization owner state"
+            requested.owner_state, "DrainRecord Requested/drain_generation",
+            "drain.requested must record the owner's Requested drain record"
         );
 
         // The real owner: the durable drain reducer refuses to skip or repeat a
@@ -2835,7 +2835,7 @@ mod host_lifecycle_boundary_table_tests {
     // WORK_UNIT_CASE: 891/9
     #[test]
     fn case_9_managed_launch_request_is_not_readiness() {
-        use super::HostRequestEvidence;
+        use crate::host_diagnostics::HostRequestEvidence;
 
         // The frozen contract: jobs requested/admitted and start-manifest
         // requested/started are launch boundaries; readiness is a separate row.
