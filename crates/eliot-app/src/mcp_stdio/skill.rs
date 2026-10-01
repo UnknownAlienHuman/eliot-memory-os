@@ -67,7 +67,7 @@ pub(super) fn dispatch_skill_influence(arguments: Value) -> Result<Value> {
     let skill = mcp_active_skill(SkillId::new_v7(), SkillLifecycleState::Active);
     // The measured Skill bytes travel with the request, so the report carries a
     // canonical #704 serialized-byte measurement instead of a caller-declared
-    // constant. (Issue #880, inventory rows 783/21 and 783/22.)
+    // constant. (Issue #880, migration of this seam.)
     let report = SkillInfluenceService::report(SkillInfluenceReportInput {
         project_id: project_id_from_label(&input.project),
         task_id: task_id_from_label(&input.task),
@@ -78,7 +78,27 @@ pub(super) fn dispatch_skill_influence(arguments: Value) -> Result<Value> {
         execution_proofs: Vec::new(),
         measured_skills: Some(vec![skill]),
     });
-    serde_json::to_value(report).map_err(Into::into)
+    // 783/22: `SkillInfluenceReport::estimated_context_cost` is owned by
+    // `eliot-types` and carries no qualifier of its own, so the engine's
+    // recorded figure is republished beside it through the canonical owner
+    // (row 783/21 is the same field on the CLI path). The value is the
+    // engine's own sum of #704 measurements over the exact Skill bytes
+    // supplied above; the app never re-derives it and never supplies a
+    // literal. `CONTEXT_COST_UNAVAILABLE` is a sentinel, not a measurement,
+    // so it is republished as `MeasurementStatus::Unavailable` with a null
+    // value instead of a number.
+    let mut response = serde_json::to_value(&report)?
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    response.insert(
+        "estimated_context_cost_measurement".to_owned(),
+        recorded_planning_wire(
+            "stu_estimate",
+            (report.estimated_context_cost != u64::MAX).then_some(report.estimated_context_cost),
+        ),
+    );
+    Ok(Value::Object(response))
 }
 
 pub(super) async fn dispatch_skill_execution_proof(

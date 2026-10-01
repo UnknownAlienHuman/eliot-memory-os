@@ -287,8 +287,8 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("783/18", "#783", "crates/eliot-app/src/mcp_stdio/task_handlers.rs", "estimated_tokens: 431"),
     ("783/19", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "&& intent.cost_or_token_units == 0)"),
     ("783/20", "#783", "crates/eliot-app/src/mcp_stdio/operator.rs", ", score.context_cost, false),"),
-    ("783/21", "#783", "crates/eliot-app/src/commands/data_and_memory.rs", "estimated_context_cost: 128"),
-    ("783/22", "#783", "crates/eliot-app/src/mcp_stdio/skill.rs", "estimated_context_cost: 128"),
+    ("783/21", "#783", "crates/eliot-app/src/commands/data_and_memory.rs", "report.estimated_context_cost"),
+    ("783/22", "#783", "crates/eliot-app/src/mcp_stdio/skill.rs", "(report.estimated_context_cost != u64::MAX)"),
     # #878 engine Context / packet-quality / Host seam
     ("878/10", "#878", "crates/eliot-engine/src/context.rs", "Ok(serde_json::to_vec(supplement)?.len().div_ceil(4))"),
     ("878/11", "#878", "crates/eliot-engine/src/context.rs", "fn estimate_tokens(packet: &ContextPacketL3)"),

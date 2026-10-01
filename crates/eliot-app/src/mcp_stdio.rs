@@ -405,7 +405,7 @@ fn measurement_wire(measurement: &CanonicalMeasurement) -> Value {
 /// never `0` and never a fallback estimate, and a present figure is
 /// [`MeasurementStatus::ConservativeStu`] - never
 /// [`MeasurementStatus::ExactTokenizer`], which this seam cannot produce.
-fn recorded_planning_wire(unit: &str, value: Option<u64>) -> Value {
+pub(crate) fn recorded_planning_wire(unit: &str, value: Option<u64>) -> Value {
     match value {
         Some(value) => json!({
             "unit": unit,
