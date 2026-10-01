@@ -131,10 +131,23 @@ impl EpistemicRevisionPayload {
     }
 
     pub fn from_parameters(parameters: &BTreeMap<String, Value>) -> Result<Self, StoreError> {
-        if parameters.len() != 1 {
+        let allowed = [
+            "revision",
+            "task_selection_evidence_json",
+            "task_selection_revision",
+            "task_selection_acceptance_digest",
+            "task_selection_scope_ref",
+            "task_selection_source_ref",
+            "task_selection_evidence_ref",
+        ];
+        if !parameters.contains_key("revision")
+            || parameters
+                .keys()
+                .any(|name| !allowed.contains(&name.as_str()))
+        {
             return Err(invalid(
                 "epistemic.parameters",
-                "exact revision parameter required",
+                "revision and only its optional exact task-selection evidence fields are allowed",
             ));
         }
         let value = parameters

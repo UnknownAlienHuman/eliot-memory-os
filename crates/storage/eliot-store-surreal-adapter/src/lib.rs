@@ -56,11 +56,12 @@ use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalSnapshotPort, CanonicalStoreClient,
     CanonicalValidationSnapshot, ExactJsonBytes, GENESIS_MANIFEST_NAME, NamedOperationManifest,
     NamedReadRequest, NamedReadResponse, OperationId, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest, RevisionHead,
-    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
-    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StateFence, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    generated_operation_manifests, operation_manifest_set_digest,
+    OrderingHeadReadback, OrderingScopeId, PreparedTransition, RequestMeta, ReservedWriteRequest,
+    ResourceGeneration, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
+    ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
+    SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
+    StoreRecoverySnapshot, WriteReceipt, generated_operation_manifests,
+    operation_manifest_set_digest,
 };
 pub use error::AdapterError;
 pub use health::{AdapterAvailability, AdapterHealth, ProviderHealth};
@@ -317,7 +318,7 @@ impl SurrealStoreAdapter {
         lanes: NonZeroUsize,
         max_pending: NonZeroUsize,
         observed_generation: SchemaGeneration,
-        kernel_generation: String,
+        kernel_generation: ResourceGeneration,
         state_fence: StateFence,
     ) -> Result<(), AdapterError> {
         let evidence = ConcurrentEvidence {
@@ -710,6 +711,16 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
             .map_err(AdapterError::into_store_error)
     }
 
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: eliot_store_api::StoreWorkScopeOwnerRequest,
+    ) -> Result<eliot_store_api::StoreWorkScopeOwnerResponse, StoreError> {
+        apply::write_work_scope_owner(self, context, request)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError> {
         apply::read_receipt(self, operation_id)
             .await
@@ -745,6 +756,15 @@ impl CanonicalStoreClient for SurrealStoreAdapter {
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError> {
         apply::read_ordering_heads(self, scopes)
+            .await
+            .map_err(AdapterError::into_store_error)
+    }
+
+    async fn ordering_head_readbacks(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        apply::read_ordering_head_readbacks(self, scopes)
             .await
             .map_err(AdapterError::into_store_error)
     }

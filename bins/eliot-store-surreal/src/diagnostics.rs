@@ -308,6 +308,7 @@ pub const ADMITTED_OPERATIONS: &[&str] = &[
     "validation_snapshot",
     "recovery",
     "initialize_genesis",
+    "write_work_scope_owner",
     "dreamer_job",
     "startup",
     "launch_config",
@@ -676,6 +677,9 @@ impl BridgeIdentity {
                 .with_request(&context.request_id)
                 .with_operation(&request.operation_id)
                 .with_idempotency_ref(&request.idempotency_key),
+            Request::WriteWorkScopeOwner { context, request } => Self::new()
+                .with_request(&context.request_id)
+                .with_idempotency_ref(&request.canonical_request_hash),
             Request::DreamerJob { context, request } => Self::new()
                 .with_request(&context.request_id)
                 .with_operation(&request.request_identity.operation.operation_id)
@@ -687,6 +691,7 @@ impl BridgeIdentity {
             | Request::Recovery { .. }
             | Request::RevisionHeads { .. }
             | Request::OrderingHeads { .. }
+            | Request::OrderingHeadReadbacks { .. }
             | Request::ValidationSnapshot => Self::new(),
         }
     }
@@ -722,8 +727,10 @@ impl BridgeIdentity {
             | Response::Named { .. }
             | Response::RevisionHeads { .. }
             | Response::OrderingHeads { .. }
+            | Response::OrderingHeadReadbacks { .. }
             | Response::ValidationSnapshot { .. }
             | Response::Recovery { .. }
+            | Response::WorkScopeOwner { .. }
             | Response::DreamerJob { .. }
             | Response::Backup { .. }
             | Response::Error { .. } => Self::new(),
@@ -992,12 +999,14 @@ pub fn classify_response(response: &Response) -> RequestOutcome {
             | WriteReceiptStatus::DeadLetter
             | WriteReceiptStatus::Cancelled => RequestOutcome::TerminalNonCommit,
         },
+        Response::WorkScopeOwner { .. } => RequestOutcome::Committed,
         Response::Receipt { .. }
         | Response::Health { .. }
         | Response::Readiness { .. }
         | Response::Named { .. }
         | Response::RevisionHeads { .. }
         | Response::OrderingHeads { .. }
+        | Response::OrderingHeadReadbacks { .. }
         | Response::ValidationSnapshot { .. }
         | Response::Recovery { .. }
         | Response::DreamerJob { .. } => RequestOutcome::ReadCompleted,
@@ -1195,8 +1204,10 @@ pub fn emit_dispatch_outcome(
         | Response::Named { .. }
         | Response::RevisionHeads { .. }
         | Response::OrderingHeads { .. }
+        | Response::OrderingHeadReadbacks { .. }
         | Response::ValidationSnapshot { .. }
         | Response::Recovery { .. }
+        | Response::WorkScopeOwner { .. }
         | Response::DreamerJob { .. }
         | Response::Backup { .. }
         | Response::Unknown { .. }
@@ -1259,9 +1270,11 @@ pub fn operation_name(request: &Request) -> &'static str {
         Request::Backup { .. } => "backup",
         Request::RevisionHeads { .. } => "revision_heads",
         Request::OrderingHeads { .. } => "ordering_heads",
+        Request::OrderingHeadReadbacks { .. } => "ordering_head_readbacks",
         Request::ValidationSnapshot => "validation_snapshot",
         Request::Recovery { .. } => "recovery",
         Request::InitializeGenesis { .. } => "initialize_genesis",
+        Request::WriteWorkScopeOwner { .. } => "write_work_scope_owner",
         Request::DreamerJob { .. } => "dreamer_job",
     }
 }
@@ -1277,7 +1290,9 @@ pub fn operation_name(request: &Request) -> &'static str {
 #[must_use]
 pub fn dispatch_boundary(request: &Request) -> BridgeBoundary {
     match request {
-        Request::Apply { .. } | Request::ReservedWrite { .. } => BridgeBoundary::MutationResult,
+        Request::Apply { .. }
+        | Request::ReservedWrite { .. }
+        | Request::WriteWorkScopeOwner { .. } => BridgeBoundary::MutationResult,
         Request::Receipt { .. } => BridgeBoundary::ReceiptLookup,
         Request::Backup { .. } => BridgeBoundary::BackupBoundary,
         Request::Recovery { .. } => BridgeBoundary::RecoveryBoundary,
@@ -1288,6 +1303,7 @@ pub fn dispatch_boundary(request: &Request) -> BridgeBoundary {
         | Request::Named { .. }
         | Request::RevisionHeads { .. }
         | Request::OrderingHeads { .. }
+        | Request::OrderingHeadReadbacks { .. }
         | Request::ValidationSnapshot => BridgeBoundary::Dispatch,
     }
 }

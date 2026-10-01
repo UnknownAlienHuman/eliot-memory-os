@@ -240,11 +240,62 @@ static GET_EVIDENCE_PACK_PARAMETERS: [ParameterDeclaration; 2] = [
         required: true,
     },
 ];
-static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
-    name: "subject",
-    shape: ParameterShape::Subject,
-    required: true,
-}];
+// Exact owner-issued selection fields shared by task-control writes and a
+// task-bound capture. The admission owner verifies their complete evidence,
+// revision, scope and proof-reference joins; this schema grants no authority.
+const TASK_SELECTION_PARAMETERS: [ParameterDeclaration; 6] = [
+    ParameterDeclaration {
+        name: "task_selection_evidence_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_revision",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_acceptance_digest",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_scope_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_source_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    ParameterDeclaration {
+        name: "task_selection_evidence_ref",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+];
+static CAPTURE_OBSERVATION_PARAMETERS: [ParameterDeclaration; 8] = [
+    ParameterDeclaration {
+        name: "subject",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    // The Governor validates the complete typed submission before serializing
+    // it, just as task control retains its complete admitted task_event_json.
+    // Older subject-only capture producers remain within their existing shape.
+    ParameterDeclaration {
+        name: "observation_submission_json",
+        shape: ParameterShape::Subject,
+        required: false,
+    },
+    TASK_SELECTION_PARAMETERS[0],
+    TASK_SELECTION_PARAMETERS[1],
+    TASK_SELECTION_PARAMETERS[2],
+    TASK_SELECTION_PARAMETERS[3],
+    TASK_SELECTION_PARAMETERS[4],
+    TASK_SELECTION_PARAMETERS[5],
+];
 static APPEND_AUDIT_EVENT_PARAMETERS: [ParameterDeclaration; 6] = [
     ParameterDeclaration {
         name: "operation_id",
@@ -277,7 +328,7 @@ static APPEND_AUDIT_EVENT_PARAMETERS: [ParameterDeclaration; 6] = [
         required: true,
     },
 ];
-static APPLY_LIFECYCLE_POLICY_PARAMETERS: [ParameterDeclaration; 6] = [
+static APPLY_LIFECYCLE_POLICY_PARAMETERS: [ParameterDeclaration; 12] = [
     ParameterDeclaration {
         name: "action",
         shape: ParameterShape::Subject,
@@ -308,6 +359,12 @@ static APPLY_LIFECYCLE_POLICY_PARAMETERS: [ParameterDeclaration; 6] = [
         shape: ParameterShape::Subject,
         required: true,
     },
+    TASK_SELECTION_PARAMETERS[0],
+    TASK_SELECTION_PARAMETERS[1],
+    TASK_SELECTION_PARAMETERS[2],
+    TASK_SELECTION_PARAMETERS[3],
+    TASK_SELECTION_PARAMETERS[4],
+    TASK_SELECTION_PARAMETERS[5],
 ];
 static RECONCILE_RECOVERY_PARAMETERS: [ParameterDeclaration; 10] = [
     ParameterDeclaration {
@@ -416,7 +473,7 @@ static APPLY_PROBLEM_OWNER_STATE_PARAMETERS: [ParameterDeclaration; 8] = [
 /// Owner-approved Governor finish persistence fields. The receipt remains an
 /// opaque canonical JSON document at this boundary; only the fixed
 /// `owner/finish` record address and outer revision are storage semantics.
-static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 3] = [
+static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 9] = [
     ParameterDeclaration {
         name: "attempt_id",
         shape: ParameterShape::Subject,
@@ -432,11 +489,17 @@ static RECORD_FINISH_DECISION_PARAMETERS: [ParameterDeclaration; 3] = [
         shape: ParameterShape::Subject,
         required: true,
     },
+    TASK_SELECTION_PARAMETERS[0],
+    TASK_SELECTION_PARAMETERS[1],
+    TASK_SELECTION_PARAMETERS[2],
+    TASK_SELECTION_PARAMETERS[3],
+    TASK_SELECTION_PARAMETERS[4],
+    TASK_SELECTION_PARAMETERS[5],
 ];
 /// Owner-approved Governor finish-evidence persistence fields. The canonical
 /// owner image remains an opaque JSON document at this boundary; the store
 /// only arbitrates its fixed owner address and revision.
-static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 2] = [
+static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 8] = [
     ParameterDeclaration {
         name: "expected_canonical_revision",
         shape: ParameterShape::Subject,
@@ -447,6 +510,12 @@ static RECORD_FINISH_EVIDENCE_PARAMETERS: [ParameterDeclaration; 2] = [
         shape: ParameterShape::Subject,
         required: true,
     },
+    TASK_SELECTION_PARAMETERS[0],
+    TASK_SELECTION_PARAMETERS[1],
+    TASK_SELECTION_PARAMETERS[2],
+    TASK_SELECTION_PARAMETERS[3],
+    TASK_SELECTION_PARAMETERS[4],
+    TASK_SELECTION_PARAMETERS[5],
 ];
 /// The Governor's complete catalog image is opaque here. The store only
 /// arbitrates the fixed owner address and outer revision; the Governor proves
@@ -464,11 +533,19 @@ static RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 2] = [
     },
 ];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
-static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
-    name: "revision",
-    shape: ParameterShape::EpistemicRevision,
-    required: true,
-}];
+static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 7] = [
+    ParameterDeclaration {
+        name: "revision",
+        shape: ParameterShape::EpistemicRevision,
+        required: true,
+    },
+    TASK_SELECTION_PARAMETERS[0],
+    TASK_SELECTION_PARAMETERS[1],
+    TASK_SELECTION_PARAMETERS[2],
+    TASK_SELECTION_PARAMETERS[3],
+    TASK_SELECTION_PARAMETERS[4],
+    TASK_SELECTION_PARAMETERS[5],
+];
 static CURRENT_POSITION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "position",
     shape: ParameterShape::Subject,
@@ -1162,7 +1239,7 @@ static GET_CAPABILITY_EVIDENCE_RECORD_RANGE_PARAMETERS: [ParameterDeclaration; 3
 /// task revision on apply, mirroring how `AppendAuditEvent` carries
 /// `expected_revision`), the admitted `actor_ref`, and `task_event_json` which
 /// preserves the complete lifecycle command in task history.
-static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
+static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 16] = [
     ParameterDeclaration {
         name: "task_id",
         shape: ParameterShape::Subject,
@@ -1213,6 +1290,12 @@ static UPDATE_TASK_STATE_PARAMETERS: [ParameterDeclaration; 10] = [
         shape: ParameterShape::Subject,
         required: false,
     },
+    TASK_SELECTION_PARAMETERS[0],
+    TASK_SELECTION_PARAMETERS[1],
+    TASK_SELECTION_PARAMETERS[2],
+    TASK_SELECTION_PARAMETERS[3],
+    TASK_SELECTION_PARAMETERS[4],
+    TASK_SELECTION_PARAMETERS[5],
 ];
 
 /// One bounded immutable swarm owner revision.
