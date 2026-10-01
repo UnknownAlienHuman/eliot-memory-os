@@ -397,6 +397,23 @@ interface admission {
     handle: artifact-id,
   }
 
+  // Native: LearningProvenance
+  // (crates/smart/eliot-context-contracts/src/atom.rs). Intrinsic learning
+  // provenance bound to one Governor-issued admission. `none` means ordinary
+  // unmarked evidence; `some` marks learning-derived material whose permit
+  // the retrieval and delivery screens verify. Carried verbatim; dropping the
+  // mark must not make governed-only input appear plain.
+  record learning-provenance {
+    campaign-id: string,
+    overlay-id: option<string>,
+    candidate-id: option<string>,
+    closure-ref: option<string>,
+    owner: option<string>,
+    draft: bool,
+    expires-at-unix-secs: option<u64>,
+    permit-digest: digest-hex,
+  }
+
   record context-candidate {
     atom-id: artifact-id,
     source-digest: digest-hex,
@@ -414,6 +431,9 @@ interface admission {
     // dependency atom identities; validated against the floor member's
     // required-dependencies.
     dependencies: list<artifact-id>,
+    // Native: ContextCandidate.learning (atom.rs). None is ordinary evidence
+    // with no learning treatment; some marks learning-derived material.
+    learning: option<learning-provenance>,
   }
 
   record admitted-atom {
@@ -564,7 +584,7 @@ interface admission {
     denominator-mismatch(admission-denominator),
     stale-fence(admission-fence),
     capacity-exceeded(admission-capacity),
-    unknown-measurement(admission-measurement),
+    unknown-measurement(admission-unknown-measurement),
     omission-handle-invalid(admission-omission),
     economy-mismatch(admission-economy),
     unsupported-schema(admission-schema),
@@ -575,7 +595,10 @@ interface admission {
   record admission-denominator { human-detail: string }
   record admission-fence { human-detail: string }
   record admission-capacity { human-detail: string }
-  record admission-measurement { human-detail: string }
+  // Unknown-measurement error detail. Named apart from the full typed
+  // request record `admission-measurement` so the two never collide:
+  // WIT parse rejects duplicate type names in one interface.
+  record admission-unknown-measurement { human-detail: string }
   record admission-omission { human-detail: string }
   record admission-economy { human-detail: string }
   record admission-schema { want-revision: u32, got-revision: u32, human-detail: string }
