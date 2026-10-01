@@ -4314,8 +4314,7 @@ fn validate_complete_owner_closure(
             || owner_member.intent.parent_grant_id != member.intent.parent_grant_id
         {
             return Err(KernelError::RecoveryUnavailable(
-                "closure member root or parent disagrees with its owner grant inventory"
-                    .to_owned(),
+                "closure member root or parent disagrees with its owner grant inventory".to_owned(),
             ));
         }
     }
@@ -4349,9 +4348,7 @@ fn validate_complete_owner_closure(
                         "cross-root descendant cannot be fenced by this closure".to_owned(),
                     ));
                 }
-                if !affected.contains(grant_id.as_str())
-                    && !preserved.contains(grant_id.as_str())
-                {
+                if !affected.contains(grant_id.as_str()) && !preserved.contains(grant_id.as_str()) {
                     return Err(KernelError::InvalidField {
                         field: "enumeration.members",
                         reason: "the owner closure omits an admitted descendant",
@@ -7827,7 +7824,9 @@ pub(crate) mod tests {
         }
 
         fn admitted_grant_hydrations(&self) -> Result<Vec<GrantClosureMember>, KernelError> {
-            Ok(vec![self.hydrate_grant_member(&self.value.intent.grant_id)?])
+            Ok(vec![
+                self.hydrate_grant_member(&self.value.intent.grant_id)?,
+            ])
         }
     }
 
@@ -9023,8 +9022,7 @@ pub(crate) mod tests {
         ));
 
         hydration_source.replace(initial.clone());
-        let mut wrong_target =
-            chain_revocation_intent(&binding, "op-owner-revision-target", 5);
+        let mut wrong_target = chain_revocation_intent(&binding, "op-owner-revision-target", 5);
         wrong_target.grant_id = "grant-chain-mid".to_owned();
         assert!(matches!(
             port.revoke_grant_closure(&wrong_target, &epoch),
@@ -9073,9 +9071,11 @@ pub(crate) mod tests {
         ] {
             assert!(port.disposition(operation_id).is_none());
             assert!(port.closure_receipt(operation_id).is_none());
-            assert!(store
-                .load_grant_closure(&OperationIdentity::new(operation_id)?)?
-                .is_none());
+            assert!(
+                store
+                    .load_grant_closure(&OperationIdentity::new(operation_id)?)?
+                    .is_none()
+            );
         }
         for member in &initial.members {
             assert!(!port.grant_revoked(&member.intent.grant_id));
@@ -9104,9 +9104,11 @@ pub(crate) mod tests {
         assert_eq!(store.load_grant_graph_revision(&root)?, Some(6));
         assert!(port.disposition(&stale_owner.operation_id).is_none());
         assert!(port.closure_receipt(&stale_owner.operation_id).is_none());
-        assert!(store
-            .load_grant_closure(&OperationIdentity::new(&stale_owner.operation_id)?)?
-            .is_none());
+        assert!(
+            store
+                .load_grant_closure(&OperationIdentity::new(&stale_owner.operation_id)?)?
+                .is_none()
+        );
         for member in &initial.members {
             assert!(!port.grant_revoked(&member.intent.grant_id));
             let subject = OperationIdentity::new(&member.intent.grant_id)?;
@@ -10162,9 +10164,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ledger_only_closure_revoke_refuses_without_durable_owner_boundary(
-    ) -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn ledger_only_closure_revoke_refuses_without_durable_owner_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
         let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
         let binding = restart_test_binding(&epoch)?;
         let port = GrantActivationPort::new();
@@ -10230,10 +10231,7 @@ pub(crate) mod tests {
         assert!(!port.grant_revoked("grant-local-mid"));
         assert!(!port.grant_revoked("grant-local-leaf"));
         assert!(port.disposition("op-local-revoke").is_none());
-        assert_eq!(
-            port.revocation_closure("op-local-revoke"),
-            None
-        );
+        assert_eq!(port.revocation_closure("op-local-revoke"), None);
         assert!(port.closure_receipt("op-local-revoke").is_none());
         assert!(port.reconciling_operations().is_empty());
         let ledger = port.lock_ledger();
