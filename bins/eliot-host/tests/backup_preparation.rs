@@ -624,7 +624,8 @@ fn alias_substitution_refused_and_identity_pinned() {
     std::fs::create_dir_all(&prepared.root).expect("recreate");
     match reconcile_preparation(&journal, "op-958-alias").expect("reconcile") {
         ReconcileDisposition::Uncertain { reason } => {
-            assert!(reason.contains("identity changed"), "names cause: {reason}");
+            // The tamper proof renders through IdentityConflict (#2629).
+            assert!(reason.contains("identity mismatch"), "names cause: {reason}");
         }
         other => panic!("expected Uncertain, got {other:?}"),
     }
