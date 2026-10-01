@@ -376,6 +376,19 @@ pub async fn commit_capability_evidence_record<P: KernelGenerationPort + ?Sized>
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: decoded.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued evidence record
+        // it commits, not its per-attempt operation identity.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "capability-evidence-commit",
+            &decoded.record_digest,
+        )
+        .ok_or_else(|| {
+            CompositionError::Owner(
+                "capability evidence record has no owner-issued subject to declare".to_owned(),
+            )
+        })?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
         task_id: None,
         transition_class: TransitionClass::CaptureCandidate,

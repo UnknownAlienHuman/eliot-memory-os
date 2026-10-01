@@ -203,6 +203,16 @@ pub fn operator_command_envelope(
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued operator action
+        // it commits, distinct from the per-attempt operation identity and the
+        // per-correction idempotency key.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "operator-action-reconciliation",
+            &action_digest,
+        )
+        .ok_or_else(|| owner_refused("operator action has no owner-issued subject to declare"))?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         // Reuses the Governor scope vocabulary from the observation/skill
         // precedent; no new scope is introduced.
         scope_id: ScopeId::new("governor").map_err(|error| owner_refused(error.to_string()))?,

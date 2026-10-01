@@ -204,6 +204,18 @@ pub fn authority_revocation_envelope(
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued revocation
+        // closure it commits. It is NOT derived from `operation_id` or from
+        // the idempotency key, either of which rotates.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "authority-revocation-closure",
+            &format!("{closure_id}@{closure_revision}"),
+        )
+        .ok_or_else(|| {
+            owner_refused("revocation closure has no owner-issued subject to declare")
+        })?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id: ScopeId::new(GOVERNOR_SCOPE_ID)
             .map_err(|error| owner_refused(error.to_string()))?,
         task_id: identity

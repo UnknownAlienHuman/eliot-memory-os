@@ -1639,10 +1639,25 @@ fn canonical_owner_snapshot_envelope(
     );
     let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+    // #1925: this leg's stable intent is the owner-issued canonical owner
+    // snapshot it records, addressed by the exact snapshot bytes whose digest
+    // the transition's admission decision already binds.
+    let write_intent_id = crate::write_intent::admission_write_intent(
+        "finish-evidence-snapshot",
+        &sha256_hex(&snapshot_bytes),
+    )
+    .ok_or_else(|| {
+        FinishAttemptError::Serialization(
+            "canonical owner snapshot has no owner-issued subject to declare".to_owned(),
+        )
+    })?;
     Ok(CanonicalWriteEnvelope {
         operation_id,
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        write_intent_id,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
         task_id: Some(task_id.to_owned()),
         transition_class: TransitionClass::RecoverySchema,
@@ -1762,10 +1777,25 @@ fn finish_envelope(
     );
     let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+    // #1925: this leg's stable intent is the owner-issued finish-decision
+    // contract it records, addressed by the exact (attempt, context, receipts)
+    // bytes whose digest the transition's admission decision already binds.
+    let write_intent_id = crate::write_intent::admission_write_intent(
+        "finish-decision-contract",
+        &sha256_hex(&contract_bytes),
+    )
+    .ok_or_else(|| {
+        FinishAttemptError::Serialization(
+            "finish decision contract has no owner-issued subject to declare".to_owned(),
+        )
+    })?;
     Ok(CanonicalWriteEnvelope {
         operation_id,
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        write_intent_id,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
         task_id: Some(context.task_id.clone()),
         transition_class: TransitionClass::RecoverySchema,
