@@ -4993,10 +4993,17 @@ impl ResearchDebtRegistrationRequest {
         // Derived, never assigned: a duplicate observation of the same debt for
         // the same inquiry re-derives these two identities exactly.
         let obligation_id = format!("research-debt-{}", debt.debt_id);
+        // Built from a BORROW of `obligation_id`, before that value is moved into
+        // the record below. Formatting borrows its arguments, so the borrow ends
+        // with this statement and `obligation_id` is still owned and still
+        // unmoved when the record literal consumes it. One of the two identities
+        // is therefore derived from the other by value rather than either being a
+        // copy of the other, and neither spelling is duplicated anywhere.
+        let operation_id = format!("register-{obligation_id}");
         let mut request = Self {
             request_kind: Self::REQUEST_KIND.to_owned(),
             obligation_id,
-            operation_id: format!("register-{obligation_id}"),
+            operation_id,
             inquiry_id: observation.inquiry_id.clone(),
             evidence_set_id: observation.evidence_set_id.clone(),
             profile_id: profile.profile_id.clone(),
