@@ -590,8 +590,12 @@ mod cue_composition_tests {
         ROLE_AFFORDANCES, ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION,
         ROLE_EVIDENCE_ASSURANCE, ROLE_NEGATIVE_MEMORY, ROLE_TASK_FRAME, RoleAcquisition,
     };
+    use eliot_contracts::RequestMetadata;
     use eliot_cue_contracts::Digest;
-    use eliot_store_api::{RevisionHead, RevisionKey, ScopeId, ScopeRevisionView};
+    use eliot_read::ReadIdentity;
+    use eliot_store_api::{
+        RevisionHead, RevisionKey, ScopeId, ScopeRevisionView,
+    };
 
     type ProofResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -736,9 +740,17 @@ mod cue_composition_tests {
             ProjectionState::Complete => Some(serde_json::json!([])),
             _ => None,
         };
+        // Issue #246 (`cue_source_revision`) derives the admitted source
+        // revision from the cue role's retained read identity, so an acquired
+        // cue role carries the exact identity its read was served under: the
+        // same scope, fence, `ExactFence` consistency, declared dependency and
+        // the same observed scope revision head the response carried.
+        let scope_id = ScopeId::new("scope-a")?;
+        let cue_heads = heads.revision_heads.clone();
+        let cue_acquired = cue_payload.is_some();
         Ok(SevenRoleInputs {
-            scope_id: ScopeId::new("scope-a")?,
-            state_fence: fence,
+            scope_id: scope_id.clone(),
+            state_fence: fence.clone(),
             clock: eliot_contracts::ClockReading::default(),
             heads_before: heads.clone(),
             heads_after: heads,
@@ -751,12 +763,97 @@ mod cue_composition_tests {
                 operation: eliot_store_api::NamedReadOperation::GetUnderstandingProjectionInputs,
                 state: cue_state,
                 payload: cue_payload,
-                revision_heads: Vec::new(),
-                identity: None,
+                revision_heads: match cue_acquired {
+                    true => cue_heads.clone(),
+                    false => Vec::new(),
+                },
+                identity: match cue_acquired {
+                    true => Some(cue_read_identity(&scope_id, &fence, &cue_heads)?),
+                    false => None,
+                },
             },
             negative_memory: unavailable(),
             evidence: unavailable(),
             affordances: unavailable(),
+        })
+    }
+
+    /// Builds the exact `GetUnderstandingProjectionInputs` read identity the
+    /// fixture's cue role was served under.
+    ///
+    /// Mirrors what `ReadService::bound_query` produces for this operation: the
+    /// same principal, the closed named operation on both the identity and the
+    /// resolved catalogue source, the declared scope dependency at its observed
+    /// revision, `ExactFence` consistency, the observed scope revision heads,
+    /// and the matching invalidation set. Nothing here is invented to satisfy
+    /// a check: every leg is the value the fixture's own fence, scope and
+    /// revision heads already carry.
+    ///
+    /// `ReadIdentity` exposes no constructor, so the identity is built through
+    /// its own canonical deserialization, which is the only way a caller
+    /// outside the `eliot-read` owner can produce one.
+    fn cue_read_identity(
+        scope_id: &ScopeId,
+        fence: &StateFence,
+        observed: &[RevisionHead],
+    ) -> ProofResult<ReadIdentity> {
+        let scope_key = format!("scope:{}", scope_id);
+        let scope_revision = observed
+            .iter()
+            .find(|head| head.key.as_str() == scope_key)
+            .map_or(1, |head| head.revision);
+        let metadata = fixture_request_metadata(fence)?;
+        let source = serde_json::json!({
+            "operation": "GetUnderstandingProjectionInputs",
+            "operation_name": "GetUnderstandingProjectionInputs",
+            "manifest_name": "understanding_projection_inputs.json",
+            "manifest_digest": sha256_hex(b"fixture.understanding-projection-inputs.manifest"),
+        });
+        let schema = serde_json::json!({
+            "manifest_name": "understanding_projection_inputs.json",
+            "manifest_version": eliot_read::CONTRACT_VERSION,
+            "manifest_schema_digest": sha256_hex(b"fixture.understanding-projection-inputs.schema"),
+            "parameter_schema_digest":
+                sha256_hex(b"fixture.understanding-projection-inputs.params"),
+        });
+        serde_json::from_value::<ReadIdentity>(serde_json::json!({
+            "principal": {
+                "product": metadata.product_id,
+                "source": metadata.source_id,
+            },
+            "request_id": metadata.request_id,
+            "operation": "GetUnderstandingProjectionInputs",
+            "scope_id": scope_id,
+            "state_fence": fence,
+            "consistency": "exact_fence",
+            "declared_dependency_revisions": { scope_key: scope_revision },
+            "observed_revision_heads": observed,
+            "ordering": { "heads": [] },
+            "source": source,
+            "schema": schema,
+            "coverage": "not_applicable",
+            "invalidation": {
+                "state_fence": fence,
+                "scope_id": scope_id,
+                "revision_heads": observed,
+                "ordering_heads": [],
+                "source": source,
+                "schema": schema,
+            },
+        }))
+        .map_err(|error| format!("cue read identity is not canonical: {error}").into())
+    }
+
+    /// Deterministic valid caller metadata for the fixture's read principal.
+    fn fixture_request_metadata(fence: &StateFence) -> ProofResult<RequestMetadata> {
+        Ok(RequestMetadata {
+            request_id: eliot_contracts::RequestId::new("fixture.cue-read")?,
+            session_id: None,
+            task_id: None,
+            product_id: eliot_contracts::ProductId::new("eliot-governor-cue-fixture")?,
+            source_id: eliot_contracts::SourceId::new("cue_composition_test")?,
+            state_fence: fence.clone(),
+            clock: eliot_contracts::ClockReading::default(),
         })
     }
 

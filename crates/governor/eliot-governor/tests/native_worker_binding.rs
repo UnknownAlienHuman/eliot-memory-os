@@ -36,6 +36,14 @@ use eliot_workscope::WorkScopeBindingSnapshot;
 
 const TEST_LINEAGE_A: &str = "550e8400-e29b-41d4-a716-446655440000";
 
+/// Canonical reference of ELIOT's shared native-worker resource facet
+/// contract, derived from the validated contract itself (T9-01 M1).
+fn canonical_native_worker_facet_ref() -> String {
+    eliot_contracts::native_worker_resource_facet_v1()
+        .and_then(|facet| facet.canonical_ref())
+        .expect("canonical ELIOT native-worker facet ref")
+}
+
 fn test_epoch(lineage: &str, sequence: u64) -> EpochId {
     EpochId::new(
         EpochLineageId::new(lineage).expect("valid test lineage"),
@@ -528,7 +536,11 @@ fn publish_valid(composition: &GovernorComposition<TestKernel>) -> NativeWorkerE
             &"e".repeat(64),
             &"f".repeat(64),
             "cmd-1",
-            "facet-1",
+            // T9-01 M1: `facet_manifest_ref` is the canonical reference of
+            // ELIOT's shared native-worker resource facet contract, derived
+            // from the validated contract rather than invented here. An opaque
+            // or locally invented ref is refused by `validate`.
+            &canonical_native_worker_facet_ref(),
             CapabilityCellId::new("native-worker-core").expect("cell id"),
             vec!["intro-1".to_owned()],
             vec!["grant-1".to_owned()],

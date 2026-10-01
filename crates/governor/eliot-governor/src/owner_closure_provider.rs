@@ -2507,18 +2507,44 @@ mod owner_closure_provider_tests {
     }
 
     fn grant_entry(fence: &StateFence, grant_id: &str, parent: Option<&str>) -> CapabilityGrant {
+        // A delegated edge must narrow on all four axes
+        // (`eliot_authority::check_narrowing`): the child's issuer is its
+        // parent's holder, its authority set is a strict subset, and neither
+        // its lifetime nor its use budget may exceed the parent's. The root
+        // therefore carries the wider `res:1` + `res:2` set and the narrower
+        // child is admitted with the `res:1` subset these fixtures' compiled
+        // transition/data classes already declare.
+        let (authority, holder, expires_at, max_uses) = match parent {
+            None => (
+                AuthoritySet::new(
+                    ["op.read".to_owned()],
+                    ["res:1".to_owned(), "res:2".to_owned()],
+                    EffectClass::Read,
+                )
+                .expect("authority"),
+                "principal:holder".to_owned(),
+                LogicalTime::new(10_000),
+                2,
+            ),
+            Some(_) => (
+                AuthoritySet::new(
+                    ["op.read".to_owned()],
+                    ["res:1".to_owned()],
+                    EffectClass::Read,
+                )
+                .expect("authority"),
+                "principal:holder".to_owned(),
+                LogicalTime::new(10_000),
+                2,
+            ),
+        };
         CapabilityGrant {
             grant_id: GrantId::new(grant_id).expect("id"),
             parent_grant_id: parent.map(|id| GrantId::new(id).expect("parent")),
             authority_root_ref: "root:alpha".to_owned(),
             issuer: PrincipalRef::new("principal:issuer").expect("issuer"),
-            holder: PrincipalRef::new("principal:holder").expect("holder"),
-            authority: AuthoritySet::new(
-                ["op.read".to_owned()],
-                ["res:1".to_owned()],
-                EffectClass::Read,
-            )
-            .expect("authority"),
+            holder: PrincipalRef::new(holder).expect("holder"),
+            authority,
             inherited_source_ceiling: None,
             binding: binding(fence),
             // The canonical lifetime the compiled mechanical subset commits to.
@@ -2527,8 +2553,8 @@ mod owner_closure_provider_tests {
             // cannot be reconciled with the projection compiled from it and is
             // refused rather than widened.
             issued_at: LogicalTime::new(1_000),
-            expires_at: LogicalTime::new(10_000),
-            max_uses: 2,
+            expires_at,
+            max_uses,
             status: GrantStatus::Active,
         }
     }
