@@ -28,6 +28,7 @@ pub mod profile;
 pub mod profile_run;
 pub mod provider_denominator;
 pub mod registry;
+pub mod rust_analyzer_profile;
 pub mod testd_port;
 pub mod testd_profile_dispatch;
 pub mod verification_profile;
@@ -100,6 +101,9 @@ pub use registry::{
     ATTESTED_IDENTITY_SLOTS, ExecutableIdentityCause, IdentitySlot, PROFILE_IDENTITY_SLOTS,
     ProfileIdentities, ProfileIdentityParams, ProviderRegistry, REQUIRED_IDENTITY_SLOTS,
     RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
+};
+pub use rust_analyzer_profile::{
+    RustAnalyzerProcessProfile, RustAnalyzerProfileError, resolve_current as resolve_rust_analyzer_profile,
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
