@@ -219,13 +219,51 @@ pub struct TraceManifest {
     pub unavailable: Vec<String>,
 }
 
+/// The three I16.12 evidence classes [`TraceManifest::seal`] binds from the
+/// owner's own retained record and the exact sealed result bytes.
+///
+/// These are the classes the earlier cut wrote as literal `None` in the struct
+/// literal, which no code path could fill and which the required set did not
+/// name, so an unqualified `VERIFIED_COMPLETE` was sealed on every run. Each is
+/// read from a real owner value here, and an absent one stays absent so the
+/// required set reports it in `missing_parts`:
+///
+/// * `principal` is the durable result lineage's authenticated producer
+///   reference — the principal/service that produced the bytes;
+/// * `verifier_result` is that lineage's immutable output artifact handle, the
+///   verifier/artifact result I16.12 names alongside it;
+/// * `active_view_packet_manifest` is the admitted campaign-view publication
+///   identity read out of the exact sealed response bytes. The result leg that
+///   admits that publication has already proved it against the stored
+///   capability, task, scope and fence, so this reads what was admitted rather
+///   than admitting anything itself.
+///
+/// No value is invented, defaulted or recomputed here: each is either an exact
+/// retained reference or `None`.
+fn retained_owner_evidence(
+    persisted: &HostRequestRecord,
+    body: &HostRequestResultBody,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let lineage = persisted.result_lineage.as_ref();
+    let principal = lineage.and_then(|retained| retained.producer_ref.clone());
+    let verifier_result = lineage.and_then(|retained| retained.output_artifact_ref.clone());
+    let active_view_packet_manifest = body
+        .response
+        .get("campaign_learning_state_view")
+        .and_then(|publication| publication.get("view_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    (principal, verifier_result, active_view_packet_manifest)
+}
+
 impl TraceManifest {
     /// Seals the manifest for one persisted result.
     ///
     /// Binds the admitted envelope (or, when queue memory already retired
     /// it, the durable record), the presenting session, the executor-observed
     /// evidence as it was RETAINED on the durable record, the durable result
-    /// lineage, and the persisted receipt. Required slots without a value land
+    /// lineage (via [`retained_owner_evidence`]), and the persisted receipt.
+    /// Required slots without a value land
     /// in `missing_parts` and force [`TraceFinish::DegradedNoProof`]; anything
     /// else seals [`TraceFinish::VerifiedComplete`]. Call sites run only after
     /// the ORS persist, so the seal never precedes the binding it describes.
@@ -274,22 +312,8 @@ impl TraceManifest {
                     .map(|session| session.as_str().to_owned())
             });
         let evidence = persisted.result_evidence.as_ref();
-        // The durable result lineage is the owner's retained read of who
-        // produced the bytes and which immutable artifact they are. Both are
-        // the exact retained references; an absent one stays absent.
-        let lineage = persisted.result_lineage.as_ref();
-        let principal = lineage.and_then(|retained| retained.producer_ref.clone());
-        let verifier_result = lineage.and_then(|retained| retained.output_artifact_ref.clone());
-        // The Active View/packet manifest is the admitted campaign-view
-        // publication the result carries; the result leg that admits it has
-        // already proved it against the stored capability, task, scope, and
-        // fence. The identity is read from the exact sealed response bytes.
-        let active_view_packet_manifest = body
-            .response
-            .get("campaign_learning_state_view")
-            .and_then(|publication| publication.get("view_id"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
+        let (principal, verifier_result, active_view_packet_manifest) =
+            retained_owner_evidence(persisted, body);
         let policy_snapshot = state_fence.as_ref().and_then(|fence| {
             fence
                 .policy_revision
