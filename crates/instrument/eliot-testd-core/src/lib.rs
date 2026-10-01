@@ -80,6 +80,73 @@ pub enum StageExecutionKind {
     DecoderOnly,
 }
 
+/// Kernel/runner-issued provider-registry freshness evidence retained with a
+/// stage so Testd can independently re-observe the same dependencies before
+/// replay. This record is deliberately data-only: it grants neither process
+/// nor storage authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdProviderRegistryFreshness {
+    /// Exact provider-registry generation used by admission.
+    pub generation: u64,
+    /// Exact normative-pair digest used to build the provider registry.
+    pub normative_pair_digest: String,
+    /// Independent invalidation inputs used by `ProviderRegistry`.
+    pub fingerprints: TestdProviderFingerprints,
+}
+
+/// Seven independent dependencies that can invalidate a provider selection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestdProviderFingerprints {
+    /// Source/worktree snapshot fingerprint.
+    pub source: String,
+    /// Cargo lockfile fingerprint.
+    pub lock: String,
+    /// Resolved toolchain fingerprint.
+    pub toolchain: String,
+    /// Closed environment projection fingerprint.
+    pub env: String,
+    /// Resolved executable identity fingerprint.
+    pub exe: String,
+    /// Compiled provider profile fingerprint.
+    pub profile: String,
+    /// Parser contract and generation fingerprint.
+    pub parser: String,
+}
+
+impl TestdProviderRegistryFreshness {
+    /// Rejects incomplete, malformed, or default-shaped freshness authority.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        if self.generation == 0 || !is_binding_digest(&self.normative_pair_digest) {
+            return Err(TestdError::InvalidBinding);
+        }
+        for (field, value) in [
+            ("provider_source_fingerprint", self.fingerprints.source.as_str()),
+            ("provider_lock_fingerprint", self.fingerprints.lock.as_str()),
+            (
+                "provider_toolchain_fingerprint",
+                self.fingerprints.toolchain.as_str(),
+            ),
+            ("provider_environment_fingerprint", self.fingerprints.env.as_str()),
+            ("provider_executable_fingerprint", self.fingerprints.exe.as_str()),
+            ("provider_profile_fingerprint", self.fingerprints.profile.as_str()),
+            ("provider_parser_fingerprint", self.fingerprints.parser.as_str()),
+        ] {
+            if value.trim().is_empty()
+                || value.len() > 1024
+                || value.chars().any(char::is_control)
+            {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "must be non-empty, bounded, and control-free",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Closed, durable identity of one profile stage admitted by the runner.
 ///
 /// This carries identity and policy bindings only. In particular it contains
@@ -99,10 +166,14 @@ pub struct InstrumentStageRequest {
     pub profile_digest: String,
     /// Immutable profile DAG digest.
     pub dag_digest: String,
-    /// Provider registry generation used for adapter selection.
+    /// ProfileRegistry generation used to compile this stage.
     pub registry_generation: u64,
-    /// Digest of the provider registry snapshot used for selection.
+    /// Digest of the ProfileRegistry snapshot used to compile this stage.
     pub registry_digest: String,
+    /// Separately retained ProviderRegistry currentness; it is never compared
+    /// with the ProfileRegistry generation/digest above.
+    #[serde(default)]
+    pub provider_freshness: Option<TestdProviderRegistryFreshness>,
     /// Exact admitted stage identifier.
     pub stage_id: String,
     /// Registered stage specification identity.
@@ -160,6 +231,9 @@ impl InstrumentStageRequest {
             .map_err(|error| TestdError::Contract(error.to_string()))?;
         if self.profile_name != self.invocation.profile || self.kind != self.invocation.kind {
             return Err(TestdError::InvalidBinding);
+        }
+        if let Some(freshness) = &self.provider_freshness {
+            freshness.validate()?;
         }
         Ok(())
     }
