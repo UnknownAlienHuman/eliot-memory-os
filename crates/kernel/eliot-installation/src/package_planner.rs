@@ -1924,6 +1924,16 @@ impl GenerationPackagePlanner {
         let native_worker_digest = digest_for("eliot-native-worker.exe")?;
         let wasm_host_digest = digest_for("eliot-wasm-host.exe")?;
         let user_broker_digest = digest_for(USER_BROKER_STAGED_ROLE)?;
+        let opencode_adapter = if include_opencode_adapter {
+            Some(OpenCodeAdapterArtifact {
+                artifact_path: destination(OPENCODE_ADAPTER_ROLES[0].0)?,
+                artifact_digest: digest_for(OPENCODE_ADAPTER_ROLES[0].0)?,
+                descriptor_path: destination(OPENCODE_ADAPTER_ROLES[1].0)?,
+                descriptor_digest: digest_for(OPENCODE_ADAPTER_ROLES[1].0)?,
+            })
+        } else {
+            None
+        };
         let config_digest = digest_for("generation.json")?;
         let eliotd_config_digest = digest_for("eliotd-governor.json")?;
         let eliotd_descriptor_digest = digest_for("eliotd.json")?;
@@ -2171,6 +2181,7 @@ impl GenerationPackagePlanner {
             native_worker_executable_path: native_worker_path.clone(),
             wasm_host_executable_path: wasm_host_path.clone(),
             user_broker_executable_path: user_broker_path.clone(),
+            opencode_adapter: opencode_adapter.clone(),
             descriptor_digest: PlatformHandle::new("0".repeat(64)).map_err(|error| {
                 InstallationError::InvalidField {
                     field: "generation.descriptor_digest".to_owned(),
@@ -2212,16 +2223,7 @@ impl GenerationPackagePlanner {
             native_worker_executable_path: native_worker_path,
             wasm_host_executable_path: wasm_host_path,
             user_broker_executable_path: user_broker_path,
-            opencode_adapter: if include_opencode_adapter {
-                Some(OpenCodeAdapterArtifact {
-                    artifact_path: destination(OPENCODE_ADAPTER_ROLES[0].0)?,
-                    artifact_digest: digest_for(OPENCODE_ADAPTER_ROLES[0].0)?,
-                    descriptor_path: destination(OPENCODE_ADAPTER_ROLES[1].0)?,
-                    descriptor_digest: digest_for(OPENCODE_ADAPTER_ROLES[1].0)?,
-                })
-            } else {
-                None
-            },
+            opencode_adapter,
             config_path,
             dependency_closure_refs: vec![
                 PlatformHandle::new(format!("evidence:phase-a-content:{phase_a_content_digest}"))
@@ -3464,6 +3466,7 @@ mod tests {
             ),
             wasm_host_executable_path: test_path(portable_root.as_str(), "eliot-wasm-host.exe"),
             user_broker_executable_path: test_path(portable_root.as_str(), USER_BROKER_STAGED_ROLE),
+            opencode_adapter: None,
             descriptor_digest: h("0".repeat(64)),
         };
         desc.store_bridge_arguments = desc

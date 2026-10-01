@@ -3266,6 +3266,7 @@ mod honest_tests {
             native_worker_executable_path: fixture_path(&portable_root, "eliot-native-worker.exe"),
             user_broker_executable_path: fixture_path(&portable_root, "eliot-user-broker.exe"),
             wasm_host_executable_path: fixture_path(&portable_root, "eliot-wasm-host.exe"),
+            opencode_adapter: None,
             descriptor_digest: fixture_handle("f".repeat(64)),
         };
         runtime_launch = runtime_launch
@@ -3875,6 +3876,7 @@ mod store_currentness_production_tests {
             native_worker_executable_path: h(&format!("{portable}/eliot-native-worker.exe")),
             user_broker_executable_path: h(&format!("{portable}/eliot-user-broker.exe")),
             wasm_host_executable_path: h(&format!("{portable}/eliot-wasm-host.exe")),
+            opencode_adapter: None,
             descriptor_digest: dh('f'),
         }
     }
@@ -4459,6 +4461,7 @@ mod live_production_observer_tests {
                     )),
                     user_broker_executable_path: h(&format!("{portable}/eliot-user-broker.exe")),
                     wasm_host_executable_path: h(&format!("{portable}/eliot-wasm-host.exe")),
+                    opencode_adapter: None,
                     descriptor_digest: dh('f'),
                 },
             }

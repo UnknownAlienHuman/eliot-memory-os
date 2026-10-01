@@ -947,6 +947,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
         user_broker_executable_path: user_broker_path.clone(),
         wasm_host_executable_path: path(&portable, "eliot-wasm-host.exe"),
+            opencode_adapter: None,
         descriptor_digest: handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch.with_computed_digest()?;

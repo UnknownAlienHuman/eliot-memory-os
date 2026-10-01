@@ -833,6 +833,7 @@ fn portable_cli_transaction(root: &Path) -> InstallationTransaction {
         native_worker_executable_path: fixture_path(root, "eliot-native-worker.exe"),
         user_broker_executable_path: fixture_path(root, "eliot-user-broker.exe"),
         wasm_host_executable_path: fixture_path(root, "eliot-wasm-host.exe"),
+        opencode_adapter: None,
         descriptor_digest: fixture_handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch

@@ -81,9 +81,9 @@ use operation_identity::{
     BrokerOperation, DurableIssuedIdentity, IssuerHandle, OperationIdentityIssuer,
 };
 use protected_launch_config::{
-    BrokerLaunchBinding, BrokerProcessBinding, REGISTRATION_LEASE_TTL_MS, binding_digest,
-    current_process_binding, current_process_identity, fresh_registration_request,
-    load_protected_launch_binding,
+    AdmittedInstallationProfile, BrokerLaunchBinding, BrokerProcessBinding,
+    REGISTRATION_LEASE_TTL_MS, binding_digest, current_process_binding,
+    current_process_identity, fresh_registration_request, load_protected_launch_binding,
 };
 
 pub const SERVICE_NAME: &str = "eliot-user-broker";
@@ -1256,6 +1256,10 @@ pub struct BrokerComposition {
     providers_admitted: bool,
     launch_binding: Option<BrokerLaunchBinding>,
     launch_lease: Option<ProtectedPathLease>,
+    /// Host-published, exact-readback P-08 profile and the retained adapter
+    /// and descriptor file leases it admitted. Absence keeps OpenCode
+    /// integration unavailable.
+    opencode_profile: Option<AdmittedInstallationProfile>,
     /// The live process identity this broker admitted itself as. Re-observed
     /// on every authenticated operation; see [`Self::verify_launch_lease`].
     process_binding: Option<BrokerProcessBinding>,
@@ -1319,7 +1323,7 @@ impl BrokerComposition {
     /// front door. The binary never substitutes a local authority/process
     /// provider when this composition is unavailable.
     pub fn start_with_kernel(config: BrokerConfig) -> Result<Self, CompositionError> {
-        let (launch_binding, launch_lease) = load_protected_launch_binding()?;
+        let (launch_binding, launch_lease, opencode_profile) = load_protected_launch_binding()?;
         let client = eliot_cli::kernel_client::KernelClient::load()
             .map_err(|error| CompositionError::Kernel(error.to_string()))?;
         let client = Arc::new(Mutex::new(client));
@@ -1335,6 +1339,7 @@ impl BrokerComposition {
             Some(Box::new(process)),
             Some(client),
             Some((launch_binding, launch_lease)),
+            opencode_profile,
             issuer,
         )
     }
@@ -1395,6 +1400,7 @@ impl BrokerComposition {
         process: Option<Box<dyn ProcessPort>>,
         kernel_client: Option<SharedKernelClient>,
         launch: Option<(BrokerLaunchBinding, ProtectedPathLease)>,
+        opencode_profile: Option<AdmittedInstallationProfile>,
         issuer: IssuerHandle,
     ) -> Result<Self, CompositionError> {
         config.validate()?;
@@ -1460,9 +1466,8 @@ impl BrokerComposition {
         // durable state is adopted only when it carries exactly this
         // installation/SID/Session/boot-Session tuple; a surviving
         // registration of another principal is refused, never heartbeated.
-        let (launch_binding, launch_lease) = launch.map_or((None, None), |(binding, lease)| {
-            (Some(binding), Some(lease))
-        });
+        let (launch_binding, launch_lease) =
+            launch.map_or((None, None), |(binding, lease)| (Some(binding), Some(lease)));
         if let Some(binding) = launch_binding.as_ref() {
             broker
                 .bind_admission(&BrokerAdmissionIdentity {
@@ -1481,6 +1486,27 @@ impl BrokerComposition {
                     }
                     other => CompositionError::Recovery(other),
                 })?;
+        }
+        if opencode_profile.is_some() && launch_binding.is_none() {
+            return Err(CompositionError::Launch(
+                "an admitted User Broker profile requires its protected launch binding".to_owned(),
+            ));
+        }
+        if let (Some(binding), Some(profile)) = (launch_binding.as_ref(), opencode_profile.as_ref()) {
+            if profile.profile.installation_id.as_str()
+                != binding.registration.installation_id.as_str()
+                || !eliot_platform_windows::ordinal_eq_str(
+                    profile.profile.broker_executable_path.as_str(),
+                    &process_binding.identity.image_path,
+                )
+                || profile.profile.broker_artifact_sha256.as_str()
+                    != binding.registration.broker_artifact_digest.as_str()
+            {
+                return Err(CompositionError::Launch(
+                    "Host-published User Broker profile does not bind this admitted launch"
+                        .to_owned(),
+                ));
+            }
         }
         // A4: a restart continues from the protected launch/caller identity
         // plus a new registration operation and never revives a historical
@@ -1524,6 +1550,7 @@ impl BrokerComposition {
             providers_admitted,
             launch_binding,
             launch_lease,
+            opencode_profile,
             process_binding: Some(process_binding),
             #[cfg(windows)]
             generation_job,
@@ -1556,6 +1583,20 @@ impl BrokerComposition {
             snapshot: self.snapshot.display().to_string(),
             generation_job,
         }
+    }
+
+    /// Returns the installation-owner-admitted OpenCode plugin binding, if
+    /// the exact Host Phase-B profile and retained plugin/descriptor files
+    /// were present and verified at this broker start.
+    #[must_use]
+    pub fn admitted_opencode_adapter(
+        &self,
+    ) -> Option<&eliot_installation::OpenCodeAdapterArtifact> {
+        self.opencode_profile
+            .as_ref()?
+            .profile
+            .opencode_adapter
+            .as_ref()
     }
 
     /// Performs broker self-authentication from the retained stable

@@ -1113,7 +1113,7 @@ pub struct CandidateManifest {
     /// runtime host report cannot fill this gap. When present, both the
     /// descriptor and executable bytes participate in the signed artifact
     /// digest set and are checked by the installation activation owner.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_adapter: Option<OpenCodeAdapterArtifact>,
     /// Canonical installation-approved generation configuration path.
     pub config_path: PlatformHandle,
@@ -1364,6 +1364,10 @@ pub struct RuntimeLaunchDescriptor {
     pub user_broker_executable_path: PlatformHandle,
     /// Explicit installation-approved WASM-host executable path.
     pub wasm_host_executable_path: PlatformHandle,
+    /// Optional exact OpenCode plugin and descriptor admitted with this
+    /// generation, propagated into the protected User Broker profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_adapter: Option<OpenCodeAdapterArtifact>,
     /// SHA-256 of the descriptor fields excluding this digest.
     pub descriptor_digest: PlatformHandle,
 }
@@ -2528,6 +2532,31 @@ impl RuntimeLaunchDescriptor {
             });
         }
         self.validate_canonical_store_arguments()?;
+        if let Some(adapter) = &self.opencode_adapter {
+            for (path, filename, path_field, digest, digest_field) in [
+                (
+                    &adapter.artifact_path,
+                    "eliot.js",
+                    "runtime_launch.opencode_adapter.artifact_path",
+                    &adapter.artifact_digest,
+                    "runtime_launch.opencode_adapter.artifact_digest",
+                ),
+                (
+                    &adapter.descriptor_path,
+                    "plugin-bridge-contract.json",
+                    "runtime_launch.opencode_adapter.descriptor_path",
+                    &adapter.descriptor_digest,
+                    "runtime_launch.opencode_adapter.descriptor_digest",
+                ),
+            ] {
+                approved_path(path, path_field)?;
+                approved_filename(path, filename, path_field)?;
+                sha256_handle(digest, digest_field)?;
+            }
+            if adapter.artifact_path == adapter.descriptor_path {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
         runtime_sha256_handle(&self.descriptor_digest, "runtime_launch.descriptor_digest")?;
         if self.compute_digest()? != self.descriptor_digest.as_str() {
             return Err(InstallationError::InvalidField {
@@ -2811,6 +2840,9 @@ impl CandidateManifest {
                 field: "manifest.runtime_launch.generation".to_owned(),
                 reason: "must exactly equal the approved manifest generation".to_owned(),
             });
+        }
+        if self.runtime_launch.opencode_adapter != self.opencode_adapter {
+            return Err(InstallationError::IdentityConflict);
         }
         if self.runtime_launch.store_config_path != self.config_path {
             return Err(InstallationError::InvalidField {

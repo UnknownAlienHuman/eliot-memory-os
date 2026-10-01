@@ -245,6 +245,7 @@ fn runtime_launch() -> RuntimeLaunchDescriptor {
         user_broker_artifact_digest: handle("e".repeat(64)),
         wasm_host_executable_path: handle(r"C:\ProgramData\Eliot\bin\eliot-wasm-host.exe"),
         wasm_host_artifact_digest: handle("f".repeat(64)),
+            opencode_adapter: None,
         descriptor_digest: handle("0".repeat(64)),
     };
     descriptor = descriptor.with_computed_digest().unwrap();

@@ -27,6 +27,7 @@
 
 use std::fs;
 
+use eliot_installation::UserBrokerInstallationProfile;
 use eliot_platform_windows::{ProtectedPathLease, WindowsPlatform};
 use eliot_user_broker_core::{OperatorArtifact, RegistrationRequest};
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,11 @@ pub(super) struct BrokerLaunchBinding {
     pub(super) registration: RegistrationRequest,
     /// Stable operator artifact binding.
     pub(super) operator_artifact: OperatorArtifactConfig,
+    /// Installation-owned User Broker profile bytes published by Host Phase
+    /// B. The path is only a locator; admission requires exact retained bytes,
+    /// the profile's self-binding, and exact launch identity equality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) installation_profile: Option<InstallationProfileBinding>,
     /// Stable installation epoch fence as exact JSON. This is epoch-scoped
     /// authority binding, not a per-operation identity: the lineage-aware
     /// epoch moves only through the operation-identity issuer from
@@ -65,6 +71,23 @@ pub(super) struct BrokerLaunchBinding {
     /// never stored or coerced here. The value is always validated through
     /// the owning request-identity validator before use.
     pub(super) launch_authority_fence: Value,
+}
+
+/// Exact protected-file locator and digest for the immutable P-08 profile.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct InstallationProfileBinding {
+    /// Absolute path supplied by the protected launch declaration.
+    pub(super) path: String,
+    /// SHA-256 over the exact canonical bytes published by Host Phase B.
+    pub(super) digest: String,
+}
+
+/// Retained admitted profile bytes for this broker process lifetime.
+pub(super) struct AdmittedInstallationProfile {
+    pub(super) profile: UserBrokerInstallationProfile,
+    pub(super) _lease: ProtectedPathLease,
+    pub(super) _adapter_leases: Vec<ProtectedPathLease>,
 }
 
 /// The live process identity this broker is admitted as.
@@ -228,6 +251,14 @@ pub(super) fn validate_launch_binding(
     }
     validate_registration_declaration(&binding.registration)?;
     validate_operator_artifact(&binding.operator_artifact)?;
+    if let Some(profile) = &binding.installation_profile {
+        if !std::path::Path::new(&profile.path).is_absolute() {
+            return Err(CompositionError::Launch(
+                "protected User Broker profile path is not absolute".to_owned(),
+            ));
+        }
+        validate_sha256(&profile.digest, "installation_profile.digest")?;
+    }
     validate_fence_value(&binding.launch_authority_fence)
         .map_err(|error| CompositionError::Launch(error.to_string()))?;
     Ok(())
@@ -309,8 +340,14 @@ pub(super) fn fresh_registration_request(
     Ok(request)
 }
 
-pub(super) fn load_protected_launch_binding()
--> Result<(BrokerLaunchBinding, ProtectedPathLease), CompositionError> {
+pub(super) fn load_protected_launch_binding() -> Result<
+    (
+        BrokerLaunchBinding,
+        ProtectedPathLease,
+        Option<AdmittedInstallationProfile>,
+    ),
+    CompositionError,
+> {
     #[cfg(not(windows))]
     {
         Err(CompositionError::Kernel(
@@ -327,8 +364,80 @@ pub(super) fn load_protected_launch_binding()
             .read_bounded(64 * 1024)
             .map_err(|error| CompositionError::Protected(error.to_string()))?;
         let binding = parse_binding_bytes(&bytes)?;
-        Ok((binding, lease))
+        let profile = binding
+            .installation_profile
+            .as_ref()
+            .map(load_admitted_installation_profile)
+            .transpose()?;
+        Ok((binding, lease, profile))
     }
+}
+
+#[cfg(windows)]
+fn load_admitted_installation_profile(
+    binding: &InstallationProfileBinding,
+) -> Result<AdmittedInstallationProfile, CompositionError> {
+    let lease = ProtectedPathLease::open_existing_absolute(std::path::Path::new(&binding.path))
+        .map_err(|error| CompositionError::Protected(error.to_string()))?;
+    let bytes = lease
+        .read_bounded(1024 * 1024)
+        .map_err(|error| CompositionError::Protected(error.to_string()))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if digest != binding.digest {
+        return Err(CompositionError::Launch(
+            "protected User Broker profile digest does not match exact retained bytes".to_owned(),
+        ));
+    }
+    let profile: UserBrokerInstallationProfile =
+        serde_json::from_slice(&bytes).map_err(CompositionError::Encoding)?;
+    profile
+        .validate()
+        .map_err(|error| CompositionError::Launch(error.to_string()))?;
+    let mut adapter_leases = Vec::new();
+    if let Some(adapter) = &profile.opencode_adapter {
+        for (path, digest, limit) in [
+            (&adapter.artifact_path, &adapter.artifact_digest, 1024 * 1024),
+            (
+                &adapter.descriptor_path,
+                &adapter.descriptor_digest,
+                256 * 1024,
+            ),
+        ] {
+            let artifact_lease = ProtectedPathLease::open_existing_absolute(
+                std::path::Path::new(path.as_str()),
+            )
+            .map_err(|error| CompositionError::Protected(error.to_string()))?;
+            let artifact_bytes = artifact_lease
+                .read_bounded(limit)
+                .map_err(|error| CompositionError::Protected(error.to_string()))?;
+            let observed_digest = format!("{:x}", Sha256::digest(&artifact_bytes));
+            if observed_digest != digest.as_str() {
+                return Err(CompositionError::Launch(
+                    "installed OpenCode adapter bytes differ from the admitted profile digest"
+                        .to_owned(),
+                ));
+            }
+            adapter_leases.push(artifact_lease);
+        }
+    }
+    Ok(AdmittedInstallationProfile {
+        profile,
+        _lease: lease,
+        _adapter_leases: adapter_leases,
+    })
+}
+
+fn validate_sha256(value: &str, field: &str) -> Result<(), CompositionError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(CompositionError::Launch(format!(
+            "protected {field} is not lowercase SHA-256"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -396,6 +505,7 @@ mod tests {
                 artifact_digest: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_owned(),
             },
+            installation_profile: None,
             launch_authority_fence: test_fence(),
         }
     }

@@ -1042,6 +1042,7 @@ fn build_typed_bundle_with_selection(
         native_worker_executable_path: native_worker_path,
         wasm_host_executable_path: wasm_host_path,
         user_broker_executable_path: user_broker_path,
+            opencode_adapter: None,
         descriptor_digest: PlatformHandle::new("0".repeat(64))
             .map_err(|error| MaterializeError::Contract(error.to_string()))?,
     }

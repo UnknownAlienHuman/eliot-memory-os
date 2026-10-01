@@ -1694,6 +1694,7 @@ fn live_receipt_manifest(
         native_worker_executable_path: path("eliot-native-worker.exe"),
         user_broker_executable_path: path("eliot-user-broker.exe"),
         wasm_host_executable_path: path("eliot-wasm-host.exe"),
+            opencode_adapter: None,
         descriptor_digest: handle("0".repeat(64)),
     };
     runtime_launch = runtime_launch

@@ -32,7 +32,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    InstallationError, PlatformHandle, RuntimeLaunchDescriptor, approved_path,
+    InstallationError, OpenCodeAdapterArtifact, PlatformHandle, RuntimeLaunchDescriptor, approved_path,
     canonical_profile_unsigned_bytes, compute_profile_digest, handle, sha256_handle, text,
     validate_absolute_root,
 };
@@ -120,6 +120,10 @@ pub struct UserBrokerInstallationProfile {
     pub broker_executable_path: PlatformHandle,
     /// Lowercase SHA-256 of the staged per-user broker executable bytes.
     pub broker_artifact_sha256: PlatformHandle,
+    /// Exact installation-admitted OpenCode plugin/descriptor pair. Absence
+    /// remains unavailable; runtime discovery cannot fill it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_adapter: Option<OpenCodeAdapterArtifact>,
     /// Protected module-specific record paths.
     pub protected_paths: UserBrokerProtectedPaths,
     /// Static client declaration template for this profile.
@@ -155,6 +159,7 @@ impl UserBrokerInstallationProfile {
             module_generation: declaration.module_generation.clone(),
             broker_executable_path: launch.user_broker_executable_path.clone(),
             broker_artifact_sha256: launch.user_broker_artifact_digest.clone(),
+            opencode_adapter: launch.opencode_adapter.clone(),
             protected_paths: derive_user_broker_protected_paths(&host_state_root)?,
             profile_sha256: PlatformHandle::new("pending")
                 .map_err(|error| InstallationError::Platform(error.to_string()))?,
@@ -239,6 +244,31 @@ impl UserBrokerInstallationProfile {
             &self.broker_artifact_sha256,
             "user_broker.broker_artifact_sha256",
         )?;
+        if let Some(adapter) = &self.opencode_adapter {
+            for (path, filename, path_field, digest, digest_field) in [
+                (
+                    &adapter.artifact_path,
+                    "eliot.js",
+                    "user_broker.opencode_adapter.artifact_path",
+                    &adapter.artifact_digest,
+                    "user_broker.opencode_adapter.artifact_digest",
+                ),
+                (
+                    &adapter.descriptor_path,
+                    "plugin-bridge-contract.json",
+                    "user_broker.opencode_adapter.descriptor_path",
+                    &adapter.descriptor_digest,
+                    "user_broker.opencode_adapter.descriptor_digest",
+                ),
+            ] {
+                approved_path(path, path_field)?;
+                crate::approved_filename(path, filename, path_field)?;
+                sha256_handle(digest, digest_field)?;
+            }
+            if adapter.artifact_path == adapter.descriptor_path {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
         if self.module_generation.generation.value() == 0 {
             return Err(InstallationError::InvalidField {
                 field: "user_broker.module_generation.generation".to_owned(),

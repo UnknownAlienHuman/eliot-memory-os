@@ -701,6 +701,7 @@ impl RegistryFixture {
             native_worker_executable_path: path_handle(&native_worker_path),
             user_broker_executable_path: path_handle(&user_broker_path),
             wasm_host_executable_path: path_handle(&wasm_host_path),
+            opencode_adapter: None,
             descriptor_digest: handle(Self::digest(22)),
         };
         runtime_launch.kernel_arguments = vec![

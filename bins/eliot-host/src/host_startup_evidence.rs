@@ -593,6 +593,7 @@ mod tests {
             user_broker_artifact_digest: hex_handle("9"),
             wasm_host_executable_path: path("eliot-wasm-host.exe"),
             wasm_host_artifact_digest: hex_handle("f"),
+            opencode_adapter: None,
             descriptor_digest: hex_handle("0"),
         }
         .with_computed_digest()
