@@ -261,11 +261,13 @@ fn validate_capture_submission_binding(
         ));
     }
 
-    let selection = submission.get("task_selection").ok_or_else(|| {
-        TaskBindingRejection::selection_required(
-            "retained observation submission is missing TaskSelectionEvidence",
-        )
-    })?;
+    let selection = submission
+        .get("task_selection")
+        .ok_or_else(|| {
+            TaskBindingRejection::selection_required(
+                "retained observation submission is missing TaskSelectionEvidence",
+            )
+        })?;
     if selection != evidence {
         return Err(TaskBindingRejection::selection_required(
             "observation submission and named operation carry different original TaskSelectionEvidence",
@@ -287,11 +289,14 @@ fn validate_capture_submission_binding(
     let scope_ref = affected_scope
         .get("work_scope")
         .and_then(serde_json::Value::as_str);
-    let evidence_task_ref = evidence.get("task_ref").and_then(serde_json::Value::as_str);
+    let evidence_task_ref = evidence
+        .get("task_ref")
+        .and_then(serde_json::Value::as_str);
     let evidence_scope_ref = evidence
         .get("work_scope_ref")
         .and_then(serde_json::Value::as_str);
-    if task_ref != evidence_task_ref || scope_ref != evidence_scope_ref {
+    if task_ref != evidence_task_ref || scope_ref != evidence_scope_ref
+    {
         return Err(TaskBindingRejection::scope_incompatible(
             "retained observation subject task or WorkScope differs from TaskSelectionEvidence",
         ));
@@ -302,6 +307,129 @@ fn validate_capture_submission_binding(
 /// Cross-checks the retained evidence independently against the operation,
 /// admitted task/fence and transition scope. The acceptance digest is compared
 /// as recorded; it is never reconstructed from caller-supplied lists or bytes.
+fn validate_retained_evidence_fields(
+    evidence: &serde_json::Value,
+) -> Result<(TaskId, TaskRevision, LowercaseSha256, ScopeId), TaskBindingRejection> {
+    let task_ref = evidence
+        .get("task_ref")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| TaskId::new(value).ok())
+        .ok_or_else(|| {
+            TaskBindingRejection::selection_required(
+                "retained task selection evidence has no valid task identity",
+            )
+        })?;
+    let task_revision = evidence
+        .get("task_revision")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskRevision>(value).ok())
+        .ok_or_else(|| {
+            TaskBindingRejection::selection_required(
+                "retained task selection evidence has no valid task revision",
+            )
+        })?;
+    let recorded_acceptance_digest = evidence
+        .get("acceptance_digest")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<LowercaseSha256>(value).ok())
+        .ok_or_else(|| {
+            TaskBindingRejection::selection_required(
+                "retained task selection evidence has no valid recorded acceptance digest",
+            )
+        })?;
+    let work_scope_ref = evidence
+        .get("work_scope_ref")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| ScopeId::new(value).ok())
+        .ok_or_else(|| {
+            TaskBindingRejection::selection_required(
+                "retained task selection evidence has no valid WorkScope identity",
+            )
+        })?;
+    let Some(flags) = evidence
+        .get("contamination_flags")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Err(TaskBindingRejection::selection_required(
+            "retained task selection evidence is missing contamination flags",
+        ));
+    };
+    if !flags.is_empty() {
+        return Err(TaskBindingRejection::selection_required(
+            "contaminated task selection evidence cannot authorize a task-bound write",
+        ));
+    }
+    Ok((task_ref, task_revision, recorded_acceptance_digest, work_scope_ref))
+}
+
+fn validate_retained_selection_operation(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    task_id: &str,
+    operation: &eliot_store_api::NamedMutationRequest,
+) -> Result<(), TaskBindingRejection> {
+    let encoded = operation_json_text(operation, "task_selection_evidence_json")?;
+    let evidence: serde_json::Value = serde_json::from_str(encoded).map_err(|_| {
+        TaskBindingRejection::selection_required(
+            "retained task selection evidence is not valid JSON",
+        )
+    })?;
+    let (task_ref, task_revision, recorded_digest, work_scope_ref) =
+        validate_retained_evidence_fields(&evidence)?;
+    let revision = operation_text(operation, "task_selection_revision")?;
+    let acceptance_digest = operation_text(operation, "task_selection_acceptance_digest")?;
+    let scope_ref = operation_text(operation, "task_selection_scope_ref")?;
+    let source_ref = operation_text(operation, "task_selection_source_ref")?;
+    let evidence_ref = operation_text(operation, "task_selection_evidence_ref")?;
+
+    if task_ref.as_str() != task_id {
+        return Err(TaskBindingRejection::scope_incompatible(
+            "retained task selection names a different task than the admitted operation",
+        ));
+    }
+    if work_scope_ref.as_str() != transition.scope_id.as_str()
+        || scope_ref != work_scope_ref.as_str()
+    {
+        return Err(TaskBindingRejection::scope_incompatible(
+            "retained task selection WorkScope does not match the prepared operation",
+        ));
+    }
+
+    let current_revision = context.state_fence.task_revision;
+    let retained_revision = task_revision.value().to_string();
+    if retained_revision != revision
+        || current_revision != Some(task_revision)
+        || recorded_digest.as_str() != acceptance_digest
+        || evidence.get("selection_source_ref").and_then(serde_json::Value::as_str)
+            != Some(source_ref)
+        || evidence.get("evidence_ref").and_then(serde_json::Value::as_str) != Some(evidence_ref)
+        || !transition
+            .required_proof_and_approval_refs
+            .iter()
+            .any(|reference| reference == source_ref)
+        || !transition
+            .required_proof_and_approval_refs
+            .iter()
+            .any(|reference| reference == evidence_ref)
+    {
+        return Err(TaskBindingRejection::selection_required(
+            "retained task selection revision, acceptance digest, or exact evidence references do not match the operation",
+        ));
+    }
+
+    if operation.operation == NamedMutationOperation::UpdateTaskState
+        && operation_text(operation, "task_id")? != task_id
+    {
+        return Err(TaskBindingRejection::scope_incompatible(
+            "task-control payload names a different task than the admitted selection",
+        ));
+    }
+    if operation.operation == NamedMutationOperation::CaptureObservation {
+        validate_capture_submission_binding(operation, transition, &evidence)?;
+    }
+    Ok(())
+}
+
 fn validate_retained_selection(
     context: &RequestMeta,
     transition: &PreparedTransition,
@@ -321,127 +449,14 @@ fn validate_retained_selection(
 
     let mut checked = false;
     for operation in &transition.named_operations {
-        if !matches!(
+        if matches!(
             operation.operation,
             NamedMutationOperation::CaptureObservation | NamedMutationOperation::UpdateTaskState
         ) {
-            continue;
-        }
-        checked = true;
-        let encoded = operation_json_text(operation, "task_selection_evidence_json")?;
-        let evidence: serde_json::Value = serde_json::from_str(encoded).map_err(|_| {
-            TaskBindingRejection::selection_required(
-                "retained task selection evidence is not valid JSON",
-            )
-        })?;
-        let task_ref = evidence
-            .get("task_ref")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| TaskId::new(value).ok())
-            .ok_or_else(|| {
-                TaskBindingRejection::selection_required(
-                    "retained task selection evidence has no valid task identity",
-                )
-            })?;
-        let task_revision = evidence
-            .get("task_revision")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<TaskRevision>(value).ok())
-            .ok_or_else(|| {
-                TaskBindingRejection::selection_required(
-                    "retained task selection evidence has no valid task revision",
-                )
-            })?;
-        let recorded_acceptance_digest = evidence
-            .get("acceptance_digest")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<LowercaseSha256>(value).ok())
-            .ok_or_else(|| {
-                TaskBindingRejection::selection_required(
-                    "retained task selection evidence has no valid recorded acceptance digest",
-                )
-            })?;
-        let work_scope_ref = evidence
-            .get("work_scope_ref")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| ScopeId::new(value).ok())
-            .ok_or_else(|| {
-                TaskBindingRejection::selection_required(
-                    "retained task selection evidence has no valid WorkScope identity",
-                )
-            })?;
-        let Some(flags) = evidence
-            .get("contamination_flags")
-            .and_then(serde_json::Value::as_array)
-        else {
-            return Err(TaskBindingRejection::selection_required(
-                "retained task selection evidence is missing contamination flags",
-            ));
-        };
-        if !flags.is_empty() {
-            return Err(TaskBindingRejection::selection_required(
-                "contaminated task selection evidence cannot authorize a task-bound write",
-            ));
-        }
-
-        let revision = operation_text(operation, "task_selection_revision")?;
-        let acceptance_digest = operation_text(operation, "task_selection_acceptance_digest")?;
-        let scope_ref = operation_text(operation, "task_selection_scope_ref")?;
-        let source_ref = operation_text(operation, "task_selection_source_ref")?;
-        let evidence_ref = operation_text(operation, "task_selection_evidence_ref")?;
-
-        if task_ref.as_str() != task_id {
-            return Err(TaskBindingRejection::scope_incompatible(
-                "retained task selection names a different task than the admitted operation",
-            ));
-        }
-        if work_scope_ref.as_str() != transition.scope_id.as_str()
-            || scope_ref != work_scope_ref.as_str()
-        {
-            return Err(TaskBindingRejection::scope_incompatible(
-                "retained task selection WorkScope does not match the prepared operation",
-            ));
-        }
-
-        let current_revision = context.state_fence.task_revision;
-        let retained_revision = task_revision.value().to_string();
-        if retained_revision != revision
-            || current_revision != Some(task_revision)
-            || recorded_acceptance_digest.as_str() != acceptance_digest
-            || evidence
-                .get("selection_source_ref")
-                .and_then(serde_json::Value::as_str)
-                != Some(source_ref)
-            || evidence
-                .get("evidence_ref")
-                .and_then(serde_json::Value::as_str)
-                != Some(evidence_ref)
-            || !transition
-                .required_proof_and_approval_refs
-                .iter()
-                .any(|reference| reference == source_ref)
-            || !transition
-                .required_proof_and_approval_refs
-                .iter()
-                .any(|reference| reference == evidence_ref)
-        {
-            return Err(TaskBindingRejection::selection_required(
-                "retained task selection revision, acceptance digest, or exact evidence references do not match the operation",
-            ));
-        }
-
-        if operation.operation == NamedMutationOperation::UpdateTaskState {
-            if operation_text(operation, "task_id")? != task_id {
-                return Err(TaskBindingRejection::scope_incompatible(
-                    "task-control payload names a different task than the admitted selection",
-                ));
-            }
-        }
-        if operation.operation == NamedMutationOperation::CaptureObservation {
-            validate_capture_submission_binding(operation, transition, &evidence)?;
+            checked = true;
+            validate_retained_selection_operation(context, transition, task_id, operation)?;
         }
     }
-
     if !checked {
         return Err(TaskBindingRejection::selection_required(
             "task-bound capture/control requires retained TaskSelectionEvidence",
