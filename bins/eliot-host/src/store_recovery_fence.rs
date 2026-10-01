@@ -33,10 +33,10 @@ pub(super) struct StoreRecoveryReopenFence {
 // F-LOG-HOST-6 (#981) recovery-fence observation helpers.
 //
 // Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); Event Log sink
+// disposition goes through the canonical bounded observer
+// (`crate::host_diagnostics::note_event_log_sink_status`), live where #984's
+// accepted safe port is live (Windows).
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals only — never digests,
@@ -50,7 +50,7 @@ pub(super) struct StoreRecoveryReopenFence {
 // is enforced by the outermost owner boundary, while these phases correlate
 // by stage order only. Sink outcome never alters result/order/cleanup.
 fn host_recovery_fence_observe(detail: &str) {
-    let _ = crate::windows_event_log::event_log_sink_status();
+    crate::host_diagnostics::note_event_log_sink_status();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::Startup,
         detail,

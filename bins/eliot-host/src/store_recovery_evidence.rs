@@ -12,10 +12,10 @@ use super::{
 // F-LOG-HOST-6 (#981) recovery-evidence observation helpers.
 //
 // Through the #889 facade only
-// (`crate::host_diagnostics::observe_entrypoint_with_detail`); the Event Log
-// seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// (`crate::host_diagnostics::observe_entrypoint_with_detail`); Event Log sink
+// disposition goes through the canonical bounded observer
+// (`crate::host_diagnostics::note_event_log_sink_status`), live where #984's
+// accepted safe port is live (Windows).
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. Arguments are static literals only — never evidence
@@ -28,7 +28,7 @@ use super::{
 // result/order/cleanup.
 #[cfg(windows)]
 fn host_recovery_observe(detail: &str) {
-    let _ = crate::windows_event_log::event_log_sink_status();
+    crate::host_diagnostics::note_event_log_sink_status();
     crate::host_diagnostics::observe_entrypoint_with_detail(
         crate::host_diagnostics::EntrypointStage::Startup,
         detail,
@@ -154,7 +154,13 @@ pub(super) fn read_store_recovery_termination_evidence(
     let path = store_recovery_termination_path(host_state_root, mutation_digest);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Bound to the requested mutation: its digest already validated
+            // above and derived this exact path. Absence stays incomplete
+            // (`None`), never clear or successful recovery.
+            host_recovery_observe("host.recovery termination absent observed");
+            return Ok(None);
+        }
         Err(error) => {
             host_recovery_observe("host.recovery termination inspect failed observed");
             return Err(HostError::RecoveryRequired(format!(
@@ -250,7 +256,13 @@ pub(super) fn read_store_recovery_inner_binding(
     let path = store_recovery_inner_binding_path(host_state_root, mutation_digest);
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Bound to the requested mutation: its digest already validated
+            // above and derived this exact path. Absence stays incomplete
+            // (`None`), never clear or successful recovery.
+            host_recovery_observe("host.recovery inner absent observed");
+            return Ok(None);
+        }
         Err(error) => {
             host_recovery_observe("host.recovery inner inspect failed observed");
             return Err(HostError::RecoveryRequired(format!(
@@ -277,4 +289,59 @@ pub(super) fn read_store_recovery_inner_binding(
     })?;
     host_recovery_observe("host.recovery inner observed");
     Ok(Some(binding))
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod store_recovery_absence_tests {
+    use super::*;
+    use crate::TestResult;
+
+    fn absence_root(label: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "eliot-981-recovery-absence-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    #[test]
+    fn absent_termination_evidence_stays_none() -> TestResult {
+        let root = absence_root("termination-absent")?;
+        let digest = "a".repeat(64);
+        let evidence = read_store_recovery_termination_evidence(&root, &digest)?;
+        assert!(evidence.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_termination_mutation_is_refused() -> TestResult {
+        let root = absence_root("termination-unbound")?;
+        let error = read_store_recovery_termination_evidence(&root, "not-a-digest").unwrap_err();
+        assert!(matches!(error, HostError::RecoveryRequired(_)));
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn absent_inner_binding_stays_none() -> TestResult {
+        let root = absence_root("inner-absent")?;
+        let digest = "b".repeat(64);
+        let binding = read_store_recovery_inner_binding(&root, &digest)?;
+        assert!(binding.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_inner_mutation_is_refused() -> TestResult {
+        let root = absence_root("inner-unbound")?;
+        let error = read_store_recovery_inner_binding(&root, "not-a-digest").unwrap_err();
+        assert!(matches!(error, HostError::RecoveryRequired(_)));
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
 }
