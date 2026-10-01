@@ -1621,6 +1621,7 @@ impl HostComposition {
                     .map_err(HostError::Installation)?
                     .clone(),
                 agent_bridge,
+                user_broker: phase_b.user_broker().cloned(),
             }),
             authority_generation: phase_b.launch.authority_generation,
             authority_state_fence: phase_b.launch.authority_state_fence.clone(),

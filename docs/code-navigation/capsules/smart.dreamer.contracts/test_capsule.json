@@ -43,7 +43,16 @@
       ]
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 10
+    "inline_cfg_test_modules": 10,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": []
+    },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -65,6 +74,7 @@
         "sha256": "cc04906a882496ece24a47bd1992208e4b8c0d6b38c83c386818dcf25e65f00b",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -75,6 +85,7 @@
         "sha256": "c075050dd9306e8a8baed09e864077bd08bb5d25483cf147cbbbd59022dba344",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -85,6 +96,7 @@
         "sha256": "54ae3907e1aa2ff4107b9f8273e9379f11cb9ded4a9bbdb43c932d8b94f8697c",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -95,6 +107,7 @@
         "sha256": "3387c72bcc72992222622b6158c296d8e6dbfa80bd6c2fdc5e84e0c4ca6cb9b5",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -105,6 +118,7 @@
         "sha256": "df726966e79a2c7a4848540ee6e56f05a04417e2aba31758d19deb0bf6096119",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -116,6 +130,7 @@
         "sha256": "1e2433910bbbe96510a786381ec6793ee704f279be1066d859a8a8d5a6936376",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -126,6 +141,7 @@
         "sha256": "0b618955031351f1cdf1aa09b401eff72ae52e755c04ad6f2510483ac30f1ac5",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -134,6 +150,7 @@
         "sha256": "4191a53f155b6094e6d18ed92920c62ab274f64a4645fa90ffdce8913a74728c",
         "test_attributes": 12,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -144,6 +161,7 @@
         "sha256": "26044c94a5b7d3b87c451547e91eca05a53459cf7ed3b7998c1a0a5a6bf318d9",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -152,6 +170,7 @@
         "sha256": "86fce0c5dcedf2861c30c247b258ad11bf71ad07cd613987a5ddaa73f5230bf5",
         "test_attributes": 8,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -162,6 +181,7 @@
         "sha256": "4da4af6a2d312903308ec4cef7babf4053902d64e1f0af3fbc6cb637076cf14c",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
@@ -172,6 +192,7 @@
         "sha256": "e10fef904d852135f16e529739be126e69203cc744f0bdd065a61133baf6f3f9",
         "test_attributes": 5,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -182,6 +203,7 @@
         "sha256": "c0303b2b6564b0ddb56538d760a7047076b21dd2743f4779d4a276c148755e26",
         "test_attributes": 24,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -193,18 +215,9 @@
         "sha256": "55567b5f98d2c3a13c2827b3d2f83d86ddce07c06944715316a6cd0a476cbff9",
         "test_attributes": 12,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
-          "fault_restart_replay"
-        ]
-      },
-      {
-        "path": "crates/smart/eliot-dreamer-contracts/tests/support/grounding.rs",
-        "bytes": 16829,
-        "sha256": "d02dec343f67dcb3153235f5b4b1d410b562f69244bd02c8998c19b3d20eded8",
-        "test_attributes": 0,
-        "inline_cfg_test": false,
-        "classes": [
           "fault_restart_replay"
         ]
       },
@@ -214,6 +227,7 @@
         "sha256": "29725abe7a702d429009bfb32f79ead8e6b54c984d89bb4f2f8d25e0aa24fcab",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -222,6 +236,7 @@
         "sha256": "5a1f79dc2a0f9e3a737d44a2eceb8f65a6c98d0ccef9884b23fb50ac864ba08e",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       }
     ],
@@ -300,8 +315,7 @@
       "crates/smart/eliot-dreamer-contracts/tests/probe_input_contracts.rs",
       "crates/smart/eliot-dreamer-contracts/tests/relation_contracts.rs",
       "crates/smart/eliot-dreamer-contracts/tests/rival_declaration_contracts.rs",
-      "crates/smart/eliot-dreamer-contracts/tests/rival_projection_contracts.rs",
-      "crates/smart/eliot-dreamer-contracts/tests/support/grounding.rs"
+      "crates/smart/eliot-dreamer-contracts/tests/rival_projection_contracts.rs"
     ]
   },
   "resource_and_serial_groups": {
@@ -328,16 +342,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 161,
-    "test_stu": 106686,
+    "test_stu": 101076,
     "nonzero": true
   },
-  "bound_contract_digest": "955a3040aa3f00e219b7fbc87fddf2afbd94293b0631dfb43c25162fb23fe135",
+  "bound_contract_digest": "6e5bad90d5807811",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -357,18 +367,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-contracts/module.toml",
         "sha256": "900a9a17974c107f920a17b06d3c70cfd976feb872c24027dc362998808ab4f5"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
+        "path_count": 89,
+        "sha256": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
         "path_count": 89,
         "sha256": "3abe84cf6fa1deb05ead8ec0694c040981fc3d736d1bae03daeebfa04bf28003"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "b6fd56077e177406419364dea70b45daafd4e8f97cfe588a6457fa4916066754",
+  "artifact_digest": "b31259a5285b0efd8dac7b1c61340f590c1f82cd67311ec4b2fc89b3d172cf54",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "b6fd56077e177406"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "76830ae62a406a41"
   }
 }

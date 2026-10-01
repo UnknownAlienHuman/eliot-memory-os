@@ -21,7 +21,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_agent_contracts::{AnchorReference, AnchorResolution, AnchorResolutionStatus};
+pub use eliot_agent_contracts::{AnchorReference, AnchoredReviewItem, ProvenanceReference};
+use eliot_agent_contracts::{
+    AnchorResolution, AnchorResolutionStatus, PublicReference, RevisionId, TargetId,
+};
 use eliot_contracts::{
     ContractError, ContractIdentity, ContractVersion, StateFence, canonical_json_bytes,
     contract_identity as foundation_contract_identity, sha256_hex,
@@ -1848,6 +1851,61 @@ impl AnchorCandidate {
         }
         Ok(())
     }
+
+    /// Builds one current-location candidate from an admitted monitor
+    /// after-state for the given original anchor (issue #1824, I10.21).
+    ///
+    /// Every field comes from admitted values: the target kind, anchor
+    /// identity frame, and context digest from the immutable original, and
+    /// the target id/revision/digest, path, symbol, and content/structural
+    /// fingerprints from the admitted after-state. The line range stays
+    /// absent because after-states carry no line identity; inventing lines
+    /// would fabricate exactness the evidence cannot prove. Provenance is
+    /// caller-supplied (usually absent: observations carry operation and
+    /// diff/artifact handles, not full provenance references), and the
+    /// historical-range flag is an explicit adapter assertion, never
+    /// inferred here.
+    ///
+    /// Deletion observations (`after` absent) yield no candidate: a deleted
+    /// target stays historically addressable through the resolver's
+    /// deletion-evidence branch over admitted observations, not through a
+    /// synthesized current location.
+    pub fn from_admitted_after_state(
+        original: &AnchorReference,
+        after: &ResourceSnapshot,
+        provenance: Option<ProvenanceReference>,
+        historical_range_match: bool,
+    ) -> Result<Self, ChangeMonitorError> {
+        original.validate()?;
+        after.validate()?;
+        if let Some(provenance) = &provenance {
+            provenance.validate()?;
+        }
+        let target = PublicReference {
+            kind: original.target.kind.clone(),
+            id: TargetId::new(after.resource_ref.clone())?,
+            revision: RevisionId::new(after.revision.clone())?,
+            digest: after.content_digest.clone(),
+        };
+        let reference = AnchorReference {
+            target,
+            anchor_id: original.anchor_id.clone(),
+            path: after.path.clone(),
+            symbol: after.symbol.clone(),
+            line_start: None,
+            line_end: None,
+            context_digest: original.context_digest.clone(),
+            provenance,
+        };
+        let candidate = Self {
+            reference,
+            content_digest: after.content_digest.clone(),
+            structural_digest: after.structural_digest.clone(),
+            historical_range_match,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
 }
 
 /// Version of the deterministic evolving-anchor resolution order.
@@ -2252,6 +2310,36 @@ impl EvolvingAnchorResolver {
             AnchorResolutionConfidence::Unresolved,
         ))
     }
+
+    /// Resolves one anchored-review item through the I10.21 order and
+    /// returns the published evidence-bearing observation (issue #1824,
+    /// I10.18/I10.21).
+    ///
+    /// The item supplies the immutable original anchor (validated with its
+    /// fence and lifecycle binding); the candidates and the monitor
+    /// snapshot are the complete immutable inputs the observation records.
+    /// The returned observation carries the algorithm version, every input,
+    /// the matching evidence tier, and confidence, and is serializable
+    /// through the contract identity schema set.
+    ///
+    /// Statuses that cannot attach (`ambiguous` with no chosen target,
+    /// `deleted`, `stale`, `unavailable`) are returned, never converted
+    /// into errors and never auto-attached: attachment stays with the
+    /// review route through `AnchoredReviewItem::validate_resolution`.
+    /// Human correction arrives as a new observation, never a rewrite.
+    pub fn resolve_anchored_review(
+        &self,
+        item: &AnchoredReviewItem,
+        candidates: &[AnchorCandidate],
+        monitor: &ChangeMonitorSnapshot,
+    ) -> Result<AnchorResolutionObservation, ChangeMonitorError> {
+        item.validate()?;
+        let observation = self.resolve_observed(&item.original_target, candidates, monitor)?;
+        if observation.resolution.anchor_id != item.original_target.anchor_id {
+            return Err(ChangeMonitorError::InvalidAnchor);
+        }
+        Ok(observation)
+    }
 }
 
 /// Attribution class for a bidirectional provenance edge.
@@ -2364,6 +2452,7 @@ pub fn contract_identity() -> Result<ContractIdentity, ChangeMonitorError> {
             "observation": schemars::schema_for!(ChangeObservation),
             "snapshot": schemars::schema_for!(ChangeMonitorSnapshot),
             "anchor_candidate": schemars::schema_for!(AnchorCandidate),
+            "anchor_resolution_observation": schemars::schema_for!(AnchorResolutionObservation),
             "provenance_view": schemars::schema_for!(ChangeProvenanceView),
         }),
     )

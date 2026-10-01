@@ -740,6 +740,25 @@ fn run_profile_supervisor(
         }
     }
 
+    // #1771 AUD4: `user_mode` supervision is the current-user launcher plus its
+    // Task Scheduler task, and it is registered from the Host process rather
+    // than from the installer transaction because only a process that exists
+    // *after* Phase-B can observe the published authority digest. By this point
+    // Phase-B has published `authority.json` and Host has read it back, so the
+    // digest the adapter re-pins is a live observation, never the Phase-A
+    // pending marker. `portable_dev` registers nothing: it is the disposable
+    // repository-local contour, and this call refuses any non-`UserMode`
+    // profile rather than composing a second supervision path.
+    if profile == InstallationProfile::UserMode {
+        if let Err(error) = eliot_host::register_user_mode_launcher(&host) {
+            // A missing or unattributable live registration leaves `user_mode`
+            // without its launcher, so this is terminal for this supervisor
+            // rather than a degraded continuation.
+            let _ = host.stop();
+            return Err(error);
+        }
+    }
+
     // Neither admitted profile enters the SystemService credential-control
     // endpoint, which requires Administrators and opens ProgramData.
     // `open_for_profile` has bound this launch descriptor to the approved
@@ -2514,20 +2533,28 @@ impl HostIdleDrainSupervisor {
         trigger: ActivationTriggerClass,
         evidence: &PlatformHandle,
     ) -> Result<DrainWakeOutcome, HostError> {
-        self.idle_since = None;
-        self.precommit_opened_at = None;
+        // Audit 5906086103 D1: grace/window timing is classified first and
+        // mutated per outcome below. A delayed duplicate
+        // (`ReplayAlreadyConsumed`) is a true no-op for timing, and a refused
+        // trigger that resumes nothing leaves timing unchanged; only genuine
+        // new observable use or an actual cancellation/queued successor resets
+        // grace and window.
         match host
             .note_observable_use(trigger, evidence)
             .map(|admission| surface_expired_wake_demands(admission, "observable use"))
         {
             Ok(DrainWakeOutcome::CancelDrain) => {
-                // A cancellation ends the drain attempt and changes the
+                // An actual cancellation ends the window and the grace; the
+                // resume below restarts them only when the generation is
+                // proven serving again. A cancellation also changes the
                 // obligation set, so the cached census is no longer authority
                 // for the next decision. The same trigger then drives the
                 // I1.5 return to ACTIVE: the tick reconcile serves
                 // pre-commit cancelled drains too (same authenticated proof
                 // through the admitted fence). The trigger-driven resume
                 // below runs as well, independently.
+                self.idle_since = None;
+                self.precommit_opened_at = None;
                 match host.resume_cancelled_drain_on_observable_use() {
                     Ok(true) => {
                         self.idle_since = Some(std::time::Instant::now());
@@ -2561,6 +2588,10 @@ impl HostIdleDrainSupervisor {
                 }
             }
             Ok(DrainWakeOutcome::QueueNextGeneration) => {
+                // A queued successor ends the grace and window of the
+                // committed generation.
+                self.idle_since = None;
+                self.precommit_opened_at = None;
                 // AUD6: the queued `Pending` intent is read back as the full
                 // owner-bound demand and observably published to the
                 // stopped-installation demand-start owner. A journal that
@@ -2592,14 +2623,22 @@ impl HostIdleDrainSupervisor {
             }
             Ok(DrainWakeOutcome::ReplayAlreadyConsumed) => {
                 // A delayed trigger of an already-consumed attempt is neither
-                // new work nor a cancellation of the current attempt.
+                // new work nor a cancellation of the current attempt, so it
+                // leaves grace and window timing unchanged: repeated
+                // duplicates can never postpone `CommitDue`. This arm is a
+                // true no-op for supervisor timing.
                 let _ = writeln!(
                     io::stderr().lock(),
                     "eliot-host: observable use repeated a trigger the current drain attempt already consumed; it did not cancel the attempt"
                 );
                 Ok(DrainWakeOutcome::ReplayAlreadyConsumed)
             }
-            Ok(DrainWakeOutcome::Proceed) => Ok(DrainWakeOutcome::Proceed),
+            Ok(DrainWakeOutcome::Proceed) => {
+                // Genuine new observable use restarts the idle grace.
+                self.idle_since = None;
+                self.precommit_opened_at = None;
+                Ok(DrainWakeOutcome::Proceed)
+            }
             Err(error) => {
                 // A fresh authenticated trigger the current generation could
                 // not admit (for example, `Draining` with an already
@@ -2621,6 +2660,8 @@ impl HostIdleDrainSupervisor {
                         Err(error)
                     }
                     Ok(false) => {
+                        // The trigger was never recorded and nothing resumed:
+                        // grace and window timing stay unchanged.
                         let _ = writeln!(
                             io::stderr().lock(),
                             "eliot-host: observable use was not admitted by the current activation generation: {error}"
@@ -2628,6 +2669,8 @@ impl HostIdleDrainSupervisor {
                         Err(error)
                     }
                     Err(resume_error) => {
+                        // Neither the trigger nor the resume landed: grace and
+                        // window timing stay unchanged.
                         let _ = writeln!(
                             io::stderr().lock(),
                             "eliot-host: observable use was not admitted by the current activation generation: {error}; cancelled-drain resume also failed: {resume_error}"
@@ -2737,8 +2780,12 @@ impl HostIdleDrainSupervisor {
         let Some(opened) = self.precommit_opened_at else {
             return match host.begin_idle_drain(self.last_census.observation_code()) {
                 Ok(true) => {
-                    // Every appended stage returned `Ok`, so the pre-commit
-                    // window is durable: only now may the timer be published.
+                    // Audit 5906086103 D3: `Ok(true)` carries the publication
+                    // gate — drain `Draining` plus matching `Draining`
+                    // activation plus the attempt/admission binding, with any
+                    // missing activation transition finished through the exact
+                    // recorded attempt. Only now may the timer be published;
+                    // a failed append never reports a window.
                     self.precommit_opened_at = Some(now);
                     let _ = writeln!(
                         io::stderr().lock(),

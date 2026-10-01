@@ -165,6 +165,36 @@ impl SurrealStoreAdapter {
         config: SurrealAdapterConfig,
         provider_process_lease: RetainedProcessPathLease,
     ) -> Result<Self, AdapterError> {
+        Self::new_with_limits(
+            config,
+            provider_process_lease,
+            ClientSetLimits::compatibility(),
+        )
+    }
+
+    /// Builds the canonical adapter with the exact bounded RPC session profile
+    /// its composition owner already resolved for this bridge.
+    ///
+    /// [`Self::new`] keeps the compatibility profile, so every existing
+    /// caller and struct literal is unchanged. A composition that already owns
+    /// one bounded read/write/health session profile (I5.7, issue #1933) binds
+    /// that same profile here, so the adapter's provider session pool and the
+    /// bridge's connection-manager bounds describe one capacity instead of two
+    /// unrelated ones. That shared bound is what
+    /// [`Self::install_concurrent_execution`] validates the execution lanes
+    /// against, so an adapter left on the compatibility profile can never
+    /// admit a generation wider than its single write session no matter what
+    /// the composition configured.
+    ///
+    /// The bound is never widened here: the supplied profile is the validated
+    /// per-role capacity itself, so an execution generation installed later is
+    /// checked against exactly the sessions this pool can actually open rather
+    /// than against an unrelated constant.
+    pub fn new_with_limits(
+        config: SurrealAdapterConfig,
+        provider_process_lease: RetainedProcessPathLease,
+        client_limits: ClientSetLimits,
+    ) -> Result<Self, AdapterError> {
         config
             .validate()
             .map_err(|error| AdapterError::Config(error.to_string()))?;
@@ -194,7 +224,7 @@ impl SurrealStoreAdapter {
             tx_rendezvous: std::sync::Mutex::new(None),
             execution: std::sync::Mutex::new(None),
             operation_manifest,
-            client_limits: ClientSetLimits::compatibility(),
+            client_limits,
         })
     }
 
@@ -336,17 +366,28 @@ impl SurrealStoreAdapter {
     /// Advertises the reserved-write capability exactly when a concurrent
     /// execution generation owns this adapter. No backend without an
     /// accepted scheduler advertises it.
+    ///
+    /// This is the single advertisement owner for the reserved-write
+    /// capability (issue #1925): the answer is derived from the same
+    /// [`Self::concurrent_execution`] owner that gates dispatch, so an
+    /// advertisement and the refusal a store would issue can never disagree.
     #[must_use]
     pub fn reserved_write_capability(&self) -> Option<&'static str> {
-        let slot = self.execution.lock().ok()?;
-        if slot
-            .as_ref()
-            .is_some_and(|execution| execution.is_concurrent())
-        {
-            Some(CAPABILITY_RESERVED_WRITE)
-        } else {
-            None
-        }
+        self.concurrent_execution()
+            .map(|_| CAPABILITY_RESERVED_WRITE)
+    }
+
+    /// Returns the installed execution generation only when it runs the
+    /// concurrent reserved-write profile.
+    ///
+    /// The one owner of "this store can serve a reserved write": the
+    /// advertisement ([`Self::reserved_write_capability`]) and the dispatch
+    /// gate both read it, so neither can claim a capability the other
+    /// refuses. A serial generation and an absent generation are both absent
+    /// here, which is the honest answer for both.
+    pub(crate) fn concurrent_execution(&self) -> Option<std::sync::Arc<WriteExecution>> {
+        self.execution_handle()
+            .filter(|execution| execution.is_concurrent())
     }
 
     /// Returns the installed execution generation, if any.

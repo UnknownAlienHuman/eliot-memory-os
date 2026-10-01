@@ -36,15 +36,16 @@
 //!   what has to exist rather than that "admitted capture is not implemented":
 //!   `KernelBackupCapture::capture` consumes a caller-issued
 //!   `CaptureCallerAuth`, a `PublicationPort` that publishes exactly once, and
-//!   an already-accepted `CaptureRequest` evidence bundle, and NEITHER the port
-//!   nor the bundle has a production producer on this tree (the port's only
-//!   implementation is `MemPublisher` inside
-//!   `bins/eliot-kernel/tests/backup_capture.rs`; `request_from_ports` and
-//!   `EbpCanonicalStoreClient::backup_begin`/`backup_page`/`backup_end` have no
-//!   production caller). Admitting capture here would invent authority, so the
-//!   item's "any missing capture-owner behavior remains with #959" holds and
-//!   this route refuses a typed owner-absence instead of a receipt for having
-//!   read its own arguments.
+//!   an already-accepted `CaptureRequest` evidence bundle. The port DOES have a
+//!   production implementation now - #959's
+//!   `eliot_blob::BlobArchivePublicationOwner` - but nothing can BIND it,
+//!   because it takes an `eliot_blob::BlobStoreService` that no production code
+//!   constructs; and the bundle still has no producer at all
+//!   (`request_from_ports` and `EbpCanonicalStoreClient::backup_begin`/
+//!   `backup_page`/`backup_end` have no production caller). Admitting capture
+//!   here would invent authority, so the item's "any missing capture-owner
+//!   behavior remains with #959" holds and this route refuses a typed
+//!   owner-absence instead of a receipt for having read its own arguments.
 //! - `backup.verify` admits the bounded inline bundle bytes, then decodes and
 //!   validates them through the real capture owner
 //!   ([`KernelBackupCapture::verify_only`], bound on the composition by #959
@@ -104,12 +105,18 @@
 //!   which is genuinely ambiguous; this implementation reads it as per-PRINCIPAL and
 //!   discloses the reading on `BackupVerifyRequestIdentity` for the owner to settle.
 //!
-//!   Three consequences are load-bearing and are each a typed answer rather than a
+//!   Four consequences are load-bearing and are each a typed answer rather than a
 //!   silent one: a cross-principal or cross-scope hit on one key is refused with a
 //!   bounded typed refusal that projects nothing; a row written under the pre-#2883
 //!   raw text key is quarantined as unscoped legacy evidence and is never certified,
 //!   re-keyed or projected, while bytes under that key that decode as NEITHER shape
-//!   fail closed instead of being read as absent; and a caller that is NOT the
+//!   fail closed instead of being read as absent; a row written under an EARLIER
+//!   verify PROFILE is addressed at that profile's own namespace key — `v2` by
+//!   #2862, `v1` by #2863 — and is quarantined as legacy unqualified evidence
+//!   with its own reason, because a profile bump moves the
+//!   `idempotency_namespace` and therefore the key, so reading a superseded row
+//!   as "absent" would let the caller stage a SECOND row for one operation
+//!   identity that already holds a stored answer; and a caller that is NOT the
 //!   principal owning an operation may read that operation's stored answer only by
 //!   presenting the caller-presented evidence pair that names it exactly — the
 //!   predecessor's durable namespace digest plus its canonical request hash — and
@@ -227,7 +234,8 @@ use eliot_ors::{
     BACKUP_VERIFY_PROFILE_VERSION, BACKUP_VERIFY_RETENTION_WINDOW, BackupVerificationDisposition,
     BackupVerificationResultRecord, BackupVerifyRequestIdentity,
     CONTRACT_VERSION as ORS_CONTRACT_VERSION, LegacyFenceBoundBackupVerificationClass,
-    LegacyUnscopedBackupVerificationClass, OrsError, RestoreJournalArchiveClass,
+    LegacyTwoValueRelationBackupVerificationClass, LegacyUnscopedBackupVerificationClass, OrsError,
+    RestoreJournalArchiveClass,
 };
 use eliot_protocol::backup::BackupClassWire;
 use eliot_protocol::{Frame, FrameKind, MessageType, ProtocolPayload};
@@ -801,14 +809,14 @@ fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
 ///    production caller, and the accepted read is ASYNC while
 ///    `KernelComposition::dispatch_backup_frame` is the synchronous frame
 ///    route.
-/// 2. a production `PublicationPort`. `capture` publishes exactly once through
-///    it and reconciles a lost response by operation identity through it; the
-///    only implementation in the repository is `MemPublisher` inside
-///    `bins/eliot-kernel/tests/backup_capture.rs`.
+/// 2. a BINDABLE production `PublicationPort`. `capture` publishes exactly once
+///    through it. #959 supplied `eliot_blob::BlobArchivePublicationOwner`, but it
+///    binds an `eliot_blob::BlobStoreService` no production code constructs.
 /// 3. a `FrozenCapturePlan` whose `build_digest` and `policy_digest` are
 ///    owner-ISSUED approved 64-hex digests. This route holds no such digest and
-///    will not synthesise one, because a plausible digest in that field is the
-///    laundered-absence this item names.
+///    will not synthesise one: `gate_approved_manifest_digests` binds each to a
+///    carried artifact's OWN recorded digest, so a digest read off the artifacts
+///    it gates compares one caller list with itself and binds nothing.
 ///
 /// So the create arm does what the item says to do with an absent owner: it
 /// returns a TYPED FAILURE NAMING THE ABSENT OWNER BEHAVIOUR. It emits no
@@ -913,9 +921,10 @@ fn handle_backup_create(
         idempotency_key,
         "plan_gap",
         BACKUP_CREATE_MISSING_OWNER,
-        "capture owner entry KernelBackupCapture::capture is unreachable: no \
-         production PublicationPort and no producer of the accepted \
-         CaptureRequest evidence; #959 owns both",
+        "capture owner entry KernelBackupCapture::capture is unreachable: \
+         #959's BlobArchivePublicationOwner cannot be bound because no \
+         production BlobStoreService exists, and no producer supplies the \
+         accepted CaptureRequest evidence",
     ))
 }
 
@@ -1077,10 +1086,11 @@ fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Val
 /// `backup_id` and `class` are text the archive declares about itself and the
 /// owner re-validates for internal consistency, and `archive_sha256` is computed by
 /// the archive format itself (`BackupBundle::bundle_sha256`) — none of the three is
-/// proved against a capture owner, because no production `impl PublicationPort`
-/// exists on this path and `verify_only` therefore always answers
-/// `StructurallyValidCandidate`. That is exactly why the surface reports a
-/// structurally valid archive as a `candidate` and never as `verified`.
+/// proved against a capture owner: `verify_only` publishes nothing and reads no
+/// retained receipt, so no production publication owner issues one on this path
+/// and `verify_only` always answers `StructurallyValidCandidate`. That is exactly
+/// why the surface reports a structurally valid archive as a `candidate` and
+/// never as `verified`.
 ///
 /// The other three fields are DERIVED from the accepted request identity, not owner
 /// answers, and are called out as such in their own field docs: `request_digest` is
@@ -1220,9 +1230,9 @@ fn verified_reply(
         );
     }
     // Explicitly null, never omitted: no retained-artifact owner issues a
-    // capture receipt on this path. The missing symbol is a production
-    // `impl PublicationPort`; the only implementation is `MemPublisher` inside
-    // `bins/eliot-kernel/tests/backup_capture.rs`.
+    // capture receipt on this path. The missing symbol is a BINDABLE production
+    // publication owner: #959's `eliot_blob::BlobArchivePublicationOwner` exists
+    // but needs a production `BlobStoreService`, and no production code builds one.
     let capture_receipt = projection
         .capture_receipt
         .clone()
@@ -1651,13 +1661,14 @@ fn backup_verify_admitted_identity(
         capture_receipt: None,
         // #2862: the three owner-evidence commitments. Absent here for the same
         // reason the eight terms above are empty, and the absence is
-        // load-bearing rather than a placeholder: no production
-        // `impl PublicationPort` resolves a retained handle on this path (the
-        // only implementation is `MemPublisher` in
-        // `bins/eliot-kernel/tests/backup_capture.rs`), and no
+        // load-bearing rather than a placeholder: no BINDABLE production
+        // publication owner resolves a retained handle on this path, and no
         // `BackupRole::Verifier` session issues a capture receipt or an archive
-        // validity attestation on this product at all. They are recorded as the
-        // owner's own answer and are never filled from caller text; ORS
+        // validity attestation on this product at all. The owner #959 did land
+        // is `eliot_blob::BlobArchivePublicationOwner`, the one production
+        // `PublicationPort`, and it binds to an `eliot_blob::BlobStoreService`
+        // that no production path constructs. They are recorded as the owner's
+        // own answer and are never filled from caller text; ORS
         // `validate()` requires each to be either a well-formed digest or absent.
         // #2862 also left them absent HERE, and `backup_verify_identity` is where
         // they are filled: from the owner's recorded evidence through
@@ -2108,6 +2119,42 @@ fn legacy_unqualified_evidence_reply(idempotency_key: &str) -> Value {
     )
 }
 
+/// Projects the typed refusal for a PRE-#2863 (`v1`) durable row, whose
+/// archived-fence answer is the retired two-value vocabulary (#2863).
+///
+/// It is a THIRD sentence, distinct from
+/// [`legacy_unscoped_evidence_reply`] and
+/// [`legacy_unqualified_evidence_reply`], because the fact the caller needs
+/// about this row is a third fact:
+///
+/// - the pre-#2883 row carries no ownership at all;
+/// - the pre-#2862 row is fully scoped but carries no owner-evidence
+///   commitments;
+/// - THIS row is fully scoped and its `target_compatibility` field held
+///   `current-session` or `historical-authority`, an authority-epoch-only
+///   relation published under the name of a TARGET COMPATIBILITY answer. That
+///   name was wrong about what it measured, which is the whole reason #2863
+///   replaced it with a typed `archive_fence_relation` plus its own proof
+///   ceiling and left `target_compatibility` to the restore owner (A13.7). So
+///   the refusal must NOT tell the caller its stored answer was a target
+///   compatibility finding, and must NOT present the row as merely
+///   un-provenanced.
+///
+/// The refusal states the class and nothing read out of the row: no stored
+/// fence, no stored relation spelling, no stored digest, no archive identity and
+/// no store error. It answers the second branch of issue #2863's instruction 8
+/// — the row does not replay as a current-profile answer, so the caller must
+/// submit a NEW explicit verification operation, which is a new `operation_id`
+/// and therefore a different `v1` key that reads `Absent`.
+fn legacy_two_value_evidence_reply(idempotency_key: &str) -> Value {
+    invalid_reply(
+        BACKUP_VERIFY_OPERATION,
+        idempotency_key,
+        "backup.verify",
+        "this operation already holds a durable verification result written under a pre-fence-relation verify profile, whose archived-fence answer used a retired two-value vocabulary published as a target compatibility; it is quarantined as legacy unqualified evidence, is neither upgraded, re-keyed nor projected here, and its stored bytes are not reinterpreted under the current relation vocabulary; submit a new explicit verification operation to obtain the current result",
+    )
+}
+
 /// Returns whether one durable-store failure is the I5.27 identity conflict
 /// rather than an outage.
 ///
@@ -2204,12 +2251,15 @@ fn undecided_report_reply(report: &CaptureReport, idempotency_key: &str) -> Opti
 ///
 /// `Absent` is a positive fact about the store, not an unknown answer: nothing is
 /// stored under this identity's namespace digest AND nothing is stored under the
-/// caller's raw text in any of the three probe classes. It is never produced from a
-/// store failure, because a failure that degraded to `Absent` would answer `ok` for
-/// a result nothing recorded. `LegacyUnscoped` is the quarantined pre-#2883 class,
-/// neither replayable nor stageable, and `Unreadable` is the fail-closed arm for
-/// bytes that decode as neither shape. The bound record is boxed so this shape stays
-/// small next to the three unit answers.
+/// caller's raw text, the pre-#2862 `v2` key or the pre-#2863 `v1` key. It is
+/// never produced from a store failure, because a failure that degraded to
+/// `Absent` would answer `ok` for a result nothing recorded. `LegacyUnscoped` is
+/// the quarantined pre-#2883 class, neither replayable nor stageable,
+/// `LegacyUnqualified` and `LegacyTwoValueUnqualified` are the two quarantined
+/// scoped legacy classes (each with its own arm and its own reason, because they
+/// are distinguishable rows), and `Unreadable` is the fail-closed arm for bytes
+/// that decode as neither shape. The bound record is boxed so this shape stays
+/// small next to the four unit answers.
 enum PriorVerification {
     /// No durable row owns this scoped verification identity, and no pre-#2883
     /// row owns the caller's raw text either.
@@ -2229,6 +2279,33 @@ enum PriorVerification {
     /// the owner-evidence level submits a NEW explicit verification operation —
     /// a new `operation_id`, hence a different legacy key that reads `Absent`.
     LegacyUnqualified,
+    /// A PRE-#2863 (`v1`) row owns this operation under verify profile `v1`'s
+    /// idempotency namespace (#2863). It is a SEPARATE arm from
+    /// [`Self::LegacyUnqualified`] and it is not a second label on it, because
+    /// the two rows are distinguishable in a way the caller must act on:
+    ///
+    /// - it is addressable: the key is reconstructed from this operation's own
+    ///   eight key components through
+    ///   [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`],
+    ///   which is exact because #2863 changed no key component — only the
+    ///   `idempotency_namespace`;
+    /// - its archived-fence answer is the TWO-VALUE vocabulary
+    ///   (`current-session` / `historical-authority`), which reported an
+    ///   authority-epoch-only relation under the field name
+    ///   `target_compatibility`. That is a MISLEADING name for what it measured,
+    ///   which is why the current profile reports the typed
+    ///   `archive_fence_relation` with its own proof ceiling and leaves
+    ///   `target_compatibility` to the restore owner (issue #2863, instruction 6).
+    ///   So the row cannot be projected under the current vocabulary at all, and
+    ///   it must not be read as if it had said something about target
+    ///   compatibility.
+    ///
+    /// Neither arm's row is rewritten, re-keyed, upgraded, backfilled or
+    /// projected; both are quarantined. The distinction exists because the
+    /// REASON a caller must submit a NEW operation differs, and because
+    /// collapsing them would make an intact, addressable, two-value row
+    /// indistinguishable from one that never bound a fence digest at all.
+    LegacyTwoValueUnqualified,
     /// Bytes are stored under the caller's raw text and decode as NEITHER the
     /// current contract nor the pre-#2883 shape. The durable row is unreadable, so
     /// the route fails closed and answers no verification result at all. This arm
@@ -2240,6 +2317,27 @@ enum PriorVerification {
     /// A durable owner-backed result already owns this scoped verification
     /// identity, validated under the same accepted request identity.
     Bound(Box<BackupVerificationResultRecord>),
+}
+
+impl PriorVerification {
+    /// Folds one pre-#2862 (fence-bound) probe class into this enum, so the
+    /// [`KernelComposition::load_prior_verification`] probe chain can ask "is
+    /// anything decided here yet?" without every probe restating the fold.
+    ///
+    /// `None` means exactly `Absent` — the `v2` key is free, so the next,
+    /// older probe must still be asked before anything may be staged. It never
+    /// means "unknown": a store failure is returned as `Err` by the probe
+    /// itself and never reaches this fold, so this cannot turn an outage into a
+    /// decision to continue.
+    fn from_fence_bound_class(class: LegacyFenceBoundBackupVerificationClass) -> Option<Self> {
+        match class {
+            LegacyFenceBoundBackupVerificationClass::Absent => None,
+            LegacyFenceBoundBackupVerificationClass::LegacyUnqualified => {
+                Some(Self::LegacyUnqualified)
+            }
+            LegacyFenceBoundBackupVerificationClass::Unreadable => Some(Self::Unreadable),
+        }
+    }
 }
 
 /// Optional caller-presented succession evidence for a reconciliation verify
@@ -2540,7 +2638,20 @@ impl KernelComposition {
     /// historical structural-candidate result it was, and no code upgrade makes it
     /// provenance-bound, because it contains no owner evidence to promote. A NEW
     /// explicit verification operation is what produces a row under the current
-    /// profile. See [`Self::load_prior_verification`] for the probe order.
+    /// profile.
+    ///
+    /// #2863 adds the FOURTH, for the same reason: it bumped `v1` to `v2` because
+    /// the identity gained `archived_fence_digest` and `observed_fence_digest`, so
+    /// a pre-#2863 `v1` row sits under yet another key this route's own
+    /// `record_key` can never address. It is QUARANTINED the same way — never
+    /// rewritten on read, and its retired two-value `target_compatibility` bytes
+    /// never reinterpreted as a current typed `archive_fence_relation`. So both
+    /// legacy scopes take the second branch of instruction 8: no replay as a
+    /// current-profile answer, and the caller is pointed at a NEW explicit
+    /// verification operation. See [`Self::load_prior_verification`] for the probe
+    /// order, which is exhaustive over every profile version precisely so that
+    /// `Absent` — the only value that stages — means no stored answer exists under
+    /// any of them.
     ///
     /// `successor_of` is therefore for exactly one case: a caller that is NOT the
     /// principal owning the operation, which the namespace key cannot otherwise
@@ -2748,8 +2859,9 @@ impl KernelComposition {
     }
 
     /// Reads the durable verification result already bound to this scoped
-    /// identity, and quarantines a pre-#2883 row on the caller's raw text and a
-    /// pre-#2862 row under the previous profile's namespace.
+    /// identity, and quarantines a pre-#2883 row on the caller's raw text, a
+    /// pre-#2862 row under the previous profile's namespace and a pre-#2863 row
+    /// under the profile before that.
     ///
     /// `record_key` is the accepted identity's 64-hex namespace digest, not caller
     /// text. A scoped lookup that finds nothing is NOT proof that nothing is stored
@@ -2769,12 +2881,32 @@ impl KernelComposition {
     /// [`BackupVerifyRequestIdentity::legacy_fence_bound_namespace_digest`], and its
     /// class decides the answer.
     ///
-    /// The order is: current key, then the raw caller text, then the legacy
-    /// profile key. It is exhaustive over the three durable states this operation
-    /// can be in, and each probe is asked only when every stricter one has already
-    /// come back clean, so no probe can mask a row the previous one found.
+    /// #2863 adds the FOURTH probe, for the same reason one version earlier and
+    /// with the same severity: that issue bumped `v1` to `v2` because the identity
+    /// gained `archived_fence_digest` and `observed_fence_digest`, so a `v1` row
+    /// also sits under a key `record_key` can never address. Its key is
+    /// reconstructed exactly by
+    /// [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`] — the
+    /// same eight key components with exactly one preimage entry forced, which is
+    /// sound precisely because #2863 changed no OTHER key component — and its
+    /// class decides the answer through
+    /// [`RedbRecoveryStore::legacy_two_value_backup_verification_class`]. A row
+    /// there is QUARANTINED, which is the second branch issue #2863's instruction 8
+    /// permits ("replay as legacy unqualified results OR require an explicit new
+    /// verification operation"): it is never rewritten on read and its
+    /// two-value `target_compatibility` bytes are never reinterpreted as a current
+    /// typed relation.
     ///
-    /// All three probes return store failures rather than degrading, because a store
+    /// The order is: current key, then the raw caller text, then the `v2` profile
+    /// key, then the `v1` profile key. It is exhaustive over the durable states
+    /// this operation can be in under ANY profile version, and each probe is asked
+    /// only when every stricter one has already come back clean, so no probe can
+    /// mask a row the previous one found. That exhaustiveness is the load-bearing
+    /// property: [`PriorVerification::Absent`] is the ONLY value that reaches
+    /// `stage_backup_verification`, so a stored answer under any profile version
+    /// refuses rather than producing a second row for one operation identity.
+    ///
+    /// All four probes return store failures rather than degrading, because a store
     /// outage that silently downgraded to a non-persisted answer would let this route
     /// answer `ok` for a verification with no durable result behind it, which A0.3
     /// classifies as a false proof claim.
@@ -2800,16 +2932,36 @@ impl KernelComposition {
             }
         }
         let legacy_key = identity.legacy_fence_bound_namespace_digest()?;
+        let fence_bound = self
+            .p07_ors
+            .legacy_fence_bound_backup_verification_class(legacy_key.as_str())?;
+        if let Some(prior) = PriorVerification::from_fence_bound_class(fence_bound) {
+            return Ok(prior);
+        }
+        // #2863 adds the FOURTH probe, and it is the one this profile's own
+        // history makes mandatory rather than merely prudent. #2863 bumped the
+        // verify profile `v1` -> `v2` because the identity gained the two fence
+        // digests, so a `v1` row sits under a key this route's `record_key` can
+        // never address. Reading that as "absent" is the fail-OPEN outcome: the
+        // caller re-runs an operation that already holds a durable answer and
+        // stages a SECOND row beside it under the current key, so one operation
+        // identity ends up with two durable answers. The key is reconstructed
+        // exactly, through
+        // [`BackupVerifyRequestIdentity::legacy_two_value_namespace_digest`],
+        // which reuses this identity's own key preimage and changes exactly one
+        // entry — `idempotency_namespace` — because #2863 changed no other key
+        // component.
+        let two_value_key = identity.legacy_two_value_namespace_digest()?;
         Ok(
             match self
                 .p07_ors
-                .legacy_fence_bound_backup_verification_class(legacy_key.as_str())?
+                .legacy_two_value_backup_verification_class(two_value_key.as_str())?
             {
-                LegacyFenceBoundBackupVerificationClass::Absent => PriorVerification::Absent,
-                LegacyFenceBoundBackupVerificationClass::LegacyUnqualified => {
-                    PriorVerification::LegacyUnqualified
+                LegacyTwoValueRelationBackupVerificationClass::Absent => PriorVerification::Absent,
+                LegacyTwoValueRelationBackupVerificationClass::LegacyUnqualified => {
+                    PriorVerification::LegacyTwoValueUnqualified
                 }
-                LegacyFenceBoundBackupVerificationClass::Unreadable => {
+                LegacyTwoValueRelationBackupVerificationClass::Unreadable => {
                     PriorVerification::Unreadable
                 }
             },
@@ -3042,6 +3194,17 @@ impl KernelComposition {
             // profile.
             PriorVerification::LegacyUnqualified => {
                 legacy_unqualified_evidence_reply(idempotency_key)
+            }
+            // #2863: a pre-#2863 `v1` row, whose stored answer used the retired
+            // two-value relation vocabulary. It is quarantined like the `v2` case
+            // and equally NEVER staged: reaching the `stage_backup_verification`
+            // arm from here would put a SECOND durable row under the current key
+            // for one operation identity that already holds a stored answer, which
+            // is the fail-open outcome both legacy probes exist to prevent. The
+            // next step is the alternative the issue permits — a NEW explicit
+            // verification operation under a new `operation_id`.
+            PriorVerification::LegacyTwoValueUnqualified => {
+                legacy_two_value_evidence_reply(idempotency_key)
             }
             // Fail closed: bytes are stored under this caller's text and decode as
             // neither shape. Staging over them would destroy evidence and answer
@@ -3889,7 +4052,13 @@ const fn restore_error_code(error: &KernelRestoreError) -> &'static str {
         KernelRestoreError::OwnerEvidenceInvalid(_) => "restore-owner-evidence-invalid",
         KernelRestoreError::CutoverNotAuthorized => "cutover-not-authorized",
         KernelRestoreError::TargetFailed(_)
-        | KernelRestoreError::StagedCleanupIncomplete { .. } => "restore-engine-failed",
+        | KernelRestoreError::StagedCleanupIncomplete { .. }
+        // A retained-for-resume disposition does not change the causal class that
+        // crosses this front door: the engine's own typed failure is still the
+        // cause, and the retained bytes and cleanup outcome are owner-local facts
+        // this wire does not carry. So it answers as the same engine-failure
+        // class rather than inventing one.
+        | KernelRestoreError::RetainedForResume { .. } => "restore-engine-failed",
     }
 }
 

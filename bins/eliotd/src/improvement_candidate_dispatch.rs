@@ -458,14 +458,19 @@
 //! and starts no flight. It adds no scheduler, no maintenance owner and no
 //! dependency, and it has no blocking `attach_*` call.
 //!
-//! The writes it performs are [`commit_unknown_effect_obligation`] and
-//! [`commit_improvement_terminal_decision`], and they write through the same
+//! The writes it performs are [`commit_unknown_effect_obligation`],
+//! [`commit_improvement_terminal_decision`] and
+//! [`commit_causal_intervention_outcome`], and they write through the same
 //! single Governor-owned seam every other durable
 //! improvement record uses — [`crate::DaemonComposition::commit_learning_record`]
-//! over the closed `RecordLearningRecord` mutation, in the same Governor scope
-//! and the same closed `candidate` record kind as the candidate artifact, the
+//! over the closed `RecordLearningRecord` mutation, in the same closed
+//! `candidate` record kind as the candidate artifact, the
 //! archive receipts and the lineage-merge receipts
-//! (`improvement_intake_dispatch`). No store client is opened here and no
+//! (`improvement_intake_dispatch`). The causal outcome record alone lands in
+//! its own scope ([`CAUSAL_OUTCOME_SCOPE`]) rather than the Governor scope,
+//! because the exhaustive candidate-scope read refuses an untaught shape and
+//! this daemon must not break the live backlog rebuild to record an outcome;
+//! see the intervention-outcome section below. No store client is opened here and no
 //! operation is invented. The obligation record exists because an unresolved
 //! external effect is otherwise a debt that lives only in this pass, and the
 //! terminal-decision record exists because a decision nobody can read back is not
@@ -584,6 +589,49 @@
 //! exercise it, which is stated rather than papered over — and the absence is
 //! the safe direction, since an unproven candidate is refused rather than
 //! promoted.
+//!
+//! # Intervention outcomes are durable, and what that commit does not do
+//!
+//! Issue #1910 W5: an intervention outcome is recorded AGAINST a causal
+//! candidate and updates — never overwrites — its causal status, rival set,
+//! calibration and transfer boundary. [`commit_causal_intervention_outcome`]
+//! is that durable writer. The transition itself is the owner's own
+//! [`eliot_types::cognition::CausalCandidate::record_intervention_outcome`]:
+//! the outcome carries the full before state and the full after state plus the
+//! explicit `assessment_basis`, and the owner refuses anything whose before
+//! state disagrees with the candidate, whose assessment is incomplete, or that
+//! drops a documented rival without `rival_update_evidence`. The three edge
+//! statuses therefore stay three distinct values chosen only by explicit
+//! assessment — recording an outcome never promotes a status by itself — and
+//! an outcome never erases a rival on its own. This daemon restates none of
+//! that logic: the writer clones, applies through the owner, and commits the
+//! updated candidate beside the appended history entry read back out of it,
+//! so the durable bytes are one value rather than two constructions.
+//!
+//! The commit travels the same Governor-owned
+//! [`crate::DaemonComposition::commit_learning_record`] seam as every other
+//! write in this file, with no permit and no authority claimed. The record
+//! kind stays the closed `candidate` kind — a record ABOUT a candidate — while
+//! the scope is the causal family scope ([`CAUSAL_OUTCOME_SCOPE`]), because a
+//! causal document under the Governor scope would refuse the live exhaustive
+//! backlog rebuild over an untaught shape.
+//!
+//! The production caller is STITCH, stated not papered over: no live daemon
+//! path holds a `CausalCandidate` yet, so the writer is reachable API with no
+//! caller rather than a caller that fabricates one. Three prerequisites belong
+//! to other owners and are named so the next owner does not re-derive them:
+//! (1) the `eliot-types` edge — `bins/eliotd` names `eliot_types::cognition`
+//! here but carries no such dependency today (one `eliot-types.workspace =
+//! true` row plus its dependency-policy inventory entry; the edge is outside
+//! every `architecture-boundaries.toml` forbidden set for `eliotd`); (2) a
+//! producer that hands this daemon an explicitly assessed outcome for a live
+//! candidate; (3) the inspector and Active View readers (issue #1910 W6/A1/A2)
+//! paging [`CAUSAL_OUTCOME_SCOPE`]. The typed owner refusal crosses this
+//! boundary inside [`ImprovementDispatchError::Contract`] with its message
+//! intact — the error enum lives in `improvement_intake_dispatch`, another
+//! writer's file, so no second error scheme is opened here — and the commit
+//! refusal travels as [`ImprovementDispatchError::Commit`], as every other
+//! write in this file does.
 
 #![forbid(unsafe_code)]
 
@@ -609,6 +657,7 @@ use eliot_store_api::{
     LearningRecordKind, ScopeId, WriteReceipt, canonical_json_bytes, learning_record_commit_params,
     learning_record_mutation_request,
 };
+use eliot_types::cognition::{CausalCandidate, CausalInterventionOutcomeRecord};
 
 use super::DaemonComposition;
 use super::improvement_candidate_route::{
@@ -630,6 +679,25 @@ use super::improvement_intake_dispatch::{
 /// this scope as its `DEDUP_SCOPE` — and a second scope would be a second
 /// durability owner.
 const RECONCILIATION_SCOPE: &str = eliot_governor::GOVERNOR_SCOPE_ID;
+
+/// Closed store scope for durable causal intervention-outcome records.
+///
+/// A DIFFERENT scope from [`RECONCILIATION_SCOPE`], deliberately, and the
+/// reason is measured rather than stylistic: `improvement_dedup_read` pages
+/// the Governor scope exhaustively and its `classify_row` refuses the WHOLE
+/// enumeration over any row shape it was not taught. A causal outcome document
+/// committed under the Governor scope would therefore stop every later pass
+/// from rebuilding its improvement registry until that read learned a causal
+/// arm it cannot name today (it holds no `eliot-types` edge either). Landing
+/// the causal family in its own scope keeps the live backlog rebuild
+/// byte-identical while the outcome writer has no production caller, and keeps
+/// a future first caller from breaking it. The seam is still the one
+/// Governor-owned commit below — a caller-addressed scope is data, not a
+/// second durability scheme — and the record kind stays the closed `candidate`
+/// kind, which is the kind for a record ABOUT a candidate that claims no
+/// promotion. The inspector and Active View readers (issue #1910 W6/A1/A2)
+/// page this scope when they arrive; until then no reader enumerates it.
+const CAUSAL_OUTCOME_SCOPE: &str = "causal-outcome";
 
 /// Deadline bounding one durable obligation-commit ingress, in Unix
 /// milliseconds.
@@ -1271,6 +1339,148 @@ pub async fn commit_improvement_terminal_decision(
             ))
         })?;
     Ok(Some(receipt))
+}
+
+/// Makes one explicitly assessed intervention outcome durable against its
+/// causal candidate, and returns the updated candidate beside the receipt.
+///
+/// # Update, not overwrite, through the owner's own transition
+///
+/// The state change is the owner's own
+/// [`eliot_types::cognition::CausalCandidate::record_intervention_outcome`]:
+/// the outcome must name this candidate, its before state must match the
+/// candidate's current edge status, rival set, calibration and transfer
+/// boundary, and its assessment must be complete — otherwise the typed owner
+/// refusal below carries the whole call and nothing is written. On success
+/// the candidate carries the outcome's after state with the outcome appended
+/// to its append-only history, so the before/after linkage outlives the pass
+/// that observed it.
+///
+/// # What the record contains, and what it does NOT
+///
+/// The document is the updated candidate beside the history entry this call
+/// appended, read back out of the updated value rather than re-stated, so the
+/// durable bytes are one record rather than two that could drift apart. It
+/// carries no permit, no authority and no activation: a status of
+/// `observed-under-intervention` records that an intervention was observed, it
+/// does not promote the mechanism, and a successful outcome still supports an
+/// effect without confirming the claimed mechanism. The proof refs are the
+/// outcome's own verifier-or-artifact reference — the evidence the assessment
+/// cites — and nothing else.
+///
+/// # Key, scope and replay behaviour
+///
+/// The key names the OUTCOME on its candidate
+/// (`causal-intervention-outcome:<candidate>:<outcome digest>`), folding the
+/// whole appended record: replaying the same assessed outcome converges on
+/// one durable record, while a genuinely different outcome on the same
+/// candidate is its own record rather than an overwrite. The scope is the
+/// causal family scope ([`CAUSAL_OUTCOME_SCOPE`]) in the closed `candidate`
+/// kind; the commit seam, ingress derivation and deadline are the same ones
+/// the other two writers in this file use. `Ok` returns the updated candidate
+/// so the caller retains exactly what was committed — there is no second
+/// construction to drift from it — alongside the owner's receipt. The updated
+/// history entry the document embeds is always present: the owner pushes
+/// exactly one entry on success, and anything else is a contract refusal
+/// rather than an empty write.
+pub async fn commit_causal_intervention_outcome(
+    composition: &mut DaemonComposition,
+    candidate: &CausalCandidate,
+    outcome: CausalInterventionOutcomeRecord,
+    state_fence: &StateFence,
+) -> Result<(CausalCandidate, WriteReceipt), ImprovementDispatchError> {
+    let candidate_id = outcome.candidate_id.clone();
+    let mut updated = candidate.clone();
+    updated
+        .record_intervention_outcome(outcome)
+        .map_err(|error| {
+            ImprovementDispatchError::Contract(format!(
+                "causal intervention outcome on candidate {candidate_id} refused: {error}"
+            ))
+        })?;
+    let Some(appended) = updated.intervention_outcomes.last().cloned() else {
+        return Err(ImprovementDispatchError::Contract(format!(
+            "causal intervention outcome on candidate {candidate_id} applied but left no history entry"
+        )));
+    };
+    let proof_ref = appended.verifier_or_artifact.clone();
+    let record_key = causal_outcome_record_key(&appended)?;
+    let record = serde_json::json!({
+        "causal_candidate": &updated,
+        "intervention_outcome": appended,
+    });
+    let record_bytes = canonical_json_bytes(&record)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let record_json = String::from_utf8(record_bytes)
+        .map_err(|_| ImprovementDispatchError::Contract("record is not utf-8".to_owned()))?;
+    let record_digest = eliot_contracts::sha256_hex(record_json.as_bytes());
+    let scope_digest = eliot_contracts::sha256_hex(CAUSAL_OUTCOME_SCOPE.as_bytes());
+    let fence_digest = eliot_contracts::sha256_hex(format!("{state_fence:?}").as_bytes());
+    let request = learning_record_mutation_request(learning_record_commit_params(
+        LearningRecordKind::Candidate,
+        record_key.clone(),
+        record_json,
+        record_digest,
+        scope_digest,
+        fence_digest,
+        record_key.clone(),
+    ));
+    let identity = reconciliation_commit_identity(&record_key, state_fence)?;
+    let scope = ScopeId::new(CAUSAL_OUTCOME_SCOPE)
+        .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?;
+    let (receipt, _effective) = composition
+        .commit_learning_record(
+            &identity,
+            request,
+            scope,
+            vec![proof_ref],
+            None,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .map_err(|error| {
+            ImprovementDispatchError::Commit(format!(
+                "the causal intervention outcome on candidate {candidate_id} could not be made \
+                 durable: {error}"
+            ))
+        })?;
+    Ok((updated, receipt))
+}
+
+/// Derives the closed store handle of one durable causal intervention outcome.
+///
+/// # The key names the OUTCOME, on the candidate it was recorded against
+///
+/// The candidate id is in the clear prefix so a reader can tell at a glance
+/// which candidate an outcome belongs to. The rest folds the WHOLE appended
+/// history entry — observed outcome, verifier, explicit assessment, and the
+/// complete before/after state — so an exact replay of the same assessed
+/// outcome converges on one durable record instead of appending a duplicate,
+/// exactly as folding the unknown-effect obligation does. A DIFFERENT outcome
+/// on the same candidate is its own record rather than an overwrite of the
+/// first, because the store arbitrates by idempotency key first and refuses
+/// changed content under a retained key.
+///
+/// The entry is passed by reference from the updated candidate's own trailing
+/// history, so the key cannot disagree with the record the same commit writes
+/// under it.
+fn causal_outcome_record_key(
+    appended: &CausalInterventionOutcomeRecord,
+) -> Result<String, ImprovementDispatchError> {
+    let outcome_identity = serde_json::json!({
+        "intervention_outcome": appended,
+    });
+    let outcome_digest = eliot_contracts::sha256_hex(
+        &canonical_json_bytes(&outcome_identity)
+            .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
+    );
+    let candidate_id = appended.candidate_id.trim();
+    Ok(format!(
+        "causal-intervention-outcome:{candidate_id}:{outcome_digest}"
+    ))
 }
 
 /// Derives the closed store handle of one durable terminal decision.

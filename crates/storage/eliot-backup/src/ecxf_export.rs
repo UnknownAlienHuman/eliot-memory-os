@@ -1068,3 +1068,144 @@ fn ecxf_error(error: eliot_ecxf::EcxfError) -> BackupError {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Kernel-fence projection (issue #2569 item 2)
+//
+// `eliot_ecxf::ExportFence` (`crates/storage/eliot-ecxf/src/lib.rs:142-163`) and
+// this crate's own `ExportFence` (`crates/storage/eliot-backup/src/lib.rs:189`)
+// are two fences that share a name and are not the same object. Eight members
+// have identical types on both sides (`export_id`, `store_generation`,
+// `state_fence`, `scope_id`, `revision_heads`, `ordering_heads`, `event_range`
+// -- which is the very same `eliot_ecxf::EventRange`, re-exported at
+// `lib.rs:184` -- and `consistent`), so those carry the source value verbatim.
+// The two fences differ in exactly two places, and both differences are
+// refusals below rather than conversions:
+//
+// * the interchange fence carries `schema_generation` and the kernel fence has
+//   no member for it, so there is nothing to carry it into. The kernel fence is
+//   pinned (`shipped_serde_boundaries.toml:68661`, `ExportFence:187`,
+//   `span_start = 187`, `span_end = 200`), so adding a member is not this
+//   crate's to do either. If kernel semantics later require the generation, its
+//   own owner adds the member;
+// * the interchange fence's `blob_reachability_manifest` holds RESIDENCY-key
+//   digests (`eliot-ecxf/src/lib.rs:151-161`: issue #1871 D1 -- reachability is
+//   keyed on residency and not on content, because I05-13 forbids merging
+//   records whose content digests match). The kernel fence's member is a
+//   `Vec<BlobHash>` that its consumers read as a bijection over CONTENT digests:
+//   `lib.rs:732` requires every `blob.locator.hash` to be in that set,
+//   `lib.rs:738` requires its length to equal the carried blob count, and
+//   `bins/eliot-kernel/src/backup_capture.rs:1660-1662` states that explicitly
+//   ("the fence bijection is still over CONTENT digests"). Re-parsing a
+//   residency key through `BlobHash::new` would type-check and would still
+//   assert a content identity that no owner ever proved, so it refuses.
+//
+// Nothing is synthesized, defaulted or dropped: a member that cannot be carried
+// ends the conversion with a named refusal instead of a plausible value.
+
+use eliot_blob_api::BlobHash;
+
+/// Why one `eliot_ecxf::ExportFence` member could not be carried onto the
+/// kernel [`ExportFence`](super::ExportFence).
+///
+/// The first refusal in source-member order is returned, matching the
+/// single-variant shape of this crate's other boundary mappings
+/// ([`ecxf_error`], and `unobserved_member` in
+/// `bins/eliot-store-surreal/src/ecxf_export.rs:170`).
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum FenceBridgeRefusal {
+    /// A source manifest entry is not a canonical digest at all.
+    #[error(
+        "ecxf export fence blob_reachability_manifest entry {entry:?} is not a canonical digest: {reason}"
+    )]
+    MalformedResidencyKey {
+        /// The offending source entry, carried verbatim so the refusal names it.
+        entry: String,
+        /// The owning constructor's own reason for refusing it.
+        reason: String,
+    },
+    /// The source carries a member the kernel fence has no member for.
+    #[error(
+        "ecxf export fence carries {member:?} and the kernel ExportFence has no member to carry it into"
+    )]
+    NoTargetMember {
+        /// The static name of the source member with no counterpart.
+        member: &'static str,
+    },
+    /// The source member holds residency identities where the kernel member is
+    /// read as a content-digest bijection.
+    #[error(
+        "ecxf export fence blob_reachability_manifest holds residency-key digests, not the content digests the kernel ExportFence binds to BackupBlob::locator.hash"
+    )]
+    ResidencyKeyIsNotContentIdentity,
+    /// The carried ORIGINAL recorded values were refused by the kernel validator.
+    #[error("the carried fence was refused by the kernel ExportFence::validate: {reason}")]
+    CarriedFenceRefused {
+        /// The kernel validator's own refusal, carried verbatim.
+        reason: String,
+    },
+}
+
+impl TryFrom<&eliot_ecxf::ExportFence> for super::ExportFence {
+    type Error = FenceBridgeRefusal;
+
+    /// Carries every member the two fences hold in common, by value.
+    ///
+    /// The ORIGINAL recorded values are carried and then proved by this crate's
+    /// own [`ExportFence::validate`](super::ExportFence::validate). No digest is
+    /// recomputed here and no stored digest is replaced by a fresh one.
+    fn try_from(source: &eliot_ecxf::ExportFence) -> Result<Self, Self::Error> {
+        // Shape gate over the source's own list: every entry is parsed by the
+        // existing `BlobHash` constructor, so a malformed entry is refused by the
+        // owner that defines the digest rather than by a local re-check of it.
+        let mut blob_reachability_manifest =
+            Vec::with_capacity(source.blob_reachability_manifest.len());
+        for entry in &source.blob_reachability_manifest {
+            blob_reachability_manifest.push(BlobHash::new(entry.clone()).map_err(|error| {
+                FenceBridgeRefusal::MalformedResidencyKey {
+                    entry: entry.clone(),
+                    reason: error.to_string(),
+                }
+            })?);
+        }
+        // The source carries `schema_generation`; the kernel fence has no member
+        // to carry it into and this crate may not add one (pinned row above).
+        // Discarding it would silently drop an owner-issued generation, so a
+        // source that declares one is refused rather than downgraded.
+        if !source.schema_generation.is_empty() {
+            return Err(FenceBridgeRefusal::NoTargetMember {
+                member: "schema_generation",
+            });
+        }
+        // The source's reachability set holds residency-key digests and the
+        // kernel member is read as a content bijection, so a populated source
+        // list refuses instead of being re-typed as content identity. An
+        // owner-issued fence always declares a non-empty `schema_generation`, so
+        // this arm is reached only by a source that `eliot_ecxf`'s own
+        // `ExportFence::validate` already refuses: the conversion is therefore
+        // total-refusing in practice and says so rather than returning a value
+        // that looks convertible and is not.
+        if !blob_reachability_manifest.is_empty() {
+            return Err(FenceBridgeRefusal::ResidencyKeyIsNotContentIdentity);
+        }
+        let fence = Self {
+            export_id: source.export_id.clone(),
+            store_generation: source.store_generation.clone(),
+            state_fence: source.state_fence.clone(),
+            scope_id: source.scope_id.clone(),
+            revision_heads: source.revision_heads.clone(),
+            ordering_heads: source.ordering_heads.clone(),
+            event_range: source.event_range.clone(),
+            blob_reachability_manifest,
+            consistent: source.consistent,
+        };
+        // The carried ORIGINAL recorded values are proved by the existing
+        // validator. It is not weakened, bypassed or re-implemented here.
+        fence
+            .validate()
+            .map_err(|error| FenceBridgeRefusal::CarriedFenceRefused {
+                reason: error.to_string(),
+            })?;
+        Ok(fence)
+    }
+}

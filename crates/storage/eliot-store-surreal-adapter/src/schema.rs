@@ -90,6 +90,13 @@ pub(crate) mod table {
     /// digest is a new row, never an in-place rewrite.
     pub(crate) const LEARNING_RECORD: &str = "learning_record";
 
+    /// Singleton instrument-registry snapshot head (issue #1814 W1.2). One
+    /// row under the fixed `head` key carrying the verbatim opaque
+    /// snapshot bytes with a store-issued revision. Replaced verbatim
+    /// with a bumped revision on each admitted apply under the same
+    /// fence+revision compare-and-set contract as the reactive tables.
+    pub(crate) const INSTRUMENT_REGISTRY: &str = "instrument_registry";
+
     /// Every physical table *name* this single owner declares, in declaration
     /// order.
     ///
@@ -119,7 +126,7 @@ pub(crate) mod table {
     ///   `automation_continuation` are declared without generation DDL;
     ///   continuations create their schemaless table only during explicit
     ///   truncated-page issuance.
-    pub(crate) const ALL_TABLES: [&str; 25] = [
+    pub(crate) const ALL_TABLES: [&str; 26] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
@@ -145,6 +152,7 @@ pub(crate) mod table {
         EXPERIENCE_BANK,
         EXPERIENCE_FEEDBACK,
         LEARNING_RECORD,
+        INSTRUMENT_REGISTRY,
     ];
 }
 
@@ -255,9 +263,17 @@ pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
 /// `erasure_transaction_bindings` (`operation_id`, `subject`, `payload_ref`,
 /// `encryption_key_ref`, `deadline_unix_ms`, `scope_id`, `surfaces`,
 /// `state_fence`, `operation_count`), and `erasure_outcome`
-/// carries the sealed per-surface outcomes (`operation_id`, `outcomes`).
-/// `operation_id` is unique in each table; one intent row plus its single
-/// outcome seal per operation — never a second ledger.
+/// carries the sealed per-surface outcomes (`operation_id`, `scope_id`,
+/// `outcomes`). `operation_id` is unique in each table; one intent row plus its
+/// single outcome seal per operation — never a second ledger.
+///
+/// `erasure_outcome.scope_id` is the *sealed* row's own copy of the single
+/// admitted scope, copied verbatim from the frozen intent that opened the
+/// transaction by `erasure_transaction_bindings` and never derived. A privacy
+/// purge ledger is read per scope, so a seal carrying only `operation_id` could
+/// not attribute its own outcomes to the scope whose data they purged. The
+/// scope the seal's identity rests on is still the intent row's, which
+/// `TX_ERASURE_INTENT` compares in the same transaction.
 pub(crate) const ERASURE_TABLES_DDL: &str = r"
 DEFINE TABLE erasure_intent SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_intent TYPE string;
@@ -273,6 +289,7 @@ DEFINE INDEX ei_operation ON erasure_intent FIELDS operation_id UNIQUE;
 
 DEFINE TABLE erasure_outcome SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_outcome TYPE string;
+DEFINE FIELD scope_id ON erasure_outcome TYPE string;
 DEFINE FIELD outcomes ON erasure_outcome TYPE array;
 DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 ";
@@ -554,6 +571,7 @@ DEFINE INDEX ei_operation ON erasure_intent FIELDS operation_id UNIQUE;
 
 DEFINE TABLE erasure_outcome SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_outcome TYPE string;
+DEFINE FIELD scope_id ON erasure_outcome TYPE string;
 DEFINE FIELD outcomes ON erasure_outcome TYPE array;
 DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
 ";

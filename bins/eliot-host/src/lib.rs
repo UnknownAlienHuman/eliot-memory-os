@@ -1641,7 +1641,7 @@ use eliot_installation::{
     InstallerServiceRegistrationApproval, InstallerServiceRole, LOCAL_SERVICE_SID,
     PHASE_B_PENDING_MARKER, PendingActivationState, PhaseBLiveBinding,
     ProvisionedSupervisionAuthority, RedbInstallationRegistry, RuntimeLaunchDescriptor,
-    StoreCredentialProvider, StoreCredentialScope,
+    StoreCredentialProvider, StoreCredentialScope, UserBrokerPreparedBinding,
     phase_b_credential_receipt_digest as installation_phase_b_credential_receipt_digest,
     phase_b_host_state_root_digest as installation_phase_b_host_state_root_digest,
     phase_b_scm_selector, phase_b_static_template_for_candidate,
@@ -2226,6 +2226,8 @@ pub enum HostBranchDisposition {
 
 #[cfg(windows)]
 mod readiness_gate;
+#[cfg(windows)]
+mod user_mode_launcher;
 #[cfg(all(windows, test))]
 use readiness_gate::{DEFAULT_READINESS_CADENCE, ReadinessFailureKind};
 #[cfg(windows)]
@@ -2233,6 +2235,8 @@ use readiness_gate::{
     HostReadinessGate, ReadinessCadence, ReadinessContourIdentity, ReadinessGateAction,
     readiness_failure_kind, reconcile_authenticated_readiness,
 };
+#[cfg(windows)]
+pub use user_mode_launcher::register_user_mode_launcher;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5662,6 +5666,9 @@ pub struct HostPhaseBMaterialization {
     agent_bridge: Option<AgentBridgePreparedBinding>,
     /// Final provider proof, populated only after `FinalizePhaseB` CAS.
     agent_bridge_final: Option<AgentBridgePhaseBBinding>,
+    /// Protected User Broker front-door record pair published and read back for
+    /// this contour. Never synthesized from a manifest or runtime descriptor.
+    user_broker: Option<UserBrokerPreparedBinding>,
     file_identities: [FileIdentity; 4],
     launch: RuntimeLaunchDescriptor,
 }
@@ -5748,6 +5755,13 @@ impl HostPhaseBMaterialization {
     #[must_use]
     pub const fn final_agent_bridge(&self) -> Option<&AgentBridgePhaseBBinding> {
         self.agent_bridge_final.as_ref()
+    }
+
+    /// Returns the published User Broker front-door record pair, when this
+    /// Phase-B materialization published one.
+    #[must_use]
+    pub const fn user_broker(&self) -> Option<&UserBrokerPreparedBinding> {
+        self.user_broker.as_ref()
     }
 }
 
@@ -7815,6 +7829,28 @@ impl HostComposition {
     #[must_use]
     pub const fn host_epoch(&self) -> &HostInstallationEpoch {
         &self.host
+    }
+
+    /// Returns the completed Phase-B materialization retained by this
+    /// composition, when one exists.
+    ///
+    /// This is the post-publication record: its
+    /// `authority_descriptor_digest` is the digest Host read back from the
+    /// published `authority.json`, not a value recomputed by the caller. The
+    /// current-user launcher registration (#1771 AUD4) reads it from here and
+    /// joins it to the durable committed Phase-B binding before it registers.
+    #[cfg(windows)]
+    pub(crate) fn phase_b_materialization(&self) -> Option<&HostPhaseBMaterialization> {
+        self.phase_b.as_ref()
+    }
+
+    /// Returns the retained canonical Host state root for this composition.
+    ///
+    /// Durable receipts published under it stay inside the selected profile's
+    /// own current-user contour; no `UserMode` receipt ever leaves it.
+    #[cfg(windows)]
+    pub(crate) fn launch_state_root(&self) -> &Path {
+        self.launch_options.host_state_root()
     }
 
     /// Creates the credential control only from this live Host composition's

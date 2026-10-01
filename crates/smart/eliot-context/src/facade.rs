@@ -457,10 +457,12 @@ pub fn adapt_admit_context(
 
 /// Assembles one admitted set through A-18 exactly once.
 ///
-/// The caller supplies the admitted set, recipe, quality verdict, policy, and
+/// The caller supplies the admitted set, recipe, the owner-resolved approved
+/// policy revision this compilation is pinned to, quality verdict, policy, and
 /// measurement callback; the facade re-runs no admission and invents no
-/// measurement. The returned envelope must echo the exact admitted set before
-/// it is handed back unchanged.
+/// measurement. `approved` is the revision whose declared `layout.role_positions`
+/// the renderer applies (#1724 W4), not a hint about the order. The returned
+/// envelope must echo the exact admitted set before it is handed back unchanged.
 ///
 /// # Errors
 ///
@@ -470,6 +472,7 @@ pub fn adapt_admit_context(
 pub fn adapt_assemble_view<F>(
     admitted: &eliot_context_contracts::AdmittedContextSet,
     recipe: &eliot_context_contracts::ContextRecipe,
+    approved: &eliot_context_contracts::ResolvedContextRecipe,
     quality: eliot_context_contracts::QualityScorecard,
     policy: &eliot_context_assembly::AssemblyPolicy,
     measure: F,
@@ -482,8 +485,9 @@ where
         eliot_context_contracts::ContextError,
     >,
 {
-    let result =
-        eliot_context_assembly::assemble_active_view(admitted, recipe, quality, policy, measure)?;
+    let result = eliot_context_assembly::assemble_active_view(
+        admitted, recipe, approved, quality, policy, measure,
+    )?;
     if result.admitted != *admitted {
         return Err(FacadeError::ResponseIdentityMismatch {
             what: "assembly.admitted",

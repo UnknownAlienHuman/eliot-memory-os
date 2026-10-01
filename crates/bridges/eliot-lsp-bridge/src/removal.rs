@@ -19,8 +19,8 @@
 //! privacy/retention owners. There is no bridge-local task database and no
 //! new journal.
 //!
-//! Wiring: the stitch phase declares `mod removal;` in the crate root. The
-//! launch path (caller STITCH) consults `blocks_new_calls` before launch,
+//! Wiring: the crate root declares `mod removal;` and re-exports this
+//! sequence. The launch path consults `blocks_new_calls` before launch,
 //! feeds per-operation exit evidence from real receipts, and the
 //! composition owner performs the revocations and the artifact release the
 //! receipt enumerates.
@@ -205,9 +205,7 @@ impl BridgeStatusProjection {
         receipt: Option<&ObservationReceipt>,
         per_operation_exits: &BTreeMap<String, i32>,
     ) -> Self {
-        let overall = receipt
-            .map(ObservedHealth::from_receipt)
-            .unwrap_or(ObservedHealth::Unknown);
+        let overall = receipt.map_or(ObservedHealth::Unknown, ObservedHealth::from_receipt);
         Self::project(current, retained, overall, per_operation_exits)
     }
 

@@ -1393,6 +1393,7 @@ fn test_commit_fence(manifest: &CandidateManifest) -> ActivationCommitFence {
                 runtime.authority_generation,
             ),
             agent_bridge: None,
+            user_broker: None,
         }),
         authority_generation: runtime.authority_generation,
         authority_state_fence: runtime.authority_state_fence.clone(),
@@ -7438,6 +7439,7 @@ fn active_phase_b_rebind_completed_receipt_requires_fresh_owner_recovery_cas() {
         semantic_config_hash: test_handle("c".repeat(64)),
         launch,
         agent_bridge: None,
+        user_broker: None,
         prepared_digest: test_handle("pending"),
     };
     let mut prepared = prepared;
@@ -7898,6 +7900,7 @@ fn staging_new_generation_clears_active_phase_b_rebind_before_commit() {
         semantic_config_hash: test_handle("c".repeat(64)),
         launch,
         agent_bridge: None,
+        user_broker: None,
         prepared_digest: test_handle("pending"),
     };
     prepared.prepared_digest = must(prepared.computed_digest());

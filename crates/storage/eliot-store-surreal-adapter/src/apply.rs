@@ -48,6 +48,7 @@ pub(crate) mod surreal_automation;
 pub(crate) mod surreal_blackboard;
 pub(crate) mod surreal_capability_evidence;
 pub(crate) mod surreal_experience;
+pub(crate) mod surreal_instrument_registry;
 pub(crate) mod surreal_learning;
 pub(crate) mod surreal_notification;
 pub(crate) mod surreal_reactive;
@@ -933,12 +934,12 @@ pub(crate) async fn apply_reserved_write(
     request: ReservedWriteRequest,
 ) -> Result<WriteReceipt, AdapterError> {
     request.validate().map_err(AdapterError::Store)?;
-    let Some(execution) = adapter.execution_handle() else {
+    // Single owner (issue #1925): the `reserved_write_capability`
+    // advertisement predicate and this dispatch refusal are one predicate,
+    // so a store never advertises a reserved write it would refuse.
+    let Some(execution) = adapter.concurrent_execution() else {
         return Err(AdapterError::Store(StoreError::UnknownOperation));
     };
-    if !execution.is_concurrent() {
-        return Err(AdapterError::Store(StoreError::UnknownOperation));
-    }
     let operation_id = request.transition.identity.operation_id.clone();
     execution.submit_reserved(request, current_time_ms())?;
     let transport = ProviderReservedTransport { adapter };
@@ -1216,6 +1217,7 @@ struct AttemptLegWrites {
     automation: surreal_automation::AutomationWrites,
     experience: surreal_experience::ExperienceWrites,
     learning: surreal_learning::LearningWrites,
+    instrument_registry: surreal_instrument_registry::InstrumentRegistryWrites,
 }
 
 /// Same-operation reuse check for one apply attempt (issue #63).
@@ -1347,12 +1349,20 @@ async fn prepare_attempt_leg_writes(
         surreal_experience::prepare_experience_writes(db, &adapter.config, transition).await?;
     let learning_writes =
         surreal_learning::prepare_learning_writes(db, &adapter.config, transition).await?;
+    let instrument_registry_writes =
+        surreal_instrument_registry::prepare_instrument_registry_writes(
+            db,
+            &adapter.config,
+            transition,
+        )
+        .await?;
     Ok(AttemptLegWrites {
         notification: notification_writes,
         reactive: reactive_writes,
         automation: automation_writes,
         experience: experience_writes,
         learning: learning_writes,
+        instrument_registry: instrument_registry_writes,
     })
 }
 
@@ -1521,6 +1531,7 @@ async fn apply_with_retry(
             &legs.automation,
             &legs.experience,
             &legs.learning,
+            &legs.instrument_registry,
             erasure,
         )
         .await;
@@ -1585,6 +1596,15 @@ async fn prepare_attempt_erasure_bundle(
     if transition.transition_class != TransitionClass::Erasure {
         return Ok(None);
     }
+    // Both halves of the ledger are read and written before any destructive
+    // statement, and a SCHEMALESS table that does not exist yet fails closed on
+    // that read instead of reading empty, so the sealed-replay check and the
+    // in-transaction intent/outcome steps below would both refuse the first
+    // erasure on a store where the tables were never created. Ensuring them
+    // here (idempotent) is the same closure the notification, reactive,
+    // automation, experience and learning slices apply, and it changes no
+    // migration chain and carries no data.
+    ensure_erasure_tables(db, &adapter.config).await?;
     let sealed =
         read_sealed_erasure_outcomes(db, &adapter.config, &transition.identity.operation_id)
             .await?;
@@ -1594,6 +1614,39 @@ async fn prepare_attempt_erasure_bundle(
     let intent = surreal_intent_from_transition(transition)?;
     let intent = record_surreal_erasure_intent(intent)?;
     Ok(Some(erasure_in_tx_parts(&intent)?))
+}
+
+/// Ensures the two erasure-ledger tables exist (idempotent).
+///
+/// Schemaless tables auto-create on write, but the sealed-outcome read and the
+/// in-transaction intent compare-and-set both fail closed on a missing table, so
+/// a store on which the erasure delta has never been applied could not run an
+/// admitted erasure at all. This one-shot definition is the closed operation
+/// that gives the source purge ledger its tables on first use, exactly as
+/// `ensure_notification_table` / `ensure_reactive_tables` /
+/// `ensure_automation_tables` / `ensure_experience_tables` / `ensure_learning_tables`
+/// do for their own slices. It declares no field, adds no data statement and
+/// writes nothing but the two table definitions.
+///
+/// It does NOT make the ledger a captured ECXF source class: the census in
+/// `backup_snapshot.rs` admits a member table only when the *admitted* schema
+/// generation's own baseline defines it, and the admitted generation is still
+/// pinned to v2. This closes the missing-table refusal, not
+/// `EcxfCaptureGap::SourcePurgeLedgerUnavailable`.
+async fn ensure_erasure_tables(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+) -> Result<(), AdapterError> {
+    let sql = format!(
+        "DEFINE TABLE IF NOT EXISTS {} SCHEMALESS; DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;",
+        schema::table::ERASURE_INTENT,
+        schema::table::ERASURE_OUTCOME,
+    );
+    let mut response = client::query(db, config, "erasure.ensure_tables", &sql, Map::new()).await?;
+    if !response.take_errors().is_empty() {
+        return Err(AdapterError::PartialOutcome);
+    }
+    Ok(())
 }
 
 /// Proves one error-free canonical transaction actually committed before
@@ -3394,6 +3447,7 @@ mod concurrent_allocation_tests {
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
                 &surreal_learning::LearningWrites::default(),
+                &surreal_instrument_registry::InstrumentRegistryWrites::default(),
             )
             .await
             .expect("first writer commits");
@@ -3418,6 +3472,7 @@ mod concurrent_allocation_tests {
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
                 &surreal_learning::LearningWrites::default(),
+                &surreal_instrument_registry::InstrumentRegistryWrites::default(),
             )
             .await
             {
@@ -3465,6 +3520,7 @@ mod concurrent_allocation_tests {
                 &surreal_automation::AutomationWrites::default(),
                 &surreal_experience::ExperienceWrites::default(),
                 &surreal_learning::LearningWrites::default(),
+                &surreal_instrument_registry::InstrumentRegistryWrites::default(),
             )
             .await
             .expect("bounded retry commits");

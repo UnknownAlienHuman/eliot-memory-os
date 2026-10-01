@@ -31,61 +31,82 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 284089,
-    "test_stu": 42252,
-    "selected_file_count": 33,
+    "scope": "the selected decision workset of this cell",
+    "source_stu": 281167,
+    "test_stu": 121462,
+    "selected_file_count": 37,
+    "physical_source_stu": 402629,
+    "physical_file_count": 37,
     "inline_cfg_test_modules": 6,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "workset_allocation": {
+    "scope": "PACKAGE_WIDE",
+    "state": "UNRESOLVED_ALLOCATION",
+    "declared_by": "[package.metadata.eliot].functional_cell_refs / functional_cell / module.toml|module_id, plus [package.metadata.eliot].functional_cell_source",
+    "rationale": null,
+    "unresolved_reason": "crates/agent/eliot-agent-coordinator declares 8 functional cells (agent.coordinator.attempt-health-projection, agent.coordinator.attempt-reconciliation, agent.coordinator.model-catalogue-query, agent.coordinator.model-preference-selection, agent.coordinator.peer-delivery, agent.coordinator.provider-admission, agent.coordinator.route-selection, agent.coordinator.staffing-plan) but no accepted cell/source allocation separates them. The selection below is package-wide and is NOT a demonstrated minimal causal workset for agent.coordinator.attempt-health-projection.",
+    "required_common_inputs": [
+      "crates/agent/eliot-agent-coordinator/src/lib.rs"
+    ],
+    "observation": "Where no sound narrower allocation exists, selection stays PACKAGE_WIDE and unresolved rather than inventing independence."
   },
   "selected_source_and_tests": {
     "selected_source": [
       {
+        "path": "crates/agent/eliot-agent-coordinator/src/admitted_provider.rs",
+        "bytes": 13174,
+        "sha256": "264f0bc0221d29b6da5ed037a04b05ef483cdbcad95fb096ca7e082160e6eff0",
+        "stu": 4392,
+        "inline_cfg_test": false
+      },
+      {
         "path": "crates/agent/eliot-agent-coordinator/src/core.rs",
-        "bytes": 164474,
-        "sha256": "f51dbff78dbdb0bd5670075ffd78335d52282a106200adf07c6c75e033369bed",
-        "stu": 54825,
+        "bytes": 258288,
+        "sha256": "d824430d23d61527ff8a66066129f8ca338cb8bc5d8e8788f1686ffa6dd2cee7",
+        "stu": 86096,
         "inline_cfg_test": true
       },
       {
-        "path": "crates/agent/eliot-agent-coordinator/src/core/admission_normalization_tests.rs",
-        "bytes": 20271,
-        "sha256": "0b561f32de61030c1209b8c50702cfa17bda2f7fb01e6c5df044877a4d8b40a1",
-        "stu": 6757,
+        "path": "crates/agent/eliot-agent-coordinator/src/factory.rs",
+        "bytes": 2280,
+        "sha256": "08373139e2290852b907e28f25b921965f2fd190541aee83b2c714afd352a4b7",
+        "stu": 760,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/fair_pull_loop.rs",
+        "bytes": 28213,
+        "sha256": "9f43d1cff92f7a4426114ae0b1708f0d50a918091ad8f9e5248a2f6808efc598",
+        "stu": 9405,
         "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/lib.rs",
-        "bytes": 2433,
-        "sha256": "f00afafbabd3d6a14ae99ab7e09f5b32b42a6fdc1c8cab3868e54f4a521642c8",
-        "stu": 811,
+        "bytes": 2801,
+        "sha256": "84f296a187da153ab15c69e69c928c80de005f84f0cb670eeb4bdb7478556f06",
+        "stu": 934,
         "inline_cfg_test": true
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/model.rs",
-        "bytes": 68090,
-        "sha256": "f9294290756a6f3e6d2b385aad204b741c5165d6eedbb2a7280ef765a40df8fe",
-        "stu": 22697,
+        "bytes": 81833,
+        "sha256": "0c1507bf4c94aa08546ac2f1e835b9ed825dd25fab5b3bda4321b928c65ea5aa",
+        "stu": 27278,
         "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/model_control.rs",
-        "bytes": 43685,
-        "sha256": "9b9d396ea11c0c8855882e7a4d2017a083c965eb961c623643eaae2aad36935b",
-        "stu": 14562,
+        "bytes": 39378,
+        "sha256": "f3465f33b76a2d1c0cc4e587e326dd1c9a3c9e031e940be11c08b272feb0060c",
+        "stu": 13126,
         "inline_cfg_test": true
       },
       {
-        "path": "crates/agent/eliot-agent-coordinator/src/model_control_tests.rs",
-        "bytes": 20240,
-        "sha256": "b302490f273426d38c2558af4a83acc0ae6f7c6b638df4bc9578b182065a5fae",
-        "stu": 6747,
-        "inline_cfg_test": false
-      },
-      {
         "path": "crates/agent/eliot-agent-coordinator/src/model_registry.rs",
-        "bytes": 69125,
-        "sha256": "d1e61e515994a941f727c9e90f9a037781bafb7c19c448d7f310661fb74a6633",
-        "stu": 23042,
+        "bytes": 71509,
+        "sha256": "a1cfe0d2dcca9b7c86ff7f353341c98b217e3eca9c179a7152190914d3711848",
+        "stu": 23837,
         "inline_cfg_test": false
       },
       {
@@ -97,30 +118,30 @@
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/provider_admission.rs",
-        "bytes": 23532,
-        "sha256": "13263c59ae4a663faf9e77865f10042fa34f6efb11b1dc0aa5ff5349476ebbf5",
-        "stu": 7844,
+        "bytes": 39529,
+        "sha256": "6fdf079ba010aa845e7a2d3fd067405387c742631782eee929c124aaee0f8c96",
+        "stu": 13177,
         "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/runtime_profile.rs",
-        "bytes": 17958,
-        "sha256": "2b5801de496c3af85615c36b2436206d2f498e897718c23498ca4ccf8a9a6c29",
-        "stu": 5986,
+        "bytes": 18289,
+        "sha256": "d72a389151108fd63e307fbb294ecac7328e92f2b8f2e5928f5b5d1aba2b215f",
+        "stu": 6097,
         "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/swarm_admission_bind.rs",
-        "bytes": 40825,
-        "sha256": "009e501ae2731502f818f725eba5c4c397a91f216cbab55138ac16e6ad535e81",
-        "stu": 13609,
+        "bytes": 42617,
+        "sha256": "b64c66d8354e99b1b4ac839900901f971d4ce61993b16458cf0c53276bb96cfa",
+        "stu": 14206,
         "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/swarm_command_candidate.rs",
-        "bytes": 35133,
-        "sha256": "6627160ca3ac2d9e02cc0ebbaef14c1eff48d6949a9280a036164651d1772f31",
-        "stu": 11711,
+        "bytes": 37356,
+        "sha256": "0627e50b3280108252182c2af918555e57bd1cba917e52632cc029801ac92a34",
+        "stu": 12452,
         "inline_cfg_test": false
       },
       {
@@ -138,25 +159,11 @@
         "inline_cfg_test": true
       },
       {
-        "path": "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/diversity_tests.rs",
-        "bytes": 14081,
-        "sha256": "11523880360ad009ae8891f2139441296637a7739aeca18673f085da69b6bbe2",
-        "stu": 4694,
-        "inline_cfg_test": false
-      },
-      {
         "path": "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/mod.rs",
         "bytes": 814,
         "sha256": "3b5999754f023b4a80d8f51d01af620fa8005969a2960bc47c63547b5b49481c",
         "stu": 272,
         "inline_cfg_test": true
-      },
-      {
-        "path": "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/tests.rs",
-        "bytes": 16770,
-        "sha256": "6ca7cf3e115c06c0d0bb440c60248811592fea9ba3ca24834b3809da09bc3ea5",
-        "stu": 5590,
-        "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/types.rs",
@@ -167,16 +174,23 @@
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/swarm_definition_admission.rs",
-        "bytes": 8266,
-        "sha256": "25169af518d93a92379962252466c75d4f671a1aae2d3b043d7adfe7f0799211",
-        "stu": 2756,
+        "bytes": 15134,
+        "sha256": "ac8355393a44ab292911e3ddba9632e2083f5a08468d30ea626e8c66a42b8600",
+        "stu": 5045,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/swarm_execution_ownership.rs",
+        "bytes": 46622,
+        "sha256": "f400dc36ce27b1a7f1428ebb2046a6716483e8ed6194f3927a1646a51db8facc",
+        "stu": 15541,
         "inline_cfg_test": false
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/src/swarm_launch_bind.rs",
-        "bytes": 24122,
-        "sha256": "c9d743a96ab05e94f99bba1bca7bd3db499bd15ced8ce8bebda0cc5cd29e7044",
-        "stu": 8041,
+        "bytes": 27066,
+        "sha256": "1c28b623927c58016a80fcbb275ece2fc795debc5d012337bb049d87fff9a5e9",
+        "stu": 9022,
         "inline_cfg_test": false
       },
       {
@@ -185,22 +199,72 @@
         "sha256": "71d3c5ff5fb14073b1e871e43b70c0cf03c9fee91c948698497fe590bf0b8622",
         "stu": 9804,
         "inline_cfg_test": false
-      },
-      {
-        "path": "crates/agent/eliot-agent-coordinator/src/tests.rs",
-        "bytes": 163850,
-        "sha256": "0ba9b6c6e04dc0051b613a726ef6f0bb8c2a382e27ab0aa66bcacf60ad383167",
-        "stu": 54617,
-        "inline_cfg_test": false
       }
     ],
     "selected_tests": [
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/core/admission_normalization_tests.rs",
+        "bytes": 20695,
+        "sha256": "24ab8a8f140c483db87c06db23871e3d698b8a6c3b2749f9d0c496d19967e052",
+        "test_attributes": 3,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/model_control_tests.rs",
+        "bytes": 20240,
+        "sha256": "b302490f273426d38c2558af4a83acc0ae6f7c6b638df4bc9578b182065a5fae",
+        "test_attributes": 16,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/diversity_tests.rs",
+        "bytes": 14081,
+        "sha256": "11523880360ad009ae8891f2139441296637a7739aeca18673f085da69b6bbe2",
+        "test_attributes": 7,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/tests.rs",
+        "bytes": 16770,
+        "sha256": "6ca7cf3e115c06c0d0bb440c60248811592fea9ba3ca24834b3809da09bc3ea5",
+        "test_attributes": 10,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "edge_profile"
+        ]
+      },
+      {
+        "path": "crates/agent/eliot-agent-coordinator/src/tests.rs",
+        "bytes": 164741,
+        "sha256": "b655f5894a71b5675941222e0387dbe33fb62f1f085a01faadeffd0e68f9adff",
+        "test_attributes": 61,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "fake_port_contract",
+          "fault_restart_replay"
+        ]
+      },
       {
         "path": "crates/agent/eliot-agent-coordinator/tests/admission_proof_normalization.rs",
         "bytes": 1801,
         "sha256": "0d2335d7f38d85354c0c409f83db734b0f5586281c2a3df93f1013c2e446bbc7",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -209,14 +273,16 @@
         "sha256": "ce01664d51226e009bbe77f2dac38e2650fa0fa97b5e2a5c9fc342a7f5310fe7",
         "test_attributes": 8,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/tests/coordinator.rs",
-        "bytes": 24574,
-        "sha256": "ec2f255b35494a2d41781003b76b44aab57c5f6b4fa789c45d361573e646bf43",
+        "bytes": 25585,
+        "sha256": "bd7fd1f01e6b8eac019c168b37978c9892fb206eb93a86e524258400d719ce48",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -225,6 +291,7 @@
         "sha256": "d1afd0fad80e1f116f28a5a43434fa0f96a0598ff9f7d45cb0b4623d1db74bca",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -233,6 +300,7 @@
         "sha256": "d22f0097a1f387a166f763fd579ef4be459dcf3a787e894215e706ab7b5a59e9",
         "test_attributes": 9,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
@@ -243,6 +311,7 @@
         "sha256": "201106085f632a47a301034f1a7400c3bdf460569ff7324778a955676782937d",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
@@ -253,16 +322,18 @@
         "sha256": "0d8057e011c551364d694a87fa925794a3b5f9386acf7efe99a520f864a57192",
         "test_attributes": 1,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
       },
       {
         "path": "crates/agent/eliot-agent-coordinator/tests/swarm_command_candidates.rs",
-        "bytes": 20239,
-        "sha256": "1ba150dafddae80078a486da708ee08a03b362c6408a029915d3aad05c72c78b",
+        "bytes": 20331,
+        "sha256": "d895e4edea1f8afc73aaeb74c5ebc59f7ec388047180f616c9f1f75dab502a28",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -274,6 +345,7 @@
         "sha256": "f305e1c2a5f0586e52b8994d57a681cb249ff8c4d82049d770ac3071d09d5f4d",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile",
           "fault_restart_replay"
@@ -285,6 +357,7 @@
         "sha256": "4f37397c51485a85093fa202edf3d0eeef998c4411b4fa3dfd615df732b38d77",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
@@ -295,10 +368,17 @@
         "sha256": "f669b77b5876ad292183627cefdf2767eb0a07265617d2b2a702d8d456050f2a",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       }
     ],
-    "source_selection_digest": "70930d56a3fb522088efa387328b3f5cdd6e591a7868514e2d6a6a3846c87813"
+    "source_selection_digest": "f71dc5adcebac77fc92cac7c3a47266831143181edce1121876415ec3bd0bf6d"
+  },
+  "unselected_package_files": {
+    "physical_inventory_file_count": 37,
+    "physical_inventory_digest": "f71dc5adcebac77fc92cac7c3a47266831143181edce1121876415ec3bd0bf6d",
+    "unselected_files": [],
+    "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
   "one_hop_providers": [
     "eliot-agent-api",
@@ -333,6 +413,9 @@
   ],
   "failure_fingerprints": [],
   "edge_tests": [
+    "crates/agent/eliot-agent-coordinator/src/model_control_tests.rs",
+    "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/diversity_tests.rs",
+    "crates/agent/eliot-agent-coordinator/src/swarm_controlboard/tests.rs",
     "crates/agent/eliot-agent-coordinator/tests/model_preference_identity.rs",
     "crates/agent/eliot-agent-coordinator/tests/model_registry.rs",
     "crates/agent/eliot-agent-coordinator/tests/model_role_eligibility.rs",
@@ -355,48 +438,58 @@
       "ARCH-SWM-02",
       "ARCH-WDG-01"
     ],
-    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+    "omitted": "Files outside the cell's selected workset, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
   },
   "effective_context_profile": {
     "estimate": "planning_estimate_only",
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "6aaf725e23719c3da3ac1322c0d1564f7a3930975365682176fd78f0982bd479",
+  "bound_contract_digest": "915e87ed6763ca5f",
   "source_provenance": {
     "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
+      "contract_semantic_inputs": {
+        "contract_catalogue": {
+          "path": "docs/architecture/handle-index.json",
+          "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
+        },
+        "architecture_boundaries": {
+          "path": "config/architecture-boundaries.toml",
+          "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
+        },
+        "logical_block_config": {
+          "path": "docs/code-navigation/logical-blocks.toml",
+          "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+        },
+        "package_manifest": {
+          "path": "crates/agent/eliot-agent-coordinator/Cargo.toml",
+          "sha256": "a1dd2793d85ddee7c919c210ff42b27d64450c82084cfef1db865a7e6dbf24b7"
+        },
+        "module_manifest": null
       },
-      "contract_catalogue": {
-        "path": "docs/architecture/handle-index.json",
-        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
-      },
-      "architecture_boundaries": {
-        "path": "config/architecture-boundaries.toml",
-        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
-      },
-      "logical_block_config": {
-        "path": "docs/code-navigation/logical-blocks.toml",
-        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
-      },
-      "package_manifest": {
-        "path": "crates/agent/eliot-agent-coordinator/Cargo.toml",
-        "sha256": "a1dd2793d85ddee7c919c210ff42b27d64450c82084cfef1db865a7e6dbf24b7"
-      },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 33,
-        "sha256": "70930d56a3fb522088efa387328b3f5cdd6e591a7868514e2d6a6a3846c87813"
+      "exact_provenance": {
+        "workspace_manifest": {
+          "path": "Cargo.toml",
+          "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+        },
+        "physical_source_inventory": {
+          "path_count": 37,
+          "sha256": "f71dc5adcebac77fc92cac7c3a47266831143181edce1121876415ec3bd0bf6d"
+        },
+        "selected_workset": {
+          "allocation_scope": "PACKAGE_WIDE",
+          "allocation_state": "UNRESOLVED_ALLOCATION",
+          "path_count": 37,
+          "sha256": "f71dc5adcebac77fc92cac7c3a47266831143181edce1121876415ec3bd0bf6d"
+        }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "2477a08b893626b41e01b16c772b6267e3d32beadca0e50b88b026466e4ec1e2",
+  "artifact_digest": "22ca5de02c164cbc35ba4c426d51dfd65dac092edf4b2f85fd283b39d2d9b676",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "2477a08b893626b4"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "db92688d14cf1704"
   }
 }

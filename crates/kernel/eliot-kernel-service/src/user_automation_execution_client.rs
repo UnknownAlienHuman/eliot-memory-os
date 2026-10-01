@@ -1,4 +1,4 @@
-//! Authenticated Kernel-to-Host client for UserAutomation execution owners.
+//! Authenticated Kernel-to-Host client for `UserAutomation` execution owners.
 //!
 //! The client carries only closed, typed projections.  The authenticated
 //! transport supplies the existing connection, descriptor, peer-admission
@@ -65,9 +65,9 @@ pub trait UserAutomationHostExecutionObserver: Send + Sync {
     ) -> Result<(), UserAutomationRuntimeError>;
 }
 
-/// Stable wire identity for the typed UserAutomation Host execution carrier.
+/// Stable wire identity for the typed `UserAutomation` Host execution carrier.
 pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_ID: &str = "eliot.user_automation.host_execution";
-/// Current semantic revision of the typed UserAutomation Host execution wire.
+/// Current semantic revision of the typed `UserAutomation` Host execution wire.
 pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION: u16 = 1;
 /// Authenticated Kernel front-door module identity used by the Host owner join.
 ///
@@ -75,14 +75,14 @@ pub const USER_AUTOMATION_HOST_EXECUTION_WIRE_VERSION: u16 = 1;
 /// from this authenticated session and still validates the typed Dreamer
 /// operation and State Fence before calling the canonical Store gateway.
 pub const USER_AUTOMATION_KERNEL_MODULE_ID: &str = "eliot-host-user-automation";
-/// Dedicated least-privilege capability advertised by the UserAutomation
+/// Dedicated least-privilege capability advertised by the `UserAutomation`
 /// owner session. The outer Dreamer frame still selects the existing
 /// `eliot.kernel.dreamer-job` dispatch family, but this capability admits only
-/// the UserAutomation Submit arm inside that family.
+/// the `UserAutomation` Submit arm inside that family.
 pub const USER_AUTOMATION_KERNEL_CAPABILITY: &str = "eliot.kernel.user-automation.submit";
-/// Existing Kernel dispatch family selected by the typed UserAutomation route.
+/// Existing Kernel dispatch family selected by the typed `UserAutomation` route.
 pub const USER_AUTOMATION_KERNEL_OPERATION: &str = "eliot.kernel.dreamer-job";
-/// Privacy class requested by the least-privilege UserAutomation session.
+/// Privacy class requested by the least-privilege `UserAutomation` session.
 /// The live Kernel policy must still admit this class; the value is never
 /// authority by itself.
 pub const USER_AUTOMATION_KERNEL_PRIVACY_CLASS: &str = "PUBLIC";
@@ -103,7 +103,7 @@ const USER_AUTOMATION_HOST_EXECUTION_OPEN_TRACE_VALUE: &str =
 ///
 /// These values are transport evidence and selectors only.  They must be
 /// copied from the existing authenticated route and never manufactured by a
-/// UserAutomation caller.
+/// `UserAutomation` caller.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserAutomationHostChannelBinding {
@@ -209,7 +209,7 @@ impl UserAutomationHostChannelBinding {
 }
 
 /// Kernel/activation evidence retained by the Host owner for one inbound
-/// UserAutomation connection. This is an in-process authority anchor; it is
+/// `UserAutomation` connection. This is an in-process authority anchor; it is
 /// never accepted from a request payload.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -504,7 +504,7 @@ impl UserAutomationHostExecutionFailure {
     }
 }
 
-/// One typed UserAutomation execution operation sent over the authenticated
+/// One typed `UserAutomation` execution operation sent over the authenticated
 /// Host channel.
 ///
 /// The three operation payloads differ by more than 2 KiB, so each one is held
@@ -528,7 +528,7 @@ pub enum UserAutomationHostExecutionOperation {
     },
     /// Read one exact retained Pending wake from the Host journal.
     ReadPendingWake {
-        /// Original Human RunNow identity and owner-issued invocation.
+        /// Original Human `RunNow` identity and owner-issued invocation.
         request: Box<UserAutomationWakeReadRequest>,
     },
     /// Enumerate the complete committed denominator from one Host snapshot.
@@ -553,7 +553,7 @@ pub enum UserAutomationHostExecutionOperation {
     },
 }
 
-/// Typed Kernel-to-Host request carrier for one UserAutomation execution
+/// Typed Kernel-to-Host request carrier for one `UserAutomation` execution
 /// operation.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1364,7 +1364,7 @@ pub fn decode_user_automation_host_execution_open_response_frame(
     Ok(response.channel)
 }
 
-/// Serializes one typed UserAutomation request into an authenticated EBP
+/// Serializes one typed `UserAutomation` request into an authenticated EBP
 /// frame. The frame identity is derived from the carrier digest and the
 /// carrier's existing metadata/fence; no authority is minted here.
 pub fn user_automation_host_execution_request_frame(
@@ -1392,7 +1392,7 @@ pub fn user_automation_host_execution_request_frame(
     Ok(frame)
 }
 
-/// Decodes and validates one typed UserAutomation request frame.
+/// Decodes and validates one typed `UserAutomation` request frame.
 pub fn decode_user_automation_host_execution_request_frame(
     frame: &Frame,
 ) -> Result<UserAutomationHostExecutionRequest, UserAutomationRuntimeError> {
@@ -1730,7 +1730,7 @@ impl UserAutomationHostExecutionTransport for AuthenticatedUserAutomationHostExe
     }
 }
 
-/// Kernel-side client implementing both UserAutomation runtime owner ports.
+/// Kernel-side client implementing both `UserAutomation` runtime owner ports.
 pub struct UserAutomationHostExecutionClient<T> {
     transport: T,
 }

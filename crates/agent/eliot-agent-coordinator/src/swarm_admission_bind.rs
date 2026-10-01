@@ -173,6 +173,15 @@ pub const ADMISSION_EXPIRY_WINDOW_FIELD: &str = "admission.expires_at_unix_ms";
 /// per-plan "no production issuer yet" flag would become false the moment a
 /// real issuer lands and would retroactively invalidate every stored plan,
 /// which is a worse failure than saying it once, here.
+///
+/// Since issue #370 R1 the *unissued* case is nonetheless refused at the
+/// admission proof itself: `provider_admission::receipt_proof_identity`
+/// compares this same recorded `expires_at_unix_ms` against zero and fails the
+/// `ProviderProofKind::Admission` proof closed when it is unissued, so a
+/// receipt with no owner-issued bound can never reach [`AgentCoordinator::admit`]
+/// through the sealed verifier. What remains unproven is only the positive
+/// leg — that a NONZERO value was issued by a real owner against a live
+/// admission — and that still needs the owner, not a coordinator-local change.
 pub const ADMISSION_EXPIRY_PRODUCER_STATUS: &str =
     "no production issuer of ProviderAdmissionReceipt::expires_at_unix_ms in this tree yet";
 

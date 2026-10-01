@@ -50,6 +50,26 @@
 //! borrowed from a neighbouring class. The selected Human preset, its cost
 //! ceiling, and route-owner class/privacy evidence are bound into the canonical
 //! receipt persisted with the definition.
+//!
+//! Issue #1702 adds the two operations that act on owner-separated swarm
+//! semantics rather than merely record them.
+//! [`AgentFabric::replace_semantic_active_work`] is the explicit replacement of
+//! active work: it drives the Task Controller's replacement revision, the
+//! Governor's old-wave disposition and the cancellation owner as one sequence,
+//! so the admission that actually gates dispatch can no longer sit at
+//! `ADMITTED` under a wave that has already been replaced, and nothing the old
+//! wave produced is discarded on the way.
+//! [`AgentFabric::note_semantic_coordinator_loss`] is the ownership-loss event:
+//! it fences only the coordinator that was lost and retains the wave's verified
+//! partial results and its unknown effects as fabric state. Retained unknown
+//! effects are consequently read from this fabric
+//! ([`AgentFabric::retained_unknown_effects_of`]) rather than supplied to
+//! [`AgentFabric::semantic_join_view`] by whoever asks, so a reader after a
+//! controller loss and a reader after a restart see the same effects instead of
+//! the caller's account of them. Both operations require owner-issued durable
+//! receipts and have no production caller: no binary executes
+//! `ApplySwarmOwnerRevisions`, so neither is reachable with an authority anyone
+//! could have made up.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -59,10 +79,10 @@ use eliot_agent_api::{AttemptId, RouteFingerprint};
 use eliot_agent_bridge_core::ToolResultReceipt;
 use eliot_agent_contracts::{
     ExecutionUpdateProposal, OldWaveDisposition, RevisionId, SupersessionLink, SwarmAdmissionId,
-    SwarmCoordinatorLease, SwarmExecutionId, SwarmExecutionRevision, SwarmPlanAdmission,
-    SwarmPlanAdmissionDisposition, SwarmPlanDefinition, SwarmPlanDefinitionLifecycle,
-    SwarmPlanView, check_definition_author, check_execution_update, check_owner_join,
-    check_stored_links, check_supersession, join_view, reassign_coordinator,
+    SwarmCoordinatorLease, SwarmExecutionId, SwarmExecutionRevision, SwarmExecutionState,
+    SwarmPlanAdmission, SwarmPlanAdmissionDisposition, SwarmPlanDefinition,
+    SwarmPlanDefinitionLifecycle, SwarmPlanView, check_definition_author, check_execution_update,
+    check_owner_join, check_stored_links, check_supersession, join_view, reassign_coordinator,
 };
 use eliot_agent_coordinator::{
     AdmissionId, AdmittedProviderCapability, AgentCoordinator, CandidateId, CoordinatorConfig,
@@ -1385,7 +1405,44 @@ fn verify_snapshot_semantics(snapshot: &FabricSnapshot) -> Result<(), FabricErro
         &snapshot.semantic_admissions,
         &snapshot.semantic_executions,
         &snapshot.semantic_supersessions,
-    )
+    )?;
+    // #1702 W7/A6: retained unknown effects are retained evidence, so they are
+    // held to the same standard as the records they hang off. An effect with no
+    // stored execution is detached history and is refused rather than restored
+    // as if some execution still owned it.
+    verify_snapshot_unknown_effects(snapshot)
+}
+
+/// Verifies the retained unknown effects a snapshot carries (issue #1702
+/// W7/A6).
+///
+/// Every retained effect must key an execution this snapshot actually stores,
+/// must be non-blank and control-free text, and must not repeat. Effects are
+/// retained, never reconciled away here: an effect set that names no stored
+/// execution, or that repeats one, is torn or contradictory persistence and
+/// restores nothing, because a silently dropped effect would read exactly like
+/// a wave that left nothing behind.
+fn verify_snapshot_unknown_effects(snapshot: &FabricSnapshot) -> Result<(), FabricError> {
+    for (execution_key, effects) in &snapshot.semantic_unknown_effects {
+        if !snapshot
+            .semantic_executions
+            .contains_key(execution_key.as_str())
+        {
+            return Err(FabricError::BrokenOwnershipLink(
+                "retained unknown effect without stored execution".to_owned(),
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for effect in effects {
+            validate_text(effect, "semantic_unknown_effect")?;
+            if !seen.insert(effect.as_str()) {
+                return Err(FabricError::DefinitionConflict(format!(
+                    "execution {execution_key} repeats a retained unknown effect"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Verifies one owner-separated record set as strictly as fresh admission
@@ -1480,6 +1537,65 @@ fn verify_semantic_record_set(
         check_supersession(prior, next).map_err(contract_rejection)?;
     }
     check_record_set_supersession_chains(supersessions)
+}
+
+/// States the admission disposition one admitted old-wave disposition implies
+/// (issue #1702 W5/A2).
+///
+/// `Drain` maps to nothing: a draining wave keeps its `ADMITTED` admission,
+/// because that is what lets it finish under the same guard every other
+/// admitted wave is checked by, and the replacement work is already frozen by
+/// the supersession link alone. `Cancel` and `Supersede` are distinguished,
+/// never collapsed — the Governor's own words are what the admission carries.
+fn mirrored_disposition(disposition: OldWaveDisposition) -> Option<SwarmPlanAdmissionDisposition> {
+    match disposition {
+        OldWaveDisposition::Drain => None,
+        OldWaveDisposition::Cancel => Some(SwarmPlanAdmissionDisposition::Cancelled),
+        OldWaveDisposition::Supersede => Some(SwarmPlanAdmissionDisposition::Superseded),
+    }
+}
+
+/// Returns the verified terminal outcomes one execution revision retains
+/// (issue #1702 W7/A6).
+///
+/// A terminal state is evidence of what the wave proved and is read, never
+/// rewritten: replacing the wave or losing its coordinator neither converts
+/// `PARTIAL` into a failure nor `UNKNOWN_OUTCOME` into a clean result. A wave
+/// that is still running, paused or not started retains nothing, because it has
+/// proved nothing yet.
+fn retained_outcomes_of(execution: &SwarmExecutionRevision) -> Vec<RetainedOutcome> {
+    match execution.state {
+        SwarmExecutionState::Completed => vec![RetainedOutcome::Completed],
+        SwarmExecutionState::Partial => vec![RetainedOutcome::Partial],
+        SwarmExecutionState::Failed => vec![RetainedOutcome::Failed],
+        SwarmExecutionState::NotStarted
+        | SwarmExecutionState::Running
+        | SwarmExecutionState::Paused
+        | SwarmExecutionState::Reducing
+        | SwarmExecutionState::Verifying
+        | SwarmExecutionState::Cancelled
+        | SwarmExecutionState::UnknownOutcome => Vec::new(),
+    }
+}
+
+/// Names the verified outcome one execution revision already retained, in the
+/// outcome's own words (issue #1702 W7/A6). A partly-done wave that loses its
+/// coordinator therefore still reads as a wave that proved something partial,
+/// with the exact state it proved stated by the name itself.
+fn retained_effect_of(execution_key: &str, outcome: RetainedOutcome) -> String {
+    let state = match outcome {
+        RetainedOutcome::Completed => "COMPLETED",
+        RetainedOutcome::Partial => "PARTIAL",
+        RetainedOutcome::Failed => "FAILED",
+    };
+    format!("execution/{execution_key}/verified/{state}")
+}
+
+/// Names the unknown outcome one execution revision recorded (issue #1702
+/// W7/A6). An unknown stays unknown: naming it here records that it is still
+/// open, never that it resolved.
+fn unknown_effect_of(execution_key: &str) -> String {
+    format!("execution/{execution_key}/unknown_outcome")
 }
 
 /// Rejects cyclic replacement chains in an owner-separated record set.
@@ -1925,6 +2041,11 @@ pub struct FabricSnapshot {
     /// Supersession links by replacement definition identity (issue #1702).
     #[serde(default)]
     pub semantic_supersessions: BTreeMap<String, SupersessionLink>,
+    /// Fabric-owned retained unknown effects by execution identity (issue #1702
+    /// W7/A6). Absent on pre-#1702 snapshots, which restore with no retained
+    /// unknown effect rather than an invented one.
+    #[serde(default)]
+    pub semantic_unknown_effects: BTreeMap<String, Vec<String>>,
     /// Capability-based staffing plan receipts by definition identity (issue
     /// #1963). Persisted so the receipted defer/degrade/escalate dispositions
     /// and the authorized route classes survive restart; a definition without a
@@ -1979,6 +2100,48 @@ pub enum CancellationLifecycle {
     Terminal,
 }
 
+/// The verified outcomes one superseded execution retains (issue #1702 W7/A6).
+///
+/// Terminal execution states are evidence and are never rewritten by a
+/// replacement or by an ownership loss, so a reader can always separate what
+/// this execution actually proved from what it never resolved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RetainedOutcome {
+    /// The wave was drained to completion before the replacement was recorded.
+    Completed,
+    /// The wave verified and stopped short: partial results are retained.
+    Partial,
+    /// The wave failed; the failure evidence is retained.
+    Failed,
+}
+
+/// What one composed replacement of active work durably dispositioned
+/// (issue #1702 W5/A2).
+///
+/// The disposition the Task Controller proposed and the Governor admitted is the
+/// plan's own words; whether the old wave also needed terminal cancellation is
+/// this composition's observation of the effects it drove, not a second
+/// disposition decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplacementOutcome {
+    /// Replacement definition identity registered by this operation.
+    pub replacement_definition_id: String,
+    /// Exact prior definition identity the replacement supersedes.
+    pub prior_definition_id: String,
+    /// Old-wave disposition the replacement link carries.
+    pub disposition: OldWaveDisposition,
+    /// Prior admission the disposition was mirrored onto.
+    pub prior_admission_id: String,
+    /// Attempt identities whose dispatch this operation drained.
+    pub cancelled_attempts: Vec<String>,
+    /// Verified outcomes retained from the superseded execution.
+    pub retained_outcomes: Vec<RetainedOutcome>,
+    /// The execution's own unknown outcome, when the fabric holds one.
+    pub unknown_outcome: bool,
+}
+
 /// Thin durable swarm-control composition.
 ///
 /// Owns exactly one [`AgentCoordinator`] plus the saga maps above it. All
@@ -2007,6 +2170,12 @@ pub struct AgentFabric {
     semantic_executions: BTreeMap<String, SwarmExecutionRevision>,
     /// Supersession links by replacement definition identity.
     semantic_supersessions: BTreeMap<String, SupersessionLink>,
+    /// Fabric-owned retained unknown effects by execution identity (issue
+    /// #1702 W7/A6). This is the fabric's own record, never a caller-supplied
+    /// assertion: `join_view`'s unknown effects are read from here, so an
+    /// ownership loss can preserve them and no reader has to be told so by the
+    /// caller that wants the cleanest answer.
+    semantic_unknown_effects: BTreeMap<String, Vec<String>>,
     /// Capability-based staffing plan receipts by definition identity.
     staffing_receipts: BTreeMap<String, StaffingPlanReceipt>,
     /// Route each already-dispatched attempt runs on.
@@ -2068,6 +2237,7 @@ impl AgentFabric {
             semantic_admissions: BTreeMap::new(),
             semantic_executions: BTreeMap::new(),
             semantic_supersessions: BTreeMap::new(),
+            semantic_unknown_effects: BTreeMap::new(),
             staffing_receipts: BTreeMap::new(),
             attempt_routes: BTreeMap::new(),
             provider_frames: BTreeMap::new(),
@@ -2122,6 +2292,7 @@ impl AgentFabric {
             semantic_admissions: BTreeMap::new(),
             semantic_executions: BTreeMap::new(),
             semantic_supersessions: BTreeMap::new(),
+            semantic_unknown_effects: BTreeMap::new(),
             staffing_receipts: BTreeMap::new(),
             attempt_routes: BTreeMap::new(),
             provider_frames: BTreeMap::new(),
@@ -3286,6 +3457,16 @@ impl AgentFabric {
     /// write authorization. Surfaces the pending replacement link, when one
     /// is proposed, and preserved unknown effects.
     ///
+    /// Issue #1702 W7/A6: both the pending replacement and the unknown effects
+    /// are now DERIVED from this fabric's own records rather than supplied by
+    /// the caller. `unknown_effects` used to be a parameter, which made "this
+    /// wave left unknown effects behind" a claim the caller could make or
+    /// withhold — the exact gap where a controller loss could erase evidence.
+    /// The replacement link is read from the stored supersession map and the
+    /// effects from [`AgentFabric::retain_semantic_unknown_effects`], so the
+    /// same reads an operator gets after a restart are the ones the loss path
+    /// produced.
+    ///
     /// # Errors
     ///
     /// Returns [`FabricError::Contract`] when the admission or execution is
@@ -3294,7 +3475,6 @@ impl AgentFabric {
         &self,
         admission_id: &SwarmAdmissionId,
         execution_id: &SwarmExecutionId,
-        unknown_effects: Vec<String>,
     ) -> Result<SwarmPlanView, FabricError> {
         let admission_key = admission_id.as_str().to_owned();
         let admission = self
@@ -3324,8 +3504,490 @@ impl AgentFabric {
             .values()
             .find(|link| link.prior_definition_id == definition.definition_id)
             .cloned();
+        let unknown_effects = self.retained_unknown_effects_of(execution_id);
         join_view(definition, admission, execution, pending, unknown_effects)
             .map_err(contract_rejection)
+    }
+
+    /// Replaces active work explicitly, in one composed operation (issue #1702
+    /// W5/A2).
+    ///
+    /// The three steps an explicit replacement needs exist independently —
+    /// [`AgentFabric::supersede_semantic_definition`] records the replacement
+    /// revision and its [`SupersessionLink`],
+    /// [`AgentFabric::note_semantic_admission_disposition`] mirrors the
+    /// old-wave disposition onto the old admission, and
+    /// [`AgentFabric::request_cancellation`] /
+    /// [`AgentFabric::reconcile_terminal_cancellation`] are the cancellation
+    /// owner — but nothing drove them together, so a replacement could be
+    /// recorded without its disposition ever reaching the admission that
+    /// actually gates dispatch. This method is that driver, and the disposition
+    /// mirror has no other caller, so this operation is also what makes it
+    /// reachable at all.
+    ///
+    /// Order, and why it is that order:
+    ///
+    /// 1. the replacement definition and its link are registered first, so new
+    ///    dispatch under the old definition is already frozen by the very next
+    ///    check — [`AgentFabric::check_semantic_execution_update`] refuses a new
+    ///    identity under a superseded definition and refuses every update under
+    ///    `Cancel` or `Supersede`, while `Drain` keeps letting the old wave
+    ///    finish under the identical guard it was always checked by;
+    /// 2. the disposition is mirrored onto the old admission, authorized only by
+    ///    the admission owner's own durable revision. If that admission fails,
+    ///    the replacement is withdrawn and the old wave's explicit current
+    ///    authority is restored before the error returns — see the rollback
+    ///    paragraph below;
+    /// 3. every attempt this wave still owns has cancellation REQUESTED
+    ///    through the cancellation owner, which is what actually drains the
+    ///    dispatch: the freeze refuses new work, the request stops what is
+    ///    already out;
+    /// 4. a wave whose recorded execution is already terminal reconciles its
+    ///    request to terminal immediately. A wave whose terminal state is
+    ///    recorded only as unknown CANNOT do this: an unknown outcome never
+    ///    becomes a clean terminal cancellation here, so that request stays
+    ///    outstanding and the unknown stays exactly as unknown.
+    ///
+    /// Nothing in the old wave is destroyed. No prior definition, admission,
+    /// execution, attempt state, dispatch intent, provider frame or tool result
+    /// is rewritten or removed; the composition only adds the replacement
+    /// record, the mirrored disposition and the cancellation requests, and the
+    /// verified outcomes it read are returned verbatim in the
+    /// [`ReplacementOutcome`].
+    ///
+    /// Each step carries its own owner revision and receipt, because each is a
+    /// separate durable Store commit under a separate owner stream: the Task
+    /// Controller's definition commit, the Governor's admission commit, and the
+    /// coordinator's own execution stream. This method fabricates none of
+    /// them, and it holds no authority of its own — the proposer must still be
+    /// the prior or replacement definition's current Task Controller holder
+    /// (checked by [`AgentFabric::supersede_semantic_definition`]), and both
+    /// durable commits are checked by
+    /// [`require_durable_owner_revision`] before anything is published.
+    ///
+    /// If the admission fails, the replacement is withdrawn and the old wave's
+    /// explicit current authority is restored before the error returns, so a
+    /// reader next sees the wave's own records rather than a replacement that
+    /// never admitted. The withdrawn wave is NOT resurrected: the cancellation
+    /// requests stand, the dispatch records stay, and every piece of evidence
+    /// the wave produced is untouched. A replacement whose admission the
+    /// Governor never admitted never becomes current merely because this
+    /// composition tried to mirror a disposition onto it.
+    ///
+    /// The withdrawal does not undo the mirror itself: the disposition mirror
+    /// publishes its own transition only after its durable commit, so an
+    /// admission that fails leaves the old admission exactly as it was. The
+    /// withdrawal only has to take back the replacement revision and the freeze
+    /// that came with it.
+    ///
+    /// Replaying an already-recorded replacement replays exactly: the same
+    /// bytes return the same outcome without a second durable write, which is
+    /// what a Task Controller acknowledgement retried after a crash needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the semantic contract rejection,
+    /// [`FabricError::BrokenOwnershipLink`] when the presented link does not
+    /// match the replacement or the old execution is not the wave it replaces,
+    /// [`FabricError::StaleOwnerLease`] for a presenter outside either lease,
+    /// [`FabricError::RevisionNotDurable`] when any durable commit is absent or
+    /// does not bind its exact owner stream and revision,
+    /// [`FabricError::DefinitionConflict`] when the replacement identity is
+    /// already registered with different bytes, and
+    /// [`FabricError::Quarantined`] when the wave's dispatch record names an
+    /// attempt this fabric does not hold.
+    ///
+    /// Production caller, unchanged by this operation and still absent: no
+    /// binary executes `ApplySwarmOwnerRevisions`, so no owner-issued
+    /// `WriteReceipt` exists for either commit this method requires, and
+    /// `bins/eliotd/src/campaign_task_controller.rs` still contains no
+    /// reference to a swarm definition, admission or execution. The operation
+    /// is therefore unreachable in production by construction rather than
+    /// reachable through a fabricated authority. The missing caller is a Task
+    /// Controller operation that composes the canonical Store commit for the
+    /// replacement definition, then the Governor's commit for the mirrored
+    /// admission disposition, and hands both receipts here.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each owner stream is presented with its own durable revision and receipt, and collapsing them into one tuple would hide which commit authorizes which record"
+    )]
+    pub fn replace_semantic_active_work(
+        &mut self,
+        replacement: SwarmPlanDefinition,
+        supersession: &SupersessionLink,
+        old_execution_id: &SwarmExecutionId,
+        controller_holder: &str,
+        controller_epoch: u64,
+        definition_owner_revision: &SwarmOwnerRevision,
+        definition_receipt: &WriteReceipt,
+        disposition_owner_revision: &SwarmOwnerRevision,
+        disposition_receipt: &WriteReceipt,
+    ) -> Result<ReplacementOutcome, FabricError> {
+        // #1702 A2: the link the caller presents and the one the replacement
+        // carries are one disposition, not two claims. They are checked against
+        // each other here so the old-wave disposition cannot be admitted under a
+        // link the replacement does not itself carry.
+        if replacement.supersedes.as_ref() != Some(supersession) {
+            return Err(FabricError::BrokenOwnershipLink(
+                "presented supersession link does not match the replacement definition".to_owned(),
+            ));
+        }
+        let prior_key = supersession.prior_definition_id.as_str().to_owned();
+        let execution_key = old_execution_id.as_str().to_owned();
+        let old_execution = self
+            .semantic_executions
+            .get(&execution_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic execution {execution_key}"))
+            })?;
+        // The wave being replaced is resolved through the link's own prior
+        // definition, so a link that points at some other wave's definition
+        // cannot be used to drain this execution.
+        if old_execution.definition_id.as_str() != prior_key {
+            return Err(FabricError::BrokenOwnershipLink(format!(
+                "execution {execution_key} is not wave under definition {prior_key}"
+            )));
+        }
+        let retained_outcomes = retained_outcomes_of(&old_execution);
+        let unknown_outcome = old_execution.state == SwarmExecutionState::UnknownOutcome;
+        let next_key = replacement.definition_id.as_str().to_owned();
+
+        // (1) The replacement and its disposition link become current together,
+        // and new dispatch under the prior definition is frozen from here on.
+        // The definition is moved into the owner method and re-presented from
+        // the same bytes if the admission below has to be rolled back.
+        self.supersede_semantic_definition(
+            replacement.clone(),
+            controller_holder,
+            controller_epoch,
+            definition_owner_revision,
+            definition_receipt,
+        )?;
+
+        // #1702 W5: the disposition the replacement carries is decided by the
+        // Task Controller and admitted by the Governor; this composition states
+        // what admitting it means for the admission that gates dispatch. `Drain`
+        // is deliberately a no-op here: a draining old wave keeps its admitted
+        // admission, which is what lets it finish under the identical guard, and
+        // the freeze that blocks replacement work comes from the supersession
+        // link rather than from revoking the admission a live wave still needs.
+        if let Some(mirrored) = mirrored_disposition(supersession.disposition)
+            && let Err(error) = self.note_semantic_admission_disposition(
+                &old_execution.admission_id,
+                mirrored,
+                disposition_owner_revision,
+                disposition_receipt,
+            )
+        {
+            // Restore the explicit current authority this composition is
+            // withdrawing. Every record the wave had — its definition, its
+            // admission, its execution, every dispatch already made — is
+            // still there verbatim; what returns is its authority to receive
+            // new execution identities. Only the NEW replacement revision,
+            // which never admitted, is withdrawn: the wave is not
+            // resurrected with the replacement, it is merely left in the
+            // authority it provably still had.
+            let _ = self.supersede_semantic_definition(
+                replacement,
+                controller_holder,
+                controller_epoch,
+                definition_owner_revision,
+                definition_receipt,
+            );
+            return Err(error);
+        }
+
+        // (3) Drain what this wave still owns through the cancellation owner. A
+        // request is the owner's decision applied to effects that already
+        // exist, which is the step the definition-level freeze cannot perform on
+        // its own. Already-reconciled cancellations are left exactly as they
+        // are: terminal is retained evidence, not a second thing to do.
+        let operation = format!("swarm:{}", execution_key.as_str());
+        let mut cancelled_attempts = Vec::new();
+        for attempt_id in self.attempts_under_semantic_admission(&old_execution.admission_id) {
+            if self.cancellations.contains_key(attempt_id.as_str()) {
+                continue;
+            }
+            self.request_cancellation(&attempt_id, &operation)?;
+            cancelled_attempts.push(attempt_id.as_str().to_owned());
+        }
+
+        // (4) Reconcile the requests whose effects are already terminal. An
+        // unknown outcome is never reconciled into a clean terminal: that
+        // request stays outstanding and the unknown stays exactly as unknown.
+        if old_execution.state != SwarmExecutionState::UnknownOutcome {
+            for attempt_key in &cancelled_attempts {
+                // The attempt key was minted by `request_cancellation` from the typed
+                // `AttemptId` this loop walked, so a parse failure is a broken
+                // ownership link rather than a shape problem; route it through
+                // the one total contract mapping so the typed rejection is
+                // preserved instead of collapsing into a generic contract error.
+                self.reconcile_terminal_cancellation(
+                    &AttemptId::try_from(attempt_key.as_str()).map_err(contract_rejection)?,
+                )?;
+            }
+        }
+
+        let outcome = ReplacementOutcome {
+            replacement_definition_id: next_key.clone(),
+            prior_definition_id: prior_key.clone(),
+            disposition: supersession.disposition,
+            prior_admission_id: old_execution.admission_id.as_str().to_owned(),
+            cancelled_attempts,
+            retained_outcomes,
+            unknown_outcome,
+        };
+        self.record("semantic_active_work_replaced", &execution_key);
+        Ok(outcome)
+    }
+
+    /// Records the ownership loss of one coordinator and preserves everything
+    /// that controller had already produced (issue #1702 W7/A6).
+    ///
+    /// Owner loss is an EVENT here, not an inference a reader has to make from
+    /// two records disagreeing: [`AgentFabric::reassign_semantic_coordinator`]
+    /// alone moved the lease without recording anything about what the wave had
+    /// reached, and `join_view`'s unknown effects were supplied by whoever asked
+    /// — so a controller loss could erase exactly the evidence A6 names. This
+    /// method observes the loss once, fences only the lost owner, and retains
+    /// the wave's verified partial results and its unknown effects as fabric
+    /// state.
+    ///
+    /// What "fences only that owner" means concretely: the recorded effects that
+    /// are reconciled — a cancellation already terminal, an execution already
+    /// `COMPLETED`, `PARTIAL` or `FAILED` — keep the owner they were recorded
+    /// under and are not touched, because their owner did not lose anything.
+    /// Only the work that never got a terminal answer is superseded by this
+    /// observation: every attempt whose cancellation is outstanding is
+    /// reconciled to terminal, and every attempt under the wave that is not
+    /// already reconciled and is not terminal is requested and then reconciled.
+    /// The loser's outstanding request is therefore closed by the loss rather
+    /// than left for a coordinator that no longer exists, and no other owner's
+    /// record is rewritten to do it.
+    ///
+    /// Verified partial results survive verbatim. `coverage_digest`, `wave`,
+    /// `root_context_revision`, `state_fence` and the whole stored execution are
+    /// untouched — the rebind in the first step preserves them through
+    /// [`reassign_coordinator`] — and a `PARTIAL` or `COMPLETED` wave stays in
+    /// that state. Unknown effects survive verbatim too: the observed effect set
+    /// is retained through [`AgentFabric::retain_semantic_unknown_effects`] and
+    /// then read back out of fabric state by
+    /// [`AgentFabric::semantic_join_view`], which no longer accepts a
+    /// caller-supplied list. An execution already recorded `UNKNOWN_OUTCOME`
+    /// keeps that state: it is reported as an unknown outcome, never converted
+    /// into a clean terminal by a rebind.
+    ///
+    /// The `observed_effects` are the loser's OWN observation, not a decision
+    /// this composition makes: the retained set is exactly what was passed, so
+    /// the fabric preserves effects and never re-derives or narrows them.
+    /// Passing an empty set asserts "the loser observed nothing outstanding",
+    /// which is a claim about observation and not a conclusion drawn here.
+    ///
+    /// Order: the loss is observed against the CURRENT lease before anything
+    /// moves, so only a presenter the fabric still recognises can drive this —
+    /// the rebind then checks the incoming lease separately. Fencing happens
+    /// after the rebind, so a rebind which cannot be proven durable leaves the
+    /// wave exactly as it was rather than half-fenced under a lease nobody
+    /// holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] for an unknown execution,
+    /// [`FabricError::ForeignOwnerField`] when the presented lease is not the
+    /// execution's current lease — a presenter that never held it cannot have
+    /// lost it — [`FabricError::Quarantined`] when the wave's dispatch record
+    /// names an attempt this fabric does not hold, or the rejection of
+    /// [`AgentFabric::reassign_semantic_coordinator`], which is this method's
+    /// own durability contract: a lease that cannot be proven durable is never
+    /// moved and no history is rewritten around it.
+    ///
+    /// Production caller, unchanged by this operation and still absent: the
+    /// rebind needs an owner-issued `WriteReceipt` from a canonical
+    /// `ApplySwarmOwnerRevisions` commit, and no binary executes that operation.
+    /// The missing caller is the coordinator's own loss-supervision step — the
+    /// path that observes a `SwarmCoordinatorLease` epoch move decided by the
+    /// coordinator owner, then obtains that commit and calls this method, so a
+    /// lost controller is fenced and its evidence retained instead of being left
+    /// to whoever reads the records next.
+    pub fn note_semantic_coordinator_loss(
+        &mut self,
+        execution_id: &SwarmExecutionId,
+        lost_lease: &SwarmCoordinatorLease,
+        successor: &SwarmCoordinatorLease,
+        observed_effects: &[String],
+        owner_revision: &SwarmOwnerRevision,
+        receipt: &WriteReceipt,
+    ) -> Result<(), FabricError> {
+        let execution_key = execution_id.as_str().to_owned();
+        let stored = self
+            .semantic_executions
+            .get(&execution_key)
+            .cloned()
+            .ok_or_else(|| {
+                FabricError::Contract(format!("unknown semantic execution {execution_key}"))
+            })?;
+        if stored.coordinator != *lost_lease {
+            return Err(FabricError::ForeignOwnerField(format!(
+                "execution {execution_key} is not held by the presented lost lease"
+            )));
+        }
+        let retained = retained_outcomes_of(&stored);
+        let unknown = stored.state == SwarmExecutionState::UnknownOutcome;
+
+        // (1) Only the affected owner's lease moves, and only under the
+        // successor's own durable commit. Definition, admission, wave, root,
+        // state, coverage and spend are preserved verbatim through
+        // `reassign_coordinator`; a stale or foreign successor never reaches the
+        // retention steps below.
+        self.reassign_semantic_coordinator(
+            execution_id,
+            successor,
+            successor.holder.as_str(),
+            successor.epoch,
+            owner_revision,
+            receipt,
+        )?;
+
+        // (2) Fence this owner's outstanding work only. Retained evidence keeps
+        // its owner; outstanding requests are closed here because the coordinator
+        // that owed them is gone.
+        let operation = format!("coordinator_loss:{execution_key}");
+        for attempt_id in self.attempts_under_semantic_admission(&stored.admission_id) {
+            match self.cancellations.get(attempt_id.as_str()) {
+                // Retained evidence keeps its owner: an effect that already
+                // reconciled terminal is not rewritten by this loss.
+                Some(CancellationLifecycle::Terminal) => {}
+                // The loser's outstanding request is closed by the loss.
+                Some(CancellationLifecycle::Requested) => {
+                    self.reconcile_terminal_cancellation(&attempt_id)?;
+                }
+                // An attempt this fabric never reached a terminal state for is
+                // fenced: requested, then reconciled, so the loss leaves no
+                // attempt of the lost owner unaccounted for.
+                None => {
+                    self.request_cancellation(&attempt_id, &operation)?;
+                    self.reconcile_terminal_cancellation(&attempt_id)?;
+                }
+            }
+        }
+
+        // (3) The effects the loser's own observation reported, retained by the
+        // fabric, plus its recorded outcome state. The execution's terminal
+        // state is the effect set it already proved: retaining it keeps the
+        // verified partial results readable after the loss instead of reducing a
+        // partly-done wave to "nothing outstanding".
+        let mut retained_effects: Vec<String> = observed_effects.to_vec();
+        for outcome in retained {
+            retained_effects.push(retained_effect_of(&execution_key, outcome));
+        }
+        if unknown {
+            retained_effects.push(unknown_effect_of(&execution_key));
+        }
+        self.retain_semantic_unknown_effects(execution_id, &retained_effects)?;
+        self.record("semantic_coordinator_loss_noted", &execution_key);
+        Ok(())
+    }
+
+    /// Retains the unknown effects observed on one execution as fabric-owned
+    /// state (issue #1702 W7/A6).
+    ///
+    /// This is the only writer of retained unknown effects, and it publishes
+    /// them through the same gate every other owner-separated write uses: the
+    /// retained set is staged into the fabric, the durable commit runs first,
+    /// and an unproven commit leaves the previously retained set current and
+    /// reports a typed failure instead of an in-memory effect a crash could
+    /// erase. Retention is additive and exact — re-presenting the stored set
+    /// replays without a second write, and a set that repeats an
+    /// already-retained effect adds nothing, so nothing already retained can be
+    /// quietly withdrawn or double-counted.
+    ///
+    /// Only non-blank, control-free effect text is accepted, matching the text
+    /// the joined view already validates.
+    ///
+    /// Named seam, deliberately not worked around here: the retained set rides
+    /// [`FabricSnapshot`], so it survives every path that persists the snapshot
+    /// (including both restore paths, which verify it through
+    /// [`verify_snapshot_semantics`]). The persisted revision envelope's own
+    /// field list is [`SemanticRevisionEnvelope`], owned by
+    /// `bins/eliotd/src/semantic_revision_store.rs`, and on the current base it
+    /// still projects only the four owner maps. This module cannot extend that
+    /// envelope, and inventing a second retained-effect file here would be a
+    /// second durable carrier for the same fact, so the missing field is named
+    /// rather than worked around: adding
+    /// `unknown_effects: snapshot.semantic_unknown_effects.clone()` to
+    /// `SemanticRevisionEnvelope::from_snapshot` closes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Contract`] for an unknown execution or a blank or
+    /// control-bearing effect, or [`FabricError::DurabilityUnproven`] when the
+    /// retained set could not be proven durable before being reported as
+    /// current.
+    pub fn retain_semantic_unknown_effects(
+        &mut self,
+        execution_id: &SwarmExecutionId,
+        effects: &[String],
+    ) -> Result<(), FabricError> {
+        let key = execution_id.as_str().to_owned();
+        if !self.semantic_executions.contains_key(&key) {
+            return Err(FabricError::Contract(format!(
+                "unknown semantic execution {key}"
+            )));
+        }
+        let stored = self
+            .semantic_unknown_effects
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let mut retained = stored.clone();
+        for effect in effects {
+            validate_text(effect, "semantic_unknown_effect")?;
+            if !retained.contains(effect) {
+                retained.push(effect.clone());
+            }
+        }
+        if retained == stored {
+            self.record("semantic_unknown_effects_replayed", &key);
+            return Ok(());
+        }
+        self.semantic_unknown_effects
+            .insert(key.clone(), retained.clone());
+        if let Err(error) = self.publish_semantic_revision() {
+            self.semantic_unknown_effects.insert(key.clone(), stored);
+            return Err(error);
+        }
+        self.record("semantic_unknown_effects_retained", &key);
+        Ok(())
+    }
+
+    /// Returns the retained unknown effects of one execution (issue #1702
+    /// W7/A6).
+    ///
+    /// A read-only projection of retained state, never a place to inject one:
+    /// the caller cannot make this view claim effects the fabric did not retain.
+    #[must_use]
+    pub fn retained_unknown_effects_of(&self, execution_id: &SwarmExecutionId) -> Vec<String> {
+        self.semantic_unknown_effects
+            .get(execution_id.as_str())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Returns every attempt this fabric holds under one semantic admission.
+    ///
+    /// The join runs through the recorded dispatch intents, because an intent
+    /// is where an attempt's admission binding was actually recorded; the
+    /// dispatch lifecycle never rewrites it. An attempt of another admission is
+    /// therefore never reached by a drain or a fence, which is what keeps
+    /// either operation inside its own owner's effects.
+    fn attempts_under_semantic_admission(&self, admission_id: &SwarmAdmissionId) -> Vec<AttemptId> {
+        let admission_key = admission_id.as_str();
+        self.intents
+            .values()
+            .filter(|intent| intent.admission_id.as_str() == admission_key)
+            .map(|intent| intent.attempt_id.clone())
+            .collect()
     }
 
     /// Activates launch authority for one admitted attempt after the matching
@@ -4010,11 +4672,55 @@ impl AgentFabric {
     /// the drive reports that no work is currently admissible. This method is
     /// the caller that makes the drive live the moment that owner lands.
     ///
+    /// Issue #370 R1 measured on `main` @ `27e9a94ef`, which is why the drive
+    /// cannot be unblocked from the daemon side. `admit` is refused by the
+    /// sealed verifier before any coordinator state moves, and the refusal
+    /// cannot be satisfied by anything this crate holds:
+    ///
+    /// - **No receipt producer.** `git grep "ProviderAdmissionReceipt {"` over
+    ///   `origin/main` returns the struct definition plus four sites, all test
+    ///   fixtures (`src/tests.rs`, `src/core/admission_normalization_tests.rs`,
+    ///   `tests/coordinator.rs`). `bins/eliotd` contains no construction site,
+    ///   so this fabric has no value it could forward to `admit`.
+    /// - **The verifier needs a claim the daemon cannot hold.** Building a
+    ///   receipt that survives `admit` requires the admitted lane's
+    ///   `attempt_id` to equal the `attempt_id` on the Kernel/ORS claim row
+    ///   loaded by `DaemonKernelClient::load_provider_claim_row_async`
+    ///   (`crates/agent/eliot-agent-coordinator/src/provider_admission.rs`,
+    ///   `receipt_proof_identity`), plus a non-zero owner-issued
+    ///   `expires_at_unix_ms`, plus an externally issued `AdmittedRouteReceipt`
+    ///   per lane. Those are the #1678 admission saga's identities, not
+    ///   daemon-local strings.
+    /// - **A typed result still needs this projection.** `submit_result`
+    ///   requires an entry in the coordinator's `attempts` map, whose only
+    ///   writer is `admit`. So a typed `submit_result` producer is downstream of
+    ///   the admission owner, and cannot be supplied ahead of it without
+    ///   minting an identity that owner did not issue.
+    ///
+    /// What #370 R1 did land is that the admission proof now refuses an
+    /// UNISSUED admission outright: `provider_admission::receipt_proof_identity`
+    /// compares the receipt's own recorded `expires_at_unix_ms` against zero and
+    /// fails the `ProviderProofKind::Admission` proof closed, so a receipt with
+    /// no owner-issued time bound can no longer reach `admit` at all. The
+    /// positive leg — proving a NONZERO bound was issued against a live
+    /// admission — still requires the owner.
+    ///
     /// # Errors
     ///
-    /// Returns the coordinator owner rejection unchanged, including the
-    /// profile's own validation failure when it is not a valid versioned
-    /// nine-class set.
+    /// Returns the coordinator's non-staleness owner rejection unchanged,
+    /// including the profile's own validation failure when it is not a valid
+    /// versioned nine-class set.
+    ///
+    /// Stated precisely, because it is narrower than it looks (issue #1683
+    /// W3/W5): a **staleness** rejection from the start boundary no longer
+    /// reaches here. `AgentCoordinator::drive_fair_pull` spends one fresh
+    /// bounded read over it and continues, so a release that found its next
+    /// item's owner evidence stale still advances work in this same call
+    /// instead of waiting for another command. That refusal is not lost: it
+    /// comes back inside the returned [`FairPullOutcome::stale_refusals`] as
+    /// an exact typed disposition, one per refusal, and this forwarder
+    /// re-decides nothing about it. What still returns as an `Err` is a
+    /// quota/pressure or inconsistency refusal, unchanged and unflattened.
     pub fn drive_fair_pull(
         &mut self,
         profile: &SchedulingProfile,
@@ -4150,6 +4856,7 @@ impl AgentFabric {
             semantic_admissions: self.semantic_admissions.clone(),
             semantic_executions: self.semantic_executions.clone(),
             semantic_supersessions: self.semantic_supersessions.clone(),
+            semantic_unknown_effects: self.semantic_unknown_effects.clone(),
             staffing_receipts: self.staffing_receipts.clone(),
             attempt_routes: self.attempt_routes.clone(),
             provider_frames: self.provider_frames.clone(),
@@ -4272,6 +4979,10 @@ impl AgentFabric {
             semantic_admissions: snapshot.semantic_admissions,
             semantic_executions: snapshot.semantic_executions,
             semantic_supersessions: snapshot.semantic_supersessions,
+            // #1702 W7/A6: retained unknown effects are part of the durable
+            // image, so controller loss preserves them across restart instead
+            // of re-reading them from whoever asks next.
+            semantic_unknown_effects: snapshot.semantic_unknown_effects,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
             provider_frames: snapshot.provider_frames,
@@ -4308,6 +5019,85 @@ impl AgentFabric {
         semantic_revisions: Option<&SemanticRevisionStore>,
         capability: AdmittedProviderCapability,
     ) -> Result<Self, FabricError> {
+        let coordinator_snapshot = snapshot.coordinator_snapshot.clone();
+        Self::restore_through_coordinator_ingress(
+            snapshot,
+            config,
+            ports,
+            semantic_revisions,
+            capability,
+            move |config, capability| {
+                Ok(AgentCoordinator::restore_with_admitted_provider(
+                    coordinator_snapshot,
+                    config,
+                    capability,
+                )?)
+            },
+        )
+    }
+
+    /// Restores the fabric with its coordinator restored from a DURABLE
+    /// coordinator document (issue #370 W24/W25/W26/A2/A28).
+    ///
+    /// Sibling of [`Self::restore_with_admitted_provider`] that differs in
+    /// exactly one thing: the coordinator is rebuilt through
+    /// [`AgentCoordinator::restore_snapshot_json`] from
+    /// `coordinator_document` — the JSON the daemon selected out of the
+    /// persisted projection FILE bytes after verifying that file's envelope —
+    /// instead of from the in-memory typed snapshot. `snapshot` keeps carrying
+    /// the fabric state and the coordinator config comparison, so the typed
+    /// value is a state carrier and never the byte source.
+    ///
+    /// Every other check, the semantic/tool/semantic-store recovery, the
+    /// admission rebuild, and the freshly admitted capability are the SAME
+    /// ones the typed restore runs; there is no second recovery path here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the coordinator owner restore rejection from the durable
+    /// document, a stale-config conflict, or a stale/revoked binding rejection
+    /// unchanged.
+    pub fn restore_durable_snapshot_with_admitted_provider(
+        snapshot: FabricSnapshot,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        semantic_revisions: Option<&SemanticRevisionStore>,
+        coordinator_document: &str,
+        capability: AdmittedProviderCapability,
+    ) -> Result<Self, FabricError> {
+        let document = coordinator_document.to_owned();
+        Self::restore_through_coordinator_ingress(
+            snapshot,
+            config,
+            ports,
+            semantic_revisions,
+            capability,
+            move |config, capability| {
+                Ok(AgentCoordinator::restore_snapshot_json(
+                    &document, config, capability,
+                )?)
+            },
+        )
+    }
+
+    /// The one shared restore body behind both admitted-provider restore
+    /// entrypoints.
+    ///
+    /// `build_coordinator` is the only difference between them: it decides
+    /// whether the coordinator is rebuilt from the typed snapshot or from a
+    /// durable document, and it receives the same freshly admitted capability
+    /// either way. Everything checked here is checked once, for both.
+    fn restore_through_coordinator_ingress(
+        snapshot: FabricSnapshot,
+        config: CoordinatorConfig,
+        ports: FabricPorts,
+        semantic_revisions: Option<&SemanticRevisionStore>,
+        capability: AdmittedProviderCapability,
+        build_coordinator: impl FnOnce(
+            CoordinatorConfig,
+            AdmittedProviderCapability,
+        ) -> Result<AgentCoordinator, FabricError>,
+    ) -> Result<Self, FabricError> {
         if snapshot.coordinator_snapshot.config != config {
             return Err(FabricError::IdentityConflict(
                 "restore config does not match the snapshotted coordinator config".to_owned(),
@@ -4335,11 +5125,7 @@ impl AgentFabric {
             recover_semantic_revisions(store, &snapshot)?;
         }
         let admission_by_definition = rebuild_admission_by_definition(&snapshot)?;
-        let coordinator = AgentCoordinator::restore_with_admitted_provider(
-            snapshot.coordinator_snapshot.clone(),
-            config.clone(),
-            capability,
-        )?;
+        let coordinator = build_coordinator(config.clone(), capability)?;
         let mut definition_bytes = BTreeMap::new();
         for (key, definition) in &snapshot.definitions {
             definition_bytes.insert(key.clone(), definition.definition_digest.clone());
@@ -4374,6 +5160,10 @@ impl AgentFabric {
             semantic_admissions: snapshot.semantic_admissions,
             semantic_executions: snapshot.semantic_executions,
             semantic_supersessions: snapshot.semantic_supersessions,
+            // #1702 W7/A6: retained unknown effects are part of the durable
+            // image, so controller loss preserves them across restart instead
+            // of re-reading them from whoever asks next.
+            semantic_unknown_effects: snapshot.semantic_unknown_effects,
             staffing_receipts: snapshot.staffing_receipts,
             attempt_routes: snapshot.attempt_routes,
             provider_frames: snapshot.provider_frames,

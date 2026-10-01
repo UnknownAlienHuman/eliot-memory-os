@@ -333,12 +333,15 @@ impl SemanticRegistry {
     /// Resolves exactly one profile by method identity and version.
     ///
     /// No fallback, no substring match, no description sniffing: a missing
-    /// entry is [`SemanticProfileError::MissingProfile`].
+    /// entry is [`SemanticProfileError::MissingProfile`]. A blank identity is
+    /// [`SemanticProfileError::InvalidText`], never a silent miss.
     pub fn resolve(
         &self,
         canonical_name: &str,
         definition_version: &str,
     ) -> Result<&ToolSemanticProfile, SemanticProfileError> {
+        non_blank(canonical_name, "method.canonical_name")?;
+        non_blank(definition_version, "method.definition_version")?;
         self.profiles
             .get(&(canonical_name.to_owned(), definition_version.to_owned()))
             .ok_or_else(|| SemanticProfileError::MissingProfile {
@@ -357,6 +360,8 @@ impl SemanticRegistry {
         provider_name: &str,
         definition_version: &str,
     ) -> Result<&ToolSemanticProfile, SemanticProfileError> {
+        non_blank(provider_name, "provider_name")?;
+        non_blank(definition_version, "method.definition_version")?;
         let canonical =
             aliases
                 .get(provider_name)

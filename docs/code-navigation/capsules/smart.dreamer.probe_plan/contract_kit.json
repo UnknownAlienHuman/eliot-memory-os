@@ -240,11 +240,7 @@
     ]
   },
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -264,18 +260,31 @@
       "module_manifest": {
         "path": "crates/smart/eliot-dreamer-probe-plan/module.toml",
         "sha256": "3ac52421cdfe55abf451c2bfa6414d4451f76b1d3712ef27f9962407c7cb00c1"
+      }
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
       },
-      "selected_source": {
+      "physical_source_inventory": {
         "path_count": 8,
         "sha256": "0ff34deb19f78cee4ad1c6633fc6c2261eaa7d63579e181bb196752f10c80367"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 7,
+        "sha256": "898dbc61b01c68b94439f645e4324b7616a434f25148d0634e6fc9dcb3ee640e"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "6c13ac64f97f94fe970f8c7140ca6261bcf71ed0d4d662908efa066289486d89",
+  "artifact_digest": "85ac18f825043f0db021aa7e649031f58a57ac2ffac343536b75e8b87b43651a",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "6c13ac64f97f94fe"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "7ac93a8431c5fd63"
   }
 }

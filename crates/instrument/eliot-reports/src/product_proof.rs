@@ -574,11 +574,20 @@ impl ProductProofStatus {
 
     /// Validates the record's internal consistency.
     ///
-    /// Two refusals are structural rather than advisory:
+    /// Four refusals are structural rather than advisory:
     ///
     /// * a `PASS` outcome requires the required installed-route execution to
     ///   be observed and no missing evidence — a record can never claim the
     ///   property is proven while the required run is absent;
+    /// * a `PASS` outcome requires the run attempt that carries the proof to
+    ///   have reached `Succeeded`. An observed installed-route stage is not
+    ///   enough on its own: an attempt that executed and failed still leaves the
+    ///   stage observed, so without this comparison a record whose execution
+    ///   never succeeded — or which carries no attempt at all — could validate
+    ///   as a pass on the strength of the stage alone;
+    /// * a `PASS` outcome requires at least one runtime-domain live evidence
+    ///   handle, so a passing proof can never be presented on an empty live
+    ///   evidence set or on build-domain handles alone;
     /// * build evidence is a build-domain handle, so a non-`PASS` product
     ///   outcome is never contradicted by a successful build.
     pub fn validate(&self) -> Result<(), ProductProofError> {
@@ -634,16 +643,32 @@ impl ProductProofStatus {
             if !self.retained.installed_route_observed() || !self.missing_evidence.is_empty() {
                 return Err(ProductProofError::PassWithoutInstalledRoute);
             }
-            if let Some(attempt) = &self.attempt
-                && attempt.execution != ExecutionStatus::Succeeded
-            {
-                return Err(ProductProofError::PassWithoutSucceededRun {
-                    run_id: attempt.run_id.clone(),
-                    execution: attempt.execution,
-                });
+            match self.attempt.as_ref() {
+                None => return Err(ProductProofError::PassWithoutAttempt),
+                Some(attempt) if attempt.execution != ExecutionStatus::Succeeded => {
+                    return Err(ProductProofError::PassWithoutSucceededRun {
+                        run_id: attempt.run_id.clone(),
+                        execution: attempt.execution,
+                    });
+                }
+                Some(_) => {}
+            }
+            if !self.live_evidence.iter().any(Self::carries_live_product) {
+                return Err(ProductProofError::PassWithoutLiveEvidence);
             }
         }
         Ok(())
+    }
+
+    /// Whether one live-evidence handle is on the runtime domain.
+    ///
+    /// The domain comparison lives here, once, because this is the same
+    /// question [`ProductProofStatus::validate`] asks when it admits every live
+    /// handle above and again when it requires a passing proof to carry at least
+    /// one. A handle that cannot support a live-product outcome cannot stand in
+    /// for one.
+    fn carries_live_product(evidence: &ProductProofEvidence) -> bool {
+        evidence.is_live_product()
     }
 
     /// Rolls this record up for presentation.
@@ -785,6 +810,13 @@ pub enum ProductProofError {
     /// execution is absent or evidence is still missing.
     #[error("PASS requires an observed installed-route execution and no missing evidence")]
     PassWithoutInstalledRoute,
+    /// A `PASS` outcome was recorded without any run attempt at all.
+    #[error("PASS requires the run attempt that carries the proof")]
+    PassWithoutAttempt,
+    /// A `PASS` outcome was recorded without a runtime-domain live evidence
+    /// handle.
+    #[error("PASS requires at least one runtime-domain live evidence handle")]
+    PassWithoutLiveEvidence,
     /// A parked run was recorded with a `PASS` outcome.
     #[error("a parked run cannot carry a PASS outcome")]
     ParkedRunCannotPass,

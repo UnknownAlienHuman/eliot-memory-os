@@ -58,6 +58,20 @@
 //! receipts, and task/plan/view pins the downstream admission owner binds
 //! against, with canonical digests over all of them.
 //!
+//! Candidate compilation is not atomic publication (issue #485 R5, audit
+//! 5872395796; coordinates the #484 compiler's current/replacement
+//! separation): the sealed candidate pins the compile-time generation, and
+//! [`bind_swarm_launch`] rechecks those pins against the CURRENT owner
+//! generation at bind time, failing closed stale iff anything moved between
+//! compile and bind. The expected-identity source is the fresh owner read
+//! carried in [`SwarmLaunchBindRequest`] — the catalogue snapshot from its
+//! collector owner and the preference policy exactly as retained in the
+//! owner publication (`ModelPreferenceStore::load_model_preferences`
+//! policy value), observed at `now_unix_ms` — never a retained copy or a
+//! caller-supplied expectation. The daemon/UI wiring that performs those
+//! fresh reads and invokes the bind, and the replace-policy commit itself,
+//! is a later stitching task (STITCH).
+//!
 //! Proof ceiling: `SWARM_LAUNCH_BINDING_PACKAGE_PROOF_ONLY`. Provider process
 //! execution, live `WorkLease`/`StateFence` issuance, route admission,
 //! mailbox/Concilium, strict Finish, and Product Pulse remain separate.
@@ -113,6 +127,16 @@ pub enum SwarmLaunchBindError {
 
 /// Exact binding input: the sealed in-process launch candidate plus the
 /// current catalogue/policy generation observed at `now_unix_ms`.
+///
+/// The `catalogue` and `policy` values are the expected-identity source for
+/// the bind-time recheck (issue #485 R5, audit 5872395796): they must be
+/// fresh reads from their owners taken at `now_unix_ms` — the catalogue
+/// snapshot from its collector owner and the preference policy exactly as
+/// retained in the owner publication — never a retained copy or a
+/// caller-supplied expectation. A stale-but-self-consistent copy cannot be
+/// detected here; supplying fresh reads is the caller's (STITCH) duty, and
+/// any movement between candidate compilation and the bind fails closed
+/// stale inside [`bind_swarm_launch`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwarmLaunchBindRequest {
@@ -435,11 +459,37 @@ fn probe_selection_id(command_id: &str, role: ModelRole) -> String {
     format!("{command_id}/{}", role_probe_key(role))
 }
 
+/// Derives the bind-time expected preference-policy identity from the
+/// owner-supplied current policy (issue #485 R5, audit 5872395796):
+/// policy ID, revision, and the canonical digest recomputed by the owner
+/// entrypoint [`preference_policy_digest`]. The sealed candidate pins are
+/// compared against exactly this triple — sourced from the CURRENT owner
+/// read, never from a caller-supplied digest string or a replacement — so
+/// the bind passes iff nothing moved between candidate compilation and the
+/// bind, and fails closed [`SwarmLaunchBindError::StalePolicy`] otherwise.
+/// The caller must have validated `policy`; [`bind_swarm_launch`] does so
+/// before calling.
+fn current_preference_identity(
+    policy: &HumanModelPreferencePolicy,
+) -> Result<(String, String, String), SwarmLaunchBindError> {
+    Ok((
+        policy.policy_id.clone(),
+        policy.revision.clone(),
+        preference_policy_digest(policy)?,
+    ))
+}
+
 /// Binds the sealed launch candidate to exact staffing against the current
 /// generation. Pure and deterministic: no provider/model call, no process
 /// launch or cancel, no lease/fence issuance, no route admission, no Task
 /// write, no fallback. Any stale, mismatched, missing, or tampered binding
 /// fails closed; typed staffing gaps are preserved verbatim.
+///
+/// This is the commit-time recheck for the launch path (issue #485 R5):
+/// the sealed compile-time pins are compared against the CURRENT owner
+/// generation sourced from the request's fresh owner reads, never against
+/// a replacement or a caller-supplied expectation. The daemon/UI wiring
+/// that supplies those fresh reads and invokes this bind is STITCH.
 pub fn bind_swarm_launch(
     request: &SwarmLaunchBindRequest,
 ) -> Result<SwarmLaunchBinding, SwarmLaunchBindError> {
@@ -475,15 +525,16 @@ pub fn bind_swarm_launch(
     if *catalogue_snapshot_id != request.catalogue.snapshot_id {
         return Err(SwarmLaunchBindError::StaleCatalogue);
     }
-    if *preference_policy_id != request.policy.policy_id
-        || *preference_revision != request.policy.revision
+    let (current_policy_id, current_policy_revision, current_policy_digest) =
+        current_preference_identity(&request.policy)?;
+    if *preference_policy_id != current_policy_id || *preference_revision != current_policy_revision
     {
         return Err(SwarmLaunchBindError::StalePolicy);
     }
     if catalogue_digest(&request.catalogue)? != *sealed_catalogue_digest {
         return Err(SwarmLaunchBindError::StaleCatalogue);
     }
-    if preference_policy_digest(&request.policy)? != *sealed_policy_digest {
+    if current_policy_digest != *sealed_policy_digest {
         return Err(SwarmLaunchBindError::StalePolicy);
     }
 
@@ -535,9 +586,9 @@ pub fn bind_swarm_launch(
         plan_revision: plan_revision.clone(),
         catalogue_snapshot_id: request.catalogue.snapshot_id.clone(),
         catalogue_digest: catalogue_digest(&request.catalogue)?,
-        preference_policy_id: request.policy.policy_id.clone(),
-        preference_revision: request.policy.revision.clone(),
-        preference_policy_digest: preference_policy_digest(&request.policy)?,
+        preference_policy_id: current_policy_id,
+        preference_revision: current_policy_revision,
+        preference_policy_digest: current_policy_digest,
         staffing_id,
         staffing_digest: staffing.staffing_digest.clone(),
         selections,

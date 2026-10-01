@@ -11,6 +11,9 @@ use serde_json::{Map, Value, json};
 
 use super::surreal_automation::{AutomationWrites, automation_write_statements};
 use super::surreal_experience::{ExperienceWrites, experience_write_statements};
+use super::surreal_instrument_registry::{
+    InstrumentRegistryWrites, instrument_registry_write_statements,
+};
 use super::surreal_learning::{LearningWrites, learning_write_statements};
 use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
 use crate::client;
@@ -86,6 +89,17 @@ const TX_ERASURE_SCRUB_EVIDENCE: &str = "UPDATE write_receipt SET evidence_recor
 /// statement before commit; same-operation replay reads this row and returns
 /// the stored outcomes without duplicate destructive work (the single
 /// completion marker for the intent row above — never a second ledger).
+///
+/// The guard compares the outcomes only, and that is the whole identity the
+/// seal carries. The seal's recorded `scope_id` is the frozen intent's own copy
+/// (written by the `CREATE` content, never derived), and the scope that sealed
+/// these outcomes is already bound before this statement by
+/// `TX_ERASURE_INTENT`, which compares the entire frozen intent — `scope_id`
+/// included — against the stored intent row inside the same transaction. A
+/// second, independent scope comparison here would add no binding evidence and
+/// would instead refuse the same-operation replay of any seal written before
+/// this column existed, because such a row reads back with no `scope_id` at
+/// all.
 const TX_ERASURE_OUTCOME: &str = "LET $erasure_outcome_existing = (SELECT VALUE { operation_id: operation_id, outcomes: outcomes } FROM ONLY type::record($erasure_outcome_table, $erasure_outcome_id)); IF type::is_object($erasure_outcome_existing) { IF $erasure_outcome_existing.outcomes != $erasure_outcomes { THROW 'erasure_intent_conflict'; }; } ELSE { CREATE type::record($erasure_outcome_table, $erasure_outcome_id) CONTENT $erasure_outcome_record; };";
 
 /// Reads one sealed erasure-outcome row by exact operation id.
@@ -140,6 +154,8 @@ const SEMANTIC_CONFLICT_MARKERS: &[&str] = &[
     "finish_owner_create_conflict",
     "canonical_owner_cas_conflict",
     "canonical_owner_create_conflict",
+    "instrument_registry_fence_conflict",
+    "instrument_registry_create_conflict",
     "module_registry_owner_cas_conflict",
     "capability_evidence_cas_conflict",
     "capability_evidence_create_conflict",
@@ -369,6 +385,7 @@ pub(super) async fn write_transaction(
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
     learning: &LearningWrites,
+    instrument_registry: &InstrumentRegistryWrites,
 ) -> Result<(), AdapterError> {
     write_canonical_transaction(
         db,
@@ -387,6 +404,7 @@ pub(super) async fn write_transaction(
         automation,
         experience,
         learning,
+        instrument_registry,
         None,
     )
     .await
@@ -441,6 +459,7 @@ pub(super) async fn write_canonical_transaction(
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
     learning: &LearningWrites,
+    instrument_registry: &InstrumentRegistryWrites,
     erasure: Option<ErasureInTx>,
 ) -> Result<(), AdapterError> {
     write_canonical_transaction_with_expected_heads(
@@ -463,6 +482,7 @@ pub(super) async fn write_canonical_transaction(
         automation,
         experience,
         learning,
+        instrument_registry,
         erasure,
     )
     .await
@@ -493,6 +513,7 @@ pub(super) async fn write_canonical_transaction_with_expected_heads(
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
     learning: &LearningWrites,
+    instrument_registry: &InstrumentRegistryWrites,
     erasure: Option<ErasureInTx>,
 ) -> Result<(), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
@@ -510,6 +531,7 @@ pub(super) async fn write_canonical_transaction_with_expected_heads(
         automation,
         experience,
         learning,
+        instrument_registry,
     )?;
     let (head_checks, head_bindings) = expected_head_predicates(
         expected_revision_heads,
@@ -696,6 +718,7 @@ fn build_apply_statements(
     automation: &AutomationWrites,
     experience: &ExperienceWrites,
     learning: &LearningWrites,
+    instrument_registry: &InstrumentRegistryWrites,
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let operation_id = transition.identity.operation_id.to_string();
     let revision = plan.next_revision_heads.first().ok_or_else(|| {
@@ -937,6 +960,9 @@ fn build_apply_statements(
     // #1868 learning-record writes commit atomically beside the experience
     // rows under the same create-or-converge contract.
     append_learning_statements(&mut sql, &mut bindings, learning)?;
+    // #1814 W1.2 instrument-registry head writes commit atomically beside
+    // the learning rows under the same fenced compare-and-set contract.
+    append_instrument_registry_statements(&mut sql, &mut bindings, instrument_registry)?;
     // #1773 capability-evidence rows commit atomically beside the learning
     // rows under the same fenced compare-and-set contract.
     append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
@@ -1587,6 +1613,30 @@ fn append_learning_statements(
     }
     Ok(())
 }
+
+/// Appends canonical instrument-registry head writes (issue #1814 W1.2).
+///
+/// Same atomicity contract as the reactive fragment above: the singleton
+/// head compare-and-set commits in the same transaction as the receipt and
+/// outbox rows. Binding collisions fail closed instead of silently
+/// overwriting a canonical binding.
+fn append_instrument_registry_statements(
+    sql: &mut String,
+    bindings: &mut Map<String, Value>,
+    instrument_registry: &InstrumentRegistryWrites,
+) -> Result<(), AdapterError> {
+    let (fragment, fragment_bindings) = instrument_registry_write_statements(instrument_registry);
+    sql.push_str(&fragment);
+    for (name, value) in fragment_bindings {
+        if bindings.insert(name.clone(), value).is_some() {
+            return Err(AdapterError::Serialization(
+                "instrument registry binding collided with a canonical binding".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Appends canonical reactive row writes (issue #1941 C4).
 ///
 /// Same atomicity contract as the notification fragment above: session
@@ -1993,8 +2043,15 @@ pub(crate) fn erasure_transaction_bindings(
             SurrealSurfaceOutcome::Unknown { surface } => format!("UNKNOWN:{surface:?}"),
         })
         .collect();
+    // The seal carries the frozen intent's own admitted scope verbatim, copied
+    // from the same validated intent the intent row and the scrub bindings
+    // already use, so a read of the ledger can attribute sealed outcomes to the
+    // scope whose data they purged. It is one copy of that one value, never a
+    // second derivation; the scope binding the seal's identity rests on is the
+    // intent row's, compared by `TX_ERASURE_INTENT` in the same transaction.
     let outcome_value = json!({
         "operation_id": intent.operation_id,
+        "scope_id": intent.scope_id.to_string(),
         "outcomes": outcome_strings,
     });
     bindings.insert(
@@ -2603,6 +2660,7 @@ mod allocation_classification_tests {
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
             &LearningWrites::default(),
+            &InstrumentRegistryWrites::default(),
         )
         .expect("statements assemble");
         assert!(sql.starts_with(schema::TX_BEGIN), "one transaction opens");
@@ -2653,6 +2711,7 @@ mod allocation_classification_tests {
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
             &LearningWrites::default(),
+            &InstrumentRegistryWrites::default(),
         )
         .expect("create path assembles");
         assert!(
@@ -2681,6 +2740,7 @@ mod allocation_classification_tests {
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
             &LearningWrites::default(),
+            &InstrumentRegistryWrites::default(),
         )
         .expect("genesis assembles");
         assert!(
@@ -2713,6 +2773,7 @@ mod allocation_classification_tests {
             &AutomationWrites::default(),
             &ExperienceWrites::default(),
             &LearningWrites::default(),
+            &InstrumentRegistryWrites::default(),
         )
         .expect("statements assemble");
         assert_eq!(

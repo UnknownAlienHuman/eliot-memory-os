@@ -39,7 +39,18 @@
       "value": null
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 9
+    "inline_cfg_test_modules": 9,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": [
+        "crates/kernel/eliot-installation/src/tests.rs"
+      ]
+    },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -49,59 +60,14 @@
     },
     "selected_tests": [
       {
-        "path": "crates/kernel/eliot-installation/src/tests/registry_concurrent_read.rs",
-        "bytes": 20023,
-        "sha256": "500146c7cf978c4dadc3bab8a6591efa281ba77b29feb3a6b27918de3c0d2086",
-        "test_attributes": 3,
+        "path": "crates/kernel/eliot-installation/src/tests.rs",
+        "bytes": 393700,
+        "sha256": "5f8c0ef6f5f72072071def3979cfd03a2cd83e4ba075566a9302d535f7b1e6dc",
+        "test_attributes": 155,
         "inline_cfg_test": false,
+        "test_only_module": true,
         "classes": [
           "edge_profile",
-          "fake_port_contract",
-          "fault_restart_replay"
-        ]
-      },
-      {
-        "path": "crates/kernel/eliot-installation/src/tests/registry_wire_launch.rs",
-        "bytes": 44222,
-        "sha256": "4e65f5d81e7b18d4ed358bc87dd4efbf9817cc422a55e3abcaeae0857399063e",
-        "test_attributes": 30,
-        "inline_cfg_test": false,
-        "classes": [
-          "edge_profile",
-          "fault_restart_replay"
-        ]
-      },
-      {
-        "path": "crates/kernel/eliot-installation/src/tests/rollback_recovery.rs",
-        "bytes": 35994,
-        "sha256": "d411d6d2c63dbef580842da537531cece7de8f77f18713fa97570db8b09b8338",
-        "test_attributes": 4,
-        "inline_cfg_test": false,
-        "classes": [
-          "edge_profile",
-          "fake_port_contract",
-          "fault_restart_replay"
-        ]
-      },
-      {
-        "path": "crates/kernel/eliot-installation/src/tests/service_start_recovery.rs",
-        "bytes": 48939,
-        "sha256": "69024670db8f6d31778225735171edace9d9dd0e197ae14e465284f4fbe0cb48",
-        "test_attributes": 13,
-        "inline_cfg_test": false,
-        "classes": [
-          "edge_profile",
-          "fake_port_contract",
-          "fault_restart_replay"
-        ]
-      },
-      {
-        "path": "crates/kernel/eliot-installation/src/tests/transaction_recovery.rs",
-        "bytes": 3158,
-        "sha256": "447ffcc6f18dd79cc5d48a2901d5ba783e012d14785781d619f10f7cb08bd66c",
-        "test_attributes": 1,
-        "inline_cfg_test": false,
-        "classes": [
           "fake_port_contract",
           "fault_restart_replay"
         ]
@@ -111,10 +77,7 @@
   },
   "parser_or_golden_corpus": [],
   "fake_port_contract_tests": [
-    "crates/kernel/eliot-installation/src/tests/registry_concurrent_read.rs",
-    "crates/kernel/eliot-installation/src/tests/rollback_recovery.rs",
-    "crates/kernel/eliot-installation/src/tests/service_start_recovery.rs",
-    "crates/kernel/eliot-installation/src/tests/transaction_recovery.rs"
+    "crates/kernel/eliot-installation/src/tests.rs"
   ],
   "real_edge_profiles": {
     "one_hop_consumers": [
@@ -133,10 +96,7 @@
       "value": null
     },
     "edge_profile_tests": [
-      "crates/kernel/eliot-installation/src/tests/registry_concurrent_read.rs",
-      "crates/kernel/eliot-installation/src/tests/registry_wire_launch.rs",
-      "crates/kernel/eliot-installation/src/tests/rollback_recovery.rs",
-      "crates/kernel/eliot-installation/src/tests/service_start_recovery.rs"
+      "crates/kernel/eliot-installation/src/tests.rs"
     ]
   },
   "fault_restart_replay_cases": {
@@ -146,11 +106,7 @@
       "value": null
     },
     "selected_cases": [
-      "crates/kernel/eliot-installation/src/tests/registry_concurrent_read.rs",
-      "crates/kernel/eliot-installation/src/tests/registry_wire_launch.rs",
-      "crates/kernel/eliot-installation/src/tests/rollback_recovery.rs",
-      "crates/kernel/eliot-installation/src/tests/service_start_recovery.rs",
-      "crates/kernel/eliot-installation/src/tests/transaction_recovery.rs"
+      "crates/kernel/eliot-installation/src/tests.rs"
     ]
   },
   "resource_and_serial_groups": {
@@ -177,16 +133,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 265,
-    "test_stu": 50779,
+    "test_stu": 131234,
     "nonzero": true
   },
-  "bound_contract_digest": "ebf23819002eb8246d9b92c8779d04448a6a06a710a39fdae7539780c1689bf3",
+  "bound_contract_digest": "174b4007676607d4",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -203,18 +155,31 @@
         "path": "crates/kernel/eliot-installation/Cargo.toml",
         "sha256": "d5a63a5af2f3f23c4c3f427a05541043583f5934f8775bdf53e8eb05d709d270"
       },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 29,
-        "sha256": "515f5e029d3e4755204be6a6001196afaac1ba62e236bdf12916fd859efdf7c2"
+      "module_manifest": null
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+      },
+      "physical_source_inventory": {
+        "path_count": 34,
+        "sha256": "613e4a01af8ff9f01b8189519d0fad30dca8e6077a5bbf4408a15fd91a6c8ee2"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 34,
+        "sha256": "613e4a01af8ff9f01b8189519d0fad30dca8e6077a5bbf4408a15fd91a6c8ee2"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "7ae55f4a2f9d3e9eaf1466890ea3ca0f62772b40dac5a20b49341c3520fd9452",
+  "artifact_digest": "76143727d97e76aa8a3df71ddef73f3af419b3e3ea82049166be0f4c2508071f",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "7ae55f4a2f9d3e9e"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "bfcacd6e7c7c7dc6"
   }
 }

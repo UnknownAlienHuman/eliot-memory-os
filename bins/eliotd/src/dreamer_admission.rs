@@ -8,10 +8,11 @@
 //! existing Governor admission gate and the K0/K1/K2/Store queue: readiness plus fence binding
 //! first, then the read-only material freeze/resolution from
 //! [`crate::dreamer_materials`], then exactly one queue submission through the [`DreamerJobQueue`]
-//! port, then the `QUEUED` response binding. Every failure fails closed before any queue
-//! admission or model work, and this helper never mints a permit: pending T1.8 is implemented in
-//! its owning turn, so without a genuinely admitted input (ready Governor, exact fence, matching
-//! source digests) nothing queues.
+//! port, then the `QUEUED` response binding, then the operator-intent execution-link join
+//! that binds the admitted plan revision to the queued execution. Every failure fails closed
+//! before any queue admission or model work, and this helper never mints a permit: pending T1.8
+//! is implemented in its owning turn, so without a genuinely admitted input (ready Governor,
+//! exact fence, matching source digests) nothing queues.
 //!
 //! The typed `eliot-dreamer-orientation::AdmittedOrientationJob` import stays out of this slice
 //! (GAP-1: the Orientation leaf is not workspace-admitted; the controller turn owns that
@@ -21,7 +22,10 @@
 use std::sync::Arc;
 
 use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
-use eliot_governor::{CompositionError, CompositionReadiness, KernelPortError};
+use eliot_governor::{
+    CompositionError, CompositionReadiness, KernelPortError, OperatorIntentExecutionLink,
+    OperatorIntentExecutionOwners,
+};
 use eliot_protocol::dreamer_job::{
     DurableJobRequest, DurableJobResponse, JobOperation, JobRole, JobState, JobSubmission,
 };
@@ -167,17 +171,26 @@ impl<'a> GovernorDreamerAdapter<'a> {
     }
 
     /// Submits one genuinely admitted Orientation intake and returns its durable `QUEUED`
-    /// identity.
+    /// identity joined to the admitted operator-intent execution.
     ///
     /// Order is load-bearing: Governor readiness, K0 request admission, fence/scope joins,
     /// material freeze, live read-only resolution with digest checks, exactly one queue
-    /// submission, then the `QUEUED` response binding. Any earlier failure returns before the
-    /// queue is touched, and no model edge exists on this path at all.
+    /// submission, then the `QUEUED` response binding, then the execution-link join. Any earlier
+    /// failure returns before the queue is touched; a refused execution link returns before any
+    /// link is published, and no model edge exists on this path at all.
+    ///
+    /// The operator-intent parts (`plan`, `plan_revision`, `record`, `epistemic`, `effects`)
+    /// must arrive from their retained owners alongside the intake: `plan` is the current
+    /// admitted plan re-read at execute time while `plan_revision` is the exact revision the
+    /// confirmation authorized, so a delayed confirmation of a predecessor revision is refused
+    /// instead of executing the replacement. This adapter mints none of those values and
+    /// substitutes no placeholder for a missing one.
     pub async fn submit_orientation(
         &self,
         input: &OrientationSubmitInput,
         queue: &impl DreamerJobQueue,
-    ) -> Result<DurableJobResponse, CompositionError> {
+        owners: OperatorIntentExecutionOwners<'_>,
+    ) -> Result<(DurableJobResponse, OperatorIntentExecutionLink), CompositionError> {
         let admitted = self.composition.kernel_snapshot().state_fence();
         let readiness = self.composition.readiness();
         let ctx = self.dreamer_route_context()?;
@@ -187,7 +200,8 @@ impl<'a> GovernorDreamerAdapter<'a> {
             ));
         }
         let service = ReadService::new(KernelContextReadClient::new(Arc::clone(self.kernel)));
-        submit_admitted_orientation(readiness, &admitted, &service, &ctx, input, queue).await
+        submit_admitted_orientation(readiness, &admitted, &service, &ctx, input, queue, owners)
+            .await
     }
 }
 
@@ -222,7 +236,10 @@ pub(crate) fn dreamer_read_context(
 ///
 /// `readiness` and `admitted_fence` must come from the live composition (see
 /// [`GovernorDreamerAdapter::submit_orientation`]); tests supply exact fences directly. The
-/// queue is touched only after every read-only gate passes.
+/// queue is touched only after every read-only gate passes. The operator-intent parts (`plan`,
+/// `plan_revision`, `record`, `epistemic`, `effects`) must come from their retained owners;
+/// after the `QUEUED` binding they are joined to the queued execution, and a refused join is
+/// returned as an error with no link published.
 pub(crate) async fn submit_admitted_orientation<'a>(
     readiness: CompositionReadiness,
     admitted_fence: &StateFence,
@@ -230,7 +247,8 @@ pub(crate) async fn submit_admitted_orientation<'a>(
     ctx: &RequestMetadata,
     input: &OrientationSubmitInput,
     queue: &'a impl DreamerJobQueue,
-) -> Result<DurableJobResponse, CompositionError> {
+    owners: OperatorIntentExecutionOwners<'_>,
+) -> Result<(DurableJobResponse, OperatorIntentExecutionLink), CompositionError> {
     if readiness != CompositionReadiness::Ready {
         return Err(CompositionError::NotReady);
     }
@@ -261,7 +279,9 @@ pub(crate) async fn submit_admitted_orientation<'a>(
             .map_err(|error| materials_error(&error))?;
     }
     let response = queue.submit(ctx.clone(), input.request.clone()).await?;
-    bind_queued_response(&input.request, response)
+    let response = bind_queued_response(&input.request, response)?;
+    let link = join_queued_execution(owners, submission, &input.request, &response)?;
+    Ok((response, link))
 }
 
 /// Admits one K0 request for orientation intake: shape-valid `SUBMIT_JOB` with the requester
@@ -305,6 +325,43 @@ pub(crate) fn bind_queued_response(
     Ok(response)
 }
 
+/// Joins the admitted plan revision to the `QUEUED` execution that answers it.
+///
+/// This is the production producer of the [`OperatorIntentExecutionLink`]: it runs on the real
+/// intake path, after the `QUEUED` response binding, and the link it returns carries the exact
+/// observed execution. The request, job and attempt identities come from the admitted
+/// submission — the authority for what was queued, already proven bound to the answer by
+/// [`bind_queued_response`] — and the owner receipt comes from the bound queue answer itself.
+/// The plan, the authorized revision, the owner's record and the answer dispositions arrive
+/// from their retained owners as parameters: nothing here rebuilds the owner's record from
+/// response projections, derives a revision, or defaults an epistemic status, so a missing
+/// owner value is a missing parameter rather than a silent placeholder. An inconsistent join
+/// (a superseded revision, a foreign request or job identity, an unverified or unevidenced
+/// claim) is refused through the link's own validation
+/// ([`OperatorIntentExecutionLink::validate_against_plan`]) before anything is returned or
+/// published.
+pub(crate) fn join_queued_execution(
+    owners: OperatorIntentExecutionOwners<'_>,
+    submission: &JobSubmission,
+    request: &DurableJobRequest,
+    response: &DurableJobResponse,
+) -> Result<OperatorIntentExecutionLink, CompositionError> {
+    OperatorIntentExecutionLink::join(
+        owners,
+        request
+            .request_identity
+            .request
+            .request
+            .metadata
+            .request_id
+            .clone(),
+        submission.job_id.clone(),
+        submission.attempt_id.clone(),
+        response.receipt_id.clone(),
+    )
+    .map_err(|error| owner_error(format!("dreamer execution link: {error}")))
+}
+
 fn owner_error(reason: impl Into<String>) -> CompositionError {
     CompositionError::Owner(reason.into())
 }
@@ -321,9 +378,15 @@ mod tests {
         OperationId, ReceiptId, ResourceGeneration, TaskId, WorkLeaseId, canonical_json_bytes,
         sha256_hex,
     };
+    use eliot_governor::{
+        OPERATOR_INTENT_CONTRACT_VERSION, OperatorIntentApprovals, OperatorIntentBudget,
+        OperatorIntentEpistemic, OperatorIntentIdentity, OperatorIntentPlan,
+        OperatorIntentPlanRevision, OperatorIntentPlanRevisionRef, OperatorIntentRisk,
+        OperatorIntentRoute, OperatorIntentScope,
+    };
     use eliot_protocol::dreamer_job::{
-        AdmissionRef, DurableRequestIdentity, JobLease, JobOperationKind, MutationDisposition,
-        OpaqueContentRef,
+        AdmissionRef, CancellationState, DurableJobRecord, DurableRequestIdentity, JobLease,
+        JobOperationKind, MutationDisposition, OpaqueContentRef,
     };
     use eliot_read::{
         BranchEnvironmentScope, FreshnessPolicy, ProvenanceDisposition, QueryIntent, QueryMode,
@@ -714,8 +777,90 @@ mod tests {
         ctx: &RequestMetadata,
         input: &OrientationSubmitInput,
         queue: &RecordingQueue,
-    ) -> Result<DurableJobResponse, CompositionError> {
-        submit_admitted_orientation(readiness, admitted, reads, ctx, input, queue).await
+        owners: OperatorIntentExecutionOwners<'_>,
+    ) -> Result<(DurableJobResponse, OperatorIntentExecutionLink), CompositionError> {
+        submit_admitted_orientation(readiness, admitted, reads, ctx, input, queue, owners).await
+    }
+
+    /// Test-only operator-intent fixtures matching an admitted intake. The plan carries the
+    /// input's own public request identity and a resolved scope with no proposed effects, and
+    /// the record carries the intake's submission at the observed `QUEUED` revision; nothing
+    /// here stands in for a retained production owner.
+    fn test_plan(input: &OrientationSubmitInput) -> TestResult<OperatorIntentPlan> {
+        Ok(OperatorIntentPlan {
+            contract_version: OPERATOR_INTENT_CONTRACT_VERSION,
+            revision: OperatorIntentPlanRevision {
+                revision_id: ArtifactId::new("plan-rev-1")?,
+                revision: 1,
+                predecessor: None,
+            },
+            identity: OperatorIntentIdentity {
+                message_id: input
+                    .request
+                    .request_identity
+                    .request
+                    .request
+                    .metadata
+                    .request_id
+                    .clone(),
+                episode_id: ArtifactId::new("episode-1")?,
+            },
+            scope: OperatorIntentScope::Resolved {
+                work_scope_id: WorkScopeId::new("scope-one")?,
+                task_id: None,
+            },
+            source_handles: Vec::new(),
+            requested_delta: "orientation question".to_owned(),
+            route: OperatorIntentRoute::Unresolved {
+                reason: "orientation needs no route".to_owned(),
+            },
+            capability_refs: Vec::new(),
+            context_refs: Vec::new(),
+            budget: OperatorIntentBudget::Unresolved {
+                reason: "orientation needs no budget".to_owned(),
+            },
+            risk: OperatorIntentRisk::Unassessed,
+            approvals: OperatorIntentApprovals::default(),
+            effects: Vec::new(),
+            rollback_limitations: Vec::new(),
+        })
+    }
+
+    fn test_record(submission: &JobSubmission) -> DurableJobRecord {
+        DurableJobRecord {
+            submission: submission.clone(),
+            state: JobState::Queued,
+            revision: 1,
+            lease: None,
+            checkpoint: None,
+            cancellation: CancellationState::None,
+            outcome: None,
+        }
+    }
+
+    fn test_intent(
+        fence: &StateFence,
+        input: &OrientationSubmitInput,
+    ) -> TestResult<(
+        OperatorIntentPlan,
+        OperatorIntentPlanRevisionRef,
+        DurableJobRecord,
+        OperatorIntentEpistemic,
+        Vec<OperatorIntentEffectDisposition>,
+    )> {
+        let plan = test_plan(input)?;
+        let plan_revision = OperatorIntentPlanRevisionRef {
+            revision_id: plan.revision.revision_id.clone(),
+            revision: plan.revision.revision,
+        };
+        let record = test_record(&test_submission(fence)?);
+        Ok((
+            plan,
+            plan_revision,
+            record,
+            OperatorIntentEpistemic::Candidate,
+            Vec::new(),
+        ))
     }
 
     #[tokio::test]
@@ -726,6 +871,7 @@ mod tests {
             &[("evidence-a", serde_json::json!({"records": []}))],
         )?;
         let (ctx, reads, queue) = harness(&fence, queued_response)?;
+        let (plan, plan_revision, record, epistemic, effects) = test_intent(&fence, &input)?;
         let error = run_intake(
             CompositionReadiness::Constructing,
             &fence,
@@ -733,6 +879,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await
         .map(|_| ())
@@ -753,6 +906,7 @@ mod tests {
         )?;
         let (ctx, mut reads, queue) = harness(&admitted, queued_response)?;
         reads.payloads = stored;
+        let (plan, plan_revision, record, epistemic, effects) = test_intent(&stale, &input)?;
         let outcome = run_intake(
             CompositionReadiness::Ready,
             &admitted,
@@ -760,6 +914,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -780,6 +941,7 @@ mod tests {
         input.materials[0].expected_digest = sha256_hex(&altered);
         let (ctx, mut reads, queue) = harness(&fence, queued_response)?;
         reads.payloads = stored;
+        let (plan, plan_revision, record, epistemic, effects) = test_intent(&fence, &input)?;
         let outcome = run_intake(
             CompositionReadiness::Ready,
             &fence,
@@ -787,6 +949,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -815,6 +984,7 @@ mod tests {
         input.request = request;
         let (ctx, mut reads, queue) = harness(&fence, queued_response)?;
         reads.payloads = stored;
+        let (plan, plan_revision, record, epistemic, effects) = test_intent(&fence, &input)?;
         let outcome = run_intake(
             CompositionReadiness::Ready,
             &fence,
@@ -822,6 +992,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -854,6 +1031,7 @@ mod tests {
         input.request = request;
         let (ctx, mut reads, queue) = harness(&fence, queued_response)?;
         reads.payloads = stored;
+        let (plan, plan_revision, record, epistemic, effects) = test_intent(&fence, &input)?;
         let outcome = run_intake(
             CompositionReadiness::Ready,
             &fence,
@@ -861,6 +1039,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -878,13 +1063,21 @@ mod tests {
         )?;
         let (ctx, mut reads, queue) = harness(&fence, queued_response)?;
         reads.payloads = stored;
-        let response = run_intake(
+        let (plan, plan_revision, record, epistemic, effects) = test_intent(&fence, &input)?;
+        let (response, _) = run_intake(
             CompositionReadiness::Ready,
             &fence,
             &reads,
             &ctx,
             &input,
             &queue,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -911,6 +1104,7 @@ mod tests {
         )?;
         let (ctx, mut reads, queue) = harness(&fence, foreign)?;
         reads.payloads = stored;
+        let (plan, plan_revision, record, epistemic, effects) = test_intent(&fence, &input)?;
         let outcome = run_intake(
             CompositionReadiness::Ready,
             &fence,
@@ -918,6 +1112,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());
@@ -934,6 +1135,7 @@ mod tests {
         )?;
         let (ctx, mut reads, queue) = harness(&fence, leased_response)?;
         reads.payloads = stored;
+        let (plan, plan_revision, record, epistemic, effects) = test_intent(&fence, &input)?;
         let outcome = run_intake(
             CompositionReadiness::Ready,
             &fence,
@@ -941,6 +1143,13 @@ mod tests {
             &ctx,
             &input,
             &queue,
+            OperatorIntentExecutionOwners {
+                plan: &plan,
+                plan_revision,
+                record,
+                epistemic,
+                effects,
+            },
         )
         .await;
         assert!(outcome.is_err());

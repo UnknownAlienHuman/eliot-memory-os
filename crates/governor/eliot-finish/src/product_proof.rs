@@ -23,9 +23,11 @@
 //!
 //! The fail-closed pass rule is not relaxed: a rollup reaches `Pass` only
 //! when the record validates, its outcome is `PASS`, and the required
-//! installed-route execution was actually observed. Every other case returns
-//! the exact refusal carrying outcome, reason, authority, and required
-//! missing evidence.
+//! installed-route execution was actually observed. The record itself refuses a
+//! `PASS` that carries no attempt, an attempt that did not succeed, or no
+//! runtime-domain live evidence handle, so those cases never reach the rollup.
+//! Every other case returns the exact refusal carrying outcome, reason,
+//! authority, and required missing evidence.
 
 #![forbid(unsafe_code)]
 
@@ -179,9 +181,13 @@ impl FinishService {
     /// factual reason, the still-missing evidence, and the updated retained
     /// evidence. Identity, authority, and build evidence are carried forward
     /// from `previous`, so one acceptance item keeps one record across
-    /// attempts rather than accumulating a parallel one. The fail-closed pass
-    /// rule is unchanged: `PASS` still requires an observed installed-route
-    /// execution, no missing evidence, and a succeeded run.
+    /// attempts rather than accumulating a parallel one. An installed-route
+    /// receipt that a prior attempt actually observed is carried forward too,
+    /// because an observation the owner really made is not retracted by a later
+    /// attempt that carried no receipt of its own. The fail-closed pass rule is
+    /// unchanged: `PASS` still requires an observed installed-route execution,
+    /// no missing evidence, a succeeded run, and at least one runtime-domain
+    /// live evidence handle.
     #[allow(
         clippy::unused_self,
         reason = "the ProductProof/FinishService boundary is the record's owner, not a state reader"
@@ -194,6 +200,25 @@ impl FinishService {
         previous
             .validate()
             .map_err(|error| ProductProofRecordError::Record(error.to_string()))?;
+        // An observed installed-route receipt is a retained observation, not a
+        // per-attempt claim: it names the installed-route execution that
+        // actually ran, so it stays observed once it has been observed. A later
+        // revision that dropped it would silently retract an observation that
+        // nothing ever proved false, and would leave a record that had already
+        // observed the route reading that it had not. The observation is
+        // therefore carried forward unless this very revision re-establishes it
+        // from its own receipt, and a record carrying an observation must also
+        // carry live evidence on the runtime domain or the rollup is refused.
+        let retained = if revision.retained.installed_route_observed() {
+            revision.retained
+        } else if previous.retained.installed_route_observed() {
+            let mut carried = revision.retained;
+            carried.stage_receipts.installed_route =
+                previous.retained.stage_receipts.installed_route.clone();
+            carried
+        } else {
+            revision.retained
+        };
         let status = previous
             .record_attempt(
                 revision.attempt,
@@ -201,7 +226,7 @@ impl FinishService {
                 revision.reason,
                 revision.missing_evidence,
                 revision.live_evidence,
-                revision.retained,
+                retained,
             )
             .map_err(|error| ProductProofRecordError::Record(error.to_string()))?;
         fail_closed_rollup(&status.rollup(), &status)?;

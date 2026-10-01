@@ -990,11 +990,27 @@ const FACADE_MAIN: &str = include_str!("main.rs");
 /// no write path and carries no [`FORBIDDEN_OWNER_SYMBOLS`] word, so admitting
 /// it to this baseline is not new facade ownership under W10; the baseline
 /// still refuses every other difference in either direction.
+///
+/// `eliot-context-contracts` is the second #783 edge on the same refused arm,
+/// added in the same change after this baseline was frozen: it supplies the
+/// canonical measurement status the arm publishes instead of an app-local
+/// label (`src/mcp_stdio.rs`: `use eliot_context_contracts::MeasurementStatus`,
+/// reached only through `CanonicalMeasurement::status`, which returns the one
+/// owner variant this seam can reach, `MeasurementStatus::ConservativeStu`,
+/// because the seam runs no route tokenizer). It is the status vocabulary of a
+/// measurement, not a measurement engine: the facade still computes nothing
+/// (that stays `eliot-context-measurement`), it owns no canonical state, opens
+/// no write path, and its owner words are `eliot`/`context`/`contracts`, none
+/// of them a [`FORBIDDEN_OWNER_SYMBOLS`] member, which is why
+/// `assert_no_new_ownership` still reports exactly the three pre-issue-18 owner
+/// names for it. Admitting it changes no guard behaviour: `require_same_set`
+/// still refuses any other difference in either direction.
 const FROZEN_FACADE_DEPENDENCIES: &[&str] = &[
     "anyhow",
     "blake3",
     "clap",
     "eliot-agent-bridge-core",
+    "eliot-context-contracts",
     "eliot-context-measurement",
     "eliot-engine",
     "eliot-runtime-contracts",

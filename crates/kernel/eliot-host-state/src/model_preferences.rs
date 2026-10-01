@@ -1,5 +1,5 @@
 //! Owner-side typed load and compare-and-swap publication for the Human
-//! model preference policy (issue #485, audit 5872395796 steps 2-3).
+//! model preference policy (issue #485, audit 5872395796 steps 2-4).
 //!
 //! Owner: `eliot-host-state`. The schema stays where step 1 put it
 //! (`eliot-agent-contracts::model_preference`, I/O-free); the pure validator
@@ -22,11 +22,31 @@
 //! [`preference_policy_digest`](eliot_agent_contracts::model_preference::preference_policy_digest);
 //! this module never branches on preference content.
 //!
-//! Residuals (later slices, not this one): R4 reconstructs the immutable
-//! publication receipt from the retained committed document; R5 wires the
-//! #484 candidate-side CAS anchor to this owner recheck. No production
-//! caller exists yet on purpose: the daemon/publication wiring is STITCH
+//! Residuals: none in this module. R4 reconstructs the immutable
+//! publication receipt from the retained committed document via
+//! [`ModelPreferenceStore::read_publication_receipt`]; R5 wires the #484
+//! candidate-side CAS anchor to this owner recheck via
+//! [`PreferenceCasExpected::from_candidate_anchor`]. No production publisher
+//! calls this store yet on purpose: the daemon/publication wiring is STITCH
 //! and must arrive with its own review.
+//!
+//! Callers (CHECK R1, audit 5872395796): the policy schema lives at
+//! `crates/agent/eliot-agent-contracts/src/model_preference.rs`
+//! ([`HumanModelPreferencePolicy::validate`](eliot_agent_contracts::model_preference::HumanModelPreferencePolicy::validate),
+//! [`preference_policy_digest`](eliot_agent_contracts::model_preference::preference_policy_digest));
+//! it is re-exported for A-02 consumption at
+//! `crates/agent/eliot-agent-coordinator/src/model_control.rs`
+//! (catalogue-dependent matching stays there). The candidate-side CAS anchor
+//! lives at
+//! `crates/agent/eliot-agent-coordinator/src/swarm_command_candidate.rs`
+//! (`SwarmCommandKind::ReplacePreferencePolicy::{expected_policy_id,
+//! expected_policy_revision, expected_policy_digest}`, compiled by
+//! `compile_replace_policy_candidate`); the authenticated submitter is
+//! `crates/surfaces/eliot-controlboard/src/swarm_command.rs`
+//! (`ControlBoard::swarm_command_candidate`,
+//! `OperatorAction::ReplaceSwarmPolicy`). This owner never imports either
+//! crate: the anchor crosses as three plain strings, and A-02/A-08 read back
+//! the committed document through the receipt below.
 //!
 //! Critical-section discipline (step 3): the CAS opens the store with a
 //! single open-or-create, then performs the entire predecessor re-read,
@@ -133,6 +153,77 @@ pub struct PreferenceCasExpected {
     pub policy_digest: String,
 }
 
+impl PreferenceCasExpected {
+    /// Genesis expectation: names the absent store (revision 0 with empty
+    /// policy identity). Only a store holding no publication accepts it;
+    /// anything retained fails closed with
+    /// [`ModelPreferenceStoreError::Stale`].
+    #[must_use]
+    pub fn genesis() -> Self {
+        Self {
+            store_revision: 0,
+            policy_id: String::new(),
+            policy_revision: String::new(),
+            policy_digest: String::new(),
+        }
+    }
+
+    /// Builds the owner-side CAS expectation from the #484 candidate-side CAS
+    /// anchor (`SwarmCommandKind::ReplacePreferencePolicy::{expected_policy_id,
+    /// expected_policy_revision, expected_policy_digest}` in
+    /// `crates/agent/eliot-agent-coordinator/src/swarm_command_candidate.rs`,
+    /// submitted via `OperatorAction::ReplaceSwarmPolicy` in
+    /// `crates/surfaces/eliot-controlboard/src/swarm_command.rs`) pinned
+    /// against the publisher's freshly loaded publication.
+    ///
+    /// The anchor crosses as three plain strings: this owner never imports
+    /// the coordinator or `ControlBoard` crates. An anchor that does not match
+    /// the loaded predecessor field-for-field — including the absent-store /
+    /// non-empty-anchor case — fails closed with
+    /// [`ModelPreferenceStoreError::Stale`]. The store revision comes from the
+    /// loaded publication, never from the candidate: the candidate carries no
+    /// store revision. This check is view-time only; the atomic recheck
+    /// happens inside
+    /// [`ModelPreferenceStore::compare_and_swap_model_preferences`], which
+    /// re-reads the predecessor in the committing write transaction, so a
+    /// publisher that loses a race still observes `Stale` and the same
+    /// expected identity with different replacement bytes commits at most
+    /// once.
+    pub fn from_candidate_anchor(
+        current: Option<&ModelPreferencePublication>,
+        expected_policy_id: &str,
+        expected_policy_revision: &str,
+        expected_policy_digest: &str,
+    ) -> Result<Self, ModelPreferenceStoreError> {
+        match current {
+            None => {
+                if expected_policy_id.is_empty()
+                    && expected_policy_revision.is_empty()
+                    && expected_policy_digest.is_empty()
+                {
+                    Ok(Self::genesis())
+                } else {
+                    Err(ModelPreferenceStoreError::Stale)
+                }
+            }
+            Some(current) => {
+                if expected_policy_id != current.policy.policy_id
+                    || expected_policy_revision != current.policy.revision
+                    || expected_policy_digest != current.policy_digest
+                {
+                    return Err(ModelPreferenceStoreError::Stale);
+                }
+                Ok(Self {
+                    store_revision: current.store_revision,
+                    policy_id: expected_policy_id.to_owned(),
+                    policy_revision: expected_policy_revision.to_owned(),
+                    policy_digest: expected_policy_digest.to_owned(),
+                })
+            }
+        }
+    }
+}
+
 /// Outcome of
 /// [`ModelPreferenceStore::compare_and_swap_model_preferences`].
 ///
@@ -163,6 +254,34 @@ impl ModelPreferenceCasOutcome {
             }
         }
     }
+}
+
+/// Immutable publication receipt for later A-02/A-08 readback (issue #485
+/// R4, audit 5872395796 step 4).
+///
+/// The receipt carries the committed versioned-document identity: exact
+/// policy identity (ID, revision, owner-recomputed digest), the monotonic
+/// store revision, and the prior revision/digest link. Genesis carries prior
+/// revision 0 and an empty prior digest. The receipt is constructed only by
+/// this owner from the retained committed document (see
+/// [`ModelPreferenceStore::read_publication_receipt`]), never manufactured
+/// from caller fields or a bare path: after a restart the same receipt
+/// reconstructs from the same retained bytes. It exposes no mutation API.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelPreferencePublicationReceipt {
+    /// Monotonic store revision of the committed document.
+    pub store_revision: u64,
+    /// Policy ID of the committed policy.
+    pub policy_id: String,
+    /// Policy revision of the committed policy.
+    pub policy_revision: String,
+    /// Owner-recomputed canonical digest of the committed policy.
+    pub policy_digest: String,
+    /// Store revision of the superseded document; 0 for genesis.
+    pub prior_store_revision: u64,
+    /// Canonical digest of the superseded document; empty for genesis.
+    pub prior_policy_digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -297,6 +416,29 @@ fn validated_publication(
     })
 }
 
+/// Rebuilds the immutable publication receipt from an already decoded
+/// retained envelope. The policy is revalidated and its digest recomputed by
+/// the owner; a retained digest that does not match the retained policy
+/// fails closed as corrupt. The prior revision/digest link is carried
+/// verbatim from the committed document.
+fn receipt_from_envelope(
+    envelope: StoredModelPreferenceEnvelope,
+) -> Result<ModelPreferencePublicationReceipt, ModelPreferenceStoreError> {
+    envelope.policy.validate()?;
+    let digest = preference_policy_digest(&envelope.policy)?;
+    if digest != envelope.policy_digest {
+        return Err(ModelPreferenceStoreError::Corrupt);
+    }
+    Ok(ModelPreferencePublicationReceipt {
+        store_revision: envelope.store_revision,
+        policy_id: envelope.policy.policy_id.clone(),
+        policy_revision: envelope.policy.revision.clone(),
+        policy_digest: envelope.policy_digest,
+        prior_store_revision: envelope.prior_store_revision,
+        prior_policy_digest: envelope.prior_policy_digest,
+    })
+}
+
 /// Pending CAS envelope for a validated predecessor: genesis demands a
 /// zero/empty expectation; a retained publication demands an exact
 /// predecessor match with scope/policy continuity, then replay on identical
@@ -398,16 +540,17 @@ impl ModelPreferenceStore {
         &self.path
     }
 
-    /// Loads and validates the retained preference publication.
+    /// Reads the retained versioned document without interpreting it.
     ///
-    /// Returns `Ok(None)` only for explicit absence: a missing file, or a
-    /// reachable store whose metadata envelope was never initialized.
-    /// Corrupt, oversized, unknown-version, digest-mismatched, or
-    /// structurally invalid content fails closed; it is never returned
-    /// as a publication.
-    pub fn load_model_preferences(
+    /// Read-only: never creates a file, table, or publication. Returns
+    /// `Ok(None)` only for explicit absence: a missing file, a missing
+    /// metadata table, or a metadata envelope that was never initialized.
+    /// A missing preferences table or current document against initialized
+    /// metadata is corrupt, not absent. Retained values are length-checked
+    /// before any heap copy.
+    fn read_retained_envelope(
         &self,
-    ) -> Result<Option<ModelPreferencePublication>, ModelPreferenceStoreError> {
+    ) -> Result<Option<StoredModelPreferenceEnvelope>, ModelPreferenceStoreError> {
         validate_store_path(&self.path)?;
         let database = match ReadOnlyDatabase::open(&self.path) {
             Ok(database) => database,
@@ -447,17 +590,51 @@ impl ModelPreferenceStore {
             }
             Err(_) => return Err(ModelPreferenceStoreError::Corrupt),
         };
-        let envelope = match prefs
+        match prefs
             .get(CURRENT_KEY)
             .map_err(|_| ModelPreferenceStoreError::Corrupt)?
         {
-            None => return Err(ModelPreferenceStoreError::Corrupt),
+            None => Err(ModelPreferenceStoreError::Corrupt),
             Some(guard) => {
                 let bytes = copy_bounded_table_value(guard.value())?;
-                decode_envelope(&bytes)?
+                decode_envelope(&bytes).map(Some)
             }
-        };
-        validated_publication(envelope).map(Some)
+        }
+    }
+
+    /// Loads and validates the retained preference publication.
+    ///
+    /// Returns `Ok(None)` only for explicit absence: a missing file, or a
+    /// reachable store whose metadata envelope was never initialized.
+    /// Corrupt, oversized, unknown-version, digest-mismatched, or
+    /// structurally invalid content fails closed; it is never returned
+    /// as a publication.
+    pub fn load_model_preferences(
+        &self,
+    ) -> Result<Option<ModelPreferencePublication>, ModelPreferenceStoreError> {
+        match self.read_retained_envelope()? {
+            None => Ok(None),
+            Some(envelope) => validated_publication(envelope).map(Some),
+        }
+    }
+
+    /// Reconstructs the immutable publication receipt from the retained
+    /// committed document (issue #485 R4, audit 5872395796 step 4).
+    ///
+    /// Read-only like [`ModelPreferenceStore::load_model_preferences`]:
+    /// after a restart the same retained bytes yield the same receipt, so
+    /// A-02/A-08 read back what the owner committed, never a caller claim.
+    /// Returns `Ok(None)` only for explicit absence; corrupt, oversized,
+    /// unknown-version, digest-mismatched, or structurally invalid content
+    /// fails closed. After a committed or replayed CAS, this is how the
+    /// publisher obtains the receipt for the retained revision.
+    pub fn read_publication_receipt(
+        &self,
+    ) -> Result<Option<ModelPreferencePublicationReceipt>, ModelPreferenceStoreError> {
+        match self.read_retained_envelope()? {
+            None => Ok(None),
+            Some(envelope) => receipt_from_envelope(envelope).map(Some),
+        }
     }
 
     /// Atomically compares the retained publication against the exact
@@ -491,6 +668,16 @@ impl ModelPreferenceStore {
     /// replacement reaches `commit`, after the byte-bound check, so the
     /// retained document is never displaced by an oversized write and no
     /// temporary path is staged or removed.
+    ///
+    /// The `expected` predecessor is built with
+    /// [`PreferenceCasExpected::from_candidate_anchor`] from the #484
+    /// candidate anchor pinned against a fresh
+    /// [`ModelPreferenceStore::load_model_preferences`]; after a committed
+    /// or replayed outcome the publisher reads the immutable receipt back
+    /// with [`ModelPreferenceStore::read_publication_receipt`]. On
+    /// [`ModelPreferenceStoreError::Stale`] the publisher reloads, re-pins,
+    /// and retries: the atomic recheck inside this transaction is what makes
+    /// the retry converge.
     pub fn compare_and_swap_model_preferences(
         &self,
         expected: &PreferenceCasExpected,

@@ -31,33 +31,55 @@
   },
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
-    "source_stu": 981766,
-    "test_stu": 82278,
-    "selected_file_count": 79,
-    "inline_cfg_test_modules": 29,
+    "scope": "the selected decision workset of this cell",
+    "source_stu": 1504656,
+    "test_stu": 86908,
+    "selected_file_count": 94,
+    "physical_source_stu": 1591564,
+    "physical_file_count": 94,
+    "inline_cfg_test_modules": 32,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
+  },
+  "workset_allocation": {
+    "scope": "PACKAGE_WIDE",
+    "state": "UNRESOLVED_ALLOCATION",
+    "declared_by": "[package.metadata.eliot].functional_cell_refs / functional_cell / module.toml|module_id, plus [package.metadata.eliot].functional_cell_source",
+    "rationale": null,
+    "unresolved_reason": "bins/eliotd declares 8 functional cells (governor.daemon.capability-admission, governor.daemon.composition, governor.daemon.kernel-transport, governor.daemon.learning-closure, governor.daemon.operator-replay, governor.daemon.poll-contour, governor.daemon.skill-catalogue, governor.daemon.startup-binding) but no accepted cell/source allocation separates them. The selection below is package-wide and is NOT a demonstrated minimal causal workset for governor.daemon.kernel-transport.",
+    "required_common_inputs": [
+      "bins/eliotd/src/lib.rs",
+      "bins/eliotd/src/main.rs"
+    ],
+    "observation": "Where no sound narrower allocation exists, selection stays PACKAGE_WIDE and unresolved rather than inventing independence."
   },
   "selected_source_and_tests": {
     "selected_source": [
       {
         "path": "bins/eliotd/src/activation_projection.rs",
-        "bytes": 63243,
-        "sha256": "cd3fbaf3da8fdb70afb98157fb29a583fbf256614f4682dda0160680784eb0aa",
-        "stu": 21081,
+        "bytes": 65920,
+        "sha256": "4bac119c1d11ef566578895581b142c3946cd82428224d66e0233325171c22c9",
+        "stu": 21974,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/agent_fabric.rs",
-        "bytes": 153190,
-        "sha256": "879a9ada54eec0fe6484dc3e4b0848eea4a5a6a7f71db6b4650c98da49150968",
-        "stu": 51064,
+        "bytes": 255030,
+        "sha256": "4d46d7c646ad79a1245d7de538d598a601946c86ebf06b9a9fbf39113c71030f",
+        "stu": 85010,
+        "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliotd/src/authority_revocation_ingress.rs",
+        "bytes": 19230,
+        "sha256": "e0d9a165a3e66ab5dd83cf9c00e53a6007ccf9f4f08ac097b2f3695612bac6d9",
+        "stu": 6410,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/campaign_context_owner.rs",
-        "bytes": 14338,
-        "sha256": "5963186a611c3920352bed59a4046ffa43c2898d96ce535ed106199a5993c8eb",
-        "stu": 4780,
+        "bytes": 15485,
+        "sha256": "d33dc4c03821bf38ee4fc1045607b9d09a448cf4b346fe6b459119e4fc6892ec",
+        "stu": 5162,
         "inline_cfg_test": false
       },
       {
@@ -76,16 +98,16 @@
       },
       {
         "path": "bins/eliotd/src/campaign_packet.rs",
-        "bytes": 67176,
-        "sha256": "738850b9e1399fcd0f2dfadcc1304ae758d9fa4a56992c5d42627e7823e6e4aa",
-        "stu": 22392,
+        "bytes": 103494,
+        "sha256": "d41876b6ed5f311a971e79352bab2fbd4b15cbdc2d84c6fa045368716769cd28",
+        "stu": 34498,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/campaign_task_controller.rs",
-        "bytes": 24785,
-        "sha256": "441c655db284641b4390409a6695f5a8bd2b3bf82514ac4c15fdcdf661aafe93",
-        "stu": 8262,
+        "bytes": 24971,
+        "sha256": "00cf84eda10ecc2522275d53c8b428c820bf21d0b4ae3fb947c2b03d81f348b7",
+        "stu": 8324,
         "inline_cfg_test": false
       },
       {
@@ -97,16 +119,16 @@
       },
       {
         "path": "bins/eliotd/src/capability_admission.rs",
-        "bytes": 34953,
-        "sha256": "e25409b4a6423c7b0e6990320bd37b332d2884d90d2ab26ef3a166c900053500",
-        "stu": 11651,
+        "bytes": 40132,
+        "sha256": "2bdd7f5a03d5861fdeb92144022e1aea5ae71272f93e55903695d5e40a99bf3d",
+        "stu": 13378,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/capability_evidence_wiring.rs",
-        "bytes": 68872,
-        "sha256": "84794a966cf749343c12720f0c15b8a001e3c336cf29170799531ce765f29459",
-        "stu": 22958,
+        "bytes": 81958,
+        "sha256": "615874b904ff18d6ecd3bd7b70b95cae837bd559fa6b1ab7c4ba384171ed451a",
+        "stu": 27320,
         "inline_cfg_test": true
       },
       {
@@ -117,59 +139,80 @@
         "inline_cfg_test": true
       },
       {
+        "path": "bins/eliotd/src/cell_declaration_registry.rs",
+        "bytes": 20450,
+        "sha256": "f99aa04c393339244eba5a3d63fe515fc4edf3612c14ff16e0724be1391ba065",
+        "stu": 6817,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliotd/src/context_reconstruction_route.rs",
+        "bytes": 47101,
+        "sha256": "78479863aa91a8611646d635e543af870d253e3587012493b5a55a64b327d704",
+        "stu": 15701,
+        "inline_cfg_test": false
+      },
+      {
         "path": "bins/eliotd/src/controlboard_adapters.rs",
-        "bytes": 108132,
-        "sha256": "2af3fca57df3ee345a2c73323ee2c3a74cd2cd0c6ef9382c23dbb94a0f871b7a",
-        "stu": 36044,
+        "bytes": 110433,
+        "sha256": "073bd1e4184bdeb24b12852ec47bd32f5141923a7e949efdf9d361da0e064613",
+        "stu": 36811,
         "inline_cfg_test": true
       },
       {
+        "path": "bins/eliotd/src/cue_activation_route.rs",
+        "bytes": 22139,
+        "sha256": "97473089dd619fb944b22280128e9352af4da26e24bb15f38dd5216ed827b42f",
+        "stu": 7380,
+        "inline_cfg_test": false
+      },
+      {
         "path": "bins/eliotd/src/daemon_config.rs",
-        "bytes": 16126,
-        "sha256": "6d8daddb250da867891de803e80a29b7b2021d9788ba53fc50b4c4c8aecf6716",
-        "stu": 5376,
+        "bytes": 17117,
+        "sha256": "c3d901a8b2a98bf48fcd7161015236bf4d66c74edbb756101cfef2169dc98811",
+        "stu": 5706,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/daemon_kernel_client.rs",
-        "bytes": 144387,
-        "sha256": "f810aca82af3b775eb9018abaa188a43a6187da45e3dad7a7726681435419316",
-        "stu": 48129,
+        "bytes": 180363,
+        "sha256": "37e977ba541edcb43f883b8a42c320ca09fc448d85b2e63e7fad5672d24d93df",
+        "stu": 60121,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/daemon_kernel_client/handshake.rs",
-        "bytes": 12645,
-        "sha256": "b745a636214a74f508a75abc9a06d21f8b4ab43cd7bcfb4c0ca1820b8650304d",
-        "stu": 4215,
+        "bytes": 12775,
+        "sha256": "33b6e331704b205978267099768f882adeced4d568fb77a4de921d4cced7654b",
+        "stu": 4259,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/daemon_kernel_port_adapters.rs",
-        "bytes": 3670,
-        "sha256": "2664c406908b05044e0e243887e9fbedb511c48a75689edc9c9634396959bc92",
-        "stu": 1224,
+        "bytes": 5939,
+        "sha256": "51ee61242fe732d021a6c882491fe7369de0390453086cbbf875a1aca225e3af",
+        "stu": 1980,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/daemon_runtime.rs",
-        "bytes": 235442,
-        "sha256": "903a5ab91ab1726669f9b965447883fccb2b300401cd1b743586822d9e1845b2",
-        "stu": 78481,
+        "bytes": 382047,
+        "sha256": "182164a89e81f77a33d149d841aaa546f4ce3336563a16afa520865bb2c45ac6",
+        "stu": 127349,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/diagnostics.rs",
-        "bytes": 61309,
-        "sha256": "a552036000e8896ce82efa4f12061dfd4c85eb6ed5f0aa89292e133cb0947c7c",
-        "stu": 20437,
+        "bytes": 62855,
+        "sha256": "5530e7199c8482472dee6aab5ad4ab40954d3c8f0df0f8dd75601c3a94c4e5c0",
+        "stu": 20952,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/dreamer_admission.rs",
-        "bytes": 36254,
-        "sha256": "37e55132546a22c89569014b90b6cea0d0f2a8da541d250e73bf3671703fae7d",
-        "stu": 12085,
+        "bytes": 45770,
+        "sha256": "d60f3bc39d2c67729b2684a2758ab081d957768fe61fdb96a9c119ed3b0609e4",
+        "stu": 15257,
         "inline_cfg_test": true
       },
       {
@@ -181,9 +224,9 @@
       },
       {
         "path": "bins/eliotd/src/dreamer_model_adapter.rs",
-        "bytes": 136017,
-        "sha256": "e78c85bc94f8bf90869e0eeb1016d1e87e016d74e91dba42b4d0ec3747fd3884",
-        "stu": 45339,
+        "bytes": 136750,
+        "sha256": "092edbc7d30f5d01294602fda08e771272b9118bfec2baa00b5d80f5f34627bd",
+        "stu": 45584,
         "inline_cfg_test": true
       },
       {
@@ -195,9 +238,9 @@
       },
       {
         "path": "bins/eliotd/src/experience_runtime.rs",
-        "bytes": 43463,
-        "sha256": "2f891e1372f22a256d207fc668136a059bdbac896d22a3b5a8f17f0034a8a4ea",
-        "stu": 14488,
+        "bytes": 46152,
+        "sha256": "ac998f00b1d0017b39d47171cde919b46f3d3dae777bdfcb88027878bd718778",
+        "stu": 15384,
         "inline_cfg_test": false
       },
       {
@@ -209,9 +252,9 @@
       },
       {
         "path": "bins/eliotd/src/finish_attempt.rs",
-        "bytes": 12503,
-        "sha256": "ce13cc16ac0853ce69649f958df9d55b34248f985aa7382590f9347eb91668aa",
-        "stu": 4168,
+        "bytes": 17807,
+        "sha256": "5b41047227022c493f5aff9567d5cfa72c5ebceeea69efdee5af589806924e68",
+        "stu": 5936,
         "inline_cfg_test": false
       },
       {
@@ -223,51 +266,72 @@
       },
       {
         "path": "bins/eliotd/src/freshness_admission.rs",
-        "bytes": 42868,
-        "sha256": "ec8606a1bb7b782274b8322aa24a7f3bf989ec31076a1e902c872a5589bc7aca",
-        "stu": 14290,
+        "bytes": 47149,
+        "sha256": "a017cc7793b2f2d955bb06e158f89e3477b4cd71086adec22d21be586ecef7b7",
+        "stu": 15717,
         "inline_cfg_test": true
       },
       {
+        "path": "bins/eliotd/src/governed_source_readback.rs",
+        "bytes": 15528,
+        "sha256": "e3e73ac1294bff5528ba8bb2decac0e709513bdba8710cf60f77dbfff43e18b2",
+        "stu": 5176,
+        "inline_cfg_test": false
+      },
+      {
         "path": "bins/eliotd/src/governor_authority_feed.rs",
-        "bytes": 7157,
-        "sha256": "6cdebd7a1e7e0f0e35b5a60dd6cb5d617fd772de2a741b4577504dd916a0add4",
-        "stu": 2386,
+        "bytes": 14003,
+        "sha256": "9148e59371c9680b267a531e4a6af9f0b5709debcd16c9aa4c7f73e29ec9910f",
+        "stu": 4668,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/governor_local_read.rs",
-        "bytes": 5749,
-        "sha256": "0ed7a21b9e5e219ae2442ea2889e0db2fc0ad5f5133c32e9a6cf8668eb55669c",
-        "stu": 1917,
+        "bytes": 6610,
+        "sha256": "e7c97b036cacc2fdf6ce0ba5f9f4cf4dc7f557a337c23ea0fc7427e233dd2335",
+        "stu": 2204,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/governor_observe_serve.rs",
-        "bytes": 10751,
-        "sha256": "1e8916b7e054fd74197c6a04a3ede4f5e776b32e786710adc898840c528dbd36",
-        "stu": 3584,
+        "bytes": 11301,
+        "sha256": "72d6b06ded3e2c507027e52567197e50e02a604f9fd46f60b65fdce701f2d64b",
+        "stu": 3767,
         "inline_cfg_test": false
       },
       {
+        "path": "bins/eliotd/src/improvement_candidate_dispatch.rs",
+        "bytes": 127734,
+        "sha256": "e763bbbca04107d1f78c002ca4a2e3bc3969096aa9fb237cb5ca408882328c74",
+        "stu": 42578,
+        "inline_cfg_test": true
+      },
+      {
         "path": "bins/eliotd/src/improvement_candidate_route.rs",
-        "bytes": 10821,
-        "sha256": "7d9f2dfc89807a390e9a2eaefa41dea150a5e69c201f0b5fd0bd01a39fee58c2",
-        "stu": 3607,
+        "bytes": 26893,
+        "sha256": "f7a73d405186a62cbd484fcec30626dd19b6ce44e497bbc5536fae32cfc472df",
+        "stu": 8965,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliotd/src/improvement_dedup_read.rs",
+        "bytes": 54783,
+        "sha256": "645be68caff56d7fc40f13ad5d0b1eace193355fdc9e3675b1dcf2788c72e626",
+        "stu": 18261,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/improvement_intake.rs",
-        "bytes": 8000,
-        "sha256": "61b5eb6bada439ab51400e5fada998c3dfeb1ac32d297970af550c97be260b8a",
-        "stu": 2667,
+        "bytes": 2634,
+        "sha256": "e4f37854300e4d2ca8fdaea56acb16e692fc37d8b75f912ad7ca143800702b52",
+        "stu": 878,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/improvement_intake_dispatch.rs",
-        "bytes": 53896,
-        "sha256": "fbebbc7927e915e677e2f422cb77df7f758c513d8c9c1e6e0f270253d0a07cf7",
-        "stu": 17966,
+        "bytes": 185453,
+        "sha256": "bb4355ad9546c353c4acbc01e31daab180836055a9d679b6ddd24faeb67f1e4f",
+        "stu": 61818,
         "inline_cfg_test": false
       },
       {
@@ -279,9 +343,9 @@
       },
       {
         "path": "bins/eliotd/src/kernel_context_read_client.rs",
-        "bytes": 96694,
-        "sha256": "59d011c5ccdefeb46ec8383e384b9e8ea04fe2b43d1e5c05afa0ab855603fe9d",
-        "stu": 32232,
+        "bytes": 166458,
+        "sha256": "7baaf0130bbd00defd2deddab502954c8579dd921953a8292729800f29052eb4",
+        "stu": 55486,
         "inline_cfg_test": true
       },
       {
@@ -293,37 +357,58 @@
       },
       {
         "path": "bins/eliotd/src/kernel_transition_client.rs",
-        "bytes": 27889,
-        "sha256": "e3f6fd75d80df4b99cffee0356793abc4cd1e9aa8dbf979f2d042fd7b632d23b",
-        "stu": 9297,
+        "bytes": 30206,
+        "sha256": "d6641fdef0c1088845359704eae145847e5314a73e6e38b56eea478e7cd502b9",
+        "stu": 10069,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/lib.rs",
-        "bytes": 182155,
-        "sha256": "2a38d7b2a8d17365e540da93a2e08004cf6d02050dcf855647ade19f00912d21",
-        "stu": 60719,
+        "bytes": 239431,
+        "sha256": "fbc77a7549d0c362a4da7040f5c2d88243f59390068e1c248ca08d63180284d3",
+        "stu": 79811,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/main.rs",
-        "bytes": 1829,
-        "sha256": "08777a57e17b9f9efee402bfe2bd4f7aa2463fa5bebb3fb6669fd9b9c7338a58",
-        "stu": 610,
+        "bytes": 5236,
+        "sha256": "ffe63a20931acef9ac3f264d6f20ada93d380f638c91261d2aa299b8b0e6acf1",
+        "stu": 1746,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliotd/src/maintenance_dispatch.rs",
+        "bytes": 123739,
+        "sha256": "a9fbd5703f36c24cad2eb251a7e09e6492912927b5867ced011a6a934e5e6386",
+        "stu": 41247,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/maintenance_family_catalog.rs",
-        "bytes": 68344,
-        "sha256": "fdea8205a9732212484d09e78f9926a577daf5d5faaaac382b00d439ce6fd60a",
-        "stu": 22782,
+        "bytes": 81272,
+        "sha256": "b5da288e760fa30de2e11c114586a431fa597b02434c949919466540bdf74d8c",
+        "stu": 27091,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/maintenance_trigger_evaluator.rs",
-        "bytes": 18241,
-        "sha256": "902eacd076c8e95de18098a897cd7984e990d41c1366f07924fdae2b756a32c5",
-        "stu": 6081,
+        "bytes": 58080,
+        "sha256": "3c45bb48ab506c5ba754fb568a1903f4b3843de156ac4035ac408dfb5ee0471f",
+        "stu": 19360,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliotd/src/negative_memory_action_gate.rs",
+        "bytes": 36927,
+        "sha256": "f6de58cfa51fa51644dceaabdbe42a37385a222b7629478263457b2066d9a793",
+        "stu": 12309,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliotd/src/notification_acknowledge_emit.rs",
+        "bytes": 20493,
+        "sha256": "5a9fabf6e1f68432e5d905a49f7806e2b54ca01f4dd7a74b85fbd9506fef34bb",
+        "stu": 6831,
         "inline_cfg_test": false
       },
       {
@@ -334,10 +419,17 @@
         "inline_cfg_test": true
       },
       {
+        "path": "bins/eliotd/src/notification_plan_admission.rs",
+        "bytes": 20437,
+        "sha256": "169ded23c0b3c72f80e84d71b412c68294921d60f201977eea25bea586b2aad4",
+        "stu": 6813,
+        "inline_cfg_test": false
+      },
+      {
         "path": "bins/eliotd/src/notification_state_emit.rs",
-        "bytes": 44588,
-        "sha256": "3e4b95d7fdde6e3c90469ecbcce387e2c1a390420f6ec7fe428e4a44cae82d91",
-        "stu": 14863,
+        "bytes": 46118,
+        "sha256": "9fb8793dc7667a20d9ac4c985993f238bb6fcf6a6f1e00368fb2be57cba794f3",
+        "stu": 15373,
         "inline_cfg_test": false
       },
       {
@@ -349,24 +441,38 @@
       },
       {
         "path": "bins/eliotd/src/observation_adapters.rs",
-        "bytes": 34620,
-        "sha256": "2e9accc2263fe6a597dd16839c5d1ab21244c35388cbdf0560a8b45c1d1ea42a",
-        "stu": 11540,
+        "bytes": 44593,
+        "sha256": "388cc2a3df908bd17291d5ec4cb6b0be34cc924ae4965006886987238f779f69",
+        "stu": 14865,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/owner_feed.rs",
-        "bytes": 22237,
-        "sha256": "0df5a695f45b6f4285751b65e5a73485db5928be1022fc4ec53d2032e072bce1",
-        "stu": 7413,
+        "bytes": 31491,
+        "sha256": "b3d8fc6fb7f50ab1e503f9927c7d001d2bcbcbd965430e267fc1c9d57c90f268",
+        "stu": 10497,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/process_origin.rs",
-        "bytes": 32496,
-        "sha256": "af6d5492ee48340a6e6737f818d6bdef77b29709ab1339e0d37030abe11c7c6b",
-        "stu": 10832,
+        "bytes": 33472,
+        "sha256": "05988335c4688c95df3e38c69b6cd65cab4c7b4ab23205d99a4ddbf7b1c28838",
+        "stu": 11158,
         "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliotd/src/provider_admission.rs",
+        "bytes": 6647,
+        "sha256": "55cc5252f4bb35f7745aead9b06445aabc54e0e3cf51d9e5566d419ab3620da9",
+        "stu": 2216,
+        "inline_cfg_test": false
+      },
+      {
+        "path": "bins/eliotd/src/provider_capability.rs",
+        "bytes": 6800,
+        "sha256": "8cf608a2e466aa2c05f1994f12b6ea4aa2edde741e32710375992cbf68335a9e",
+        "stu": 2267,
+        "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/provider_transport_policy.rs",
@@ -391,10 +497,17 @@
       },
       {
         "path": "bins/eliotd/src/route_receipts.rs",
-        "bytes": 22275,
-        "sha256": "94ae500ddb23e4fdabda75418163d6c56520f010ed1f091a4c0a5567568b8b81",
-        "stu": 7425,
+        "bytes": 24658,
+        "sha256": "c6b53440871e0a51535dc72abf1a93c63a4284a112e1f043af30a26cc39da82f",
+        "stu": 8220,
         "inline_cfg_test": true
+      },
+      {
+        "path": "bins/eliotd/src/semantic_revision_store.rs",
+        "bytes": 28713,
+        "sha256": "effc6b359f8bb2f91a99b931cbd61873998011955677c695a4549c164b52a55e",
+        "stu": 9571,
+        "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/skill_acceptance_read.rs",
@@ -412,23 +525,23 @@
       },
       {
         "path": "bins/eliotd/src/skill_dispatch.rs",
-        "bytes": 60413,
-        "sha256": "dd00ff2a560e8149401dae6973de013c9c7f407234e5969ab3ab5d3fd5c775d6",
-        "stu": 20138,
+        "bytes": 82397,
+        "sha256": "296c8433594627ba7a02142c37d2fdfaa5ed3b656fa0b004f5d8db34dc2f1f78",
+        "stu": 27466,
         "inline_cfg_test": true
       },
       {
         "path": "bins/eliotd/src/skill_evidence_read.rs",
-        "bytes": 17672,
-        "sha256": "c624fb12d548fd65369dbf03399602756ecd20a956c51eb70b8973e9ed7f592a",
-        "stu": 5891,
+        "bytes": 23971,
+        "sha256": "f73a85edb4e19a518c6f58816d778a2917d64e6f7e44b20c8ce32f20bbeb317d",
+        "stu": 7991,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/skill_lifecycle_adapters.rs",
-        "bytes": 136571,
-        "sha256": "a9d9a9fd09b2d12ff97ba7e209a01e0d76779445c9b0021782ddd3314ddc77f3",
-        "stu": 45524,
+        "bytes": 136845,
+        "sha256": "3b3a0dfc61f053f6aaac22fcad41a4f4ad38007fbac5811484aa010209272b49",
+        "stu": 45615,
         "inline_cfg_test": true
       },
       {
@@ -439,10 +552,17 @@
         "inline_cfg_test": true
       },
       {
+        "path": "bins/eliotd/src/solo_agent_driver.rs",
+        "bytes": 133262,
+        "sha256": "dca21020ad34bf0081c67e3e8532ec7dde9885e38adeda697b1ac03df8f16cab",
+        "stu": 44421,
+        "inline_cfg_test": true
+      },
+      {
         "path": "bins/eliotd/src/staffing_policy.rs",
-        "bytes": 49705,
-        "sha256": "ec5c5cf7b617804b75d20981eb6d914eefb88f4e76e2897ee231f1c1fa4f46aa",
-        "stu": 16569,
+        "bytes": 51843,
+        "sha256": "0c57a534a0814930821d8860c6ab4e83370317644058d53b64744242500e2efa",
+        "stu": 17281,
         "inline_cfg_test": false
       },
       {
@@ -454,9 +574,9 @@
       },
       {
         "path": "bins/eliotd/src/startup_evidence_producer.rs",
-        "bytes": 54268,
-        "sha256": "a9e0d3f3701b2a1c03a1474ad705c3d6a46872f91d06a9f2167f2a40016ca211",
-        "stu": 18090,
+        "bytes": 59967,
+        "sha256": "41d0a42a1f66bd1b0a8d54a482d4b12e96a0fc7500ca69886359e4a8b3f2d96d",
+        "stu": 19989,
         "inline_cfg_test": true
       },
       {
@@ -482,16 +602,16 @@
       },
       {
         "path": "bins/eliotd/src/swarm_composition.rs",
-        "bytes": 77876,
-        "sha256": "ce80b399d614226d576e3adee927cc5329e26e38fef982b0d125effc112af7f3",
-        "stu": 25959,
+        "bytes": 78122,
+        "sha256": "5e1f764524edab74baae2be3eeb4852ef6708537a53d6233a7ce2ffa290a7a8d",
+        "stu": 26041,
         "inline_cfg_test": false
       },
       {
         "path": "bins/eliotd/src/task_binding_admission.rs",
-        "bytes": 53763,
-        "sha256": "c338f6dd9a8413f80b44ecf94d07ad03c984695e03bcbd333dfdbacc51b03602",
-        "stu": 17921,
+        "bytes": 174200,
+        "sha256": "e6979c4f5364c637dbc474f6ed52565c3e2f57b4532f3045c77b527f6bb66747",
+        "stu": 58067,
         "inline_cfg_test": true
       },
       {
@@ -503,46 +623,53 @@
       },
       {
         "path": "bins/eliotd/src/testd_terminal_completion.rs",
-        "bytes": 38325,
-        "sha256": "443a970018a01eda1d2dfe78cfac35897ba5fa45066ae74eac5cb72f1f81758c",
-        "stu": 12775,
-        "inline_cfg_test": false
-      },
-      {
-        "path": "bins/eliotd/src/tests.rs",
-        "bytes": 12474,
-        "sha256": "092adf10582cdfea97155dbbfde397ade790dc1be9e1cbf5682f5f413f866069",
-        "stu": 4158,
+        "bytes": 45469,
+        "sha256": "7436067b8472542752f7775669320ca50ced3b1db53962bb806b639553a3004d",
+        "stu": 15157,
         "inline_cfg_test": false
       }
     ],
     "selected_tests": [
       {
+        "path": "bins/eliotd/src/tests.rs",
+        "bytes": 12508,
+        "sha256": "0a4efe566b7e25d655c1a2371797e1514bb9f1f28fae0e98fb7aef0490e4552d",
+        "test_attributes": 9,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
         "path": "bins/eliotd/tests/activation_invalid_ticket_wiring.rs",
-        "bytes": 19367,
-        "sha256": "e5149b55af1329a433fbf7780483f7f48074d0df78e6eebb26fb6bbe66071d9c",
+        "bytes": 19401,
+        "sha256": "474a3750bc58385b221989846db577a68fecf78f8721409b52ddf8962f5d9114",
         "test_attributes": 14,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
       },
       {
         "path": "bins/eliotd/tests/activation_resolution_dispatch.rs",
-        "bytes": 27250,
-        "sha256": "1e9d2c0d485fb872f1d3ffc7eff958c66365580b9ead0a3b57ba405f2592d020",
+        "bytes": 27348,
+        "sha256": "5c8a5c28a2414cf876ed14fa61f6301394379c70d0e4dfd56ca8a479cb43e123",
         "test_attributes": 12,
         "inline_cfg_test": true,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
       },
       {
         "path": "bins/eliotd/tests/agent_fabric_wiring.rs",
-        "bytes": 70940,
-        "sha256": "d241a37830a9188d2ebf3fb6050dbccbf25153f6ff95e8f3454309c9ecf19357",
+        "bytes": 71826,
+        "sha256": "da79bdb69aef3d60903cf09d11b2032674a2e2673cc08bf98db094b504eea217",
         "test_attributes": 31,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -550,10 +677,11 @@
       },
       {
         "path": "bins/eliotd/tests/daemon_diagnostics.rs",
-        "bytes": 45282,
-        "sha256": "221125dfb87ad1da5f1bea58bdb05a1bfcd8b715688dd941997084332516b887",
+        "bytes": 45780,
+        "sha256": "bd80b7a6a47aabe7f97a923f5cb1c6393b27910a95123f3d8cd13f9ba82f1bac",
         "test_attributes": 21,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -561,10 +689,11 @@
       },
       {
         "path": "bins/eliotd/tests/epistemic_readback.rs",
-        "bytes": 11445,
-        "sha256": "3e05975b2428bc53d02a78a1c72d317b2dc12eac2924bb2cccbf0c4c47433738",
+        "bytes": 11506,
+        "sha256": "48bcce5493eab4f49e89727250cdfe3d09ac03a4a3bf809dadf16af9d78d9b8d",
         "test_attributes": 6,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -576,14 +705,16 @@
         "sha256": "9a7b9cfdc0c7db830e6cda5169533061a97a9c565d189bdb4eb589897c7bf086",
         "test_attributes": 3,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
         "path": "bins/eliotd/tests/local_read_e2e.rs",
-        "bytes": 19544,
-        "sha256": "47b79fb126c30688abbd7797731401b9266b45448d59c2c36cac0613b909537c",
+        "bytes": 19350,
+        "sha256": "9f4c624fe9113abe3f1ca429dfcca76f02f39bf54003c3b27f329924f67d615c",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fault_restart_replay"
         ]
@@ -594,6 +725,7 @@
         "sha256": "abbc7277e12cdc538a2023191e507d1682fc32fa2ca8d00a8ce061e9f2930824",
         "test_attributes": 7,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -602,6 +734,7 @@
         "sha256": "4ae75124d12e0309eb97d37c74f5b350eef415f0ed755616a32efbb81badca53",
         "test_attributes": 5,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -613,6 +746,7 @@
         "sha256": "aaec2686a4b9a862635101a6f57a7d97d60145abb1348842041e1e7d314c1bfd",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       },
       {
@@ -621,10 +755,17 @@
         "sha256": "3c8f15369157597613520d907634f7e0125612f4f3aa1055871385402c76f2a9",
         "test_attributes": 4,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": []
       }
     ],
-    "source_selection_digest": "5e6ea4691e37e5bf977c6f076fea4448f832dd7e03932a3de9f934e39ff0462b"
+    "source_selection_digest": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
+  },
+  "unselected_package_files": {
+    "physical_inventory_file_count": 94,
+    "physical_inventory_digest": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3",
+    "unselected_files": [],
+    "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
   "one_hop_providers": [
     "eliot-agent-api",
@@ -633,6 +774,7 @@
     "eliot-agent-coordinator",
     "eliot-authority",
     "eliot-bootstrap",
+    "eliot-canonical",
     "eliot-cognitive-quality",
     "eliot-config",
     "eliot-conformance-contracts",
@@ -643,14 +785,12 @@
     "eliot-context-contracts",
     "eliot-contracts",
     "eliot-controlboard",
+    "eliot-cue-activation",
+    "eliot-cue-contracts",
     "eliot-doctor-core",
-    "eliot-dreamer-bundle",
-    "eliot-dreamer-candidate-validation",
-    "eliot-dreamer-claim-grounding",
     "eliot-dreamer-contracts",
+    "eliot-dreamer-failure",
     "eliot-dreamer-memory-revision",
-    "eliot-dreamer-probe-plan",
-    "eliot-dreamer-rival-model",
     "eliot-epistemic-contracts",
     "eliot-evaluation-contracts",
     "eliot-experience-provider",
@@ -669,6 +809,7 @@
     "eliot-observability-runtime",
     "eliot-observation",
     "eliot-observation-contracts",
+    "eliot-ors",
     "eliot-platform",
     "eliot-platform-windows",
     "eliot-process",
@@ -677,6 +818,7 @@
     "eliot-reactive-context-plan",
     "eliot-read",
     "eliot-receipts",
+    "eliot-reports",
     "eliot-runtime-contracts",
     "eliot-security-contracts",
     "eliot-self-quality",
@@ -684,6 +826,7 @@
     "eliot-store-api",
     "eliot-swarm",
     "eliot-testd-core",
+    "eliot-types",
     "eliot-understanding-assessment",
     "eliot-watchdog-core",
     "eliot-workscope",
@@ -720,48 +863,58 @@
       "ARCH-OBS-01",
       "ARCH-SEC-02"
     ],
-    "omitted": "Files outside the package source/test selection, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
+    "omitted": "Files outside the cell's selected workset, exact route tokenizer measurement, executed edge and Product Pulse results, and every runtime, store, and live-state observation."
   },
   "effective_context_profile": {
     "estimate": "planning_estimate_only",
     "qualification": "UNVALIDATED (I2.16, I0.5)",
     "reference_capsule_handle": "I2.20"
   },
-  "bound_contract_digest": "109c9dd550f9a1f5808720d3cc7532865439673560bc784e1d99a29a2cb6a6e4",
+  "bound_contract_digest": "c0d1a8fa69552d96",
   "source_provenance": {
     "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
+      "contract_semantic_inputs": {
+        "contract_catalogue": {
+          "path": "docs/architecture/handle-index.json",
+          "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
+        },
+        "architecture_boundaries": {
+          "path": "config/architecture-boundaries.toml",
+          "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
+        },
+        "logical_block_config": {
+          "path": "docs/code-navigation/logical-blocks.toml",
+          "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
+        },
+        "package_manifest": {
+          "path": "bins/eliotd/Cargo.toml",
+          "sha256": "acba1fd649d8e5962b7cca70223ac251bbc263fb8d2455a89cd3c4bc48a84f2c"
+        },
+        "module_manifest": null
       },
-      "contract_catalogue": {
-        "path": "docs/architecture/handle-index.json",
-        "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
-      },
-      "architecture_boundaries": {
-        "path": "config/architecture-boundaries.toml",
-        "sha256": "18d0b35a716c7541eddb043d0526d34266c3fc9d5697897a688700f06a908a8c"
-      },
-      "logical_block_config": {
-        "path": "docs/code-navigation/logical-blocks.toml",
-        "sha256": "625ebd5b61298f5c67de50e74d6c0681157e21036feb6a32322965ac252bd9ef"
-      },
-      "package_manifest": {
-        "path": "bins/eliotd/Cargo.toml",
-        "sha256": "cae3983df692fb5b9b527363c385ceae667aeb550bec8fa9e4b6a973a4c3c175"
-      },
-      "module_manifest": null,
-      "selected_source": {
-        "path_count": 79,
-        "sha256": "5e6ea4691e37e5bf977c6f076fea4448f832dd7e03932a3de9f934e39ff0462b"
+      "exact_provenance": {
+        "workspace_manifest": {
+          "path": "Cargo.toml",
+          "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+        },
+        "physical_source_inventory": {
+          "path_count": 94,
+          "sha256": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
+        },
+        "selected_workset": {
+          "allocation_scope": "PACKAGE_WIDE",
+          "allocation_state": "UNRESOLVED_ALLOCATION",
+          "path_count": 94,
+          "sha256": "efa8620ea08be5d3edb178258aa56b0f7999e13aafc97eb0d6dd1f31dd36c8d3"
+        }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "95aa3a1f00d82808f4056b60a5add984be0655839c8e3a58a07690e10f296b2d",
+  "artifact_digest": "1a8bb7ad33445eaf21d3f56c661ae4cd5ab357d12bbe07fd6417ae6d52d4328d",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "95aa3a1f00d82808"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "4b3eac3251bbea35"
   }
 }

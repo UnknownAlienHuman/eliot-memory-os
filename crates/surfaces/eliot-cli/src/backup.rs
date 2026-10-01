@@ -114,15 +114,39 @@
 //!
 //! A declared ceiling is a bound, not a projection, so the returned answer is
 //! related to that bound before anything is rendered. The restore-test path
-//! does this through [`restore_test_claim`] and
-//! [`require_restore_test_ceiling`]: the reply's own `status` is graded into
-//! the stage it evidences, and the protocol owners' own
-//! [`ProofCeiling::is_at_most`], [`EffectClass`] ordering and
-//! [`BackupStage::can_advance`] relations decide whether that answer is
-//! admitted or refused. An answer above the declared ceiling is refused
-//! through [`refuse_unproven_claim`] like any other unproven claim, so a
-//! richer future owner response is projected when it is within the ceiling and
-//! refused — never rendered as success — when it is not.
+//! does this through [`restore_test_receipt`], [`restore_test_claim`] and
+//! [`require_restore_test_ceiling`], and it grades from the answer's OWN
+//! DECLARED SHAPE rather than from the set of states that happen to exist
+//! today: the owner's returned receipt is decoded into its own
+//! [`VerifyClassCeiling`] rung through that type's total [`from_wire`], and
+//! [`rehearsal_band`] places the rung on the protocol's own ladder. The rung is
+//! TOTAL — every member has a stated position and there is no arm to fall
+//! through — so adding a rung to the owner's vocabulary is a compile error here
+//! until this surface says where it sits, and a rung with no stated position has
+//! no ceiling to inherit. The returned rung is then related to the bound by the
+//! protocol owners' own [`ProofCeiling::is_at_most`] and [`EffectClass`] ordering,
+//! the owner's own `operational_recovery_ready`/`cutover_performed` answers are
+//! compared as content rather than assumed, and the lifecycle reading is bounded
+//! by the derived ordering of [`BackupStage`] — the same declared ladder
+//! [`BackupStage::can_advance`] walks one edge at a time. A richer future
+//! owner response is therefore ADMITTED at the band its own rung declares, and
+//! refused — never rendered as success — only where a named relation refuses it.
+//!
+//! A rehearsed answer is the one reply on this surface that carries the owner's
+//! DURABLE evidence, so all of it is read before anything is rendered:
+//! [`restore_test_receipt`] takes the receipt, [`restore_test_evidence`] takes
+//! the finalize evidence document, the applied `phase_log` and the admitted
+//! `journal_owner` the owner projected beside it, and [`apply_executed_route`]
+//! takes the route the execution admitted. Every operator-visible string the
+//! `ok` arm writes is then derived from those reads, and the shared outcome type
+//! grows no field: the owner's rung rides the two proof-level fields, the route
+//! rides `gates_passed` and `missing_obligations`, and the outstanding
+//! obligation, the reason and the next action are written from the read values.
+//! That is the whole point — a fixed sentence about what the owner did not supply
+//! is false the moment the owner supplies it, so the surface reads the answer and
+//! says what it found. The next action names the receipt identity and the journal
+//! owner the owner actually recorded beside the same operation identity, so an
+//! operator is never sent to reconcile an identity the owner never wrote down.
 
 use std::fmt::Write as _;
 
@@ -1331,6 +1355,21 @@ fn envelope_count(response: &Value, field: &'static str) -> Result<u64, BackupCl
         .ok_or(BackupClientError::Client(CliError::ResultMismatch))
 }
 
+/// Reads one owner's own boolean answer, refusing every other JSON type.
+///
+/// A boolean the owner sent is a CLAIM it makes about itself, so it is read
+/// here as a typed value and compared as content by the caller's relation
+/// check — never defaulted and never inferred from a sibling field. A missing
+/// key is a typed result mismatch rather than a coerced `false`, because a
+/// receipt that does not say whether it performed a cutover is not one this
+/// surface may reason about.
+fn envelope_flag(response: &Value, field: &'static str) -> Result<bool, BackupClientError> {
+    response
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or(BackupClientError::Client(CliError::ResultMismatch))
+}
+
 /// Reads one optional bounded string field from a reply envelope.
 ///
 /// I10.8.6: absence is a fact only under a complete relation, so an absent
@@ -1383,30 +1422,37 @@ struct ExecutedRoute<'a> {
 fn envelope_executed_route(
     response: &Value,
 ) -> Result<(Vec<String>, Vec<String>), BackupClientError> {
-    let passed = envelope_gate_list(response, "gates_passed")?;
+    let passed = envelope_name_list(response, "gates_passed")?;
     if passed.is_empty() {
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
-    let not_admitted = envelope_gate_list(response, "gates_not_admitted")?;
+    let not_admitted = envelope_name_list(response, "gates_not_admitted")?;
     if passed.iter().any(|gate| not_admitted.contains(gate)) {
         return Err(BackupClientError::Client(CliError::ResultMismatch));
     }
     Ok((passed, not_admitted))
 }
 
-/// Reads one bounded gate-name array from a reply envelope.
-fn envelope_gate_list(
+/// Reads one bounded owner-name array from a reply envelope, refusing every
+/// element that is not a JSON string.
+///
+/// Both arrays the owner reports in bounded name lists are read through this one
+/// decoder — the executed route's two gate lists and the restore owner's applied
+/// `phase_log` — so neither is spelled, shaped or bounded a second way. The
+/// decode is shape only: what the names MEAN is the caller's question, and this
+/// function asserts nothing about a name it cannot interpret.
+fn envelope_name_list(
     response: &Value,
     field: &'static str,
 ) -> Result<Vec<String>, BackupClientError> {
-    let gates = response
+    let names = response
         .get(field)
         .and_then(Value::as_array)
         .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
-    gates
+    names
         .iter()
-        .map(|gate| {
-            gate.as_str()
+        .map(|name| {
+            name.as_str()
                 .map(str::to_owned)
                 .ok_or(BackupClientError::Client(CliError::ResultMismatch))
         })
@@ -1475,8 +1521,22 @@ fn respond(
 /// the operation may be re-run once the named owner exists — the same operation
 /// identity, not a second capture of a different scope.
 ///
-/// Every other state keeps the existing shared wording, so verify and
-/// restore-test are unchanged.
+/// Every other state keeps the existing shared wording, so verify is unchanged.
+/// `candidate` names the capture-provenance owner an unproven ARCHIVE waits on,
+/// which is the verify row's outstanding work. The rehearsed `candidate` is NOT
+/// decided here: that answer carries the owner's own receipt and journal binding,
+/// so its next action is written by [`apply_accepted_exit`] from the values that
+/// answer actually returned. A shared sentence for it could only name the
+/// transport correlation, which is the one identity a reconciliation instruction
+/// must not be reduced to.
+///
+/// The default arm names no owner at all, and says so by pointing at the
+/// obligation the outcome already carries. A refusal, an invalid request or a
+/// ceiling refusal names a causal class or a relation, not an absent owner, so
+/// the old "after the named owner lands" presupposed an owner the answer never
+/// named — on this path and on verify. Where an owner really is absent the
+/// blocked arm already puts its exact name first in `missing_obligations`, so
+/// nothing is lost by not asserting it here.
 fn next_action(state: &str, operation: &str, operation_id: &str) -> String {
     if state == BACKUP_STATE_REFUSED && operation == BACKUP_CREATE_OPERATION {
         return format!(
@@ -1490,11 +1550,17 @@ fn next_action(state: &str, operation: &str, operation_id: &str) -> String {
         BACKUP_STATE_VERIFIED => format!(
             "operation {operation_id} verified; backup existence is not recovery proof, so rehearse the isolated restore before treating it as a recovery point"
         ),
+        // A rehearsal that returned its own receipt is a DIFFERENT fact from a
+        // verify that reported a candidate archive: the rehearsal waits on the
+        // owner evidence its own answer did not carry and is reconciled by the
+        // receipt identity and journal owner that answer recorded, while a
+        // candidate archive waits on capture provenance. So the rehearsed one is
+        // written by [`apply_accepted_exit`] from the values it read, not here.
         BACKUP_STATE_CANDIDATE => format!(
             "operation {operation_id} reported a structurally valid but unproven archive candidate; an owner must bind those bytes to a retained capture receipt and a class ceiling before any recovery claim, and neither a second {operation} nor a restore is a safe next action"
         ),
         _ => format!(
-            "reconcile the same operation {operation_id} after the named owner lands; a second {operation} is never a safe next action"
+            "reconcile this same operation {operation_id} against the obligation stated above; a second {operation} is never a safe next action"
         ),
     }
 }
@@ -2421,33 +2487,128 @@ fn apply_cancellation(
     Ok(())
 }
 
-/// Projects one accepted-but-unproven restore-test exit onto its outcome.
+/// Projects the owner's OWN executed route onto the outcome.
+///
+/// Both reply kinds this operation gets that report a route — a blocked
+/// rehearsal and a rehearsed one — carry it in the same two disjoint fields, so
+/// the projection is the same projection: the gates the execution ran become
+/// `gates_passed`, and each gate the owner did NOT admit becomes its own bounded
+/// obligation, because a gate no owner admitted is outstanding work and never a
+/// passed one. Leaving either half unread is what lets a projection print
+/// `gates_passed: none` beside an answer that reported gates, or name one
+/// outstanding obligation beside an answer that named several.
+fn apply_executed_route(
+    outcome: &mut BackupOperationOutcome,
+    passed: &[String],
+    not_admitted: &[String],
+) {
+    outcome.gates_passed = passed.to_vec();
+    for gate in not_admitted {
+        outcome
+            .missing_obligations
+            .push(format!("{RESTORE_TEST_GATE_OBLIGATION}: {gate}"));
+    }
+}
+
+/// Projects one accepted restore-test exit onto its outcome, from the owner's
+/// own receipt and the owner's own evidence beside it.
 ///
 /// This is the projection half of the rule that a successful transport/exit is
-/// not capture/restore proof, and it writes only what the reply supports: the
-/// owner's own bounded reason when it sent one, echoed verbatim, and the exact
-/// owner evidence that is absent when it did not. `state` keeps the unknown
-/// state chosen by the caller and `proof_level` keeps the stage the status
-/// evidenced, so an accepted exit can never render as a completed rehearsal, a
-/// recovery point or a cutover — the gap is named rather than implied, and the
-/// only safe next action stays the same operation identity.
+/// not capture/restore proof, and every string it writes is DERIVED from what the
+/// owner returned rather than restated. Two facts decide the outstanding
+/// obligation, and both are read, never assumed: whether the owner returned a
+/// receipt, and whether the finalize evidence document it returned carries the
+/// owner-issued bounded operational validation evidence for the isolated root.
+/// The document is asked only that question — this surface does not own the rest
+/// of that vocabulary — and the receipt's own `operational_recovery_ready` and
+/// `cutover_performed` answers were already compared as content by
+/// [`require_restore_test_ceiling`], so an answer claiming either never reaches
+/// this projection.
+///
+/// `next_reconciliation` is written here too, and it names the identities the
+/// answer ACTUALLY carries: the receipt identity and the admitted journal owner
+/// the owner recorded for the durable stream, beside the same operation identity
+/// so a second rehearsal is still never proposed. Naming only the transport
+/// correlation would send an operator after an identity the owner never wrote
+/// down, which is the one thing a reconciliation instruction must not do.
 fn apply_accepted_exit(
     outcome: &mut BackupOperationOutcome,
     response: &Value,
     operation_id: &str,
+    receipt: Option<&RestoreTestReceipt<'_>>,
+    evidence: &RestoreTestEvidence<'_>,
 ) -> Result<(), BackupClientError> {
-    outcome.missing_obligations = vec![format!(
-        "owner-issued restore evidence for the rehearsal of operation {operation_id} (absent from the owner's own answer: no capture receipt, no restore-step result, no reconciliation and no cutover admission)"
-    )];
+    outcome
+        .missing_obligations
+        .push(outstanding_restore_obligation(
+            operation_id,
+            receipt,
+            evidence,
+        ));
     match envelope_optional_text(response, "reason")? {
         Some(reason) => reason.clone_into(&mut outcome.reason),
+        None if receipt.is_some() => {
+            outcome.reason = format!(
+                "owner answered {BACKUP_WIRE_OK} to {BACKUP_RESTORE_TEST_OPERATION} with its own restore receipt and the phase log of the steps it applied; a receipt is not an operational recovery point, so the operational evidence this answer does not carry stays outstanding and only the recorded receipt is safe to reconcile"
+            );
+        }
         None => {
             outcome.reason = format!(
-                "owner answered {BACKUP_WIRE_OK} to {BACKUP_RESTORE_TEST_OPERATION} without a capture receipt, a restore-step result, a reconciliation or a cutover admission; a successful exit is not capture/restore proof, so this operation is unproven and only the same operation identity is safe to reconcile"
+                "owner answered {BACKUP_WIRE_OK} to {BACKUP_RESTORE_TEST_OPERATION} without a restore receipt; a successful exit is not capture/restore proof, so this operation is unproven and only the same operation identity is safe to reconcile"
             );
         }
     }
+    outcome.next_reconciliation = match receipt {
+        Some(receipt) => format!(
+            "reconcile restore receipt {} of the durable restore journal {} for this same operation {operation_id}; a second {BACKUP_RESTORE_TEST_OPERATION} is never a safe next action",
+            receipt.receipt_id, evidence.journal_owner
+        ),
+        None => format!(
+            "reconcile this same operation {operation_id}; the owner's own answer carried no restore receipt to reconcile, and a second {BACKUP_RESTORE_TEST_OPERATION} is never a safe next action"
+        ),
+    };
     Ok(())
+}
+
+/// The one outstanding owner obligation a rehearsed answer still has, read from
+/// what that answer actually returned.
+///
+/// The receipt arm names the bounded operational validation evidence for the
+/// isolated root when the owner's own finalize document carries none, and names
+/// the cutover admission instead when it does — A13.7 keeps cutover a separate
+/// Human/System Owner authority no isolated rehearsal holds, so that obligation
+/// is outstanding either way and this says WHICH one, from the answer rather than
+/// from a fixed sentence. The no-receipt arm names the receipt itself, and states
+/// the applied phase log exactly as read, so a surface that previously denied the
+/// owner supplied a restore-step result now reports what it did supply.
+fn outstanding_restore_obligation(
+    operation_id: &str,
+    receipt: Option<&RestoreTestReceipt<'_>>,
+    evidence: &RestoreTestEvidence<'_>,
+) -> String {
+    match receipt {
+        Some(receipt) if evidence.operational_validation => format!(
+            "cutover admission for the isolated root the owner validated with its own bounded operational validation evidence under restore receipt {} (absent from the owner's own answer: cutover is a separate Human/System Owner authority, and an isolated rehearsal never asks for one)",
+            receipt.receipt_id
+        ),
+        Some(receipt) => format!(
+            "owner-issued bounded operational validation evidence for the isolated root named by restore receipt {} (absent from the owner's own answer: {}, and the receipt answers operational_recovery_ready = false and cutover_performed = false, so the rehearsal is not an operational recovery point)",
+            receipt.receipt_id,
+            if evidence.finalize_evidence {
+                "the owner's finalize evidence document carries none"
+            } else {
+                "the answer carried no finalize evidence document"
+            }
+        ),
+        None => format!(
+            "owner-issued restore receipt for the rehearsal of operation {operation_id} (absent from the owner's own answer: the reply carried none, {})",
+            if evidence.phase_log.is_empty() {
+                "and its applied phase log is empty, so it reports no applied restore step"
+            } else {
+                "and its applied phase log names the steps it ran, which no receipt attests"
+            }
+        ),
+    }
 }
 
 /// Routes one isolated restore-test command through the correlated Kernel
@@ -2459,19 +2620,51 @@ fn apply_accepted_exit(
 /// command may be rendered as a cutover admission (A13.7 keeps cutover a
 /// separate authority).
 ///
-/// The proven level is GRADED from the returned reply, never assumed:
-/// [`restore_test_claim`] derives the lifecycle stage the returned `status`
-/// actually evidences, and [`require_restore_test_ceiling`] relates that
-/// claim to the catalogue row this operation is declared under before any
-/// state or level is reported. An answer above the declared proof ceiling or
-/// effect class, or a stage that is not a legal advance on the protocol's own
-/// ladder, is refused through the module's existing typed refusal and is
-/// never rendered. A successful transport/exit is not capture/restore proof:
-/// an `ok` reply that evidences no capture receipt, no restore-step result, no
-/// reconciliation and no cutover admission is reported as the unknown outcome
-/// with the same operation identity, never as a completed rehearsal. The
-/// stable operation identity — the correlated idempotency key, never a value
-/// read back from the reply body — is what the owner lane reconciles.
+/// The proven level is GRADED from the returned reply, never assumed, and the
+/// grade is derived from the answer's OWN DECLARED SHAPE rather than from the
+/// set of states that happen to exist today. [`restore_test_receipt`] reads the
+/// owner's own restore receipt — its rung, its target, and its two
+/// self-claims — and [`rehearsal_band`] places that rung on the protocol's
+/// ladder through a TOTAL match over the closed vocabulary, so a rung added to
+/// the owner's ladder is a compile error here until this surface states where it
+/// sits and no rung can fall through to an unrelated band.
+/// [`require_restore_test_ceiling`] then relates that graded claim to the
+/// catalogue row this operation is declared under before any state or level is
+/// reported, and separately compares the owner's own `cutover_performed` and
+/// `operational_recovery_ready` answers as content. An answer above the declared
+/// proof ceiling or effect class, a receipt claiming a cutover or operational
+/// readiness this route holds no authority for, a receipt about another target,
+/// or a stage outside this operation's own ladder is refused through the
+/// module's existing typed refusal and is never rendered.
+///
+/// A successful transport/exit is still not capture/restore proof on its own:
+/// an `ok` reply that carried no receipt proved only the exit and is reported as
+/// the unknown outcome with the same operation identity. A richer future owner
+/// response is therefore ADMITTED at the band its own rung declares — this is
+/// what makes the check structural rather than an enumeration of today's states
+/// — and refused only where one of the named relations above refuses it.
+///
+/// A rehearsed answer is also the only one that carries the owner's DURABLE
+/// evidence, so all of it is read before anything is rendered:
+/// [`restore_test_receipt`] takes the receipt, [`restore_test_evidence`] takes
+/// the finalize document, the applied `phase_log` and the admitted
+/// `journal_owner` the owner projected beside it, and [`apply_executed_route`]
+/// takes the route the execution admitted. Every string the `ok` arm writes is
+/// then derived from those reads, so no operator-visible text on this path can
+/// assert something about the owner's answer the surface has not looked at —
+/// which is what a fixed "the owner supplied no restore-step result" sentence
+/// could not promise once the owner supplies a receipt, a phase log and a
+/// finalize document. The outcome type is shared with create and verify and grows
+/// no field here: the owner's rung rides the two proof-level fields, the route
+/// rides `gates_passed` and `missing_obligations`, and the outstanding
+/// obligation, the reason and the next action are all written from the read
+/// values.
+///
+/// The stable operation identity — the correlated idempotency key, never a value
+/// read back from the reply body — stays the identity this operation reconciles
+/// under, and the `ok` arm names the receipt identity and the journal owner
+/// beside it so a reconciliation instruction never points at an identity the
+/// owner did not record.
 /// The `backup.restore-test` wire payload, built from the validated request
 /// parameters only.
 ///
@@ -2520,37 +2713,21 @@ pub fn backup_restore_test(
     envelope_command(&response, BACKUP_RESTORE_TEST_OPERATION)?;
     envelope_idempotency(&response, &request.request)?;
     let wire_status = envelope_status(&response)?;
-    // The route the execution actually admitted is read ONCE, here, before the
-    // reply is graded, and it is the grading input for the `blocked` band. It is
-    // read from the owner's own answer rather than reconstructed from the
-    // status, so the band this surface may claim is set by gates that provably
-    // ran and by gates the owner provably did not admit. A reply that does not
-    // carry the route at all yields `None`, which only the `blocked` arm accepts,
-    // so a richer status can never borrow another status's route to justify a
-    // ceiling.
-    let route_parts = if wire_status == BACKUP_STATE_BLOCKED {
-        Some(envelope_executed_route(&response)?)
-    } else {
-        None
-    };
-    let executed_route = route_parts
-        .as_ref()
-        .map(|(passed, not_admitted)| ExecutedRoute {
-            passed: passed.as_slice(),
-            not_admitted: not_admitted.as_slice(),
-        });
+    let route = admitted_executed_route(&response, wire_status)?;
+    let executed_route = route.as_ref().map(|route| ExecutedRoute {
+        passed: route.passed.as_slice(),
+        not_admitted: route.not_admitted.as_slice(),
+    });
+    // The owner's own receipt is decoded BEFORE the reply is graded, so the
+    // grade is placed by the rung the owner declared rather than by the status
+    // token beside it. An answer that carries no receipt declares no rung, and
+    // `restore_test_claim` then admits only the observation floor for it.
+    let receipt = restore_test_receipt(&response)?;
     // The reply is graded BEFORE any state or proven level is decided, so no
     // owner answer below is projected on the strength of a status this surface
     // has not first related to the catalogue row read above.
-    let claim = restore_test_claim(wire_status, executed_route.as_ref())?;
-    // A successful exit is not this operation's own answer state: `ok` is the
-    // only status here that is never a domain verdict, so the unknown state is
-    // the single honest one for it. This mirrors the verify path's mapping and
-    // keeps the reconciled operation identity unchanged.
-    let state = match wire_status {
-        BACKUP_WIRE_OK => BACKUP_STATE_UNKNOWN,
-        other => other,
-    };
+    let claim = restore_test_claim(wire_status, executed_route.as_ref(), receipt.as_ref())?;
+    let state = restore_test_state(wire_status, receipt.is_some());
     let mut outcome = BackupOperationOutcome {
         operation: BACKUP_RESTORE_TEST_OPERATION.to_owned(),
         state: state.to_owned(),
@@ -2570,19 +2747,31 @@ pub fn backup_restore_test(
         effect,
         proof_ceiling,
         // Graded from the reply, never assumed: the lifecycle stage the
-        // returned status actually evidences, and the stage
-        // `require_restore_test_ceiling` has accepted as a legal advance of
-        // this operation's own ladder. A status that evidenced a later stage
-        // than the surface may claim is refused below and never reaches this
-        // line, so the level here can never be a claim the reply did not make.
+        // owner's own declared rung places it at, and the rung
+        // `require_restore_test_ceiling` has accepted as reachable on this
+        // operation's own ladder. A claim whose stage is outside that ladder,
+        // or whose proof/effect reading is above the declared ceiling, is
+        // refused below and never reaches this line, so the level here can never
+        // be a claim the reply did not make.
         proof_level: claim.stage,
-        // A blocked rehearsal proves no verification level, no class
-        // ceiling, no capture receipt and no archived-fence relation. The
-        // capture operation identity the request declared above is the
-        // request's own claim, never an owner-issued verification answer, so
-        // all four stay explicitly absent.
-        verification_level: None,
-        class_ceiling: None,
+        // The owner's own declared rung, reported through the two fields that already
+        // carry a proof level and a class ceiling on this shared outcome type —
+        // no new field and no second result schema. Both are the OWNER's
+        // spelling, read back through the same typed owner the grade was placed
+        // from, so the operator reads the value the ceiling comparison actually
+        // used. They stay explicitly absent when the owner returned no receipt:
+        // a blocked rehearsal declares no rung, and no rung may be synthesised
+        // for it.
+        verification_level: receipt
+            .as_ref()
+            .map(|receipt| receipt.level.wire_name().to_owned()),
+        class_ceiling: receipt
+            .as_ref()
+            .map(|receipt| receipt.level.wire_name().to_owned()),
+        // The capture receipt is a CAPTURE owner's fact. A restore receipt is a
+        // different owner fact about a different operation, so it is reported
+        // through the rung above and never folded into this field: doing so
+        // would make a rehearsal look like it had capture provenance.
         capture_receipt: None,
         // A rehearsal proves no archive result, so there is no result identity to
         // bind. It stays an explicit absence: the capture operation identity the
@@ -2610,8 +2799,14 @@ pub fn backup_restore_test(
     // reports this operation's typed refusal with the exact relation that
     // refused it, and it carries no owner-echoed field, so an answer above the
     // declared ceiling can never render as this operation's outcome at all.
-    if let Err(unproven) = require_restore_test_ceiling(&claim, wire_status, effect, proof_ceiling)
-    {
+    if let Err(unproven) = require_restore_test_ceiling(
+        &claim,
+        receipt.as_ref(),
+        wire_status,
+        effect,
+        proof_ceiling,
+        params.target_id.as_str(),
+    ) {
         return refuse_unproven_claim(
             request,
             &operation_id,
@@ -2622,42 +2817,37 @@ pub fn backup_restore_test(
     }
     match wire_status {
         BACKUP_STATE_BLOCKED => {
-            if envelope_text(&response, "code")? != "plan_gap" {
-                return Err(BackupClientError::Client(CliError::ResultMismatch));
-            }
-            // The route read above, which `restore_test_claim` already required
-            // to be non-empty on the passed side and disjoint across both sides.
-            // Only the admitted half is reported as `gates_passed`; the gates the
-            // owner did NOT admit each become a bounded missing obligation,
-            // because a gate no owner admitted is an outstanding obligation and
-            // never a passed one.
             let route = executed_route
                 .as_ref()
                 .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
-            outcome.gates_passed = route.passed.to_vec();
-            // The Kernel's own owner name comes first, unresolved, exactly as
-            // the reply wrote it. The declaration obligation is this surface's
-            // own: the `source:`/`destination:` lines above are what the request
-            // declared, and no owner provisioned, admitted or issued either
-            // identity, so the projection must not read as a provisioned
-            // destination or an admitted source.
-            outcome.missing_obligations = vec![
-                envelope_text(&response, "missing_owner")?.to_owned(),
-                RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION.to_owned(),
-            ];
-            for gate in route.not_admitted {
-                outcome
-                    .missing_obligations
-                    .push(format!("{RESTORE_TEST_GATE_OBLIGATION}: {gate}"));
-            }
-            envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
+            apply_plan_gap(&mut outcome, &response, route)?;
         }
         BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED => {
             envelope_text(&response, "reason")?.clone_into(&mut outcome.reason);
             let code = envelope_text(&response, "code")?.to_owned();
             outcome.missing_obligations = vec![format!("{state}: {code}")];
         }
-        BACKUP_WIRE_OK => apply_accepted_exit(&mut outcome, &response, &operation_id)?,
+        // A successful transport/exit is never by itself rehearsal proof, so this
+        // projection is driven by what the owner actually returned rather than by
+        // the token: the receipt, the evidence it projected beside it, and the
+        // route the execution admitted are all read here, and every string below
+        // is derived from them. The route read here is the PROJECTION input and is
+        // deliberately not the one `restore_test_claim` grades from: only the
+        // `blocked` arm may let a route justify a ceiling, and that read stays
+        // where it is, so a rehearsed answer still places its claim by the rung
+        // the owner declared.
+        BACKUP_WIRE_OK => {
+            let evidence = restore_test_evidence(&response)?;
+            let (passed, not_admitted) = envelope_executed_route(&response)?;
+            apply_executed_route(&mut outcome, &passed, &not_admitted);
+            apply_accepted_exit(
+                &mut outcome,
+                &response,
+                &operation_id,
+                receipt.as_ref(),
+                &evidence,
+            )?;
+        }
         BACKUP_STATE_CANCELLED => {
             // A cancellation is the owner's own answer, not a malformed field,
             // so it is decoded through the same closed cleanup contract the
@@ -2680,26 +2870,241 @@ pub fn backup_restore_test(
     respond(request, CommandId::BackupRestoreTest, &outcome)
 }
 
+/// Decides the answer STATE this operation reports for one graded reply.
+///
+/// Every status other than `ok` is its own state, so it is reported verbatim. A
+/// successful transport/exit is not by itself this operation's answer state, so
+/// the `ok` state is decided by what the owner actually returned rather than by
+/// the token: a rehearsal that carried its own restore receipt has a graded,
+/// owner-declared outcome, while an `ok` with no receipt proved only the exit and
+/// stays the unknown state. Both keep the reconciled operation identity
+/// unchanged, so this decision changes what the operator is told and never which
+/// operation they are told to reconcile.
+fn restore_test_state(wire_status: &str, owner_returned_receipt: bool) -> &str {
+    match wire_status {
+        BACKUP_WIRE_OK if owner_returned_receipt => BACKUP_STATE_CANDIDATE,
+        BACKUP_WIRE_OK => BACKUP_STATE_UNKNOWN,
+        other => other,
+    }
+}
+
+/// Reads the route the owner actually admitted, for the one status whose band
+/// it grades.
+///
+/// The route is read ONCE, from the owner's own answer, rather than
+/// reconstructed from the status, so the band this surface may claim is set by
+/// gates that provably ran and by gates the owner provably did not admit. Only
+/// `blocked` reads it here: every other status returns `None`, which only the
+/// `blocked` arm of [`restore_test_claim`] accepts, so a richer status can never
+/// borrow another status's route to justify a ceiling. A reply that carries no
+/// route at all yields `None` for `blocked` too, and that arm then refuses.
+///
+/// A rehearsed answer reports the same two fields, and the `ok` arm reads them
+/// for the PROJECTION alone — through [`envelope_executed_route`] directly, so
+/// the grading read above stays exactly the one that can justify a ceiling. That
+/// separation is the point: a gate list is evidence of what ran and may be
+/// reported as such, but only the blocked band is ever placed from it.
+///
+/// The gate lists are returned OWNED because they are decoded here and the
+/// [`ExecutedRoute`] view of them borrows this function's own result; the caller
+/// holds the tuple for as long as it grades and projects the claim.
+fn admitted_executed_route(
+    response: &Value,
+    wire_status: &str,
+) -> Result<Option<ExecutedRouteOwned>, BackupClientError> {
+    if wire_status != BACKUP_STATE_BLOCKED {
+        return Ok(None);
+    }
+    let (passed, not_admitted) = envelope_executed_route(response)?;
+    Ok(Some(ExecutedRouteOwned {
+        passed,
+        not_admitted,
+    }))
+}
+
+/// The owner's own decoded gate lists, before they are viewed as one route.
+struct ExecutedRouteOwned {
+    /// Gates the owner admits it ran.
+    passed: Vec<String>,
+    /// Gates the owner names it did not admit.
+    not_admitted: Vec<String>,
+}
+
+/// Projects one `plan_gap` answer onto its outcome.
+///
+/// A plan gap is the ABSENCE of a named owner, so it projects absence: the
+/// owner's own unresolved name first, then this surface's own declaration
+/// obligation, then one bounded obligation per gate the owner did not admit —
+/// a gate no owner admitted is an outstanding obligation and never a passed one.
+/// The route handed in is the one `restore_test_claim` already required to be
+/// non-empty on the passed side and disjoint across both sides.
+fn apply_plan_gap(
+    outcome: &mut BackupOperationOutcome,
+    response: &Value,
+    route: &ExecutedRoute<'_>,
+) -> Result<(), BackupClientError> {
+    if envelope_text(response, "code")? != "plan_gap" {
+        return Err(BackupClientError::Client(CliError::ResultMismatch));
+    }
+    // The Kernel's own owner name comes first, unresolved, exactly as the reply
+    // wrote it. The declaration obligation is this surface's own: the
+    // `source:`/`destination:` lines are what the request declared, and no owner
+    // provisioned, admitted or issued either identity, so the projection must not
+    // read as a provisioned destination or an admitted source.
+    outcome.missing_obligations = vec![
+        envelope_text(response, "missing_owner")?.to_owned(),
+        RESTORE_TEST_DECLARED_IDENTITY_OBLIGATION.to_owned(),
+    ];
+    apply_executed_route(outcome, route.passed, route.not_admitted);
+    envelope_text(response, "reason")?.clone_into(&mut outcome.reason);
+    Ok(())
+}
+
+/// The owner's own restore receipt, decoded into the vocabularies that own it.
+///
+/// The Kernel route projects the receipt the restore owner produced
+/// WHOLE (`rehearsed_reply` in `bins/eliot-kernel/src/request_dispatch.rs`), and
+/// this reads that answer rather than re-deriving a classification from the
+/// status token beside it. Everything here is the OWNER's own declared value:
+/// the rung is decoded through [`VerifyClassCeiling`], which owns this
+/// vocabulary's spelling and is TOTAL over it, and the two flags are the
+/// owner's own answers read as typed booleans by [`envelope_flag`]. Nothing is
+/// inferred from a sibling field, defaulted, or computed. In particular no
+/// digest on the receipt is recomputed here and no field this surface does not
+/// grade is treated as evidence about the rung: an owner's recorded value is
+/// either read as that value or not read at all.
+struct RestoreTestReceipt<'a> {
+    /// The owner's own receipt identity, echoed verbatim into operator text.
+    receipt_id: &'a str,
+    /// The rung the owner declared this rehearsal reached.
+    level: VerifyClassCeiling,
+    /// The target the owner says it restored into.
+    target_id: &'a str,
+    /// The owner's own statement that this receipt asserts operational
+    /// recovery readiness.
+    operational_recovery_ready: bool,
+    /// The owner's own statement that a cutover happened. An isolated
+    /// rehearsal may never be one (A13.7 keeps cutover a separate authority),
+    /// so this is compared and not trusted.
+    cutover_performed: bool,
+}
+
+/// Decodes the owner's own receipt out of one restore-test reply.
+///
+/// An absent `receipt` is an explicit absence and not an error: a reply that
+/// reports no receipt has declared no rung, and
+/// [`restore_test_claim`] then admits only the observation floor. A reply that
+/// DOES carry one is read strictly, and a receipt whose fields this surface
+/// cannot name — a rung outside the closed vocabulary, a flag that is not a
+/// boolean, an identity that is not bounded text — is a typed result mismatch
+/// rather than a partially trusted receipt. That strictness is the point: a
+/// richer future owner answer must be DECODED and related, never silently
+/// dropped into whatever band today's known states happen to map onto.
+fn restore_test_receipt(
+    response: &Value,
+) -> Result<Option<RestoreTestReceipt<'_>>, BackupClientError> {
+    let Some(receipt) = response.get("receipt") else {
+        return Ok(None);
+    };
+    if receipt.is_null() {
+        return Ok(None);
+    }
+    let receipt_id = envelope_text(receipt, "receipt_id")?;
+    non_blank(receipt_id, "backup.receipt.receipt_id").map_err(BackupClientError::Client)?;
+    let target_id = envelope_text(receipt, "target_id")?;
+    non_blank(target_id, "backup.receipt.target_id").map_err(BackupClientError::Client)?;
+    // The rung is decoded through the ONE typed owner of this vocabulary, so a
+    // rung outside it is refused instead of being coerced onto a nearby one and
+    // inheriting that rung's ceiling.
+    let level = VerifyClassCeiling::from_wire(envelope_text(receipt, "evidence_level")?)
+        .ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
+    Ok(Some(RestoreTestReceipt {
+        receipt_id,
+        level,
+        target_id,
+        operational_recovery_ready: envelope_flag(receipt, "operational_recovery_ready")?,
+        cutover_performed: envelope_flag(receipt, "cutover_performed")?,
+    }))
+}
+
+/// The restore evidence the owner answers BESIDE its receipt.
+///
+/// `rehearsed_reply` answers a rehearsed `backup.restore-test` with four owner
+/// answers next to the receipt: the finalize evidence document the run wrote, the
+/// exact applied phase log, the admitted journal owner binding behind the run,
+/// and the owner's own `reason`. This holds the three structured ones, read from
+/// the owner's own answer so no projection on this path can assert something
+/// about an answer it has not looked at.
+struct RestoreTestEvidence<'a> {
+    /// Whether the owner wrote a finalize evidence document for this run. A
+    /// `null` is the owner's own answer — a run that executed no finalize, or a
+    /// resumed run whose file the owner re-validated — and is an explicit
+    /// absence here, never a gap in this surface.
+    finalize_evidence: bool,
+    /// Whether that document carries the owner-issued bounded operational
+    /// validation evidence for the isolated root.
+    operational_validation: bool,
+    /// The exact applied phase log, in execution order. It is THIS process's
+    /// own calls, so a resumed run reports only the phases it re-executed and
+    /// never the whole history behind the receipt.
+    phase_log: Vec<String>,
+    /// The admitted journal owner binding behind this restore. This is the
+    /// identity the owner recorded for the durable stream the receipt was
+    /// written to, which is the handle an operator reconciles this exact answer
+    /// against.
+    journal_owner: &'a str,
+}
+
+/// Decodes the restore evidence the owner projects beside its receipt.
+///
+/// The finalize document is read for the ONE fact the outstanding-obligation
+/// text turns on: whether it carries the owner-issued bounded operational
+/// validation evidence for the isolated root, which A13.7 keeps with the exact
+/// owner that may issue it. Nothing else inside the document is decoded,
+/// re-derived or summarised here, because this surface does not own that
+/// vocabulary; a document is a document or a typed result mismatch, and its
+/// `operational_validation` member is read as the owner's own presence or
+/// absence, never coerced to a value.
+///
+/// `phase_log` and `journal_owner` are read on the same pass so neither is
+/// dropped unread: the phase log is the owner's own record of the steps it
+/// applied, and the journal owner is the identity it recorded for the durable
+/// stream. Both are closed-checked (bounded name list, bounded non-blank text),
+/// because a rehearsal that answered neither in a shape this surface can name is
+/// an answer this surface may not reason about.
+fn restore_test_evidence(response: &Value) -> Result<RestoreTestEvidence<'_>, BackupClientError> {
+    let (finalize_evidence, operational_validation) = match response.get("evidence") {
+        None | Some(Value::Null) => (false, false),
+        Some(evidence) => {
+            if !evidence.is_object() {
+                return Err(BackupClientError::Client(CliError::ResultMismatch));
+            }
+            match evidence.get("operational_validation") {
+                Some(Value::Null) => (true, false),
+                Some(_) => (true, true),
+                None => return Err(BackupClientError::Client(CliError::ResultMismatch)),
+            }
+        }
+    };
+    let phase_log = envelope_name_list(response, "phase_log")?;
+    let journal_owner = envelope_text(response, "journal_owner")?;
+    non_blank(journal_owner, "backup.journal_owner").map_err(BackupClientError::Client)?;
+    Ok(RestoreTestEvidence {
+        finalize_evidence,
+        operational_validation,
+        phase_log,
+        journal_owner,
+    })
+}
+
 /// The bounded classification ONE returned restore-test answer makes.
 ///
-/// Today's Kernel restore-test reply carries no effect class, no proof ceiling
-/// and no lifecycle-stage field: `handle_backup_restore_test` answers with the
-/// base envelope plus, for a blocked rehearsal, `code`, `missing_owner`,
-/// `reason`, `gates_passed` and `gates_not_admitted`
-/// (`bins/eliot-kernel/src/request_dispatch.rs`). This claim is therefore graded
-/// from what the reply DOES carry — its `status`, and the stage that status
-/// together with the fields it is answered with actually evidences — and never
-/// from a field the owner did not send. No digest, receipt or synthetic ceiling
-/// is invented to make the relation look complete; the values below are the
-/// protocol owners' own [`BackupStage`], [`ProofCeiling`] and [`EffectClass`]
-/// members, and each arm names the strongest classification its status can
-/// honestly be read as.
-///
-/// What bounds the `blocked` arm is [`envelope_executed_route`], not this table:
-/// the band it may claim is reached only because the reply's admitted route was
-/// read and checked to be disjoint from the route the owner did not admit, so
-/// the ceiling is set by gates that provably ran rather than by a gate list this
-/// surface restates.
+/// Every field is derived from the answer's OWN DECLARED SHAPE and is then
+/// compared against the catalogue row by [`require_restore_test_ceiling`]. No
+/// digest, receipt or synthetic ceiling is invented to make the relation look
+/// complete; the values are the protocol owners' own [`BackupStage`],
+/// [`ProofCeiling`] and [`EffectClass`] members, placed by
+/// [`rehearsal_band`] from the rung the owner named.
 struct RestoreTestClaim {
     /// Furthest lifecycle stage this answer actually evidences.
     stage: BackupStage,
@@ -2709,37 +3114,104 @@ struct RestoreTestClaim {
     effect: EffectClass,
 }
 
-/// Grades one closed restore-test `status` into the bounded claim it may make.
+/// Places the owner's DECLARED rung on this surface's ladder.
 ///
-/// The status is the only classification-bearing value the reply carries, so it
-/// is the whole of the grading input, and each arm states why that status
-/// evidences that much and no more. A status outside the graded closed set is a
-/// typed result mismatch here, exactly as in [`envelope_status`]: a status this
-/// surface cannot name is a status it cannot bound.
+/// This is the structural half of the check, and its totality is the guarantee:
+/// it matches over [`VerifyClassCeiling`], which is closed, with no catch-all
+/// arm and no default. Adding a rung to the owner's vocabulary is therefore a
+/// COMPILE ERROR here until this surface states where that rung sits, so a
+/// richer future owner response can neither inherit an older rung's ceiling nor
+/// fall through to some unrelated band. Every arm reads its own position off the
+/// member the owner named — the ladder order below is the owner's own declaration
+/// order in `RestoreEvidenceLevel` — and none of them is a lookup beside the
+/// enum.
+fn rehearsal_band(level: VerifyClassCeiling) -> (BackupStage, ProofCeiling, EffectClass) {
+    match level {
+        // Archive/build validity alone: the bytes were checked and nothing was
+        // imported into any root. The furthest lifecycle step that evidences is
+        // the archive itself, so the ladder stops at `Verified` and the strongest
+        // honest reading is a candidate artifact. Placing it higher would claim
+        // a restore step this rung never reached.
+        VerifyClassCeiling::ArchiveValid => (
+            BackupStage::Verified,
+            ProofCeiling::CandidateArtifact,
+            EffectClass::Candidate,
+        ),
+        // The isolated root imported with no active authority
+        // (`IsolatedImportComplete`), and the same import with external effects
+        // still UNRESOLVED (`ReconciliationRequired`), place the claim at the
+        // SAME band, and the two rungs are therefore one arm rather than two
+        // named arms with identical bodies: the lifecycle advance is identical —
+        // a restore step was applied — and the lifecycle has not reached
+        // `Reconciled` under either rung, because reconciliation is exactly what
+        // the second rung says is still outstanding, so this surface must not say
+        // it has happened. The unresolved effects are why the ceiling stops at
+        // the candidate band rather than rising, and A13.7 keeps activation and
+        // cutover out of reach here under either rung.
+        //
+        // Naming them separately would assert a distinction this surface does not
+        // draw: the difference between the two rungs is a fact about the owner's
+        // reconciliation state, and the owner reports it in the receipt itself,
+        // not through the band this surface may claim.
+        VerifyClassCeiling::IsolatedImportComplete | VerifyClassCeiling::ReconciliationRequired => {
+            (
+                BackupStage::RestoreStepApplied,
+                ProofCeiling::CandidateArtifact,
+                EffectClass::Candidate,
+            )
+        }
+        // The owner asserts bounded validation evidence for the isolated root.
+        // A13.7 keeps that with the restore owner and no isolated rehearsal
+        // holds it, so this rung is refused by
+        // [`require_restore_test_ceiling`] rather than rendered. Its position is
+        // still stated here so the refusal names a real ceiling instead of
+        // "unknown".
+        VerifyClassCeiling::OperationallyValidated => (
+            BackupStage::RehearsalComplete,
+            ProofCeiling::ScopedVerification,
+            EffectClass::Candidate,
+        ),
+        // A separate Human/System Owner authorization, which this surface never
+        // asks for and the Kernel method has no path to. Also refused; stated so
+        // the ceiling comparison is a real comparison.
+        VerifyClassCeiling::Cutover => (
+            BackupStage::CutoverAdmitted,
+            ProofCeiling::ObservedExternalEffect,
+            EffectClass::ExternalEffect,
+        ),
+    }
+}
+
+/// Grades one returned restore-test answer into the bounded claim it may make.
 ///
-/// The `blocked` arm is additionally gated on the reply's OWN executed route
-/// rather than on the status token alone, and that is what keeps this table from
-/// being today's hard-coded limited state standing in for a structural check.
-/// A `blocked` answer is graded at the candidate band only when the owner both
-/// admitted at least one gate AND named at least one gate it did not admit: the
-/// first is what earns the band and the second is what caps it. A `blocked`
-/// reply that claims an empty not-admitted set is saying it refused while
-/// admitting its whole route, and there is no reading of that which supports any
+/// The grading INPUT is the answer's own declared shape, not a table of today's
+/// statuses. When the owner returned its receipt, the rung it declared places
+/// the whole claim through the total [`rehearsal_band`]; when it returned none,
+/// no rung was declared and the only honest reading is the observation floor. A
+/// status outside the closed wire vocabulary is still a typed result mismatch,
+/// exactly as in [`envelope_status`]: a status this surface cannot name is a
+/// status it cannot bound.
+///
+/// The `blocked` arm remains gated on the reply's OWN executed route rather than
+/// on the status token alone. A `blocked` answer is graded at the candidate band
+/// only when the owner both admitted at least one gate AND named at least one
+/// gate it did not admit: the first is what earns the band and the second is
+/// what caps it. A `blocked` reply claiming an empty not-admitted set is saying
+/// it refused while admitting its whole route, and no reading of that supports a
 /// band above the observation floor, so it is refused rather than rendered at a
 /// ceiling the owner's own answer contradicts.
 fn restore_test_claim(
     status: &str,
     executed_route: Option<&ExecutedRoute<'_>>,
+    receipt: Option<&RestoreTestReceipt<'_>>,
 ) -> Result<RestoreTestClaim, BackupClientError> {
     let claim = match status {
         // The rehearsal's shape gates ran for real and the reply enumerates the
-        // ones that did, so this answer is bounded by exactly the band the
-        // catalogue row declares: a candidate-shaped rehearsal with no owner
-        // evidence behind it. A plan gap is the ABSENCE of a named owner, never
-        // a lifecycle advance, so the evidenced stage stays `Requested` even
-        // though the admitted gates passed. The gates the owner did NOT admit
-        // are reported as obligations, not folded into this ceiling — they are
-        // the reason the band stops where it does.
+        // ones that did. A plan gap is the ABSENCE of a named owner, never a
+        // lifecycle advance, so the evidenced stage stays `Requested` even though
+        // the admitted gates passed, and the gates the owner did NOT admit are
+        // reported as obligations rather than folded into this ceiling — they
+        // are the reason the band stops where it does.
         BACKUP_STATE_BLOCKED => {
             let route =
                 executed_route.ok_or(BackupClientError::Client(CliError::ResultMismatch))?;
@@ -2752,25 +3224,40 @@ fn restore_test_claim(
                 effect: EffectClass::Candidate,
             }
         }
-        // Every remaining admitted status — a successful transport/exit, an
-        // invalid request, a refusal, a cancellation — reports that this
-        // operation did not run to any proven lifecycle step. The `ok` case is
-        // the one that makes the rule load-bearing: a successful exit is not
-        // capture/restore proof, and the reply it answered with evidenced no
-        // capture receipt, no restore-step result, no reconciliation and no
-        // cutover admission, so it proves an observation of the exit and
-        // nothing else. Naming a `RehearsalComplete` level here would be a
-        // claim the owner never made, so this is deliberately not one, and
-        // under-claiming an effect is the safe direction of that error: it can
+        // A non-`ok` status reports that this operation ran no proven lifecycle
+        // step, and a `cancelled`, `invalid` or `refused` answer carries no
+        // receipt of its own — a cancellation is a cleanup answer, not a
+        // rehearsal result. The observation floor is therefore correct for all
+        // of them and under-claiming is the safe direction of that error: it can
         // never report a mutation the owner did not state, and it can never lift
         // a cancelled answer into a proven one.
-        BACKUP_WIRE_OK | BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED | BACKUP_STATE_CANCELLED => {
-            RestoreTestClaim {
+        BACKUP_STATE_INVALID | BACKUP_STATE_REFUSED | BACKUP_STATE_CANCELLED => RestoreTestClaim {
+            stage: BackupStage::Requested,
+            proof: ProofCeiling::Observation,
+            effect: EffectClass::Read,
+        },
+        // A successful transport/exit is not capture/restore proof (I5.13), so
+        // this status is graded from the receipt the owner DID return, never
+        // from the `ok` token alone. This is the arm that makes the check
+        // structural: the band is placed by the rung the owner declared, so a
+        // rehearsal that genuinely completed an isolated import is reported at
+        // the ladder position that import reached, and an `ok` with no receipt
+        // stays at the observation floor because no rung was declared for it.
+        BACKUP_WIRE_OK => match receipt {
+            Some(receipt) => {
+                let (stage, proof, effect) = rehearsal_band(receipt.level);
+                RestoreTestClaim {
+                    stage,
+                    proof,
+                    effect,
+                }
+            }
+            None => RestoreTestClaim {
                 stage: BackupStage::Requested,
                 proof: ProofCeiling::Observation,
                 effect: EffectClass::Read,
-            }
-        }
+            },
+        },
         _ => return Err(BackupClientError::Client(CliError::ResultMismatch)),
     };
     Ok(claim)
@@ -2783,11 +3270,30 @@ fn restore_test_claim(
 /// comparison between real returned classification and the real declared
 /// ceiling rather than a local restatement of it: [`ProofCeiling::is_at_most`]
 /// bounds the proof reading, `EffectClass`'s own ordering bounds the effect
-/// reading, and [`BackupStage::can_advance`] bounds the lifecycle reading to
-/// the legal edges of the one ladder that owns those stages. The declared pair
-/// is the same [`catalogued_ceiling`] row the projection above reports, so a
-/// catalogue edit that reclassifies this command changes what is admitted
-/// instead of silently diverging from it.
+/// reading, and the lifecycle reading is bounded by the ladder
+/// [`BackupStage`] declares. The declared pair is the same
+/// [`catalogued_ceiling`] row the projection reports, so a catalogue edit that
+/// reclassifies this command changes what is admitted instead of silently
+/// diverging from it.
+///
+/// **The lifecycle bound is reachability, not one edge.** The previous check
+/// called [`BackupStage::can_advance`] with a single `Requested` edge, which
+/// admits only `Requested` and `Captured` and therefore refuses every genuinely
+/// advanced rehearsal — a real completed isolated import could never be
+/// reported. Reachability along the same ladder is what the protocol declares,
+/// and it is read off [`BackupStage`]'s OWN derived ordering, which lists the
+/// stages in ladder order (`Requested` < `Captured` < … < `CutoverAdmitted`) —
+/// the same order [`BackupStage::can_advance`] walks one edge at a time. So this
+/// is not a weaker check substituted for a stronger one: it admits exactly the
+/// rungs the declared ladder contains and still refuses any stage outside it,
+/// and cutover stays unreachable because no rung this route can produce
+/// declares a stage at or above it.
+///
+/// The owner's own `cutover_performed` and `operational_recovery_ready` answers
+/// are compared as content here rather than assumed. They are the owner's claims
+/// about itself, and an isolated rehearsal holds neither the cutover authority
+/// nor the operational-validation evidence, so an answer asserting either is
+/// refused instead of rendered.
 ///
 /// An answer outside the declared ceiling is refused as this operation's typed
 /// refusal naming the exact relation that refused it — never rendered at the
@@ -2795,10 +3301,57 @@ fn restore_test_claim(
 /// owner over-claimed or merely answered in a shape this surface does not know.
 fn require_restore_test_ceiling(
     claim: &RestoreTestClaim,
+    receipt: Option<&RestoreTestReceipt<'_>>,
     status: &str,
     declared_effect: EffectClass,
     declared_proof: ProofCeiling,
+    declared_target_id: &str,
 ) -> Result<(), UnprovenClaim> {
+    // The owner's own self-claims first, because a receipt that contradicts the
+    // boundary this route holds is refused on its own terms whatever ceiling it
+    // also claims. A13.7 keeps cutover a separate authority; no isolated
+    // rehearsal holds owner-issued operational validation evidence.
+    if let Some(receipt) = receipt {
+        if receipt.cutover_performed {
+            return Err(UnprovenClaim {
+                obligation: format!(
+                    "a receipt {} for {BACKUP_RESTORE_TEST_OPERATION} that does not claim a cutover was performed (absent from the owner's own answer: it answers cutover_performed = true)",
+                    receipt.receipt_id
+                ),
+                reason: format!(
+                    "owner returned receipt {} for {BACKUP_RESTORE_TEST_OPERATION} answering cutover_performed = true; A13.7 requires a separate Human/System Owner authority for cutover, this surface never asks for one and the Kernel method has no cutover path, so a receipt claiming it is refused rather than rendered",
+                    receipt.receipt_id
+                ),
+            });
+        }
+        if receipt.operational_recovery_ready {
+            return Err(UnprovenClaim {
+                obligation: format!(
+                    "a receipt {} for {BACKUP_RESTORE_TEST_OPERATION} that does not assert operational recovery readiness (absent from the owner's own answer: it answers operational_recovery_ready = true)",
+                    receipt.receipt_id
+                ),
+                reason: format!(
+                    "owner returned receipt {} for {BACKUP_RESTORE_TEST_OPERATION} answering operational_recovery_ready = true; operational readiness is asserted by the exact owner that issues bounded validation evidence for the isolated root, which an isolated rehearsal does not hold, so it is refused rather than rendered",
+                    receipt.receipt_id
+                ),
+            });
+        }
+        // The receipt must be about the destination this request declared. This
+        // is a relation between the answer and the REQUEST only the caller
+        // holds, so the owner cannot state it and this surface must check it.
+        if receipt.target_id != declared_target_id {
+            return Err(UnprovenClaim {
+                obligation: format!(
+                    "a receipt whose target_id is the {declared_target_id} this request declared (the owner's own receipt {} names target_id {})",
+                    receipt.receipt_id, receipt.target_id
+                ),
+                reason: format!(
+                    "owner returned receipt {} for {BACKUP_RESTORE_TEST_OPERATION} naming target_id {}, but this request declared target_id {declared_target_id}; a receipt about another destination is not this request's answer",
+                    receipt.receipt_id, receipt.target_id
+                ),
+            });
+        }
+    }
     if !claim.proof.is_at_most(declared_proof) {
         return Err(UnprovenClaim {
             obligation: format!(
@@ -2823,21 +3376,35 @@ fn require_restore_test_ceiling(
             ),
         });
     }
-    // A rehearsal starts at the requested stage: there is no ladder edge below
-    // it, and the only stage this operation can never prove is an admitted
-    // cutover, because this surface never asks for one and the Kernel method
-    // has no cutover path.
-    if !BackupStage::can_advance(BackupStage::Requested, claim.stage) {
+    // Reachability along the ONE ladder that owns these stages. A rehearsal
+    // starts at the requested stage, and the stage an answer evidences is
+    // admitted when the declared ladder contains it at or above that start.
+    // The cutover rung is unreachable on this route for two independent reasons:
+    // no owner-declared rung reachable from here places a claim at or above it,
+    // and this surface never asks for a cutover at all.
+    if claim.stage < BackupStage::Requested {
         return Err(UnprovenClaim {
             obligation: format!(
-                "a lifecycle stage this surface may render for {BACKUP_RESTORE_TEST_OPERATION}, reached by a legal advance from {:?} (absent from the owner's own answer: it reads as {:?})",
+                "a lifecycle stage this surface may render for {BACKUP_RESTORE_TEST_OPERATION}, on the ladder at or above {:?} (absent from the owner's own answer: it reads as {:?})",
                 BackupStage::Requested,
                 claim.stage
             ),
             reason: format!(
-                "owner answered {status} to {BACKUP_RESTORE_TEST_OPERATION} with lifecycle stage {:?}, which is not an advance of this operation's ladder from {:?}; cutover is a separate authority (A13.7) and a rehearsal never reaches it, so a stage above that ladder is refused rather than rendered",
+                "owner answered {status} to {BACKUP_RESTORE_TEST_OPERATION} with lifecycle stage {:?}, which is below the {:?} start of this operation's own ladder; a stage that ladder does not contain is refused rather than rendered",
                 claim.stage,
                 BackupStage::Requested
+            ),
+        });
+    }
+    if claim.stage >= BackupStage::CutoverAdmitted {
+        return Err(UnprovenClaim {
+            obligation: format!(
+                "a lifecycle stage below the cutover rung for {BACKUP_RESTORE_TEST_OPERATION} (absent from the owner's own answer: it reads as {:?})",
+                claim.stage
+            ),
+            reason: format!(
+                "owner answered {status} to {BACKUP_RESTORE_TEST_OPERATION} with lifecycle stage {:?}; cutover is a separate authority (A13.7) and an isolated rehearsal never reaches it, so a stage at or above the cutover rung is refused rather than rendered",
+                claim.stage
             ),
         });
     }

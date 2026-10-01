@@ -110,9 +110,18 @@ pub enum HostEventReconciliation {
     },
     /// The event is not terminal, so it closes no correlation.
     NotTerminal,
-    /// The event is terminal but no tracked correlation claimed it. This is
-    /// the ordinary case for a host event that is not about an MCP invocation,
-    /// and it is never a fault.
+    /// The event is terminal, this process tracks at least one emission
+    /// correlation, and none of them claimed it.
+    ///
+    /// This is the ordinary case for a host event that is not about one of the
+    /// MCP invocations this process emitted, and it is never a fault. It
+    /// requires a NON-EMPTY correlation store: "there was something to claim
+    /// and none of it claimed this event" is a per-event fact about one
+    /// observation, while "this process tracked no emission at all" is a fact
+    /// about the join itself and is refused as
+    /// [`ReconcileFailure::NoCorrelationTracked`] instead. Reporting the two
+    /// identically would state an ordinary per-event outcome for a join that
+    /// cannot run, which is the false proof claim A0.3 forbids.
     NoTrackedCorrelation,
 }
 
@@ -128,6 +137,21 @@ pub enum ReconcileFailure {
     /// The event joined a correlation but the owner's own log refused the
     /// resulting revision, so no current assessment exists.
     RevisionRefused(String),
+    /// This process retained no emission correlation, so the join has no
+    /// candidate set to offer the event at all.
+    ///
+    /// #2899: the correlation store is process-local to the bridge and its
+    /// only writer is [`observe_mcp_emission`], which runs on the MCP stdio
+    /// front door. A host event reaching this method through any other ingress
+    /// therefore finds an empty store, and the join is structurally unable to
+    /// resolve there no matter what the event carries. That is a different fact
+    /// from "this event names no tracked correlation", and it is refused
+    /// separately so the absence of the candidate set is never reported as an
+    /// ordinary per-event outcome. It names no missing producer and proposes no
+    /// placement: the front door that owns both sides of this join is an
+    /// architecture-owner decision, and this variant is the typed evidence of
+    /// its absence, not a substitute for it.
+    NoCorrelationTracked,
     /// More than one retained correlation accepted the same candidate event.
     ///
     /// Attribution is decided by the host event's own invocation scope, so this
@@ -146,6 +170,9 @@ impl std::fmt::Display for ReconcileFailure {
             Self::RevisionRefused(detail) => {
                 write!(formatter, "owner's log refused the revision: {detail}")
             }
+            Self::NoCorrelationTracked => formatter.write_str(
+                "this process retained no emission correlation, so the event closed none",
+            ),
             Self::AmbiguousAttribution(event_id) => write!(
                 formatter,
                 "host event {event_id} matched more than one correlation; it closes none"
@@ -596,6 +623,17 @@ impl BridgeRunner {
     /// exact invocation is instead read back out of each retained emission's own
     /// immutable identity and matched against the host event's own minted
     /// invocation scope.
+    ///
+    /// A process that retained no emission at all cannot offer the event
+    /// anything, so it refuses with
+    /// [`ReconcileFailure::NoCorrelationTracked`] instead of answering
+    /// [`HostEventReconciliation::NoTrackedCorrelation`]. The store is
+    /// process-local and written only by [`observe_mcp_emission`] on the MCP
+    /// stdio front door, so this is the outcome on every ingress served by a
+    /// different door. It is stated, not repaired: the front door that owns
+    /// both sides is not named by the architecture and is not this method's to
+    /// choose, so nothing here defaults a correlation, widens the join, or
+    /// weakens a refusal to make the two sides meet.
     pub fn reconcile_terminal_host_event(
         &mut self,
         event: &HostEventEnvelope,
@@ -609,6 +647,18 @@ impl BridgeRunner {
             return Err(ReconcileFailure::OwnerUnavailable);
         }
         let candidate_count = self.correlations.records().len();
+        // An empty candidate set is refused before the loop, not reported as
+        // its outcome. Offering an event to zero correlations and then calling
+        // the result "no tracked correlation claimed it" would assert an
+        // ordinary per-event fact the join never tested, on every ingress whose
+        // front door does not also run the MCP emission producer. Refusing here
+        // keeps the per-event answer truthful for the doors where the candidate
+        // set exists, and names the missing one everywhere else (A0.3: a false
+        // proof claim is a hard boundary). No correlation is created, defaulted
+        // or implied by this refusal.
+        if candidate_count == 0 {
+            return Err(ReconcileFailure::NoCorrelationTracked);
+        }
         // Every retained correlation is offered the candidate and the join
         // decides; a refusal means the event is not attributable to that
         // correlation, which is the ordinary outcome for all of them. The loop

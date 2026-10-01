@@ -504,11 +504,17 @@ struct ServerLog {
 /// committed receipt for the admitted request; `Apply` panics so any
 /// unreserved fallback fails outright; `Receipt` answers empty (the gateway
 /// reconciles from the send response, never by polling here).
+///
+/// The announced `session_principal_binding` is projected from the same
+/// `HostStoreBootstrapRequirement` the real client admits with, so it carries
+/// the authenticated peer principal tuple the requirement was built from
+/// rather than a retyped literal (#4652).
 async fn serve(
     mut server: NamedPipeServer,
     connection_id: String,
     artifact_hash: String,
     config_hash: String,
+    session_principal_binding: String,
     log: Arc<ServerLog>,
 ) {
     let limits = TransportLimits::default();
@@ -519,7 +525,11 @@ async fn serve(
     assert_eq!(frame.kind, FrameKind::Control, "994-kr expects EBP hello");
     let hello = ServerHello {
         selected_protocol: ProtocolVersion::CURRENT,
-        session_principal_binding: "sconc994-kr-store-session".to_owned(),
+        // Same projection the production client validator reconstructs in
+        // `decode_server_hello`: the exact authenticated peer principal tuple
+        // carried by the requirement. A stale or retyped literal here is
+        // refused by production code, never accommodated by the fixture.
+        session_principal_binding,
         allowed_capabilities: eliot_store_api::CAPABILITIES
             .iter()
             .map(|value| (*value).to_owned())
@@ -679,12 +689,21 @@ async fn route(tag: &str) -> Route {
     let artifact = requirement.approved_artifact_hash.as_str().to_owned();
     let config = requirement.approved_config_hash.as_str().to_owned();
     let connection_id = requirement.connection_id.as_str().to_owned();
+    // ONE source for the announced principal: the very tuple the requirement
+    // admitted, already resolved from the authenticated peer identity above.
+    // Both halves are threaded; neither is retyped.
+    let session_principal_binding = format!(
+        "sid={};session={}",
+        requirement.expected_peer_sid.as_str(),
+        requirement.expected_peer_session_id
+    );
     let log = Arc::new(ServerLog::default());
     let server_task = tokio::spawn(serve(
         server,
         connection_id,
         artifact,
         config,
+        session_principal_binding,
         Arc::clone(&log),
     ));
     let client = EbpCanonicalStoreClient::connect(transport, requirement)

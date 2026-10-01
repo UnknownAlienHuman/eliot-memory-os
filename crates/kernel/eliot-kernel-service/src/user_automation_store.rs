@@ -82,7 +82,7 @@ pub struct CanonicalUserAutomationStore<C> {
     client: C,
 }
 
-/// Kernel-authenticated selector for one production UserAutomation occurrence.
+/// Kernel-authenticated selector for one production `UserAutomation` occurrence.
 ///
 /// The daemon contributes only the automation and immutable revision selectors.
 /// Kernel supplies the authenticated principal and current State Fence before
@@ -149,7 +149,7 @@ pub struct UserAutomationNamedReadProvenance {
     /// Revision heads and the response fence are global observations.  The
     /// payload digest retains the target row/read projection as well, so a
     /// current-pointer revalidation can reject a response race even when the
-    /// global head list and StateFence happen to be unchanged.
+    /// global head list and `StateFence` happen to be unchanged.
     pub response_payload_digest: String,
 }
 
@@ -244,7 +244,7 @@ impl<C> CanonicalUserAutomationStore<C> {
         automation_id: &str,
         occurrence_id: &str,
         request: &NamedReadRequest,
-        response: NamedReadResponse,
+        response: &NamedReadResponse,
     ) -> Result<UserAutomationInvocation, StoreError> {
         let expected = Self::invocation_read_request(
             automation_id.to_owned(),
@@ -254,7 +254,7 @@ impl<C> CanonicalUserAutomationStore<C> {
         if request != &expected {
             return Err(StoreError::IdentityConflict);
         }
-        validate_named_response(request, &response)?;
+        validate_named_response(request, response)?;
         let entries = response
             .payload
             .get(eliot_store_api::AUTOMATION_PAGE_INVOCATIONS)
@@ -310,11 +310,11 @@ impl<C> CanonicalUserAutomationStore<C> {
     pub fn project_owner_snapshot(
         lookup: &UserAutomationOwnerLookup,
         current_request: &NamedReadRequest,
-        current_response: NamedReadResponse,
+        current_response: &NamedReadResponse,
         history_request: &NamedReadRequest,
-        history_response: NamedReadResponse,
+        history_response: &NamedReadResponse,
         current_after_request: &NamedReadRequest,
-        current_after_response: NamedReadResponse,
+        current_after_response: &NamedReadResponse,
     ) -> Result<UserAutomationOwnerSnapshot, StoreError> {
         let (expected_current, expected_history) = Self::owner_read_requests(lookup)?;
         if current_request != &expected_current
@@ -323,9 +323,9 @@ impl<C> CanonicalUserAutomationStore<C> {
         {
             return Err(StoreError::IdentityConflict);
         }
-        validate_owner_named_response(lookup, current_request, &current_response)?;
-        validate_owner_named_response(lookup, history_request, &history_response)?;
-        validate_owner_named_response(lookup, current_after_request, &current_after_response)?;
+        validate_owner_named_response(lookup, current_request, current_response)?;
+        validate_owner_named_response(lookup, history_request, history_response)?;
+        validate_owner_named_response(lookup, current_after_request, current_after_response)?;
 
         let current_before_payload_digest = canonical_payload_digest(&current_response.payload)?;
         let current_after_payload_digest =
@@ -339,8 +339,8 @@ impl<C> CanonicalUserAutomationStore<C> {
             return Err(StoreError::RevisionConflict);
         }
 
-        let current = owner_current_row(&current_response)?;
-        let current_after = owner_current_row(&current_after_response)?;
+        let current = owner_current_row(current_response)?;
+        let current_after = owner_current_row(current_after_response)?;
         let (current_automation_id, current_revision, current_state) =
             owner_current_fields(current)?;
         let (after_automation_id, after_revision, after_state) =
@@ -401,12 +401,12 @@ impl<C> CanonicalUserAutomationStore<C> {
             normalization_receipt: decode_retained_normalization_envelope(entry)?,
             state_fence: lookup.state_fence.clone(),
             provenance: UserAutomationOwnerReadProvenance {
-                current_before: owner_read_provenance(current_request, &current_response),
-                history: owner_read_provenance(history_request, &history_response),
+                current_before: owner_read_provenance(current_request, current_response)?,
+                history: owner_read_provenance(history_request, history_response)?,
                 current_after: owner_read_provenance(
                     current_after_request,
-                    &current_after_response,
-                ),
+                    current_after_response,
+                )?,
             },
         })
     }
@@ -591,19 +591,23 @@ fn owner_current_fields(
     Ok((automation_id, revision, state))
 }
 
+/// Projects the owner-issued provenance for one validated canonical named read.
+///
+/// The payload digest is canonicalized rather than asserted, so a payload the
+/// canonical encoder rejects surfaces as the same typed `StoreError` the read
+/// path already uses instead of a panic.
 fn owner_read_provenance(
     request: &NamedReadRequest,
     response: &NamedReadResponse,
-) -> UserAutomationNamedReadProvenance {
-    UserAutomationNamedReadProvenance {
+) -> Result<UserAutomationNamedReadProvenance, StoreError> {
+    Ok(UserAutomationNamedReadProvenance {
         operation: request.operation,
         parameters: request.parameters.clone(),
         request_state_fence: request.state_fence.clone(),
         response_state_fence: response.state_fence.clone(),
         response_revision_heads: response.revision_heads.clone(),
-        response_payload_digest: canonical_payload_digest(&response.payload)
-            .expect("validated named-read payload must be canonicalizable"),
-    }
+        response_payload_digest: canonical_payload_digest(&response.payload)?,
+    })
 }
 
 fn canonical_payload_digest(payload: &Value) -> Result<String, StoreError> {
@@ -2175,7 +2179,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
                 })?,
             occurrence_id,
             &query,
-            response,
+            &response,
         )
     }
 }

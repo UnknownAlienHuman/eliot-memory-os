@@ -14,6 +14,16 @@
 //! replacement's receipt back from the committed row rather than asserting one —
 //! see [`KernelComposition::apply_authenticated_generation_cutover`].
 //!
+//! That ingress is also where the `I5.11`/`I14.14` rollback rule is enforced on
+//! the switch itself rather than only on the operation that reports a rollback:
+//! every committed cutover row's durable state-migration decision for the pinned
+//! canonical-store scope is read through
+//! [`StorageReplacement::refuse_unproven_generation_rollback`] before the row for
+//! the requested cutover identity is written and before the semantic gateway is
+//! asked to move the live route, so a fresh cutover frame cannot obtain the
+//! generation rollback that a forward-repair requirement closed, and the
+//! caller-supplied `migration` claim is never written first.
+//!
 //! Architecture: A5.4 Time и State Fence; A13.2 Kernel и failure domains; A13.3 Module supervision и Doctor; ARCH-AUTH-01; ARCH-RES-03; ARCH-RES-04
 //! Implementation: I4.5 Generation vector and State Fence; I5.6 Admission and staging; I14.14 Module hot replacement; I14.15 Daemon hot replacement; I14.16 Kernel and Host update; I14.21 Unknown commit recovery
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::generation_route_snapshot` and `KernelComposition::apply_generation_cutover` plus inseparable fencing with zero external users; no new crate.
@@ -484,6 +494,71 @@ fn generation_cutover_terminal_code(error: &KernelServiceError) -> &'static str 
     }
 }
 
+/// Projects one refusal from the durable-migration rollback gate onto the
+/// authenticated cutover reply, and returns every other refusal unchanged.
+///
+/// [`StorageReplacement::refuse_unproven_generation_rollback`] answers
+/// [`KernelServiceError::GenerationFenced`] — "a rollback over a committed
+/// irreversible migration", the forward-repair state — and that is a refusal
+/// about the ROUTE, not a malformed request. Returning it as a plain error would
+/// lose it: this ingress's caller flattens every error to one transport fence,
+/// so the refusal would reach the wire indistinguishable from a bad payload, with
+/// no stable code and no observation at all. It is therefore projected through
+/// the same path the failed live swap uses (the `GenerationCutoverOutcome`
+/// terminal code read by [`generation_cutover_terminal_code`]), which keeps
+/// "requested", "refused" and "committed" three distinct answers on the real
+/// control-plane path.
+///
+/// The observation pair and the single terminal diagnostic are the gateway's own
+/// (`kernel.generation.cutover_requested` / `kernel.generation.cutover_failed`
+/// plus one `observe_terminal_error`), emitted here because this frame is
+/// refused BEFORE the gateway is reached: exactly one attempt, one rejection and
+/// one terminal for the failed cutover, never two. Only the validated request's
+/// own cutover identity is logged — never a route, epoch, generation or fence —
+/// and no error payload crosses the reply (I15.4, I07.20).
+///
+/// No receipt rides along. The no-row admission path refuses before the
+/// coordinator re-derives one from a durable row, and the existing-row path
+/// carries `None` by the outcome's own contract because that request presented
+/// no completion, so the reply never asserts cutover evidence this ingress does
+/// not hold.
+///
+/// The closed reply shape gains nothing for this refusal: the forward-repair
+/// state is carried on the wire by the stable terminal code the mapper already
+/// owns, and a new disposition field would widen a reply that
+/// [`GenerationCutoverOutcome`] deliberately keeps closed. The typed refusal
+/// itself is unchanged and still reaches any caller that inspects it directly.
+///
+/// Any other class — a durable ORS refusal the gate propagates, or a request this
+/// ingress never admitted — stays an error, because the daemon boundary already
+/// fences those and this projection must not widen what is answered on the wire.
+fn rollback_refusal_outcome(
+    request: &GenerationCutoverRequest,
+    error: KernelServiceError,
+) -> Result<GenerationCutoverOutcome, KernelServiceError> {
+    if !matches!(&error, KernelServiceError::GenerationFenced) {
+        return Err(error);
+    }
+    observe_generation_cutover(
+        "kernel.generation.cutover_requested",
+        "attempt",
+        request.cutover_id.as_str(),
+    );
+    observe_generation_cutover(
+        "kernel.generation.cutover_failed",
+        "rejected",
+        request.cutover_id.as_str(),
+    );
+    super::kernel_diagnostics::observe_terminal_error(generation_cutover_terminal_code(&error));
+    Ok(GenerationCutoverOutcome {
+        version: 1,
+        cutover_id: request.cutover_id.clone(),
+        terminal_code: Some(generation_cutover_terminal_code(&error)),
+        state_fence: request.state_fence.clone(),
+        cutover_receipt: None,
+    })
+}
+
 #[derive(Clone, Copy)]
 struct ServiceFenceObservation {
     succeeded: bool,
@@ -893,6 +968,29 @@ impl KernelComposition {
     /// - only a `Committed` record reaches the gateway. A staged (`Armed`)
     ///   candidate or a `FailedRequiresForwardCutover` row is evidence, never
     ///   authority, and is refused before any ORS staging happens.
+    /// - the durable migration decision gates the switch, not only the rollback
+    ///   report. `I5.11` allows switching generation back only when no
+    ///   irreversible migration/effect occurred, and `I14.14` requires forward
+    ///   repair instead. So on BOTH admission paths below this ingress calls
+    ///   [`StorageReplacement::refuse_unproven_generation_rollback`], which reads
+    ///   EVERY committed `CUTOVER_OWNERSHIP` row of the pinned `canonical_store`
+    ///   route scope and refuses a switch whose candidate generation is at or
+    ///   behind the `new_generation` of any row recording a
+    ///   `ForwardRepairRequired` decision. Every row, not the newest one: a
+    ///   later ordinary forward cutover commits `RetainCompatible` on its own row
+    ///   and does not retract what an earlier row recorded, so resolving a single
+    ///   newest winner would let a rollback to the pre-migration generation be
+    ///   laundered through one intervening forward cutover. It runs before this
+    ///   ingress writes any row and before the gateway is asked to switch, so the
+    ///   `migration` field a request supplies — `RetainCompatible` included — can
+    ///   neither decide the question nor be written over the top of a committed
+    ///   decision. A refusal here is [`KernelServiceError::GenerationFenced`],
+    ///   the same typed refusal the rollback-reporting operation already returns
+    ///   for that decision, and it is projected onto the authenticated reply by
+    ///   [`rollback_refusal_outcome`] rather than returned as a bare error: the
+    ///   daemon boundary fences every error identically, so an unprojected
+    ///   refusal would reach the wire indistinguishable from a malformed request
+    ///   and would carry no stable code and no observation.
     ///
     /// ## The one cutover this ingress commits
     ///
@@ -912,7 +1010,10 @@ impl KernelComposition {
     /// This boundary reports that same terminal code back on the authenticated
     /// reply through [`GenerationCutoverOutcome::terminal_code`] so a refused or
     /// unknown cutover is observable on the real control-plane path and is never
-    /// projected as a committed cutover. No route, epoch, generation, digest, or
+    /// projected as a committed cutover. The one terminal property is kept, not
+    /// shared twice: a frame refused by the rollback gate never reaches the
+    /// gateway, so that frame's single terminal is the one
+    /// [`rollback_refusal_outcome`] emits. No route, epoch, generation, digest, or
     /// owner error string crosses the reply (I15.4, I07.20).
     pub fn apply_authenticated_generation_cutover(
         &self,
@@ -930,6 +1031,25 @@ impl KernelComposition {
             .load_cutover_ownership(request.cutover_id.as_str())
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
         let (record, cutover_receipt) = if let Some(record) = existing {
+            // I5.11 / I14.14: the switch path, not only the rollback-reporting
+            // path, reads the durable migration decision. This row is already
+            // durable and this frame is about to move the live route onto it, so
+            // the committed rows of the pinned `canonical_store` scope decide
+            // whether the switch may happen at all — every one of them, so a
+            // forward-repair requirement a later forward cutover already
+            // committed over cannot be laundered out of view. The decision is
+            // each row's own `migration`, never this request's claim, and it is
+            // read before the gateway is asked to switch. The refusal is
+            // projected on the authenticated reply as
+            // `CUTOVER_GENERATION_FENCED` by `rollback_refusal_outcome`; every
+            // other class from this gate stays an error.
+            if let Err(error) = StorageReplacement::refuse_unproven_generation_rollback(
+                ors,
+                request.cutover_id.as_str(),
+                record.new_generation,
+            ) {
+                return rollback_refusal_outcome(request, error);
+            }
             (record, None)
         } else {
             // No row at all. This ingress owns the `canonical_store` route
@@ -946,6 +1066,25 @@ impl KernelComposition {
                         field: "generation_cutover.request.cutover_id",
                         reason: "no cutover ownership record is recorded for this cutover",
                     })?;
+            // Same rule, and it has to run HERE: once this ingress writes the
+            // row below, the route is switched from a record whose `migration`
+            // this request supplied, so a rollback could be hidden by presenting
+            // `migration: RetainCompatible` over an incumbent row that records
+            // forward repair. Refusing before the write is what stops the
+            // caller's payload from ever becoming the durable answer; the ORS
+            // owner itself checks only state, epoch lineage and epoch advance.
+            // The gate scans every committed row of the scope, so this frame
+            // cannot be laundered either by its own payload or by an earlier
+            // forward cutover that committed `RetainCompatible` over a
+            // forward-repair row. The refusal is projected on the authenticated
+            // reply as `CUTOVER_GENERATION_FENCED` by `rollback_refusal_outcome`.
+            if let Err(error) = StorageReplacement::refuse_unproven_generation_rollback(
+                ors,
+                request.cutover_id.as_str(),
+                replacement.candidate_generation,
+            ) {
+                return rollback_refusal_outcome(request, error);
+            }
             let (record, receipt) =
                 commit_canonical_store_cutover_ownership(ors, request, replacement)?;
             (record, Some(receipt))

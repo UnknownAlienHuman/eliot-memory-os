@@ -129,12 +129,14 @@ pub use maintenance_trigger_delivery::{
     MaintenanceTriggerDeliveryLedger, MaintenanceTriggerDeliveryRow,
     MaintenanceTriggerRecoveryCounts, MaintenanceTriggerServiceContext,
     handle_maintenance_trigger_ack, handle_maintenance_trigger_claim,
-    handle_maintenance_trigger_decision, handle_maintenance_trigger_expiry,
-    handle_maintenance_trigger_gap, handle_maintenance_trigger_intake,
-    handle_maintenance_trigger_mark_ambiguous, handle_maintenance_trigger_pending_page,
+    handle_maintenance_trigger_compact, handle_maintenance_trigger_decision,
+    handle_maintenance_trigger_expiry, handle_maintenance_trigger_gap,
+    handle_maintenance_trigger_intake, handle_maintenance_trigger_mark_ambiguous,
+    handle_maintenance_trigger_pending_page, handle_maintenance_trigger_recovery_counts,
     handle_maintenance_trigger_release_expired, handle_maintenance_trigger_replacement_pending_set,
     handle_maintenance_trigger_revocation, handle_maintenance_trigger_supersession,
-    recover_maintenance_trigger_commit, replay_maintenance_trigger_after_crash,
+    reconcile_maintenance_trigger_replacement, recover_maintenance_trigger_commit,
+    replay_maintenance_trigger_after_crash,
 };
 pub use notification_state::{
     AuthenticatedNotificationSession, NotificationMetrics, NotificationServiceContext,
@@ -218,11 +220,11 @@ pub use reactive_state::{
 };
 pub use storage_replacement::{
     CANONICAL_STORE_CAPABILITY, CANONICAL_STORE_EFFECT_DOMAIN, CANONICAL_STORE_MODULE_ID,
-    CANONICAL_STORE_WORK_SCOPE, IrreversibleStorageEffect, STORAGE_REPLACEMENT_TRANSFER_FORMAT,
-    StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
-    StorageReplacementTransfer, StorageRollbackDisposition, active_canonical_store_generation,
-    canonical_store_route_owner, canonical_store_route_scope,
-    establish_canonical_store_route_owner,
+    CANONICAL_STORE_WORK_SCOPE, CanonicalStoreWriterAdmission, CanonicalStoreWriterRefusal,
+    IrreversibleStorageEffect, STORAGE_REPLACEMENT_TRANSFER_FORMAT, StorageReplacement,
+    StorageReplacementCutoverReceipt, StorageReplacementStage, StorageReplacementTransfer,
+    StorageRollbackDisposition, active_canonical_store_generation, canonical_store_route_owner,
+    canonical_store_route_scope, establish_canonical_store_route_owner,
 };
 pub use store_client::{
     EbpCanonicalStoreClient, EbpStoreTransport, StoreBackupClientError, StoreClientError,
@@ -271,7 +273,7 @@ pub use store_write_reservation::{
 };
 pub use store_write_status::{
     CanonicalStoreWriteStatus, CanonicalStoreWriteStatusRefusal,
-    project_canonical_store_write_status,
+    project_canonical_store_write_status, project_canonical_store_write_status_from_journal,
 };
 pub use testd_front_door::{
     AuthenticatedTestdSession, TESTD_ADMISSION_ADVERTISED, TESTD_ADMISSION_WIRE_ID,

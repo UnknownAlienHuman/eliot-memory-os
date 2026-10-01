@@ -426,6 +426,61 @@ impl KernelComposition {
                 route.active_generation().value()
             ),
         );
+        // I5.11 stage 8 / A12.3 / A0.3 fail-closed "a second ungoverned
+        // canonical owner or write path" (issue #1872, item W5).
+        //
+        // Everything above this point is self-referential: the route, the
+        // bootstrap requirement and the Host descriptor all descend from the
+        // same Host-supplied generation, so the tuple equality at :405 proves
+        // only that the composition agrees with itself. The one fact that is
+        // NOT the caller's claim is the durable `canonical_store` route owner in
+        // ORS, which is written only by an admitted owner — the Kernel
+        // Generation Registry cutover ingress, or the one-time composition
+        // that establishes the initial owner. So the candidate generation is
+        // admitted against THAT durable owner before a `KernelStoreGateway` is
+        // built, and a candidate the owner does not name is refused here
+        // instead of being connected and retained.
+        //
+        // This is deliberately not satisfied by the Store-layer
+        // `require_active_store_generation` refusal that already exists: that
+        // gate refuses every Store operation a non-owner gateway would issue,
+        // which leaves such a gateway constructed, attached and retained as the
+        // composition's live canonical Store connection on every restart. A
+        // dead Store path is not an absent bridge. The cutover workflow is the
+        // only way a new store generation becomes the canonical writer.
+        let admission =
+            match eliot_kernel_service::StorageReplacement::canonical_store_writer_admission(
+                &self.generation_gateway.ors,
+                route.active_generation(),
+            ) {
+                Ok(admission) => admission,
+                Err(refusal) => {
+                    observe_entrypoint_with_detail(
+                        EntrypointStage::StoreBootstrap,
+                        &format!(
+                            "kernel.store.connect_rejected:canonical_store_writer_admission:{}",
+                            refusal.reason_code()
+                        ),
+                    );
+                    // The same typed composition refusal the route-mismatch
+                    // check above returns: this composition may not hold the
+                    // canonical Store writer for a generation the durable route
+                    // owner does not name. `KernelBuildError` owns no
+                    // route-owner variant, and inventing one here would be a
+                    // second error scheme beside the existing one, so the
+                    // typed `CanonicalStoreWriterRefusal` is rendered into the
+                    // route refusal whose Display already names the governed
+                    // `I5.11` stage-8 cutover as the path to use instead.
+                    return Err(KernelBuildError::Core(refusal.to_string()));
+                }
+            };
+        observe_entrypoint_with_detail(
+            EntrypointStage::StoreBootstrap,
+            &format!(
+                "kernel.store.writer_admitted:store_bridge:generation={}",
+                admission.durable_owner_generation.value()
+            ),
+        );
         let gateway = Arc::new(KernelStoreGateway::new(
             self.service.clone(),
             Arc::new(client),

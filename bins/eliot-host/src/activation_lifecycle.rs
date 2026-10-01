@@ -103,6 +103,7 @@ use super::{
     BOUNDARY_WAKE_SATISFY_TERMINAL, HostBranchDisposition, HostComposition, HostError,
     HostTerminalGuard, drain_rearm_operation, fresh_identity, host_lifecycle_observe_drain,
     host_lifecycle_observe_requested, host_lifecycle_observe_scm, operation, record_fence,
+    sha256_json,
 };
 
 /// Capability every I1.5 observable-use trigger needs: the Host-owned
@@ -236,12 +237,19 @@ pub enum ActivationTriggerClass {
     /// No UI ingress reaches Host in-tree (verified: no UI listener under
     /// `bins/eliot-host`, and `HostRuntimeControlRequest` carries no
     /// caller/principal field that could attribute a carrier to a UI session),
-    /// so this class has no producer here: STITCH caller is the
-    /// ControlBoard/Operator contract owner (`crates/agent`,
-    /// `crates/governor`), which must propagate the authenticated UI identity
-    /// onto a Host-visible envelope. A `Human`-origin automation carrier must
-    /// never be minted as this class: it is CLI-or-UI ambiguous, so that
-    /// attribution would fabricate the trigger.
+    /// so this class has no producer here. The attested half has landed: the
+    /// Operator contract carries the versioned UI-session attestation
+    /// (`crates/governor/eliot-governor/src/operator_intent.rs::OperatorIntentUiSessionAttestation`,
+    /// stamped only from authenticated UI sessions, fail-closed absence), and
+    /// [`ActivationTriggerClass::ui_request_from_attested_ui_session`] derives
+    /// this class from that attestation alone. STITCH remainder: the
+    /// Host-visible envelope passthrough (wire owner
+    /// `crates/kernel/eliot-host-service/src/runtime_control.rs`) and the
+    /// one-line classifier hookup
+    /// (`bins/eliot-host/src/main.rs::runtime_control_request_trigger_class`).
+    /// A `Human`-origin automation carrier must never be minted as this class:
+    /// it is CLI-or-UI ambiguous, so that attribution would fabricate the
+    /// trigger.
     UiRequest,
     /// Agent bridge / MCP attach or tool call.
     AgentBridgeAttach,
@@ -317,6 +325,44 @@ impl ActivationTriggerClass {
             ],
         }
     }
+
+    /// Derives [`Self::UiRequest`] from an attested UI-session identity.
+    ///
+    /// `Some` attestation mints `UiRequest`; `None` (the envelope carries no
+    /// UI attestation) yields `None`: absence is not a UI request and is
+    /// never inferred. The attestation is the only input: a `Human`-origin
+    /// automation carrier carries none of these bindings (it is CLI-or-UI
+    /// ambiguous), so it must never be converted into
+    /// [`AttestedUiSessionIdentity`]; that conversion would fabricate the
+    /// trigger.
+    #[must_use]
+    pub fn ui_request_from_attested_ui_session(
+        attestation: Option<&AttestedUiSessionIdentity>,
+    ) -> Option<Self> {
+        attestation.map(|_| Self::UiRequest)
+    }
+}
+
+/// Attested UI-session identity a Host-visible envelope carries for one
+/// request.
+///
+/// This is the Host-side reading of the ControlBoard/Operator contract's
+/// versioned UI-session attestation
+/// (`crates/governor/eliot-governor/src/operator_intent.rs::OperatorIntentUiSessionAttestation`):
+/// the authenticated UI principal, session, and authentication receipt the
+/// surface owner bound to this exact request. Every member is a validated
+/// [`PlatformHandle`], so no blank or control-character value can reach the
+/// derivation. It is populated only from authenticated UI sessions — never
+/// defaulted, never cloned from a CLI carrier — and its absence means the
+/// request is not a UI request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestedUiSessionIdentity {
+    /// Authenticated UI principal, bound to the request's receipt.
+    pub ui_principal_ref: PlatformHandle,
+    /// Authenticated UI session, equal to the candidate's session claim.
+    pub ui_session_id: PlatformHandle,
+    /// Authentication evidence handle the surface owner bound to this request.
+    pub ui_authentication_receipt_ref: PlatformHandle,
 }
 
 /// Classification of one observable-use trigger against the durable drain
@@ -379,17 +425,28 @@ pub struct ObservableUseOutcome {
 /// They are returned by [`HostComposition::rearm_cancelled_drain`] so the
 /// `Draining` record of the same attempt gets byte-identical attempt identity
 /// and evidence: the two records of one attempt must agree, and a retry of that
-/// attempt must reproduce them exactly.
+/// attempt must reproduce them exactly. The `Draining` continuation additionally
+/// names the exact re-armed `Requested` record checksum, so the reducer admits
+/// the continuation only for the attempt it continues.
 struct DrainRearmAttempt {
     /// Record checksum of the `Cancelled` predecessor this attempt re-arms.
-    /// It is also the value carried in [`DrainRecord::expected_predecessor`].
+    /// It is also the value carried in the `Requested` record's
+    /// [`DrainRecord::expected_predecessor`].
     predecessor_checksum: String,
     /// `drain_generation` of the predecessor. A re-arm never changes the drain
     /// generation: the reducer rejects a different one, and the successor stays
     /// inside the same installation-scoped `activation_generation`.
     drain_generation: EpochTransition,
-    /// Census code read at the re-arm boundary, never the caller's cached one.
-    census_code: &'static str,
+    /// Owner census binding read at the re-arm boundary, never the caller's
+    /// cached code: `idle:<owner-fence-digest>` over the exact `#1751`
+    /// `RuntimeLeaseCensus` fence that admitted this attempt, which the
+    /// retirement barrier revalidates before commit.
+    census_binding: String,
+    /// Record checksum of the re-armed `Requested` record itself. It is the
+    /// value carried in the `Draining` continuation's
+    /// [`DrainRecord::expected_predecessor`], so a restarted process resumes
+    /// the same successor instead of substituting a generic continuation.
+    requested_checksum: String,
     /// Attempt evidence, inheriting the predecessor's consumed triggers.
     evidence_refs: Vec<PlatformHandle>,
 }
@@ -884,6 +941,11 @@ impl HostComposition {
     /// readiness revalidation), or the lease census re-read at this boundary is
     /// not `Idle`. No attempt exists in that case and none is implied.
     ///
+    /// A durable `Requested` or `Draining` prefix left by a crash between
+    /// appends is resumed from the durable record — or refused with a typed
+    /// error when it is not bound to this activation — so a restart recovers
+    /// the same successor instead of substituting fresh evidence.
+    ///
     /// # Errors
     ///
     /// Returns an error when admission is fenced, the durable state or census
@@ -907,7 +969,6 @@ impl HostComposition {
         let activation = state.activation.clone().ok_or_else(|| {
             HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
         })?;
-        let mut rearm: Option<DrainRearmAttempt> = None;
         if state.drain_commit.is_some() {
             // I14.23: after the durable `DrainCommitRecord` the process and
             // authority fence is linearized, so a wake waits for a fresh
@@ -919,10 +980,20 @@ impl HostComposition {
                     .to_owned(),
             ));
         }
-        match state.drain.as_ref().map(|drain| drain.state) {
+        let opened = match state.drain.as_ref().map(|drain| drain.state) {
             Some(DrainState::Draining) => {
-                host_terminal.disarm();
-                return Ok(true);
+                // Audit 5906086103 D2/D3: a durable `Draining` record alone is
+                // not an opened window — the helper verifies the matching
+                // `Draining` activation and binding, finishes a missing
+                // activation transition through the exact recorded attempt, or
+                // fails closed. Only an established window authorizes the
+                // caller to publish its timer.
+                let drain = state.drain.as_ref().ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery(
+                        "draining pre-commit drain record is absent".to_owned(),
+                    )
+                })?;
+                self.resume_draining_window(&activation, drain)?
             }
             Some(DrainState::Failed) => {
                 // I1.5: "A failed or timed-out drain leaves `DEGRADED_RECOVERY`
@@ -946,9 +1017,22 @@ impl HostComposition {
                     host_terminal.disarm();
                     return Ok(false);
                 };
-                rearm = Some(attempt);
+                self.append_idle_drain_draining(&activation, Some(&attempt), Vec::new())?;
+                self.transition_activation(ActivationState::Draining, "host-idle-drain")?;
+                true
             }
-            Some(DrainState::Requested) => {}
+            Some(DrainState::Requested) => {
+                // Audit 5906086103 D2: a crash between the re-arm appends
+                // leaves `Requested` durable — the helper resumes the
+                // successor from the durable record instead of substituting
+                // fresh evidence or operations.
+                let requested = state.drain.as_ref().ok_or_else(|| {
+                    HostError::OwnerLeaseRecovery(
+                        "requested pre-commit drain record is absent".to_owned(),
+                    )
+                })?;
+                self.resume_requested_drain(&activation, requested)?
+            }
             None => {
                 if activation.state != ActivationState::Active {
                     host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_NOT_ACTIVE);
@@ -963,12 +1047,99 @@ impl HostComposition {
                     evidence_refs: evidence_refs.clone(),
                     expected_predecessor: None,
                 }))?;
+                self.append_idle_drain_draining(&activation, None, evidence_refs)?;
+                self.transition_activation(ActivationState::Draining, "host-idle-drain")?;
+                true
             }
+        };
+        if opened {
+            host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_PRE_COMMIT_OPEN);
         }
-        self.append_idle_drain_draining(&activation, rearm.as_ref(), evidence_refs)?;
-        self.transition_activation(ActivationState::Draining, "host-idle-drain")?;
-        host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_PRE_COMMIT_OPEN);
         host_terminal.disarm();
+        Ok(opened)
+    }
+
+    /// Verifies or finishes a durable `Draining` attempt, reporting whether the
+    /// pre-commit window is established.
+    ///
+    /// When the matching `Draining` activation proves the attempt fully
+    /// established, the window is durable. When only the activation transition
+    /// is missing (crash between the appends), it is finished through the
+    /// exact recorded attempt and re-verified. Anything else fails closed: a
+    /// partial attempt is never published as a fully opened window while
+    /// admissions may still be open.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable state cannot be read, the attempt is
+    /// not bound to this activation, or the journal rejects the missing
+    /// transition.
+    fn resume_draining_window(
+        &mut self,
+        activation: &EliotActivationRecord,
+        drain: &DrainRecord,
+    ) -> Result<bool, HostError> {
+        if activation.state == ActivationState::Draining {
+            verify_drain_activation_binding(activation, drain)?;
+            return Ok(true);
+        }
+        if activation.state != ActivationState::Active {
+            return Err(HostError::RecoveryRequired(
+                "pre-commit drain is Draining without a matching Active-or-Draining activation; recovery required"
+                    .to_owned(),
+            ));
+        }
+        verify_drain_fence_binding(activation, drain)?;
+        self.transition_activation(ActivationState::Draining, "host-idle-drain")?;
+        let finished = self.snapshot()?;
+        let finished_activation = finished.activation.clone().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("activation record is absent".to_owned())
+        })?;
+        let finished_drain = finished.drain.as_ref().ok_or_else(|| {
+            HostError::OwnerLeaseRecovery("draining pre-commit drain record is absent".to_owned())
+        })?;
+        verify_drain_activation_binding(&finished_activation, finished_drain)?;
+        Ok(true)
+    }
+
+    /// Resumes a durable `Requested` attempt left by a crash between the
+    /// re-arm appends, reporting whether the pre-commit window is established.
+    ///
+    /// The successor is resumed from the durable record — deterministic
+    /// operation, inherited evidence, exact predecessor link — never a fresh
+    /// evidence/operation substitution. A first attempt continues link-less on
+    /// its durable evidence; a re-armed attempt replays its exact attempt
+    /// identity, and a foreign record is refused instead of continued.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable state cannot be read, the attempt is
+    /// not bound to this activation, or the journal rejects the continuation.
+    fn resume_requested_drain(
+        &mut self,
+        activation: &EliotActivationRecord,
+        requested: &DrainRecord,
+    ) -> Result<bool, HostError> {
+        if activation.state != ActivationState::Active {
+            return Err(HostError::RecoveryRequired(
+                "pre-commit drain is Requested without an Active activation to open the window; recovery required"
+                    .to_owned(),
+            ));
+        }
+        verify_drain_fence_binding(activation, requested)?;
+        if requested.expected_predecessor.is_some() {
+            self.append_rearm_draining_continuation(activation, requested)?;
+        } else {
+            self.append_record(HostStateRecord::Drain(DrainRecord {
+                fence: activation.fence.clone(),
+                operation: operation("host-idle-drain-draining")?,
+                drain_generation: requested.drain_generation.clone(),
+                state: DrainState::Draining,
+                evidence_refs: requested.evidence_refs.clone(),
+                expected_predecessor: None,
+            }))?;
+        }
+        self.transition_activation(ActivationState::Draining, "host-idle-drain")?;
         Ok(true)
     }
 
@@ -977,9 +1148,11 @@ impl HostComposition {
     /// A re-armed attempt reuses its own deterministic identity, its
     /// predecessor's `drain_generation` and its inherited evidence, so both
     /// appended records of that attempt agree and an exact retry reproduces
-    /// them byte-for-byte. A first attempt keeps the existing label and
-    /// generation. The continuation record itself carries no attempt link: only
-    /// the `Cancelled -> Requested` edge does.
+    /// them byte-for-byte. The continuation additionally names the exact
+    /// re-armed `Requested` record checksum, which is what the reducer checks
+    /// before admitting it — a restarted process therefore resumes the same
+    /// successor instead of substituting a generic continuation. A first
+    /// attempt keeps the existing label and generation with no attempt link.
     ///
     /// # Errors
     ///
@@ -990,22 +1163,24 @@ impl HostComposition {
         rearm: Option<&DrainRearmAttempt>,
         evidence_refs: Vec<PlatformHandle>,
     ) -> Result<(), HostError> {
-        let (operation, drain_generation, evidence_refs) = match rearm {
+        let (operation, drain_generation, evidence_refs, expected_predecessor) = match rearm {
             Some(attempt) => (
                 drain_rearm_operation(
                     &activation.fence,
                     &attempt.drain_generation,
                     &attempt.predecessor_checksum,
-                    attempt.census_code,
+                    &attempt.census_binding,
                     "draining",
                 )?,
                 attempt.drain_generation.clone(),
                 attempt.evidence_refs.clone(),
+                Some(attempt.requested_checksum.clone()),
             ),
             None => (
                 operation("host-idle-drain-draining")?,
                 activation.fence.activation_generation.clone(),
                 evidence_refs,
+                None,
             ),
         };
         self.append_record(HostStateRecord::Drain(DrainRecord {
@@ -1014,7 +1189,7 @@ impl HostComposition {
             drain_generation,
             state: DrainState::Draining,
             evidence_refs,
-            expected_predecessor: None,
+            expected_predecessor,
         }))
         .map(|_| ())
     }
@@ -1065,10 +1240,30 @@ impl HostComposition {
         // sensing/containment"). This is one read per re-arm attempt, never one
         // per tick.
         let census = self.idle_lease_census()?;
-        if !census.admits_drain() {
+        let IdleLeaseCensus::Idle { owner_census } = &census else {
+            host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_REARM_CENSUS_NOT_IDLE);
+            return Ok(None);
+        };
+        if !owner_census.is_fully_retired() {
             host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_REARM_CENSUS_NOT_IDLE);
             return Ok(None);
         }
+        // Audit 5906086103 D4: the attempt binds the exact owner-issued census
+        // that admitted it — the `#1751` `RuntimeLeaseCensus` fence (same
+        // contract the Kernel gate and the retirement barrier consume, see
+        // `HostComposition::read_runtime_lease_census_for_activation` and
+        // `HostComposition::require_generation_retirement_barrier`), digested
+        // into the attempt identity and evidence — never a cached zero, a bare
+        // code, or a second Host-local counter. The barrier revalidates the
+        // same fence before commit, so new work is either included in that
+        // census or prevents the drain.
+        let census_binding = format!(
+            "idle:{}",
+            sha256_json(&(
+                &owner_census.state_fence,
+                &owner_census.supervision_lease_id
+            ))?
+        );
         let predecessor_checksum = record_checksum(&HostStateRecord::Drain(predecessor.clone()))?;
         // The successor inherits its predecessor's evidence, which is what
         // keeps a delayed first-attempt trigger recognisable as already
@@ -1077,7 +1272,7 @@ impl HostComposition {
         let mut evidence_refs = vec![
             PlatformHandle::new(format!("drain-rearm-predecessor:{predecessor_checksum}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?,
-            PlatformHandle::new(census.observation_code())
+            PlatformHandle::new(census_binding.clone())
                 .map_err(|error| HostError::Platform(error.to_string()))?,
         ];
         for bound in &predecessor.evidence_refs {
@@ -1085,28 +1280,89 @@ impl HostComposition {
                 evidence_refs.push(bound.clone());
             }
         }
+        let requested = DrainRecord {
+            fence: activation.fence.clone(),
+            operation: drain_rearm_operation(
+                &activation.fence,
+                &predecessor.drain_generation,
+                &predecessor_checksum,
+                &census_binding,
+                "request",
+            )?,
+            drain_generation: predecessor.drain_generation.clone(),
+            state: DrainState::Requested,
+            evidence_refs: evidence_refs.clone(),
+            expected_predecessor: Some(predecessor_checksum.clone()),
+        };
+        let requested_checksum = record_checksum(&HostStateRecord::Drain(requested.clone()))?;
         let attempt = DrainRearmAttempt {
             predecessor_checksum,
             drain_generation: predecessor.drain_generation.clone(),
-            census_code: census.observation_code(),
+            census_binding,
+            requested_checksum,
             evidence_refs: evidence_refs.clone(),
         };
+        self.append_record(HostStateRecord::Drain(requested))?;
+        host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_REARM_REQUESTED);
+        Ok(Some(attempt))
+    }
+
+    /// Appends the `Draining` continuation of a durable re-armed `Requested`
+    /// record after a crash between the re-arm appends.
+    ///
+    /// Every continuation fact is reconstructed from the durable record: the
+    /// cancelled predecessor checksum and census binding it names, its drain
+    /// generation, and its inherited evidence. The durable record must itself
+    /// reproduce the deterministic re-arm operation of this activation, so a
+    /// foreign record is refused instead of continued. The continuation names
+    /// the exact durable `Requested` checksum, so the reducer admits it only
+    /// for the attempt it continues.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable record is not this activation's
+    /// re-arm attempt or the journal rejects the continuation.
+    fn append_rearm_draining_continuation(
+        &mut self,
+        activation: &EliotActivationRecord,
+        requested: &DrainRecord,
+    ) -> Result<(), HostError> {
+        let cancelled_checksum = requested.expected_predecessor.clone().ok_or_else(|| {
+            HostError::RecoveryRequired(
+                "re-armed Requested record names no cancelled predecessor; recovery required"
+                    .to_owned(),
+            )
+        })?;
+        let census_binding = rearm_census_binding_from(requested)?;
+        let expected_request = drain_rearm_operation(
+            &activation.fence,
+            &requested.drain_generation,
+            &cancelled_checksum,
+            &census_binding,
+            "request",
+        )?;
+        if expected_request != requested.operation {
+            return Err(HostError::RecoveryRequired(
+                "durable Requested record is not this activation's re-arm attempt; recovery required"
+                    .to_owned(),
+            ));
+        }
+        let requested_checksum = record_checksum(&HostStateRecord::Drain(requested.clone()))?;
         self.append_record(HostStateRecord::Drain(DrainRecord {
             fence: activation.fence.clone(),
             operation: drain_rearm_operation(
                 &activation.fence,
-                &attempt.drain_generation,
-                &attempt.predecessor_checksum,
-                attempt.census_code,
-                "request",
+                &requested.drain_generation,
+                &cancelled_checksum,
+                &census_binding,
+                "draining",
             )?,
-            drain_generation: attempt.drain_generation.clone(),
-            state: DrainState::Requested,
-            evidence_refs,
-            expected_predecessor: Some(attempt.predecessor_checksum.clone()),
-        }))?;
-        host_lifecycle_observe_drain(BOUNDARY_IDLE_DRAIN_REARM_REQUESTED);
-        Ok(Some(attempt))
+            drain_generation: requested.drain_generation.clone(),
+            state: DrainState::Draining,
+            evidence_refs: requested.evidence_refs.clone(),
+            expected_predecessor: Some(requested_checksum),
+        }))
+        .map(|_| ())
     }
 
     /// Establishes the generation-scoped lease census that gates idle drain.
@@ -1789,6 +2045,88 @@ pub(super) fn prove_terminal_runtime_release(
         "clean stop would silently release a runtime-lease reference that is not this generation's lease"
             .to_owned(),
     ))
+}
+
+/// Requires a pre-commit drain record to be bound to the current activation
+/// generation.
+///
+/// Audit 5906086103 D3: the timer publication gate. The fence identity and
+/// generation, the attempt's drain generation, and non-empty admission
+/// evidence must all name this generation; a record bound elsewhere is refused
+/// instead of published or continued.
+fn verify_drain_fence_binding(
+    activation: &EliotActivationRecord,
+    drain: &DrainRecord,
+) -> Result<(), HostError> {
+    if drain.fence.activation_id != activation.activation_id
+        || drain.fence.activation_generation != activation.fence.activation_generation
+        || drain.drain_generation != activation.fence.activation_generation
+        || drain.evidence_refs.is_empty()
+    {
+        return Err(HostError::RecoveryRequired(
+            "pre-commit drain attempt is not bound to the current activation generation; recovery required"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Requires a fully established pre-commit window: `Draining` drain plus
+/// matching `Draining` activation plus the attempt/admission binding.
+///
+/// Only an established window authorizes the caller to publish
+/// `precommit_opened_at`. A partial prefix is never a window.
+fn verify_drain_activation_binding(
+    activation: &EliotActivationRecord,
+    drain: &DrainRecord,
+) -> Result<(), HostError> {
+    if activation.state != ActivationState::Draining {
+        return Err(HostError::RecoveryRequired(
+            "pre-commit window requires a Draining activation; recovery required".to_owned(),
+        ));
+    }
+    verify_drain_fence_binding(activation, drain)
+}
+
+/// Reads the owner census binding a durable re-armed `Requested` record was
+/// admitted under.
+///
+/// Evidence layout is the re-arm writer's own contract: the predecessor link,
+/// then the census binding (`idle` for attempts admitted before the fence
+/// binding landed, `idle:<owner-fence-digest>` after), then the inherited
+/// predecessor evidence. Anything else is a foreign record and is refused.
+fn rearm_census_binding_from(requested: &DrainRecord) -> Result<String, HostError> {
+    let mut refs = requested.evidence_refs.iter();
+    let predecessor_ref = refs.next().ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "re-armed Requested record carries no predecessor evidence; recovery required"
+                .to_owned(),
+        )
+    })?;
+    let census_ref = refs.next().ok_or_else(|| {
+        HostError::RecoveryRequired(
+            "re-armed Requested record carries no owner census binding; recovery required"
+                .to_owned(),
+        )
+    })?;
+    if !predecessor_ref
+        .as_str()
+        .starts_with("drain-rearm-predecessor:")
+    {
+        return Err(HostError::RecoveryRequired(
+            "re-armed Requested record carries no predecessor evidence; recovery required"
+                .to_owned(),
+        ));
+    }
+    let binding = census_ref.as_str();
+    if binding == "idle" || (binding.starts_with("idle:") && binding.len() > "idle:".len()) {
+        Ok(binding.to_owned())
+    } else {
+        Err(HostError::RecoveryRequired(
+            "re-armed Requested record carries no owner census binding; recovery required"
+                .to_owned(),
+        ))
+    }
 }
 
 fn activation_admission_from(state: &HostState) -> Result<ActivationAdmission, HostError> {

@@ -2609,8 +2609,8 @@ impl KernelStoreGateway {
         .await
     }
 
-    /// Reads and authenticates the current UserAutomation owner material through
-    /// the active generation-routed Store contour. The UserAutomation adapter
+    /// Reads and authenticates the current `UserAutomation` owner material through
+    /// the active generation-routed Store contour. The `UserAutomation` adapter
     /// constructs and projects the closed named reads; this gateway remains the
     /// only production path that performs their Store IO.
     pub async fn read_user_automation_owner(
@@ -2627,11 +2627,11 @@ impl KernelStoreGateway {
         CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::project_owner_snapshot(
             lookup,
             &current_request,
-            current_response,
+            &current_response,
             &history_request,
-            history_response,
+            &history_response,
             &current_request,
-            current_after_response,
+            &current_after_response,
         )
         .map_err(|error| error.to_string())
     }
@@ -2659,7 +2659,7 @@ impl KernelStoreGateway {
             automation_id,
             occurrence_id,
             &request,
-            response,
+            &response,
         )
         .map_err(|error| error.to_string())
     }
@@ -8562,8 +8562,13 @@ enum RetainedUserAutomationObligation {
     Answered {
         /// The retained bounded owner answer body, served verbatim on replay.
         result_response: serde_json::Value,
-        /// Actual carrier request commitment retained by the v1 response event.
-        /// Absent on the legacy wrapped-answer contract.
+        /// Original admitted carrier request commitment this answer must be
+        /// read back against: the one retained by the v1 response event, or,
+        /// for a claim settled by exact owner readback, the ORIGINAL admitted
+        /// carrier digest of that claim's first transport observation. Never a
+        /// digest of the retained answer body. Absent when neither the response
+        /// event nor owner readback ties the body to this claim, which keeps
+        /// the answer refused rather than served.
         transport_request_sha256: Option<String>,
     },
     /// The durable record proves the owner effect was issued and its answer is
@@ -8581,6 +8586,17 @@ enum RetainedUserAutomationObligation {
 /// the owner was never handed the request; the only `Routed` retry is backed by
 /// a retained first-attempt `DefinitelyNotSent` proof. Legacy `Admitted` rows
 /// and every other routed or possible-effect state remain reconciling.
+///
+/// A `ResultReceived`/`Terminal` row holding an answer is answered, and the
+/// carrier commitment it is read back against is whichever of the two
+/// independently recorded values the claim actually carries: the response
+/// observation's own carrier digest, or — for a claim settled by exact owner
+/// readback, which appends no response observation (issue #2970) — the
+/// ORIGINAL admitted carrier digest, admitted only while the retained owner
+/// evidence still binds to this operation, request, payload, attempt identity
+/// and attempt generation and still owns the record's result digest. A claim
+/// carrying neither stays unanswered, so an unknown outcome is never projected
+/// as a settled answer (I14.21).
 fn classify_retained_obligation(
     obligation: &UserAutomationRuntimeObligation,
     record: HostRequestRecord,
@@ -8594,20 +8610,65 @@ fn classify_retained_obligation(
             obligation.owner_operation_id
         ),
     };
-    let transport_request_sha256 = (record.send_claim_protocol_version
-        == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION)
-        .then(|| {
-            record.attempt.as_ref().and_then(|attempt| {
-                attempt
-                    .transport_observations
-                    .last()
-                    .filter(|observation| {
-                        observation.boundary == HostRequestTransportBoundary::ResponseReceived
-                    })
-                    .map(|observation| observation.transport_request_sha256.clone())
+    // The carrier request commitment this claim was ADMITTED with. Every
+    // observation of one claim repeats it (the ORS observation validation
+    // requires it), so the first observation carries the original admitted
+    // value rather than any later observation of it.
+    let admitted_transport_request_sha256 = record
+        .attempt
+        .as_ref()
+        .and_then(|attempt| attempt.transport_observations.first())
+        .map(|observation| observation.transport_request_sha256.clone());
+    // The commitment this attempt durably OBSERVED at the response boundary.
+    let observed_transport_request_sha256 = record.attempt.as_ref().and_then(|attempt| {
+        attempt
+            .transport_observations
+            .last()
+            .filter(|observation| {
+                observation.boundary == HostRequestTransportBoundary::ResponseReceived
+            })
+            .map(|observation| observation.transport_request_sha256.clone())
+    });
+    // An exact owner readback settles the claim in the same transaction as the
+    // result body, but it does not rewrite the original transport observation
+    // history (issue #2970): the readback path terminalizes the phase without
+    // appending a `ResponseReceived` observation. That evidence is an
+    // independently recorded owner receipt, and ORS binds it to this exact
+    // operation, request, payload, attempt identity and attempt generation, and
+    // requires the retained result digest to equal its recorded owner result
+    // commitment. So when that binding holds, the retained body is this
+    // obligation's own answer and the value it must be read back against is the
+    // ORIGINAL admitted carrier digest — not a digest of the retained body, and
+    // not an echo of any payload.
+    //
+    // Requiring the owner's recorded result commitment to equal the record's
+    // own `result_digest` is a comparison against a value the owner committed
+    // to out of band, so a stale or superseded body — one the owner never
+    // committed to under this claim — still fails here and stays refused. A
+    // claim with no readback and no response observation keeps the previous
+    // refusal, so an unknown outcome is never turned into a settled one.
+    let owner_readback_transport_request_sha256 = record
+        .attempt
+        .as_ref()
+        .filter(|attempt| {
+            attempt.owner_readback.as_ref().is_some_and(|readback| {
+                readback.operation_id == record.operation_id
+                    && readback.request_digest == record.request_digest
+                    && readback.payload_digest == record.payload_digest
+                    && readback.attempt_id == attempt.attempt_id
+                    && readback.attempt_generation == attempt.generation
+                    && record.result_digest.as_deref()
+                        == Some(readback.result_commitment_sha256.as_str())
             })
         })
-        .flatten();
+        .and(admitted_transport_request_sha256);
+    let transport_request_sha256 = if record.send_claim_protocol_version
+        == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
+    {
+        observed_transport_request_sha256.or(owner_readback_transport_request_sha256)
+    } else {
+        None
+    };
     let is_current_protocol =
         record.send_claim_protocol_version == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION;
     let has_no_attempt = record.attempt.is_none();

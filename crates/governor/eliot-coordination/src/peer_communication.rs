@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_agent_contracts::{
     CoordinationMapView, DeliveryPolicy, LivePeerMessageKind, LivePeerMessagePayload,
-    MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES, MessageUrgency, RequestedReaction,
+    MAX_LIVE_PEER_PAYLOAD_BYTES, MAX_LIVE_PEER_REFERENCES, MessageUrgency, PublicReference,
+    RequestedReaction,
 };
 use eliot_contracts::{
     BoardEntryState, ClockReading, EpochId, EpochRelation, PeerBoardKind, StateFence,
@@ -3788,12 +3789,30 @@ pub struct AnchoredReview {
     pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
+    /// Review body exactly as submitted. Empty for records admitted before
+    /// content binding; new submissions must carry nonblank bounded content.
+    #[serde(default)]
+    pub content: String,
     pub criteria: Vec<String>,
     pub proof_refs: Vec<String>,
     pub anchor_field: String,
     pub anchor_resolution: AnchorResolution,
     pub findings: Vec<String>,
     pub evidence_refs: Vec<String>,
+    /// Response references bound at submit (I10.18
+    /// `response_change_and_verifier_refs`). Typed public handles only; they
+    /// grant no write, effect, goal, or acceptance authority.
+    #[serde(default)]
+    pub response_refs: Vec<PublicReference>,
+    /// Requested-change references bound at submit. A referenced change is a
+    /// candidate only: it takes effect solely through the normal owner,
+    /// effect, and verifier paths, never through this record.
+    #[serde(default)]
+    pub change_refs: Vec<PublicReference>,
+    /// Verifier-result references bound at submit. They are evidence handles,
+    /// never verifier authority.
+    #[serde(default)]
+    pub verifier_refs: Vec<PublicReference>,
     pub dissent: Option<String>,
     pub uncertainty: Option<String>,
     pub recommendation: ReviewRecommendation,
@@ -3815,6 +3834,14 @@ pub struct AnchoredReview {
     #[serde(default)]
     pub submission_sequence: u64,
     pub durability: PeerDurability,
+    /// Authorized anchor corrections appended after submit, oldest first.
+    /// The original anchor fields above are immutable: a correction appends
+    /// the Human-selected replacement with its evidence, author and
+    /// authority beside the retained original, never over it (I11.10).
+    /// Empty for records admitted before correction binding; old snapshots
+    /// load without it.
+    #[serde(default)]
+    pub corrections: Vec<PeerReviewCorrection>,
 }
 
 /// Submission draft for one anchored review.
@@ -3829,12 +3856,24 @@ pub struct SubmitPeerReview {
     pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
+    /// Review body supplied by the author. Validated as a submit-time
+    /// original: nonblank, bounded, and immutable once admitted.
+    pub content: String,
     pub criteria: Vec<String>,
     pub proof_refs: Vec<String>,
     pub anchor_field: String,
     pub anchor_resolution: AnchorResolution,
     pub findings: Vec<String>,
     pub evidence_refs: Vec<String>,
+    /// Response references supplied by the author. Each entry is validated as
+    /// a submit-time original; entries grant no authority.
+    pub response_refs: Vec<PublicReference>,
+    /// Requested-change references supplied by the author. Each entry is
+    /// validated as a submit-time original and retained as a candidate only.
+    pub change_refs: Vec<PublicReference>,
+    /// Verifier-result references supplied by the author. Each entry is
+    /// validated as a submit-time original and retained as evidence only.
+    pub verifier_refs: Vec<PublicReference>,
     pub dissent: Option<String>,
     pub uncertainty: Option<String>,
     pub recommendation: ReviewRecommendation,
@@ -3876,6 +3915,84 @@ pub struct PeerReviewAckReceipt {
     pub admitted: bool,
     pub merged: bool,
     pub finished: bool,
+}
+
+/// One authorized anchor correction appended to a retained review.
+///
+/// The original anchor (`anchor_field`, `anchor_resolution`,
+/// `artifact_revision`/`artifact_digest` on [`AnchoredReview`]) is immutable:
+/// a correction never rewrites it. It appends the Human-selected replacement
+/// beside its evidence, author and authority. A selected replacement is an
+/// authorized correction, never proof the automatic resolver was exact
+/// (I11.10): `anchor_resolution` records the claimed replacement resolution,
+/// not a resolver verdict.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PeerReviewCorrection {
+    /// Exact review this correction targets.
+    pub review_id: String,
+    /// Retry identity. A repeated `request_id` with an identical body
+    /// reconciles the original receipt instead of appending a duplicate; the
+    /// same key with a different body is an idempotency conflict.
+    pub request_id: String,
+    /// Per-review sequence of this correction. The first correction expects
+    /// index 0; a writer racing on a stale count is rejected so concurrent
+    /// corrections cannot silently reorder.
+    pub correction_index: u64,
+    /// Replacement anchor selector exactly as authorized.
+    pub anchor_field: String,
+    /// Replacement resolution claimed at correction time: a historical claim
+    /// about the replacement, never a current-target proof.
+    pub anchor_resolution: AnchorResolution,
+    /// Evidence carried by the correction itself.
+    pub evidence_refs: Vec<String>,
+    /// Session that authored the correction, authenticated through the same
+    /// sender path as review submit.
+    pub author_session_id: String,
+    /// Principal bound to the author session at correction time.
+    pub author_principal: String,
+    pub authority_epoch: EpochId,
+    pub state_fence: StateFence,
+    pub created_at: u64,
+    /// Admission sequence of the corrected review (`ReviewItemSubmitted`),
+    /// joining the correction to the item's delivery evidence. A correction
+    /// carries no independent event: event kinds are owned outside this
+    /// slice, so the correction rides the review's own admission sequence.
+    pub submission_sequence: u64,
+    pub durability: PeerDurability,
+}
+
+/// Draft for one authorized anchor correction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CorrectPeerReviewAnchor {
+    pub request_id: String,
+    pub review_id: String,
+    /// Correction index the writer observed. It must equal the retained
+    /// correction count or the writer raced a concurrent correction.
+    pub expected_correction_index: u64,
+    /// Artifact revision the writer corrects against. It must equal the
+    /// retained revision: changed content under the same operation identity
+    /// is rejected, never rebound silently.
+    pub expected_artifact_revision: u64,
+    pub anchor_field: String,
+    pub anchor_resolution: AnchorResolution,
+    pub evidence_refs: Vec<String>,
+    pub author_session_id: String,
+    pub authority_epoch: EpochId,
+    pub state_fence: StateFence,
+}
+
+/// Receipt for one anchor correction. The receipt proves retention only:
+/// correction, answering, acceptance of a code change and verified
+/// resolution stay distinct events, and only an explicit resolution or a
+/// reasoned rejection disposes the obligation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PeerReviewCorrectionReceipt {
+    pub correction: PeerReviewCorrection,
+    pub durability: PeerDurability,
+    pub replayed: bool,
 }
 
 /// Expected-review denominator for one artifact: expected versus submitted
@@ -3929,6 +4046,8 @@ pub struct PeerReviewObligation {
     pub operation: String,
     pub target_kind: ReviewTargetKind,
     pub kind: ReviewKind,
+    /// Review body copied from the retained record.
+    pub content: String,
     /// Historical anchor selector exactly as submitted.
     pub anchor_field: String,
     /// Anchor resolution claimed at submit; the owner records the claim and
@@ -3958,6 +4077,16 @@ pub struct PeerReviewObligation {
     pub conflict_id: Option<String>,
     pub evidence_refs: Vec<String>,
     pub proof_refs: Vec<String>,
+    /// Response references copied from the retained record. They grant no
+    /// write, effect, goal, or acceptance authority.
+    pub response_refs: Vec<PublicReference>,
+    /// Requested-change references copied from the retained record. They are
+    /// candidates only; a referenced change takes effect solely through the
+    /// normal owner, effect, and verifier paths.
+    pub change_refs: Vec<PublicReference>,
+    /// Verifier-result references copied from the retained record. They are
+    /// evidence handles, never verifier authority.
+    pub verifier_refs: Vec<PublicReference>,
     pub created_at: u64,
     /// Record fence the retained obligation was admitted under.
     pub state_fence: StateFence,
@@ -3965,6 +4094,13 @@ pub struct PeerReviewObligation {
     /// retained record. Joins the item to its delivery evidence; zero for
     /// records admitted before sequence binding.
     pub submission_sequence: u64,
+    /// Number of authorized anchor corrections retained on this obligation.
+    /// The original anchor above never moves; corrections append beside it.
+    pub correction_count: u64,
+    /// Latest retained correction, when any. It carries the replacement
+    /// anchor with its evidence, author and authority verbatim from the
+    /// retained record; the full appended history stays on the record.
+    pub latest_correction: Option<PeerReviewCorrection>,
 }
 
 impl PeerReviewObligation {
@@ -3995,6 +4131,7 @@ impl From<&AnchoredReview> for PeerReviewObligation {
             operation: review.operation.clone(),
             target_kind: review.target_kind,
             kind: review.kind,
+            content: review.content.clone(),
             anchor_field: review.anchor_field.clone(),
             anchor_resolution: review.anchor_resolution,
             current_resolution: None,
@@ -4005,9 +4142,14 @@ impl From<&AnchoredReview> for PeerReviewObligation {
             conflict_id: review.conflict_id.clone(),
             evidence_refs: review.evidence_refs.clone(),
             proof_refs: review.proof_refs.clone(),
+            response_refs: review.response_refs.clone(),
+            change_refs: review.change_refs.clone(),
+            verifier_refs: review.verifier_refs.clone(),
             created_at: review.created_at,
             state_fence: review.state_fence.clone(),
             submission_sequence: review.submission_sequence,
+            correction_count: review.corrections.len() as u64,
+            latest_correction: review.corrections.last().cloned(),
         }
     }
 }
@@ -4081,6 +4223,25 @@ fn current_anchor_resolution(
     } else {
         None
     }
+}
+
+/// Whether a retained correction is the exact retention of a correction
+/// draft: every draft-carried field matches, so a lost-ack retry reconciles
+/// the original receipt while any changed field under the same `request_id`
+/// is an idempotency conflict.
+fn correction_replays_draft(
+    correction: &PeerReviewCorrection,
+    draft: &CorrectPeerReviewAnchor,
+) -> bool {
+    correction.review_id == draft.review_id
+        && correction.request_id == draft.request_id
+        && correction.correction_index == draft.expected_correction_index
+        && correction.anchor_field == draft.anchor_field
+        && correction.anchor_resolution == draft.anchor_resolution
+        && correction.evidence_refs == draft.evidence_refs
+        && correction.author_session_id == draft.author_session_id
+        && correction.authority_epoch == draft.authority_epoch
+        && correction.state_fence == draft.state_fence
 }
 
 impl CoordinationOwner {
@@ -4221,6 +4382,34 @@ impl CoordinationOwner {
         for finding in draft.findings.iter().chain(draft.evidence_refs.iter()) {
             peer_text(finding, "review_finding")?;
         }
+        peer_text(&draft.content, "review_content")?;
+        if draft.content.len() as u64 > MAX_PEER_MESSAGE_BYTES {
+            return Err(CoordinationError::InvalidField("review_content"));
+        }
+        if draft.response_refs.len() > MAX_PEER_REFERENCES {
+            return Err(CoordinationError::InvalidField("response_refs"));
+        }
+        if draft.change_refs.len() > MAX_PEER_REFERENCES {
+            return Err(CoordinationError::InvalidField("change_refs"));
+        }
+        if draft.verifier_refs.len() > MAX_PEER_REFERENCES {
+            return Err(CoordinationError::InvalidField("verifier_refs"));
+        }
+        for reference in &draft.response_refs {
+            reference
+                .validate()
+                .map_err(|_| CoordinationError::InvalidField("response_refs"))?;
+        }
+        for reference in &draft.change_refs {
+            reference
+                .validate()
+                .map_err(|_| CoordinationError::InvalidField("change_refs"))?;
+        }
+        for reference in &draft.verifier_refs {
+            reference
+                .validate()
+                .map_err(|_| CoordinationError::InvalidField("verifier_refs"))?;
+        }
         if let Some(indexed) = self.peer_review_requests.get(&draft.request_id) {
             if indexed != &draft.review_id {
                 return Err(CoordinationError::PeerSemanticConflict(
@@ -4300,12 +4489,16 @@ impl CoordinationOwner {
             operation: draft.operation.clone(),
             target_kind: draft.target_kind,
             kind: draft.kind,
+            content: draft.content.clone(),
             criteria: draft.criteria.clone(),
             proof_refs: draft.proof_refs.clone(),
             anchor_field: draft.anchor_field.clone(),
             anchor_resolution: draft.anchor_resolution,
             findings: draft.findings.clone(),
             evidence_refs: draft.evidence_refs.clone(),
+            response_refs: draft.response_refs.clone(),
+            change_refs: draft.change_refs.clone(),
+            verifier_refs: draft.verifier_refs.clone(),
             dissent: draft.dissent.clone(),
             uncertainty: draft.uncertainty.clone(),
             recommendation: draft.recommendation,
@@ -4316,6 +4509,7 @@ impl CoordinationOwner {
             expires_at: draft.expires_at,
             conflict_id: None,
             submission_sequence: 0,
+            corrections: Vec::new(),
             authority_epoch: draft.authority_epoch.clone(),
             state_fence: draft.state_fence.clone(),
             created_at: now,
@@ -4469,6 +4663,123 @@ impl CoordinationOwner {
             stored.rejection_reason = Some(reason);
         }
         Ok(stored.clone())
+    }
+
+    /// Appends one authorized anchor correction to a retained review.
+    ///
+    /// Correction runs through the existing authenticated sender path: the
+    /// author's session, epoch and fence are checked by `peer_sender`, so
+    /// only a live session bound to its principal may correct, and the
+    /// principal is bound from the session the way submit binds it. The
+    /// original anchor is preserved; the replacement is appended with its
+    /// evidence, author and authority. A Human-selected replacement is an
+    /// authorized correction, never proof the resolver was exact. Delivery,
+    /// answering, correction, acceptance of a code change and verified
+    /// resolution stay distinct: this method changes no lifecycle, so a
+    /// correction alone never disposes the obligation, and an answer without
+    /// the required proof still closes nothing. A repeated `request_id` with
+    /// an identical body reconciles the original receipt instead of
+    /// appending a duplicate; the same key with a different body conflicts.
+    /// Stale concurrent corrections and changed content under the same
+    /// operation identity fail without changing the record.
+    pub fn correct_peer_review_anchor(
+        &mut self,
+        draft: &CorrectPeerReviewAnchor,
+        clock: &dyn PeerClockPort,
+        durability: &dyn PeerDurabilityPort,
+    ) -> Result<PeerReviewCorrectionReceipt, CoordinationError> {
+        peer_text(&draft.request_id, "request_id")?;
+        peer_text(&draft.review_id, "review_id")?;
+        peer_text(&draft.author_session_id, "author_session_id")?;
+        peer_text(&draft.anchor_field, "anchor_field")?;
+        for evidence in &draft.evidence_refs {
+            peer_text(evidence, "correction_evidence")?;
+        }
+        self.common(draft.authority_epoch.clone(), &draft.state_fence)?;
+        let now = clock.now_ms();
+        self.peer_sender(
+            &draft.author_session_id,
+            &draft.authority_epoch,
+            &draft.state_fence,
+            now,
+        )?;
+        let stored = self
+            .peer_reviews
+            .get(&draft.review_id)
+            .cloned()
+            .ok_or_else(|| CoordinationError::NotFound {
+                kind: "peer_review",
+                id: draft.review_id.clone(),
+            })?;
+        if let Some(correction) = stored
+            .corrections
+            .iter()
+            .find(|correction| correction.request_id == draft.request_id)
+        {
+            if !correction_replays_draft(correction, draft) {
+                return Err(CoordinationError::IdempotencyConflict(
+                    draft.request_id.clone(),
+                ));
+            }
+            return Ok(PeerReviewCorrectionReceipt {
+                correction: correction.clone(),
+                durability: correction.durability.clone(),
+                replayed: true,
+            });
+        }
+        if draft.expected_artifact_revision != stored.artifact_revision {
+            return Err(CoordinationError::InvalidState);
+        }
+        if !matches!(
+            stored.lifecycle,
+            PeerReviewLifecycle::PendingDelivery
+                | PeerReviewLifecycle::Delivered
+                | PeerReviewLifecycle::Answered
+        ) {
+            return Err(CoordinationError::InvalidState);
+        }
+        let retained_count = stored.corrections.len() as u64;
+        if draft.expected_correction_index != retained_count {
+            return Err(CoordinationError::PeerSemanticConflict(
+                draft.review_id.clone(),
+            ));
+        }
+        if !draft.anchor_resolution.satisfies_required_review() {
+            return Err(CoordinationError::PeerReviewAnchorInvalid(
+                draft.review_id.clone(),
+            ));
+        }
+        let recorded = attest_peer_durability(durability)?;
+        let author_principal = self
+            .sessions
+            .get(&draft.author_session_id)
+            .map(|session| session.principal_id.clone())
+            .ok_or(CoordinationError::InvalidState)?;
+        let correction = PeerReviewCorrection {
+            review_id: draft.review_id.clone(),
+            request_id: draft.request_id.clone(),
+            correction_index: retained_count,
+            anchor_field: draft.anchor_field.clone(),
+            anchor_resolution: draft.anchor_resolution,
+            evidence_refs: draft.evidence_refs.clone(),
+            author_session_id: draft.author_session_id.clone(),
+            author_principal,
+            authority_epoch: draft.authority_epoch.clone(),
+            state_fence: draft.state_fence.clone(),
+            created_at: now,
+            submission_sequence: stored.submission_sequence,
+            durability: recorded.clone(),
+        };
+        let stored = self
+            .peer_reviews
+            .get_mut(&draft.review_id)
+            .ok_or(CoordinationError::InvalidState)?;
+        stored.corrections.push(correction.clone());
+        Ok(PeerReviewCorrectionReceipt {
+            correction,
+            durability: recorded,
+            replayed: false,
+        })
     }
 
     /// Acknowledges one review without changing it. The receipt proves the

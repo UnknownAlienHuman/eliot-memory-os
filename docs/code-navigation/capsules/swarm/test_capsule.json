@@ -39,7 +39,18 @@
       "value": null
     },
     "forbidden_pattern_hits": [],
-    "inline_cfg_test_modules": 5
+    "inline_cfg_test_modules": 5,
+    "test_only_modules": {
+      "classification_rule": "A module reachable only through cfg(test) module edges or from a test target root is test source; a path component named `tests` is not evidence of anything. Coverage is preserved: classified test-only modules stay in the test slice and their test attributes are still counted.",
+      "paths": [
+        "crates/agent/eliot-swarm/src/repair_tests.rs"
+      ]
+    },
+    "unresolved_cfg_or_module_cases": {
+      "rule": "A cfg predicate that mentions `test` but can also hold without it is neither test-only nor an unconditional production edge. It is reported here as explicit uncertainty and the file stays production-reachable, so no path is renamed and no test is removed to shrink a context estimate.",
+      "cases": []
+    },
+    "unselected_package_files": []
   },
   "unit_property_model_tests": {
     "declared_proof_surface": {
@@ -49,21 +60,34 @@
     },
     "selected_tests": [
       {
+        "path": "crates/agent/eliot-swarm/src/repair_tests.rs",
+        "bytes": 50087,
+        "sha256": "1eb553c37c22db8f7f983f910431d43b3c9b1ccae8fb2660df6712ba45fd80ab",
+        "test_attributes": 15,
+        "inline_cfg_test": false,
+        "test_only_module": true,
+        "classes": [
+          "fault_restart_replay"
+        ]
+      },
+      {
         "path": "crates/agent/eliot-swarm/tests/disposition.rs",
         "bytes": 3999,
         "sha256": "18e0e7b10289420ff7a60977be3ec824c69dec358b9e4c8a5754826417aadcc5",
         "test_attributes": 2,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "edge_profile"
         ]
       },
       {
         "path": "crates/agent/eliot-swarm/tests/durable_work.rs",
-        "bytes": 97847,
-        "sha256": "5b096cc3c652eb037c08e5c785b504ef7d95614f830e02a81aecef50de9b71ef",
+        "bytes": 97977,
+        "sha256": "35bf3e3eb81dd32031e012c558b9148e5e9f107c49bdec304b83fadcd64579fd",
         "test_attributes": 40,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -75,6 +99,7 @@
         "sha256": "3514cbe27f5c6aaa7d0cc8a5934b18214b563143b4be4d4b3595d20a9791a385",
         "test_attributes": 8,
         "inline_cfg_test": false,
+        "test_only_module": false,
         "classes": [
           "fake_port_contract",
           "fault_restart_replay"
@@ -109,6 +134,7 @@
       "value": null
     },
     "selected_cases": [
+      "crates/agent/eliot-swarm/src/repair_tests.rs",
       "crates/agent/eliot-swarm/tests/durable_work.rs",
       "crates/agent/eliot-swarm/tests/swarm_real_cases.rs"
     ]
@@ -137,16 +163,12 @@
   "expected_nonzero_test_count": {
     "method": "count of #[test]/#[tokio::test] attributes in the selected test slice",
     "test_attribute_count": 101,
-    "test_stu": 51738,
+    "test_stu": 68477,
     "nonzero": true
   },
-  "bound_contract_digest": "db77044af9d02336e5e1950c57ea95b35416d2a38f935cfe4ff69a22d2dcd365",
+  "bound_contract_digest": "aee3478b03b541d3",
   "source_provenance": {
-    "input_digests": {
-      "workspace_manifest": {
-        "path": "Cargo.toml",
-        "sha256": "81bc862b06245f16b3845388a32098fd2cc7597939e97788475a047cc447ce2a"
-      },
+    "contract_semantic_inputs": {
       "contract_catalogue": {
         "path": "docs/architecture/handle-index.json",
         "sha256": "154a529a1d3e9d9f4ff4a8af14a8ce0265ed5553ba95ab807bd530cf07e99812"
@@ -163,18 +185,31 @@
         "path": "crates/agent/eliot-swarm/Cargo.toml",
         "sha256": "71da7c87657ad0e87f3ecf7cb9f0e71c0830f22740c54f29f8c2309b0c47e092"
       },
-      "module_manifest": null,
-      "selected_source": {
+      "module_manifest": null
+    },
+    "exact_provenance": {
+      "workspace_manifest": {
+        "path": "Cargo.toml",
+        "sha256": "f2ab651b76ac9f5870f8268c52d1db5839cdb957f5939cd0d8e3a2edcd91fe45"
+      },
+      "physical_source_inventory": {
         "path_count": 9,
-        "sha256": "ac0d13ddb8c23479ffba28fce83cb97c68e2d03003cc1e9d347bddd71997af80"
+        "sha256": "17186f3b1a7b203d510da63640813fac9821a91f5ec217779174a6aa854f271c"
+      },
+      "selected_workset": {
+        "allocation_scope": "PACKAGE_WIDE",
+        "allocation_state": "EXPLICIT_PACKAGE_WIDE",
+        "path_count": 9,
+        "sha256": "17186f3b1a7b203d510da63640813fac9821a91f5ec217779174a6aa854f271c"
       }
     },
     "generator": "scripts/code_navigation.py capsules",
-    "generator_version": "1.0.0"
+    "generator_version": "1.0.0",
+    "note": "A change under exact_provenance moves artifact_digest only. It is not a public API or semantic-contract change and is not an instruction to re-read or re-test every cell."
   },
-  "artifact_digest": "bcad8121eaf18e34120ddd63c1c8120c43aafea44224956a5d11dacf24c336e2",
+  "artifact_digest": "c3868443c28cef590af31a498538b19719e737adaf2375a2e892560c7ddc3f47",
   "contract_revision": {
-    "derivation": "first 16 hex characters of the artifact digest",
-    "value": "bcad8121eaf18e34"
+    "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
+    "value": "e39636735d0e8989"
   }
 }

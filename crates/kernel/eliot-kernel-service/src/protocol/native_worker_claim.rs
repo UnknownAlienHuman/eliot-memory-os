@@ -728,7 +728,7 @@ impl NativeWorkerClaimRequest {
         &self,
         registration_id: &str,
         worker_generation: u64,
-        authority_epoch: EpochId,
+        authority_epoch: &EpochId,
         state_fence: &StateFence,
     ) -> Result<(), KernelServiceError> {
         if self.registration_id != registration_id {
@@ -743,7 +743,7 @@ impl NativeWorkerClaimRequest {
                 reason: "claim generation does not match the presenting registration",
             });
         }
-        if self.authority_epoch != authority_epoch {
+        if self.authority_epoch != *authority_epoch {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "native_worker_claim.epoch_fence",
             });
@@ -1243,7 +1243,7 @@ impl NativeWorkerClaimConflict {
 )]
 pub enum NativeWorkerClaimResponse {
     /// The claim was admitted; the receipt is the admission proof.
-    Admitted(NativeWorkerClaimReceipt),
+    Admitted(Box<NativeWorkerClaimReceipt>),
     /// The claim was refused for the named typed reason.
     Rejected(NativeWorkerClaimRejection),
     /// The claim identity conflicts with admitted bound work.
@@ -1437,7 +1437,7 @@ mod executable_binding_tests {
             .expect("envelope digest validates");
         fixture
             .claim
-            .validate_presented_under_registration("reg-1", 1, test_epoch(1), &live_fence())
+            .validate_presented_under_registration("reg-1", 1, &test_epoch(1), &live_fence())
             .expect("registration binds");
         fixture
             .claim

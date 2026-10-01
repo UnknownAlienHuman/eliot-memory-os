@@ -8,10 +8,11 @@ use contract_models::{
     windows_path_is_within,
 };
 pub use contract_models::{
-    InstallerProtectedFileReadback, InstallerRootAbsentSnapshot, InstallerRootCreateAttempt,
-    InstallerRootCreateDisposition, InstallerRootError, InstallerRootObjectSnapshot,
-    InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation, InstallerRootPrimitiveSpec,
-    InstallerRootProfile, InstallerRootStage, windows_path_identity_digest, windows_paths_equal,
+    ISOLATED_RESTORE_ROOT_DIR, InstallerProtectedFileReadback, InstallerRootAbsentSnapshot,
+    InstallerRootCreateAttempt, InstallerRootCreateDisposition, InstallerRootError,
+    InstallerRootObjectSnapshot, InstallerRootPrimitiveCreate, InstallerRootPrimitiveObservation,
+    InstallerRootPrimitiveSpec, InstallerRootProfile, InstallerRootStage,
+    windows_path_identity_digest, windows_paths_equal,
 };
 
 use std::path::{Path, PathBuf};
@@ -165,9 +166,41 @@ impl WindowsInstallerRootExecutor {
                 let root_is_installations = windows_paths_equal(&request.root, &installations);
                 let packages = expected.join("packages");
                 let root_is_packages = windows_paths_equal(&request.root, &packages);
+                // The isolated restore area is the fourth owner-declared leaf of
+                // this contour, admitted exactly the way `installations` and
+                // `packages` are: one exact named leaf, sibling to them, one
+                // level below the profile root. It is not a widened test and
+                // not a subtree.
+                //
+                // The installation root contract publishes this exact leaf as a
+                // `CreateRoot` effect (`effect:create:isolated_restore_root`)
+                // that the plan validator REQUIRES to be created and ACL'd
+                // ("transaction plan must create and ACL exactly the declared
+                // root hierarchy"). I5.13 requires `restore to isolated root;`
+                // and every destination preparation proves this area already
+                // exists through this contour, so the published effect has to be
+                // executable. Excluding it left an effect the executor always
+                // refused, so no non-`PortableDev` plan could execute.
+                //
+                // Admission is by declared name under the same profile root the
+                // installation root was already proved to sit in, so nothing new
+                // is admitted outside the contour: `expected` is still the exact
+                // OS-resolved `<known folder>\Eliot`, the profile anchor must
+                // still equal that known folder, the installation root must
+                // still be a 64-hex leaf of `Eliot\installations`, `..`/`.` are
+                // still refused, and every existing ancestor is still proved
+                // non-reparse. Only the one exact leaf is added;
+                // `isolated-restore\<anything>` stays refused exactly as
+                // `packages\<anything>` is, because the installer builds the
+                // hierarchy one leaf at a time and no descendant of a declared
+                // leaf is itself declared.
+                let isolated_restore = expected.join(ISOLATED_RESTORE_ROOT_DIR);
+                let root_is_isolated_restore =
+                    windows_paths_equal(&request.root, &isolated_restore);
                 if !root_is_profile
                     && !root_is_installations
                     && !root_is_packages
+                    && !root_is_isolated_restore
                     && !windows_path_is_within(&request.root, &request.installation_root)
                 {
                     return Err(InstallerRootError::InvalidPath);
