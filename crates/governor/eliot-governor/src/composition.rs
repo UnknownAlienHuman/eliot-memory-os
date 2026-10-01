@@ -123,6 +123,7 @@ use eliot_workscope::{
     AuthorityBasis, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
+    GoverningSourceCandidate, PrecedenceDeclaration, SourceCandidateOrigin,
     IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
     MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
     PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
@@ -7251,19 +7252,323 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// for that request.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
-    pub fn admit_initial_scope_binding(
+    pub async fn admit_initial_scope_binding(
         &self,
+        now: u64,
+        authenticated_identity: (&str, &str),
+        task_binding: (&str, u64),
+        work_scope_ref: &str,
+        state_fence: &StateFence,
         descriptor: &WorkScopeDescriptor,
         owner_revision: u64,
         binding: &ScopeBinding,
         observed: &ObservedScopeResources,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
+        source_candidates: &[GoverningSourceCandidate],
+        declared_precedences: &[PrecedenceDeclaration],
+        absence_reason_ref: Option<&str>,
+        admission_deadline: u64,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
         let fence = self.snapshot.state_fence();
+        if !fences_match_exact(&fence, state_fence)
+            || descriptor.state_fence != fence
+            || descriptor.privacy != *privacy
+            || descriptor.scope_ref != work_scope_ref
+            || binding.scope.scope_ref != work_scope_ref
+            || admission_deadline < now
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let work_scope_read = self.recovery.owner_read(RecoveryOwner::WorkScope)?;
+        let next_owner_revision = work_scope_read.revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("WorkScope owner revision overflow".to_owned())
+        })?;
+        if owner_revision != next_owner_revision || self.owners.work_scope.is_some() {
+            return Err(CompositionError::Recovery(
+                "initial WorkScope owner revision is not the exact next retained revision"
+                    .to_owned(),
+            ));
+        }
+
+        let task_state = self
+            .current_task_binding_state_for_initial_scope(
+                now,
+                authenticated_identity,
+                work_scope_ref,
+                state_fence,
+                task_binding,
+            )
+            .await?;
+        let TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+            selection_source_ref,
+            evidence_ref,
+        } = task_state
+        else {
+            return Err(CompositionError::ActivationStaleFence);
+        };
+
+        let policy_owner = self.owners.policy.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "initial WorkScope binding has no current Policy owner".to_owned(),
+            )
+        })?;
+        let policy_read = self.recovery.policy_read.as_ref().ok_or_else(|| {
+            CompositionError::Recovery(
+                "initial WorkScope binding has no current Policy named read".to_owned(),
+            )
+        })?;
+        if policy_owner.state_fence() != &fence
+            || policy_read.state_fence != fence
+            || policy_read.revision != policy_owner.revision()
+            || policy_read.value_digest != policy_owner.canonical_digest()
+            || policy_owner.rebuilt_digest()? != policy_owner.snapshot_digest()
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let policy_snapshot = policy_owner.snapshot();
+        let privacy_setting = policy_snapshot
+            .settings
+            .iter()
+            .find(|setting| setting.key == eliot_config::PRIVACY_MODE_KEY)
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "initial WorkScope binding has no admitted privacy.mode setting".to_owned(),
+                )
+            })?;
+        if privacy_setting.owner_ref != policy_snapshot.policy_owner.owner_ref {
+            return Err(CompositionError::Recovery(
+                "initial WorkScope privacy setting has a foreign policy owner".to_owned(),
+            ));
+        }
+        let privacy_choice = privacy_setting
+            .value_ref
+            .strip_prefix("literal:")
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "initial WorkScope privacy setting is not an admitted literal".to_owned(),
+                )
+            })?;
+        eliot_config::PrivacyChoice::parse(privacy_choice)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+
+        let (principal_ref, session_ref) = authenticated_identity;
+        let is_policy_owner = principal_ref == policy_snapshot.policy_owner.owner_ref;
+        for authority in source_candidates
+            .iter()
+            .filter_map(|candidate| candidate.claim.as_ref())
+            .chain(declared_precedences.iter().map(|declaration| &declaration.authority))
+        {
+            match authority {
+                AuthorityBasis::HumanOwner { owner_ref } => {
+                    if owner_ref != &policy_snapshot.policy_owner.owner_ref || !is_policy_owner {
+                        return Err(CompositionError::Recovery(
+                            "Human source authority is not the authenticated current policy/task owner"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                AuthorityBasis::DelegatedTaskBinding {
+                    binding_ref,
+                    task_ref: delegated_task_ref,
+                } => {
+                    if delegated_task_ref != &task_ref
+                        || (binding_ref != &selection_source_ref && binding_ref != &evidence_ref)
+                    {
+                        return Err(CompositionError::Recovery(
+                            "source delegation does not name the exact live selected WorkLease and task"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                AuthorityBasis::ProjectContract { .. } => {
+                    return Err(CompositionError::Recovery(
+                        "initial WorkScope binding has no current owner proof for a project contract claim"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+
+        if !is_policy_owner {
+            let owner_hydrations = self
+                .owners
+                .authority
+                .owner_hydrations
+                .as_ref()
+                .ok_or_else(|| {
+                    CompositionError::Recovery(
+                        "delegated initial WorkScope binding has no retained effective capability hydrations"
+                            .to_owned(),
+                    )
+                })?;
+            let graph_revision = self.owners.authority.grants.revision();
+            if owner_hydrations.state_fence != fence
+                || owner_hydrations.grant_graph_revision != graph_revision
+            {
+                return Err(CompositionError::ActivationStaleFence);
+            }
+            let class_label = |class: PrivacyClass| match class {
+                PrivacyClass::Public => "PUBLIC",
+                PrivacyClass::Internal => "INTERNAL",
+                PrivacyClass::Private => "PRIVATE",
+                PrivacyClass::Secret => "SECRET",
+                PrivacyClass::Licensed => "LICENSED",
+            };
+            let mut intents: Vec<_> = owner_hydrations
+                .roots
+                .iter()
+                .map(|hydration| &hydration.intent)
+                .chain(
+                    owner_hydrations
+                        .members
+                        .iter()
+                        .map(|hydration| &hydration.intent),
+                )
+                .collect();
+            intents.sort_by(|left, right| left.grant_id.cmp(&right.grant_id));
+            let matching_leaves: Vec<_> = intents
+                .iter()
+                .copied()
+                .filter(|intent| {
+                    intent.holder_principal == principal_ref
+                        && intent.session_id == session_ref
+                        && intent.scope_id == work_scope_ref
+                        && intent.binding.state_fence == fence
+                        && intent.grant_graph_revision == graph_revision
+                })
+                .collect();
+            if matching_leaves.is_empty() {
+                return Err(CompositionError::Recovery(
+                    "delegated initial WorkScope binding has no effective grant for this holder, session, scope, and fence"
+                        .to_owned(),
+                ));
+            }
+            let now_ms = i64::try_from(now).map_err(|_| {
+                CompositionError::Recovery(
+                    "initial WorkScope binding time exceeds the authority clock range".to_owned(),
+                )
+            })?;
+            for class in &privacy.admitted_classes {
+                let label = class_label(*class);
+                let covered = matching_leaves.iter().any(|leaf| {
+                    let mut current = Some(*leaf);
+                    let mut seen = BTreeSet::new();
+                    while let Some(intent) = current {
+                        if !seen.insert(intent.grant_id.as_str())
+                            || intent.mechanical_subset.verify_recorded_commitment().is_err()
+                            || intent.mechanical_subset.binding.state_fence != fence
+                            || intent.mechanical_subset.holder_principal != intent.holder_principal
+                            || intent.mechanical_subset.session_id != intent.session_id
+                            || intent.mechanical_subset.scope_id != intent.scope_id
+                            || intent.issued_at_ms > now_ms
+                            || !intent
+                                .expires_at_ms
+                                .is_some_and(|expires_at_ms| now_ms < expires_at_ms)
+                            || !intent
+                                .mechanical_subset
+                                .data_classes
+                                .iter()
+                                .any(|authorized| authorized == label)
+                        {
+                            return false;
+                        }
+                        let Ok(grant_id) = GrantId::new(intent.grant_id.clone()) else {
+                            return false;
+                        };
+                        if !self.owners.authority.grants.grant_is_admitted(&grant_id) {
+                            return false;
+                        }
+                        current = intent.parent_grant_id.as_deref().and_then(|parent| {
+                            intents.iter().copied().find(|candidate| {
+                                candidate.grant_id == parent
+                                    && candidate.grant_graph_revision == graph_revision
+                            })
+                        });
+                        if intent.parent_grant_id.is_some() && current.is_none() {
+                            return false;
+                        }
+                    }
+                    true
+                });
+                if !covered {
+                    return Err(CompositionError::Recovery(format!(
+                        "delegated WorkScope privacy class {label} is outside the current holder grant path"
+                    )));
+                }
+            }
+        }
+
+        let observed_instance = observed.instances.first().ok_or_else(|| {
+            CompositionError::Recovery(
+                "initial WorkScope binding has no independent observed instance".to_owned(),
+            )
+        })?;
+        if descriptor.root_identities.is_empty()
+            || !descriptor
+                .root_identities
+                .contains(&observed_instance.root_identity)
+            || !observed
+                .root_identities
+                .contains(&observed_instance.root_identity)
+            || source_candidates.iter().any(|candidate| {
+                !matches!(
+                    &candidate.origin,
+                    SourceCandidateOrigin::AuthenticatedRoot { root_identity }
+                        if root_identity == &observed_instance.root_identity
+                            && descriptor.root_identities.contains(root_identity)
+                )
+            })
+        {
+            return Err(CompositionError::Recovery(
+                "governing source candidate origin is not joined to the admitted and observed root"
+                    .to_owned(),
+            ));
+        }
+
+        let source_admission = Self::admit_governing_sources_for_scope(
+            SourceAdmissionRequest {
+                scope_ref: binding.scope.scope_ref.clone(),
+                generation: binding.scope.generation,
+                candidates: source_candidates.to_vec(),
+                precedences: declared_precedences.to_vec(),
+                required_owner_ref: policy_snapshot.policy_owner.owner_ref.clone(),
+                proven_current_bindings: vec![TaskBindingState::CurrentTaskContract {
+                    task_ref,
+                    task_revision,
+                    acceptance_digest,
+                    selection_source_ref,
+                    evidence_ref,
+                }],
+                proven_contracts: Vec::new(),
+                absence_reason_ref: absence_reason_ref.map(str::to_owned),
+                state_fence: fence.clone(),
+                expires_at: admission_deadline,
+            },
+            now,
+        )?;
+        if source_admission.admitted != *sources {
+            return Err(CompositionError::Recovery(
+                "original governing source set differs from current owner-validated admission"
+                    .to_owned(),
+            ));
+        }
+
+        if !privacy.admits(binding.privacy_class)
+        {
+            return Err(CompositionError::Recovery(
+                "WorkScope privacy boundary does not admit the binding's source class"
+                    .to_owned(),
+            ));
+        }
+
         let observed_binding = observed_scope_binding(
             binding,
             observed,
@@ -7700,6 +8005,62 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         })
     }
 
+    async fn current_task_binding_state_for_initial_scope(
+        &self,
+        now: u64,
+        authenticated_identity: (&str, &str),
+        work_scope_ref: &str,
+        state_fence: &StateFence,
+        task_binding: (&str, u64),
+    ) -> Result<TaskBindingState, CompositionError> {
+        let (principal_ref, session_ref) = authenticated_identity;
+        let (task_ref, task_revision) = task_binding;
+        let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
+        if !fences_match_exact(&activation.state_fence, state_fence)
+            || !fences_match_exact(&self.snapshot.state_fence(), state_fence)
+            || activation.principal_id != principal_ref
+            || activation.session_id != session_ref
+            || activation.task_id.as_str() != task_ref
+            || activation.task_revision != task_revision
+            || state_fence.task_revision.map(TaskRevision::value) != Some(task_revision)
+            || activation.work_scope_id != work_scope_ref
+            || selected.work_item.work_item_id != activation.work_unit_id
+            || selected.work_item.task_id != activation.task_id.as_str()
+            || selected.work_item.state_fence != activation.state_fence
+            || selected.work_item.owner_session_id.as_deref()
+                != Some(activation.session_id.as_str())
+            || selected.lease.work_item_id != selected.work_item.work_item_id
+            || selected.lease.holder_session_id != activation.session_id
+            || selected.lease.state_fence != activation.state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let acceptance = self
+            .kernel
+            .task_contract_acceptance_set(
+                &activation.task_id,
+                activation.task_revision,
+                &activation.state_fence,
+            )
+            .await?;
+        acceptance.validate()?;
+        if acceptance.task_id != activation.task_id
+            || acceptance.task_revision != activation.task_revision
+            || !fences_match_exact(&acceptance.read_state_fence, &activation.state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        Ok(TaskBindingState::CurrentTaskContract {
+            task_ref: activation.task_id.to_string(),
+            task_revision: activation.task_revision,
+            acceptance_digest: acceptance.acceptance_digest,
+            selection_source_ref: selected.lease.lease_id,
+            evidence_ref: selected.work_item.work_item_id,
+        })
+    }
+
     /// Produces immutable task-selection evidence from the exact unique active
     /// owner selection and the `TaskContract` acceptance record at that fence.
     ///
@@ -7715,7 +8076,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// coordination read that joins the authenticated principal/session to
     /// the task and `WorkScope`. The owner's recorded acceptance digest is
     /// copied verbatim; it is never recomputed from caller data or a task id.
-    pub async fn issue_task_selection_evidence_for_binding(
+    async fn issue_task_selection_evidence_for_binding(
         &self,
         now: u64,
         authenticated_identity: (&str, &str),
