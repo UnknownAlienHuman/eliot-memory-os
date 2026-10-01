@@ -732,15 +732,12 @@ fn both_gates_pass_then_exactly_one_selection_emits() {
     match admit_context_governed(
         &input,
         &LearningGovernance::Presented(presented_1869(
-            &governor,
-            &verified,
-            &overlay,
-            &backlog,
-            NOW_1869,
+            &governor, &verified, &overlay, &backlog, NOW_1869,
         )),
         &DownstreamReservation::NotReserved,
     )
-    .expect("both gates satisfied") {
+    .expect("both gates satisfied")
+    {
         HeadroomAdmissionOutcome::Admitted {
             result,
             traces,
@@ -797,14 +794,18 @@ fn reserved_headroom_without_carriage_refuses_on_missing_evidence() {
             &LearningGovernance::Unpresented,
             &DownstreamReservation::Reserved(&headroom),
         ),
-        Err(ContextError::InvalidField("learning.governed_path_required"))
+        Err(ContextError::InvalidField(
+            "learning.governed_path_required"
+        ))
     );
     // The same guarantee on the headroom-only projection of the composed entry:
     // a learning-marked input cannot slip through by arriving with a reservation
     // and without the carriage.
     assert_eq!(
         admit_context_traced_with_headroom(&input, &headroom),
-        Err(ContextError::InvalidField("learning.governed_path_required"))
+        Err(ContextError::InvalidField(
+            "learning.governed_path_required"
+        ))
     );
 }
 
@@ -833,11 +834,7 @@ fn learning_path_and_headroom_path_do_not_diverge() {
     let with_reservation = admit_context_governed(
         &input,
         &LearningGovernance::Presented(presented_1869(
-            &governor,
-            &verified,
-            &overlay,
-            &backlog,
-            NOW_1869,
+            &governor, &verified, &overlay, &backlog, NOW_1869,
         )),
         &DownstreamReservation::Reserved(&headroom),
     );
@@ -846,11 +843,7 @@ fn learning_path_and_headroom_path_do_not_diverge() {
     let without_reservation = admit_context_governed(
         &input,
         &LearningGovernance::Presented(presented_1869(
-            &governor,
-            &verified,
-            &overlay,
-            &backlog,
-            NOW_1869,
+            &governor, &verified, &overlay, &backlog, NOW_1869,
         )),
         &DownstreamReservation::NotReserved,
     );
