@@ -625,3 +625,76 @@ module_id = "smart.dreamer.curation"
 manifest = "crates/smart/eliot-dreamer-curation/module.toml"
 role = "screened_exact_one_handler_fan_in"
 kind = "curation_stage"
+
+
+# ---------------------------------------------------------------------------
+# #261 r11 W0 handoff notes for the three families whose field contract was
+# completed at r11. These are NOT new [[assignment]] rows and NOT new agents:
+# this wave assigns orders 1-31 and the three families below are NOT among them.
+# They belong to the foundation projection, foundation observation and
+# foundation epistemic seams, which are decided in their own waves.
+#
+# What r11 does here is make the W0 handoff legible: a reader of this wave can
+# see which existing crate owns each family, what the field contract now states,
+# and who the first consumer actually is. One of the three has NO consumer, and
+# that is recorded as an empty value with an owner rather than filled in.
+#
+# No write_scope is widened, no package_action changes, and no product pulse is
+# created. The proof ceiling of this wave is unchanged.
+# ---------------------------------------------------------------------------
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-memory-projection-contracts-selection"
+owning_crate = "eliot-memory-projection-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31 and the projection-contracts seam is foundation, assigned upstream"
+definition_revision = "eliot_contracts::ContractVersion 0.2.0, exact triple equality, under freeze rule VR-SELECTION-CONTRACT-VERSION"
+field_contract_state = "FROZEN_EXACT at 6 of 6 members as of freeze r11, every row carrying a resolving validator anchor and a typed error variant"
+input_rust_path = "eliot_memory_projection_contracts::MemoryProjectionBatch plus MemoryQueryIntent plus MemorySelectionPolicy"
+output_rust_path = "eliot_memory_projection_contracts::MemorySelectionTrace"
+first_consumer = ""
+first_consumer_status = "NONE_EXISTS"
+error_unknown_behaviour = "Every rejection is a SelectionError or a wrapped MemoryProjectionError variant. An unreadable batch produces NO trace at all rather than a partial one, and an UNKNOWN batch denominator does not block selection because select() reads that denominator and never echoes it, since selection deliberately claims no completeness."
+later_positive_acceptance = "a selection over a batch whose records are all inside the allowlist and whose passing count is at or below the intent limit yields a trace whose coverage.considered equals the consumer's own batch.records length, whose selected plus not_selected equals considered, and which survives validate_against against the exact intent, policy and batch it was computed from"
+later_negative_acceptance = "a trace whose selected exceeds either the echoed policy ceiling or the intent limit is rejected as LimitOverPolicy or LimitExceeded rather than by silent truncation; a trace whose counts balance but whose entries do not replay against the batch is rejected as CoverageMismatch"
+owning_task_for_the_gap = "the cognitive-wave integrator named as integration_owner at crates/foundation/eliot-memory-projection-contracts/module.toml"
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-observation-contracts-failure"
+owning_crate = "eliot-observation-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31 and the observation-contracts seam is foundation; the Governor owner cell eliot-observation at order 1 is a DIFFERENT seam and is not this contract crate"
+definition_revision = "eliot_contracts::ContractVersion 1.0.0, exact triple equality, plus each record's own frozen digest recomputed from every other field on each validate, under freeze rule VR-FAILURE-OBSERVATION-VERSION"
+field_contract_state = "FROZEN_EXACT at 4 of 4 members as of freeze r11, every row carrying a resolving validator anchor and a typed error variant"
+input_rust_path = "eliot_observation_contracts::FailureObservation plus MemoryRevisionEvidence"
+output_rust_path = "smart.dreamer.memory_revision::NegativeMemoryExtinctionCandidate, which is the consumer's own output and NOT a frozen input to this family"
+first_consumer = "eliot-dreamer-memory-revision"
+first_consumer_status = "MEASURED_EXISTS"
+error_unknown_behaviour = "Every rejection is an ObservationError variant. Unknown evidence is a VALUE and never an error path: an unreadable source is CoverageDisposition::Unavailable plus a named FailureOmission and an unadmitted source is the UNADMITTED_SOURCE omission class, neither of which is silently reported as an empty list. A Complete verdict requires the FULL POSTURE, namely disposition Complete AND an empty blind_intervals list."
+later_positive_acceptance = "an observation carrying a valid recomputed digest, a validated SourceRevisionHandle, refs within their bounds with no duplicates, and coverage with disposition Complete and an empty blind_intervals list satisfies coverage_complete and is accepted as a complete read"
+later_negative_acceptance = "an observation whose stored digest does not match the recomputed digest is rejected; a repeated ref handle is rejected as Duplicate rather than deduplicated; an observation whose coverage disposition is Complete but whose blind_intervals list is NON-EMPTY does NOT satisfy coverage_complete and is carried as a partial read"
+owning_task_for_the_gap = "none; the contract and its caller both exist. What remains unproven is runtime behaviour."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
+
+[[w0_contract_handoff_note]]
+issue = 261
+family = "eliot-epistemic-contracts-contribution"
+owning_crate = "eliot-epistemic-contracts"
+in_this_wave = false
+in_this_wave_reason = "this wave assigns orders 1-31; the envelope owner is the foundation epistemic seam, which is distinct from the order-2 eliot-epistemic position RESOLVER cell that this wave does assign"
+definition_revision = "eliot_contracts::ContractVersion 1.2.0, exact triple equality, CONJUNCTIVE with the view_kind discriminator and a currentness of Current, under freeze rule VR-CONTRIBUTION-CONTRACT-VERSION"
+field_contract_state = "FROZEN_EXACT at 1 of 1 top-level member as of freeze r11; the nested owners CurrentEpistemicPosition, AdmittedKind and Currentness are dispositioned by their own pre-existing frozen_type rows and are referenced rather than duplicated"
+input_rust_path = "eliot_epistemic_contracts::CurrentEpistemicPosition, already validated and admitted by its owner"
+output_rust_path = "eliot_epistemic_contracts::ProviderContribution"
+first_consumer = "eliot-epistemic-context-provider, and independently eliot-understanding-assessment"
+first_consumer_status = "MEASURED_EXISTS_TWO_INDEPENDENT_CONSUMERS"
+error_unknown_behaviour = "Every rejection is a ContractError variant. The whole envelope is the unit of failure: contribute() returns Result with no partial variant, so a caller can never be handed a partly-populated handoff. A superseded position is REFUSED outright rather than contributed with a weakened marker, and the epistemic distinctions the envelope does not carry, such as assumed, conflicted, stale or under investigation, stay visible on the CurrentEpistemicPosition and are not flattened by the handoff."
+later_positive_acceptance = "contribute over a validated Current position yields an envelope whose echoes all EQUAL the corresponding admission-envelope field, so a consumer holding the admission record can re-derive the envelope field by field and reach the same bytes; the understanding-assessment consumer accepts it as a citation and reads position_digest as the cite digest"
+later_negative_acceptance = "contribute over a position whose currentness is Superseded is refused with ImpossibleCombination and NO envelope is produced; a position whose own frozen digest does not recompute is refused BEFORE any envelope exists; passing the version check while carrying a wrong view_kind is still rejected"
+owning_task_for_the_gap = "none; the contract and two independent callers all exist. What remains unproven is runtime behaviour."
+proof_ceiling = "STATIC_FIELD_CONTRACT_ONLY"
+evidence_execution_status = "NOT_EXECUTED"
