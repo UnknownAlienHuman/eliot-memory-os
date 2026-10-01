@@ -43,6 +43,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
+from code_navigation_lib.registry import build_registry
+
 FIX = ROOT / "scripts" / "testdata" / "work-unit-gate" / "wave-c0"
 BASE_SHA = "bf219fe3a9615877c6870c0dfbecc1dce97b3904"
 ADMISSION_NOTE = "admitted via #829 (T8-A0) root workspace membership"
@@ -673,8 +675,35 @@ class TestWaveAdmissionC0(unittest.TestCase):
         for path in self.six_paths:
             self.assertIn(path, package_index)
             self.assertNotIn(path, prototype_index)
-        self.assertIn("**131**", package_index)
-        self.assertIn("**40**", prototype_index)
+        # Coverage denominators are derived from the generator that owns them,
+        # not copied from the committed file or frozen at the September base.
+        # `package_docs.render` emits len(_packages(registry)) as "Workspace
+        # members"; `prototype_docs.render` emits the same expression over the
+        # nonmember filter as "Nonmember Cargo packages". build_registry() is
+        # the shared producer of both, so re-deriving through it keeps this
+        # leg true under legitimate later workspace growth while still failing
+        # if either index drifts from its generator.
+        registry = build_registry(ROOT)
+        expected_members = sum(1 for pkg in registry["packages"]
+                               if pkg.get("workspace_member") is True)
+        expected_prototypes = sum(1 for pkg in registry["packages"]
+                                  if pkg.get("workspace_member") is not True)
+        self.assertEqual(expected_members, registry["counts"]["workspace_members"])
+        self.assertEqual(expected_prototypes, registry["counts"]["nonmember_packages"])
+        self.assertIn(f"- Workspace members: **{expected_members}**.", package_index)
+        self.assertIn(f"- Nonmember Cargo packages: **{expected_prototypes}**.",
+                      prototype_index)
+        # Negative legs: the same derived denominators must not be satisfiable
+        # by an off-by-one or a stale frozen literal in the index text.
+        self.assertNotIn(f"- Workspace members: **{expected_members + 1}**.",
+                         package_index)
+        self.assertNotIn(f"- Nonmember Cargo packages: **{expected_prototypes + 1}**.",
+                         prototype_index)
+        # Each admitted package is rendered as a workspace row, and the exact six
+        # never reappear as prototype rows.
+        for path in self.six_paths:
+            self.assertTrue(any(line.startswith("| ") and path in line
+                                for line in package_index.splitlines()), path)
 
     # WORK_UNIT_CASE: 829/22
     def test_22_second_generation_byte_identical(self) -> None:
@@ -761,10 +790,53 @@ class TestWaveAdmissionC0(unittest.TestCase):
     def test_29_before_after_arithmetic_reconciles(self) -> None:
         base = self._base_manifest()["workspace"]
         live = root_workspace()
-        self.assertEqual(len(base["members"]) + 6, len(live["members"]))
-        self.assertEqual(len(base["exclude"]) - 6, len(live["exclude"]))
-        self.assertIn(f"**{self.baseline['prototypes'] - 6}**",
-                      read_bytes("docs/code-navigation/PROTOTYPE_DOCS_INDEX.md").decode("utf-8"))
+        # The frozen baseline counts are immutable history about BASE_SHA, so
+        # they are reconciled against BASE_SHA's own manifest, not against
+        # today's workspace (which has since grown by unrelated members).
+        self.assertEqual(self.baseline["members_count"], len(base["members"]))
+        self.assertEqual(self.baseline["excluded_count"], len(base["exclude"]))
+        # Admission transaction: the exact six moved exclude -> members. This
+        # is a set transition, so unrelated later growth neither satisfies nor
+        # falsifies it; a missing or extra affected path still does.
+        base_members, live_members = set(base["members"]), set(live["members"])
+        self.assertEqual(len(self.six_paths), 6)
+        for path in self.six_paths:
+            self.assertNotIn(path, base_members, f"{path} was already a member")
+            self.assertIn(path, base["exclude"], f"{path} was not excluded at base")
+            self.assertIn(path, live_members, f"{path} is not admitted now")
+            self.assertNotIn(path, live["exclude"], f"{path} is still excluded")
+        admitted = sorted(live_members - base_members)
+        self.assertTrue(set(self.six_paths) <= set(admitted))
+        # Current-state denominator is derived from the current workspace, so
+        # later unrelated members cannot keep this leg red and cannot hide a
+        # genuine shortfall.
+        self.assertGreaterEqual(len(live_members), len(base_members) + 6)
+        # The generated prototype index must agree with its own generator now;
+        # the frozen `baseline.prototypes - 6` figure is September history and
+        # is only valid against BASE_SHA's index bytes.
+        registry = build_registry(ROOT)
+        live_prototypes = registry["counts"]["nonmember_packages"]
+        prototype_index = read_bytes(
+            "docs/code-navigation/PROTOTYPE_DOCS_INDEX.md").decode("utf-8")
+        self.assertIn(f"- Nonmember Cargo packages: **{live_prototypes}**.",
+                      prototype_index)
+        base_index = git("show",
+                         f"{BASE_SHA}:docs/code-navigation/PROTOTYPE_DOCS_INDEX.md")
+        self.assertEqual(base_index.returncode, 0, base_index.stderr)
+        self.assertIn(
+            f"- Nonmember Cargo packages: **{self.baseline['prototypes']}**.",
+            base_index.stdout)
+        # Historical membership transition, proven on BASE_SHA's own index
+        # bytes: at the frozen base the exact six were projected as prototypes
+        # and absent from the workspace index; today they are projected as
+        # workspace rows and absent from the prototype index.
+        base_package_index = git(
+            "show", f"{BASE_SHA}:docs/code-navigation/PACKAGE_DOCS_INDEX.md")
+        self.assertEqual(base_package_index.returncode, 0, base_package_index.stderr)
+        for path in self.six_paths:
+            self.assertIn(path, base_index.stdout, path)
+            self.assertNotIn(path, base_package_index.stdout, path)
+        # Source-byte pins: the fixture claims these exact lib.rs digests.
         for item in self.six:
             live_digest = sha256_bytes(read_bytes(f"{item['crate_path']}/src/lib.rs"))
             self.assertEqual(live_digest, item["lib_sha256"], item["name"])
