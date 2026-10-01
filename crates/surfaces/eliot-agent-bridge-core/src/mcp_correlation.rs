@@ -847,7 +847,10 @@ impl std::fmt::Display for OwnerBindingError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OwnerRecordRejected(reason) => {
-                write!(formatter, "owner operation record did not validate: {reason}")
+                write!(
+                    formatter,
+                    "owner operation record did not validate: {reason}"
+                )
             }
         }
     }
