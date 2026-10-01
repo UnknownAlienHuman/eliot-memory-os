@@ -2200,6 +2200,8 @@ fn lease_census_reason(error: &HostError) -> &'static str {
         | HostError::Stopped => "supervision-spool-unreadable",
         #[cfg(windows)]
         HostError::KernelSupervisionRevocationUncontained(_) => "supervision-spool-unreadable",
+        #[cfg(windows)]
+        HostError::KernelSupervisionRevocationSuperseded(_) => "supervision-spool-unreadable",
         // A refused independent-Watchdog proof means the supervision
         // obligation cannot be established either, so the census stays
         // `Unavailable` on the supervision leg and never reports `Idle`.

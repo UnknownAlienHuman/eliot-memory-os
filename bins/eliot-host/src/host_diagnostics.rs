@@ -752,6 +752,10 @@ const fn project_host_error_reason(error: &HostError) -> &'static str {
             "kernel_supervision_revocation_uncontained"
         }
         #[cfg(windows)]
+        HostError::KernelSupervisionRevocationSuperseded(_) => {
+            "kernel_supervision_revocation_superseded"
+        }
+        #[cfg(windows)]
         HostError::OriginCollisionUnproven(_) => "origin_collision_unproven",
         #[cfg(windows)]
         HostError::StoreEndpointOwnerUnreadable(_) => "store_endpoint_owner_unreadable",
