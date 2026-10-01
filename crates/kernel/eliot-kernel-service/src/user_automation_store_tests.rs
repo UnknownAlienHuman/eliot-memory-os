@@ -183,8 +183,8 @@ fn unbound_normalization_receipt_envelope() -> Box<eliot_receipts::ReceiptEnvelo
             occurrence_count: 1,
         }),
     };
-    let (_, envelope) = super::normalize_user_automation_operation(&request)
-        .expect("Kernel normalization fixture");
+    let (_, envelope) =
+        super::normalize_user_automation_operation(&request).expect("Kernel normalization fixture");
     Box::new(envelope)
 }
 
