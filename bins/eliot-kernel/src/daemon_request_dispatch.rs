@@ -4118,6 +4118,7 @@ impl KernelComposition {
                                 identity,
                                 authenticated_peer,
                                 authenticated_peer_sha256,
+                                initial_setup_authority,
                             )) => serde_json::json!({
                                 "status": "known",
                                 "value": {
@@ -4128,6 +4129,7 @@ impl KernelComposition {
                                         "identity": identity,
                                         "authenticated_peer": authenticated_peer,
                                         "authenticated_peer_sha256": authenticated_peer_sha256,
+                                        "initial_setup_authority": initial_setup_authority,
                                         "operation_id": attempt.operation_id,
                                         "attempt": attempt,
                                     }

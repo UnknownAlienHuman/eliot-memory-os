@@ -5242,6 +5242,44 @@ impl RedbRecoveryStore {
         Ok(Some(record))
     }
 
+    /// Loads the unique committed initial-setup Policy predecessor for one
+    /// exact live fence. This selector is used only by the task-free first
+    /// WorkScope claim: it never chooses by recency, product label, or a
+    /// caller-supplied receipt. Multiple committed setup lineages at the same
+    /// fence are treated as an integrity conflict.
+    pub fn load_unique_initial_setup_authority_for_fence(
+        &self,
+        state_fence: &eliot_contracts::StateFence,
+    ) -> Result<Option<InitialSetupAuthorityRecord>, OrsError> {
+        state_fence.validate()?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let authorities = read
+            .open_table(INITIAL_SETUP_AUTHORITIES)
+            .map_err(storage)?;
+        let mut selected: Option<InitialSetupAuthorityRecord> = None;
+        for entry in authorities.iter().map_err(storage)? {
+            let (key, value) = entry.map_err(storage)?;
+            let record: InitialSetupAuthorityRecord =
+                decode_named(value.value(), "initial_setup_authority")?;
+            record.validate()?;
+            if record.policy_operation.operation_id.as_str() != key.value()
+                || record.state_fence != *state_fence
+                || record.phase == InitialSetupAuthorityPhase::Prepared
+            {
+                continue;
+            }
+            if selected.is_some() {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "initial_setup_authority",
+                    reason: "multiple committed setup roots share the exact State Fence"
+                        .to_owned(),
+                });
+            }
+            selected = Some(record);
+        }
+        Ok(selected)
+    }
+
     /// Exports one coherent backup page under a single read transaction.
     ///
     /// Delegates to the ORS-owned `backup_snapshot` projection; binds the

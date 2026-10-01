@@ -21,7 +21,11 @@
 
 use std::collections::BTreeMap;
 
-use eliot_ors::{HostRequestState, OperationIdentity, OrsError};
+use eliot_ors::{
+    HostRequestState, InitialSetupAuthorityPhase, InitialSetupAuthorityRecord,
+    OperationIdentity, OrsError,
+};
+use eliot_receipts::CausalBinding;
 use eliot_protocol::{
     FinishAttempt, FinishResultBody, HOST_REQUEST_INVOKE_READ_WIRE_ID, HostRequestEnvelope,
     HostRequestInvokeReadPayload, HostRequestResultBody, TaskControllerAttempt,
@@ -384,6 +388,7 @@ impl KernelComposition {
                 eliot_protocol::RequestIdentity,
                 eliot_ors::HostRequestKernelAuthenticatedPeer,
                 String,
+                Option<(InitialSetupAuthorityRecord, CausalBinding)>,
             )>,
         TransportError,
     > {
@@ -440,6 +445,70 @@ impl KernelComposition {
                     .authenticated_peer_sha256
                     .clone()
                     .ok_or(TransportError::PeerIdentityUnavailable)?;
+                let initial_setup_authority = if invocation.action
+                    == eliot_protocol::TaskControllerAction::BindScope
+                {
+                    let Some(record) = self
+                        .generation_gateway
+                        .ors
+                        .load_unique_initial_setup_authority_for_fence(&envelope.state_fence)
+                        .map_err(|_| TransportError::SessionFenced)?
+                    else {
+                        return Err(TransportError::SessionFenced);
+                    };
+                    let policy_receipt = record
+                        .policy_write_receipt
+                        .as_ref()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let policy_envelope = policy_receipt
+                        .envelope
+                        .as_ref()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let policy_identity: eliot_protocol::RequestIdentity =
+                        serde_json::from_str(&record.policy_request_identity_json)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                    policy_identity
+                        .validate()
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    if record.phase != InitialSetupAuthorityPhase::PolicyCommitted
+                        || policy_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+                        || policy_receipt.state_fence != envelope.state_fence
+                        || policy_envelope.core.authority != record.authority_binding
+                        || policy_envelope.core.causal != record.policy_causal_binding
+                        || policy_identity.request.state_fence != envelope.state_fence
+                        || policy_identity.request.metadata.state_fence != envelope.state_fence
+                        || policy_identity.request.metadata.product_id
+                            != request_identity.request.metadata.product_id
+                        || policy_identity.request.metadata.source_id
+                            != request_identity.request.metadata.source_id
+                        || policy_identity.request.metadata.session_id
+                            != request_identity.request.metadata.session_id
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let sequence = policy_envelope
+                        .core
+                        .causal
+                        .transaction_sequence
+                        .value()
+                        .checked_add(1)
+                        .ok_or(TransportError::SessionFenced)?;
+                    let receipt_id = policy_envelope.identity.receipt_id.clone();
+                    Some((
+                        record,
+                        CausalBinding {
+                            state_fence: envelope.state_fence.clone(),
+                            transaction_sequence: eliot_contracts::TransactionSequence::new(
+                                sequence,
+                            )
+                            .map_err(|_| TransportError::SessionFenced)?,
+                            parent_receipt_id: Some(receipt_id.clone()),
+                            predecessor_receipt_ids: vec![receipt_id],
+                        },
+                    ))
+                } else {
+                    None
+                };
                 if !self.application_binding_live_for_claim(
                     envelope,
                     &admission_owner,
@@ -509,6 +578,7 @@ impl KernelComposition {
                     request_identity,
                     authenticated_peer,
                     authenticated_peer_sha256,
+                    initial_setup_authority,
                 )));
             }
         }
