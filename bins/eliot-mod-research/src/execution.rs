@@ -1218,7 +1218,13 @@ mod tests {
                 PermitIssuance::new(
                     ActionLeaseRef::new(format!("lease-24-{nonce}")).expect("lease"),
                     fence,
-                    BTreeMap::new(),
+                    BTreeMap::from([
+                        ("research-dispatch".to_owned(), DIGEST_A.to_owned()),
+                        (
+                            "research-submit-binding".to_owned(),
+                            DIGEST_B.to_owned(),
+                        ),
+                    ]),
                     100,
                     10_000,
                     format!("nonce-24-{nonce}"),
