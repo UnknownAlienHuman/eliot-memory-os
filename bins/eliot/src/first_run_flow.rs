@@ -19,7 +19,8 @@ use eliot_config::first_run::{
     parse_kind, parse_role, recommend_when_automation_disabled, to_settings,
 };
 use eliot_config::initial_snapshot::{
-    InitialSnapshotIdentity, PrivacyChoice, prepare_initial_snapshot_payload_with_blob_policy,
+    InitialSnapshotIdentity, PrivacyChoice,
+    prepare_initial_snapshot_payload_with_source_approval,
 };
 use eliot_config::BlobProcessPolicyValue;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
@@ -97,6 +98,9 @@ pub struct SetupInitialConfigArgs {
     /// Explicit closed S-04 policy and six-domain residency JSON. No policy
     /// or owner domain is inferred by the setup flow.
     pub blob_process_policy_json: String,
+    /// Canonical signed-payload field containing the explicit Human approval
+    /// of the exact governing Architecture/Implementation source pair.
+    pub governing_source_approval_json: String,
     pub dreamer_route: Option<String>,
     pub watchdog_route: Option<String>,
     pub dreamer_displayed: bool,
@@ -359,11 +363,12 @@ pub fn run_setup_initial_config(args: &SetupInitialConfigArgs) -> Result<i32> {
     let blob_process_policy = BlobProcessPolicyValue::from_json(&args.blob_process_policy_json)
         .map_err(|error| anyhow::anyhow!(error.to_string()))
         .context("validate explicit Blob process policy and residency input")?;
-    let payload = prepare_initial_snapshot_payload_with_blob_policy(
+    let payload = prepare_initial_snapshot_payload_with_source_approval(
         &identity,
         privacy,
         &decision,
         &blob_process_policy,
+        &args.governing_source_approval_json,
     )
         .map_err(|error| anyhow::anyhow!(error.to_string()))
         .context("prepare the first signed configuration payload")?;

@@ -165,7 +165,7 @@ pub fn prepare_initial_snapshot_payload(
     privacy: PrivacyChoice,
     first_run: &FirstRunDecision,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
-    prepare_initial_snapshot_payload_inner(identity, privacy, first_run, None)
+    prepare_initial_snapshot_payload_inner(identity, privacy, first_run, None, None)
 }
 
 /// Builds the first signed configuration payload with an explicit
@@ -183,6 +183,28 @@ pub fn prepare_initial_snapshot_payload_with_blob_policy(
         privacy,
         first_run,
         Some(blob_process_policy),
+        None,
+    )
+}
+
+/// Builds the first signed configuration payload with an explicit Blob
+/// policy and canonical Governor-owned governing-source approval. Config
+/// treats the approval as an opaque closed JSON object to avoid a dependency
+/// cycle; the existing signed payload binds its exact bytes, and Governor
+/// validates its semantic fields.
+pub fn prepare_initial_snapshot_payload_with_source_approval(
+    identity: &InitialSnapshotIdentity,
+    privacy: PrivacyChoice,
+    first_run: &FirstRunDecision,
+    blob_process_policy: &BlobProcessPolicyValue,
+    governing_source_approval_json: &str,
+) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
+    prepare_initial_snapshot_payload_inner(
+        identity,
+        privacy,
+        first_run,
+        Some(blob_process_policy),
+        Some(governing_source_approval_json),
     )
 }
 
@@ -191,6 +213,7 @@ fn prepare_initial_snapshot_payload_inner(
     privacy: PrivacyChoice,
     first_run: &FirstRunDecision,
     blob_process_policy: Option<&BlobProcessPolicyValue>,
+    governing_source_approval_json: Option<&str>,
 ) -> Result<InitialSnapshotPayload, InitialSnapshotError> {
     identity.validate()?;
     if matches!(privacy, PrivacyChoice::LocalOnly) && first_run.has_paid_route() {
@@ -241,6 +264,7 @@ fn prepare_initial_snapshot_payload_inner(
         key_identity: identity.key_identity.clone(),
         runtime_state_roots_digest: identity.runtime_state_roots_digest.clone(),
         setup_revision: identity.setup_revision,
+        governing_source_approval_json: governing_source_approval_json.map(str::to_owned),
     };
     payload.validate()?;
     Ok(payload)
@@ -274,6 +298,12 @@ pub struct InitialSnapshotPayload {
     pub runtime_state_roots_digest: String,
     /// Setup binding revision at milestone 7.
     pub setup_revision: u64,
+    /// Canonical Governor-owned approval of the exact governing source pair.
+    /// When present, these bytes are covered by this payload's existing
+    /// detached signature. Absence remains readable for legacy snapshots but
+    /// cannot establish WorkScope source authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governing_source_approval_json: Option<String>,
 }
 
 impl InitialSnapshotPayload {
@@ -296,6 +326,9 @@ impl InitialSnapshotPayload {
         )?;
         if self.setup_revision == 0 {
             return Err(invalid_field("setup_revision", "must be non-zero"));
+        }
+        if let Some(approval_json) = &self.governing_source_approval_json {
+            validate_canonical_json_object(approval_json, "governing_source_approval_json")?;
         }
         self.snapshot
             .validate()
@@ -365,6 +398,23 @@ impl InitialSnapshotPayload {
         })?;
         PrivacyChoice::parse(value)
     }
+}
+
+fn validate_canonical_json_object(
+    json: &str,
+    field: &'static str,
+) -> Result<(), InitialSnapshotError> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| invalid_field(field, format!("invalid JSON object: {error}")))?;
+    if !value.is_object() {
+        return Err(invalid_field(field, "must encode a JSON object"));
+    }
+    let canonical = canonical_json_bytes(&value)
+        .map_err(|error| InitialSnapshotError::Canonicalization(error.to_string()))?;
+    if canonical != json.as_bytes() {
+        return Err(invalid_field(field, "must use canonical JSON encoding"));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]

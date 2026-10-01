@@ -948,6 +948,10 @@ enum SetupCommand {
         /// residency template admitted into the signed Config snapshot.
         #[arg(long)]
         blob_process_policy_json: String,
+        /// Canonical JSON of the Human-approved governing-source pair; this
+        /// exact value is covered by the existing signed initial snapshot.
+        #[arg(long)]
+        governing_source_approval_json: String,
         /// Dreamer route kind: `unassigned`, `local`, `economy`, or `paid`.
         #[arg(long)]
         dreamer_route: Option<String>,
@@ -1093,6 +1097,7 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             resource_generation,
             privacy,
             blob_process_policy_json,
+            governing_source_approval_json,
             dreamer_route,
             watchdog_route,
             dreamer_displayed,
@@ -1115,6 +1120,7 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             resource_generation,
             privacy,
             blob_process_policy_json,
+            governing_source_approval_json,
             dreamer_route,
             watchdog_route,
             dreamer_displayed,
