@@ -282,6 +282,145 @@ def _prerequisite_evidence(
             return ()
     return tuple(evidence)
 
+
+# ---------------------------------------------------------------------------
+# Cohort owner/sharing/currency wiring (#852 W1b).
+#
+# The frozen cohort module verifies open only what its caller supplies:
+#   integration_owners   typed owner profile bound by the accepted
+#                        assignment-bound classification (never unit-name
+#                        spelling, never magic issue numbers);
+#   package_sharing      explicit typed sharing edges over accepted finite
+#                        roots and accepted lock prerequisite order;
+#   expected_base_commit / expected_repository
+#                        caller-supplied currency expectations for the
+#                        committed lock (observed checkout HEAD / unanimous
+#                        descriptor repository; omitted when unobservable);
+#   assignment_receipts  live or explicitly admitted offline receipts rebound
+#                        per row before catalogue integrity is declared.
+# Until supplied, those paths fail closed inside cohort; this layer supplies
+# them from the accepted catalogue/snapshot/lock inputs it already holds, and
+# supplies nothing it has not observed (unobservable stays omitted, never
+# fabricated, never a fallback).
+# ---------------------------------------------------------------------------
+
+def _observed_base_commit(root: Path) -> str | None:
+    """Observe the current checkout revision for lock-currency expectations.
+
+    Fixed read-only `git rev-parse HEAD` projection bounded to `root`; only a
+    well-formed 40-hex observation becomes an expectation, so a stale lock
+    base is invalidation rather than a valid self-consistent catalogue. Temp
+    fixture roots (no `.git`) and any unobservable/malformed output yield no
+    expectation, keeping lock-internal verification exactly as before.
+    """
+    if not cohort.is_real_repository_root(root):
+        return None
+    observed = _git_observed(root, ["rev-parse", "HEAD"])
+    if observed is None or re.fullmatch(r"[0-9a-f]{40}", observed) is None:
+        return None
+    return observed
+
+
+def _expected_repository(descriptors: object) -> c.RepositoryIdentity | None:
+    """Unanimous repository expectation across typed descriptors, if any.
+
+    A single distinct repository becomes the moved-source expectation for the
+    committed lock. Zero descriptors or mixed repositories yield no
+    expectation (structural checks still apply); nothing is guessed.
+    """
+    assert isinstance(descriptors, (list, tuple, set, dict))
+    values = descriptors.values() if isinstance(descriptors, dict) else descriptors
+    repos = set()
+    for desc in values:
+        if type(desc) is not c.WorkUnitDescriptor:
+            raise cohort.CohortError(cohort.CohortProblem.INTERNAL_ERROR,
+                                     "currency descriptor mistyped")
+        repos.add(desc.issue.repository)
+    if len(repos) != 1:
+        return None
+    return next(iter(repos))
+
+
+def _integration_owner_profile(bound: object) -> cohort.IntegrationOwnerProfile:
+    """Build the accepted typed integration-owner profile for this operation.
+
+    Authority comes only from the accepted assignment-bound classification: a
+    descriptor whose accepted phase is WORKSPACE_INTEGRATION carries the
+    catalogue's own membership obligation for its exact (issue, unit) pair.
+    Unit-name spelling is identity, never authority: names are never read,
+    only listed pairs. Descriptors without an established assignment binding
+    contribute nothing, so an unbound claim can never confer authority. No
+    bound integration-scoped descriptor yields the empty profile, which keeps
+    restricted-root claims deny-by-default exactly as before.
+    """
+    assert isinstance(bound, (list, tuple, set, dict))
+    values = bound.values() if isinstance(bound, dict) else bound
+    entries = []
+    for desc in values:
+        if type(desc) is not c.WorkUnitDescriptor:
+            raise cohort.CohortError(cohort.CohortProblem.INTERNAL_ERROR,
+                                     "integration owner descriptor mistyped")
+        if desc.phase is c.VerificationPhase.WORKSPACE_INTEGRATION:
+            entries.append(cohort.IntegrationOwnerEntry(issue=desc.issue, unit=desc.unit))
+    return cohort.IntegrationOwnerProfile(owners=tuple(entries))
+
+
+def _package_sharing_edges(descriptors: object, prerequisites: dict) -> tuple:
+    """Derive explicit typed package-sharing edges from accepted inputs.
+
+    For every pair of typed descriptors naming one package: DISJOINT when
+    their finite mutable (source) scopes do not overlap; SERIALIZED when an
+    accepted catalogue/lock prerequisite edge orders the pair one way.
+    Same-order tracks alone never suffice, and pairs with overlapping scopes
+    and no ordering edge keep their conflict. Cohort re-validates package,
+    scopes and order together; this layer invents neither roots nor order.
+    """
+    assert isinstance(descriptors, (list, tuple, set, dict))
+    typed = list(descriptors.values() if isinstance(descriptors, dict) else descriptors)
+    for desc in typed:
+        if type(desc) is not c.WorkUnitDescriptor:
+            raise cohort.CohortError(cohort.CohortProblem.INTERNAL_ERROR,
+                                     "package sharing descriptor mistyped")
+    edges = []
+    for pos, first in enumerate(typed):
+        if first.package is None:
+            continue
+        for second in typed[pos + 1:]:
+            if second.package is None or second.package.name != first.package.name:
+                continue
+            if first.issue == second.issue:
+                continue
+            if first.issue.repository != second.issue.repository:
+                continue
+            if not cohort.check_write_scope_overlap(first, second):
+                kind = cohort.PackageSharingKind.DISJOINT
+            elif (second.issue.number in prerequisites.get(first.issue.number, set())
+                    or first.issue.number in prerequisites.get(second.issue.number, set())):
+                kind = cohort.PackageSharingKind.SERIALIZED
+            else:
+                continue
+            edges.append(cohort.PackageSharingEdge(
+                package=first.package, issues=(first.issue, second.issue), kind=kind))
+    return tuple(edges)
+
+
+def _assignment_receipts(memo_assignment: dict) -> dict:
+    """Project acquired assignment documents onto their typed source receipts.
+
+    Only issues whose assignment was actually acquired through the frozen #849
+    source (live or explicitly admitted offline) contribute a receipt, so
+    rows stay bound to live evidence and no receipt is fabricated for
+    unacquired rows. Callers pass the result only where it covers the rows
+    being verified; otherwise they pass none and keep lock-internal binding.
+    """
+    receipts = {}
+    for number, doc in memo_assignment.items():
+        if type(doc) is not assignment_source.AssignmentDocument:
+            raise cohort.CohortError(cohort.CohortProblem.INTERNAL_ERROR,
+                                     "assignment document mistyped")
+        receipts[number] = doc.receipt
+    return receipts
+
 # Frozen CLI contract (#837 D-WU-FINAL, integrator-frozen; byte-for-byte).
 # Proof kinds: catalogue-only | selected | full-project (validated before
 # effects). Selector: --issue NUMBER (repeatable, distinct values) xor --crate
@@ -909,7 +1048,12 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     typed_by_issue = {t.issue.number: t for t in typed_descs}
                     catalogue = cohort.verify_cohort_lock(
-                        lock_path, root / ".github" / "work-units", typed_by_issue)
+                        lock_path, root / ".github" / "work-units", typed_by_issue,
+                        expected_base_commit=_observed_base_commit(root),
+                        expected_repository=_expected_repository(typed_descs),
+                        # Catalogue-only acquires no assignment: lock-internal
+                        # row binding (no receipt fabricated for unacquired rows).
+                        assignment_receipts=None)
                 except cohort.CohortError as exc:
                     return finish(fail_result(f"catalogue aggregate lock invalid: {_redact(exc.problem.value if hasattr(exc, 'problem') else type(exc).__name__)}", 1,
                                               ceiling="catalogue-integrity-only", scope="selected",
@@ -947,7 +1091,15 @@ def main(argv: list[str] | None = None) -> int:
                                             disposition=c.CatalogueDisposition.ASSIGNED,
                                             descriptor=d, prerequisites=()) for d in sorted(typed_descs, key=lambda d: d.issue))
                 expected = tuple(sorted({r.issue for r in rows}))
-                catalogue = cohort.materialize_catalogue(rows, expected)
+                # No assignment binding is established on catalogue-only, so no
+                # descriptor confers owner authority here (empty profile keeps
+                # restricted-root claims deny-by-default); disjoint sharing
+                # still verifies open over accepted finite roots, while
+                # serialized sharing needs lock order that only a lock supplies.
+                catalogue = cohort.materialize_catalogue(
+                    rows, expected,
+                    integration_owners=_integration_owner_profile(()),
+                    package_sharing=_package_sharing_edges(typed_descs, {}))
             except cohort.CohortError as exc:
                 return finish(fail_result(f"catalogue structural failure: {_redact(exc.problem.value if hasattr(exc, 'problem') else type(exc).__name__)}", 1,
                                           ceiling="catalogue-integrity-only", scope="selected",
@@ -1272,6 +1424,39 @@ def main(argv: list[str] | None = None) -> int:
             return finish(fail_result("catalogue contract failure", 1, failed=["catalogue"]))
         except Exception:
             return finish(fail_result("catalogue internal failure", 2))
+        # Committed-lock re-verification on the execution path. A present lock
+        # is authority, not decoration: re-discover the numeric class, rebind
+        # rows to caller-supplied descriptors and receipts, and check currency
+        # against caller-supplied expectations. A missing lock declares nothing
+        # (the synthesized-denominator flow below continues unchanged); a
+        # present but invalid or stale lock fails closed and never becomes an
+        # empty mapping. Receipts are supplied only where they cover every
+        # assigned locked row (full denominator acquired); a selected subset
+        # keeps lock-internal binding while its own rows stay bound to live
+        # evidence through parse_descriptor.
+        if locked:
+            try:
+                assigned_locked = {number for number, row in locked.items()
+                                   if row.disposition is c.CatalogueDisposition.ASSIGNED}
+                observed_receipts = _assignment_receipts(memo_assignment)
+                catalogue_check = cohort.verify_cohort_lock(
+                    lock_path, root / ".github" / "work-units",
+                    {d.issue.number: d for d in all_typed},
+                    expected_base_commit=_observed_base_commit(root),
+                    expected_repository=_expected_repository(all_typed),
+                    assignment_receipts=(observed_receipts
+                                         if assigned_locked.issubset(observed_receipts)
+                                         else None))
+            except cohort.CohortError as exc:
+                return finish(fail_result(
+                    f"catalogue aggregate lock invalid: {_redact(exc.problem.value)}", 1,
+                    failed=["catalogue-lock"]))
+            except c.ContractViolation:
+                return finish(fail_result("catalogue contract failure", 1, failed=["catalogue"]))
+            except Exception:
+                return finish(fail_result("catalogue internal failure", 2))
+            if type(catalogue_check) is not c.CatalogueIntegrityReceipt:
+                return finish(fail_result("malformed child return: catalogue lock", 2))
         try:
             # A discovered descriptor keeps its own ASSIGNED row when the lock
             # declares none for it (a root that ships no lock at all, or a
@@ -1288,7 +1473,22 @@ def main(argv: list[str] | None = None) -> int:
                 row for number, row in sorted(locked.items())
                 if number not in synthesized)
             expected_all = tuple(sorted({r.issue for r in rows_all}))
-            catalogue_full = cohort.materialize_catalogue(rows_all, expected_all)
+            # Owner authority comes only from assignment-bound descriptors
+            # whose accepted phase carries the catalogue's own membership
+            # obligation; sharing edges come from accepted finite roots plus
+            # the accepted prerequisite order above (locked edges preserved,
+            # synthesized rows declare none). Restricted-root claims and
+            # valid sharing therefore verify open for the exact owner, while
+            # unbound claims stay deny-by-default.
+            owner_profile = _integration_owner_profile(
+                tuple(bound_descs[n] for n in sorted(bound_descs)))
+            sharing_edges = _package_sharing_edges(
+                all_typed,
+                {r.issue.number: {p.number for p in r.prerequisites} for r in rows_all})
+            catalogue_full = cohort.materialize_catalogue(
+                rows_all, expected_all,
+                integration_owners=owner_profile,
+                package_sharing=sharing_edges)
         except cohort.CohortError as exc:
             problem = exc.problem.value if hasattr(exc, "problem") else type(exc).__name__
             return finish(fail_result(f"catalogue structural failure: {_redact(problem)}", 1,
@@ -1375,7 +1575,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 return finish(fail_result("internal failure: attempt paths", 2))
             try:
-                cohort.validate_descriptor_scope(d)
+                cohort.validate_descriptor_scope(d, integration_owners=owner_profile)
             except cohort.CohortError:
                 return finish(fail_result(f"contract failure: descriptor scope issue-{d.issue.number}", 1,
                                           failed=[f"issue-{d.issue.number}"]))
