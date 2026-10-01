@@ -11449,11 +11449,13 @@ mod live_surreal_evidence_pack_e2e {
         StateRequest, StoreReadFailure, TimeScope,
     };
     use eliot_store_api::{
-        EVIDENCE_PACK_MAX_RECORDS, EffectClass, EventProjectionRelationIntents,
-        NamedMutationOperation, NamedMutationRequest, NamedReadOperation, OperationId,
-        OperationIdentity, OrderingScopeId, PreparedTransition, ReadConsistency, ScopeId,
-        TransitionClass, WriteReceiptStatus, generated_operation_manifests,
-        operation_manifest_set_digest, sha256_hex,
+        CanonicalRequestView, EVIDENCE_PACK_MAX_RECORDS, EffectClass,
+        EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
+        NamedReadOperation, OperationId, OrderingHeadExpectation, OrderingScopeId,
+        PreparedTransition, ReadConsistency, ScopeId, SecurityContext, TransitionClass,
+        WriteReceiptStatus, generated_operation_manifests, operation_manifest_set_digest,
+        sha256_hex, supported_admission_contract_set_digest, validate_store_receipt_envelope,
+        verify_canonical_request_hash,
     };
     use eliot_store_surreal_adapter::{
         PINNED_SURREALDB_MAJOR, SchemaGeneration, SemanticReadiness, SurrealAdapterConfig,
@@ -11516,37 +11518,32 @@ mod live_surreal_evidence_pack_e2e {
     }
 
     fn live_capture_transition(
+        context: &RequestMetadata,
         fence: &StateFence,
         scope: &ScopeId,
         subject: &str,
         tag: &str,
-    ) -> PreparedTransition {
+    ) -> (PreparedTransition, Vec<OrderingHeadExpectation>) {
         let entries = generated_operation_manifests().expect("operation catalogue generates");
         let set_digest = operation_manifest_set_digest(&entries).expect("set digest computes");
-        let mut transition = PreparedTransition {
-            contract_version: eliot_store_api::CONTRACT_VERSION,
-            identity: OperationIdentity {
-                operation_id: OperationId::new(format!("op-t11-live-{tag}"))
-                    .expect("operation identity"),
-                idempotency_key: format!("idem-t11-live-{tag}"),
-                canonical_request_hash: sha256_hex(format!("op-t11-live-{tag}").as_bytes()),
-            },
+        let ordering_heads = vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(scope.as_str()).expect("ordering scope"),
+            expected_sequence: 1,
             state_fence: fence.clone(),
+        }];
+        let envelope = eliot_canonical::CanonicalWriteEnvelope {
+            operation_id: OperationId::new(format!("op-t11-live-{tag}"))
+                .expect("operation identity"),
+            request: context.clone(),
+            idempotency_key: format!("idem-t11-live-{tag}"),
             scope_id: scope.clone(),
             task_id: None,
-            ordering_scopes: vec![OrderingScopeId::new(scope.as_str()).expect("ordering scope")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest:
-                eliot_store_api::supported_admission_contract_set_digest()
-                    .expect("admission contract set computes"),
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .expect("admission contract set computes"),
             operation_manifest_digest: set_digest,
-            // Issue-#18 digests are derived, never defaulted; no semantic
-            // source is bound here (`[]`).
-            admission_digest: String::new(),
-            mutation_plan_digest: String::new(),
-            semantic_source_revisions: Vec::new(),
-            named_operations: vec![NamedMutationRequest {
+            semantic_commands: vec![NamedMutationRequest {
                 operation: NamedMutationOperation::CaptureObservation,
                 parameters: BTreeMap::from([("subject".to_owned(), json!(subject))]),
             }],
@@ -11555,11 +11552,15 @@ mod live_surreal_evidence_pack_e2e {
                 projection_kinds: Vec::new(),
                 relation_kinds: Vec::new(),
             },
-            security: eliot_store_api::SecurityContext::default(),
+            security: SecurityContext::default(),
             required_proof_and_approval_refs: Vec::new(),
+            expected_revision_heads: Vec::new(),
+            expected_ordering_heads: ordering_heads.clone(),
         };
-        eliot_store_api::bind_issue18_digests(&mut transition).expect("issue-18 digests bind");
-        transition
+        (
+            envelope.prepare().expect("production capture envelope prepares"),
+            ordering_heads,
+        )
     }
 
     fn verification_intent() -> QueryIntent {
@@ -11927,13 +11928,44 @@ mod live_surreal_evidence_pack_e2e {
         // Existing capture path: one real observation through the production
         // atomic writer on the live provider.
         let ctx = live_context(&fence, &format!("capture-{tag}"));
-        let transition = live_capture_transition(&fence, &scope, &subject, &tag);
+        let (transition, expected_ordering_heads) =
+            live_capture_transition(&ctx, &fence, &scope, &subject, &tag);
+        let original_request = CanonicalRequestView::from_apply(
+            &ctx,
+            &transition,
+            &[],
+            &expected_ordering_heads,
+        );
+        let original_digest = transition.identity.canonical_request_hash.clone();
+        verify_canonical_request_hash(&original_request, &original_digest)
+            .expect("the retained capture identity binds its original submitted request");
         let receipt = adapter
-            .apply_prepared(&ctx, transition, Vec::new(), Vec::new())
+            .apply_prepared(
+                &ctx,
+                transition.clone(),
+                Vec::new(),
+                expected_ordering_heads.clone(),
+            )
             .await
             .expect("live capture commits");
         assert_eq!(receipt.status, WriteReceiptStatus::Committed);
         assert_eq!(receipt.state_fence, fence);
+        receipt.validate().expect("the original write receipt validates");
+        assert_eq!(receipt.canonical_request_hash, original_digest);
+
+        // Read back and validate the owner's retained receipt against the
+        // original request before asking the read facade to project evidence.
+        let retained_receipt = adapter
+            .reconcile(receipt.operation_id.clone())
+            .await
+            .expect("retained capture receipt reads")
+            .expect("committed capture receipt is retained");
+        retained_receipt
+            .validate()
+            .expect("the retained capture receipt validates");
+        validate_store_receipt_envelope(&ctx, &transition, &retained_receipt)
+            .expect("the retained receipt binds the original capture request");
+        assert_eq!(retained_receipt, receipt);
 
         // `eliot.query` acceptance: the Governor read facade over the SAME
         // live adapter returns the exact record/provenance. Free text cannot
