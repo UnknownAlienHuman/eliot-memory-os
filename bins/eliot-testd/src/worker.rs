@@ -785,6 +785,14 @@ fn observe_tool_identity(
     let (selected_path, selected_sha256) = match stage_command.executable.as_str() {
         "cargo" => (&observation.cargo_path, &observation.cargo_sha256),
         "cargo-nextest" => (&observation.nextest_path, &observation.nextest_sha256),
+        "dotnet" => observation
+            .dotnet_path
+            .as_ref()
+            .zip(observation.dotnet_sha256.as_ref())
+            .ok_or(TestdError::Invalid {
+                field: "stage_request.stage_command.executable",
+                reason: "dotnet stage has no separately observed dotnet identity",
+            })?,
         _ => {
             return Err(TestdError::Invalid {
                 field: "stage_request.stage_command.executable",
@@ -835,6 +843,20 @@ fn observe_tool_identity(
             return Err(TestdError::InvalidBinding);
         }
     }
+    match (
+        observation.dotnet_path.as_deref(),
+        observation.dotnet_sha256.as_deref(),
+    ) {
+        (Some(path), Some(digest)) => {
+            if required(crate::TESTD_ENV_DOTNET)? != path
+                || required(crate::TESTD_ENV_DOTNET_SHA256)? != digest
+            {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
+        (None, None) if !environment.contains_key(crate::TESTD_ENV_DOTNET) => {}
+        _ => return Err(TestdError::InvalidBinding),
+    }
     reobserve_tool_files(&observation)?;
     Ok((observation, process_environment))
 }
@@ -862,6 +884,21 @@ fn reobserve_tool_files(observation: &TestdToolObservation) -> Result<(), TestdE
             return Err(TestdError::Invalid {
                 field: "tool_environment",
                 reason: "owner-observed tool changed before start",
+            });
+        }
+    }
+    if let (Some(path), Some(expected)) = (
+        observation.dotnet_path.as_deref(),
+        observation.dotnet_sha256.as_deref(),
+    ) {
+        let bytes = std::fs::read(path).map_err(|_| TestdError::Invalid {
+            field: "tool_environment",
+            reason: "owner-observed dotnet tool cannot be reread before execution",
+        })?;
+        if eliot_testd_core::sha256_hex(&bytes) != expected {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "owner-observed dotnet tool changed before execution",
             });
         }
     }

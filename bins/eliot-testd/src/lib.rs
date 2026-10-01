@@ -1499,6 +1499,8 @@ const TESTD_ENV_CARGO: &str = "CARGO";
 const TESTD_ENV_RUSTC: &str = "RUSTC";
 const TESTD_ENV_CARGO_SHA256: &str = "ELIOT_TESTD_CARGO_SHA256";
 const TESTD_ENV_RUSTC_SHA256: &str = "ELIOT_TESTD_RUSTC_SHA256";
+const TESTD_ENV_DOTNET: &str = "ELIOT_TESTD_DOTNET";
+const TESTD_ENV_DOTNET_SHA256: &str = "ELIOT_TESTD_DOTNET_SHA256";
 const TESTD_ENV_TOOLCHAIN: &str = "ELIOT_TESTD_TOOLCHAIN";
 const TESTD_ENV_CARGO_HOME: &str = "CARGO_HOME";
 const TESTD_ENV_RUSTUP_HOME: &str = "RUSTUP_HOME";
@@ -1567,6 +1569,7 @@ pub fn resolve_testd_tool_at(
         &selected.cargo,
         &selected.rustc,
         &selected.toolchain,
+        None,
     )?;
     Ok(ResolvedTestdTool {
         executable_absolute: executable.path,
@@ -1580,8 +1583,9 @@ pub fn resolve_testd_tool_at(
 fn resolve_testd_executor_tool_at(
     selector: &str,
     source_root: &Path,
+    owner_observation: &TestdToolObservation,
 ) -> Result<ResolvedTestdTool, TestdError> {
-    if !matches!(selector, "cargo" | "cargo-nextest") {
+    if !matches!(selector, "cargo" | "cargo-nextest" | "dotnet") {
         return Err(TestdError::Invalid {
             field: "stage_command.executable",
             reason: "runner stage selected an unregistered tool selector",
@@ -1592,18 +1596,42 @@ fn resolve_testd_executor_tool_at(
         reason: "the platform tool locator carries no PATH",
     })?;
     let nextest = resolve_tool_file("cargo-nextest", &path_var)?;
+    let dotnet = match (
+        owner_observation.dotnet_path.as_deref(),
+        owner_observation.dotnet_sha256.as_deref(),
+    ) {
+        (Some(expected_path), Some(expected_sha256)) => {
+            let measured = resolve_tool_file("dotnet", &path_var)?;
+            if measured.path != expected_path || measured.sha256 != expected_sha256 {
+                return Err(TestdError::Invalid {
+                    field: "process_tool.dotnet",
+                    reason: "current dotnet path or bytes differ from the independently retained observation",
+                });
+            }
+            Some(measured)
+        }
+        (None, None) if selector != "dotnet" => None,
+        _ => {
+            return Err(TestdError::Invalid {
+                field: "process_tool.dotnet",
+                reason: "dotnet selection requires a separately retained path and digest",
+            });
+        }
+    };
     let rustup_home = owner_home_path("RUSTUP_HOME", ".rustup")?;
     let selected = resolve_selected_toolchain(&rustup_home, source_root)?;
-    let executable = if selector == "cargo" {
-        &selected.cargo
-    } else {
-        &nextest
+    let executable = match selector {
+        "cargo" => &selected.cargo,
+        "cargo-nextest" => &nextest,
+        "dotnet" => dotnet.as_ref().ok_or(TestdError::InvalidBinding)?,
+        _ => return Err(TestdError::InvalidBinding),
     };
     let environment = productive_tool_environment(
         &nextest,
         &selected.cargo,
         &selected.rustc,
         &selected.toolchain,
+        dotnet.as_ref(),
     )?;
     Ok(ResolvedTestdTool {
         executable_absolute: executable.path.clone(),
@@ -1626,6 +1654,7 @@ fn resolve_tool_file(
             "cargo" => &["cargo.exe", "cargo"],
             "cargo-nextest" => &["cargo-nextest.exe", "cargo-nextest"],
             "rustc" => &["rustc.exe", "rustc"],
+            "dotnet" => &["dotnet.exe", "dotnet"],
             _ => &[],
         }
     } else {
@@ -1669,6 +1698,7 @@ fn productive_tool_environment(
     cargo: &ResolvedToolFile,
     rustc: &ResolvedToolFile,
     selected_toolchain: &str,
+    dotnet: Option<&ResolvedToolFile>,
 ) -> Result<Vec<(String, String)>, TestdError> {
     let cargo_home = owner_home_path("CARGO_HOME", ".cargo")?;
     let rustup_home = owner_home_path("RUSTUP_HOME", ".rustup")?;
@@ -1680,6 +1710,13 @@ fn productive_tool_environment(
         })?;
         directories.insert(parent.to_path_buf());
     }
+    if let Some(dotnet) = dotnet {
+        let parent = Path::new(&dotnet.path).parent().ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "resolved dotnet tool has no parent directory",
+        })?;
+        directories.insert(parent.to_path_buf());
+    }
     let path_value = std::env::join_paths(directories)
         .map_err(|_| TestdError::Invalid {
             field: "tool_environment",
@@ -1687,7 +1724,7 @@ fn productive_tool_environment(
         })?
         .to_string_lossy()
         .into_owned();
-    Ok(vec![
+    let mut environment = vec![
         (TESTD_ENV_NEXTEST_GATE.to_owned(), "1".to_owned()),
         (TESTD_ENV_NEXTEST.to_owned(), nextest.path.clone()),
         (TESTD_ENV_NEXTEST_SHA256.to_owned(), nextest.sha256.clone()),
@@ -1702,7 +1739,12 @@ fn productive_tool_environment(
             selected_toolchain.to_owned(),
         ),
         (TESTD_ENV_PATH.to_owned(), path_value),
-    ])
+    ];
+    if let Some(dotnet) = dotnet {
+        environment.push((TESTD_ENV_DOTNET.to_owned(), dotnet.path.clone()));
+        environment.push((TESTD_ENV_DOTNET_SHA256.to_owned(), dotnet.sha256.clone()));
+    }
+    Ok(environment)
 }
 
 struct SelectedToolchain {
@@ -1921,7 +1963,7 @@ fn validate_productive_tool_environment(
     cache_root: &str,
 ) -> Result<eliot_process::EnvironmentProjection, TestdError> {
     let values: BTreeMap<_, _> = environment.iter().cloned().collect();
-    let expected_keys = [
+    let mut expected_keys = vec![
         TESTD_ENV_NEXTEST_GATE,
         TESTD_ENV_NEXTEST,
         TESTD_ENV_NEXTEST_SHA256,
@@ -1935,6 +1977,9 @@ fn validate_productive_tool_environment(
         TESTD_ENV_PATH,
         "CARGO_TARGET_DIR",
     ];
+    if selector == "dotnet" || values.contains_key(TESTD_ENV_DOTNET) {
+        expected_keys.extend([TESTD_ENV_DOTNET, TESTD_ENV_DOTNET_SHA256]);
+    }
     if values.len() != environment.len()
         || values.len() != expected_keys.len()
         || expected_keys.iter().any(|key| !values.contains_key(*key))
@@ -1962,6 +2007,13 @@ fn validate_productive_tool_environment(
     let selected_path = match selector {
         "cargo" => cargo.as_str(),
         "cargo-nextest" => nextest_path.as_str(),
+        "dotnet" => values
+            .get(TESTD_ENV_DOTNET)
+            .map(String::as_str)
+            .ok_or(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "dotnet stage has no separately observed executable path",
+            })?,
         _ => {
             return Err(TestdError::Invalid {
                 field: "stage_command.executable",
@@ -1972,11 +2024,22 @@ fn validate_productive_tool_environment(
     if selected_executable_path != selected_path {
         return Err(TestdError::InvalidBinding);
     }
-    let expected_hashes = [
+    let mut expected_hashes = vec![
         (TESTD_ENV_NEXTEST_SHA256, nextest_path.as_str()),
         (TESTD_ENV_CARGO_SHA256, cargo),
         (TESTD_ENV_RUSTC_SHA256, rustc),
     ];
+    if selector == "dotnet" || values.contains_key(TESTD_ENV_DOTNET) {
+        let dotnet_path = values.get(TESTD_ENV_DOTNET).ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "dotnet selection has no separately observed executable path",
+        })?;
+        validate_owner_tool_path(dotnet_path)?;
+        expected_hashes.push((
+            TESTD_ENV_DOTNET_SHA256,
+            dotnet_path.as_str(),
+        ));
+    }
     for (hash_key, path) in expected_hashes {
         let expected = values.get(hash_key).ok_or(TestdError::Invalid {
             field: "tool_environment",
@@ -2026,11 +2089,18 @@ fn validate_productive_tool_environment(
         field: "tool_environment",
         reason: "productive environment is missing a bounded PATH",
     })?;
-    let expected_dirs = [nextest, Path::new(cargo), Path::new(rustc)]
+    let mut expected_dirs = [nextest, Path::new(cargo), Path::new(rustc)]
         .iter()
         .filter_map(|path| path.parent())
         .map(Path::to_path_buf)
         .collect::<BTreeSet<_>>();
+    if let Some(dotnet) = values.get(TESTD_ENV_DOTNET) {
+        let parent = Path::new(dotnet).parent().ok_or(TestdError::Invalid {
+            field: "tool_environment",
+            reason: "dotnet executable has no parent directory",
+        })?;
+        expected_dirs.insert(parent.to_path_buf());
+    }
     let observed_dirs =
         std::env::split_paths(std::ffi::OsStr::new(path_value)).collect::<BTreeSet<_>>();
     if observed_dirs != expected_dirs {
@@ -2253,7 +2323,13 @@ fn derive_dispatch_process_intent(
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
     };
     let tool = if stage_command.is_some() {
-        resolve_testd_executor_tool_at(program_path, canonical_job_source)?
+        let owner_observation = job.provider_tool_observation.as_ref().ok_or(
+            TestdError::Invalid {
+                field: "provider_tool_observation",
+                reason: "productive stage has no durable owner-measured tools",
+            },
+        )?;
+        resolve_testd_executor_tool_at(program_path, canonical_job_source, owner_observation)?
     } else {
         resolve_testd_tool_at(program_path, canonical_job_source)?
     };

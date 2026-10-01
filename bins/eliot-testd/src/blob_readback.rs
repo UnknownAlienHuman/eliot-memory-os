@@ -190,7 +190,7 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             let response = match kernel_response.outcome {
                 BlobProcessStreamKernelOutcome::Completed { response, .. } => {
                     match response.operation {
-                        BlobProcessStreamOperationResponse::SourceReadback { response } => response,
+                        BlobProcessStreamOperationResponse::SourceReadback { response } => *response,
                         _ => return Err(integrity_error(stream)),
                     }
                 }

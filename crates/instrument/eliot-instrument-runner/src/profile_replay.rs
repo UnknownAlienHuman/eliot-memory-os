@@ -14,6 +14,7 @@ use eliot_bootstrap::{
 use eliot_contracts::{ArtifactId, ClockReading, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{EvidenceCoverage, RawEvidence, RawEvidenceSource, VerificationOutcome};
 use eliot_instrument_cargo::{CONTRACT_NAME as CARGO_INSTRUMENT, parse_jsonl as parse_cargo_jsonl};
+use eliot_instrument_dotnet::{CONTRACT_ID as DOTNET_INSTRUMENT, parse_build_output};
 use eliot_instrument_nextest::{
     NEXTEST_INSTRUMENT, NEXTEST_STDOUT_CONTENT_TYPE, parse_jsonl, parse_list_json,
 };
@@ -914,6 +915,15 @@ fn replay_profile_stream_inner(
             started_at,
             finished_at,
         ),
+        DOTNET_INSTRUMENT => dotnet_receipt(
+            source,
+            verified,
+            bytes,
+            entry,
+            parser_revision,
+            terminal,
+            finished_at,
+        ),
         _ => Err(ProfileReplayError::UnsupportedProfile {
             profile: stage.profile_name.clone(),
         }),
@@ -1059,6 +1069,13 @@ fn current_selection<'a>(
         RUSTC_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Build,
         RUSTFMT_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Format,
         NEXTEST_INSTRUMENT => stage.kind == eliot_instrument_api::InstrumentKind::Test,
+        DOTNET_INSTRUMENT => matches!(
+            stage.kind,
+            eliot_instrument_api::InstrumentKind::Build
+                | eliot_instrument_api::InstrumentKind::Test
+                | eliot_instrument_api::InstrumentKind::Verify
+                | eliot_instrument_api::InstrumentKind::Inspect
+        ),
         _ => false,
     };
     if stage.execution != StageExecutionKind::Process || !supported_process {
@@ -1339,6 +1356,39 @@ fn rustfmt_receipt(
             finished_at,
         ),
     }
+}
+
+fn dotnet_receipt(
+    source: &TestdStreamEvidenceBinding,
+    verified: VerifiedSource<'_>,
+    bytes: &EphemeralSourceBytes,
+    entry: &RegistryEntry,
+    parser_revision: String,
+    terminal: Option<&ExitStatus>,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    let report = match parse_build_output(bytes.bytes()) {
+        Ok(report) => report,
+        Err(error) => {
+            return parse_failed_receipt(
+                source,
+                verified,
+                entry,
+                parser_revision,
+                error.to_string(),
+                finished_at,
+            );
+        }
+    };
+    evaluated_report_receipt(
+        source,
+        verified,
+        entry,
+        parser_revision,
+        terminal_outcome(report.outcome(), terminal),
+        "msbuild-console-diagnostic-summary-and-terminal-outcome",
+        finished_at,
+    )
 }
 
 fn terminal_code(terminal: Option<&ExitStatus>) -> Option<i32> {
