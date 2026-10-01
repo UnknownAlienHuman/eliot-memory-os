@@ -898,22 +898,27 @@ impl StartupCoordinator {
         self.governor_observation_readback.clone()
     }
 
-    /// Consumes exactly the readback used by one publish. A fresh source read
-    /// is required before the same page can be associated with another
-    /// revision.
+    /// Records a Governor projection and consumes its associated readback
+    /// under the same coordinator mutation. Revision failure leaves the
+    /// readback available for a negative-source retry.
     #[cfg(windows)]
-    pub(crate) fn mark_governor_authority_observation_published(
+    pub(crate) fn record_governor_authority_observation_projection(
         &mut self,
-        expected: &GovernorAuthorityObservationReadback,
         revision: u64,
+        fingerprint: String,
+        profile: GovernanceProfile,
+        expected: &GovernorAuthorityObservationReadback,
     ) -> Result<(), String> {
-        let Some(current) = self.governor_observation_readback.as_mut() else {
+        let Some(current) = self.governor_observation_readback.as_ref() else {
             return Err("governor observation readback is absent".to_owned());
         };
         if current != expected || current.published_revision.is_some() || revision == 0 {
             return Err("governor observation readback is stale or already published".to_owned());
         }
-        current.published_revision = Some(revision);
+        self.record_governor_derived_authority(revision, fingerprint, profile)?;
+        if let Some(current) = self.governor_observation_readback.as_mut() {
+            current.published_revision = Some(revision);
+        }
         Ok(())
     }
 
@@ -1311,6 +1316,41 @@ impl super::KernelComposition {
     /// revision rule, so a newer degraded projection revokes everything
     /// issued under the old one.
     ///
+    /// # Errors
+    ///
+    /// Returns a platform error when the startup gate lock is poisoned, and
+    /// the fixed-shape reason when the revision does not strictly advance or
+    /// the fingerprint does not name the exact active fingerprint.
+    #[cfg(windows)]
+    pub(crate) fn record_governor_issued_coverage_projection_with_observation(
+        &self,
+        revision: u64,
+        fingerprint: String,
+        verified: bool,
+        authorizes_enforcement: bool,
+        authorizes_complete_coverage_ops: bool,
+        readback: &GovernorAuthorityObservationReadback,
+    ) -> Result<(), eliot_kernel_service::KernelServiceError> {
+        let profile = governor_authorization_axes_to_profile(
+            verified,
+            authorizes_enforcement,
+            authorizes_complete_coverage_ops,
+        );
+        let mut coordinator = self.startup_coordinator.lock().map_err(|_| {
+            eliot_kernel_service::KernelServiceError::Platform(
+                "startup gate lock poisoned".to_owned(),
+            )
+        })?;
+        coordinator
+            .record_governor_authority_observation_projection(
+                revision,
+                fingerprint,
+                profile,
+                readback,
+            )
+            .map_err(eliot_kernel_service::KernelServiceError::Platform)
+    }
+
     /// # Errors
     ///
     /// Returns a platform error when the startup gate lock is poisoned, and
