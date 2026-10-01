@@ -1180,9 +1180,7 @@ pub enum AdmitMaintenanceRevocationError {
     NotRevokedClosure,
     /// The canonical second phase is already linked: nothing is pending, so
     /// admitting a duplicate obligation would fabricate work.
-    #[error(
-        "maintenance revocation admission refused: canonical second phase is already linked"
-    )]
+    #[error("maintenance revocation admission refused: canonical second phase is already linked")]
     SecondPhaseComplete,
     /// The committed closure is bound to a different State Fence than the live
     /// admitted one: the operation belongs to a superseded generation and must
@@ -1202,9 +1200,7 @@ impl AdmitMaintenanceRevocationError {
         match self {
             Self::Receipt(_) => "committed closure fails its own receipt contract",
             Self::Identity(_) => "committed closure names an invalid grant or snapshot identity",
-            Self::NotRevokedClosure => {
-                "committed closure is not a revoked revocation obligation"
-            }
+            Self::NotRevokedClosure => "committed closure is not a revoked revocation obligation",
             Self::SecondPhaseComplete => "canonical second phase is already linked",
             Self::StaleFence => {
                 "committed closure is not bound to the live composition State Fence"
