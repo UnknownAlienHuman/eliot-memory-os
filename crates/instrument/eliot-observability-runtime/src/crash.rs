@@ -19,9 +19,7 @@ use eliot_contracts::{EpochId, StateFence};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{MAX_CRASH_REPORT_BYTES, RollingLogPolicy};
-use crate::rolling_log::{
-    RollingLogAppendError, RollingLogAppendOutcome, RollingLogHandle,
-};
+use crate::rolling_log::{RollingLogAppendError, RollingLogAppendOutcome, RollingLogHandle};
 
 const MAX_IDENTITY_CHARS: usize = 128;
 const MAX_EVIDENCE_HANDLES: usize = 8;
@@ -406,11 +404,26 @@ impl CrashRuntimeContext {
             handle.validate()?;
         }
         for field in [
-            (self.module_generation_ref.is_some(), MissingCrashContextField::ModuleGeneration),
-            (self.process_generation_ref.is_some(), MissingCrashContextField::ProcessGeneration),
-            (self.authority_epoch.is_some(), MissingCrashContextField::AuthorityEpoch),
-            (self.state_fence.is_some(), MissingCrashContextField::StateFence),
-            (self.audit_head.is_some(), MissingCrashContextField::AuditHead),
+            (
+                self.module_generation_ref.is_some(),
+                MissingCrashContextField::ModuleGeneration,
+            ),
+            (
+                self.process_generation_ref.is_some(),
+                MissingCrashContextField::ProcessGeneration,
+            ),
+            (
+                self.authority_epoch.is_some(),
+                MissingCrashContextField::AuthorityEpoch,
+            ),
+            (
+                self.state_fence.is_some(),
+                MissingCrashContextField::StateFence,
+            ),
+            (
+                self.audit_head.is_some(),
+                MissingCrashContextField::AuditHead,
+            ),
         ] {
             if field.0 == self.missing_fields.contains(&field.1) {
                 return Err(CrashReportError::InvalidMetadata(
@@ -529,7 +542,6 @@ impl CrashReport {
         }
         Ok(text)
     }
-
 }
 
 /// One honest outcome of the best-effort crash evidence path.
@@ -657,7 +669,6 @@ impl CrashReportSink {
             .map_err(|error| CrashReportError::Io(io::Error::other(error)))?;
         Ok(Self { policy, handle })
     }
-
 }
 
 /// Cloneable handle for publishing owner-supplied runtime context and reading
@@ -679,10 +690,7 @@ impl CrashReporterHandle {
     ///
     /// This is called on the normal startup/update path. The panic hook uses
     /// only `try_read`, so it never waits for this lock.
-    pub fn update_context(
-        &self,
-        context: CrashRuntimeContext,
-    ) -> Result<(), CrashReportError> {
+    pub fn update_context(&self, context: CrashRuntimeContext) -> Result<(), CrashReportError> {
         self.state.context_gap.store(true, Ordering::Release);
         context.validate()?;
         let mut current = self
@@ -781,9 +789,9 @@ impl CrashReporterHandle {
             .write()
             .map_err(|_| CrashReportError::InvalidMetadata("retention_policy.poisoned"))?;
         match current.as_ref() {
-            Some(existing) if existing.policy != policy => Err(
-                CrashReportError::InvalidMetadata("retention_policy.binding_conflict"),
-            ),
+            Some(existing) if existing.policy != policy => Err(CrashReportError::InvalidMetadata(
+                "retention_policy.binding_conflict",
+            )),
             Some(_) => Ok(()),
             None => {
                 *current = Some(CrashReportSink::start(policy)?);
@@ -803,10 +811,8 @@ impl CrashReporterHandle {
     /// has no durable telemetry sink available.
     pub fn unsupported_non_panic_fault(&self) -> CrashTelemetryOutcome {
         let report_id = self.state.next_report_id();
-        self.state.enqueue_gap(
-            report_id,
-            CrashTelemetryGapReason::UnsupportedNonPanicFault,
-        )
+        self.state
+            .enqueue_gap(report_id, CrashTelemetryGapReason::UnsupportedNonPanicFault)
     }
 }
 
@@ -858,7 +864,8 @@ pub fn install_crash_reporter(
         .lock()
         .map_err(|_| CrashReportError::InvalidMetadata("reporter_install_lock"))?;
     if let Some(existing) = REPORTER.get() {
-        if existing.process != config.process || existing.package_version != config.package_version {
+        if existing.process != config.process || existing.package_version != config.package_version
+        {
             return Err(CrashReportError::InvalidMetadata(
                 "reporter_installation_conflict",
             ));
@@ -911,15 +918,17 @@ pub fn install_crash_reporter(
             .unwrap_or(true);
         if !capture_is_nested {
             let capture_state = Arc::clone(&hook_state);
-            let capture_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                capture_state.capture_panic();
-            }));
+            let capture_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    capture_state.capture_panic();
+                }));
             let _ = PANIC_CAPTURE_ACTIVE.try_with(|active| active.set(false));
             if capture_result.is_err() {
                 hook_state.overflow_gap.store(true, Ordering::Release);
-                hook_state
-                    .outcome
-                    .store(CrashTelemetryOutcome::GapUnpersisted.as_u8(), Ordering::Release);
+                hook_state.outcome.store(
+                    CrashTelemetryOutcome::GapUnpersisted.as_u8(),
+                    Ordering::Release,
+                );
             }
         }
         prior_hook(info);
@@ -953,27 +962,42 @@ impl CrashReporterState {
         let runtime_profile = match self.runtime_profile.try_read() {
             Ok(runtime_profile) => runtime_profile.clone(),
             Err(_) => {
-                self.enqueue_gap(report_id, CrashTelemetryGapReason::RuntimeProfileUnavailable);
+                self.enqueue_gap(
+                    report_id,
+                    CrashTelemetryGapReason::RuntimeProfileUnavailable,
+                );
                 return;
             }
         };
         let Some(runtime_profile) = runtime_profile else {
-            self.enqueue_gap(report_id, CrashTelemetryGapReason::RuntimeProfileUnavailable);
+            self.enqueue_gap(
+                report_id,
+                CrashTelemetryGapReason::RuntimeProfileUnavailable,
+            );
             return;
         };
         if self.context_gap.load(Ordering::Acquire) {
-            self.enqueue_gap(report_id, CrashTelemetryGapReason::RuntimeContextUnavailable);
+            self.enqueue_gap(
+                report_id,
+                CrashTelemetryGapReason::RuntimeContextUnavailable,
+            );
             return;
         }
         let context = match self.context.try_read() {
             Ok(context) => context.clone(),
             Err(_) => {
-                self.enqueue_gap(report_id, CrashTelemetryGapReason::RuntimeContextUnavailable);
+                self.enqueue_gap(
+                    report_id,
+                    CrashTelemetryGapReason::RuntimeContextUnavailable,
+                );
                 return;
             }
         };
         if self.context_gap.load(Ordering::Acquire) {
-            self.enqueue_gap(report_id, CrashTelemetryGapReason::RuntimeContextUnavailable);
+            self.enqueue_gap(
+                report_id,
+                CrashTelemetryGapReason::RuntimeContextUnavailable,
+            );
             return;
         }
         let mut context = context;
@@ -1029,13 +1053,17 @@ impl CrashReporterState {
             }
             Err(TrySendError::Full(_)) => {
                 self.overflow_gap.store(true, Ordering::Release);
-                self.outcome
-                    .store(CrashTelemetryOutcome::QueueSaturated.as_u8(), Ordering::Release);
+                self.outcome.store(
+                    CrashTelemetryOutcome::QueueSaturated.as_u8(),
+                    Ordering::Release,
+                );
                 CrashTelemetryOutcome::QueueSaturated
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.outcome
-                    .store(CrashTelemetryOutcome::WriterUnavailable.as_u8(), Ordering::Release);
+                self.outcome.store(
+                    CrashTelemetryOutcome::WriterUnavailable.as_u8(),
+                    Ordering::Release,
+                );
                 CrashTelemetryOutcome::WriterUnavailable
             }
         }
@@ -1051,9 +1079,10 @@ fn crash_writer_loop(receiver: mpsc::Receiver<CrashCapture>, state: Arc<CrashRep
                     Err(error) => Err(report_error_reason(&error)),
                 };
                 match append_result {
-                    Ok(()) => state
-                        .outcome
-                        .store(CrashTelemetryOutcome::ReportWritten.as_u8(), Ordering::Release),
+                    Ok(()) => state.outcome.store(
+                        CrashTelemetryOutcome::ReportWritten.as_u8(),
+                        Ordering::Release,
+                    ),
                     Err(reason) => state.write_gap(report.report_id, reason),
                 }
             }
@@ -1093,11 +1122,15 @@ impl CrashReporterState {
         let Some(writer) = sink else {
             return Err(CrashTelemetryGapReason::RetentionPolicyUnavailable);
         };
-        let receipt = writer.try_send_with_ack(rendered).map_err(|error| match error {
-            RollingLogAppendError::OverBound => CrashTelemetryGapReason::ReportRejected,
-            RollingLogAppendError::QueueFull => CrashTelemetryGapReason::QueueSaturated,
-            RollingLogAppendError::WriterUnavailable => CrashTelemetryGapReason::WriterUnavailable,
-        })?;
+        let receipt = writer
+            .try_send_with_ack(rendered)
+            .map_err(|error| match error {
+                RollingLogAppendError::OverBound => CrashTelemetryGapReason::ReportRejected,
+                RollingLogAppendError::QueueFull => CrashTelemetryGapReason::QueueSaturated,
+                RollingLogAppendError::WriterUnavailable => {
+                    CrashTelemetryGapReason::WriterUnavailable
+                }
+            })?;
         match receipt.recv_timeout(ROLLING_APPEND_ACK_TIMEOUT) {
             Ok(RollingLogAppendOutcome::Written) => Ok(()),
             Ok(RollingLogAppendOutcome::RetentionFailure) => {
@@ -1124,8 +1157,10 @@ impl CrashReporterState {
             reason,
         };
         let Ok(text) = serde_json::to_string(&record) else {
-            self.outcome
-                .store(CrashTelemetryOutcome::GapUnpersisted.as_u8(), Ordering::Release);
+            self.outcome.store(
+                CrashTelemetryOutcome::GapUnpersisted.as_u8(),
+                Ordering::Release,
+            );
             return;
         };
         let write_result = if text.len() > MAX_GAP_RECORD_BYTES {

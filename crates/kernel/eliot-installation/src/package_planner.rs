@@ -128,9 +128,8 @@ fn package_roles_for_manifest(
 ) -> Result<Vec<(&'static str, bool)>, InstallationError> {
     let include_module_provenance =
         module_provenance_present(manifest.files.iter().map(|file| file.relative_path.clone()))?;
-    let include_symbols = release_symbols_present(
-        manifest.files.iter().map(|file| file.relative_path.clone()),
-    )?;
+    let include_symbols =
+        release_symbols_present(manifest.files.iter().map(|file| file.relative_path.clone()))?;
     let roles = package_inventory_roles(include_module_provenance, include_symbols);
     if manifest.files.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
@@ -1095,7 +1094,10 @@ pub(crate) fn validate_exact_expected_file_digests(
                 .iter()
                 .find(|spec| spec.relative_path == item.relative_path)
                 .ok_or(InstallationError::IdentityConflict)?;
-            if spec.executable || item.expected_size == 0 || item.expected_size != spec.expected_size {
+            if spec.executable
+                || item.expected_size == 0
+                || item.expected_size != spec.expected_size
+            {
                 return Err(InstallationError::IdentityConflict);
             }
             crate::sha256_handle(&item.sha256, "expected symbol artifact digest")?;
@@ -1766,9 +1768,8 @@ impl GenerationPackagePlanner {
         let include_module_provenance = module_provenance_present(
             observed.files.iter().map(|file| file.relative_path.clone()),
         )?;
-        let include_release_symbols = release_symbols_present(
-            observed.files.iter().map(|file| file.relative_path.clone()),
-        )?;
+        let include_release_symbols =
+            release_symbols_present(observed.files.iter().map(|file| file.relative_path.clone()))?;
         let package_roles =
             package_inventory_roles(include_module_provenance, include_release_symbols);
         let governor_lease = source
@@ -1806,14 +1807,16 @@ impl GenerationPackagePlanner {
         if let Some((_, config)) = source_store_config.as_ref() {
             let has_host_binding = config.runtime_launch.host_symbol_binding.is_some();
             let has_kernel_binding = config.runtime_launch.kernel_symbol_binding.is_some();
-            if has_host_binding != has_kernel_binding || has_host_binding != include_release_symbols {
+            if has_host_binding != has_kernel_binding || has_host_binding != include_release_symbols
+            {
                 return Err(InstallationError::IdentityConflict);
             }
         } else if include_release_symbols {
             return Err(InstallationError::InvalidField {
                 field: "generation.symbol_binding".to_owned(),
-                reason: "symbol-bearing package requires the authenticated generation launch descriptor"
-                    .to_owned(),
+                reason:
+                    "symbol-bearing package requires the authenticated generation launch descriptor"
+                        .to_owned(),
             });
         }
 

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-mod host_console_protocol;
 mod crash_context;
+mod host_console_protocol;
 
 #[cfg(windows)]
 use std::ffi::OsString;
@@ -75,9 +75,7 @@ fn install_host_crash_reporter() {
     }
 }
 
-fn attach_current_host_crash_reporter(
-    host: &mut HostComposition,
-) {
+fn attach_current_host_crash_reporter(host: &mut HostComposition) {
     if let Some(reporter) = CRASH_REPORTER.get() {
         if crash_context::attach_reporter(host, reporter).is_err() {
             tracing::warn!(

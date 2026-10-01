@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 
 use eliot_contracts::sha256_hex;
 #[cfg(windows)]
-use eliot_installation::{AdmittedSymbolBinding, SymbolExecutableRole};
-#[cfg(windows)]
 use eliot_installation::InstallationProfile;
+#[cfg(windows)]
+use eliot_installation::{AdmittedSymbolBinding, SymbolExecutableRole};
 use eliot_kernel::AuthorityDescriptorContour;
 #[cfg(windows)]
 use eliot_kernel_service::KERNEL_CONTROL_PIPE;
@@ -73,12 +73,14 @@ impl KernelStartupBinding {
             std::env::var("ELIOT_INSTALLATION_PROFILE").map_err(|_| {
                 "Host launch context did not inject the installation profile".to_owned()
             })?;
-        binding.admitted_symbol_binding = match std::env::var("ELIOT_KERNEL_ADMITTED_SYMBOL_BINDING")
-        {
+        binding.admitted_symbol_binding = match std::env::var(
+            "ELIOT_KERNEL_ADMITTED_SYMBOL_BINDING",
+        ) {
             Ok(value) => {
-                let admitted: AdmittedSymbolBinding = serde_json::from_str(&value).map_err(|error| {
-                    format!("Host launch context symbol binding is invalid: {error}")
-                })?;
+                let admitted: AdmittedSymbolBinding =
+                    serde_json::from_str(&value).map_err(|error| {
+                        format!("Host launch context symbol binding is invalid: {error}")
+                    })?;
                 if admitted.role != SymbolExecutableRole::Kernel
                     || admitted.retention_id.as_str() != binding.approved_generation
                 {
