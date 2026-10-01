@@ -1097,7 +1097,8 @@ impl InstallationTransaction {
                             || progress.service_start_deadline_ms.is_some()
                         {
                             return Err(InstallationError::IncompleteObservation(
-                                "timeout recovery refuses a pending start carrying intent".to_owned(),
+                                "timeout recovery refuses a pending start carrying intent"
+                                    .to_owned(),
                             ));
                         }
                     }
@@ -1111,7 +1112,8 @@ impl InstallationTransaction {
                     }
                     InstallationEffectProgressState::Unknown { .. } => {
                         return Err(InstallationError::IncompleteObservation(
-                            "timeout recovery refuses a non-timeout unknown service start".to_owned(),
+                            "timeout recovery refuses a non-timeout unknown service start"
+                                .to_owned(),
                         ));
                     }
                     InstallationEffectProgressState::Applied { .. } => {

@@ -11026,7 +11026,9 @@ where
                     other => {
                         return Err(InstallationError::IncompleteObservation(format!(
                             "service start reconciliation stays unknown for effect {}: {}",
-                            transaction.effect_progress[watchdog_index].effect_id.as_str(),
+                            transaction.effect_progress[watchdog_index]
+                                .effect_id
+                                .as_str(),
                             port_pending(other).as_str(),
                         )));
                     }
