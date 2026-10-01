@@ -804,6 +804,50 @@ pub const BRIDGE_INGEST_WITHHELD_RECIPIENT_GRANT_EMPTY: &str = "recipient_grant_
 /// hold, so raw persistence is withheld on the source side.
 pub const BRIDGE_INGEST_WITHHELD_SOURCE_CLASS_UNADMITTED: &str = "source_class_not_admitted";
 
+/// Withholding side recorded when no Governor-owned provider-restriction
+/// evidence reached the verdict for these exact bytes: provider-forbidden
+/// hidden reasoning (I7.23) cannot be ruled out, so raw persistence is
+/// withheld on the provider leg.
+pub const BRIDGE_INGEST_WITHHELD_PROVIDER_RESTRICTION_UNDECIDED: &str =
+    "provider_restriction_undecided";
+
+/// Withholding side recorded when no event-retention terms reached the
+/// verdict for these exact bytes: I7.23 admits raw retention only within the
+/// applicable retention contract, so raw persistence is withheld on the
+/// retention leg.
+pub const BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED: &str = "retention_terms_undecided";
+
+/// Availability of one Governor-owned policy leg for a bridge-ingest verdict
+/// (issue #1934, I7.23): the provider-restriction leg (provider-forbidden
+/// hidden reasoning must be ruled out before verbatim retention) and the
+/// retention-terms leg (raw retention is admitted only within the applicable
+/// retention contract).
+///
+/// No bridge-ingest caller presents either leg yet — `EventEnvelope` carries
+/// no provider-retention field and the retained `Session` negotiates no
+/// provider terms — so every verdict on this path records `Unavailable` and
+/// withholds raw persistence. The legs still enter the owner rule as
+/// deny-only gates over the exact decided evidence, so a future presenting
+/// caller is evaluated by the same rule: a leg can only withhold, never
+/// grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BridgeIngestPolicyLeg {
+    /// No owner-presented provider/retention terms reached the verdict:
+    /// raw persistence stays withheld on this leg.
+    Unavailable,
+}
+
+impl BridgeIngestPolicyLeg {
+    /// Closed wire spelling the persistence owner validates when the leg
+    /// crosses the JSON authorization boundary.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// Owner-resolved disclosure verdict for one bridge-ingest candidate (issue
 /// #1934, I7.23).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -816,7 +860,9 @@ pub enum BridgeIngestDisclosure {
     /// evidence determined. Only the deterministic redacted projection plus
     /// its receipt may persist.
     Withheld {
-        /// One of [`BRIDGE_INGEST_WITHHELD_RECIPIENT_GRANT_EMPTY`] or
+        /// One of [`BRIDGE_INGEST_WITHHELD_PROVIDER_RESTRICTION_UNDECIDED`],
+        /// [`BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED`],
+        /// [`BRIDGE_INGEST_WITHHELD_RECIPIENT_GRANT_EMPTY`], or
         /// [`BRIDGE_INGEST_WITHHELD_SOURCE_CLASS_UNADMITTED`].
         side: &'static str,
     },
@@ -845,24 +891,36 @@ impl BridgeIngestDisclosure {
 /// Resolves whether one bridge event's exact bytes may persist verbatim
 /// inside one Governor-resolved scope (issue #1934, I7.23).
 ///
-/// I7.23: secret values, provider-forbidden hidden reasoning, and data outside
-/// the `WorkScope` privacy boundary are never persisted merely to preserve
-/// "rawness". Admission is therefore membership, mirroring
+/// I7.23: raw payload is retained for forensic replay and parser correction
+/// only within the applicable retention/privacy contract; secret values,
+/// provider-forbidden hidden reasoning, and data outside the `WorkScope`
+/// privacy boundary are never persisted merely to preserve "rawness".
+/// Admission is therefore membership, mirroring
 /// [`PrivacyProfile::admits`]: a source privacy class proven for these exact
-/// bytes and explicitly named by the session owner's recipient grant. Absent
-/// evidence is unresolved, never permission: an unproven source class, or a
-/// proven one the grant does not name, withholds raw persistence, naming the
-/// side the evaluated evidence determined.
+/// bytes and explicitly named by the session owner's recipient grant — and
+/// only once the provider-restriction and retention-terms legs are decided
+/// for those same bytes. Absent evidence is unresolved, never permission: an
+/// unproven source class, a proven one the grant does not name, undecided
+/// provider restriction, or undecided retention terms each withhold raw
+/// persistence, naming the side the evaluated evidence determined.
 ///
-/// The scope boundary profile, provider retention constraints, and the
-/// Governor's `DisclosureDecision` do not reach this query — no caller on the
-/// bridge-ingest path carries them — so nothing here can admit what those legs
-/// would deny; events requiring them stay withheld until decided through the
-/// Governor path that presents them.
+/// The provider-restriction and retention-terms legs enter this query as
+/// deny-only gates: either leg withholds before any grant membership can
+/// admit, and neither leg can admit what the grant membership would deny.
+/// No caller on the bridge-ingest path carries either leg yet, so events
+/// requiring them stay withheld until decided through the Governor path that
+/// presents them.
+///
+/// # Errors
+///
+/// Returns an error when the scope reference, a grant class, or a proven
+/// source class is blank or carries control characters.
 pub fn resolve_bridge_ingest_disclosure(
     scope_ref: &str,
     source_class: Option<&str>,
     recipient_grant: &[String],
+    provider_restriction: BridgeIngestPolicyLeg,
+    retention_terms: BridgeIngestPolicyLeg,
 ) -> Result<BridgeIngestDisclosure, WorkScopeError> {
     text(scope_ref, "scope_ref")?;
     for granted in recipient_grant {
@@ -870,6 +928,18 @@ pub fn resolve_bridge_ingest_disclosure(
     }
     if let Some(class) = source_class {
         text(class, "source_class")?;
+    }
+    if matches!(provider_restriction, BridgeIngestPolicyLeg::Unavailable) {
+        return Ok(BridgeIngestDisclosure::Withheld {
+            side: BRIDGE_INGEST_WITHHELD_PROVIDER_RESTRICTION_UNDECIDED,
+        });
+    }
+    if matches!(retention_terms, BridgeIngestPolicyLeg::Unavailable) {
+        return Ok(BridgeIngestDisclosure::Withheld {
+            side: BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED,
+        });
+    }
+    if let Some(class) = source_class {
         if recipient_grant.iter().any(|granted| granted == class) {
             return Ok(BridgeIngestDisclosure::Admitted);
         }
