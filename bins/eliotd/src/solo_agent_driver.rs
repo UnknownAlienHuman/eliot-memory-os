@@ -1605,20 +1605,22 @@ fn intake_revisions_match(live: &SoloDelegateIntake, consumed: &SoloDelegateInta
         && live.delegate.source_digest == consumed.delegate.source_digest
 }
 
-/// Revalidates the consumed revisions after owner IO, before the adopt step
-/// touches the fabric (issue #2567 AUD9).
+/// Adopt step for the drive path: revalidates the consumed revisions after
+/// owner IO, before the adopt step touches the fabric (issue #2567 AUD9).
 ///
-/// The fence check the drive already had is the first of four: a fence that
+/// The fence check the drive already had is the first of five: a fence that
 /// moved under the seam await refuses with a typed stale fence; a live
 /// authority epoch that no longer matches the consumed expectation refuses
 /// with a typed stale epoch; a queue head that no longer carries the
 /// consumed task/route/admission revisions refuses with a typed identity
-/// conflict; and a live slot that another unsettled operation now holds
-/// refuses with a typed identity conflict (a settled slot clears under the
-/// same rule as the prepare step). Every refusal leaves the queue head queued
-/// for a fresh evaluation instead of adopting verified material under another
+/// conflict; the consumed owner-verified binding must still bind the live
+/// head itself (never a caller-claimed substitute that arrived under IO);
+/// and a live slot that another unsettled operation now holds refuses with
+/// a typed identity conflict (a settled slot clears under the same rule as
+/// the prepare step). Every refusal leaves the queue head queued for a
+/// fresh evaluation instead of adopting verified material under another
 /// generation, task, route, or admission.
-fn recheck_adopt_revisions(
+fn adopt_solo_drive(
     composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     intake: &SoloDelegateIntake,
@@ -1659,6 +1661,11 @@ fn recheck_adopt_revisions(
                 ),
             ));
         }
+        // The prepare-time cross-check ran before the seam await, so adopt
+        // re-proves the consumed owner-verified binding against the live
+        // head: a caller-claimed substitute that arrived under IO refuses
+        // here with a typed identity conflict and the head stays queued.
+        check_verified_binds_intake(head, prepared)?;
         if let Some(live_operation) = state.live_operation.clone()
             && live_operation != prepared.operation_id
         {
@@ -1732,7 +1739,7 @@ async fn drive_solo_delegate_verified_async(
 /// Prepare/IO/adopt: readiness, intake shape, solo recipe, binding
 /// cross-check, and single live slot are prepared under short borrows; the
 /// snapshot below is cloned before the seam await so the adopt step
-/// (`recheck_adopt_revisions`) can revalidate the exact consumed
+/// (`adopt_solo_drive`) can revalidate the exact consumed
 /// fence/epoch, task/route/admission, and live-slot revisions after owner
 /// IO; the fabric chain (`define_and_plan` -> `stage_reservation` ->
 /// `commit_admission` -> `activate` -> launch-gate revalidation ->
@@ -1805,11 +1812,11 @@ async fn drive_admitted_material_async(
         .agent_fabric_new_verified_async(kernel, ports, material, &intake.claimed)
         .await?;
     // AUD9: adopt revalidates the consumed revisions after owner IO, before
-    // touching the fabric (see `recheck_adopt_revisions`): fence, epoch,
+    // touching the fabric (see `adopt_solo_drive`): fence, epoch,
     // task/route, and live-slot admission. Any move refuses with a typed
     // stale/conflict instead of adopting verified material under another
     // generation; the queue head stays queued for a fresh evaluation.
-    recheck_adopt_revisions(composition, kernel, &intake, &prepared)?;
+    adopt_solo_drive(composition, kernel, &intake, &prepared)?;
     // Issue #1702 W2: the drive runs against the daemon state root, so every
     // owner-separated revision published on this fabric is committed and
     // verified durably before anything reports it current. Attaching the store
@@ -2857,10 +2864,12 @@ pub async fn solo_poll_queue_async(
     // Queue adopt (issue #2567 AUD9): recheck the consumed revisions under a
     // short lock before dequeuing. The drive adopt already revalidated
     // post-seam; this closes the remaining window over the sync fabric
-    // chain and persist. A head that left or moved (task/route/admission),
-    // or a live fence/epoch that no longer binds the consumed fence, refuses
-    // with a typed stale/conflict and the head stays queued instead of
-    // dequeuing another operation's intake.
+    // chain and persist, and binds the drive outcome to the consumed
+    // material before the head leaves the queue. A head that left or moved
+    // (task/route/admission), an outcome that addresses another
+    // operation/attempt/binding, or a live fence/epoch that no longer binds
+    // the consumed fence, refuses with a typed stale/conflict and the head
+    // stays queued instead of dequeuing another operation's intake.
     {
         let composition = composition.lock().await;
         let live = kernel.kernel_fence();
@@ -2894,6 +2903,22 @@ pub async fn solo_poll_queue_async(
             return Err(DaemonError::ProviderAdmission(FabricError::StaleEpoch(
                 "solo queue adopt refuses an epoch moved during the verified drive".to_owned(),
             )));
+        }
+        // Queue adopt also binds the drive outcome to the consumed material:
+        // an outcome that addresses another operation, attempt, or binding
+        // refuses with a typed identity conflict instead of dequeuing (and
+        // granting) this head's slot.
+        if outcome.operation_id != expected.claimed.operation_id
+            || outcome.attempt_id != expected.claimed.attempt_id
+            || outcome.dispatch.binding_digest != expected.claimed.binding_digest
+            || outcome.dispatch.executable_digest != expected.claimed.executable_digest
+        {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo queue adopt refuses an outcome that does not bind the consumed material"
+                        .to_owned(),
+                ),
+            ));
         }
         if head.claimed.operation_id == outcome.operation_id {
             state.queue.pop_front();
