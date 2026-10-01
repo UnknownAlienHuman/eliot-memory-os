@@ -72,6 +72,8 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
             idempotency_key: "idem-admit-1".to_owned(),
             canonical_request_hash: "a".repeat(64),
         },
+        write_intent_id: "intent-admit-1".to_owned(),
+        write_envelope_protocol_version: 1,
         state_fence: fence(),
         scope_id: ScopeId::new("scope-admit-1").unwrap(),
         task_id: None,

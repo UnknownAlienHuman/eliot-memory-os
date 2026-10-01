@@ -395,6 +395,33 @@ pub const GENESIS_RECEIPT_SCOPE_ID: &str = "store";
 pub const GENESIS_RECEIPT_ORDERING_SCOPE: &str = "store";
 /// Stable neutral manifest name used for every provider's genesis receipt.
 pub const GENESIS_MANIFEST_NAME: &str = "eliot.storage.genesis";
+/// Closed write-intent declaration of the store's own all-absent genesis seed.
+///
+/// `I05-05-write-envelope.md` gives `write_intent_id` exactly one purpose:
+/// the stable user/agent intent across typed correction attempts. The atomic
+/// all-absent seed that brings a store into existence is the one canonical
+/// write with no user or agent behind it, so there is no owner value to take.
+/// That absence is DECLARED as this one fixed closed value instead of being
+/// hidden behind a defaulted member, an `Option`, or a second optional
+/// identity scheme, and it is bound to the genesis transition alone:
+/// [`PreparedTransition::validate`] refuses this exact text on every
+/// transition that carries named operations, so it can never be presented as
+/// a user/agent write intent on a real semantic write. The store bootstrap
+/// therefore declares "this write has no user/agent intent" in a form that is
+/// exact, greppable, and refusable, rather than minting a plausible-looking
+/// intent identity that two unrelated writers could both adopt.
+pub const GENESIS_STORE_SEED_WRITE_INTENT: &str = "store.genesis.seed";
+/// Write-envelope protocol revision recorded on the genesis seed transition.
+///
+/// The store bootstrap write is not admitted through the write-envelope
+/// protocol, so no envelope admits it and none issues this value. The one
+/// revision that is admitted by the owning boundary is recorded, because the
+/// member is a `u32` that a prepared transition must always name, and because
+/// the reserved-write producer reads it beside
+/// [`GENESIS_STORE_SEED_WRITE_INTENT`]; it grants no envelope admission and
+/// [`PreparedTransition::validate`] refuses it on any transition that carries
+/// named operations.
+pub const GENESIS_STORE_SEED_WRITE_ENVELOPE_PROTOCOL_VERSION: u32 = 1;
 
 /// Compatibility spelling used by the store boundary.
 pub type RequestMeta = RequestMetadata;
@@ -4875,6 +4902,31 @@ pub struct PreparedTransition {
     /// plan.
     pub contract_version: ContractVersion,
     pub identity: OperationIdentity,
+    /// Stable user/agent write intent of the admitted submission.
+    ///
+    /// This is a THIRD, DISTINCT identity beside `identity.operation_id`
+    /// (which rotates per attempt) and `identity.idempotency_key` (which
+    /// rotates per typed correction): `I05-05-write-envelope.md` gives it
+    /// exactly one purpose, "stable user/agent intent across typed correction
+    /// attempts", and `I06-08-contract-rejection.md` requires a
+    /// schema-invalid `NOT_ATTEMPTED` request to leave it unconsumed. It is
+    /// therefore never derived from the operation identity or the idempotency
+    /// key. The Governor owner supplies it from the admitted
+    /// `VersionedWriteSubmission`; this field exists so the store, Kernel, and
+    /// the reserved-write producer all bind the SAME owner value, and it is
+    /// hash-bound through [`CanonicalRequestView`] so a post-admission edit
+    /// forks into the typed digest mismatch like every other load-bearing
+    /// member.
+    pub write_intent_id: String,
+    /// Write-envelope protocol version of the admitted submission.
+    ///
+    /// Recorded verbatim from the submission that produced this plan so the
+    /// reserved-write producer binds the exact protocol revision the
+    /// admission decision was taken under. `eliot-store-api` does not own the
+    /// write-envelope protocol, so it refuses only the unrepresentable
+    /// revision `0`; the owning validator in `eliot-canonical` performs the
+    /// exact equality check against its own supported version.
+    pub write_envelope_protocol_version: u32,
     pub state_fence: StateFence,
     pub scope_id: ScopeId,
     pub task_id: Option<String>,
@@ -4925,6 +4977,7 @@ impl PreparedTransition {
         // partially understood under newer code.
         validate_recovery_contract_version(self.contract_version)?;
         self.identity.validate()?;
+        self.write_intent_identity_valid()?;
         self.state_fence
             .validate()
             .map_err(StoreError::Foundation)?;
@@ -5009,6 +5062,43 @@ impl PreparedTransition {
             });
         }
         self.security.validate(&self.state_fence)
+    }
+
+    /// Refuses a missing, malformed, or out-of-place write-intent identity.
+    ///
+    /// Both members are load-bearing, so neither has a default and neither is
+    /// optional: a blank intent, the unrepresentable protocol revision `0`, and
+    /// the genesis-seed declaration on a transition that actually performs
+    /// named operations are each a typed refusal. A defaulted or optional
+    /// member would make "no owner supplied one" silently acceptable and would
+    /// let the genesis declaration pass as a user/agent intent.
+    fn write_intent_identity_valid(&self) -> Result<(), StoreError> {
+        validate_text(&self.write_intent_id, "write_intent_id")?;
+        if self.write_envelope_protocol_version == 0 {
+            return Err(StoreError::InvalidField {
+                field: "write_envelope_protocol_version",
+                reason: "must be greater than zero",
+            });
+        }
+        if self.write_intent_id == GENESIS_STORE_SEED_WRITE_INTENT {
+            if !self.named_operations.is_empty() {
+                return Err(StoreError::InvalidField {
+                    field: "write_intent_id",
+                    reason: "the genesis seed write intent declares the absence of a \
+                             user/agent intent and is refused on a transition carrying \
+                             named operations",
+                });
+            }
+            if self.write_envelope_protocol_version
+                != GENESIS_STORE_SEED_WRITE_ENVELOPE_PROTOCOL_VERSION
+            {
+                return Err(StoreError::InvalidField {
+                    field: "write_envelope_protocol_version",
+                    reason: "does not match the genesis seed declaration",
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Checks this plan against a closed named-operation manifest.
@@ -5189,6 +5279,12 @@ pub fn genesis_transition(
             idempotency_key: request.idempotency_key.clone(),
             canonical_request_hash: request.canonical_request_hash.clone(),
         },
+        // The atomic all-absent seed has no user/agent behind it, so the
+        // write-intent absence is declared by the closed genesis constants
+        // above rather than defaulted. `PreparedTransition::validate` refuses
+        // both values on any transition carrying named operations.
+        write_intent_id: GENESIS_STORE_SEED_WRITE_INTENT.to_owned(),
+        write_envelope_protocol_version: GENESIS_STORE_SEED_WRITE_ENVELOPE_PROTOCOL_VERSION,
         state_fence: request.state_fence.clone(),
         scope_id: ScopeId::new(GENESIS_RECEIPT_SCOPE_ID)?,
         task_id: None,
@@ -6705,6 +6801,8 @@ mod tests {
                 idempotency_key: "retry-1".to_owned(),
                 canonical_request_hash: "a".repeat(64),
             },
+            write_intent_id: "intent-1".to_owned(),
+            write_envelope_protocol_version: 1,
             state_fence: fence(),
             scope_id: ScopeId::new("scope-1")?,
             task_id: None,
@@ -7123,6 +7221,8 @@ mod tests {
                 idempotency_key: "retry-erasure-18".to_owned(),
                 canonical_request_hash: "c".repeat(64),
             },
+            write_intent_id: "intent-erasure-18".to_owned(),
+            write_envelope_protocol_version: 1,
             scope_id: ScopeId::new("scope-erasure-18")?,
             ordering_scope: OrderingScopeId::new("scope-erasure-18")?,
             state_fence: fence(),

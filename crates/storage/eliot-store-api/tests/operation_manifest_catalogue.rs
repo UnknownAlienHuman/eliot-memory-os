@@ -396,6 +396,8 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
             idempotency_key: "retry-1".to_owned(),
             canonical_request_hash: "a".repeat(64),
         },
+        write_intent_id: "intent-operation-1".to_owned(),
+        write_envelope_protocol_version: 1,
         state_fence: fence(),
         scope_id: ScopeId::new("scope-one").unwrap(),
         task_id: None,
