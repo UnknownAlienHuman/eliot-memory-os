@@ -670,6 +670,15 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
         // closed validator.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::AdmitWork,
+        transition_classes: &[TransitionClass::TaskControl],
+        maximum_effect: EffectClass::ReversibleMutation,
+        // Work definitions and their five original claim references are
+        // bounded owner records; the exact typed validator remains narrower
+        // than this canonical-JSON transport bound.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
 ];
 
 fn read_entry_spec(descriptor: &ActivatedReadDescriptor) -> OperationManifestSpec {
@@ -1011,6 +1020,10 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::RecordTaskContractAcceptanceSet => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 validate_task_contract_acceptance_transition(transition, &command.parameters)?;
+            }
+            NamedMutationOperation::AdmitWork => {
+                validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                crate::validate_work_admission_transition(transition)?;
             }
             NamedMutationOperation::RecordAuthorityRevocation => {
                 return Err(StoreError::UnknownOperation);

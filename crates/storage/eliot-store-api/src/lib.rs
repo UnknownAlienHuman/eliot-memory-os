@@ -60,6 +60,7 @@ mod store_failure;
 mod swarm_owner_revisions;
 mod task_contract_acceptance;
 mod user_automation_state;
+pub mod work_admission;
 mod wire;
 pub mod write_admission;
 
@@ -249,6 +250,14 @@ pub use task_contract_acceptance::{
     TaskContractAcceptanceRecord, decode_task_contract_acceptance_record,
     task_contract_acceptance_record_key, task_contract_acceptance_record_request,
     validate_acceptance_record_identity,
+};
+pub use work_admission::{
+    ExpectedWorkAdmissionCommitment, WORK_ADMISSION_SCHEMA_V1, WorkAdmissionBudget,
+    WorkAdmissionBudgetDimension, WorkAdmissionClaimRef, WorkAdmissionClaims,
+    WorkAdmissionDependency, WorkAdmissionRecord, WorkAdmissionSemanticRevision,
+    WorkAdmissionState, WorkAdmissionSubmission, admit_work_operation, decode_work_admission_record,
+    validate_admit_work_command, validate_work_admission_transition,
+    work_admission_value_digest,
 };
 
 pub use wire::{
@@ -4039,6 +4048,10 @@ pub enum NamedMutationOperation {
     CaptureObservation,
     ApplyEpistemicRevision,
     UpdateTaskState,
+    /// Persists the Governor-owned semantic ADMITTED decision and its exact
+    /// reservation/claim/fence/epoch join in the same canonical transaction
+    /// as the operation's launch-outbox row (#1678, I14.6/I10.15).
+    AdmitWork,
     /// Unactivated contract for immutable swarm owner revisions; requires a
     /// verified semantic-owner authorization gate before catalogue admission.
     ApplySwarmOwnerRevisions,
@@ -4206,7 +4219,8 @@ impl NamedMutationOperation {
             Self::ApplyEpistemicRevision => TransitionClass::Epistemic,
             Self::UpdateTaskState
             | Self::ApplySwarmOwnerRevisions
-            | Self::RecordTaskContractAcceptanceSet => TransitionClass::TaskControl,
+            | Self::RecordTaskContractAcceptanceSet
+            | Self::AdmitWork => TransitionClass::TaskControl,
             Self::ApplyLifecyclePolicy => TransitionClass::LifecyclePolicy,
             Self::ReconcileRecovery
             | Self::RecordFinishDecision
@@ -5034,6 +5048,13 @@ impl PreparedTransition {
             operation.operation == NamedMutationOperation::ApplySwarmOwnerRevisions
         }) {
             validate_swarm_owner_revision_transition(self)?;
+        }
+        if self
+            .named_operations
+            .iter()
+            .any(|operation| operation.operation == NamedMutationOperation::AdmitWork)
+        {
+            validate_work_admission_transition(self)?;
         }
         // Issue #18: the bound decision/plan digests are recomputed from the
         // carried content and compared; any divergence (including a
