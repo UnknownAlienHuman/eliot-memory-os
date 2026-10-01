@@ -813,6 +813,84 @@ impl KernelComposition {
         result
     }
 
+    /// Asynchronous authenticated front-door dispatch. Most frames retain the
+    /// synchronous closed matrix; bridge-event forwarding is the one route
+    /// whose I7.23 gate rereads canonical Policy and WorkScope owners through
+    /// the async Store gateway before persistence.
+    pub async fn dispatch_frame_async(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        #[cfg(windows)]
+        {
+            let is_bridge_forward = matches!(
+                (&frame.kind, &frame.message_type, &frame.payload),
+                (FrameKind::Request, MessageType::Execute, ProtocolPayload::Json(payload))
+                    if payload
+                        .get("operation")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(super::host_request_route::AGENT_BRIDGE_EVENT_FORWARD_OPERATION)
+            );
+            if is_bridge_forward {
+                if self
+                    .generation_poison
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .is_some()
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                frame.validate()?;
+                if !session.accepts(&session.authority_epoch, session.session_epoch)
+                    || frame.connection_id != session.connection_id
+                    || frame.protocol_version != session.protocol_version
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                self.require_current_daemon_session(session)?;
+                if let Some(identity) = &frame.request_identity
+                    && !session
+                        .module_generation
+                        .state_fence
+                        .is_compatible_with(&identity.request.state_fence)
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                if session.module_generation.module_id.as_str() == USER_BROKER_MODULE_ID {
+                    return self.dispatch_frame(session, frame);
+                }
+                let result = self
+                    .dispatch_bridge_event_forward_frame_async(session, frame)
+                    .await;
+                let requested = requested_route_name(frame);
+                if let Some(metrics) = super::execution_metrics::kernel_metrics() {
+                    metrics.record(metrics.record_route(
+                        ModuleIdentity::LocalHttpAdapter,
+                        WorkClass::Interactive,
+                        requested.as_deref().unwrap_or("unreadable"),
+                        result.as_ref().ok().map(actual_route_name),
+                    ));
+                }
+                match &result {
+                    Ok(action) => {
+                        observe_frame("kernel.frame_validated", "success");
+                        observe_frame("kernel.frame_admitted", "success");
+                        observe_frame("kernel.frame_dispatched", actual_route_name(action));
+                        observe_frame("kernel.frame_cleanup", "complete");
+                    }
+                    Err(error) => {
+                        observe_frame("kernel.frame_decode_reject", "fenced");
+                        super::kernel_diagnostics::observe_terminal_error(frame_terminal_code(error));
+                        observe_frame("kernel.frame_cleanup", "fenced");
+                    }
+                }
+                return result;
+            }
+        }
+        self.dispatch_frame(session, frame)
+    }
+
     /// Runs the currently admitted, deliberately closed semantic gateway.
     ///
     /// Heartbeats are handled locally. Other validated frames, including

@@ -6604,6 +6604,7 @@ impl KernelComposition {
                         identity.deadline_unix_ms,
                         None,
                         restricted_source.as_deref(),
+                        None,
                     )?
                 } else {
                     self.with_live_bridge_application_binding(
@@ -6617,6 +6618,7 @@ impl KernelComposition {
                                 identity.deadline_unix_ms,
                                 Some(binding.work_scope_id.as_str()),
                                 restricted_source.as_deref(),
+                                None,
                             )
                         },
                     )?
@@ -6653,6 +6655,119 @@ impl KernelComposition {
                 )?
             }
             _ => return Err(TransportError::SessionFenced),
+        };
+        let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+        reply.request_id = Some(request_id);
+        reply
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(KernelFrameAction::Reply(reply))
+    }
+
+    /// Async durable-forward entry used by the authenticated front-door
+    /// driver. The canonical owner read completes before the existing live
+    /// activation/session locks are reacquired; the latter rechecks that the
+    /// same scope binding is still current before ORS staging.
+    pub(crate) async fn dispatch_bridge_event_forward_frame_async(
+        &self,
+        session: &Session,
+        frame: &Frame,
+    ) -> Result<KernelFrameAction, TransportError> {
+        session
+            .peer
+            .validate()
+            .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+        let request_id = frame
+            .request_id
+            .clone()
+            .ok_or(TransportError::SessionFenced)?;
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&identity.request.state_fence)
+            || frame.connection_id != session.connection_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let payload = match &frame.payload {
+            ProtocolPayload::Json(payload) => payload.clone(),
+            _ => return Err(TransportError::SessionFenced),
+        };
+        if payload.get("operation").and_then(serde_json::Value::as_str)
+            != Some(AGENT_BRIDGE_EVENT_FORWARD_OPERATION)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if !matches!(
+            self.service_state()
+                .map_err(|_| TransportError::SessionFenced)?,
+            KernelServiceState::Ready | KernelServiceState::Degraded
+        ) {
+            return Err(TransportError::SessionFenced);
+        }
+        let event = bridge_event_envelope_from_payload(&payload)?;
+        let restricted_source = bridge_restricted_source_bytes_from_payload(&payload)?;
+        if event.delivery_class == DeliveryClass::BestEffortTelemetry {
+            return self.dispatch_bridge_event_frame(
+                session,
+                frame,
+                AGENT_BRIDGE_EVENT_FORWARD_OPERATION,
+            );
+        }
+        let value = {
+            let retained_scope = {
+                let connections = self
+                    .agent_bridge_connections
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let state = connections
+                    .get(&session.connection_id)
+                    .ok_or(TransportError::SessionFenced)?;
+                if !state.activation_completed || state.session.as_ref() != Some(session) {
+                    return Err(TransportError::SessionFenced);
+                }
+                state
+                    .activated_binding
+                    .as_ref()
+                    .map(|binding| binding.work_scope_id.clone())
+                    .filter(|scope| !scope.trim().is_empty())
+                    .ok_or(TransportError::SessionFenced)?
+            };
+            let gateway = self
+                .retained_store_gateway()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let owner_read =
+                super::bridge_event_policy_owner::BridgeEventPolicyOwnerRead::recover(
+                    &gateway,
+                    &identity.request.state_fence,
+                    &retained_scope,
+                )
+                .await
+                .map_err(|_| TransportError::SessionFenced)?;
+            self.with_live_bridge_application_binding(
+                session,
+                &identity.request.state_fence,
+                |binding| {
+                    if binding.work_scope_id != retained_scope
+                        || owner_read.scope_ref != binding.work_scope_id
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.admit_bridge_event_envelope(
+                        session,
+                        &event,
+                        &identity.request.state_fence,
+                        identity.deadline_unix_ms,
+                        Some(binding.work_scope_id.as_str()),
+                        restricted_source.as_deref(),
+                        Some(&owner_read),
+                    )
+                },
+            )?
         };
         let mut reply = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
         reply.request_id = Some(request_id);
@@ -6831,6 +6946,7 @@ impl KernelComposition {
         deadline_unix_ms: u64,
         work_scope_id: Option<&str>,
         restricted_source_bytes: Option<&[u8]>,
+        policy_owner_read: Option<&super::bridge_event_policy_owner::BridgeEventPolicyOwnerRead>,
     ) -> Result<serde_json::Value, TransportError> {
         // Authority check against the retained Session, never caller text:
         // the event must cohere with the presenting live fence (same
@@ -6896,6 +7012,7 @@ impl KernelComposition {
                     &envelope_bytes,
                     work_scope_id,
                     restricted_source_bytes,
+                    policy_owner_read,
                 )?;
                 let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
                     &envelope_bytes,
@@ -6911,6 +7028,8 @@ impl KernelComposition {
                     &envelope_sha,
                     &privacy,
                     expired,
+                    restricted_source_bytes,
+                    policy_owner_read,
                 )
             }
             DeliveryClass::BestEffortTelemetry => {
@@ -6982,6 +7101,7 @@ impl KernelComposition {
         envelope_bytes: &[u8],
         work_scope_id: &str,
         _restricted_source_bytes: Option<&[u8]>,
+        _policy_owner_read: Option<&super::bridge_event_policy_owner::BridgeEventPolicyOwnerRead>,
     ) -> Result<serde_json::Value, TransportError> {
         let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
         // The scope commits to the Governor-resolved scope as well as the
@@ -7024,6 +7144,49 @@ impl KernelComposition {
             "recipient_grant": &session.privacy_classes,
             "provider_restriction": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
             "retention_terms": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
+        }))
+    }
+
+    /// Binds the raw callback sidecar to the exact current Policy and guarded
+    /// WorkScope readback. The Envelope's independent authorization remains
+    /// redacted unless its legacy owner rule itself admits it.
+    fn bridge_event_restricted_source_authorization(
+        source_bytes: Option<&[u8]>,
+        scope_ref: &str,
+        owner: Option<&super::bridge_event_policy_owner::BridgeEventPolicyOwnerRead>,
+    ) -> Result<serde_json::Value, TransportError> {
+        let owner = owner.ok_or(TransportError::SessionFenced)?;
+        if owner.scope_ref != scope_ref {
+            return Err(TransportError::SessionFenced);
+        }
+        let source_sha256 = source_bytes.map(eliot_contracts::sha256_hex);
+        let rule = owner.terms.as_ref().and_then(|terms| {
+            terms.rules.iter().find(|rule| {
+                rule.source_class
+                    == super::bridge_event_policy_owner::BridgeSourceClassWire::RestrictedHandleOnly
+            })
+        });
+        let raw_allowed = source_sha256.is_some()
+            && rule.is_some_and(|rule| {
+                rule.workscope_privacy_class == owner.privacy_class
+                    && rule.provider_restriction
+                        == super::bridge_event_policy_owner::BridgeProviderRestrictionWire::HiddenReasoningExcluded
+                    && rule.retention
+                        == super::bridge_event_policy_owner::BridgeRetentionWire::RawAllowed
+            });
+        Ok(serde_json::json!({
+            "verdict": if raw_allowed { "admitted" } else { "rejected" },
+            "source_class": "RESTRICTED_HANDLE_ONLY",
+            "source_sha256": source_sha256,
+            "scope_ref": owner.scope_ref,
+            "work_scope_privacy_class": owner.privacy_class,
+            "work_scope_owner_digest": owner.work_scope_owner_digest,
+            "work_scope_owner_revision": owner.work_scope_owner_revision,
+            "policy_owner_digest": owner.policy_owner_digest,
+            "policy_snapshot_digest": owner.policy_snapshot_digest,
+            "policy_snapshot_id": owner.policy_snapshot_id,
+            "policy_revision": owner.policy_revision,
+            "policy_terms": owner.terms,
         }))
     }
 
@@ -7084,8 +7247,15 @@ impl KernelComposition {
         envelope_sha: &str,
         privacy: &serde_json::Value,
         expired: bool,
+        restricted_source_bytes: Option<&[u8]>,
+        policy_owner_read: Option<&super::bridge_event_policy_owner::BridgeEventPolicyOwnerRead>,
     ) -> Result<serde_json::Value, TransportError> {
         let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
+        let restricted_source_authorization = Self::bridge_event_restricted_source_authorization(
+            restricted_source_bytes,
+            policy_owner_read.map_or("", |owner| owner.scope_ref.as_str()),
+            policy_owner_read,
+        )?;
         let staged = serde_json::json!({
             "stream_id": event.stream_id,
             "event_id": event.event_id,
@@ -7096,6 +7266,20 @@ impl KernelComposition {
             "envelope": serde_json::to_value(event)
                 .map_err(|_| TransportError::SessionFenced)?,
             "envelope_sha256": envelope_sha,
+            "restricted_source_bytes": restricted_source_bytes,
+            "restricted_source_sha256": restricted_source_bytes.map(eliot_contracts::sha256_hex),
+            "restricted_source_authorization": restricted_source_authorization,
+            "privacy_owner_readback": policy_owner_read.map(|owner| serde_json::json!({
+                "policy_owner_digest": owner.policy_owner_digest,
+                "policy_snapshot_digest": owner.policy_snapshot_digest,
+                "policy_snapshot_id": owner.policy_snapshot_id,
+                "policy_revision": owner.policy_revision,
+                "work_scope_owner_digest": owner.work_scope_owner_digest,
+                "work_scope_owner_revision": owner.work_scope_owner_revision,
+                "scope_ref": owner.scope_ref,
+                "work_scope_privacy_class": owner.privacy_class,
+                "policy_terms": owner.terms,
+            })),
             "staging_connection": session.connection_id,
             "privacy_disposition": privacy_legs.disposition,
             "redacted_classes": privacy_legs.classes,
@@ -7152,6 +7336,50 @@ impl KernelComposition {
             Err(OrsError::ProjectionLimitExceeded) => return Err(TransportError::Backpressure),
             Err(_) => return Err(TransportError::SessionFenced),
         };
+        if let Some(raw_bytes) = restricted_source_bytes {
+            let sidecar = outcome
+                .get("restricted_source")
+                .filter(|value| value.is_object())
+                .ok_or(TransportError::SessionFenced)?;
+            if sidecar.get("verdict").and_then(serde_json::Value::as_str) == Some("ADMITTED") {
+                let namespace = outcome
+                    .get("owner_namespace")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(TransportError::SessionFenced)?;
+                let handle = sidecar
+                    .get("read_handle")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(TransportError::SessionFenced)?;
+                let readback = self
+                    .generation_gateway
+                    .ors
+                    .load_bridge_event_restricted_source_checked(
+                        &event.stream_id,
+                        &event.event_id,
+                        namespace,
+                        handle,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .ok_or(TransportError::SessionFenced)?;
+                let owner = policy_owner_read.ok_or(TransportError::SessionFenced)?;
+                if readback.bytes != raw_bytes
+                    || readback.sha256 != eliot_contracts::sha256_hex(raw_bytes)
+                    || readback.policy_owner_digest != owner.policy_owner_digest
+                    || readback.work_scope_owner_digest != owner.work_scope_owner_digest
+                    || readback.policy_revision != owner.policy_revision
+                    || readback.work_scope_revision != owner.work_scope_owner_revision
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+            }
+        }
+        let mut outcome = outcome;
+        if let Some(sidecar) = outcome
+            .get_mut("restricted_source")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            sidecar.insert("read_handle".to_owned(), serde_json::Value::Null);
+        }
         // An elapsed absolute deadline is staged honestly, then
         // reported as a timeout instead of an admission: the durable
         // record preserves the late presentation for reconcile, while

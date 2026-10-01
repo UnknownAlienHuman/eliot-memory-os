@@ -332,7 +332,7 @@ async fn serve_connection(
             session.fence();
             return Err(error);
         }
-        let action = match kernel.dispatch_frame(&session, &frame) {
+        let action = match kernel.dispatch_frame_async(&session, &frame).await {
             Ok(action) => action,
             Err(error) => {
                 session.fence();
@@ -603,7 +603,7 @@ async fn serve_user_broker_connection(
         let Some(frame) = received else {
             break Ok(());
         };
-        let action = match kernel.dispatch_frame(&session, &frame) {
+        let action = match kernel.dispatch_frame_async(&session, &frame).await {
             Ok(action) => action,
             Err(error) => break Err(error),
         };
@@ -767,7 +767,7 @@ async fn serve_admitted_bridge_host_requests(
             kernel.revoke_agent_bridge(&connection_id);
             return Err(error);
         }
-        let action = match kernel.dispatch_frame(&session, &frame) {
+        let action = match kernel.dispatch_frame_async(&session, &frame).await {
             Ok(action) => action,
             Err(
                 error @ (TransportError::Backpressure | TransportError::AttributedBackpressure(_)),

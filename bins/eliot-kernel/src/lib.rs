@@ -50,6 +50,7 @@ mod backup_capture_ports;
 mod backup_restore;
 mod backup_restore_ports;
 mod backup_verify_provenance;
+mod bridge_event_policy_owner;
 #[cfg(windows)]
 mod blackboard;
 mod blob_store_controller;

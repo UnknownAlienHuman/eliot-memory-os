@@ -1010,6 +1010,38 @@ struct BridgeEventRow {
     /// answer.
     #[serde(default)]
     normalization_warnings: Vec<String>,
+    /// Exact restricted callback bytes are stored only when the checked
+    /// Policy/WorkScope join admitted this source class and their digest is
+    /// independently bound below. They are never part of the normalized
+    /// EventEnvelope or its public projection.
+    #[serde(default)]
+    restricted_source_bytes: Vec<u8>,
+    #[serde(default)]
+    restricted_source_sha256: String,
+    #[serde(default)]
+    restricted_source_read_handle: String,
+    #[serde(default)]
+    restricted_source_policy_owner_digest: String,
+    #[serde(default)]
+    restricted_source_work_scope_owner_digest: String,
+    #[serde(default)]
+    restricted_source_policy_revision: u64,
+    #[serde(default)]
+    restricted_source_work_scope_revision: u64,
+    #[serde(default)]
+    restricted_source_verdict: String,
+}
+
+/// Restricted sidecar bytes returned only after an exact owner-bound handle
+/// recheck against the retained BridgeEventRow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeEventRestrictedSourceReadback {
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub policy_owner_digest: String,
+    pub work_scope_owner_digest: String,
+    pub policy_revision: u64,
+    pub work_scope_revision: u64,
 }
 
 impl BridgeEventRow {
@@ -1052,7 +1084,74 @@ impl BridgeEventRow {
             crate::model::validate_digest(&self.owner_namespace, "owner_namespace")?;
         }
         self.validate_privacy()?;
+        self.validate_restricted_source()?;
         self.validate_provenance()
+    }
+
+    fn validate_restricted_source(&self) -> Result<(), OrsError> {
+        let evidence = [
+            self.restricted_source_read_handle.as_str(),
+            self.restricted_source_policy_owner_digest.as_str(),
+            self.restricted_source_work_scope_owner_digest.as_str(),
+        ];
+        let absent = self.restricted_source_bytes.is_empty()
+            && self.restricted_source_sha256.is_empty()
+            && evidence.iter().all(|field| field.is_empty())
+            && self.restricted_source_policy_revision == 0
+            && self.restricted_source_work_scope_revision == 0
+            && self.restricted_source_verdict.is_empty();
+        if absent {
+            return Ok(());
+        }
+        if self.restricted_source_sha256.is_empty()
+            || evidence[1..].iter().any(|field| field.is_empty())
+            || self.restricted_source_policy_revision == 0
+            || self.restricted_source_work_scope_revision == 0
+            || !matches!(self.restricted_source_verdict.as_str(), "ADMITTED" | "WITHHELD")
+        {
+            return Err(OrsError::InvalidField {
+                field: "restricted_source",
+                reason: "restricted source bytes bind exact owner digests, revisions and read handle together",
+            });
+        }
+        crate::model::validate_digest(
+            &self.restricted_source_sha256,
+            "restricted_source_sha256",
+        )?;
+        crate::model::validate_digest(
+            &self.restricted_source_read_handle,
+            "restricted_source_read_handle",
+        ).or_else(|error| {
+            if self.restricted_source_verdict == "WITHHELD"
+                && self.restricted_source_read_handle.is_empty()
+            {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
+        crate::model::validate_digest(
+            &self.restricted_source_policy_owner_digest,
+            "restricted_source_policy_owner_digest",
+        )?;
+        crate::model::validate_digest(
+            &self.restricted_source_work_scope_owner_digest,
+            "restricted_source_work_scope_owner_digest",
+        )?;
+        if self.restricted_source_verdict == "ADMITTED"
+            && (self.restricted_source_bytes.is_empty()
+                || self.restricted_source_bytes.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES
+                || crate::model::sha256_hex(&self.restricted_source_bytes)
+                    != self.restricted_source_sha256)
+        {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        if self.restricted_source_verdict == "WITHHELD"
+            && (!self.restricted_source_bytes.is_empty() || !self.restricted_source_read_handle.is_empty())
+        {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        Ok(())
     }
 
     /// Validates the I7.23 ingest provenance carried by this row (issue
@@ -2048,6 +2147,18 @@ struct BridgeEventReplayCommitment {
     redaction_marker: String,
     #[serde(default)]
     redaction_version: u16,
+    #[serde(default)]
+    restricted_source_sha256: String,
+    #[serde(default)]
+    restricted_source_policy_owner_digest: String,
+    #[serde(default)]
+    restricted_source_work_scope_owner_digest: String,
+    #[serde(default)]
+    restricted_source_policy_revision: u64,
+    #[serde(default)]
+    restricted_source_work_scope_revision: u64,
+    #[serde(default)]
+    restricted_source_verdict: String,
     compacted_at_ms: u64,
     acked_at_compaction: u64,
 }
@@ -2092,6 +2203,37 @@ impl BridgeEventReplayCommitment {
                 field: "transport_hash",
                 reason: "replay commitment binds the original transport hash",
             });
+        }
+        let raw_bound = !self.restricted_source_sha256.is_empty();
+        let raw_absent = self.restricted_source_sha256.is_empty()
+            && self.restricted_source_policy_owner_digest.is_empty()
+            && self.restricted_source_work_scope_owner_digest.is_empty()
+            && self.restricted_source_policy_revision == 0
+            && self.restricted_source_work_scope_revision == 0
+            && self.restricted_source_verdict.is_empty();
+        if !raw_absent {
+            crate::model::validate_digest(
+                &self.restricted_source_sha256,
+                "restricted_source_sha256",
+            )?;
+            crate::model::validate_digest(
+                &self.restricted_source_policy_owner_digest,
+                "restricted_source_policy_owner_digest",
+            )?;
+            crate::model::validate_digest(
+                &self.restricted_source_work_scope_owner_digest,
+                "restricted_source_work_scope_owner_digest",
+            )?;
+            if !raw_bound
+                || self.restricted_source_policy_revision == 0
+                || self.restricted_source_work_scope_revision == 0
+                || !matches!(self.restricted_source_verdict.as_str(), "ADMITTED" | "WITHHELD")
+            {
+                return Err(OrsError::InvalidField {
+                    field: "restricted_source",
+                    reason: "replay commitment binds the complete restricted-source decision",
+                });
+            }
         }
         if self.redacted {
             if self.redacted_classes.is_empty()
@@ -3120,6 +3262,26 @@ struct BridgeEventPrivacyStaging {
     /// Persisted as its own durable row and related to `stored_bytes` before
     /// any cursor may be advanced.
     normalized_bytes: Vec<u8>,
+    restricted_source_bytes: Vec<u8>,
+    restricted_source_sha256: String,
+    restricted_source_read_handle: String,
+    restricted_source_policy_owner_digest: String,
+    restricted_source_work_scope_owner_digest: String,
+    restricted_source_policy_revision: u64,
+    restricted_source_work_scope_revision: u64,
+    restricted_source_verdict: String,
+}
+
+#[derive(Default)]
+struct BridgeRestrictedSourceStaging {
+    bytes: Vec<u8>,
+    digest: String,
+    read_handle: String,
+    policy_owner_digest: String,
+    work_scope_owner_digest: String,
+    policy_revision: u64,
+    work_scope_revision: u64,
+    verdict: String,
 }
 
 /// Resolved I7.23 ingest provenance for one staged bridge event (issue
@@ -3171,6 +3333,19 @@ fn bridge_event_outcome(
     } else {
         serde_json::Value::Null
     };
+    let restricted_source = if row.restricted_source_verdict.is_empty() {
+        serde_json::Value::Null
+    } else {
+        json!({
+            "verdict": row.restricted_source_verdict,
+            "sha256": row.restricted_source_sha256,
+            "read_handle": if row.restricted_source_read_handle.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::from(row.restricted_source_read_handle.as_str())
+            },
+        })
+    };
     let privacy_authorization = if row.admitted_source.is_empty() {
         serde_json::Value::Null
     } else {
@@ -3202,6 +3377,7 @@ fn bridge_event_outcome(
         "privacy_disposition": privacy_disposition,
         "transport_hash": row.transport_hash,
         "redaction": redaction,
+        "restricted_source": restricted_source,
         "privacy_authorization": privacy_authorization,
         "handoff": handoff,
         "adapter_version": row.adapter_version,
@@ -12000,6 +12176,10 @@ impl RedbRecoveryStore {
             &classes,
             &reason,
         );
+        let restricted_source = Self::bridge_event_restricted_source_staging(
+            staged,
+            enforced_scope,
+        )?;
         Ok(BridgeEventPrivacyStaging {
             denied,
             reason,
@@ -12010,6 +12190,219 @@ impl RedbRecoveryStore {
             policy_revision,
             stored_bytes,
             normalized_bytes,
+            restricted_source_bytes: restricted_source.bytes,
+            restricted_source_sha256: restricted_source.digest,
+            restricted_source_read_handle: restricted_source.read_handle,
+            restricted_source_policy_owner_digest: restricted_source.policy_owner_digest,
+            restricted_source_work_scope_owner_digest: restricted_source.work_scope_owner_digest,
+            restricted_source_policy_revision: restricted_source.policy_revision,
+            restricted_source_work_scope_revision: restricted_source.work_scope_revision,
+            restricted_source_verdict: restricted_source.verdict,
+        })
+    }
+
+    /// Resolves the separate restricted raw-source sidecar only from a
+    /// checked Kernel owner join. The ordinary normalized EventEnvelope is
+    /// never substituted for these callback bytes, and a denied sidecar keeps
+    /// only its digest and explicit owner readback facts.
+    fn bridge_event_restricted_source_staging(
+        staged: &serde_json::Value,
+        enforced_namespace: Option<&str>,
+    ) -> Result<BridgeRestrictedSourceStaging, OrsError> {
+        let Some(raw_value) = staged.get("restricted_source_bytes") else {
+            return Ok(BridgeRestrictedSourceStaging::default());
+        };
+        let raw_bytes = raw_value.as_array().ok_or(OrsError::InvalidField {
+            field: "restricted_source_bytes",
+            reason: "restricted callback source must be an exact byte array",
+        })?;
+        if raw_bytes.is_empty() || raw_bytes.len() > MAX_BRIDGE_EVENT_ENVELOPE_BYTES {
+            return Err(OrsError::PayloadTooLarge);
+        }
+        let bytes = raw_bytes
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|byte| u8::try_from(byte).ok())
+                    .ok_or(OrsError::InvalidField {
+                        field: "restricted_source_bytes",
+                        reason: "restricted callback source must contain exact byte values",
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let digest = crate::model::sha256_hex(&bytes);
+        if staged
+            .get("restricted_source_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(digest.as_str())
+        {
+            return Err(OrsError::PayloadIntegrityMismatch);
+        }
+        let namespace = enforced_namespace.ok_or(OrsError::InvalidField {
+            field: "restricted_source_authorization",
+            reason: "restricted raw source requires the owner-checked stage entry",
+        })?;
+        let authorization = staged
+            .get("restricted_source_authorization")
+            .filter(|value| value.is_object())
+            .ok_or(OrsError::InvalidField {
+                field: "restricted_source_authorization",
+                reason: "restricted raw source requires explicit owner evidence",
+            })?;
+        let owner_readback = staged
+            .get("privacy_owner_readback")
+            .filter(|value| value.is_object())
+            .ok_or(OrsError::InvalidField {
+                field: "privacy_owner_readback",
+                reason: "restricted raw source requires Policy and WorkScope readback",
+            })?;
+        let read_text = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .ok_or(OrsError::InvalidField {
+                    field: "restricted_source_authorization",
+                    reason: "restricted source owner evidence is incomplete",
+                })
+        };
+        let policy_owner_digest = read_text(authorization, "policy_owner_digest")?.to_owned();
+        let work_scope_owner_digest =
+            read_text(authorization, "work_scope_owner_digest")?.to_owned();
+        crate::model::validate_digest(&policy_owner_digest, "policy_owner_digest")?;
+        crate::model::validate_digest(&work_scope_owner_digest, "work_scope_owner_digest")?;
+        let policy_revision = authorization
+            .get("policy_revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or(OrsError::InvalidField {
+                field: "policy_revision",
+                reason: "current Policy revision is required",
+            })?;
+        let work_scope_revision = authorization
+            .get("work_scope_owner_revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or(OrsError::InvalidField {
+                field: "work_scope_owner_revision",
+                reason: "current WorkScope owner revision is required",
+            })?;
+        let scope_ref = read_text(authorization, "scope_ref")?;
+        let owner_policy_digest = read_text(owner_readback, "policy_owner_digest")?;
+        let owner_work_scope_digest = read_text(owner_readback, "work_scope_owner_digest")?;
+        let owner_scope_ref = read_text(owner_readback, "scope_ref")?;
+        let owner_policy_revision = owner_readback
+            .get("policy_revision")
+            .and_then(serde_json::Value::as_u64);
+        let owner_work_scope_revision = owner_readback
+            .get("work_scope_owner_revision")
+            .and_then(serde_json::Value::as_u64);
+        let source_class = read_text(authorization, "source_class")?;
+        let policy_snapshot_digest = read_text(authorization, "policy_snapshot_digest")?;
+        let owner_policy_snapshot_digest = read_text(owner_readback, "policy_snapshot_digest")?;
+        let policy_snapshot_id = read_text(authorization, "policy_snapshot_id")?;
+        let owner_policy_snapshot_id = read_text(owner_readback, "policy_snapshot_id")?;
+        let verdict = read_text(authorization, "verdict")?;
+        let policy_terms = authorization.get("policy_terms");
+        if !matches!(verdict, "admitted" | "rejected")
+            || read_text(authorization, "source_sha256")? != digest
+            || source_class != "RESTRICTED_HANDLE_ONLY"
+            || scope_ref != owner_scope_ref
+            || policy_owner_digest != owner_policy_digest
+            || work_scope_owner_digest != owner_work_scope_digest
+            || Some(policy_revision) != owner_policy_revision
+            || Some(work_scope_revision) != owner_work_scope_revision
+            || read_text(authorization, "scope_ref")? != read_text(owner_readback, "scope_ref")?
+            || policy_snapshot_digest != owner_policy_snapshot_digest
+            || policy_snapshot_id != owner_policy_snapshot_id
+            || authorization.get("work_scope_privacy_class")
+                != owner_readback.get("work_scope_privacy_class")
+            || policy_terms != owner_readback.get("policy_terms")
+        {
+            return Ok(BridgeRestrictedSourceStaging {
+                digest,
+                policy_owner_digest,
+                work_scope_owner_digest,
+                policy_revision,
+                work_scope_revision,
+                verdict: "WITHHELD".to_owned(),
+                ..BridgeRestrictedSourceStaging::default()
+            });
+        }
+        if verdict != "admitted" {
+            return Ok(BridgeRestrictedSourceStaging {
+                digest,
+                policy_owner_digest,
+                work_scope_owner_digest,
+                policy_revision,
+                work_scope_revision,
+                verdict: "WITHHELD".to_owned(),
+                ..BridgeRestrictedSourceStaging::default()
+            });
+        }
+        let policy_terms = policy_terms
+            .filter(|value| value.is_object())
+            .ok_or(OrsError::InvalidField {
+                field: "policy_terms",
+                reason: "explicit current Policy terms are required for raw admission",
+            })?;
+        let rules = policy_terms
+            .get("rules")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(OrsError::InvalidField {
+                field: "policy_terms.rules",
+                reason: "current Policy rule set is invalid",
+            })?;
+        let allowed_rule = rules.iter().any(|rule| {
+            rule.get("source_class").and_then(serde_json::Value::as_str)
+                == Some("RESTRICTED_HANDLE_ONLY")
+                && rule
+                    .get("workscope_privacy_class")
+                    == authorization.get("work_scope_privacy_class")
+                && rule
+                    .get("provider_restriction")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("HIDDEN_REASONING_EXCLUDED")
+                && rule.get("retention").and_then(serde_json::Value::as_str)
+                    == Some("RAW_ALLOWED")
+        });
+        if !allowed_rule || Self::privacy_deny_scan(&bytes).0 {
+            return Ok(BridgeRestrictedSourceStaging {
+                digest,
+                policy_owner_digest,
+                work_scope_owner_digest,
+                policy_revision,
+                work_scope_revision,
+                verdict: "WITHHELD".to_owned(),
+                ..BridgeRestrictedSourceStaging::default()
+            });
+        }
+        let identity = serde_json::json!({
+            "owner_namespace": namespace,
+            "stream_id": staged.get("stream_id"),
+            "event_id": staged.get("event_id"),
+            "restricted_source_sha256": digest,
+            "policy_owner_digest": policy_owner_digest,
+            "work_scope_owner_digest": work_scope_owner_digest,
+            "policy_revision": policy_revision,
+            "work_scope_revision": work_scope_revision,
+        });
+        let mut handle_bytes = b"eliot.ors.bridge.restricted-source.read.v1\0".to_vec();
+        handle_bytes.extend(canonical_json_bytes(&identity).map_err(|_| {
+            OrsError::InvalidField {
+                field: "restricted_source_read_handle",
+                reason: "restricted source handle identity is not canonical",
+            }
+        })?);
+        Ok(BridgeRestrictedSourceStaging {
+            bytes,
+            digest,
+            read_handle: crate::model::sha256_hex(&handle_bytes),
+            policy_owner_digest,
+            work_scope_owner_digest,
+            policy_revision,
+            work_scope_revision,
+            verdict: "ADMITTED".to_owned(),
         })
     }
 
@@ -12390,6 +12783,20 @@ impl RedbRecoveryStore {
                     requested_route: provenance.requested_route,
                     actual_route: provenance.actual_route,
                     normalization_warnings: provenance.warnings,
+                    restricted_source_bytes: staging.restricted_source_bytes.clone(),
+                    restricted_source_sha256: staging.restricted_source_sha256.clone(),
+                    restricted_source_read_handle: staging.restricted_source_read_handle.clone(),
+                    restricted_source_policy_owner_digest: staging
+                        .restricted_source_policy_owner_digest
+                        .clone(),
+                    restricted_source_work_scope_owner_digest: staging
+                        .restricted_source_work_scope_owner_digest
+                        .clone(),
+                    restricted_source_policy_revision: staging
+                        .restricted_source_policy_revision,
+                    restricted_source_work_scope_revision: staging
+                        .restricted_source_work_scope_revision,
+                    restricted_source_verdict: staging.restricted_source_verdict.clone(),
                 };
                 row.validate()?;
                 {
@@ -12424,6 +12831,50 @@ impl RedbRecoveryStore {
     /// acknowledgement replays to the stored facts instead of duplicating
     /// normalization or application. Unknown identities return `Ok(None)`,
     /// never a synthesized event.
+    /// Reads exact restricted callback bytes through a retained owner-bound
+    /// capability. The capability is checked against the admitted row, stream
+    /// namespace, event identity, and source digest on every read.
+    pub fn load_bridge_event_restricted_source_checked(
+        &self,
+        stream_id: &str,
+        event_id: &str,
+        owner_namespace: &str,
+        read_handle: &str,
+    ) -> Result<Option<BridgeEventRestrictedSourceReadback>, OrsError> {
+        bridge_identity_text(stream_id, "stream_id")?;
+        bridge_identity_text(event_id, "event_id")?;
+        crate::model::validate_digest(owner_namespace, "owner_namespace")?;
+        crate::model::validate_digest(read_handle, "restricted_source_read_handle")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let key = format!("{stream_id}::{event_id}");
+        let row: Option<BridgeEventRow> = {
+            let records = read.open_table(BRIDGE_EVENT_RECORDS).map_err(storage)?;
+            records
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+        };
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        row.validate()?;
+        if row.owner_namespace != owner_namespace
+            || row.restricted_source_verdict != "ADMITTED"
+            || row.restricted_source_read_handle != read_handle
+        {
+            return Ok(None);
+        }
+        Ok(Some(BridgeEventRestrictedSourceReadback {
+            bytes: row.restricted_source_bytes,
+            sha256: row.restricted_source_sha256,
+            policy_owner_digest: row.restricted_source_policy_owner_digest,
+            work_scope_owner_digest: row.restricted_source_work_scope_owner_digest,
+            policy_revision: row.restricted_source_policy_revision,
+            work_scope_revision: row.restricted_source_work_scope_revision,
+        }))
+    }
+
     pub fn load_bridge_event(
         &self,
         stream_id: &str,
@@ -16867,6 +17318,16 @@ impl RedbRecoveryStore {
             && commitment.transport_hash == staging.transport_hash
             && commitment.redacted == staging.denied
             && commitment.redacted_classes == staging.classes
+            && commitment.restricted_source_sha256 == staging.restricted_source_sha256
+            && commitment.restricted_source_policy_owner_digest
+                == staging.restricted_source_policy_owner_digest
+            && commitment.restricted_source_work_scope_owner_digest
+                == staging.restricted_source_work_scope_owner_digest
+            && commitment.restricted_source_policy_revision
+                == staging.restricted_source_policy_revision
+            && commitment.restricted_source_work_scope_revision
+                == staging.restricted_source_work_scope_revision
+            && commitment.restricted_source_verdict == staging.restricted_source_verdict
     }
 
     /// Builds the exact-replay outcome from a retained replay commitment
@@ -17401,6 +17862,15 @@ impl RedbRecoveryStore {
             || row.admitted_source != staging.admitted_source
             || row.admitted_scope != staging.scope
             || row.admitted_policy_revision != staging.policy_revision
+            || row.restricted_source_sha256 != staging.restricted_source_sha256
+            || row.restricted_source_policy_owner_digest
+                != staging.restricted_source_policy_owner_digest
+            || row.restricted_source_work_scope_owner_digest
+                != staging.restricted_source_work_scope_owner_digest
+            || row.restricted_source_policy_revision != staging.restricted_source_policy_revision
+            || row.restricted_source_work_scope_revision
+                != staging.restricted_source_work_scope_revision
+            || row.restricted_source_verdict != staging.restricted_source_verdict
             || !Self::bridge_event_provenance_matches(row, provenance)
         {
             return Err(OrsError::DuplicateConflict);
@@ -17670,6 +18140,18 @@ impl RedbRecoveryStore {
             requested_route: provenance.requested_route.clone(),
             actual_route: provenance.actual_route.clone(),
             normalization_warnings: provenance.warnings.clone(),
+            restricted_source_bytes: staging.restricted_source_bytes.clone(),
+            restricted_source_sha256: staging.restricted_source_sha256.clone(),
+            restricted_source_read_handle: staging.restricted_source_read_handle.clone(),
+            restricted_source_policy_owner_digest: staging
+                .restricted_source_policy_owner_digest
+                .clone(),
+            restricted_source_work_scope_owner_digest: staging
+                .restricted_source_work_scope_owner_digest
+                .clone(),
+            restricted_source_policy_revision: staging.restricted_source_policy_revision,
+            restricted_source_work_scope_revision: staging.restricted_source_work_scope_revision,
+            restricted_source_verdict: staging.restricted_source_verdict.clone(),
         };
         row.validate()?;
         {
@@ -18802,6 +19284,16 @@ impl RedbRecoveryStore {
             redacted_classes: victim.redacted_classes.clone(),
             redaction_marker: victim.redaction_marker.clone(),
             redaction_version: victim.redaction_version,
+            restricted_source_sha256: victim.restricted_source_sha256.clone(),
+            restricted_source_policy_owner_digest: victim
+                .restricted_source_policy_owner_digest
+                .clone(),
+            restricted_source_work_scope_owner_digest: victim
+                .restricted_source_work_scope_owner_digest
+                .clone(),
+            restricted_source_policy_revision: victim.restricted_source_policy_revision,
+            restricted_source_work_scope_revision: victim.restricted_source_work_scope_revision,
+            restricted_source_verdict: victim.restricted_source_verdict.clone(),
             compacted_at_ms: now_ms,
             acked_at_compaction: acked,
         }
