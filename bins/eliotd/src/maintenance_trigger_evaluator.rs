@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
@@ -762,7 +763,7 @@ fn evidence_committed_trigger_id(
     let mut framed = String::new();
     for reference in &ordered {
         let len = reference.len();
-        framed.push_str(&format!("{len}:{reference}\n"));
+        let _ = writeln!(framed, "{len}:{reference}");
     }
     let commitment = sha256_hex(framed.as_bytes());
     let policy = match policy_revision {
