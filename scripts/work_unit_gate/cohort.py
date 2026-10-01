@@ -958,7 +958,11 @@ def locked_catalogue_rows(
     that ships no lock has declared no row, no disposition and no prerequisite
     edge, and the caller keeps its own discovered denominator unchanged. An
     existing lock that is malformed, unreadable or digest-invalid instead
-    propagates INVALID_AGGREGATE_LOCK; it never becomes `{}`. Present-but-
+    propagates INVALID_AGGREGATE_LOCK; it never becomes `{}`. The aggregate
+    sha256 is re-derived over the projected rows through the same
+    CatalogueIntegrityReceipt digest verify_cohort_lock compares, binding the
+    same caller-supplied descriptors, so a well-formed but wrong digest fails
+    closed here instead of projecting as valid rows. Present-but-
     unusable paths (directory, broken link, special file) are invalid, not
     missing. Prerequisite edges are never dropped here; a row that declares a
     prerequisite keeps it so the selected plan can demand the matching
@@ -994,6 +998,18 @@ def locked_catalogue_rows(
                 descriptor=descriptor,
                 prerequisites=tuple(c.IssueIdentity(repo, n) for n in entry.prerequisites),
             )
+        # Re-derive the aggregate digest over the projected rows (#852 AUD2).
+        # read_cohort_lock closed-validates only the FORMAT of [aggregate]
+        # sha256 via _lock_digest, so without this recompute a well-formed
+        # but wrong digest would project as valid rows on the selected/full
+        # path. The same caller-supplied descriptors bound above participate
+        # here exactly as in verify_cohort_lock, so both paths agree on the
+        # lock identity; any mismatch is INVALID_AGGREGATE_LOCK, never {}.
+        ordered = tuple(rows[number] for number in sorted(rows))
+        expected = tuple(row.issue for row in ordered)
+        recomputed = c.CatalogueIntegrityReceipt(ordered, expected).sha256
+        if recomputed != lock.aggregate.sha256:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock aggregate digest mismatch")
     except CohortError:
         raise
     except c.ContractViolation as exc:
