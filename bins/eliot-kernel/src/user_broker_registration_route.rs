@@ -24,8 +24,9 @@ use eliot_user_broker_core::{
 };
 
 use super::user_broker_registration_authority::{
-    LiveUserBrokerRegistration, SpentUserBrokerOperationIdentity, UserBrokerFenceReplay,
-    UserBrokerHeartbeatReplay, UserBrokerSessionBinding,
+    BrokerWorkScope, LiveUserBrokerRegistration, SpentUserBrokerOperationIdentity,
+    UserBrokerFenceReplay, UserBrokerHeartbeatReplay, UserBrokerSessionBinding,
+    admit_interactive_user_execution,
 };
 use super::{
     FrameKind, KernelComposition, KernelFrameAction, KernelServiceState, MessageType, Session,
@@ -69,6 +70,10 @@ struct UserBrokerHeartbeatPayload {
 struct UserBrokerAuthorizeLaunchPayload {
     registration: RegistrationReceipt,
     request: LaunchRequest,
+    /// I1.6 `WorkScope` the caller claims this execution for. The claim is
+    /// never trusted: the route re-derives the expected scope from the live
+    /// registration and refuses anything else.
+    work_scope: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1097,6 +1102,16 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        // AC1: the claimed WorkScope must be the one this exact live
+        // registration authorizes. A mismatched scope is presented evidence
+        // that does not match, so it is refused without fencing the live
+        // registration itself.
+        admit_interactive_user_execution(
+            &current.registration,
+            &current.receipt,
+            request.work_scope.as_str(),
+            now,
+        )?;
         if now >= current.receipt.expires_at {
             drop(live);
             self.fence_user_broker_session(session);
@@ -1489,17 +1504,33 @@ impl KernelComposition {
         let _ = self.persist_user_broker_fence(&registration);
     }
 
+    /// Persists the durable fence for one revoked broker session and leaves
+    /// the reconciliation intent for its broker-bound execution leases.
+    ///
+    /// The record is the opaque ORS fence write, extended with the exact
+    /// revoked scope (`interactive_user:<sid>`), the revoked SID/session
+    /// tuple, the fenced broker-local epoch, and the revocation instant: that
+    /// is the reconciliation intent a later pass uses to bound cleanup/receipt
+    /// reconciliation to the revoked user scope. Machine-scoped canonical
+    /// work is never named here and is unaffected by the fence.
     fn persist_user_broker_fence(
         &self,
         registration: &LiveUserBrokerRegistration,
     ) -> Result<(), TransportError> {
         let now = super::unix_ms();
         let created_at_ms = i64::try_from(now).map_err(|_| TransportError::SessionFenced)?;
+        let revoked_scope =
+            BrokerWorkScope::for_registration(&registration.registration).route_string();
         let payload_bytes = serde_json::to_vec(&(
             "user-broker-session-fenced-v1",
             &registration.receipt.registration_digest,
             registration.session.connection_id(),
             registration.session.session_epoch(),
+            &registration.registration.windows_sid,
+            &registration.registration.interactive_session_id,
+            revoked_scope,
+            registration.receipt.user_broker_epoch,
+            created_at_ms,
         ))
         .map_err(|_| TransportError::SessionFenced)?;
         let payload_length =
