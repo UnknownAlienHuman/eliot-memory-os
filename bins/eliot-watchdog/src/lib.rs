@@ -473,11 +473,15 @@ impl IndependentKernelSensor {
     ///
     /// Returns an error when the root or its spool file cannot be opened and
     /// retained as a protected file, or when the epoch is invalid.
+    ///
+    /// The binding is borrowed, not consumed. This constructor retains the one
+    /// copy it needs inside the `Arc` it shares with the backup port; the caller
+    /// keeps its own binding and no ownership is transferred here.
     pub fn open_runtime_binding(
-        binding: WatchdogRuntimeBinding,
+        binding: &WatchdogRuntimeBinding,
         watchdog_epoch: u64,
     ) -> Result<Self, SpoolError> {
-        let spool = Arc::new(WatchdogSpool::open_runtime_binding(&binding)?);
+        let spool = Arc::new(WatchdogSpool::open_runtime_binding(binding)?);
         let installation_id = binding
             .selected_manifest
             .runtime_launch
@@ -538,10 +542,14 @@ impl IndependentKernelSensor {
     /// # Errors
     ///
     /// Returns an error when the protected spool cannot be opened or retained.
+    ///
+    /// The binding is borrowed for the same reason as
+    /// [`Self::open_runtime_binding`]: the gap-only sensor retains one `Arc` copy
+    /// and consumes no ownership from the caller.
     pub fn open_runtime_binding_without_epoch(
-        binding: WatchdogRuntimeBinding,
+        binding: &WatchdogRuntimeBinding,
     ) -> Result<Self, SpoolError> {
-        let spool = Arc::new(WatchdogSpool::open_runtime_binding(&binding)?);
+        let spool = Arc::new(WatchdogSpool::open_runtime_binding(binding)?);
         let installation_id = binding
             .selected_manifest
             .runtime_launch

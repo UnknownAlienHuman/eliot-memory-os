@@ -138,10 +138,10 @@ pub(super) fn run_watchdog(
     let sensor = Arc::new(
         match initial_admission {
             Some(admission) => IndependentKernelSensor::open_runtime_binding(
-                binding.clone(),
+                &binding,
                 admission.watchdog_epoch().value(),
             ),
-            None => IndependentKernelSensor::open_runtime_binding_without_epoch(binding.clone()),
+            None => IndependentKernelSensor::open_runtime_binding_without_epoch(&binding),
         }
         .map_err(|error| error.to_string())?,
     );

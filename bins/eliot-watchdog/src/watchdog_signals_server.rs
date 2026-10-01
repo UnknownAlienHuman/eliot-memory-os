@@ -203,6 +203,10 @@ impl KernelPeerAdmission {
 /// an explicit typed refusal instead of vanishing, and that refusal is the owner's
 /// own, reached through the same handle and the same dispatch as any executable
 /// method.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "SnapshotPage carries the owner's own bounded page beside the owner's own fence identity so the published frame holds the owner's exact bytes; boxing it would diverge from the sibling owner-outcome seam shape and add an allocation to every capture read"
+)]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", tag = "outcome")]
 pub enum WatchdogSignalsOutcome {
@@ -693,7 +697,9 @@ enum SignalsRequest {
 fn decode_signals_request(
     frame: &eliot_protocol::Frame,
 ) -> Result<SignalsRequest, WatchdogSignalsError> {
-    frame.validate().map_err(map_protocol_error)?;
+    frame
+        .validate()
+        .map_err(|error| map_protocol_error(&error))?;
     if frame.kind != eliot_protocol::FrameKind::Control
         || frame.message_type != eliot_protocol::MessageType::Start
         || frame.request_id.is_some()
@@ -906,7 +912,9 @@ fn encode_signals_response(
         ),
         trace_context: std::collections::BTreeMap::new(),
     };
-    frame.validate().map_err(map_protocol_error)?;
+    frame
+        .validate()
+        .map_err(|error| map_protocol_error(&error))?;
     Ok(frame)
 }
 
@@ -915,7 +923,11 @@ fn encode_signals_response(
 /// The protocol owner stays the only place a frame is judged; this only records a
 /// bounded, secret-free trace of its own rejection and returns the transport's
 /// single fail-closed frame refusal.
-fn map_protocol_error(error: eliot_protocol::ProtocolError) -> TransportError {
+///
+/// The rejection is borrowed, not consumed: the owner's typed error is only
+/// rendered into the bounded trace, and no part of it is stored, moved, or
+/// re-published, so this projection has no use for ownership.
+fn map_protocol_error(error: &eliot_protocol::ProtocolError) -> TransportError {
     tracing::debug!(
         event = "watchdog.signals_frame_fenced",
         observation = "fenced",
