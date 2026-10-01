@@ -21,6 +21,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import http.client
 import json
 from pathlib import Path
 import os
@@ -34,6 +35,14 @@ OFFICIAL_REPOSITORY = "https://github.com/surrealdb/surrealdb"
 GITHUB_API_REPOSITORY = "https://api.github.com/repos/surrealdb/surrealdb"
 OSV_ENDPOINT = "https://api.osv.dev/v1/query"
 REPARSE_POINT = 0x400
+
+# Issue #3004, external audit 5886158422: a truncated body raises
+# http.client.IncompleteRead, a HTTPException and therefore NOT an OSError.
+# Every guard below catches (RuntimeError, OSError), so a short transfer used
+# to escape record_missing() entirely and end the run with no receipt at all.
+# TRANSPORT_FAILURES names exactly that class so a transport fault becomes an
+# honest missing input instead of an unrecorded exit.
+TRANSPORT_FAILURES = (RuntimeError, OSError, http.client.HTTPException)
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -276,14 +285,24 @@ def materialize(
 
 
 def fetch(url: str, *, data: bytes | None = None, accept: str = "application/octet-stream") -> bytes:
+    """Read the declared body, converting a transport fault into a typed failure.
+
+    A truncated body raises http.client.IncompleteRead, which is a
+    HTTPException and not an OSError. Naming it here keeps the transport
+    boundary typed and makes the enclosing record_missing() report an honest
+    missing input instead of the run dying with no receipt.
+    """
     request = Request(
         url,
         data=data,
         headers={"Accept": accept, "User-Agent": "eliot-dependency-policy-provisioner"},
         method="POST" if data is not None else "GET",
     )
-    with urlopen(request, timeout=120) as response:
-        return response.read()
+    try:
+        with urlopen(request, timeout=120) as response:
+            return response.read()
+    except http.client.HTTPException as exc:
+        raise RuntimeError(f"transport failed while reading {url}: {exc}") from exc
 
 
 def url_for_tag(tag: str) -> str:
@@ -451,7 +470,7 @@ def main() -> int:
         before = len(records)
         try:
             fetch_to(raw_path, url, subject, expected, expected_bytes, accept=accept)
-        except (RuntimeError, OSError) as exc:
+        except TRANSPORT_FAILURES as exc:
             record_missing(subject, exc)
         else:
             record_ready(subject, records[before])
@@ -467,7 +486,7 @@ def main() -> int:
     query_bytes = (json.dumps(query, separators=(",", ":"), ensure_ascii=False) + "\r\n").encode("utf-8")
     try:
         query_record = materialize(root, surreal["advisory_query_path"], query_bytes, surreal["advisory_query_sha256"])
-    except (RuntimeError, OSError) as exc:
+    except TRANSPORT_FAILURES as exc:
         record_missing("osv.query.surrealdb", exc)
     else:
         records.append({
@@ -484,7 +503,7 @@ def main() -> int:
     response_bytes: bytes | None = None
     try:
         response_bytes = read_historical_advisory(root, surreal, args.historical_osv_response)
-    except (RuntimeError, OSError) as exc:
+    except TRANSPORT_FAILURES as exc:
         record_missing("osv.response.surrealdb", exc)
     if response_bytes is not None:
         try:
@@ -495,7 +514,7 @@ def main() -> int:
                 surreal["advisory_response_digest"],
                 replace_existing=True,
             )
-        except (RuntimeError, OSError) as exc:
+        except TRANSPORT_FAILURES as exc:
             record_missing("osv.response.surrealdb", exc)
         else:
             records.append({
@@ -527,7 +546,7 @@ def main() -> int:
             candidate_query_expected_sha256,
             replace_existing=True,
         )
-    except (RuntimeError, OSError) as exc:
+    except TRANSPORT_FAILURES as exc:
         record_missing(f"osv.query.surrealdb.release-candidate.{candidate_tag}", exc)
     else:
         records.append({
@@ -574,7 +593,7 @@ def main() -> int:
             candidate_response_bytes,
             replace_existing=True,
         )
-    except (RuntimeError, OSError) as exc:
+    except TRANSPORT_FAILURES as exc:
         record_missing(f"osv.response.surrealdb.release-candidate.{candidate_tag}", exc)
     else:
         records.append({
