@@ -388,10 +388,10 @@ impl ProtectedRootLease {
                 return Err(ProtectedPathError::IdentityMismatch);
             }
             for (retained, reopened) in self.directories.iter().zip(&current.directories) {
-                let retained_identity = file_identity_from_handle(retained)
-                    .map_err(|_| ProtectedPathError::Io)?;
-                let reopened_identity = file_identity_from_handle(reopened)
-                    .map_err(|_| ProtectedPathError::Io)?;
+                let retained_identity =
+                    file_identity_from_handle(retained).map_err(|_| ProtectedPathError::Io)?;
+                let reopened_identity =
+                    file_identity_from_handle(reopened).map_err(|_| ProtectedPathError::Io)?;
                 if retained_identity != reopened_identity {
                     return Err(ProtectedPathError::IdentityMismatch);
                 }

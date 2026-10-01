@@ -278,10 +278,7 @@ pub struct InitialBindScopeOwnerProof {
 }
 
 impl InitialBindScopeOwnerProof {
-    pub fn new(
-        evidence: AgentActivationBindScopeEvidence,
-        envelope: HostRequestEnvelope,
-    ) -> Self {
+    pub fn new(evidence: AgentActivationBindScopeEvidence, envelope: HostRequestEnvelope) -> Self {
         Self { evidence, envelope }
     }
 }
@@ -849,9 +846,7 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
         quarantine_key: &str,
     ) -> Result<Option<ScanDisclosureQuarantineRecord>, OrsError> {
         if quarantine_key.trim().is_empty() {
-            return Err(OrsError::Contract(
-                "quarantine key is empty".to_owned(),
-            ));
+            return Err(OrsError::Contract("quarantine key is empty".to_owned()));
         }
         match self.request(ScanDisclosureOwnerRpcAction::QuarantineLoad {
             binding: &self.binding,
@@ -1107,7 +1102,9 @@ pub fn prepare_initial_bind_scope_discovery(
         || envelope.identity.work_scope_id.as_deref() != Some(evidence.work_scope_id.as_str())
         || envelope.identity.deadline_unix_ms != evidence.ticket_deadline_unix_ms
         || envelope.state_fence != evidence.state_fence
-        || proposal.validate_for_task_scope(&evidence.work_scope_id).is_err()
+        || proposal
+            .validate_for_task_scope(&evidence.work_scope_id)
+            .is_err()
         || proposal.binding.scope.scope_ref != evidence.work_scope_id
         || proposal.descriptor.scope_ref != evidence.work_scope_id
         || proposal.sources.scope_ref != evidence.work_scope_id
@@ -1117,19 +1114,21 @@ pub fn prepare_initial_bind_scope_discovery(
         || now == 0
         || now > evidence.ticket_deadline_unix_ms
     {
-        return Err(fail("BIND_SCOPE proposal or original claim/evidence is not exact and current"));
+        return Err(fail(
+            "BIND_SCOPE proposal or original claim/evidence is not exact and current",
+        ));
     }
     let explicit_root = proposal
         .explicit_root
         .to_str()
         .filter(|path| Path::new(path).is_absolute())
         .ok_or_else(|| fail("BIND_SCOPE requires one explicit absolute UTF-8 root"))?;
-    let (facts, observed) = observe_explicit_workspace_facts(
-        proposal.explicit_root.as_path(),
-        &evidence.state_fence,
-    )?;
+    let (facts, observed) =
+        observe_explicit_workspace_facts(proposal.explicit_root.as_path(), &evidence.state_fence)?;
     let Some(instance) = observed.instances.first() else {
-        return Err(fail("Host observation returned no explicit workspace instance"));
+        return Err(fail(
+            "Host observation returned no explicit workspace instance",
+        ));
     };
     if observed.instances.len() != 1
         || proposal.binding.scope.root_identity != instance.root_identity
@@ -1142,7 +1141,9 @@ pub fn prepare_initial_bind_scope_discovery(
         || proposal.descriptor.kind != observed.kind
         || proposal.descriptor.lineage != observed.lineage
     {
-        return Err(fail("BIND_SCOPE owner proposal disagrees with independent Host root facts"));
+        return Err(fail(
+            "BIND_SCOPE owner proposal disagrees with independent Host root facts",
+        ));
     }
     let allowed_reads = initial_discovery_allowed_reads(&facts);
     let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
@@ -1158,7 +1159,11 @@ pub fn prepare_initial_bind_scope_discovery(
             allowed_reads: &allowed_reads,
         },
     })
-    .map_err(|error| fail(&format!("BIND_SCOPE owner request encoding failed: {error}")))?;
+    .map_err(|error| {
+        fail(&format!(
+            "BIND_SCOPE owner request encoding failed: {error}"
+        ))
+    })?;
     let value = kernel
         .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
         .map_err(|error| fail(&format!("BIND_SCOPE owner request failed: {error}")))?;
@@ -1185,7 +1190,9 @@ pub fn prepare_initial_bind_scope_discovery(
                 || ticket.kernel_deadline_unix_ms != evidence.ticket_deadline_unix_ms
                 || ticket.workspace_selector.is_some()
             {
-                return Err(fail("Kernel explicit-root prerequisite returned another ticket"));
+                return Err(fail(
+                    "Kernel explicit-root prerequisite returned another ticket",
+                ));
             }
             return Err(TaskBindingError::selection_required(
                 "original activation ticket has no explicit workspace selector; submit a new explicit-root Attach",
@@ -1216,7 +1223,9 @@ pub fn prepare_initial_bind_scope_discovery(
             .as_ref()
             .is_some_and(|proposed| proposed != &lease)
     {
-        return Err(fail("Kernel-retained discovery lease or BIND_SCOPE proposal identity conflicts"));
+        return Err(fail(
+            "Kernel-retained discovery lease or BIND_SCOPE proposal identity conflicts",
+        ));
     }
     let discovery = observe_cold_start_discovery(
         &ticket,

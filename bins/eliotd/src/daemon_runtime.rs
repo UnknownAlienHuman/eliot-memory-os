@@ -5550,13 +5550,9 @@ async fn run_task_controller_poll(
     let body = match prepared {
         eliotd::campaign_task_controller::TaskControllerClaimPreparation::Rejected(body) => *body,
         eliotd::campaign_task_controller::TaskControllerClaimPreparation::BindScope(prepared) => {
-            eliotd::campaign_task_controller::complete_initial_work_scope_binding(
-                kernel.as_ref(),
-                &composition,
-                *prepared,
-            )
-            .await
-            .map_err(|error| format!("daemon WorkScope binding dispatch: {error}"))?
+            complete_initial_task_scope_binding(kernel, &composition, *prepared)
+                .await
+                .map_err(|error| format!("daemon WorkScope binding dispatch: {error}"))?
         }
         eliotd::campaign_task_controller::TaskControllerClaimPreparation::Ready(prepared) => {
             let transition = {
@@ -5599,6 +5595,175 @@ async fn run_task_controller_poll(
                 "Kernel Task Controller result submit: {first_error}; retry: {second_error}"
             )),
         },
+    }
+}
+
+/// Obtains the original Kernel discovery lease before the first WorkScope
+/// CAS, then continues that same accepted ticket through scan and readiness.
+async fn complete_initial_task_scope_binding(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    mut prepared: eliotd::campaign_task_controller::PreparedInitialWorkScopeBinding,
+) -> Result<eliot_protocol::TaskControllerResultBody, String> {
+    use eliotd::campaign_task_controller::{
+        task_controller_rejection, task_controller_result_body,
+    };
+    let claimed = prepared.claimed.clone();
+    let Some(evidence) = claimed.invocation.bind_scope_evidence.clone() else {
+        return task_controller_rejection(&claimed, "initial_scope_evidence_missing");
+    };
+    if evidence.principal_id != claimed.authenticated_principal
+        || evidence.session_id != claimed.attempt.session_id
+        || evidence.task_id != claimed.attempt.task_id.as_str()
+        || evidence.work_scope_id != claimed.attempt.scope_id
+        || evidence.state_fence != claimed.attempt.state_fence
+        || unix_ms(SystemTime::now())? > claimed.attempt.expires_at_unix_ms
+    {
+        return task_controller_rejection(&claimed, "initial_scope_attempt_mismatch");
+    }
+    let proof = eliotd::task_binding_admission::InitialBindScopeOwnerProof::new(
+        evidence.clone(),
+        claimed.envelope.clone(),
+    );
+    let route_kernel = Arc::clone(kernel);
+    let envelope = claimed.envelope.clone();
+    let proposal = prepared.request.clone();
+    let authenticated = tokio::task::spawn_blocking(move || {
+        eliotd::task_binding_admission::prepare_initial_bind_scope_discovery(
+            &route_kernel,
+            &envelope,
+            &evidence,
+            &proposal,
+            eliotd::unix_ms(),
+        )
+    })
+    .await
+    .map_err(|error| format!("initial discovery owner worker: {error}"))?;
+    let (ticket, mut discovery) = match authenticated {
+        Ok(value) => value,
+        Err(_) => return task_controller_rejection(&claimed, "initial_discovery_not_admitted"),
+    };
+    let now = unix_ms(SystemTime::now())?;
+    if now > claimed.attempt.expires_at_unix_ms || now > ticket.kernel_deadline_unix_ms {
+        return task_controller_rejection(&claimed, "attempt_expired");
+    }
+    // Only the owner-returned lease is added. Governor still independently
+    // admits the original policy, privacy boundary, and governing sources.
+    prepared.request.discovery_lease = Some(discovery.lease.clone());
+    prepared.request.bootstrap_discovery.now = now;
+    prepared.observed = discovery.discovery.observed.clone();
+    let admitted_discovery = prepared.request.bootstrap_discovery.clone();
+    let body = eliotd::campaign_task_controller::complete_initial_work_scope_binding(
+        kernel.as_ref(),
+        composition,
+        prepared,
+    )
+    .await?;
+    if body
+        .response
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("admitted")
+    {
+        return Ok(body);
+    }
+    discovery.discovery = admitted_discovery;
+    let cold_start =
+        trigger_initial_cold_start(kernel, composition, &ticket, discovery, &proof).await;
+    let mut response = body.response;
+    response["cold_start"] = match cold_start {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({"status":"refused","reason":error.to_string()}),
+    };
+    task_controller_result_body(&claimed, response)
+}
+
+/// Uses the bounded initial proof rather than inventing a resolved activation.
+async fn trigger_initial_cold_start(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    ticket: &AgentActivationResolutionTicket,
+    discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
+    proof: &eliotd::task_binding_admission::InitialBindScopeOwnerProof,
+) -> Result<serde_json::Value, ColdStartIngressError> {
+    let route_kernel = Arc::clone(kernel);
+    let connection = ticket.connection_id.clone();
+    let ticket_id = ticket.ticket_id.clone();
+    let retained_proof = proof.clone();
+    let contour = tokio::task::spawn_blocking(move || {
+        eliotd::task_binding_admission::request_initial_scan_disclosure_contour(
+            &route_kernel,
+            &connection,
+            &ticket_id,
+            &retained_proof,
+        )
+    })
+    .await
+    .map_err(|error| ColdStartIngressError::Owner {
+        owner: "initial scan contour worker",
+        detail: error.to_string(),
+    })?
+    .map_err(scan_owner_error)?;
+    let readiness_owner = Arc::new(
+        eliotd::task_binding_admission::KernelColdStartReadinessRecordOwner::new_initial(
+            Arc::clone(kernel),
+            ticket.connection_id.clone(),
+            ticket.ticket_id.clone(),
+            proof.clone(),
+        ),
+    );
+    composition
+        .lock()
+        .await
+        .bind_cold_start_readiness_owner(&contour, readiness_owner)
+        .map_err(|error| ColdStartIngressError::Owner {
+            owner: "initial readiness owner",
+            detail: error.to_string(),
+        })?;
+    match trigger_cold_start_controller(
+        kernel,
+        composition,
+        ticket,
+        discovery,
+        contour,
+        Some(proof),
+    )
+    .await?
+    {
+        eliotd::task_binding_admission::ColdStartTriggerResult::Question(question) => {
+            serde_json::to_value(question).map_err(|error| ColdStartIngressError::Owner {
+                owner: "initial privacy question",
+                detail: error.to_string(),
+            })
+        }
+        eliotd::task_binding_admission::ColdStartTriggerResult::Persisted { scan } => {
+            let now = unix_ms(SystemTime::now()).map_err(ColdStartIngressError::Clock)?;
+            let joined = composition
+                .lock()
+                .await
+                .compile_cold_start_from_owner_inputs(
+                    scan.trigger,
+                    &scan.binding.principal_ref,
+                    &scan.binding.session_ref,
+                    &scan.binding.candidate_root_ref,
+                    &scan.discovery.lease,
+                    &scan.scan_evidence,
+                    &scan.binding,
+                    &scan.receipt_handle,
+                    now,
+                )
+                .await
+                .map_err(|error| ColdStartIngressError::Owner {
+                    owner: "initial readiness compilation",
+                    detail: error.to_string(),
+                })?;
+            // Preserve Created/Joined/JoinedTerminal as returned by the owner;
+            // a lease join alone is never projected as MaterialReady.
+            serde_json::to_value(joined).map_err(|error| ColdStartIngressError::Owner {
+                owner: "initial readiness result",
+                detail: error.to_string(),
+            })
+        }
     }
 }
 
@@ -7164,7 +7329,8 @@ async fn trigger_accepted_cold_start(
             return;
         }
         let trigger_result =
-            trigger_cold_start_controller(kernel, &composition, ticket, discovery, contour).await;
+            trigger_cold_start_controller(kernel, &composition, ticket, discovery, contour, None)
+                .await;
         match trigger_result {
             Err(refusal) => {
                 tracing::warn!(
@@ -7304,6 +7470,7 @@ async fn retain_discovery_lease_revision(
     ticket: &AgentActivationResolutionTicket,
     lease: &eliot_workscope::DiscoveryReadLease,
     owner: eliot_governor::WorkScopeBindingOwner,
+    proof: Option<&eliotd::task_binding_admission::InitialBindScopeOwnerProof>,
 ) -> Result<(), ColdStartIngressError> {
     let snapshot = owner
         .read_current(&ticket.state_fence)
@@ -7315,15 +7482,29 @@ async fn retain_discovery_lease_revision(
             .ok_or(ColdStartIngressError::WorkScope(
                 eliot_workscope::WorkScopeError::BindingReceiptMismatch,
             ))?;
-    let persist = || {
-        eliotd::task_binding_admission::retain_scan_discovery_lease_owner_revision(
-            kernel,
-            &ticket.connection_id,
-            &ticket.ticket_id,
-            expected_owner_revision,
-            lease,
-            &snapshot,
-        )
+    let persist = || async {
+        if let Some(proof) = proof {
+            eliotd::task_binding_admission::retain_initial_scan_discovery_lease_owner_revision(
+                kernel,
+                &ticket.connection_id,
+                &ticket.ticket_id,
+                proof,
+                expected_owner_revision,
+                lease,
+                &snapshot,
+            )
+            .await
+        } else {
+            eliotd::task_binding_admission::retain_scan_discovery_lease_owner_revision(
+                kernel,
+                &ticket.connection_id,
+                &ticket.ticket_id,
+                expected_owner_revision,
+                lease,
+                &snapshot,
+            )
+            .await
+        }
     };
     if persist().await.is_err() {
         // The Kernel child identity is derived from the retained original
@@ -7348,6 +7529,7 @@ async fn retain_scan_evidence_revision(
     binding: &eliot_workscope::ScanDisclosureOwnerBinding,
     receipt_handle: &eliot_workscope::ScanReceiptHandle,
     owner: eliot_governor::WorkScopeBindingOwner,
+    proof: Option<&eliotd::task_binding_admission::InitialBindScopeOwnerProof>,
 ) -> Result<(), ColdStartIngressError> {
     let snapshot = owner
         .read_current(&ticket.state_fence)
@@ -7359,18 +7541,35 @@ async fn retain_scan_evidence_revision(
             .ok_or(ColdStartIngressError::WorkScope(
                 eliot_workscope::WorkScopeError::BindingReceiptMismatch,
             ))?;
-    let persist = || {
-        eliotd::task_binding_admission::retain_scan_evidence_owner_revision(
-            kernel,
-            &ticket.connection_id,
-            &ticket.ticket_id,
-            expected_owner_revision,
-            discovery_lease,
-            evidence,
-            binding,
-            receipt_handle,
-            &snapshot,
-        )
+    let persist = || async {
+        if let Some(proof) = proof {
+            eliotd::task_binding_admission::retain_initial_scan_evidence_owner_revision(
+                kernel,
+                &ticket.connection_id,
+                &ticket.ticket_id,
+                proof,
+                expected_owner_revision,
+                discovery_lease,
+                evidence,
+                binding,
+                receipt_handle,
+                &snapshot,
+            )
+            .await
+        } else {
+            eliotd::task_binding_admission::retain_scan_evidence_owner_revision(
+                kernel,
+                &ticket.connection_id,
+                &ticket.ticket_id,
+                expected_owner_revision,
+                discovery_lease,
+                evidence,
+                binding,
+                receipt_handle,
+                &snapshot,
+            )
+            .await
+        }
     };
     if persist().await.is_err() {
         persist().await.map_err(|second| scan_owner_error(second))?;
@@ -7419,6 +7618,7 @@ async fn trigger_cold_start_controller(
     ticket: &AgentActivationResolutionTicket,
     mut discovery: eliotd::task_binding_admission::ColdStartDiscoveryInput,
     contour: eliot_governor::InstallationScanContour,
+    proof: Option<&eliotd::task_binding_admission::InitialBindScopeOwnerProof>,
 ) -> Result<eliotd::task_binding_admission::ColdStartTriggerResult, ColdStartIngressError> {
     let now = unix_ms(SystemTime::now()).map_err(ColdStartIngressError::Clock)?;
     let trigger = eliot_workscope::ColdStartTrigger::AttachOrLaunch;
@@ -7476,18 +7676,36 @@ async fn trigger_cold_start_controller(
             owner: "Governor discovery-lease admission",
             detail: error.to_string(),
         })?;
-    retain_discovery_lease_revision(kernel, composition, ticket, &discovery.lease, lease_owner)
-        .await?;
+    retain_discovery_lease_revision(
+        kernel,
+        composition,
+        ticket,
+        &discovery.lease,
+        lease_owner,
+        proof,
+    )
+    .await?;
 
     let route_kernel = Arc::clone(kernel);
     let connection_id = ticket.connection_id.clone();
     let ticket_id = ticket.ticket_id.clone();
+    let retained_proof = proof.cloned();
     let binding = tokio::task::spawn_blocking(move || {
-        eliotd::task_binding_admission::request_scan_disclosure_binding(
-            &route_kernel,
-            &connection_id,
-            &ticket_id,
-        )
+        if let Some(proof) = retained_proof.as_ref() {
+            eliotd::task_binding_admission::request_initial_scan_disclosure_binding(
+                &route_kernel,
+                &connection_id,
+                &ticket_id,
+                proof,
+            )
+            .map_err(|error| error.to_string())
+        } else {
+            eliotd::task_binding_admission::request_scan_disclosure_binding(
+                &route_kernel,
+                &connection_id,
+                &ticket_id,
+            )
+        }
     })
     .await
     .map_err(|error| ColdStartIngressError::Owner {
@@ -7498,14 +7716,22 @@ async fn trigger_cold_start_controller(
         owner: "scan disclosure binding",
         detail,
     })?;
-    let owner = Arc::new(
+    let owner = Arc::new(if let Some(proof) = proof {
+        eliotd::task_binding_admission::KernelScanDisclosureRecordOwner::new_initial(
+            Arc::clone(kernel),
+            ticket.connection_id.clone(),
+            ticket.ticket_id.clone(),
+            binding.clone(),
+            proof.clone(),
+        )
+    } else {
         eliotd::task_binding_admission::KernelScanDisclosureRecordOwner::new(
             Arc::clone(kernel),
             ticket.connection_id.clone(),
             ticket.ticket_id.clone(),
             binding.clone(),
-        ),
-    );
+        )
+    });
     let store = composition
         .lock()
         .await
@@ -7561,6 +7787,7 @@ async fn trigger_cold_start_controller(
                 ));
             }
             let receipt_handle = *persisted;
+            let now = unix_ms(SystemTime::now()).map_err(ColdStartIngressError::Clock)?;
             let evidence_owner = composition
                 .lock()
                 .await
@@ -7586,6 +7813,7 @@ async fn trigger_cold_start_controller(
                 &binding,
                 &receipt_handle,
                 evidence_owner,
+                proof,
             )
             .await?;
             Ok(

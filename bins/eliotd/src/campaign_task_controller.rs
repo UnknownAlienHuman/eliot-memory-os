@@ -388,7 +388,8 @@ async fn read_authenticated_owner_publications(
     Ok(publications)
 }
 
-fn task_controller_result_body(
+/// Binds an exact response to the retained original invocation and attempt.
+pub fn task_controller_result_body(
     claimed: &TaskControllerClaimedInvocation,
     response: serde_json::Value,
 ) -> Result<TaskControllerResultBody, String> {
@@ -408,7 +409,8 @@ fn task_controller_result_body(
     Ok(body)
 }
 
-fn task_controller_rejection(
+/// Returns a bounded rejection for the retained original invocation.
+pub fn task_controller_rejection(
     claimed: &TaskControllerClaimedInvocation,
     reason: &str,
 ) -> Result<TaskControllerResultBody, String> {
@@ -719,6 +721,9 @@ pub async fn complete_initial_work_scope_binding(
         Err(code) => return task_controller_rejection(&claimed, code),
     };
     let now = unix_ms();
+    if now == 0 || now > claimed.attempt.expires_at_unix_ms {
+        return task_controller_rejection(&claimed, "attempt_expired");
+    }
     let owner = match admit_initial_scope_owner(
         composition,
         InitialScopeBindingAdmissionRequest {
@@ -756,6 +761,9 @@ pub async fn complete_initial_work_scope_binding(
         .map_err(|error| format!("admitted WorkScope owner read failed: {error}"))?;
     if snapshot.owner_revision != owner_revision || snapshot.state_fence != *fence {
         return task_controller_rejection(&claimed, "scope_owner_revision_mismatch");
+    }
+    if unix_ms() > claimed.attempt.expires_at_unix_ms {
+        return task_controller_rejection(&claimed, "attempt_expired");
     }
     let readback = match persist_or_reconcile_work_scope_owner(
         kernel,

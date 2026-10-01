@@ -18,8 +18,8 @@ use eliot_ipc::ApplicationSessionState;
 use eliot_ipc::{Session, TransportError};
 use eliot_ors::{
     ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey, ColdStartReadinessStageOutcome,
-    ColdStartReadinessTerminalDisposition, ScanDisclosureOrsRecord,
-    ScanDisclosureQuarantineRecord, ScanDisclosureReadFailure, ScanDisclosureStageOutcome,
+    ColdStartReadinessTerminalDisposition, ScanDisclosureOrsRecord, ScanDisclosureQuarantineRecord,
+    ScanDisclosureReadFailure, ScanDisclosureStageOutcome,
 };
 #[cfg(windows)]
 use eliot_store_api::{
@@ -449,9 +449,7 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    fn verify_scan_disclosure_storage(
-        &self,
-    ) -> Result<(), ScanDisclosureReadFailure> {
+    fn verify_scan_disclosure_storage(&self) -> Result<(), ScanDisclosureReadFailure> {
         let binding = self
             .eliotd_receipt_binding
             .as_ref()
@@ -535,23 +533,23 @@ impl KernelComposition {
             || root_identity_ref.chars().any(char::is_control)
             || !matches!(
                 allowed_reads.as_slice(),
-                [DiscoveryRead::FilesystemIdentity, DiscoveryRead::GoverningSourceCandidates]
-                    | [
-                        DiscoveryRead::FilesystemIdentity,
-                        DiscoveryRead::GoverningSourceCandidates,
-                        DiscoveryRead::VcsIdentity
-                    ]
-                    | [
-                        DiscoveryRead::FilesystemIdentity,
-                        DiscoveryRead::GoverningSourceCandidates,
-                        DiscoveryRead::ManifestNamesAndHashes
-                    ]
-                    | [
-                        DiscoveryRead::FilesystemIdentity,
-                        DiscoveryRead::GoverningSourceCandidates,
-                        DiscoveryRead::VcsIdentity,
-                        DiscoveryRead::ManifestNamesAndHashes
-                    ]
+                [
+                    DiscoveryRead::FilesystemIdentity,
+                    DiscoveryRead::GoverningSourceCandidates
+                ] | [
+                    DiscoveryRead::FilesystemIdentity,
+                    DiscoveryRead::GoverningSourceCandidates,
+                    DiscoveryRead::VcsIdentity
+                ] | [
+                    DiscoveryRead::FilesystemIdentity,
+                    DiscoveryRead::GoverningSourceCandidates,
+                    DiscoveryRead::ManifestNamesAndHashes
+                ] | [
+                    DiscoveryRead::FilesystemIdentity,
+                    DiscoveryRead::GoverningSourceCandidates,
+                    DiscoveryRead::VcsIdentity,
+                    DiscoveryRead::ManifestNamesAndHashes
+                ]
             )
         {
             return Err(TransportError::SessionFenced);
@@ -602,11 +600,12 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
-        let (session_epoch, activated_binding) = self.validate_scan_disclosure_accepted_connection(
-            &request.application_connection_id,
-            &ticket,
-            pending_entry.as_ref(),
-        )?;
+        let (session_epoch, activated_binding) = self
+            .validate_scan_disclosure_accepted_connection(
+                &request.application_connection_id,
+                &ticket,
+                pending_entry.as_ref(),
+            )?;
         if session_epoch.is_some() || activated_binding.is_some() {
             return Err(TransportError::SessionFenced);
         }
@@ -617,8 +616,8 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
 
-        let consumption_limit = u32::try_from(allowed_reads.len())
-            .map_err(|_| TransportError::SessionFenced)?;
+        let consumption_limit =
+            u32::try_from(allowed_reads.len()).map_err(|_| TransportError::SessionFenced)?;
         let lease_request = DiscoveryLeaseRequest {
             proposer_ref: evidence.principal_id.clone(),
             session_ref: evidence.session_id.clone(),
@@ -629,8 +628,8 @@ impl KernelComposition {
             consumption_limit,
             deadline: ticket.kernel_deadline_unix_ms,
         };
-        let issued = issue_discovery_lease(&lease_request)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let issued =
+            issue_discovery_lease(&lease_request).map_err(|_| TransportError::SessionFenced)?;
         issued
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -665,7 +664,8 @@ impl KernelComposition {
         }
         let lease_bytes = eliot_contracts::canonical_json_bytes(&issued)
             .map_err(|_| TransportError::SessionFenced)?;
-        let lease_json = String::from_utf8(lease_bytes).map_err(|_| TransportError::SessionFenced)?;
+        let lease_json =
+            String::from_utf8(lease_bytes).map_err(|_| TransportError::SessionFenced)?;
         let retained = self
             .generation_gateway
             .ors
@@ -676,13 +676,16 @@ impl KernelComposition {
             })?;
         let mut expected_lifecycle = lifecycle.clone();
         expected_lifecycle.initial_discovery_lease = Some(lease_json.clone());
-        if retained != expected_lifecycle || retained.result_sha256.as_deref() != Some(result_sha256) {
+        if retained != expected_lifecycle
+            || retained.result_sha256.as_deref() != Some(result_sha256)
+        {
             return Err(TransportError::IdentityConflict);
         }
-        let retained_ticket = serde_json::from_str::<
-            eliot_protocol::AgentActivationResolutionTicket,
-        >(&retained.ticket_payload)
-        .map_err(|_| TransportError::SessionFenced)?;
+        let retained_ticket =
+            serde_json::from_str::<eliot_protocol::AgentActivationResolutionTicket>(
+                &retained.ticket_payload,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
         let retained_lease = serde_json::from_str::<DiscoveryReadLease>(
             retained
                 .initial_discovery_lease
@@ -833,12 +836,8 @@ impl KernelComposition {
                 binding,
                 quarantine_key,
             } => {
-                self.load_scan_disclosure_quarantine_owner(
-                    current,
-                    &binding,
-                    &quarantine_key,
-                )
-                .await
+                self.load_scan_disclosure_quarantine_owner(current, &binding, &quarantine_key)
+                    .await
             }
             ScanDisclosureOwnerAction::ReadinessClaim { key } => {
                 self.claim_cold_start_readiness_owner(current, key.as_ref())
@@ -1191,9 +1190,9 @@ impl KernelComposition {
             .p07_ors
             .load_scan_disclosure(operation_key)
             .map_err(|error| {
-                ScanDisclosureOwnerActionError::ReceiptRead(
-                    Self::scan_disclosure_read_failure(error),
-                )
+                ScanDisclosureOwnerActionError::ReceiptRead(Self::scan_disclosure_read_failure(
+                    error,
+                ))
             })?;
         if let Some(record) = record.as_ref() {
             if Self::validate_record_binding(current, binding, record).is_err() {
@@ -1312,9 +1311,7 @@ impl KernelComposition {
                 | eliot_ors::OrsError::IntegrityProblem {
                     record_type: eliot_ors::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE,
                     ..
-                } => {
-                    TransportError::IdentityConflict
-                }
+                } => TransportError::IdentityConflict,
                 _ => TransportError::SessionFenced,
             })?;
         Self::validate_scan_disclosure_quarantine_record(&contour, &retained)?;
@@ -1345,9 +1342,7 @@ impl KernelComposition {
             .load_scan_disclosure_quarantine(quarantine_key)
             .map_err(|error| match error {
                 eliot_ors::OrsError::IntegrityProblem { .. }
-                | eliot_ors::OrsError::PayloadIntegrityMismatch => {
-                    TransportError::IdentityConflict
-                }
+                | eliot_ors::OrsError::PayloadIntegrityMismatch => TransportError::IdentityConflict,
                 _ => TransportError::SessionFenced,
             })?;
         if let Some(record) = record.as_ref() {
@@ -1729,7 +1724,8 @@ impl KernelComposition {
                 return Err(TransportError::IdentityConflict);
             }
         }
-        let (kernel_owner_revision, kernel_owner_bundle_sha256) = if let Some(proof) = initial_proof {
+        let (kernel_owner_revision, kernel_owner_bundle_sha256) = if let Some(proof) = initial_proof
+        {
             (
                 proof.evidence.kernel_owner.revision,
                 proof.evidence.kernel_owner.bundle_sha256.clone(),
@@ -1787,7 +1783,10 @@ impl KernelComposition {
         current: &CurrentScanDisclosureActivation,
         connection_id: &str,
     ) -> Result<(), TransportError> {
-        let binding = current.binding.as_ref().ok_or(TransportError::SessionFenced)?;
+        let binding = current
+            .binding
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
         let retained = current
             .activated_binding
             .as_ref()
@@ -2025,16 +2024,14 @@ impl KernelComposition {
                 .scan_binding
                 .as_ref()
                 .is_some_and(|binding| {
-                    current_lease.is_none_or(|lease| {
-                        binding.lease_consumed != u64::from(lease.consumed)
-                    })
+                    current_lease
+                        .is_none_or(|lease| binding.lease_consumed != u64::from(lease.consumed))
                 });
             if lifecycle.state != eliot_ors::ActivationLifecycleState::ResultAccepted
                 || lifecycle.ticket_id != current.ticket.ticket_id
                 || lifecycle.ticket_sha256 != current.ticket.ticket_sha256
                 || lifecycle.connection_id != current.ticket.connection_id
-                || lifecycle.result_sha256.as_deref()
-                    != Some(current.result.result_sha256.as_str())
+                || lifecycle.result_sha256.as_deref() != Some(current.result.result_sha256.as_str())
                 || lifecycle.kernel_deadline_unix_ms != evidence.ticket_deadline_unix_ms
                 || lifecycle.initial_discovery_lease.as_deref() != Some(retained_initial_lease)
                 || original_lease.proposer_ref != evidence.principal_id
@@ -2046,8 +2043,7 @@ impl KernelComposition {
                     != original_lease.candidate_root_ref
                 || original_lease.candidate_root_ref != cold_start_inputs.explicit_root_identity
                 || original_lease.deadline != evidence.ticket_deadline_unix_ms
-                || original_lease.allowed_reads
-                    != original_bootstrap.evidence.attested_reads
+                || original_lease.allowed_reads != original_bootstrap.evidence.attested_reads
                 || original_lease.consumed != 0
                 || (require_discovery_lease && current_lease.is_none())
                 || current_lease_conflicts
@@ -2063,8 +2059,7 @@ impl KernelComposition {
                 || cold_start_inputs.state_fence != evidence.state_fence
                 || cold_start_inputs.principal_ref != evidence.principal_id
                 || cold_start_inputs.session_ref != evidence.session_id
-                || cold_start_inputs.explicit_root_identity
-                    != original_lease.candidate_root_ref
+                || cold_start_inputs.explicit_root_identity != original_lease.candidate_root_ref
             {
                 return Err(TransportError::IdentityConflict);
             }
@@ -2319,8 +2314,7 @@ impl KernelComposition {
                 || lifecycle.ticket_id != current.ticket.ticket_id
                 || lifecycle.ticket_sha256 != current.ticket.ticket_sha256
                 || lifecycle.connection_id != current.ticket.connection_id
-                || lifecycle.result_sha256.as_deref()
-                    != Some(current.result.result_sha256.as_str())
+                || lifecycle.result_sha256.as_deref() != Some(current.result.result_sha256.as_str())
                 || lifecycle.kernel_deadline_unix_ms != proof.evidence.ticket_deadline_unix_ms
                 || original_lease != *lease
             {
