@@ -160,6 +160,23 @@ pub fn observed_invalidation_set(
     profile_registry: &InstrumentRegistry,
     observations: &ReplayObservedInputs,
 ) -> Result<InvalidationSet, ProfileReplayError> {
+    observations
+        .source
+        .validate()
+        .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
+    if !observations.source.unchanged()
+        || observations.source.before.repository_root != observations.source.after.repository_root
+        || !valid_sha256_text(&observations.cargo_lock_sha256)
+        || !valid_sha256_text(&observations.lane_fingerprint_digest)
+    {
+        return Err(ProfileReplayError::CurrentnessObservation(
+            "source, lockfile, or lane identity moved or is malformed".to_owned(),
+        ));
+    }
+    observations
+        .tools
+        .validate()
+        .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
     let environment_bytes = serde_json::to_vec(&observations.environment)
         .map_err(|error| ProfileReplayError::CurrentnessObservation(error.to_string()))?;
     let executable_bytes = serde_json::to_vec(&observations.tools)
