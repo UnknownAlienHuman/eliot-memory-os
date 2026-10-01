@@ -52,13 +52,16 @@ committed as repository authority.
 | `wasm_component_lane.py` | Affected-component WASM build/test lane selector and evidence helper (#764) | Build/test lane selection only |
 | `verify-legacy-config-retirement.py` | Verify legacy config filenames, modes, roots, and module manifests stay retired (#1219) | Static source and packaging evidence only |
 | `context_measurement_inventory.py` | Deterministic source-bound inventory of serialized-context measurement cases with closed classification and frozen denominator (#866) | Static source classification only |
+| `audit-context-measurement-ownership.py` | Read-only context-measurement ownership oracle and reconciliation (#787) | Context-measurement ownership oracle evidence only |
 | `audit_cue_kind_retirement.py` | Cross-package `CueKind` retirement oracle library over the static source/wire/caller denominator (#835); exercised by `scripts/tests/test_cue_kind_retirement.py` | Static source denominator evidence only |
 | `verify-excluded-dispositions-1811.py` | Fail-closed excluded/standalone disposition gate over standalone packages and root exclude entries with consumption evidence checks (#1811) | Static source and packaging evidence only |
 | `verify-lint-policy.ps1` | Verify the Rust lint-policy configuration and declared exceptions | Static source-policy evidence only |
 | `audit_host_diagnostic_coverage.py` | Bounded Host diagnostic coverage and identity validator (#985) | Static host diagnostic coverage evidence only |
 | `documentation_evidence_check.py` | Frozen outer documentation evidence package verifier (I18.31 W4) | Documentation evidence package re-extraction evidence only |
+| `gen_capability_cell_registry.py` | Generate daemon capability-cell registry block in contract (#13) | Generated capability-cell registry block only |
 | `gen_operator_schedule_contract.py` | Generate C# mirror of Kernel UserAutomation schedule contract (#2865) | Generated C# schedule contract mirror only |
 | `gen_user_automation_zone_table.py` | Generate pinned IANA zone table for Kernel UserAutomation occurrence validator (#2805) | Pinned IANA zone table generation only |
+| `prepare-dependency-policy-inputs.py` | Declared reproducible scanner/input preparation for dependency policy (#1229) | Scanner/input preparation evidence only |
 | `read_freeze_digest.py` | Reproducible-digest readback for static field contract freeze (#223) | Static contract freeze digest readback only |
 | `requirements-verification.txt` | Python dependency manifest for repository verification scripts | Verification dependency manifest |
 | `generate_reason_codes.py` | Render the I7.20 reason-code projection (`docs/generated/reason-codes.md`) from the `eliot-protocol` Rust registry, verified against the normative I7.20 canonical set; `--check` fails on a stale projection (#1743) | Generated reason-code projection only |
