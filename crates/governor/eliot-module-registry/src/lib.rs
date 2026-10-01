@@ -33,6 +33,12 @@ use thiserror::Error;
 pub const CONTRACT_NAME: &str = "eliot.governor.module-registry";
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion::new(1, 0, 0);
 
+mod catalog_readback;
+
+pub use catalog_readback::{
+    ModuleCatalogOwnerReadback, ModuleRegistryAdmissionError, VerifiedModuleCatalogGeneration,
+};
+
 fn text(value: &str, field: &'static str) -> Result<(), ModuleError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         return Err(ModuleError::InvalidField {
