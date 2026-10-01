@@ -404,6 +404,7 @@ struct PeerState {
 
 struct ScriptedPeer {
     requirement: HostStoreBootstrapRequirement,
+    hello_principal_binding_override: Option<String>,
     pending: Option<Frame>,
     reply: DreamerReply,
     state: Arc<Mutex<PeerState>>,
@@ -413,7 +414,10 @@ impl ScriptedPeer {
     fn hello_frame(&self) -> Frame {
         let hello = ServerHello {
             selected_protocol: ProtocolVersion::CURRENT,
-            session_principal_binding: server_hello_principal_binding(&self.requirement),
+            session_principal_binding: self
+                .hello_principal_binding_override
+                .clone()
+                .unwrap_or_else(|| server_hello_principal_binding(&self.requirement)),
             allowed_capabilities: CAPABILITIES
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -619,6 +623,7 @@ async fn connect_client_for(
     let state = Arc::new(Mutex::new(PeerState::default()));
     let peer = ScriptedPeer {
         requirement: requirement.clone(),
+        hello_principal_binding_override: None,
         pending: None,
         reply,
         state: Arc::clone(&state),
@@ -634,6 +639,25 @@ async fn connect_client_for(
     (client, state)
 }
 
+async fn connect_client_with_hello_binding(
+    fence: StateFence,
+    hello_principal_binding: String,
+) -> (
+    Result<EbpCanonicalStoreClient<ScriptedPeer>, StoreClientError>,
+    Arc<Mutex<PeerState>>,
+) {
+    let requirement = edge_requirement_for(&fence);
+    let state = Arc::new(Mutex::new(PeerState::default()));
+    let peer = ScriptedPeer {
+        requirement: requirement.clone(),
+        hello_principal_binding_override: Some(hello_principal_binding),
+        pending: None,
+        reply: DreamerReply::UnknownDelivery,
+        state: Arc::clone(&state),
+    };
+    (EbpCanonicalStoreClient::connect(peer, requirement).await, state)
+}
+
 fn peer_snapshot(state: &Arc<Mutex<PeerState>>) -> (usize, Vec<String>, Vec<(String, String)>) {
     let guard = state.lock().expect("peer state");
     (
@@ -641,6 +665,46 @@ fn peer_snapshot(state: &Arc<Mutex<PeerState>>) -> (usize, Vec<String>, Vec<(Str
         guard.receipt_ops.clone(),
         guard.sent_frames.clone(),
     )
+}
+
+// 779/25 — a substituted ServerHello principal cannot reach readiness.
+#[tokio::test]
+async fn dreamer_store_rejects_foreign_server_hello_principal_before_readiness() {
+    let fence = edge_fence();
+    let requirement = edge_requirement_for(&fence);
+    let sid = requirement.expected_peer_sid.as_str();
+    let session = requirement.expected_peer_session_id;
+    let invalid_bindings = [
+        (
+            format!("sid={sid}-substituted;session={session}"),
+            "substituted SID",
+        ),
+        (
+            format!("sid={sid};session={}", session + 1),
+            "substituted session",
+        ),
+    ];
+
+    for (binding, label) in invalid_bindings {
+        let (result, state) = connect_client_with_hello_binding(fence.clone(), binding).await;
+        let message = match result {
+            Err(StoreClientError::Contract(message)) => message,
+            Err(error) => panic!("779/25 {label} refused at the wrong boundary: {error:?}"),
+            Ok(_) => panic!("779/25 {label} must refuse at the handshake"),
+        };
+        assert!(
+            message.contains("store handshake"),
+            "779/25 {label} must fail the exact handshake binding check, got {message:?}"
+        );
+
+        let (dreamer_sends, receipt_ops, sent_frames) = peer_snapshot(&state);
+        assert_eq!(dreamer_sends, 0, "779/25 no Dreamer ledger send for {label}");
+        assert!(receipt_ops.is_empty(), "779/25 no receipt query for {label}");
+        assert!(
+            sent_frames.is_empty(),
+            "779/25 no readiness or ledger request before rejecting {label}: {sent_frames:?}"
+        );
+    }
 }
 
 // 779/01 — submit round trip: single DreamerJob frame, no reconcile query.
