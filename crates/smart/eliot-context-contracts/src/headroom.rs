@@ -299,6 +299,7 @@ impl AdmittedOrientationHeadroomSupplyV1 {
         if self.request.canonical_digest()? != self.request_digest
             || self.request.pipeline_id != self.pipeline_id
             || self.request.attempt_id != self.attempt_id
+            || self.request.attempt_id.as_str() != self.context_binding.attempt_id.as_str()
             || self.request.binding != self.context_binding
             || self.request.binding.task_id != self.task_id
             || self.request.binding.operation_id.as_ref() != Some(&self.operation_id)
@@ -314,10 +315,7 @@ impl AdmittedOrientationHeadroomSupplyV1 {
                     || demand.request.deadline_ms != self.deadline_ms
                     || demand.request.requesting_generation_ref
                         != self.state_fence.resource_generation
-                    || !demand
-                        .request
-                        .authority_epoch_ref
-                        .is_same_authority(&self.state_fence.authority_epoch)
+                    || demand.request.authority_epoch_ref != self.state_fence.authority_epoch
             })
         {
             return Err(ContextError::IdentityConflict);
