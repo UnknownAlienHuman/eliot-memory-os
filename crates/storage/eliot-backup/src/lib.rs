@@ -4255,6 +4255,7 @@ mod backup_verify_tests_948 {
             scope: OrderingScopeId::new("order-1").expect("ordering scope"),
             sequence: 1,
             state_fence: fence_value,
+            committed_receipt_sha256: None,
         }];
         input.receipts = vec![receipt_for("event-1", "op-7")];
         BackupBundle::build(input).expect("closed references validate");

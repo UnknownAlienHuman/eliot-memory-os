@@ -4384,6 +4384,38 @@ pub struct OrderingHead {
     pub scope: OrderingScopeId,
     pub sequence: u64,
     pub state_fence: StateFence,
+    /// The digest of the store-issued receipt that last advanced this Ordering
+    /// Scope, i.e. `ReceiptEnvelope::identity::canonical_sha256` exactly as
+    /// [`ReceiptEnvelope::issue`] computed it once over the canonical receipt
+    /// bytes (issue #1925, `I5.7`).
+    ///
+    /// This is the value ORS compares at
+    /// `observed.committed_head_sha256 == receipt.identity.canonical_sha256`
+    /// and then records as the scope's next canonical head, so a reservation's
+    /// `ExpectedOrderingHead::head_sha256` must be this digest and no other.
+    /// It is a RECORDED value: the durable writer copies the issued envelope's
+    /// own digest verbatim into the `ordering_head` record beside the head body
+    /// (the same sibling placement `previous_event_hash`/`event_hash` use), and
+    /// the head read projects that sibling back out. No reader ever recomputes
+    /// it and no reader compares a recomputation against itself.
+    ///
+    /// It is deliberately not a member of the serialized head body: the receipt
+    /// digest covers the receipt, and the receipt's `ordering_sequences` carry
+    /// these same head values, so putting the digest inside them would make the
+    /// receipt's own canonical bytes depend on themselves.
+    ///
+    /// `None` means the record carries no receipt digest: a row written before
+    /// per-scope receipt digests were recorded, or a head value that is not a
+    /// read-back of a durable record. It is NEVER a substitute digest. A scope
+    /// with no prior commit has no `ordering_head` row at all, so the read
+    /// omits the scope entirely and there is no genesis digest to invent; a
+    /// caller that must publish a head digest for such a scope has nothing to
+    /// publish and must refuse rather than fabricate one.
+    ///
+    /// (`ORDERING_LINK_GENESIS_HASH` is the ordering chain-link's genesis prior
+    /// and is a different digest entirely; it is never a receipt digest.)
+    #[serde(default, skip_serializing)]
+    pub committed_receipt_sha256: Option<String>,
 }
 
 impl OrderingHead {
@@ -4394,6 +4426,9 @@ impl OrderingHead {
                 field: "ordering.sequence",
                 reason: "must be non-zero",
             });
+        }
+        if let Some(digest) = &self.committed_receipt_sha256 {
+            validate_digest(digest, "ordering.committed_receipt_sha256")?;
         }
         self.state_fence.validate().map_err(StoreError::Foundation)
     }

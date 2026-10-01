@@ -795,6 +795,7 @@ fn receipt_with_envelope(
             scope: scope.scope.clone(),
             sequence: scope.reserved_sequence,
             state_fence: request.context.state_fence.clone(),
+            committed_receipt_sha256: None,
         })
         .collect();
     let (error_code, commit_id, committed_at, applied, envelope_disposition) = match status {
@@ -3671,6 +3672,7 @@ fn startup_receipt(
             scope,
             sequence: reserved_sequence,
             state_fence: context.state_fence.clone(),
+            committed_receipt_sha256: None,
         }],
         revision_before_after: Vec::new(),
         applied_command_ids: vec!["capture-observation".to_owned()],

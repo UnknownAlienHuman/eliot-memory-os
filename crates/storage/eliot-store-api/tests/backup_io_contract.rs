@@ -116,6 +116,7 @@ fn scope(fence: &StateFence) -> ScopeRevisionView {
             scope: OrderingScopeId::new("order-950-1").unwrap(),
             sequence: 4,
             state_fence: fence.clone(),
+            committed_receipt_sha256: None,
         }],
         state_fence: fence.clone(),
     }

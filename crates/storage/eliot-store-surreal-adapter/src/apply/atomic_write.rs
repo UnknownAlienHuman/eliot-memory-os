@@ -544,6 +544,7 @@ pub(super) async fn write_canonical_transaction_with_expected_heads(
         expected_ordering_heads,
         &transition.state_fence,
         current_chain_tips,
+        current_orderings,
     )?;
     sql.insert_str(schema::TX_BEGIN.len(), &head_checks);
     for (name, value) in head_bindings {
@@ -610,11 +611,21 @@ pub(super) async fn write_canonical_transaction_with_expected_heads(
 /// expected head. The ordering chain hash is the exact pre-plan observation
 /// that produced the planned next link; the transaction compares that same
 /// stored sibling field before any canonical mutation.
+///
+/// Issue #1925: the recorded receipt digest is handled the same way and from
+/// the same source. `current_orderings` is the set
+/// [`load_verified_attempt_state`](crate::apply::load_verified_attempt_state)
+/// read and verified immediately before planning, so the digest bound here is
+/// that observation copied verbatim — the head read's own recorded value, never
+/// a value this function recomputes. A scope with no observed head contributes
+/// no expectation and therefore no digest: genesis has no receipt to name, and
+/// the transaction invents nothing for it.
 fn expected_head_predicates(
     revisions: &[RevisionHeadExpectation],
     orderings: &[OrderingHeadExpectation],
     state_fence: &StateFence,
     chain_tips: &OrderingChainTips,
+    current_orderings: &[OrderingHead],
 ) -> Result<(String, Map<String, Value>), AdapterError> {
     let mut sql = String::new();
     let mut bindings = Map::new();
@@ -673,6 +684,19 @@ fn expected_head_predicates(
         bindings.insert(
             format!("ordering_genesis_hash{suffix}"),
             json!(ORDERING_LINK_GENESIS_HASH),
+        );
+        // Issue #1925: the receipt digest the observed head records, copied
+        // verbatim out of that observation. It is `NONE` for a scope whose
+        // observed head carries none (a row written before per-scope receipt
+        // digests existed), which the CAS then requires the stored sibling to
+        // match, so such a row can never silently acquire a digest.
+        let observed_receipt_sha256 = current_orderings
+            .iter()
+            .find(|head| head.scope.as_str() == scope)
+            .and_then(|head| head.committed_receipt_sha256.clone());
+        bindings.insert(
+            format!("expected_ordering_receipt_sha256{suffix}"),
+            observed_receipt_sha256.map_or(Value::Null, |digest| json!(digest)),
         );
     }
     Ok((sql, bindings))
@@ -734,11 +758,16 @@ fn build_apply_statements(
     })?;
     let mut sql = String::from(schema::TX_BEGIN);
     let mut bindings = Map::new();
-    let context = &receipt
-        .require_reconciliation_envelope()?
-        .core
-        .request
-        .metadata;
+    let envelope = receipt.require_reconciliation_envelope()?;
+    let context = &envelope.core.request.metadata;
+    // Issue #1925: the one digest that binds an Ordering Scope to the receipt
+    // that advanced it. `ReceiptEnvelope::issue` computed
+    // `identity.canonical_sha256` once over the canonical receipt bytes; it is
+    // COPIED here verbatim into every `ordering_head` record this transaction
+    // writes, in the same CAS-guarded statement that advances the head. No
+    // second derivation and no recomputation exists: the head read projects this
+    // stored sibling back out (`READ_ORDERING_HEADS_BY_SCOPES`).
+    let committed_receipt_sha256 = envelope.identity.canonical_sha256.clone();
     let epistemic = EpistemicCommit::from_prepared(context, transition)?;
     if let Some(commit) = &epistemic {
         commit.readback(receipt)?;
@@ -836,6 +865,13 @@ fn build_apply_statements(
         // shipped `OrderingHead` serde boundary is unchanged: both hashes are
         // sibling fields on the schemaless record, invisible to every
         // `SELECT VALUE body` reader.
+        //
+        // Issue #1925: `committed_receipt_sha256` is a third such sibling, the
+        // receipt digest that last advanced this scope. It is stored from the
+        // ONE `ReceiptEnvelope::issue` result computed above, so the head, its
+        // chain tip, and the receipt binding advance in the same statement or
+        // not at all — a head can never name a receipt the transaction did not
+        // commit.
         let link = chain_link_for_scope(plan, head)?;
         bindings.insert(
             format!("ordering_table{suffix}"),
@@ -852,6 +888,7 @@ fn build_apply_statements(
                 "body": to_value(head)?,
                 "previous_event_hash": link.previous_event_hash,
                 "event_hash": link.event_hash,
+                "committed_receipt_sha256": committed_receipt_sha256,
             }),
         );
         bindings.insert(
@@ -2650,6 +2687,7 @@ mod allocation_classification_tests {
                 scope: head.scope.clone(),
                 sequence: head.sequence.saturating_sub(1),
                 state_fence: fence(),
+                committed_receipt_sha256: None,
             })
             .collect();
         let (sql, bindings) = build_apply_statements(

@@ -243,6 +243,7 @@ impl FakeStore {
                     scope: scope.clone(),
                     sequence,
                     state_fence: transition.state_fence.clone(),
+                    committed_receipt_sha256: None,
                 })
                 .collect(),
             revision_before_after: Vec::<RevisionDelta>::new(),

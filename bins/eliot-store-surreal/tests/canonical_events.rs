@@ -91,11 +91,13 @@ fn committed_bundle() -> CommittedCanonicalTransition {
                 scope: OrderingScopeId::new("scope-1931-a").unwrap(),
                 sequence: 7,
                 state_fence: fence(),
+                committed_receipt_sha256: None,
             },
             OrderingHead {
                 scope: OrderingScopeId::new("scope-1931-b").unwrap(),
                 sequence: 3,
                 state_fence: fence(),
+                committed_receipt_sha256: None,
             },
         ],
         revision_before_after: Vec::new(),
@@ -278,6 +280,7 @@ fn atomic_bundle_rejects_phantom_or_missing_members() {
         scope: OrderingScopeId::new("scope-1931-ghost").unwrap(),
         sequence: 1,
         state_fence: fence(),
+        committed_receipt_sha256: None,
     });
     assert!(phantom_scope.validate_atomic().is_err());
 
