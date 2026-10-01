@@ -4355,7 +4355,7 @@ mod tests {
             clock: ClockReading::default(),
         };
         ReceiptCore {
-            contract: user_automation_contract_identity().expect("receipt contract"),
+            contract: eliot_receipts::contract_identity().expect("receipt contract"),
             kind: ReceiptKind::Verification,
             work_scope: WorkScopeBinding {
                 scope_id: eliot_receipts::WorkScopeId::new("scope-1").expect("scope"),
