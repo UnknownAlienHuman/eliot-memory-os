@@ -629,8 +629,7 @@ mod tests {
 
         let first = resolve(&request(vec![first_record.clone(), second_record.clone()]))
             .expect("valid read set");
-        let second = resolve(&request(vec![second_record, first_record]))
-            .expect("valid read set");
+        let second = resolve(&request(vec![second_record, first_record])).expect("valid read set");
 
         assert_eq!(first, second);
     }
