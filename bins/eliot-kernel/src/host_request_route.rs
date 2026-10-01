@@ -2609,6 +2609,25 @@ impl KernelComposition {
             indexed.into_iter().partition(|operation_ref| {
                 !is_exact_operator_registration_carrier(operation_ref)
             });
+        // A malformed duplicate queue projection cannot cancel the durable
+        // request represented by a second, exact retained operator carrier.
+        // This matters because disconnect fencing writes by operation key;
+        // blindly fencing the bad duplicate would turn the valid admitted row
+        // into Unknown even though its owner continuation remains queued.
+        let outstanding = outstanding
+            .into_iter()
+            .filter(|operation_ref| {
+                !operation_ref
+                    .instrument_registry_registration_envelope
+                    .as_ref()
+                    .is_some_and(|_| {
+                        accepted_operator_registrations.iter().any(|accepted| {
+                            accepted.operation_id == operation_ref.operation_id
+                                && accepted.request_digest == operation_ref.request_digest
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
         if !accepted_operator_registrations.is_empty() {
             let mut index = match self.host_request_connection_index.lock() {
                 Ok(index) => index,
@@ -11067,13 +11086,23 @@ mod invoke_read_tool_tests {
 
     #[cfg(windows)]
     fn operator_registration_queue_row() -> HostRequestOperationRef {
+        operator_registration_queue_row_with_principal(&"a".repeat(64))
+    }
+
+    #[cfg(windows)]
+    fn operator_registration_queue_row_with_principal(
+        principal_sha256: &str,
+    ) -> HostRequestOperationRef {
         let mut envelope = test_envelope("instrument_registry.register", &"0".repeat(64));
+        envelope.identity.task_id = Some("task-test".to_owned());
         let request_identity = RequestIdentity {
             request: eliot_receipts::RequestBinding {
                 metadata: eliot_contracts::RequestMetadata {
                     request_id: envelope.identity.request_id.clone(),
                     session_id: None,
-                    task_id: None,
+                    task_id: Some(
+                        eliot_contracts::TaskId::new("task-test").expect("task id"),
+                    ),
                     product_id: eliot_contracts::ProductId::new("eliot-test")
                         .expect("product id"),
                     source_id: eliot_contracts::SourceId::new("eliot-test-operator")
@@ -11091,12 +11120,11 @@ mod invoke_read_tool_tests {
             wire_id: InstrumentRegistryRegistrationInvocation::WIRE_ID.to_owned(),
             wire_version: InstrumentRegistryRegistrationInvocation::WIRE_VERSION,
             request_identity: request_identity.clone(),
-            authenticated_principal_sha256: "a".repeat(64),
+            authenticated_principal_sha256: principal_sha256.to_owned(),
             snapshot_json: "{}".to_owned(),
         };
         envelope.kind = HostRequestKind::InstrumentRegistryRegistration;
         envelope.identity.session_id = None;
-        envelope.identity.task_id = None;
         envelope.identity.work_scope_id = Some("scope-test".to_owned());
         envelope.identity.payload_schema_id =
             InstrumentRegistryRegistrationInvocation::PAYLOAD_SCHEMA_ID.to_owned();
@@ -11126,10 +11154,104 @@ mod invoke_read_tool_tests {
     }
 
     #[cfg(windows)]
+    fn operator_test_session(state_fence: &eliot_contracts::StateFence, user: &str) -> Session {
+        let process = eliot_ipc::ProcessBinding::from_observation(
+            4242,
+            1,
+            "eliot-operator-test.exe",
+        )
+        .expect("test process binding");
+        let session_identity = "7".to_owned();
+        let peer = PeerIdentity::Authenticated {
+            process_id: process.process_id(),
+            user_identity: user.to_owned(),
+            session_identity: session_identity.clone(),
+            proof: eliot_ipc::IdentityProof::for_test(
+                process,
+                user.to_owned(),
+                session_identity,
+            ),
+        };
+        Session {
+            connection_id: "operator-status-connection".to_owned(),
+            protocol_version: eliot_ipc::ProtocolVersion::CURRENT,
+            peer,
+            authority_epoch: state_fence.authority_epoch.clone(),
+            module_generation: eliot_runtime_contracts::ModuleGeneration {
+                module_id: eliot_contracts::ContractId::new("eliot-operator-test")
+                    .expect("module id"),
+                generation: state_fence.resource_generation,
+                artifact_id: eliot_contracts::ArtifactId::new("a".repeat(64))
+                    .expect("artifact id"),
+                state: eliot_runtime_contracts::ModuleGenerationState::Ready,
+                health: eliot_runtime_contracts::HealthVector::healthy(),
+                state_fence: state_fence.clone(),
+            },
+            launch_nonce: "operator-status-nonce".to_owned(),
+            capabilities: Vec::new(),
+            privacy_classes: Vec::new(),
+            effects: Vec::new(),
+            session_epoch: 1,
+            state: eliot_ipc::SessionState::Open,
+        }
+    }
+
+    #[cfg(windows)]
+    fn seed_durable_operator_registration(
+        kernel: &KernelComposition,
+        operation_ref: &HostRequestOperationRef,
+    ) -> HostRequestRecord {
+        let envelope = operation_ref
+            .instrument_registry_registration_envelope
+            .as_ref()
+            .expect("registration envelope");
+        let invocation = operation_ref
+            .instrument_registry_registration_invocation
+            .as_ref()
+            .expect("registration invocation");
+        let requested = requested_host_request_record(envelope).expect("requested row");
+        let staged = kernel
+            .stage_host_request_record(&requested)
+            .expect("durable requested row");
+        let payload = serde_json::to_value(invocation).expect("typed registration payload");
+        kernel
+            .generation_gateway
+            .ors
+            .bind_host_request_payload(
+                &staged.operation_id,
+                &staged.request_digest,
+                &payload,
+            )
+            .expect("bind original payload")
+            .expect("row exists");
+        kernel
+            .generation_gateway
+            .ors
+            .advance_host_request(
+                &staged.operation_id,
+                &staged.request_digest,
+                HostRequestState::Admitted,
+                None,
+            )
+            .expect("admit original row")
+            .expect("row exists")
+    }
+
+    #[cfg(windows)]
     #[test]
     fn issue_1814_disconnect_retains_only_exact_operator_registration_carrier() {
         let (kernel, root) = queue_fixture("operator-disconnect");
         let accepted = operator_registration_queue_row();
+        let admitted = seed_durable_operator_registration(&kernel, &accepted);
+        let operation_id = admitted.operation_id.clone();
+        let request_digest = admitted.request_digest.clone();
+        let expected_payload = serde_json::to_value(
+            accepted
+                .instrument_registry_registration_invocation
+                .as_ref()
+                .expect("accepted invocation"),
+        )
+        .expect("payload value");
         assert!(is_exact_operator_registration_carrier(&accepted));
         let mut substituted = accepted.clone();
         substituted
@@ -11148,6 +11270,14 @@ mod invoke_read_tool_tests {
         assert_eq!(retained.len(), 1, "only the exact admitted carrier survives close");
         assert!(is_exact_operator_registration_carrier(&retained[0]));
         drop(index);
+        let durable = kernel
+            .generation_gateway
+            .ors
+            .load_host_request(&operation_id, &request_digest)
+            .expect("read durable admitted row")
+            .expect("row exists");
+        assert_eq!(durable.state, HostRequestState::Admitted);
+        assert_eq!(durable.payload_body, Some(expected_payload));
         drop(kernel);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
@@ -11157,8 +11287,9 @@ mod invoke_read_tool_tests {
     fn issue_1814_owner_fence_retires_registration_claim_and_refuses_later_use() {
         let (kernel, root) = queue_fixture("operator-fence");
         let accepted = operator_registration_queue_row();
-        let operation_id = accepted.operation_id.clone();
-        let request_digest = accepted.request_digest.clone();
+        let admitted = seed_durable_operator_registration(&kernel, &accepted);
+        let operation_id = admitted.operation_id.clone();
+        let request_digest = admitted.request_digest.clone();
         *kernel.host_request_connection_index.lock().expect("index") =
             BTreeMap::from([("operator-conn".to_owned(), vec![accepted])]);
 
@@ -11182,6 +11313,13 @@ mod invoke_read_tool_tests {
             None,
             "a fenced operation cannot be claimed or submitted afterward"
         );
+        let durable = kernel
+            .generation_gateway
+            .ors
+            .load_host_request(&OperationIdentity::new(operation_id.clone()).expect("op id"), &request_digest)
+            .expect("read durable fenced row")
+            .expect("row remains auditable");
+        assert_eq!(durable.state, HostRequestState::Unknown);
         drop(kernel);
         std::fs::remove_dir_all(root).expect("cleanup");
     }
@@ -11189,14 +11327,46 @@ mod invoke_read_tool_tests {
     #[cfg(windows)]
     #[test]
     fn issue_1814_registration_status_reads_after_disconnect_for_same_owner_only() {
-        let queued = operator_registration_queue_row();
+        use eliot_contracts::{canonical_json_bytes, sha256_hex};
+
+        let template = test_envelope("instrument_registry.register", &"0".repeat(64));
+        let session = operator_test_session(&template.state_fence, "S-1-5-21-operator");
+        let principal_sha256 = authenticated_operator_principal_sha256(&session)
+            .expect("authenticated owner principal");
+        let queued = operator_registration_queue_row_with_principal(&principal_sha256);
+        let (kernel, root) = queue_fixture("operator-status");
+        let admitted = seed_durable_operator_registration(&kernel, &queued);
+        let response = serde_json::json!({
+            "kind": "instrument_registry_registration",
+            "write_receipt": {"receipt_id": "original-registration-receipt"},
+            "named_readback": {"snapshot": "exact-committed-snapshot"}
+        });
+        let result_digest =
+            sha256_hex(&canonical_json_bytes(&response).expect("canonical result"));
+        let terminal = kernel
+            .generation_gateway
+            .ors
+            .persist_host_request_result(
+                &admitted.operation_id,
+                &admitted.request_digest,
+                &result_digest,
+                &response,
+                None,
+                None,
+            )
+            .expect("persist original result")
+            .expect("terminal row");
+        assert_eq!(terminal.state, HostRequestState::ResultReceived);
         let original = queued
             .instrument_registry_registration_identity
             .as_ref()
             .expect("original identity");
-        let mut original = original.clone();
-        let task = eliot_contracts::TaskId::new("task-original").expect("task id");
-        original.request.metadata.task_id = Some(task.clone());
+        let task = original
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .expect("original task");
         let mut current_read = original.clone();
         current_read.request.metadata.request_id =
             eliot_contracts::RequestId::new("status-read-request").expect("read request id");
@@ -11205,33 +11375,30 @@ mod invoke_read_tool_tests {
         );
         current_read.idempotency_key = "status-read-idempotency".to_owned();
         current_read.cancellation_id = "status-read-cancellation".to_owned();
+        let query = InstrumentRegistryRegistrationStatusRequest {
+            wire_id: InstrumentRegistryRegistrationStatusRequest::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryRegistrationStatusRequest::WIRE_VERSION,
+            operation_id: queued.operation_id.clone(),
+            request_digest: queued.request_digest.clone(),
+            work_scope_id: "scope-test".to_owned(),
+        };
+        let result = kernel
+            .read_operator_registry_registration_status(&session, &query, &current_read)
+            .expect("same authenticated operator may read result after disconnect");
+        assert_eq!(result["status"], "known");
+        assert_eq!(result["value"]["record"]["state"], "ResultReceived");
+        assert_eq!(result["value"]["registration_result"], response);
 
-        assert!(operator_registration_status_matches_owner(
-            &original,
-            &current_read,
-            Some(task.as_str()),
-            Some(task.as_str()),
-            "scope-test",
-            Some("scope-test"),
-            &"a".repeat(64),
-            &"a".repeat(64),
-        ));
         let mut foreign_task = current_read.clone();
         foreign_task.request.metadata.task_id = Some(
             eliot_contracts::TaskId::new("task-foreign").expect("foreign task id"),
         );
+        assert!(matches!(
+            kernel.read_operator_registry_registration_status(&session, &query, &foreign_task),
+            Err(TransportError::SessionFenced)
+        ), "same principal cannot read another task's registration result");
         assert!(!operator_registration_status_matches_owner(
-            &original,
-            &foreign_task,
-            Some(task.as_str()),
-            Some(task.as_str()),
-            "scope-test",
-            Some("scope-test"),
-            &"a".repeat(64),
-            &"a".repeat(64),
-        ));
-        assert!(!operator_registration_status_matches_owner(
-            &original,
+            original,
             &current_read,
             Some(task.as_str()),
             Some(task.as_str()),
@@ -11241,7 +11408,7 @@ mod invoke_read_tool_tests {
             &"a".repeat(64),
         ));
         assert!(!operator_registration_status_matches_owner(
-            &original,
+            original,
             &current_read,
             Some(task.as_str()),
             Some(task.as_str()),
@@ -11250,6 +11417,8 @@ mod invoke_read_tool_tests {
             &"a".repeat(64),
             &"b".repeat(64),
         ));
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[cfg(windows)]
@@ -11258,16 +11427,24 @@ mod invoke_read_tool_tests {
         use eliot_contracts::{canonical_json_bytes, sha256_hex};
 
         let queued = operator_registration_queue_row();
-        let envelope = queued
-            .instrument_registry_registration_envelope
-            .as_ref()
-            .expect("registration envelope");
-        let mut stored = requested_host_request_record(envelope).expect("durable row shape");
+        let (kernel, root) = queue_fixture("operator-terminal-result");
+        let admitted = seed_durable_operator_registration(&kernel, &queued);
         let response = serde_json::json!({"status":"registered","receipt":"original"});
         let digest = sha256_hex(&canonical_json_bytes(&response).expect("canonical response"));
-        stored.state = HostRequestState::ResultReceived;
-        stored.result_digest = Some(digest.clone());
-        stored.result_response = Some(response.clone());
+        let stored = kernel
+            .generation_gateway
+            .ors
+            .persist_host_request_result(
+                &admitted.operation_id,
+                &admitted.request_digest,
+                &digest,
+                &response,
+                None,
+                None,
+            )
+            .expect("persist terminal result")
+            .expect("row exists");
+        assert_eq!(stored.state, HostRequestState::ResultReceived);
         let body = HostRequestResultBody {
             wire_id: HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
             wire_version: HostRequestResultBody::CONTRACT_VERSION,
@@ -11287,6 +11464,8 @@ mod invoke_read_tool_tests {
         let mut changed_bytes = body;
         changed_bytes.response["receipt"] = serde_json::json!("substituted");
         assert!(!exact_terminal_result_replay(&stored, &changed_bytes));
+        drop(kernel);
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[cfg(windows)]
