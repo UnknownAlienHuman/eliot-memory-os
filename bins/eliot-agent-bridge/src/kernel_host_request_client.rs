@@ -32,8 +32,8 @@ use eliot_contracts::{
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
 use eliot_mcp::{
     HostCancellationPortOutcome, HostCancellationRequest, HostInvocationPortOutcome,
-    HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, PortFailure,
-    ObserveInput, ResponseKind, ToolRequest,
+    HostInvocationRequest, HostOperationHandle, KernelHostRequestPort, McpResponse, ObserveInput,
+    PortFailure, ResponseKind, ToolRequest,
 };
 use eliot_protocol::{
     AgentHostRequestFailure, EncodingProfile, FINISH_INVOKE_PAYLOAD_SCHEMA_ID, Frame, FrameKind,
@@ -3742,27 +3742,19 @@ fn invocation_frame(
     facts: &TransportFacts,
 ) -> Result<Frame, PortFailure> {
     match canonical_dispatch_entry(&request.tool) {
-        CanonicalDispatchEntry::InvokeRead => host_request_invoke_read_frame(request, envelope, facts),
-        CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
-            AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-            envelope,
-            facts,
-        ),
+        CanonicalDispatchEntry::InvokeRead => {
+            host_request_invoke_read_frame(request, envelope, facts)
+        }
+        CanonicalDispatchEntry::SubmitAdmitOnly { .. } => {
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)
+        }
         CanonicalDispatchEntry::SubmitActGated { .. } => {
             revalidate_act_dispatch(request, envelope, facts)?;
-            host_request_frame_for_envelope(
-                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                envelope,
-                facts,
-            )
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)
         }
         CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
             revalidate_coordinate_dispatch(request, envelope, facts)?;
-            host_request_frame_for_envelope(
-                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                envelope,
-                facts,
-            )
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)
         }
         CanonicalDispatchEntry::SubmitCarryingBytes => {
             host_request_user_automation_frame(request, envelope, facts)
