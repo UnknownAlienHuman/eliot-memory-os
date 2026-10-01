@@ -887,7 +887,10 @@ fn observed_capture_gaps(generation: &str) -> Result<Vec<EcxfCaptureGap>, StoreE
     for (gap, columns) in [
         (
             EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
-            &["architecture_source_digest", "normative_pair_identity_receipt_digest"][..],
+            &[
+                "architecture_source_digest",
+                "normative_pair_identity_receipt_digest",
+            ][..],
         ),
         (
             EcxfCaptureGap::SourceExportReceiptUnavailable,
