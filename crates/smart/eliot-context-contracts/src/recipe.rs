@@ -1480,16 +1480,20 @@ impl<'a> RecipePolicyDigestContent<'a> {
     /// acceptance A2 forbids. Under the old whole-struct digest the same mistake
     /// moved the digest, so it was loud.
     ///
-    /// The records this projection carries WHOLE — `applicability`, `stages`,
-    /// `section_budgets`, `omission`, `blocking_dimensions`, `execution`,
-    /// `supersession`, and the `role_positions` and `reserves` elements — are
-    /// certified at their own members: a member added inside one of those keeps
-    /// moving the digest, which is the loud direction, and the members this item
-    /// audited are classified by name in the module header above. What the
-    /// exhaustive destructuring covers is every level this projection itself
-    /// enumerates, which is where an under-certified member could be introduced
-    /// silently.
-    fn canonical_bytes(policy: &ContextRecipePolicy) -> Result<Vec<u8>, ContextError> {
+    /// Two levels below this one are enforced for the same reason rather than
+    /// only by the digest. `applicability` and `omission` are re-shaped
+    /// member-by-member by a struct LITERAL that names every one of their
+    /// members, so adding a member to either is also a compile error here;
+    /// `stages`, `section_budgets`, `blocking_dimensions`, `execution`,
+    /// `supersession`, and the `role_positions` and `reserves` elements are
+    /// carried WHOLE, where a member added inside one of those is not
+    /// compile-enforced but keeps moving the digest, which is the loud
+    /// direction. The members of those records that this item audited are
+    /// classified by name in the module header above. What the exhaustive
+    /// destructuring and the exhaustive literals cover is every level this
+    /// projection itself enumerates, which is where an under-certified member
+    /// could be introduced silently.
+    fn canonical_bytes<'p>(policy: &'p ContextRecipePolicy) -> Result<Vec<u8>, ContextError> {
         let ContextRecipePolicy {
             policy_schema_version,
             policy_id,
@@ -1528,7 +1532,13 @@ impl<'a> RecipePolicyDigestContent<'a> {
             state,
             counter_metrics,
         } = qualification;
-        let mut certified_metrics: Vec<RecipeCounterMetricDigestContent<'a>> = counter_metrics
+        // `'p` is this function's own borrow of `policy`, not the projection's
+        // `'a`: the impl's `'a` appears in no parameter of this signature, so it
+        // is universally quantified over the body and cannot be the region this
+        // borrow produces. Every local this function builds (the canonical sets,
+        // the sorted metrics) borrows for shorter than `'p`, so it is the
+        // projection parameter the locals keep short, not the parameter.
+        let mut certified_metrics: Vec<RecipeCounterMetricDigestContent<'p>> = counter_metrics
             .iter()
             .map(|metric| {
                 let RecipeCounterMetric {
