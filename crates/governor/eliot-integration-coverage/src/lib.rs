@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -358,6 +359,118 @@ pub struct IntegrationCoverageProfile {
     pub gaps: Vec<String>,
 }
 
+fn summarize_source_readback(
+    source_readback: &SourceReadback,
+) -> Result<(String, Vec<String>, usize), CoverageError> {
+    match source_readback {
+        SourceReadback::Unavailable { reason } => {
+            validate_text(reason, "observation.source.reason")?;
+            Ok((
+                format!("Kernel ORS source readback unavailable: {reason}"),
+                vec![format!("Original event source unavailable: {reason}")],
+                0,
+            ))
+        }
+        SourceReadback::Available {
+            selectors,
+            roster,
+            streams,
+            next,
+        } => summarize_available_source_readback(selectors, roster, streams, next),
+    }
+}
+
+fn summarize_available_source_readback(
+    selectors: &ObservationSelectors,
+    roster: &ObservationRosterPage,
+    streams: &[ObservationStreamReadback],
+    next: &Option<ObservationContinuation>,
+) -> Result<(String, Vec<String>, usize), CoverageError> {
+    validate_roster(roster)?;
+    if selectors.page_limit == 0 {
+        return Err(CoverageError::InvalidField(
+            "observation.source.selectors.page_limit",
+        ));
+    }
+    let mut gaps = Vec::new();
+    let mut record_count = 0_usize;
+    let mut stream_bounds = Vec::new();
+    for stream in streams {
+        if !roster.owners.contains(&stream.owner) {
+            return Err(CoverageError::InvalidField(
+                "observation.source.stream.owner_not_in_roster",
+            ));
+        }
+        if stream.owner != stream.page.owner {
+            return Err(CoverageError::InvalidField(
+                "observation.source.stream.page_owner_mismatch",
+            ));
+        }
+        validate_event_page(&stream.page)?;
+        record_count = record_count.saturating_add(stream.page.records.len());
+        stream_bounds.push(format!(
+            "owner-seq={} stream={} observed-through={} durable={} observed={} acked={} compacted={}",
+            stream.owner.owner_list_sequence,
+            stream.owner.local_stream,
+            stream.page.observed_through_sequence,
+            stream.page.cursor.durable_sequence,
+            stream.page.cursor.observed_sequence,
+            stream.page.cursor.acked_sequence,
+            stream.page.cursor.compacted_sequence,
+        ));
+        for gap in &stream.page.gaps {
+            gaps.push(format!(
+                "ORS retained gap {} on {} at sequences {}..{} ({})",
+                gap.gap_id, gap.stream_id, gap.start_sequence, gap.end_sequence, gap.reason_ref,
+            ));
+        }
+        if u64::try_from(stream.page.gaps.len()).unwrap_or(u64::MAX) < stream.page.gap_total {
+            gaps.push(format!(
+                "ORS reports {} total gaps for {} but this page retains only {}",
+                stream.page.gap_total,
+                stream.owner.local_stream,
+                stream.page.gaps.len(),
+            ));
+        }
+        if stream.page.continuation.is_some() {
+            gaps.push(format!(
+                "ORS event page for {} continues beyond this bounded readback",
+                stream.owner.local_stream,
+            ));
+        }
+    }
+    if roster.owners.len() < usize::try_from(roster.owner_total).unwrap_or(usize::MAX)
+        || roster.continuation.is_some()
+    {
+        gaps.push(format!(
+            "ORS roster page contains {} of {} retained owners",
+            roster.owners.len(),
+            roster.owner_total,
+        ));
+    }
+    if next.is_some() {
+        gaps.push("Kernel source snapshot has a bounded continuation beyond this readback.".to_owned());
+    }
+    if streams.is_empty() || record_count == 0 {
+        gaps.push(
+            "No original retained bridge event row was available in this bounded readback."
+                .to_owned(),
+        );
+    }
+    let source = format!(
+        "Kernel-authenticated ORS readback: {} retained owner rows of {}; {} original event rows; selectors owner={} event={} limit={}; roster cutoff={}; cursor and scoped-gap bounds retained [{}]; adapter admission is ADAPTER identity only.",
+        roster.owners.len(),
+        roster.owner_total,
+        record_count,
+        selectors.after_owner_sequence,
+        selectors.after_event_sequence,
+        selectors.page_limit,
+        roster.owner_cutoff,
+        stream_bounds.join("; "),
+    );
+    Ok((source, gaps, record_count))
+}
+
 impl IntegrationCoverageProfile {
     /// Builds a candidate (unverified) profile from discovery output.
     pub fn candidate(
@@ -396,128 +509,22 @@ impl IntegrationCoverageProfile {
         let mut profile_gaps = vec![
             "No source-issued native I7.16 event-class manifest or independent expected-event denominator was included in this observation.".to_owned(),
         ];
-        let (mut source, source_gaps, source_record_count) = match &observation.source {
-            SourceReadback::Unavailable { reason } => {
-                validate_text(reason, "observation.source.reason")?;
-                (
-                    format!("Kernel ORS source readback unavailable: {reason}"),
-                    vec![format!("Original event source unavailable: {reason}")],
-                    0,
-                )
-            }
-            SourceReadback::Available {
-                selectors,
-                roster,
-                streams,
-                next,
-            } => {
-                validate_roster(roster)?;
-                if selectors.page_limit == 0 {
-                    return Err(CoverageError::InvalidField(
-                        "observation.source.selectors.page_limit",
-                    ));
-                }
-                let mut gaps = Vec::new();
-                let mut record_count = 0_usize;
-                let mut stream_bounds = Vec::new();
-                for stream in streams {
-                    if !roster.owners.contains(&stream.owner) {
-                        return Err(CoverageError::InvalidField(
-                            "observation.source.stream.owner_not_in_roster",
-                        ));
-                    }
-                    if stream.owner != stream.page.owner {
-                        return Err(CoverageError::InvalidField(
-                            "observation.source.stream.page_owner_mismatch",
-                        ));
-                    }
-                    validate_event_page(&stream.page)?;
-                    record_count = record_count.saturating_add(stream.page.records.len());
-                    stream_bounds.push(format!(
-                        "owner-seq={} stream={} observed-through={} durable={} observed={} acked={} compacted={}",
-                        stream.owner.owner_list_sequence,
-                        stream.owner.local_stream,
-                        stream.page.observed_through_sequence,
-                        stream.page.cursor.durable_sequence,
-                        stream.page.cursor.observed_sequence,
-                        stream.page.cursor.acked_sequence,
-                        stream.page.cursor.compacted_sequence,
-                    ));
-                    for gap in &stream.page.gaps {
-                        gaps.push(format!(
-                            "ORS retained gap {} on {} at sequences {}..{} ({})",
-                            gap.gap_id,
-                            gap.stream_id,
-                            gap.start_sequence,
-                            gap.end_sequence,
-                            gap.reason_ref,
-                        ));
-                    }
-                    if u64::try_from(stream.page.gaps.len()).unwrap_or(u64::MAX)
-                        < stream.page.gap_total
-                    {
-                        gaps.push(format!(
-                            "ORS reports {} total gaps for {} but this page retains only {}",
-                            stream.page.gap_total,
-                            stream.owner.local_stream,
-                            stream.page.gaps.len(),
-                        ));
-                    }
-                    if stream.page.continuation.is_some() {
-                        gaps.push(format!(
-                            "ORS event page for {} continues beyond this bounded readback",
-                            stream.owner.local_stream,
-                        ));
-                    }
-                }
-                if roster.owners.len() < usize::try_from(roster.owner_total).unwrap_or(usize::MAX)
-                    || roster.continuation.is_some()
-                {
-                    gaps.push(format!(
-                        "ORS roster page contains {} of {} retained owners",
-                        roster.owners.len(),
-                        roster.owner_total,
-                    ));
-                }
-                if next.is_some() {
-                    gaps.push(
-                        "Kernel source snapshot has a bounded continuation beyond this readback."
-                            .to_owned(),
-                    );
-                }
-                if streams.is_empty() || record_count == 0 {
-                    gaps.push(
-                        "No original retained bridge event row was available in this bounded readback."
-                            .to_owned(),
-                    );
-                }
-                let source = format!(
-                    "Kernel-authenticated ORS readback: {} retained owner rows of {}; {} original event rows; selectors owner={} event={} limit={}; roster cutoff={}; cursor and scoped-gap bounds retained [{}]; adapter admission is ADAPTER identity only.",
-                    roster.owners.len(),
-                    roster.owner_total,
-                    record_count,
-                    selectors.after_owner_sequence,
-                    selectors.after_event_sequence,
-                    selectors.page_limit,
-                    roster.owner_cutoff,
-                    stream_bounds.join("; "),
-                );
-                (source, gaps, record_count)
-            }
-        };
+        let (mut source, source_gaps, source_record_count) =
+            summarize_source_readback(&observation.source)?;
         profile_gaps.extend(source_gaps);
         if let Some(adapter) = &observation.adapter {
             validate_adapter_identity(adapter)?;
             if adapter.descriptor_sha256 != fingerprint {
                 return Err(CoverageError::FingerprintMismatch);
             }
-            source.push_str(&format!(
+            let _ = write!(
+                source,
                 "; admitted adapter tuple descriptor={} profile_id={} profile_sha256={} executable_sha256={}",
                 adapter.descriptor_sha256,
                 adapter.profile_id,
                 adapter.profile_sha256,
                 adapter.executable_sha256,
-            ));
+            );
         } else {
             profile_gaps.push(
                 "Current adapter admission is unavailable; the prior Governor fingerprint is retained only for degradation.".to_owned(),
@@ -821,6 +828,79 @@ impl GovernorCoverageDerivation {
         Ok(candidate)
     }
 
+    fn validated_observation(
+        observation: &GovernorAuthorityObservation,
+        adapter: Option<AdapterAdmissionIdentity>,
+    ) -> GovernorAuthorityObservation {
+        let watchdog = match &observation.watchdog {
+            EvidenceAvailability::Available { evidence } if evidence.validate().is_ok() => {
+                EvidenceAvailability::Available {
+                    evidence: evidence.clone(),
+                }
+            }
+            EvidenceAvailability::Available { .. } => EvidenceAvailability::Unavailable {
+                reason: "Kernel watchdog evidence failed Governor validation".to_owned(),
+            },
+            EvidenceAvailability::Unavailable { reason }
+                if validate_optional_text(reason, "observation.watchdog.reason").is_ok()
+                    && !reason.trim().is_empty() =>
+            {
+                EvidenceAvailability::Unavailable {
+                    reason: reason.clone(),
+                }
+            }
+            EvidenceAvailability::Unavailable { .. } => EvidenceAvailability::Unavailable {
+                reason: "Kernel did not provide a valid watchdog unavailability reason".to_owned(),
+            },
+        };
+        let trace = match &observation.trace {
+            EvidenceAvailability::Available { evidence } => EvidenceAvailability::Available {
+                evidence: *evidence,
+            },
+            EvidenceAvailability::Unavailable { reason }
+                if validate_optional_text(reason, "observation.trace.reason").is_ok()
+                    && !reason.trim().is_empty() =>
+            {
+                EvidenceAvailability::Unavailable {
+                    reason: reason.clone(),
+                }
+            }
+            EvidenceAvailability::Unavailable { .. } => EvidenceAvailability::Unavailable {
+                reason: "Kernel did not provide a valid trace unavailability reason".to_owned(),
+            },
+        };
+        GovernorAuthorityObservation {
+            adapter,
+            source: observation.source.clone(),
+            watchdog,
+            trace,
+        }
+    }
+
+    fn observation_coverage(
+        observation: &mut GovernorAuthorityObservation,
+        fingerprint: String,
+    ) -> Result<IntegrationCoverageProfile, CoverageError> {
+        match IntegrationCoverageProfile::from_authority_observation(observation, fingerprint.clone())
+        {
+            Ok(coverage) => Ok(coverage),
+            Err(error) => {
+                observation.source = SourceReadback::Unavailable {
+                    reason: format!(
+                        "Governor rejected inconsistent Kernel source evidence: {error}"
+                    ),
+                };
+                observation.watchdog = EvidenceAvailability::Unavailable {
+                    reason: "Governor rejected the combined Kernel source observation".to_owned(),
+                };
+                observation.trace = EvidenceAvailability::Unavailable {
+                    reason: "Governor rejected the combined Kernel source observation".to_owned(),
+                };
+                IntegrationCoverageProfile::from_authority_observation(observation, fingerprint)
+            }
+        }
+    }
+
     /// Derives a profile from source readback even when some source classes,
     /// watchdog evidence, or trace evidence are unavailable. Unknown inputs
     /// produce a new unverified/degraded revision instead of preserving a
@@ -845,73 +925,9 @@ impl GovernorCoverageDerivation {
         let Some(fingerprint) = fingerprint else {
             return Ok(None);
         };
-        let adapter = admitted_adapter;
-        let validated_watchdog = match &observation.watchdog {
-            EvidenceAvailability::Available { evidence } if evidence.validate().is_ok() => {
-                EvidenceAvailability::Available {
-                    evidence: evidence.clone(),
-                }
-            }
-            EvidenceAvailability::Available { .. } => EvidenceAvailability::Unavailable {
-                reason: "Kernel watchdog evidence failed Governor validation".to_owned(),
-            },
-            EvidenceAvailability::Unavailable { reason }
-                if validate_optional_text(reason, "observation.watchdog.reason").is_ok()
-                    && !reason.trim().is_empty() =>
-            {
-                EvidenceAvailability::Unavailable {
-                    reason: reason.clone(),
-                }
-            }
-            EvidenceAvailability::Unavailable { .. } => EvidenceAvailability::Unavailable {
-                reason: "Kernel did not provide a valid watchdog unavailability reason".to_owned(),
-            },
-        };
-        let validated_trace = match &observation.trace {
-            EvidenceAvailability::Available { evidence } => EvidenceAvailability::Available {
-                evidence: *evidence,
-            },
-            EvidenceAvailability::Unavailable { reason }
-                if validate_optional_text(reason, "observation.trace.reason").is_ok()
-                    && !reason.trim().is_empty() =>
-            {
-                EvidenceAvailability::Unavailable {
-                    reason: reason.clone(),
-                }
-            }
-            EvidenceAvailability::Unavailable { .. } => EvidenceAvailability::Unavailable {
-                reason: "Kernel did not provide a valid trace unavailability reason".to_owned(),
-            },
-        };
-        let mut validated_observation = GovernorAuthorityObservation {
-            adapter,
-            source: observation.source.clone(),
-            watchdog: validated_watchdog,
-            trace: validated_trace,
-        };
-        let coverage = match IntegrationCoverageProfile::from_authority_observation(
-            &validated_observation,
-            fingerprint.clone(),
-        ) {
-            Ok(coverage) => coverage,
-            Err(error) => {
-                validated_observation.source = SourceReadback::Unavailable {
-                    reason: format!(
-                        "Governor rejected inconsistent Kernel source evidence: {error}"
-                    ),
-                };
-                validated_observation.watchdog = EvidenceAvailability::Unavailable {
-                    reason: "Governor rejected the combined Kernel source observation".to_owned(),
-                };
-                validated_observation.trace = EvidenceAvailability::Unavailable {
-                    reason: "Governor rejected the combined Kernel source observation".to_owned(),
-                };
-                IntegrationCoverageProfile::from_authority_observation(
-                    &validated_observation,
-                    fingerprint,
-                )?
-            }
-        };
+        let mut validated_observation =
+            Self::validated_observation(observation, admitted_adapter);
+        let coverage = Self::observation_coverage(&mut validated_observation, fingerprint)?;
         let binding = ObservationDerivationBinding {
             observation: observation.clone(),
         };

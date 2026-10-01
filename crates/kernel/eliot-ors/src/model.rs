@@ -226,7 +226,7 @@ pub struct BridgeEventObservationGap {
 
 /// Committed source observation page. `owner_total` is exposed by the roster
 /// separately; neither returned rows nor cursor values imply source
-/// completeness or an ALL_EVENTS denominator.
+/// completeness or an `ALL_EVENTS` denominator.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeEventObservationPage {
