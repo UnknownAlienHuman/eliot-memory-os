@@ -9646,10 +9646,10 @@ fn validate_route(
 /// release because the retention reads the staged operation's own epoch,
 /// fence, recovery owner and reservation identity.
 ///
-/// A failure to record never discards the refusal itself: the original cause is
-/// reported and the retention failure is appended, so the caller still learns
-/// the plan was refused. In that case the order is still released, so a
-/// recorder fault cannot strand an `Eligible` reservation.
+/// A failure to record preserves the original staged operation and reservation.
+/// The caller receives both the refusal and retention failure; the owner must
+/// reconcile that same operation before releasing its order. A recorder fault
+/// never makes unsupported recorded material disappear from recovery.
 fn refuse_determinate_reserved_write(
     owner: &CompositionReservation,
     token: &WriterReservationToken,
@@ -9669,17 +9669,12 @@ fn refuse_determinate_reserved_write(
         } else {
             "prepared transition outside current contract or operation-manifest support"
         };
-        let retained = retain_unsupported_prepared_plan(
-            owner,
-            token,
-            reason,
-        );
+        let retained = retain_unsupported_prepared_plan(owner, token, reason);
         if let Err(retained) = retained {
-            let _ = cancel_before_send(owner, token);
             return format!(
-                "reserved write refused for operation {operation_id}: the staged prepared \
-                 transition is outside current admissible support and could not be retained \
-                 as visible recovery work ({retained}); cause: {error}"
+                "reserved write refused for operation {operation_id}: retaining the unsupported \
+                 staged plan as visible recovery work failed ({retained}); the original \
+                 operation and reservation remain retained for reconciliation; cause: {error}"
             );
         }
     }

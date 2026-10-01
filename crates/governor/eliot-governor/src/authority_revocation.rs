@@ -343,7 +343,7 @@ pub fn canonical_receipt_identity(
 /// own `validate()`. The durable closure receipt carries no per-closure bound
 /// field, so this binds the standing limit set the closure's complete-verdict
 /// gate runs under rather than a value supplied per closure.
-
+///
 /// Content identity for the durable closure coordinates that do not fit in
 /// the closed seven-field revocation command. The digest remains a proof
 /// reference in the envelope; the contract-set field is reserved for current

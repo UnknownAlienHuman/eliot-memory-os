@@ -537,9 +537,8 @@ pub fn build_persist_transitions(
                 field: "lifecycle.persist.session",
                 reason: "bound session is required",
             })?;
-    let admission_contract_set_digest =
-        eliot_store_api::supported_admission_contract_set_digest()
-            .map_err(LifecyclePersistError::from_store)?;
+    let admission_contract_set_digest = eliot_store_api::supported_admission_contract_set_digest()
+        .map_err(LifecyclePersistError::from_store)?;
     let mut built = Vec::with_capacity(
         request.hop_identities.len() + request.hop_mutations.iter().flatten().count(),
     );

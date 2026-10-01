@@ -1648,7 +1648,9 @@ fn canonical_owner_snapshot_envelope(
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
-            .map_err(|error| FinishAttemptError::Composition(CompositionError::Canonical(error)))?,
+            .map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Canonical(error))
+        })?,
         operation_manifest_digest: production_manifest_digest()?,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::RecordFinishEvidence,
@@ -1769,7 +1771,9 @@ fn finish_envelope(
         transition_class: TransitionClass::RecoverySchema,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
-            .map_err(|error| FinishAttemptError::Composition(CompositionError::Canonical(error)))?,
+            .map_err(|error| {
+            FinishAttemptError::Composition(CompositionError::Canonical(error))
+        })?,
         operation_manifest_digest: production_manifest_digest()?,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::RecordFinishDecision,

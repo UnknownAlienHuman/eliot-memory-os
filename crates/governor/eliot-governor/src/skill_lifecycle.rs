@@ -483,7 +483,9 @@ fn skill_envelope(
         transition_class: TransitionClass::LifecyclePolicy,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
         admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
-            .map_err(|error| SkillError::Serialization(error.to_string()))?,
+            .map_err(|error| {
+            SkillError::Serialization(error.to_string())
+        })?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::ApplyLifecyclePolicy,

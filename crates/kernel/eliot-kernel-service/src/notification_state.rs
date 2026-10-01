@@ -32,9 +32,8 @@ use eliot_store_api::{
     NOTIFY_PARAM_PRINCIPAL, NOTIFY_PARAM_RECORD_JSON, NOTIFY_PARAM_SOURCE_RECEIPT_JSON,
     OperationId, OperationIdentity, OperationManifestDigest, OrderingScopeId, PreparedTransition,
     ReceiptEnvelope, RequestMetadata, ScopeId, SecurityContext, StoreError, TransitionClass,
-    WriteReceiptStatus, generated_operation_manifests,
-    notification_mutation_request, notification_read_request, operation_manifest_set_digest,
-    verify_canonical_request_hash,
+    WriteReceiptStatus, generated_operation_manifests, notification_mutation_request,
+    notification_read_request, operation_manifest_set_digest, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -620,9 +619,8 @@ fn build_notification_transition(
     let parameters = notification_parameters(request)?;
     let manifest_digest = operation_manifest_set_digest(&generated_operation_manifests()?)
         .map_err(|_| NotificationServiceError::ManifestMismatch)?;
-    let admission_contract_set_digest =
-        eliot_store_api::supported_admission_contract_set_digest()
-            .map_err(NotificationServiceError::from_store)?;
+    let admission_contract_set_digest = eliot_store_api::supported_admission_contract_set_digest()
+        .map_err(NotificationServiceError::from_store)?;
     let scope = ScopeId::new(NOTIFICATION_STATE_SCOPE).map_err(|_| {
         NotificationServiceError::InvalidField {
             field: "notification.scope",

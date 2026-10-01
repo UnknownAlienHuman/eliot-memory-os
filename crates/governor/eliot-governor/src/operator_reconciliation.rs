@@ -58,7 +58,7 @@
 use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_contracts::{OperationId, SessionId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{OperationId, SessionId};
 use eliot_protocol::RequestIdentity;
 use eliot_store_api::{
     CONTRACT_VERSION, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
@@ -125,14 +125,6 @@ fn production_manifest_digest() -> Result<OperationManifestDigest, CompositionEr
     )
     .map_err(|error| CompositionError::Owner(error.to_string()))?;
     Ok(manifest.digest)
-}
-
-/// Canonical digest helper for the operator binding record.
-fn canonical_digest(value: &impl serde::Serialize) -> Result<String, CompositionError> {
-    let bytes = canonical_json_bytes(value).map_err(|error| {
-        CompositionError::Owner(format!("cannot canonicalize operator binding: {error}"))
-    })?;
-    Ok(sha256_hex(&bytes))
 }
 
 fn owner_refused(detail: impl Into<String>) -> CompositionError {

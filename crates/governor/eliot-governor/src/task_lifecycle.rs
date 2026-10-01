@@ -43,9 +43,7 @@
 use std::collections::BTreeMap;
 
 use eliot_canonical::CanonicalWriteEnvelope;
-use eliot_contracts::{
-    OperationId, RequestMetadata, StateFence, TaskId, TaskRevision,
-};
+use eliot_contracts::{OperationId, RequestMetadata, StateFence, TaskId, TaskRevision};
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRole, LearningStateViewRecipe,
     TASK_CONTROLLER_CAMPAIGN_OWNER_ID,

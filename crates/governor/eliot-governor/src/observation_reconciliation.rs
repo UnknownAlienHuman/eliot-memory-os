@@ -250,14 +250,6 @@ fn doctor_fence_echo(
     })
 }
 
-/// Canonical digest helper for admission-contract digests.
-fn canonical_digest(value: &impl serde::Serialize) -> Result<String, CompositionError> {
-    let bytes = canonical_json_bytes(value).map_err(|error| {
-        CompositionError::Owner(format!("cannot canonicalize admission bytes: {error}"))
-    })?;
-    Ok(sha256_hex(&bytes))
-}
-
 /// Reconstructs the production adapter manifest digest.
 ///
 /// The shape mirrors `default_manifest` exactly (same adapter name, contract

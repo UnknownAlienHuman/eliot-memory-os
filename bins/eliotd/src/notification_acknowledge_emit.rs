@@ -120,16 +120,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-};
+use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
     CanonicalReadClient, NOTIFICATION_STATE_MUTATION_NAME, NOTIFY_MUTATION_ACKNOWLEDGE,
-    NOTIFY_PAGE_RECORDS, NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_MUTATION, NOTIFY_PARAM_NOTIFICATION_ID,
-    NOTIFY_PARAM_PRINCIPAL, NamedReadResponse, StoreError, WriteReceipt, WriteReceiptStatus,
-    notification_read_request,
+    NOTIFY_PAGE_RECORDS, NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_MUTATION,
+    NOTIFY_PARAM_NOTIFICATION_ID, NOTIFY_PARAM_PRINCIPAL, NamedReadResponse, StoreError,
+    WriteReceipt, WriteReceiptStatus, notification_read_request,
 };
 
 use super::notification_state_emit::{

@@ -18,10 +18,9 @@ use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
     OperationId, OperationManifestDigest, OrderingScopeId, PreparedTransition, ReceiptEnvelope,
     RequestMetadata, ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceiptStatus,
-    generated_operation_manifests, operation_manifest_set_digest,
-    reactive_ledger_mutation_request, reactive_ledger_read_request,
-    resource_snapshot_mutation_request, resource_snapshot_read_request,
-    verify_canonical_request_hash,
+    generated_operation_manifests, operation_manifest_set_digest, reactive_ledger_mutation_request,
+    reactive_ledger_read_request, resource_snapshot_mutation_request,
+    resource_snapshot_read_request, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -649,9 +648,8 @@ where
 {
     let manifest_digest = operation_manifest_set_digest(&generated_operation_manifests()?)
         .map_err(|_| ReactiveServiceError::ManifestMismatch)?;
-    let admission_contract_set_digest =
-        eliot_store_api::supported_admission_contract_set_digest()
-            .map_err(ReactiveServiceError::from_store)?;
+    let admission_contract_set_digest = eliot_store_api::supported_admission_contract_set_digest()
+        .map_err(ReactiveServiceError::from_store)?;
     let scope = ScopeId::new(eliot_store_api::REACTIVE_STATE_SCOPE).map_err(|_| {
         ReactiveServiceError::InvalidField {
             field: "reactive.scope",
@@ -713,7 +711,6 @@ impl ReactiveTransitionRequest for ReactiveLedgerRequest {
     fn task_id(&self) -> Option<String> {
         self.context.task_id.clone().map(|task| task.to_string())
     }
-
 }
 
 impl ReactiveTransitionRequest for ResourceSnapshotRequest {
@@ -728,7 +725,6 @@ impl ReactiveTransitionRequest for ResourceSnapshotRequest {
     fn task_id(&self) -> Option<String> {
         self.context.task_id.clone().map(|task| task.to_string())
     }
-
 }
 
 /// Reads back the committed ledger revision for a write response.
