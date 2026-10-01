@@ -180,6 +180,12 @@ pub struct ProductProofBuildEvidence {
 impl ProductProofBuildEvidence {
     /// Binds one release build to its retained handle and the binaries that
     /// build produced.
+    ///
+    /// The constructor canonicalizes the name order and defers every
+    /// binary-set invariant — non-empty, non-blank, one name per artifact on
+    /// the target platform — to [`Self::validate`], so a record built here and
+    /// the same record read off the wire are held to one rule set rather than
+    /// two that can drift apart.
     pub fn new(
         evidence: ProductProofEvidence,
         mut binary_names: Vec<String>,
@@ -187,11 +193,6 @@ impl ProductProofBuildEvidence {
         if evidence.domain != ProductProofEvidenceDomain::Build {
             return Err(ProductProofError::BuildEvidenceWrongDomain {
                 evidence_id: evidence.evidence_id.clone(),
-            });
-        }
-        if binary_names.is_empty() {
-            return Err(ProductProofError::EmptyField {
-                field: "product_proof.build_evidence.binary_names",
             });
         }
         binary_names.sort();
@@ -203,7 +204,23 @@ impl ProductProofBuildEvidence {
         Ok(build)
     }
 
+    /// The invariants of the recorded binary set.
+    ///
+    /// This is the single validator, and [`Self::new`] is not an alternative
+    /// path past it: every field here is `pub` and `Deserialize` is derived, so
+    /// `serde_json` constructs this record directly. An invariant stated only
+    /// in the constructor would therefore hold for records built in Rust and
+    /// be absent for records read off the wire, and an empty binary set is
+    /// exactly the shape that reaches a `PASS` rollup unchallenged — the
+    /// duplicate scan over an empty `Vec` is vacuously false. The constructor
+    /// therefore owns no invariant of its own: it sorts the names into
+    /// canonical order and defers every refusal to here.
     fn validate(&self) -> Result<(), ProductProofError> {
+        if self.binary_names.is_empty() {
+            return Err(ProductProofError::EmptyField {
+                field: "product_proof.build_evidence.binary_names",
+            });
+        }
         self.evidence.validate()?;
         for name in &self.binary_names {
             valid_text(name, "product_proof.build_evidence.binary_name")
@@ -213,10 +230,29 @@ impl ProductProofBuildEvidence {
         // own binary set from a single observed artifact. The list is checked
         // against the names this record actually carries, which is a property
         // of the record and not a copy of an external expected list.
-        if self.binary_names.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(ProductProofError::DuplicateField {
-                field: "product_proof.build_evidence.binary_names",
-            });
+        //
+        // The comparison key is `trim().to_ascii_lowercase()`, and it is
+        // deliberate: this record targets a Windows release surface
+        // (`ProductProofExecutableIdentity` resolves an executable name and
+        // `eliot-finish` builds `{}.exe`), and Windows resolves filenames
+        // case-insensitively. `eliotd.exe`, `ELIOTD.EXE` and `eliotd.exe ` are
+        // ONE artifact on the target platform, so a byte-exact comparison
+        // would let a single observed binary be recorded more than once —
+        // exactly the inflation this check exists to prevent. Do NOT simplify
+        // this back to `==` or to an adjacent-pair scan: both are weaker than
+        // the invariant.
+        //
+        // The normalized key is used for the COMPARISON ONLY.
+        // `binary_names` keeps every name exactly as the build emitted it,
+        // because the record reports the observed artifact, not a normalized
+        // alias of it; a later reader must see the name that was observed.
+        let mut seen = std::collections::BTreeSet::new();
+        for name in &self.binary_names {
+            if !seen.insert(name.trim().to_ascii_lowercase()) {
+                return Err(ProductProofError::DuplicateField {
+                    field: "product_proof.build_evidence.binary_names",
+                });
+            }
         }
         Ok(())
     }
@@ -935,18 +971,46 @@ mod tests {
 
     /// The successful release build, linked as build evidence only.
     fn build_evidence(binary_names: Vec<&str>) -> ProductProofBuildEvidence {
-        let evidence = ProductProofEvidence::new(
-            ProductProofEvidenceDomain::Build,
-            "build:release-1903",
-            "nine-binary release build observed at its exact source head",
-            observed_by(),
-        )
-        .expect("build-domain evidence handle");
+        let evidence = build_domain_evidence();
         ProductProofBuildEvidence::new(
             evidence,
             binary_names.into_iter().map(str::to_owned).collect(),
         )
         .expect("release build evidence")
+    }
+
+    /// The build-domain evidence handle, without the binary set. Split out so
+    /// the tests below can build the same evidence for the wire path, which
+    /// never calls [`ProductProofBuildEvidence::new`].
+    fn build_domain_evidence() -> ProductProofEvidence {
+        ProductProofEvidence::new(
+            ProductProofEvidenceDomain::Build,
+            "build:release-1903",
+            "nine-binary release build observed at its exact source head",
+            observed_by(),
+        )
+        .expect("build-domain evidence handle")
+    }
+
+    /// The exact wire shape of a [`ProductProofBuildEvidence`] with the given
+    /// binary names.
+    ///
+    /// Built from a real record rather than hand-written, so the fixture cannot
+    /// drift from the serde surface: only `binary_names` is replaced. The
+    /// digest is carried through verbatim, which is the point of the wire
+    /// path — `serde_json` never calls [`ReportInputRevision::new`], so nothing
+    /// recomputes it, and these tests deliberately do not ask anything to be
+    /// recomputed.
+    fn build_evidence_json(binary_names: &[&str]) -> serde_json::Value {
+        let mut value = serde_json::to_value(build_evidence(vec!["eliotd.exe"]))
+            .expect("serialized build evidence fixture");
+        value["binary_names"] = serde_json::json!(
+            binary_names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<String>>()
+        );
+        value
     }
 
     fn succeeded_attempt(run_id: &str) -> ProductProofRunAttempt {
@@ -1066,25 +1130,124 @@ mod tests {
 
     /// REFUSAL: one observed artifact named twice would inflate the recorded
     /// binary set, so a duplicated list is refused.
+    ///
+    /// This is the byte-identical case. The case-insensitive and whitespace
+    /// variants of the same artifact are refused by the next test; the check is
+    /// platform-correct rather than byte-exact, so all three spellings of one
+    /// artifact are the same refusal.
     #[test]
     fn duplicated_binary_name_is_refused_1903() {
-        let evidence = ProductProofEvidence::new(
-            ProductProofEvidenceDomain::Build,
-            "build:release-1903",
-            "nine-binary release build observed at its exact source head",
-            observed_by(),
-        )
-        .expect("build-domain evidence handle");
-        let duplicated = ProductProofBuildEvidence::new(
-            evidence,
-            vec!["eliotd.exe".to_owned(), "eliotd.exe".to_owned()],
-        );
         assert!(matches!(
-            duplicated,
+            ProductProofBuildEvidence::new(
+                build_domain_evidence(),
+                vec!["eliotd.exe".to_owned(), "eliotd.exe".to_owned()],
+            ),
             Err(ProductProofError::DuplicateField {
                 field: "product_proof.build_evidence.binary_names"
             })
         ));
+    }
+
+    /// REFUSAL: on the Windows release surface this record targets, the same
+    /// artifact is nameable many ways, and every one of them is one binary.
+    ///
+    /// `eliotd.exe`, `ELIOTD.EXE`, `eliotd.exe ` and ` eliotd.exe` are the same
+    /// file to Windows. Accepting two of them as two binaries is exactly the
+    /// inflation of the recorded binary set from a single observed artifact that
+    /// the duplicate check exists to prevent, so all three variants are refused
+    /// — and the refusal is asserted on the WIRE path, where nothing but
+    /// [`ProductProofBuildEvidence::validate`] stands between the JSON and the
+    /// answer. A genuinely distinct set is admitted by the same check, which is
+    /// what makes the refusal discriminating rather than blanket.
+    #[test]
+    fn case_variant_duplicate_binary_name_is_refused_1903() {
+        for variant in [
+            vec!["eliotd.exe", "ELIOTD.EXE"],
+            vec!["eliotd.exe", "eliotd.exe "],
+            vec!["eliotd.exe", " eliotd.exe"],
+        ] {
+            let wire_record =
+                serde_json::from_value::<ProductProofBuildEvidence>(build_evidence_json(&variant))
+                    .expect("wire record deserializes; the refusal is in validate, not serde");
+            assert!(
+                matches!(
+                    wire_record.validate(),
+                    Err(ProductProofError::DuplicateField {
+                        field: "product_proof.build_evidence.binary_names"
+                    })
+                ),
+                "one artifact spelled {variant:?} must be refused as a duplicate"
+            );
+        }
+
+        // The same check admits a set of genuinely distinct artifacts, and it
+        // keeps every name exactly as the build emitted it — the normalization
+        // is for the comparison only, never the stored record.
+        let distinct = serde_json::from_value::<ProductProofBuildEvidence>(build_evidence_json(&[
+            "eliot-doctor.exe",
+            "Eliotd.exe",
+            "eliot-testd.exe",
+        ]))
+        .expect("wire record deserializes");
+        distinct.validate().expect("a distinct binary set is valid");
+        assert_eq!(
+            distinct.binary_names,
+            vec![
+                "eliot-doctor.exe".to_owned(),
+                "Eliotd.exe".to_owned(),
+                "eliot-testd.exe".to_owned()
+            ]
+        );
+    }
+
+    /// REFUSAL: a record read off the wire that names NO binary is refused.
+    ///
+    /// This is the guard against the forge and the reason the invariant lives in
+    /// [`ProductProofBuildEvidence::validate`] rather than in `new`. The record
+    /// here is built by `serde_json::from_value`, so `new` is never called: it
+    /// has all-`pub` fields and a derived `Deserialize`, and the derived
+    /// implementation is the only thing standing between a JSON document and a
+    /// validated record. Before the fix the empty list passed, because a
+    /// duplicate scan over an empty `Vec` is vacuously false — and an empty
+    /// binary set attached to an otherwise passing record rolled up as `PASS`
+    /// through [`ProductProofStatus::rollup`] and on to the projection and the
+    /// live status surface. The premise below pins that the rest of this record
+    /// is genuinely a `PASS`, so the refusal asserted after it is caused by the
+    /// empty set alone and nothing else.
+    #[test]
+    fn empty_binary_set_read_off_the_wire_is_refused_1903() {
+        let forged = serde_json::from_value::<ProductProofBuildEvidence>(build_evidence_json(&[]))
+            .expect("wire record deserializes; the refusal is in validate, not serde");
+        assert!(
+            forged.binary_names.is_empty(),
+            "premise: the forged wire record really does name no binary"
+        );
+        assert!(matches!(
+            forged.validate(),
+            Err(ProductProofError::EmptyField {
+                field: "product_proof.build_evidence.binary_names"
+            })
+        ));
+
+        // Premise: this build evidence is otherwise identical to the forged
+        // one and validates. Without it, the refusal above would not
+        // discriminate an empty set from any other property of the fixture.
+        let honest = serde_json::from_value::<ProductProofBuildEvidence>(build_evidence_json(&[
+            "eliot-doctor.exe",
+            "eliot-testd.exe",
+            "eliotd.exe",
+        ]))
+        .expect("wire record deserializes");
+        honest.validate().expect("a named binary set is valid");
+
+        // And the refusal is end-to-end: the same empty set carried by a record
+        // that genuinely rolls up as PASS can no longer reach a `PASS` rollup,
+        // so no presentation path can render it.
+        let forged_status = ProductProofStatus {
+            build_evidence: Some(forged),
+            ..observed_launch_receipt_pass()
+        };
+        assert!(!forged_status.rollup().is_pass());
     }
 
     /// POSITIVE: the caller-supplied binary set binds the record to the build
