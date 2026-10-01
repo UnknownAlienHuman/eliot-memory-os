@@ -231,6 +231,8 @@ pub use store_client::{
 #[cfg(windows)]
 pub use store_gateway::KernelStoreGateway;
 #[cfg(windows)]
+pub use store_gateway::BlobProcessStreamGatewayError;
+#[cfg(windows)]
 pub use store_gateway::NamedReadGatewayError;
 #[cfg(windows)]
 pub use store_gateway::StoreApplyRefusal;
