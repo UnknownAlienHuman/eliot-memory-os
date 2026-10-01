@@ -2,7 +2,9 @@
 use super::provider_owner::{
     ProviderOwner, require_listener_owner, require_unchanged_identity, validate_child_process,
 };
-use super::rpc_parse::{parse_response, provider_version_from_rpc, rpc_result};
+use super::rpc_parse::{
+    ResponseCeiling, parse_response, parse_response_bounded, provider_version_from_rpc, rpc_result,
+};
 use super::{RPC_PROTOCOL_VERSION, RpcRequest, RpcSocket, millis};
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
@@ -118,6 +120,37 @@ impl RpcSession {
             .await
     }
 
+    /// Issues one request whose response is admitted under `ceiling`.
+    ///
+    /// This is the bounded-capture entry point of the accepted transport
+    /// (issue #951). It differs from [`RpcSession::request`] in exactly one
+    /// way: the response is charged against an ELIOT-owned byte ceiling at the
+    /// frame boundary, before UTF-8 conversion and before any JSON `Value` is
+    /// constructed. Everything else — the versioned request id, the deadline,
+    /// the owner-liveness check, the connection-peer proof — is unchanged, so
+    /// a bounded capture cannot acquire a different transport, a different
+    /// operation identity or a weaker time bound than any other named
+    /// operation.
+    pub(super) async fn request_bounded(
+        &self,
+        operation: &'static str,
+        method: &'static str,
+        params: Value,
+        ceiling: ResponseCeiling,
+    ) -> Result<Value, AdapterError> {
+        let id = format!("{RPC_PROTOCOL_VERSION}:{operation}:{}", Uuid::new_v4());
+        let expected_id = Value::String(id.clone());
+        let payload = serde_json::to_string(&RpcRequest {
+            id,
+            method,
+            params: Some(params),
+        })
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+
+        self.request_payload(payload, expected_id, false, Some(ceiling))
+            .await
+    }
+
     async fn request_with_guard(
         &self,
         operation: &'static str,
@@ -134,7 +167,7 @@ impl RpcSession {
         })
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
 
-        self.request_payload(payload, expected_id, prove_connection_owner)
+        self.request_payload(payload, expected_id, prove_connection_owner, None)
             .await
     }
 
@@ -152,20 +185,34 @@ impl RpcSession {
         })
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
 
-        self.request_payload(payload, expected_id, true).await
+        self.request_payload(payload, expected_id, true, None)
+            .await
     }
 
+    /// Sends one payload and reads its response under the accepted transport's
+    /// time bound, plus an optional ELIOT-owned response byte ceiling.
+    ///
+    /// `ceiling` is `Some` exactly for the bounded capture path. When it is
+    /// `Some`, each received frame is charged against it *before* the binary arm
+    /// copies the frame and before either arm converts it to text, so a
+    /// provider response larger than the admitted ceiling is refused with
+    /// [`StoreError::PayloadTooLarge`](eliot_store_api::StoreError::PayloadTooLarge)
+    /// rather than being materialized and refused afterwards. When it is
+    /// `None` the previous unbounded read is unchanged: the ceiling is a
+    /// property of an admitted capture budget, and no other named operation
+    /// has one.
     async fn request_payload(
         &self,
         payload: String,
         expected_id: Value,
         prove_connection_owner: bool,
+        ceiling: Option<ResponseCeiling>,
     ) -> Result<Value, AdapterError> {
         let owner = self
             .owner
             .upgrade()
             .ok_or(AdapterError::ProviderUnavailable)?;
-        timeout(self.request_timeout, async {
+        let read_response = async -> Result<Value, AdapterError> {
             let mut socket = self.socket.lock().await;
             if prove_connection_owner {
                 let (client_local_endpoint, peer_endpoint) =
@@ -187,15 +234,28 @@ impl RpcSession {
                     .map_err(|_| AdapterError::ProviderUnavailable)?;
                 match message {
                     Message::Text(text) => {
-                        let response = parse_response(text.as_str())?;
+                        let response = match ceiling {
+                            Some(ceiling) => parse_response_bounded(text.as_str().as_bytes(), ceiling)?,
+                            None => parse_response(text.as_str())?,
+                        };
                         if response.id.as_ref() == Some(&expected_id) {
                             return rpc_result(response);
                         }
                     }
                     Message::Binary(bytes) => {
-                        let text = String::from_utf8(bytes.to_vec())
-                            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
-                        let response = parse_response(&text)?;
+                        // The bounded arm reads the frame in place: the ceiling
+                        // is charged against the borrowed slice, so an oversize
+                        // binary response is refused before `to_vec`, before
+                        // UTF-8 conversion and before the parse tree exists.
+                        let response = match ceiling {
+                            Some(ceiling) => parse_response_bounded(&bytes, ceiling)?,
+                            None => {
+                                let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
+                                    AdapterError::Serialization(error.to_string())
+                                })?;
+                                parse_response(&text)?
+                            }
+                        };
                         if response.id.as_ref() == Some(&expected_id) {
                             return rpc_result(response);
                         }
@@ -208,9 +268,15 @@ impl RpcSession {
                     Message::Close(_) => return Err(AdapterError::ProviderUnavailable),
                 }
             }
-        })
-        .await
-        .map_err(|_| AdapterError::ProviderUnavailable)?
+        };
+        // The deadline maps only its own expiry onto a transport loss. A
+        // response-size refusal is an exact, typed outcome of the admitted
+        // budget and is returned unchanged: folding it into
+        // `ProviderUnavailable` would report an over-budget source as a lost
+        // provider and let a bounded refusal read as retryable.
+        timeout(self.request_timeout, read_response)
+            .await
+            .map_err(|_| AdapterError::ProviderUnavailable)?
     }
 }
 
