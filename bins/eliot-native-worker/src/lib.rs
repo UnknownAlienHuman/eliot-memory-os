@@ -2025,6 +2025,9 @@ pub mod admitted_material {
             "attempt_id": request.get("attempt_id").cloned().unwrap_or(serde_json::Value::Null),
             "operation_id": request.get("operation_id").cloned().unwrap_or(serde_json::Value::Null),
             "route_class": request.get("route_class").cloned().unwrap_or(serde_json::Value::Null),
+            "visibility": request.get("visibility").cloned().unwrap_or(serde_json::Value::Null),
+            "privacy_class": request.get("privacy_class").cloned().unwrap_or(serde_json::Value::Null),
+            "swarm_id": request.get("swarm_id").cloned().unwrap_or(serde_json::Value::Null),
             "budget": request.get("budget").cloned().unwrap_or(serde_json::Value::Null),
             "deadline_unix_ms": request.get("deadline_unix_ms").cloned().unwrap_or(serde_json::Value::Null),
             "cancellation_policy_id": request.get("cancellation_policy_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -2285,6 +2288,11 @@ pub mod admitted_material {
                 "execute".to_owned(),
                 "inspect".to_owned(),
             ]),
+            // Owner-published legs echo the admitted claim verbatim (or
+            // `None` when the owner has not published them); never invented.
+            visibility: claim.visibility.clone(),
+            privacy_class: claim.privacy_class,
+            swarm_id: claim.swarm_id.clone(),
         };
 
         // Worker-originated reconcile and readiness for the exact admitted
