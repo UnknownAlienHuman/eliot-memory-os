@@ -9,9 +9,13 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use eliot_canonical::{CanonicalWriteEnvelope, FinishAttemptDraft, FinishEvidence};
-use eliot_change_monitor::ChangeMonitor;
+use eliot_change_monitor::{
+    Attribution, ChangeHint, ChangeKind, ChangeMonitor, ChangeMonitorError, ChangeObservation,
+    ChangeOrigin, FenceInvalidation, ResourceSnapshot,
+};
 use eliot_contracts::{
     OperationId, StateFence, TaskId, canonical_json_bytes, fences_match_exact, sha256_hex,
 };
@@ -33,6 +37,7 @@ use eliot_testd_core::{
     JobState as TestdJobState, TestdStore, TestdTerminalCompletionEvidence,
     verification_receipt_sha256,
 };
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
@@ -94,6 +99,533 @@ impl FinishAttemptError {
     pub const fn store_failure(&self) -> Option<&StoreFailure> {
         None
     }
+}
+
+/// Version of the Kernel observation transfer schema this owner ingests.
+///
+/// It binds the exact field contract below. A schema change bumps the
+/// version on the producing side instead of silently reinterpreting fields.
+/// This value tracks the Kernel ledger's `OBSERVATION_TRANSFER_FORMAT_VERSION`
+/// (issue #1824, audit 5910747803 defect #7).
+pub const KERNEL_CHANGE_TRANSFER_FORMAT_VERSION: u32 = 1;
+
+/// Descriptor of the projection that produced an ingestible transfer
+/// document. This value tracks the Kernel ledger's
+/// `OBSERVATION_TRANSFER_PROJECTION`.
+pub const KERNEL_CHANGE_TRANSFER_PROJECTION: &str = "kernel-change-ledger/v1";
+
+/// File name of the durable observation transfer beside the Kernel ledger
+/// sidecar (`.eliot/` under the Kernel work root). The Governor hydration
+/// lane reads this file to converge its owner on the Kernel projection,
+/// including across a Kernel restart.
+pub const KERNEL_CHANGE_TRANSFER_FILE_NAME: &str = "kernel-change-transfer.v1.json";
+
+/// Origin route of one transferred pending hint, mirroring the Kernel
+/// ledger's `HintOrigin` vocabulary exactly. Variant spellings are
+/// significant: the transfer is the cross-process vehicle, so a renamed
+/// route must arrive as a version bump, never as a silent reinterpretation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub enum KernelTransferHintOrigin {
+    /// Untrusted host event: a re-check hint.
+    HostEvent,
+    /// Received OS filesystem notification.
+    FilesystemNotification,
+    /// Polling inference over retained digests: not an OS/host route.
+    PollReconcile,
+}
+
+/// Verdict of one transferred unknown-origin change, mirroring the
+/// unknown-row subset of the Kernel ledger's `TransferEvidenceClass`
+/// vocabulary exactly: the origin-attribution confidence the producing lane
+/// proved. An unknown row carrying the governed-admitted class is not
+/// ingestible and refuses at parse time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+pub enum KernelTransferEvidenceClass {
+    /// An unreconciled unknown-origin change: the exact before/after pair
+    /// with no claimant.
+    UnknownUnreconciled,
+    /// An unknown-origin change the owning ledger reconciled to evidence.
+    UnknownReconciled,
+    /// A gap marker carrying only the frozen before-state its blocking duty
+    /// guards. An open gap blocks; a gap the ledger closed through a
+    /// covering observation exports reconciled with this class.
+    ObservationGap,
+}
+
+/// One pending hint for the Governor owner: the hint identity the owner
+/// confirms through its own content/Git readback instead of minting a
+/// parallel one. The claimant correlation and the producer fence generation
+/// the transfer also carries are schema-reserved for the owner-side readback
+/// leg; the pending leg below admits the hint identity only.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct KernelTransferredPendingHint {
+    /// Idempotent host-event identity.
+    pub hint_id: String,
+    /// Stable identity of the hinted resource.
+    pub resource: String,
+    /// Canonical repository-relative path of the hinted resource.
+    pub path: String,
+    /// Host event, filesystem notification, or poll-reconcile route.
+    pub origin: KernelTransferHintOrigin,
+    /// Exact host event/notification receipt, when available.
+    pub origin_ref: Option<String>,
+}
+
+/// One unknown-origin Material change for the Governor owner: the owning
+/// ledger's verdict for one exact before/after transition. The digests the
+/// transfer also carries stay in the document for the owner-side readback
+/// leg; this leg enforces the verdict itself.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct KernelTransferredUnknownChange {
+    /// Idempotent Kernel ledger identity of the unknown change.
+    pub change_id: String,
+    /// Stable identity of the changed resource.
+    pub resource: String,
+    /// Whether the owning ledger reconciled this change to evidence.
+    pub reconciled: bool,
+    /// The ledger's origin-attribution confidence for this change.
+    pub evidence_class: KernelTransferEvidenceClass,
+}
+
+/// One governed-tool original for the Governor owner: the immutable original
+/// anchor identity (the exact operation/diff identity plus the before/after
+/// revisions the ledger hashed itself) with the full
+/// Session/lease/operation/attempt/fence correlation. These rows are admitted
+/// evidence by construction.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct KernelTransferredGovernedOriginal {
+    /// Idempotent Kernel ledger identity of the governed change.
+    pub change_id: String,
+    /// Stable identity of the changed resource.
+    pub resource: String,
+    /// Canonical repository-relative path of the changed resource.
+    pub path: String,
+    /// Path before the transition, when it differs from `path`.
+    pub before_path: Option<String>,
+    /// Revision before the transition, absent for a creation.
+    pub before_revision: Option<String>,
+    /// Content digest before the transition, when the ledger retained one.
+    pub before_digest: Option<String>,
+    /// Revision after the transition, absent for a deletion.
+    pub after_revision: Option<String>,
+    /// Content digest after the transition, when the ledger retained one.
+    pub after_digest: Option<String>,
+    /// Session that owns the tool operation.
+    pub session: String,
+    /// Action lease that owns the tool operation.
+    pub action_lease: String,
+    /// Exact tool operation identity.
+    pub operation: String,
+    /// Attempt receipt that proves the tool operation.
+    pub attempt_receipt: String,
+    /// Exact material diff/artifact handle bound to the operation output.
+    pub diff_handle: String,
+}
+
+/// One unknown-to-evidence link for the Governor owner:
+/// history-preserving reconciliation evidence, never a rewrite.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct KernelTransferredReconciliation {
+    /// Immutable unknown-origin material observation being reconciled.
+    pub unknown_change_id: String,
+    /// Separate immutable evidence observation for the exact same transition.
+    pub evidence_change_id: String,
+}
+
+/// The single-owner projection export: pending hints, unknown-origin
+/// verdicts, governed originals, and reconciliation links in ledger key
+/// order, so the Governor owner rebuilds the same projection instead of
+/// answering from disconnected state (I10.21 W4; audit 5910747803 defect
+/// #7). This struct mirrors the gate-relevant sections of the Kernel
+/// ledger's `ObservationTransferDocument` field for field; where the
+/// document and this mirror disagree, the transfer producer is
+/// authoritative and this mirror must be updated, never worked around.
+/// Sections this leg does not consume (retained resource tips) and fields
+/// reserved for the owner-side readback leg are ignored by the tolerant
+/// parse below; a breaking change arrives as a format version bump, which
+/// the parse gates.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct KernelObservationTransfer {
+    /// Schema version of this document.
+    pub format_version: u32,
+    /// Descriptor of the projection that produced this document.
+    pub projection: String,
+    /// Pending hints in ledger key order.
+    pub pending_hints: Vec<KernelTransferredPendingHint>,
+    /// Unknown-origin verdicts in ledger key order.
+    pub unknown_changes: Vec<KernelTransferredUnknownChange>,
+    /// Governed-tool originals in ledger key order.
+    pub governed_originals: Vec<KernelTransferredGovernedOriginal>,
+    /// Unknown-to-evidence links in ledger key order.
+    pub reconciliations: Vec<KernelTransferredReconciliation>,
+}
+
+/// Maps a transfer-application failure to the existing typed recovery
+/// refusal. The transfer is recovery input, so a malformed document, an
+/// unroutable route, or conflicting identity claims arrive as
+/// `CompositionError::Recovery`, the same typed channel the owner rebuild
+/// uses; live-gate verdicts keep their own variants.
+fn recovery_refusal(detail: String) -> FinishAttemptError {
+    FinishAttemptError::Composition(CompositionError::Recovery(detail))
+}
+
+/// Parses one Kernel observation transfer document.
+///
+/// The version and projection are gated before anything is applied: a
+/// document from another projection or schema version is refused instead
+/// of being reinterpreted field by field.
+pub fn parse_kernel_change_transfer(
+    json: &str,
+) -> Result<KernelObservationTransfer, FinishAttemptError> {
+    let document: KernelObservationTransfer = serde_json::from_str(json).map_err(|error| {
+        recovery_refusal(format!(
+            "kernel change transfer is not a v1 observation document: {error}"
+        ))
+    })?;
+    if document.format_version != KERNEL_CHANGE_TRANSFER_FORMAT_VERSION {
+        let format_version = document.format_version;
+        return Err(recovery_refusal(format!(
+            "kernel change transfer format version {format_version} is not ingestible (expected {KERNEL_CHANGE_TRANSFER_FORMAT_VERSION})"
+        )));
+    }
+    if document.projection != KERNEL_CHANGE_TRANSFER_PROJECTION {
+        let projection = document.projection.as_str();
+        return Err(recovery_refusal(format!(
+            "kernel change transfer projection '{projection}' is not the Kernel change-ledger projection"
+        )));
+    }
+    Ok(document)
+}
+
+/// Reads one durable Kernel observation transfer file.
+///
+/// An absent file is not an error: a Kernel that never wrote a transfer
+/// leaves the Governor gate on its recovered local state, which is exactly
+/// the pre-transfer behavior. A present-but-unreadable or unparsable file
+/// refuses fail-closed instead of gating past evidence that cannot be read.
+pub fn read_kernel_change_transfer_file(
+    path: &Path,
+) -> Result<Option<KernelObservationTransfer>, FinishAttemptError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(recovery_refusal(format!(
+                "kernel change transfer at {path} is unreadable: {error}",
+                path = path.display()
+            )));
+        }
+    };
+    let json = String::from_utf8(bytes).map_err(|error| {
+        recovery_refusal(format!("kernel change transfer is not UTF-8: {error}"))
+    })?;
+    parse_kernel_change_transfer(&json).map(Some)
+}
+
+/// Locates the durable Kernel observation transfer beside the ledger
+/// sidecar: `.eliot/` under `ELIOT_WORK_ROOT`, else under the process
+/// working directory. This mirrors the Kernel's transfer path (same
+/// deployment, same convention); the composition caller reads it through
+/// `read_kernel_change_transfer_file`.
+pub fn kernel_change_transfer_path() -> Result<PathBuf, FinishAttemptError> {
+    let root = std::env::var_os("ELIOT_WORK_ROOT").map_or_else(
+        || {
+            std::env::current_dir().map_err(|error| {
+                recovery_refusal(format!("governor work root is undeterminable: {error}"))
+            })
+        },
+        |root| Ok(PathBuf::from(root)),
+    )?;
+    Ok(root.join(".eliot").join(KERNEL_CHANGE_TRANSFER_FILE_NAME))
+}
+
+/// Hydrates the Governor-owned `ChangeMonitor` from one Kernel observation
+/// transfer before the finish gate reads it (I10.21 W4; audit 5910747803
+/// defect #7: no second monitor state — this owner becomes a projection of
+/// the Kernel ledger through this entry).
+///
+/// Transferred observations are stamped with the live fence at which this
+/// owner applies them: the transfer carries only a producer generation, and
+/// no scalar-to-canonical coercion can authorize a `StateFence`, so the
+/// fence is an explicit caller input, never derived from the document.
+///
+/// Section routing (I10.21: "Filesystem notification alone is a hint.
+/// Git/content checksum/re-read supplies evidence. Unknown-origin Material
+/// mutation blocks governed acceptance until reconciled"): pending hints are
+/// admitted pending through `ingest_hint`, so the gate blocks until the
+/// owner-side content/Git readback confirms them; governed originals are
+/// admitted as evidence through `ingest_governed_tool_mutation`;
+/// reconciliation links are applied through `reconcile_unknown_change`
+/// whenever both sides are locally projected. Every row is validated by
+/// those existing entries; their typed failures refuse here instead of
+/// merging silently, except for governed rows that only lack an admitted
+/// baseline, which are skipped for the next hydration retry (governed
+/// evidence never blocks the gate). Reconciliation links whose sides are
+/// not locally projected honor the owning ledger's resolved verdict; an
+/// unreconciled unknown or open gap marker this owner cannot project
+/// refuses with `UnreconciledMaterialChange`.
+///
+/// Caller: `GovernorComposition::prepare_finish_decision`
+/// (`composition.rs`, which owns `&mut self.owners.change_monitor`) reads
+/// the transfer via `read_kernel_change_transfer_file` and calls this entry
+/// with the live identity fence immediately before the
+/// `has_pending_hints`/`has_unknown_material_change` checks below, so the
+/// gate answers from the hydrated projection. A failed hydration refuses
+/// the finish; the gate never runs after it.
+pub fn hydrate_change_monitor_from_kernel_transfer(
+    monitor: &mut ChangeMonitor,
+    fence: &StateFence,
+    transfer: &KernelObservationTransfer,
+) -> Result<(), FinishAttemptError> {
+    hydrate_transfer_hints(monitor, fence, transfer)?;
+    hydrate_transfer_governed(monitor, fence, transfer)?;
+    hydrate_transfer_reconciliations(monitor, transfer)?;
+    hydrate_transfer_unknowns(monitor, transfer)
+}
+
+/// Admits every transferred pending hint through the existing hint entry.
+/// Admission is idempotent: an identical replay is accepted by the entry,
+/// while the same identity with different content refuses instead of
+/// merging.
+fn hydrate_transfer_hints(
+    monitor: &mut ChangeMonitor,
+    fence: &StateFence,
+    transfer: &KernelObservationTransfer,
+) -> Result<(), FinishAttemptError> {
+    for hint in &transfer.pending_hints {
+        let origin = match hint.origin {
+            KernelTransferHintOrigin::HostEvent => ChangeOrigin::HostEvent,
+            KernelTransferHintOrigin::FilesystemNotification => {
+                ChangeOrigin::FilesystemNotification
+            }
+            // A poll-reconcile row is a polling inference, never an OS/host
+            // route: coercing it would repeat audit 5910747803 defect #2, so
+            // the hydration refuses and finish stays blocked instead.
+            KernelTransferHintOrigin::PollReconcile => {
+                let hint_id = hint.hint_id.as_str();
+                return Err(recovery_refusal(format!(
+                    "kernel change transfer hint '{hint_id}' uses a poll-reconcile route, which cannot confirm a host/filesystem hint"
+                )));
+            }
+        };
+        let observation_hint = ChangeHint {
+            hint_id: hint.hint_id.clone(),
+            state_fence: fence.clone(),
+            resource_ref: hint.resource.clone(),
+            path: hint.path.clone(),
+            origin,
+            origin_ref: hint.origin_ref.clone(),
+        };
+        monitor.ingest_hint(observation_hint).map_err(|error| {
+            let hint_id = hint.hint_id.as_str();
+            recovery_refusal(format!(
+                "kernel change transfer hint '{hint_id}' is not admittable: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Admits every transferred governed original through the existing narrow
+/// governed-mutation entry after that entry's own validation.
+fn hydrate_transfer_governed(
+    monitor: &mut ChangeMonitor,
+    fence: &StateFence,
+    transfer: &KernelObservationTransfer,
+) -> Result<(), FinishAttemptError> {
+    for original in &transfer.governed_originals {
+        let observation = governed_transfer_observation(fence, original)?;
+        if let Err(error) = observation.validate() {
+            let change_id = original.change_id.as_str();
+            return Err(recovery_refusal(format!(
+                "kernel change transfer governed original '{change_id}' is malformed: {error}"
+            )));
+        }
+        match monitor.ingest_governed_tool_mutation(observation) {
+            // Admitted rows merge; only the missing-baseline refusal defers:
+            // the narrow entry cannot project a first mutation until this
+            // owner has admitted a verified baseline ("The first mutation of
+            // a resource cannot pass until that owner has admitted a verified
+            // baseline"), and governed evidence never blocks the gate, so the
+            // row is skipped for the next hydration retry instead of wedging
+            // finish. Every other typed failure refuses: conflicting or
+            // otherwise unprojectable evidence must not merge silently
+            // (audit 5910747803 defect #4).
+            Ok(_) | Err(ChangeMonitorError::InvalidGovernedMutationReceipt) => {}
+            Err(error) => {
+                let change_id = original.change_id.as_str();
+                return Err(recovery_refusal(format!(
+                    "kernel change transfer governed original '{change_id}' cannot be projected: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Builds the Governor projection row for one transferred governed
+/// original: the exact operation/diff identity plus the before/after
+/// revisions the ledger hashed, correlated to Session, `ActionLease`, tool
+/// operation, attempt receipt, and diff handle (I10.21 W3/W5).
+fn governed_transfer_observation(
+    fence: &StateFence,
+    original: &KernelTransferredGovernedOriginal,
+) -> Result<ChangeObservation, FinishAttemptError> {
+    let before = original.before_revision.as_ref().map(|revision| {
+        let path = original
+            .before_path
+            .as_ref()
+            .unwrap_or(&original.path)
+            .clone();
+        ResourceSnapshot {
+            resource_ref: original.resource.clone(),
+            revision: revision.clone(),
+            path: Some(path),
+            symbol: None,
+            content_digest: original.before_digest.clone(),
+            structural_digest: None,
+        }
+    });
+    let after = original
+        .after_revision
+        .as_ref()
+        .map(|revision| ResourceSnapshot {
+            resource_ref: original.resource.clone(),
+            revision: revision.clone(),
+            path: Some(original.path.clone()),
+            symbol: None,
+            content_digest: original.after_digest.clone(),
+            structural_digest: None,
+        });
+    let kind = match (&before, &after) {
+        (None, None) => {
+            let change_id = original.change_id.as_str();
+            return Err(recovery_refusal(format!(
+                "kernel change transfer governed original '{change_id}' carries neither a before nor an after revision"
+            )));
+        }
+        (None, Some(_)) => ChangeKind::Created,
+        (Some(_), None) => ChangeKind::Deleted,
+        (Some(before_snapshot), Some(after_snapshot)) => {
+            if before_snapshot.path == after_snapshot.path {
+                ChangeKind::Modified
+            } else {
+                ChangeKind::Renamed
+            }
+        }
+    };
+    Ok(ChangeObservation {
+        change_id: original.change_id.clone(),
+        state_fence: fence.clone(),
+        kind,
+        before,
+        after,
+        origin: ChangeOrigin::ProcessToolReceipt,
+        // Receipt-linked, never exact: the Kernel ledger hashed the tracked
+        // bytes and bound the correlation; this owner projects that linkage
+        // without claiming it performed the reads itself.
+        attribution: Attribution::ReceiptLinked,
+        origin_ref: Some(original.attempt_receipt.clone()),
+        session_ref: Some(original.session.clone()),
+        action_lease_ref: Some(original.action_lease.clone()),
+        operation_ref: Some(original.operation.clone()),
+        diff_or_artifact_ref: Some(original.diff_handle.clone()),
+        unknown_origin: false,
+        // I10.21 requires State Fence invalidations to be recorded for
+        // observed changes. The invalidation is stamped at the live fence
+        // where this owner first observes the mutation: prior decisions on
+        // the resource at this fence may no longer apply.
+        invalidations: vec![FenceInvalidation {
+            dependency: format!("resource:{resource}", resource = original.resource),
+            state_fence: fence.clone(),
+            reason_ref: original.attempt_receipt.clone(),
+        }],
+    })
+}
+
+/// Applies every transferred reconciliation link through the existing
+/// reconciliation entry whenever both sides are locally projected. Links
+/// whose sides this owner has not projected honor the owning ledger's
+/// resolved verdict (the unknowns leg below continues past resolved rows);
+/// anything else refuses, because an unverifiable link must not clear a
+/// blocker and an unreconciled unknown must not pass silently.
+fn hydrate_transfer_reconciliations(
+    monitor: &mut ChangeMonitor,
+    transfer: &KernelObservationTransfer,
+) -> Result<(), FinishAttemptError> {
+    let snapshot = monitor.snapshot();
+    let projected: BTreeSet<&str> = snapshot
+        .observations
+        .iter()
+        .map(|record| record.observation.change_id.as_str())
+        .collect();
+    for link in &transfer.reconciliations {
+        if projected.contains(link.unknown_change_id.as_str())
+            && projected.contains(link.evidence_change_id.as_str())
+        {
+            monitor
+                .reconcile_unknown_change(&link.unknown_change_id, &link.evidence_change_id)
+                .map_err(|error| {
+                    let unknown_change_id = link.unknown_change_id.as_str();
+                    let evidence_change_id = link.evidence_change_id.as_str();
+                    recovery_refusal(format!(
+                        "kernel change transfer reconciliation '{unknown_change_id}' <- '{evidence_change_id}' is invalid: {error}"
+                    ))
+                })?;
+            continue;
+        }
+        let resolved = transfer
+            .unknown_changes
+            .iter()
+            .find(|unknown| unknown.change_id == link.unknown_change_id)
+            .is_some_and(|unknown| unknown.reconciled);
+        if !resolved {
+            let unknown_change_id = link.unknown_change_id.as_str();
+            let evidence_change_id = link.evidence_change_id.as_str();
+            return Err(recovery_refusal(format!(
+                "kernel change transfer reconciliation '{unknown_change_id}' <- '{evidence_change_id}' names observations this owner has not projected"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Enforces the transfer's unknown-origin blockers against the hydrated
+/// projection (I10.21: "Unknown-origin Material mutation blocks governed
+/// acceptance until reconciled, but does not crash unrelated modules").
+/// A row the owning ledger reconciled — including a gap marker closed by a
+/// covering observation, which exports reconciled with the gap class — is
+/// not a blocker. When this owner already projects an unreconciled unknown
+/// for the resource, the gate below refuses on that local state. Otherwise
+/// the transfer's own verdict is the block: this owner holds no observation
+/// that could clear it, so finishing would accept past an unreconciled
+/// Material mutation it cannot see.
+fn hydrate_transfer_unknowns(
+    monitor: &ChangeMonitor,
+    transfer: &KernelObservationTransfer,
+) -> Result<(), FinishAttemptError> {
+    for unknown in &transfer.unknown_changes {
+        if unknown.reconciled {
+            continue;
+        }
+        match unknown.evidence_class {
+            KernelTransferEvidenceClass::UnknownReconciled => {
+                // The owning ledger contradicts itself on this row: fail
+                // closed instead of guessing which half to trust.
+                let change_id = unknown.change_id.as_str();
+                return Err(recovery_refusal(format!(
+                    "kernel change transfer unknown change '{change_id}' is marked resolved but not reconciled"
+                )));
+            }
+            KernelTransferEvidenceClass::UnknownUnreconciled
+            | KernelTransferEvidenceClass::ObservationGap => {
+                if !monitor.has_unreconciled_unknown_change_for(&unknown.resource) {
+                    return Err(FinishAttemptError::UnreconciledMaterialChange);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Governor adapter over the single task, canonical, and finish owners.
@@ -1493,6 +2025,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
                 "finish owner revision is absent; finish persistence is unavailable".to_owned(),
             )));
         }
+        // I10.21 W4 (audit 5910747803 defect #7): this gate reads the
+        // Governor-owned projection, which `GovernorComposition::prepare_finish_decision`
+        // hydrates from the durable Kernel transfer immediately before this
+        // call, so these checks answer from that projection.
         if self.change_monitor.has_pending_hints() {
             return Err(FinishAttemptError::UnverifiedChangeHint);
         }

@@ -23,6 +23,8 @@ use crate::controlboard_projection::{
 };
 use crate::finish_attempt::{
     PreparedFinishDecision, PreparedKernelExchange, current_plan_envelope,
+    hydrate_change_monitor_from_kernel_transfer, kernel_change_transfer_path,
+    read_kernel_change_transfer_file,
 };
 use crate::migration_inventory::PRODUCT_PROOF_PLAN;
 use crate::negative_memory_gate::{
@@ -6749,6 +6751,23 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
         self.refresh_from_kernel()
             .map_err(FinishAttemptError::Composition)?;
+        // I10.21 W4 (audit 5910747803 defect #7): hydrate the
+        // Governor-owned change monitor from the durable Kernel observation
+        // transfer before the finish gate reads it, so the gate answers from
+        // the Kernel ledger's projection instead of disconnected state. An
+        // absent transfer leaves the recovered local state, which is exactly
+        // the pre-transfer behavior; a present-but-unreadable transfer
+        // refuses fail-closed, and transferred blockers refuse through the
+        // gate's own typed verdicts.
+        let fence = identity.request.metadata.state_fence.clone();
+        let transfer_path = kernel_change_transfer_path()?;
+        if let Some(transfer) = read_kernel_change_transfer_file(&transfer_path)? {
+            hydrate_change_monitor_from_kernel_transfer(
+                &mut self.owners.change_monitor,
+                &fence,
+                &transfer,
+            )?;
+        }
         self.finish_attempt_service()
             .prepare_finish_decision(identity, operation_id, draft)
     }
