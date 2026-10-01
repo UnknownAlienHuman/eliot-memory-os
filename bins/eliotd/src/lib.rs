@@ -4033,7 +4033,7 @@ impl DaemonComposition {
     /// Requires one production model route through the daemon route gate
     /// (#1957, I3.4).
     ///
-    /// This is the daemon's production call into
+    /// This is the daemon's route-gate entry into
     /// [`AgentFabric::require_model_route`]. Order is load-bearing: the
     /// caller-observed route scope is first applied as an I3.4 scope change, so
     /// a runtime, adapter, provider, or serializer change stops authorizing the
@@ -4059,6 +4059,24 @@ impl DaemonComposition {
     ///
     /// Returns [`DaemonError::Composition`] when the composition is not ready,
     /// or the gate's rejection unchanged.
+    ///
+    /// # Live status
+    ///
+    /// No production caller, and this is transitive rather than a bare
+    /// zero-call finding: the one code reference to this method is inside
+    /// `Self::drive_verified_agent_fabric`, which is itself `#[cfg(test)]`
+    /// and has no caller of its own. Measured on this tree, no code in any
+    /// crate names `drive_verified_agent_fabric` outside its own defining
+    /// line, so the route gate is exercised by the test driver only.
+    /// `bins/eliotd/src/capability_evidence_wiring.rs` records the same
+    /// measurement for this pair: the driver seam lives outside `bins/eliotd`
+    /// and the production `ProductionModelRegistryPort` reports
+    /// `PortBindingState::Missing`. So the summary sentence above is not true
+    /// of this tree — what is live is the *predicate*, reached through
+    /// [`GovernorCapabilityAdmission::admit_production_route`](crate::GovernorCapabilityAdmission::admit_production_route)
+    /// via the C1 join `gate_model_capability`, not through this rebind entry.
+    /// Whether a production caller is added here or this entry is retired is
+    /// an owner decision; no caller was invented to close the gap.
     pub fn require_admitted_model_route(
         &mut self,
         fabric: &mut AgentFabric,

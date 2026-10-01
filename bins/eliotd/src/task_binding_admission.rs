@@ -1326,6 +1326,20 @@ pub fn correlate_activation_result(
 /// absence, and no cold capture is retroactively attached here.
 ///
 /// Called by [`admit_canonical_write`] to derive its selection legs.
+///
+/// # Not yet reached (issue #1929)
+///
+/// That named caller is not live either. Measured on this tree by symbol,
+/// this constructor has **two** code references, both of them inside entries
+/// with no live caller: [`admit_bootstrap_context`] (zero call sites, disclosed
+/// on its own entry) and [`admit_canonical_write`], whose only two callers are
+/// [`admit_canonical_write_with_activation`] and
+/// `DaemonComposition::commit_canonical_and_refresh`, and that composition entry
+/// has zero production call sites. So this answer constructor is transitively
+/// dead at depth three and no typed selection leg is derived on any live daemon
+/// path. The blocking symbol is the compiled readiness receipt named in this
+/// module's "Measured reachability" section; a production caller needs that owner
+/// to exist first, and none was invented to close the gap.
 pub fn selection_response_for_receipt(
     receipt: &OnboardingReadinessReceipt,
 ) -> Result<TaskSelectionResponse, TaskBindingError> {
@@ -1485,6 +1499,21 @@ pub fn admit_task_bound(
 /// with `TASK_SELECTION_REQUIRED`. Neither arm changes a task. Called by
 /// [`admit_canonical_write`] for its task-relative leg, so the wrong
 /// workspace/task case rejects before any selection evidence is consulted.
+///
+/// # Not yet reached (issue #1929)
+///
+/// That named caller is itself unreachable. Measured on this tree by symbol,
+/// this refusal has exactly **one** code reference: the task-relative leg
+/// inside [`admit_canonical_write`], whose only callers are
+/// [`admit_canonical_write_with_activation`] and
+/// `DaemonComposition::commit_canonical_and_refresh`, and that composition entry
+/// has zero production call sites. So the wrong-workspace/wrong-task case is
+/// not rejected by this entry on any live daemon path — the ordering sentence
+/// above describes the code as written, not a behaviour production enforces
+/// today. The two stable codes stay enforced on the real write path by
+/// `eliot_store_surreal::task_binding_gate::gate_apply`, which re-derives them
+/// from the opaque proof handles the transition actually carries. No caller was
+/// invented to close the gap.
 pub fn refuse_task_identity_conflict(
     context_task_ref: Option<&str>,
     envelope_task_ref: Option<&str>,
@@ -1520,6 +1549,20 @@ pub fn refuse_task_identity_conflict(
 /// effect is withheld with `TASK_SCOPE_INCOMPATIBLE`. Called by
 /// [`admit_canonical_write`] for its task-relative leg before
 /// [`admit_task_bound`].
+///
+/// # Not yet reached (issue #1929)
+///
+/// That named caller is itself unreachable, exactly as for
+/// [`refuse_task_identity_conflict`] on the preceding leg. Measured on this
+/// tree by symbol, this refusal has exactly **one** code reference: the
+/// task-relative leg inside [`admit_canonical_write`], whose only callers are
+/// [`admit_canonical_write_with_activation`] and
+/// `DaemonComposition::commit_canonical_and_refresh`, and that composition entry
+/// has zero production call sites. So this entry is transitively dead and the
+/// "never even read the READY token" property above is a property of the code as
+/// written, not a behaviour a live daemon path currently applies. The module's
+/// "Measured reachability" section records the same fact from the caller side;
+/// no caller was invented to close the gap.
 pub fn refuse_ready_string_without_evidence(
     receipt: &OnboardingReadinessReceipt,
     has_owner_evidence: bool,
