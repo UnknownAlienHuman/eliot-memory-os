@@ -130,6 +130,11 @@ pub enum DreamerMaterialError {
     SemanticInputUnavailable,
     /// The retained Store owner response carries a malformed semantic input.
     SemanticInputStale,
+    /// The retained owner record does not carry the owner's OWN recorded
+    /// digest, byte length and artifact handle. Kept distinct from
+    /// [`Self::SemanticInputStale`] so a stale owner record is never read as a
+    /// stale semantic input, or the reverse.
+    OwnerRecordStale,
     /// A mechanical gate failed (lock poison, serialization, live authority
     /// unavailable).
     Gate(String),
@@ -151,6 +156,9 @@ impl std::fmt::Display for DreamerMaterialError {
             }
             Self::SemanticInputStale => {
                 f.write_str("the durable Dreamer semantic input reference or bytes are stale")
+            }
+            Self::OwnerRecordStale => {
+                f.write_str("the durable Dreamer owner record is not the owner's recorded value")
             }
             Self::Gate(detail) => write!(f, "dreamer launch gate failed: {detail}"),
             Self::Io(detail) => write!(f, "dreamer material file failed: {detail}"),
@@ -697,7 +705,7 @@ pub(crate) fn validate_dreamer_material(
     if let Some(owner_record) = &envelope.owner_record {
         owner_record
             .validate("owner_record.sha256")
-            .map_err(|_| DreamerMaterialError::SemanticInputStale)?;
+            .map_err(|_| DreamerMaterialError::OwnerRecordStale)?;
     }
     envelope
         .fence
