@@ -163,18 +163,18 @@ pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 10] = [
         generation: Some(schema::GENERATION_V3),
         predecessor_generation: Some(schema::GENERATION_V2),
         ddl: schema::SCHEMA_MIGRATION_V2_TO_V3_DDL,
-        disposition: BodyDisposition::DeclaredNotAdmitted,
-        note: "additive erasure-table delta; the same bytes as the ERASURE_TABLES_DDL body it aliases; declared for the v2-to-v3 step but no current admission resolves it, so the closed ordered graph of issue #1221 wave B must admit or retire it",
+        disposition: BodyDisposition::ExecutableGraph,
+        note: "additive v2-to-v3 delta; the same bytes as the ERASURE_TABLES_DDL body it aliases. Admitted so a store already carrying a schema_meta row can reach the generation its capture census is built for; it is the forward route into generation 3, while the baseline below is the empty-database route",
         pinned_sha256: None,
     },
     EmbeddedSchemaBody {
         const_name: "SCHEMA_DDL_V3",
-        migration_id: None,
+        migration_id: Some(schema::MIGRATION_ID_V3),
         generation: Some(schema::GENERATION_V3),
         predecessor_generation: None,
         ddl: schema::SCHEMA_DDL_V3,
-        disposition: BodyDisposition::DeclaredNotAdmitted,
-        note: "assembled third-generation baseline carrying no migration id; read only to census the table set of the v3 generation, never applied as a migration plan",
+        disposition: BodyDisposition::ExecutableGraph,
+        note: "third-generation fresh-database baseline; the only plan an empty database admits at the pinned generation. It carries a migration identity of its own precisely so an empty database has a legal route into generation 3, and it has no predecessor because no row precedes it; a store that already carries a row reaches the same generation through the admitted delta instead",
         pinned_sha256: None,
     },
     EmbeddedSchemaBody {
@@ -462,12 +462,12 @@ pub(crate) struct RestoreSchemaDependency {
 /// `crates/eliot-store/src/readiness.rs` `CompiledMigration::new` is the same
 /// minting point as the three adapter constructors and is therefore not a
 /// separate row.
-pub(crate) static MIGRATION_CONSTRUCTORS: [MigrationConstructor; 4] = [
+pub(crate) static MIGRATION_CONSTRUCTORS: [MigrationConstructor; 5] = [
     MigrationConstructor {
         location: "crates/storage/eliot-store-surreal-adapter/src/lib.rs::SurrealStoreAdapter::initial_schema_migration",
-        builds: &["SCHEMA_DDL", "SCHEMA_DDL_V2"],
+        builds: &["SCHEMA_DDL", "SCHEMA_DDL_V2", "SCHEMA_DDL_V3"],
         disposition: AccessDisposition::OwnerAdmitted,
-        note: "builds the fresh-database baseline plan from the published first-generation or second-generation constant, and the admission gate resolves the result",
+        note: "builds the fresh-database baseline plan from the published first-generation, second-generation or third-generation constant, and the admission gate resolves the result",
     },
     MigrationConstructor {
         location: "crates/storage/eliot-store-surreal-adapter/src/lib.rs::SurrealStoreAdapter::v1_to_v2_migration",
@@ -480,6 +480,12 @@ pub(crate) static MIGRATION_CONSTRUCTORS: [MigrationConstructor; 4] = [
         builds: &["SCHEMA_DDL_V2"],
         disposition: AccessDisposition::OwnerAdmitted,
         note: "builds the second-generation baseline plan; the only plan an empty database admits",
+    },
+    MigrationConstructor {
+        location: "crates/storage/eliot-store-surreal-adapter/src/lib.rs::SurrealStoreAdapter::v2_to_v3_migration",
+        builds: &["SCHEMA_MIGRATION_V2_TO_V3_DDL"],
+        disposition: AccessDisposition::OwnerAdmitted,
+        note: "builds the additive v2-to-v3 erasure-table plan from the published delta constant, and the admission gate resolves the result. It is the only constructor that reaches the pinned generation, so a store below it has exactly one admitted route forward rather than a second baseline",
     },
     MigrationConstructor {
         location: "crates/eliot-store/src/migration.rs::CompiledMigration::new",
