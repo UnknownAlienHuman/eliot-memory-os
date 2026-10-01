@@ -28,6 +28,21 @@ struct ProcessStreamPolicyBindingWire {
 }
 
 impl ProcessStreamPolicyBinding {
+    /// The generic P-04 policy shipped with the process executor. This policy
+    /// deliberately permits only a bounded prefix; owners that authorize a
+    /// different disclosure/retention rule must issue and seal a separate
+    /// binding on the original process intent.
+    #[must_use]
+    pub fn p04_bounded_prefix_only() -> Self {
+        Self {
+            policy_ref: "p04:stream-policy:transport-preview-v1".to_owned(),
+            privacy_ref: "p04:privacy:raw-transport-preview".to_owned(),
+            visibility_ref: "p04:visibility:operation-diagnostic".to_owned(),
+            retention_ref: "p04:retention:bounded-prefix-only".to_owned(),
+            redaction_ref: "p04:redaction:none-raw-preview".to_owned(),
+        }
+    }
+
     /// Creates the exact policy/retention/disclosure binding applied before persistence.
     pub fn new(
         policy_ref: impl Into<String>,
