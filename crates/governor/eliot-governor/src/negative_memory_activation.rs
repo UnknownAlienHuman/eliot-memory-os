@@ -758,9 +758,7 @@ pub async fn commit_negative_memory_activation<P: KernelGenerationPort + ?Sized>
             "negative-memory-activation",
             &document.document_digest()?,
         )
-        .ok_or_else(|| {
-            owner_error("activation document has no owner-issued subject to declare")
-        })?,
+        .ok_or_else(|| owner_error("activation document has no owner-issued subject to declare"))?,
         write_envelope_protocol_version:
             crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,

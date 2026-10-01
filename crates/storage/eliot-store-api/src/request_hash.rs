@@ -681,9 +681,10 @@ mod tests {
     #[test]
     fn golden_request_hash_is_stable_across_crates() {
         let view = golden_view();
-        // #1925 RE-PIN REQUIRED — the literal below is a deliberate fail-closed
-        // sentinel, NOT a digest. It must be replaced with the value
-        // `canonical_request_hash` actually emits over the current fixture.
+        // #1925 RE-PIN — the literal below is the value
+        // `canonical_request_hash` EMITTED over the current fixture, read off
+        // the owner's own failure output. It was not derived by reading this
+        // file and it was not invented; see the discipline note below.
         //
         // The previously pinned
         // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
@@ -702,17 +703,18 @@ mod tests {
         // as a failing sentinel rather than invented.
         assert_eq!(
             canonical_request_hash(&view).expect("golden hash computes"),
-"REPIN-REQUIRED-1925-NOT-A-DIGEST"
+            "05cedc381edc6a841ee071f1fd5eaba6c667dac0c14fa4262c94a740aaac51f7"
         );
     }
     // #1925: the #3977 regeneration pinned
     // `21b8b2be1415dae7f905e202725e0eb02c953d06afef64a946db7d2a19bd601c`
     // over a `golden_view` that did not yet carry the two write-intent identity
-    // members, so that literal is stale again here: both members are hash-bound
-    // and this fixture declares them. The assertion above therefore holds the
-    // re-pin sentinel rather than either predecessor — a retained digest
-    // computed under pre-binding bytes is never reinterpreted under the new
-    // bytes. See issue #3977 for the original regeneration.
+    // members, so that literal was stale again here: both members are hash-bound
+    // and this fixture declares them, and the assertion above now pins the value
+    // the owner function emits over the merged fixture rather than either
+    // predecessor — a retained digest computed under pre-binding bytes is never
+    // reinterpreted under the new bytes. See issue #3977 for the original
+    // regeneration.
     //
     // #3977 also required the two cross-crate references that cite this vector
     // by name (`eliot-store-surreal-adapter/src/plan.rs`,
