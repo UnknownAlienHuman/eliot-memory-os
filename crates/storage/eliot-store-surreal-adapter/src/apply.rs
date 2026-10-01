@@ -1069,16 +1069,12 @@ pub(crate) async fn apply_sequence_disposition(
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
     let _admission = adapter.exclusive_admission.ordinary_write().await;
-    let expected_ordering_heads = if request.choice.dispositions_reserved_position() {
-        request.expected_ordering_heads
-    } else {
-        // A dependent-only choice records its complete bounded outcomes but
-        // does not disposition the gap's reserved position. Its exact current
-        // heads were read and bound above; no canonical head is advanced and
-        // ORS retains the affected-scope block until a later skip/replace
-        // receipt is reconciled.
-        Vec::new()
-    };
+    // Every choice compares the complete head set again inside the same
+    // transaction that stores the owner decision. For `cancel_dependents` the
+    // prepared transition has no ordering scopes, so these predicates are
+    // read-only and do not advance a head; skip/replace declare all affected
+    // scopes and advance them atomically with the control receipt.
+    let expected_ordering_heads = request.expected_ordering_heads;
     Box::pin(apply_with_retry(
         adapter,
         db,
