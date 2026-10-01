@@ -108,7 +108,12 @@ fn transition_with(tag: &str) -> PreparedTransition {
         ordering_scopes: vec![OrderingScopeId::new(format!("scope-991-{tag}")).unwrap()],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        // The owner's own computed value, never a literal: `PreparedTransition::validate`
+        // refuses with `ManifestMismatch` unless this equals
+        // `supported_admission_contract_set_digest()`, so a hard-coded digest here rots the
+        // moment the supported set changes and the failure looks like a fixture problem.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("the supported admission contract set digest is owner-computed"),
         operation_manifest_digest: OperationManifestDigest::new(format!("manifest-991-{tag}"))
             .unwrap(),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
