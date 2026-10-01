@@ -8066,4 +8066,72 @@ mod tests {
         request.snapshot_json = "{".to_owned();
         assert!(request.validate().is_err());
     }
+
+    #[test]
+    fn issue_1814_registration_carrier_preserves_original_operator_identity() {
+        let state_fence = fence();
+        let request_id = RequestId::new("issue-1814-registration-request").expect("request id");
+        let request_identity = RequestIdentity {
+            request: RequestBinding {
+                metadata: RequestMetadata {
+                    request_id: request_id.clone(),
+                    session_id: None,
+                    task_id: None,
+                    product_id: ProductId::new("eliot-cli").expect("product id"),
+                    source_id: SourceId::new("operator-registration").expect("source id"),
+                    state_fence: state_fence.clone(),
+                    clock: ClockReading::default(),
+                },
+                state_fence: state_fence.clone(),
+            },
+            idempotency_key: "issue-1814-registration-idempotency".to_owned(),
+            deadline_unix_ms: 99_999,
+            cancellation_id: "issue-1814-registration-cancel".to_owned(),
+        };
+        let invocation = InstrumentRegistryRegistrationInvocation {
+            wire_id: InstrumentRegistryRegistrationInvocation::WIRE_ID.to_owned(),
+            wire_version: InstrumentRegistryRegistrationInvocation::WIRE_VERSION,
+            request_identity: request_identity.clone(),
+            snapshot_json: "{}".to_owned(),
+        };
+        let envelope = HostRequestEnvelope {
+            wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: HostRequestEnvelope::CONTRACT_VERSION,
+            kind: HostRequestKind::InstrumentRegistryRegistration,
+            connection_id: "issue-1814-connection".to_owned(),
+            identity: HostRequestIdentity {
+                request_id: request_id.clone(),
+                correlation_projection: Some(eliot_contracts::HostCorrelationProjection::Opaque {
+                    domain: eliot_contracts::HostCorrelationDomain::Request,
+                    occurrence: request_id.to_string(),
+                }),
+                idempotency_key: request_identity.idempotency_key.clone(),
+                cancellation_id: request_identity.cancellation_id.clone(),
+                parent_operation_id: None,
+                deadline_unix_ms: request_identity.deadline_unix_ms,
+                capability: "instrument_registry.register".to_owned(),
+                session_id: None,
+                task_id: None,
+                work_scope_id: Some("scope-1814".to_owned()),
+                payload_schema_id: InstrumentRegistryRegistrationInvocation::PAYLOAD_SCHEMA_ID
+                    .to_owned(),
+                payload_sha256: invocation.action_payload_sha256().expect("action digest"),
+            },
+            state_fence,
+            descriptor_sha256: String::new(),
+            peer_admission_receipt_sha256: String::new(),
+            authenticated_source: Some(HostRequestAuthenticatedSource::Operator {
+                request_identity: request_identity.clone(),
+            }),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        }
+        .with_computed_digest()
+        .expect("envelope digest");
+        assert!(invocation.validate_for_envelope(&envelope).is_ok());
+
+        let mut substituted = invocation;
+        substituted.request_identity.idempotency_key.push_str("-forged");
+        assert!(substituted.validate_for_envelope(&envelope).is_err());
+    }
 }
