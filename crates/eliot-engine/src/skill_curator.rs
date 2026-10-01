@@ -5,10 +5,11 @@ use crate::{
 };
 use eliot_types::{
     AgentId, CommandContext, ForgettingOperator, ForgettingReason, LifecycleStatus, ProjectId,
-    SemanticCommand, SkillArchiveProposal, SkillCardV2, SkillCurationAction,
-    SkillCurationDecisionKind, SkillCurationExpectedEffect, SkillCurationGateDecision,
-    SkillCurationGateReason, SkillCurationProposal, SkillCurationReason, SkillCurationReceipt,
-    SkillCurationRisk, SkillCurationRollbackPlan, SkillCuratorRun, SkillCuratorRunStatus, SkillId,
+    SemanticCommand, SkillArchiveProposal, SkillCardV2, SkillContextMeasurementProjection,
+    SkillContextStuDelta, SkillCurationAction, SkillCurationDecisionKind,
+    SkillCurationExpectedEffect, SkillCurationGateDecision, SkillCurationGateReason,
+    SkillCurationProposal, SkillCurationReason, SkillCurationReceipt, SkillCurationRisk,
+    SkillCurationRollbackPlan, SkillCuratorRun, SkillCuratorRunStatus, SkillId,
     SkillLifecycleState, SkillMergeProposal, SkillPatchProposal, SkillQuarantineProposal,
     SkillReplayRequirement, SkillScopeRule, SkillSplitProposal, TaintClass, TaskId,
     ToolObservationRecordCommand, Visibility, WriteId, WriteReceiptRef,
@@ -593,7 +594,7 @@ fn base_proposal(
         expected_effect: SkillCurationExpectedEffect {
             summary: summary.to_owned(),
             utility_delta: expected_utility_delta(action),
-            context_cost_delta_tokens: expected_context_delta(action, skill),
+            context_cost_delta_stu: expected_context_delta(action, skill),
             risk_delta: expected_risk_delta(action),
         },
         risks: vec![SkillCurationRisk {
@@ -647,17 +648,31 @@ fn duplicate_skill_groups(skills: &[SkillCardV2]) -> Vec<Vec<SkillId>> {
         .collect()
 }
 
-/// Canonical measured Skill context cost in unvalidated STU.
+/// Canonical measured Skill context cost as a typed, unit-qualified projection.
 ///
 /// Delegates to the single #704 owner in `skill.rs`, so the curator and
 /// `skill.rs` yield the identical measurement for the same Skill revision and
 /// serialized bytes. A serialization or measurement failure is not a small
-/// cost: it yields `None`, which every caller below treats as "cost unknown",
-/// never as zero, cheap or preferred.
-fn measured_skill_context_cost(skill: &SkillCardV2) -> Option<u64> {
+/// cost: it yields
+/// [`SkillContextMeasurementStatus::Unavailable`](eliot_types::SkillContextMeasurementStatus::Unavailable),
+/// which every caller below reads as "cost unknown", never as zero, cheap or
+/// preferred.
+fn measured_skill_context_measurement(
+    skill: &SkillCardV2,
+) -> SkillContextMeasurementProjection {
     measure_skill_context_envelope(skill)
-        .ok()
-        .map(|measurement| measurement.estimated_context_cost())
+        .map(|measurement| measurement.projection_or_unavailable(skill))
+        .unwrap_or_else(|_| {
+            SkillContextMeasurementProjection::unavailable(&skill.skill_id, &skill.version)
+        })
+}
+
+/// The conservative STU this Skill envelope measured, if it measured one.
+///
+/// `None` for an unavailable projection, so no caller can read "not measured"
+/// as a cost of zero.
+fn measured_skill_context_cost(skill: &SkillCardV2) -> Option<u64> {
+    measured_skill_context_measurement(skill).stu_value()
 }
 
 fn low_utility_high_cost(skill: &SkillCardV2) -> bool {
@@ -712,19 +727,35 @@ fn expected_utility_delta(action: SkillCurationAction) -> f64 {
     }
 }
 
-fn expected_context_delta(action: SkillCurationAction, skill: &SkillCardV2) -> i64 {
-    // Unchanged divisors and thresholds. Unknown canonical evidence yields no
-    // claimed saving: the delta stays zero rather than an invented reduction.
+/// Expected curation effect on the Skill envelope, in conservative STU.
+///
+/// The return type is [`SkillContextStuDelta`], so the unit travels with the
+/// number: this can no longer be published as a token count. There is no
+/// route/model/tokenizer observation over a `SkillCardV2` envelope, so no
+/// actual-token delta exists here and none is expressed (#880 AUD2).
+///
+/// Unchanged divisors. Unknown canonical evidence yields no claimed saving:
+/// the delta stays zero rather than an invented reduction, and zero here means
+/// "no measured envelope changed", not "the envelope is free".
+fn expected_context_delta(
+    action: SkillCurationAction,
+    skill: &SkillCardV2,
+) -> SkillContextStuDelta {
     let Some(cost) = measured_skill_context_cost(skill) else {
-        return 0;
+        return SkillContextStuDelta::ZERO;
     };
     let cost = i64::try_from(cost).unwrap_or(i64::MAX);
-    match action {
-        SkillCurationAction::Keep | SkillCurationAction::Promote => 0,
-        SkillCurationAction::Patch => -cost / 10,
-        SkillCurationAction::Merge | SkillCurationAction::Split => -cost / 4,
-        SkillCurationAction::Archive | SkillCurationAction::Quarantine => -cost,
-    }
+    let magnitude = match action {
+        SkillCurationAction::Keep | SkillCurationAction::Promote => SkillContextStuDelta::ZERO,
+        SkillCurationAction::Patch => SkillContextStuDelta(cost).divided_by_stu(10),
+        SkillCurationAction::Merge | SkillCurationAction::Split => {
+            SkillContextStuDelta(cost).divided_by_stu(4)
+        }
+        SkillCurationAction::Archive | SkillCurationAction::Quarantine => {
+            SkillContextStuDelta(cost)
+        }
+    };
+    magnitude.negated_stu()
 }
 
 fn expected_risk_delta(action: SkillCurationAction) -> f64 {

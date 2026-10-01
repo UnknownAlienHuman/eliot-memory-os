@@ -5,10 +5,13 @@ use eliot_types::{
     AgentId, CommandContext, EpistemicStatus, ExperienceMaturityState, ExperiencePattern,
     ForgettingOperator, ForgettingPolicy, ForgettingReason, LifecycleStatus, MemoryEcologyDecision,
     MemoryLifecycleState, ProcedurePromotionOutcome, ProjectId, SemanticCommand,
-    SkillActivationDecision, SkillActivationRecord, SkillCardV2, SkillDistractorFilter,
-    SkillExecutionOutcome, SkillExecutionProof, SkillId, SkillInfluenceReport, SkillInputSource,
-    SkillLifecycleRecord, SkillLifecycleState, SkillNeedEstimate, SkillNeedVerdict, TaintClass,
-    TaskId, ToolObservationRecordCommand, VerifierPlan, Visibility, WriteId, WriteReceiptRef,
+    SKILL_CONTEXT_MEASUREMENT_SCHEMA_VERSION, SkillActivationDecision, SkillActivationRecord,
+    SkillCardV2, SkillContextMeasurementProjection, SkillContextMeasurementStatus,
+    SkillContextMeasurementUnit, SkillDistractorFilter, SkillExecutionOutcome,
+    SkillExecutionProof, SkillId, SkillInfluenceReport, SkillInputSource, SkillLifecycleRecord,
+    SkillLifecycleState, SkillNeedEstimate, SkillNeedVerdict, TaintClass, TaskId,
+    ToolObservationRecordCommand, VerifierPlan, Visibility, WriteId, WriteReceiptRef,
+    sum_skill_context_stu,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -230,11 +233,15 @@ impl SkillLifecycleService {
             successes: skill.success_count,
             failures: skill.failure_count,
             // A serialization or measurement failure leaves the canonical cost
-            // unknown (`None`). It never becomes zero, a minimum-one estimate,
-            // or any local `/4` ratio.
-            context_cost: measurement
+            // typed-absent (`SkillContextMeasurementStatus::Unavailable` with
+            // no value). It never becomes zero, a minimum-one estimate, any
+            // local `/4` ratio, or a number that reads as an enormous cost.
+            context_measurement: measurement
                 .as_ref()
-                .map(SkillContextEnvelopeMeasurement::estimated_context_cost),
+                .map_or_else(
+                    || SkillContextMeasurementProjection::unavailable(&skill.skill_id, &skill.version),
+                    |measurement| measurement.projection_or_unavailable(skill),
+                ),
             last_verified: skill.last_verified_at,
             where_applies: skill.applies_when.clone(),
             where_not_apply: skill.does_not_apply_when.clone(),
@@ -750,50 +757,53 @@ pub struct SkillInfluenceReportInput {
     pub executed: Vec<SkillId>,
     pub execution_proofs: Vec<String>,
     /// Exact `SkillCardV2` envelopes whose canonical #704 measurements back
-    /// `SkillInfluenceReport::estimated_context_cost`.
+    /// `SkillInfluenceReport::context_measurement`.
     ///
-    /// A bare caller-supplied integer is no longer accepted: the report's
-    /// context cost is the sum of the canonical unvalidated STU over these
-    /// exact serialized bytes. `None` means the measurement is unknown or
-    /// unavailable, never zero and never a caller-declared value.
+    /// A bare caller-supplied integer is not accepted: the report's context
+    /// cost is the checked aggregate of the canonical unvalidated STU
+    /// projections over these exact serialized bytes, in the unit and status
+    /// of its parts. `None` means the measurement is unknown or unavailable,
+    /// never zero and never a caller-declared value.
     pub measured_skills: Option<Vec<SkillCardV2>>,
 }
 
 impl SkillInfluenceReportInput {
     /// Canonical aggregate context cost for the reported Skill set.
     ///
-    /// Every measured Skill contributes its own canonical record, so the same
-    /// Skill revision always contributes the same amount. `Ok(None)` means no
-    /// Skill bytes were supplied (measurement absent); a serialization or
-    /// measurement failure is a typed `Err` rather than a silent drop that
-    /// would report a cheaper value.
-    fn canonical_context_cost(&self) -> Result<Option<u64>, EngineError> {
+    /// Every measured Skill contributes its own typed projection, so the same
+    /// Skill revision always contributes the same amount and the aggregate
+    /// seals over the ordered chain of the parts' content digests. `Ok(None)`
+    /// means no Skill bytes were supplied (measurement absent); a
+    /// serialization or measurement failure is a typed `Err` rather than a
+    /// silent drop that would report a cheaper value.
+    fn canonical_context_cost(
+        &self,
+    ) -> Result<Option<SkillContextMeasurementProjection>, EngineError> {
         let Some(skills) = self.measured_skills.as_ref() else {
             return Ok(None);
         };
-        let mut total = 0_u64;
+        let mut projections = Vec::with_capacity(skills.len());
         for skill in skills {
             let measurement = measure_skill_context_envelope(skill)?;
-            total = total
-                .checked_add(measurement.estimated_context_cost())
-                .ok_or(ContextError::Overflow)?;
+            projections.push(measurement.projection());
         }
-        Ok(Some(total))
+        sum_skill_context_stu(&projections)
+            .map_err(|error| EngineError::WriteRejected(error.to_string()))
     }
 }
 
 impl SkillInfluenceService {
     /// Builds the influence report from canonical #704 measurements only.
     ///
-    /// `SkillInfluenceReport::estimated_context_cost` is the sum of the exact
-    /// serialized envelope measurements of `input.measured_skills`. Absent
-    /// Skill bytes or a serialization/measurement failure is an explicitly
+    /// `SkillInfluenceReport::context_measurement` is the checked aggregate of
+    /// the exact serialized envelope measurements of `input.measured_skills`,
+    /// in the unit and status of its parts. Absent Skill bytes, a
+    /// serialization/measurement failure or a checked overflow is an explicitly
     /// unavailable cost: the report is never produced with a zero, a
-    /// caller-declared or a `/4` cost. `SkillInfluenceReport` carries no
-    /// `Option`/`Result` on this field and its consumers are non-fallible, so
-    /// the unavailable state is reported as the typed sentinel
-    /// [`CONTEXT_COST_UNAVAILABLE`] rather than as a measurement that could be
-    /// mistaken for a real one.
+    /// caller-declared, a `/4`, or a `u64::MAX` cost. That sentinel is gone
+    /// (#880 AUD2 repair 2): the owning type can express absence, so absence is
+    /// expressed as absence instead of as an enormous number that a consumer
+    /// could add, sum, compare to a budget or persist.
     pub fn report(input: SkillInfluenceReportInput) -> SkillInfluenceReport {
         let included_set = input.included.iter().copied().collect::<BTreeSet<_>>();
         let excluded = input
@@ -802,11 +812,18 @@ impl SkillInfluenceService {
             .copied()
             .filter(|skill_id| !included_set.contains(skill_id))
             .collect();
-        let estimated_context_cost = input
-            .canonical_context_cost()
-            .ok()
-            .flatten()
-            .unwrap_or(CONTEXT_COST_UNAVAILABLE);
+        let unavailable_skill_ref = input
+            .considered
+            .first()
+            .copied()
+            .unwrap_or_else(SkillId::new_v7);
+        let context_measurement = match input.canonical_context_cost() {
+            Ok(Some(aggregate)) => aggregate,
+            Ok(None) | Err(_) => SkillContextMeasurementProjection::unavailable(
+                &unavailable_skill_ref,
+                SKILL_CONTEXT_MEASUREMENT_SCHEMA_VERSION,
+            ),
+        };
         SkillInfluenceReport {
             report_id: format!("skill-influence-{}", WriteId::new_v7()),
             project_id: input.project_id,
@@ -817,7 +834,7 @@ impl SkillInfluenceService {
             skills_excluded: excluded,
             skills_executed: input.executed,
             execution_proofs: input.execution_proofs,
-            estimated_context_cost,
+            context_measurement,
             observed_decision_delta: None,
             created_at: OffsetDateTime::now_utc(),
             write_receipt: None,
@@ -1027,17 +1044,6 @@ pub(crate) fn measure_skill_context_envelope(
     })
 }
 
-/// Reported aggregate context cost when no canonical measurement exists.
-///
-/// This is a sentinel, not a measurement: it is deliberately outside the range
-/// any real STU total can occupy, so a consumer comparing a reported cost
-/// against a budget can never mistake "unmeasured" for "free" or for a small
-/// number. It is only used where the owning type cannot express absence
-/// (`SkillInfluenceReport::estimated_context_cost` is a plain `u64` consumed by
-/// non-fallible callers); every path that CAN express absence uses `None` or a
-/// typed error instead.
-pub(crate) const CONTEXT_COST_UNAVAILABLE: u64 = u64::MAX;
-
 /// Deterministic #704 measurement record for one Skill revision.
 ///
 /// Every field is a pure function of the Skill ID/version and the exact
@@ -1058,10 +1064,50 @@ pub(crate) struct SkillContextEnvelopeMeasurement {
 }
 
 impl SkillContextEnvelopeMeasurement {
-    /// Canonical unvalidated planning estimate; never a current token count.
+    /// The typed, unit-qualified projection of this measurement.
+    ///
+    /// This is the only form in which a Skill envelope's cost reaches a public
+    /// record (#880 AUD2). It seals the STU together with its unit, its status
+    /// and its serializer/profile/content binding, so the value can no longer
+    /// travel under a field name that reads as a token count, and it can no
+    /// longer be edited without invalidating its own digest.
     #[must_use]
-    pub(crate) fn estimated_context_cost(&self) -> u64 {
-        self.stu_estimate.value
+    pub(crate) fn projection(&self) -> SkillContextMeasurementProjection {
+        SkillContextMeasurementProjection::sealed(SkillContextMeasurementProjection {
+            schema_version: SKILL_CONTEXT_MEASUREMENT_SCHEMA_VERSION.to_owned(),
+            skill_ref: self.skill_ref.clone(),
+            skill_version: self.skill_version.clone(),
+            value: Some(self.stu_estimate.value),
+            unit: SkillContextMeasurementUnit::Stu,
+            status: SkillContextMeasurementStatus::UnvalidatedStu,
+            empirical: self.stu_estimate.empirical,
+            rendered_utf8_bytes: self.rendered_utf8_bytes,
+            serializer_id: self.serializer_id.clone(),
+            serializer_version: self.serializer_version.clone(),
+            serializer_options_digest: self.serializer_options_digest.clone(),
+            serializer_profile_digest: self.serializer_profile_digest.clone(),
+            content_digest: self.content_digest.clone(),
+            actual_tokens: None,
+            value_digest: String::new(),
+        })
+    }
+
+    /// The typed projection of this envelope, or typed absence.
+    ///
+    /// A serialization or measurement failure is not a small cost and not a
+    /// large one: it is [`SkillContextMeasurementStatus::Unavailable`] with no
+    /// value at all. This is the path that replaces the `u64::MAX` sentinel
+    /// (#880 AUD2 repair 2).
+    #[must_use]
+    pub(crate) fn projection_or_unavailable(
+        &self,
+        skill: &SkillCardV2,
+    ) -> SkillContextMeasurementProjection {
+        let projection = self.projection();
+        if projection.validate().is_ok() {
+            return projection;
+        }
+        SkillContextMeasurementProjection::unavailable(&skill.skill_id, &skill.version)
     }
 
     /// Full canonical binding for one measured Skill revision.

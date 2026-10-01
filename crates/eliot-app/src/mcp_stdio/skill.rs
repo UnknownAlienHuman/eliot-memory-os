@@ -78,27 +78,45 @@ pub(super) fn dispatch_skill_influence(arguments: Value) -> Result<Value> {
         execution_proofs: Vec::new(),
         measured_skills: Some(vec![skill]),
     });
-    // 783/22: `SkillInfluenceReport::estimated_context_cost` is owned by
-    // `eliot-types` and carries no qualifier of its own, so the engine's
-    // recorded figure is republished beside it through the canonical owner
-    // (row 783/21 is the same field on the CLI path). The value is the
-    // engine's own sum of #704 measurements over the exact Skill bytes
-    // supplied above; the app never re-derives it and never supplies a
-    // literal. `CONTEXT_COST_UNAVAILABLE` is a sentinel, not a measurement,
-    // so it is republished as `MeasurementStatus::Unavailable` with a null
-    // value instead of a number.
+    // 783/22: `SkillInfluenceReport::context_measurement` is owned by
+    // `eliot-types` and now carries the unit, status and evidence binding
+    // itself (#880 AUD2), so the engine's figure is republished verbatim from
+    // that projection rather than beside a hand-built qualifier. The value is
+    // the engine's own checked aggregate over the exact Skill bytes supplied
+    // above; the app never re-derives it and never supplies a literal. An
+    // unavailable measurement is republished with a null value and its own
+    // status, and there is no `u64::MAX` sentinel left that a consumer could
+    // compare against a budget as though it were an enormous cost.
+    report
+        .context_measurement
+        .validate()
+        .context("engine context measurement projection is not closed")?;
     let mut response = serde_json::to_value(&report)?
         .as_object()
         .cloned()
         .unwrap_or_default();
     response.insert(
-        "estimated_context_cost_measurement".to_owned(),
-        recorded_planning_wire(
-            "stu_estimate",
-            (report.estimated_context_cost != u64::MAX).then_some(report.estimated_context_cost),
-        ),
+        "context_measurement_wire".to_owned(),
+        recorded_context_measurement_wire(&report.context_measurement),
     );
     Ok(Value::Object(response))
+}
+
+/// 783/22: the engine's typed context measurement, republished with its own
+/// unit, status and seal so the wire form cannot disagree with the record.
+fn recorded_context_measurement_wire(
+    measurement: &SkillContextMeasurementProjection,
+) -> Value {
+    json!({
+        "schema_version": measurement.schema_version,
+        "unit": measurement.unit,
+        "status": measurement.status,
+        "empirical": measurement.empirical,
+        "value": measurement.value,
+        "rendered_utf8_bytes": measurement.rendered_utf8_bytes,
+        "content_digest": measurement.content_digest,
+        "value_digest": measurement.value_digest,
+    })
 }
 
 pub(super) async fn dispatch_skill_execution_proof(
