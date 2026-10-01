@@ -280,7 +280,16 @@ CONSUMER_SEAM_CASES: tuple[tuple[str, str, str, str], ...] = (
     ("783/11", "#783", "crates/eliot-app/src/mcp_stdio.rs", "combined_ul_tokens"),
     ("783/12", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "serialized_bytes: measurement.byte_len"),
     ("783/13", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units: measurement.stu_estimate"),
-    ("783/14", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "serialized_bytes: measurement.byte_len"),
+    # 783/14 is the legacy memory `token_units` wire that the migration ADDED
+    # beside the current plan (memory.rs:144, publishing through
+    # `legacy_memory_token_units_wire`). The bare `token_units` token is used
+    # rather than the full JSON key `legacy_token_units_measurements` because
+    # the masker blanks the string literal, so only `token_units` survives
+    # into masked source; the first masked occurrence is 144, which is
+    # distinct from 783/12 (819) and 783/13 (1007). The row stays the
+    # `bare_measurement_field_or_conversion` class the field name earns, and
+    # the key is a wire key, never a second measurement owner.
+    ("783/14", "#783", "crates/eliot-app/src/mcp_stdio/memory.rs", "token_units"),
     ("783/15", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "estimated_tokens,"),
     ("783/16", "#783", "crates/eliot-app/src/mcp_stdio/dispatch.rs", "details.section_tokens"),
     ("783/17", "#783", "crates/eliot-app/src/mcp_stdio/autonomy.rs", "runtime.ledger.cost_or_token_units"),
@@ -446,7 +455,8 @@ CONSUMER_WRITE_EDGES: dict[str, tuple[str, ...]] = {
         "serialized-after: " + INTEGRATION_OWNER + " regenerates the inventory once #704/#783/#878/#880 have merged",
     ),
     "#783": (
-        "single-writer: crates/eliot-app/src/mcp_stdio.rs, crates/eliot-app/src/mcp_stdio/{memory,dispatch,task_handlers,operator,skill}.rs and crates/eliot-app/src/commands/data_and_memory.rs are the #783 app seam",
+        "single-writer: crates/eliot-app/src/mcp_stdio.rs, crates/eliot-app/src/mcp_stdio/{autonomy,memory,dispatch,task_handlers,operator,skill}.rs, crates/eliot-app/src/commands/data_and_memory.rs and the crates/eliot-app/Cargo.toml measurement dependency edge are the #783 app seam",
+        "the crate writes every path the #783 denominator rows pin (783/15-22 include autonomy.rs) and the single manifest edge that granted the canonical measurement owner dependency; no other #783-owned path is writable",
         "parallel-with: #878 and #880, on disjoint engine paths; no shared mutable source path between the three",
         "blocked-for-others: " + _OWNED_TOML_EDGE,
         "serialized-after: #704 algorithm merge, then " + INTEGRATION_OWNER + " regeneration",
