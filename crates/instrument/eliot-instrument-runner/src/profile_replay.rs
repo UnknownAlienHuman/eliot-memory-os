@@ -164,19 +164,39 @@ impl VerifiedTestdReplayContext {
                 return Err(ProfileReplayError::StageMismatch { field });
             }
         }
-        let command = stage
-            .stage_command
-            .as_ref()
-            .ok_or(ProfileReplayError::StageMismatch {
-                field: "stage_command",
-            })?;
-        if command.executable != selected.command.executable
-            || command.argv != selected.command.argv
-            || command.spec_digest != selected.spec_digest
-        {
+        let admitted_execution = if selected.external {
+            StageExecutionKind::Process
+        } else {
+            StageExecutionKind::DecoderOnly
+        };
+        if stage.execution != admitted_execution {
             return Err(ProfileReplayError::StageMismatch {
-                field: "stage_command",
+                field: "execution",
             });
+        }
+        match admitted_execution {
+            StageExecutionKind::Process => {
+                let command = stage
+                    .stage_command
+                    .as_ref()
+                    .ok_or(ProfileReplayError::StageMismatch {
+                        field: "stage_command",
+                    })?;
+                if command.executable != selected.command.executable
+                    || command.argv != selected.command.argv
+                    || command.spec_digest != selected.spec_digest
+                {
+                    return Err(ProfileReplayError::StageMismatch {
+                        field: "stage_command",
+                    });
+                }
+            }
+            StageExecutionKind::DecoderOnly if stage.stage_command.is_none() => {}
+            StageExecutionKind::DecoderOnly => {
+                return Err(ProfileReplayError::StageMismatch {
+                    field: "stage_command",
+                });
+            }
         }
         let lifecycle =
             stage
