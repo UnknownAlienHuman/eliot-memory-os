@@ -77,6 +77,11 @@ use eliot_store_api::{
 use serde::Deserialize;
 
 use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
+use super::admission_reservation_use_route::OPERATION as ADMISSION_RESERVATION_CURRENT_USE_OPERATION;
+use super::admission_reservation_saga::{
+    INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION,
+    INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION,
+};
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
     ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
@@ -665,6 +670,13 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         // canonical owner receipt it must read is live `KernelStoreGateway`
         // IO, which the synchronous claim route structurally cannot reach.
         ADMISSION_RESERVATION_ADMIT_OPERATION => ADMISSION_RESERVATION_ADMIT_OPERATION,
+        ADMISSION_RESERVATION_CURRENT_USE_OPERATION => ADMISSION_RESERVATION_CURRENT_USE_OPERATION,
+        INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION => {
+            INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION
+        }
+        INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION => {
+            INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION
+        }
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
@@ -3157,6 +3169,45 @@ impl KernelComposition {
             return Ok(frame);
         }
         #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_EFFECT_RESERVATION_STAGE_OPERATION {
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value = self
+                .instrument_registry_effect_reservation_stage_operation(
+                    session,
+                    payload.clone(),
+                    Some(identity),
+                )
+                .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
+        #[cfg(windows)]
+        if operation == INSTRUMENT_REGISTRY_EFFECT_RESERVATION_ACTIVATE_OPERATION {
+            let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+            if identity.request.metadata.request_id != request_id
+                || identity.request.state_fence != session.module_generation.state_fence
+            {
+                return Err(TransportError::SessionFenced);
+            }
+            let value = self
+                .instrument_registry_effect_reservation_activate_operation(
+                    session,
+                    payload.clone(),
+                    Some(identity),
+                )
+                .await?;
+            let mut frame = status_frame(session, FrameKind::Response, MessageType::Result, value)?;
+            frame.request_id = Some(request_id);
+            frame.validate()?;
+            return Ok(frame);
+        }
         if operation == USER_AUTOMATION_PREFLIGHT_SELECTOR {
             // The complete preflight projection is a front-door read, not a
             // daemon-module operation: the principal comes from the
