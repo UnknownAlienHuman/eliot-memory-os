@@ -557,6 +557,12 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     pub kernel_causal_binding_json: String,
     /// SHA-256 of the exact Kernel causal binding JSON.
     pub kernel_causal_binding_sha256: String,
+    /// Canonical operation binding for the exact purpose-scoped owner effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_operation_binding_json: Option<String>,
+    /// SHA-256 of the exact operation binding JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_operation_binding_sha256: Option<String>,
     /// Digest of the authenticated outer Kernel request identity.
     pub outer_request_sha256: String,
     /// Product identity copied from the authenticated request metadata.
@@ -964,6 +970,34 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             }
             _ => return Err(WireValidationError::InvalidField("pull_purpose_fields")),
         }
+        validate_optional_canonical_owner_json_pair(
+            "kernel_operation_binding",
+            &self.kernel_operation_binding_json,
+            &self.kernel_operation_binding_sha256,
+        )?;
+        if let Some(operation_json) = &self.kernel_operation_binding_json {
+            let expected_effect = match self.purpose {
+                BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant => None,
+                BlobProcessStreamOwnerFactsPullPurpose::SourceReadback => {
+                    Some(eliot_receipts::EffectClass::Read)
+                }
+                BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission
+                | BlobProcessStreamOwnerFactsPullPurpose::StoreOpen
+                | BlobProcessStreamOwnerFactsPullPurpose::ReadyAttach => {
+                    Some(eliot_receipts::EffectClass::ReversibleMutation)
+                }
+            };
+            let operation: eliot_receipts::OperationBinding = serde_json::from_str(operation_json)
+                .map_err(|_| WireValidationError::InvalidField("kernel_operation_binding"))?;
+            if operation.operation_kind != BLOB_PROCESS_STREAM_WIRE_ID
+                || operation.state_fence != self.state_fence
+                || expected_effect.is_none_or(|effect| operation.effect != effect)
+            {
+                return Err(WireValidationError::InvalidField("kernel_operation_binding"));
+            }
+        } else if self.purpose != BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant {
+            return Err(WireValidationError::InvalidField("kernel_operation_binding"));
+        }
         if let Some(work_scope_ref) = &self.expected_work_scope_ref {
             validate_text("expected_work_scope_ref", work_scope_ref)?;
         }
@@ -1051,6 +1085,12 @@ pub struct BlobProcessStreamVerifiedOwnerFacts {
     pub work_scope_binding_json: String,
     /// SHA-256 of the exact WorkScope binding snapshot JSON.
     pub work_scope_binding_sha256: String,
+    /// Exact receipt-grade WorkScope binding, including scope, product,
+    /// generation, and fence. This is read from the WorkScope owner and is
+    /// distinct from the richer snapshot above.
+    pub work_scope_receipt_binding_json: String,
+    /// SHA-256 of the exact receipt-grade WorkScope binding JSON.
+    pub work_scope_receipt_binding_sha256: String,
     /// Matched WorkScope guard receipt JSON.
     pub matched_guard_receipt_json: String,
     /// SHA-256 of the exact matched guard receipt JSON.
@@ -1075,6 +1115,43 @@ pub struct BlobProcessStreamVerifiedOwnerFacts {
     pub authority_binding_json: String,
     /// SHA-256 of the exact authority binding JSON.
     pub authority_binding_sha256: String,
+    /// Exact operation binding for the admitted Blob Stage effect, when this
+    /// pull purpose authorizes a Stage operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_operation_binding_json: Option<String>,
+    /// SHA-256 of the Stage operation binding JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_operation_binding_sha256: Option<String>,
+    /// Exact authority binding for the admitted Blob Stage effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_authority_binding_json: Option<String>,
+    /// SHA-256 of the Stage authority binding JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_authority_binding_sha256: Option<String>,
+    /// Exact causal binding for the admitted Blob Stage effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_causal_binding_json: Option<String>,
+    /// SHA-256 of the Stage causal binding JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_causal_binding_sha256: Option<String>,
+    /// Exact operation binding for a fresh Blob Read effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_operation_binding_json: Option<String>,
+    /// SHA-256 of the Read operation binding JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_operation_binding_sha256: Option<String>,
+    /// Distinct authority binding for a fresh Blob Read effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_authority_binding_json: Option<String>,
+    /// SHA-256 of the Read authority binding JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_authority_binding_sha256: Option<String>,
+    /// Distinct causal binding for a fresh Blob Read effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_causal_binding_json: Option<String>,
+    /// SHA-256 of the Read causal binding JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_causal_binding_sha256: Option<String>,
     /// Owner-computed digest over the exact currentness input set.
     pub currentness_sha256: String,
     /// Current task binding read by the named Task owner, when the admitted
@@ -1103,6 +1180,11 @@ impl BlobProcessStreamVerifiedOwnerFacts {
                 &self.work_scope_binding_sha256,
             ),
             (
+                "work_scope_receipt_binding",
+                &self.work_scope_receipt_binding_json,
+                &self.work_scope_receipt_binding_sha256,
+            ),
+            (
                 "matched_guard_receipt",
                 &self.matched_guard_receipt_json,
                 &self.matched_guard_receipt_sha256,
@@ -1127,6 +1209,55 @@ impl BlobProcessStreamVerifiedOwnerFacts {
         ] {
             validate_canonical_owner_json(name, json, digest)?;
         }
+        let scope_binding: eliot_receipts::WorkScopeBinding = serde_json::from_str(
+            &self.work_scope_receipt_binding_json,
+        )
+        .map_err(|_| WireValidationError::InvalidField("work_scope_receipt_binding"))?;
+        if scope_binding.state_fence.resource_generation != scope_binding.resource_generation {
+            return Err(WireValidationError::InvalidField("work_scope_receipt_binding"));
+        }
+        validate_optional_canonical_owner_json_pair(
+            "stage_operation_binding",
+            &self.stage_operation_binding_json,
+            &self.stage_operation_binding_sha256,
+        )?;
+        validate_optional_canonical_owner_json_pair(
+            "stage_authority_binding",
+            &self.stage_authority_binding_json,
+            &self.stage_authority_binding_sha256,
+        )?;
+        validate_optional_canonical_owner_json_pair(
+            "stage_causal_binding",
+            &self.stage_causal_binding_json,
+            &self.stage_causal_binding_sha256,
+        )?;
+        validate_optional_canonical_owner_json_pair(
+            "read_operation_binding",
+            &self.read_operation_binding_json,
+            &self.read_operation_binding_sha256,
+        )?;
+        validate_optional_canonical_owner_json_pair(
+            "read_authority_binding",
+            &self.read_authority_binding_json,
+            &self.read_authority_binding_sha256,
+        )?;
+        validate_optional_canonical_owner_json_pair(
+            "read_causal_binding",
+            &self.read_causal_binding_json,
+            &self.read_causal_binding_sha256,
+        )?;
+        validate_effect_context_pair(
+            self.stage_operation_binding_json.as_deref(),
+            self.stage_authority_binding_json.as_deref(),
+            self.stage_causal_binding_json.as_deref(),
+            eliot_receipts::EffectClass::ReversibleMutation,
+        )?;
+        validate_effect_context_pair(
+            self.read_operation_binding_json.as_deref(),
+            self.read_authority_binding_json.as_deref(),
+            self.read_causal_binding_json.as_deref(),
+            eliot_receipts::EffectClass::Read,
+        )?;
         validate_digest("currentness_sha256", &self.currentness_sha256)?;
         validate_optional_canonical_owner_json_pair(
             "task_binding",
@@ -1441,14 +1572,58 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             owner_facts_json, ..
         } = &self.outcome
         {
-            let owner_facts: BlobProcessStreamVerifiedOwnerFacts =
-                serde_json::from_str(owner_facts_json)
-                    .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
-            if owner_facts.causal_binding_json != request.kernel_causal_binding_json
-                || owner_facts.causal_binding_sha256 != request.kernel_causal_binding_sha256
-                || owner_facts.authority_binding_json != request.kernel_authority_binding_json
-                || owner_facts.authority_binding_sha256 != request.kernel_authority_binding_sha256
+            let owner_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
+                owner_facts_json,
+            )
+            .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
+            let scope_binding: eliot_receipts::WorkScopeBinding = serde_json::from_str(
+                &owner_facts.work_scope_receipt_binding_json,
+            )
+            .map_err(|_| WireValidationError::InvalidField("work_scope_receipt_binding"))?;
+            let scope_ref = match &self.outcome {
+                BlobProcessStreamOwnerFactsPullOutcome::Available { work_scope_ref, .. } => {
+                    work_scope_ref.as_str()
+                }
+                _ => return Err(WireValidationError::InvalidField("work_scope_receipt_binding")),
+            };
+            if scope_binding.product_id.as_str() != request.product_id
+                || scope_binding.scope_id.as_str() != scope_ref
+                || scope_binding.state_fence != request.state_fence
+                || scope_binding.resource_generation != request.state_fence.resource_generation
             {
+                return Err(WireValidationError::InvalidField("work_scope_receipt_binding"));
+            }
+            let current_operation = request.kernel_operation_binding_json.as_ref();
+            let context_matches = match request.purpose {
+                BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant => true,
+                BlobProcessStreamOwnerFactsPullPurpose::SourceReadback => {
+                    owner_facts.read_operation_binding_json.as_ref() == current_operation
+                        && owner_facts.read_operation_binding_sha256.as_ref()
+                            == request.kernel_operation_binding_sha256.as_ref()
+                        && owner_facts.read_authority_binding_json.as_ref()
+                            == Some(&request.kernel_authority_binding_json)
+                        && owner_facts.read_authority_binding_sha256.as_ref()
+                            == Some(&request.kernel_authority_binding_sha256)
+                        && owner_facts.read_causal_binding_json.as_ref()
+                            == Some(&request.kernel_causal_binding_json)
+                        && owner_facts.read_causal_binding_sha256.as_ref()
+                            == Some(&request.kernel_causal_binding_sha256)
+                }
+                _ => {
+                    owner_facts.stage_operation_binding_json.as_ref() == current_operation
+                        && owner_facts.stage_operation_binding_sha256.as_ref()
+                            == request.kernel_operation_binding_sha256.as_ref()
+                        && owner_facts.stage_authority_binding_json.as_ref()
+                            == Some(&request.kernel_authority_binding_json)
+                        && owner_facts.stage_authority_binding_sha256.as_ref()
+                            == Some(&request.kernel_authority_binding_sha256)
+                        && owner_facts.stage_causal_binding_json.as_ref()
+                            == Some(&request.kernel_causal_binding_json)
+                        && owner_facts.stage_causal_binding_sha256.as_ref()
+                            == Some(&request.kernel_causal_binding_sha256)
+                }
+            };
+            if !context_matches {
                 return Err(WireValidationError::InvalidField("owner_authority_binding"));
             }
             match (&request.task_id, &owner_facts.task_binding_json) {
@@ -2517,6 +2692,37 @@ fn validate_optional_canonical_owner_json_pair(
         (Some(json), Some(digest)) => validate_canonical_owner_json(field, json, digest),
         (None, None) => Ok(()),
         _ => Err(WireValidationError::InvalidField(field)),
+    }
+}
+
+fn validate_effect_context_pair(
+    operation_json: Option<&str>,
+    authority_json: Option<&str>,
+    causal_json: Option<&str>,
+    expected_effect: eliot_receipts::EffectClass,
+) -> Result<(), WireValidationError> {
+    match (operation_json, authority_json, causal_json) {
+        (None, None, None) => Ok(()),
+        (Some(operation_json), Some(authority_json), Some(causal_json)) => {
+            let operation: eliot_receipts::OperationBinding =
+                serde_json::from_str(operation_json)
+                    .map_err(|_| WireValidationError::InvalidField("operation_binding"))?;
+            let authority: eliot_receipts::AuthorityBinding =
+                serde_json::from_str(authority_json)
+                    .map_err(|_| WireValidationError::InvalidField("authority_binding"))?;
+            let causal: eliot_receipts::CausalBinding = serde_json::from_str(causal_json)
+                .map_err(|_| WireValidationError::InvalidField("causal_binding"))?;
+            if operation.operation_kind != BLOB_PROCESS_STREAM_WIRE_ID
+                || operation.effect != expected_effect
+                || authority.allowed_effect != expected_effect
+                || operation.state_fence != authority.state_fence
+                || operation.state_fence != causal.state_fence
+            {
+                return Err(WireValidationError::InvalidField("receipt_context_binding"));
+            }
+            Ok(())
+        }
+        _ => Err(WireValidationError::InvalidField("receipt_context_binding")),
     }
 }
 

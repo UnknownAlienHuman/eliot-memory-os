@@ -982,6 +982,30 @@ fn blob_store_request_identity(
 }
 
 #[cfg(windows)]
+fn blob_operation_binding_json(
+    identity: &RequestIdentity,
+    operation_id: &str,
+    effect: eliot_receipts::EffectClass,
+) -> Result<(String, String), String> {
+    use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
+    use eliot_receipts::OperationBinding;
+
+    identity.validate().map_err(|error| error.to_string())?;
+    let operation = OperationBinding {
+        operation_id: OperationId::new(operation_id).map_err(|error| error.to_string())?,
+        request_id: identity.request.metadata.request_id.clone(),
+        idempotency_key: identity.idempotency_key.clone(),
+        operation_kind: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),
+        effect,
+        state_fence: identity.request.state_fence.clone(),
+    };
+    let json = String::from_utf8(canonical_json_bytes(&operation).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let digest = sha256_hex(json.as_bytes());
+    Ok((json, digest))
+}
+
+#[cfg(windows)]
 fn blob_store_sink_request(
     capability: &eliot_blob_api::wire::ProcessStreamSinkCapabilityRef,
     owner_facts: &eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts,
@@ -1637,6 +1661,12 @@ impl KernelComposition {
             canonical_json_bytes(&owner_update_identity).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        let (kernel_operation_binding_json, kernel_operation_binding_sha256) =
+            blob_operation_binding_json(
+                &owner_update_identity,
+                &source_admission_operation_id,
+                eliot_receipts::EffectClass::ReversibleMutation,
+            )?;
         let outer_request_sha256 = sha256_hex(owner_update_identity_json.as_bytes());
         let causal = CausalBinding {
             state_fence: pull_request.state_fence.clone(),
@@ -1668,6 +1698,8 @@ impl KernelComposition {
         pull_request.owner_update_identity_sha256 =
             Some(sha256_hex(owner_update_identity_json.as_bytes()));
         pull_request.owner_update_identity_json = Some(owner_update_identity_json);
+        pull_request.kernel_operation_binding_json = Some(kernel_operation_binding_json);
+        pull_request.kernel_operation_binding_sha256 = Some(kernel_operation_binding_sha256);
         pull_request.source_admission_json = None;
         pull_request.source_admission_sha256 = None;
         pull_request.source_admission_write_receipt_json = None;
@@ -1875,6 +1907,16 @@ impl KernelComposition {
             &request.call_token.reference,
             deadline_ms,
         )?;
+        let store_open_operation_id = format!(
+            "blob-process-stage:{}:{}",
+            request.capability.reference, request.call_token.reference
+        );
+        let (kernel_operation_binding_json, kernel_operation_binding_sha256) =
+            blob_operation_binding_json(
+                &store_identity,
+                &store_open_operation_id,
+                eliot_receipts::EffectClass::ReversibleMutation,
+            )?;
         let outer_identity_json = String::from_utf8(
             canonical_json_bytes(&store_identity).map_err(|error| error.to_string())?,
         )
@@ -1902,6 +1944,9 @@ impl KernelComposition {
         store_open_request.open_request_sha256 = Some(open_request_sha256.to_owned());
         store_open_request.owner_update_identity_json = None;
         store_open_request.owner_update_identity_sha256 = None;
+        store_open_request.kernel_operation_binding_json = Some(kernel_operation_binding_json);
+        store_open_request.kernel_operation_binding_sha256 =
+            Some(kernel_operation_binding_sha256);
         store_open_request.source_admission_json = Some(process_source_admission_json);
         store_open_request.source_admission_sha256 = Some(process_source_admission_sha256);
         store_open_request.source_admission_write_receipt_json =

@@ -97,6 +97,10 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
+    /// Bind an observed explicit workspace to the retained task's WorkScope.
+    /// The daemon validates this action through the authenticated initial
+    /// owner-admission path; the caller supplies no owner receipt or binding.
+    BindScope,
 }
 
 /// Owner-native material bundle used only for a complete campaign-owner

@@ -3085,6 +3085,8 @@ impl ProcessExecutionGateway {
             kernel_authority_binding_json: authority_json,
             kernel_causal_binding_sha256: sha256_hex(causal_json.as_bytes()),
             kernel_causal_binding_json: causal_json,
+            kernel_operation_binding_json: None,
+            kernel_operation_binding_sha256: None,
             outer_request_sha256: sha256_hex(outer_identity_json.as_bytes()),
             product_id: identity.request.metadata.product_id.as_str().to_owned(),
             source_id: identity.request.metadata.source_id.as_str().to_owned(),
