@@ -1288,6 +1288,10 @@ impl KernelComposition {
         Self::validate_profile_resolver_client_binding(&policy, client)?;
         let mut session = Session::establish(connection_id, peer, client, policy.protocol_range)?;
         session.capabilities = vec![
+            eliot_blob_api::verification_wire::VERIFICATION_STAGE_TOOL_PROBE_WIRE_ID.to_owned(),
+            eliot_blob_api::verification_wire::VERIFICATION_STAGE_LAUNCH_WIRE_ID.to_owned(),
+            eliot_blob_api::verification_wire::VERIFICATION_STAGE_LIFECYCLE_WIRE_ID.to_owned(),
+            eliot_blob_api::verification_wire::VERIFICATION_STAGE_READBACK_WIRE_ID.to_owned(),
             "eliot.kernel.verification-stage-open".to_owned(),
             "eliot.kernel.verification-stage-call".to_owned(),
             "eliot.kernel.verification-stage-reconcile".to_owned(),

@@ -498,6 +498,15 @@ pub mod kernel_client {
         BlobProcessStreamKernelReconcileRequest, BlobProcessStreamKernelRequest,
         BlobProcessStreamKernelResponse,
     };
+    use eliot_blob_api::verification_wire::{
+        VERIFICATION_STAGE_LAUNCH_WIRE_ID, VERIFICATION_STAGE_LIFECYCLE_WIRE_ID,
+        VERIFICATION_STAGE_READBACK_WIRE_ID, VERIFICATION_STAGE_TOOL_PROBE_WIRE_ID,
+        VerificationStageExecutionPort, VerificationStageLaunchRequest,
+        VerificationStageLaunchResponse, VerificationStageLifecycleRequest,
+        VerificationStageLifecycleResponse, VerificationStagePortError,
+        VerificationStageReadbackRequest, VerificationStageReadbackResponse,
+        VerificationStageToolProbeRequest, VerificationStageToolProbeResponse,
+    };
     use eliot_contracts::{EpochId, RequestId};
     use eliot_ipc::{
         DeliveryOutcome, NamedPipeTransport, TransportLimits, client_hello_frame,
@@ -511,7 +520,7 @@ pub mod kernel_client {
         ProtocolVersion, RequestIdentity, ServerHello,
     };
     pub use eliot_user_broker_core::{OperatorLaunchReceipt, OperatorLaunchRestartReceipt};
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use thiserror::Error;
@@ -522,6 +531,16 @@ pub mod kernel_client {
     const OPERATION_LIMIT: usize = 160;
     const KERNEL_SERVICE_NAME: &str = "eliot-kernel";
     const KERNEL_PROTOCOL_VERSION: &str = "eliot.kernel.v1";
+    const PROFILE_RESOLVER_MODULE_ID: &str = "eliot-profile-resolver";
+    const PROFILE_RESOLVER_CAPABILITIES: [&str; 7] = [
+        VERIFICATION_STAGE_TOOL_PROBE_WIRE_ID,
+        VERIFICATION_STAGE_LAUNCH_WIRE_ID,
+        VERIFICATION_STAGE_LIFECYCLE_WIRE_ID,
+        VERIFICATION_STAGE_READBACK_WIRE_ID,
+        eliot_blob_api::verification_wire::VERIFICATION_STAGE_OPEN_WIRE_ID,
+        eliot_blob_api::verification_wire::VERIFICATION_STAGE_CALL_WIRE_ID,
+        eliot_blob_api::verification_wire::VERIFICATION_STAGE_RECONCILE_WIRE_ID,
+    ];
 
     /// Protected installation-provided connection declaration.
     #[derive(Clone, Debug, Deserialize)]
@@ -674,6 +693,24 @@ pub mod kernel_client {
                     config_lease: lease,
                 })
             }
+        }
+
+        /// Loads the protected ProfileResolver-only Kernel session declaration.
+        ///
+        /// This constructor accepts no caller-selected ClientHello,
+        /// RequestIdentity, session label, fence, or capability. It reuses the
+        /// installation-approved client declaration and fails closed unless
+        /// that declaration names the dedicated ProfileResolver module; the
+        /// authenticated front door then assigns the distinct server-side
+        /// `ProfileResolverSession` class.
+        pub fn load_profile_resolver() -> Result<Self, KernelClientError> {
+            let client = Self::load()?;
+            if client.config.client_hello.module_bridge_identity != PROFILE_RESOLVER_MODULE_ID {
+                return Err(KernelClientError::Configuration(
+                    "protected Kernel client declaration is not for ProfileResolver".to_owned(),
+                ));
+            }
+            Ok(client)
         }
 
         /// Binds the exact caller identity for the next application request.
@@ -1067,6 +1104,164 @@ pub mod kernel_client {
                 .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
             Ok(typed)
         }
+
+        /// Sends one closed, identityless ProfileResolver operation over the
+        /// authenticated role session. The application request carries no
+        /// `RequestIdentity`; Kernel admits it only from the protected
+        /// `ProfileResolverSession` and derives the process/store authority.
+        fn verification_stage_exchange<T>(
+            &self,
+            wire_id: &str,
+            request: &impl Serialize,
+        ) -> Result<T, VerificationStagePortError>
+        where
+            T: DeserializeOwned,
+        {
+            #[cfg(not(windows))]
+            {
+                let _ = (wire_id, request);
+                Err(VerificationStagePortError::Unavailable)
+            }
+            #[cfg(windows)]
+            {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| VerificationStagePortError::Unavailable)?;
+                runtime
+                    .block_on(self.verification_stage_exchange_async(wire_id, request))
+                    .map_err(|error| match error {
+                        KernelClientError::UnknownOutcome(_) => {
+                            VerificationStagePortError::UnknownOutcome
+                        }
+                        KernelClientError::Rejected(_)
+                        | KernelClientError::Configuration(_)
+                        | KernelClientError::MissingRequestIdentity
+                        | KernelClientError::FrontDoorClosed(_) => {
+                            VerificationStagePortError::Unavailable
+                        }
+                        KernelClientError::RestartRequired(_) => {
+                            VerificationStagePortError::Unavailable
+                        }
+                    })
+            }
+        }
+
+        #[cfg(windows)]
+        async fn verification_stage_exchange_async<T>(
+            &self,
+            wire_id: &str,
+            request: &impl Serialize,
+        ) -> Result<T, KernelClientError>
+        where
+            T: DeserializeOwned,
+        {
+            validate_operation(wire_id)?;
+            if self.config.client_hello.module_bridge_identity != PROFILE_RESOLVER_MODULE_ID {
+                return Err(KernelClientError::Configuration(
+                    "protected Kernel session is not ProfileResolver".to_owned(),
+                ));
+            }
+            let payload = serde_json::to_value(request)
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let request_bytes = serde_json::to_vec(&payload)
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let digest = format!("{:x}", Sha256::digest(&request_bytes));
+            let request_id = RequestId::new(format!("verification-stage-{digest}"))
+                .map_err(|error| KernelClientError::Configuration(error.to_string()))?;
+            let (mut transport, limits) = self.connect().await?;
+            let frame = Frame {
+                protocol_version: ProtocolVersion::CURRENT,
+                encoding_profile: EncodingProfile::JsonV1,
+                connection_id: self.config.connection_id.clone(),
+                request_id: Some(request_id.clone()),
+                kind: FrameKind::Request,
+                message_type: MessageType::Execute,
+                request_identity: None,
+                payload: ProtocolPayload::Json(payload),
+                trace_context: BTreeMap::new(),
+            };
+            require_delivery(
+                transport.send_frame(&frame, limits).await,
+                "ProfileResolver verification-stage request",
+            )?;
+            let response = transport
+                .receive_frame(limits)
+                .await
+                .map_err(|error| KernelClientError::UnknownOutcome(error.to_string()))?;
+            let value = validate_result_response(
+                &self.config.connection_id,
+                &request_id,
+                &response,
+            )?;
+            serde_json::from_value(value).map_err(|error| {
+                KernelClientError::UnknownOutcome(format!(
+                    "ProfileResolver verification-stage reply is not closed: {error}"
+                ))
+            })
+        }
+    }
+
+    impl VerificationStageExecutionPort for KernelClient {
+        fn probe_tool_version(
+            &self,
+            request: &VerificationStageToolProbeRequest,
+        ) -> Result<VerificationStageToolProbeResponse, VerificationStagePortError> {
+            request
+                .validate()
+                .map_err(|_| VerificationStagePortError::InvalidResponse)?;
+            let response: VerificationStageToolProbeResponse = self
+                .verification_stage_exchange(VERIFICATION_STAGE_TOOL_PROBE_WIRE_ID, request)?;
+            response
+                .validate_for_request(request)
+                .map_err(|_| VerificationStagePortError::InvalidResponse)?;
+            Ok(response)
+        }
+
+        fn launch_stage(
+            &self,
+            request: &VerificationStageLaunchRequest,
+        ) -> Result<VerificationStageLaunchResponse, VerificationStagePortError> {
+            request
+                .validate()
+                .map_err(|_| VerificationStagePortError::InvalidResponse)?;
+            let response: VerificationStageLaunchResponse = self
+                .verification_stage_exchange(VERIFICATION_STAGE_LAUNCH_WIRE_ID, request)?;
+            response
+                .validate_for_request(request)
+                .map_err(|_| VerificationStagePortError::InvalidResponse)?;
+            Ok(response)
+        }
+
+        fn lifecycle(
+            &self,
+            request: &VerificationStageLifecycleRequest,
+        ) -> Result<VerificationStageLifecycleResponse, VerificationStagePortError> {
+            request
+                .validate()
+                .map_err(|_| VerificationStagePortError::InvalidResponse)?;
+            let response: VerificationStageLifecycleResponse = self
+                .verification_stage_exchange(VERIFICATION_STAGE_LIFECYCLE_WIRE_ID, request)?;
+            response
+                .validate_for_request(request)
+                .map_err(|_| VerificationStagePortError::InvalidResponse)?;
+            Ok(response)
+        }
+
+        fn readback_source(
+            &self,
+            request: &VerificationStageReadbackRequest,
+        ) -> Result<VerificationStageReadbackResponse, VerificationStagePortError> {
+            request
+                .validate()
+                .map_err(|_| VerificationStagePortError::InvalidResponse)?;
+            let response: VerificationStageReadbackResponse = self
+                .verification_stage_exchange(VERIFICATION_STAGE_READBACK_WIRE_ID, request)?;
+            response
+                .validate_for_request(request)
+                .map_err(|_| VerificationStagePortError::InvalidResponse)?;
+            Ok(response)
+        }
     }
 
     fn validate_config(config: &KernelClientConfig) -> Result<(), KernelClientError> {
@@ -1164,6 +1359,18 @@ pub mod kernel_client {
         {
             return Err(KernelClientError::Rejected(
                 "Kernel ServerHello is not bound to the protected authority".to_owned(),
+            ));
+        }
+        if config.client_hello.module_bridge_identity == PROFILE_RESOLVER_MODULE_ID
+            && hello.allowed_capabilities
+                != PROFILE_RESOLVER_CAPABILITIES
+                    .iter()
+                    .map(|capability| (*capability).to_owned())
+                    .collect::<Vec<_>>()
+        {
+            return Err(KernelClientError::Rejected(
+                "Kernel ProfileResolver ServerHello does not grant the exact closed capability set"
+                    .to_owned(),
             ));
         }
         validate_server_snapshot(

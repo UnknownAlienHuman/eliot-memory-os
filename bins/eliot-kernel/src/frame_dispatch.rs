@@ -27,7 +27,7 @@ use super::daemon_request_dispatch::{
     STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
 };
 use super::dreamer_job_dispatch::is_dreamer_operation;
-use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
+use super::front_door_session::{DOCTOR_MODULE_ID, PROFILE_RESOLVER_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, GENERATION_CUTOVER_OPERATION,
 };
@@ -264,6 +264,16 @@ fn observe_runtime_capability_health(capability: &eliot_kernel_core::CapabilityH
 fn actual_route_name(action: &KernelFrameAction) -> &'static str {
     match action {
         KernelFrameAction::Reply(_) => "reply_admitted",
+        KernelFrameAction::ProfileResolverToolProbe { .. } => {
+            "profile_resolver_tool_probe_admitted"
+        }
+        KernelFrameAction::ProfileResolverLaunch { .. } => "profile_resolver_launch_admitted",
+        KernelFrameAction::ProfileResolverLifecycle { .. } => {
+            "profile_resolver_lifecycle_admitted"
+        }
+        KernelFrameAction::ProfileResolverReadback { .. } => {
+            "profile_resolver_readback_admitted"
+        }
         KernelFrameAction::BlobProcessStream { .. } => "blob_process_stream_admitted",
         KernelFrameAction::BlobProcessStreamReconcile { .. } => {
             "blob_process_stream_reconcile_admitted"
@@ -895,6 +905,92 @@ impl KernelComposition {
                 ProtocolPayload::Json(payload) => payload.clone(),
                 _ => return Err(TransportError::SessionFenced),
             };
+            let profile_resolver_selector = payload
+                .get("wire_id")
+                .and_then(serde_json::Value::as_str);
+            if let Some(selector) = profile_resolver_selector {
+                let (capability, route) = match selector {
+                    eliot_blob_api::verification_wire::VERIFICATION_STAGE_TOOL_PROBE_WIRE_ID => (
+                        selector,
+                        "tool_probe",
+                    ),
+                    eliot_blob_api::verification_wire::VERIFICATION_STAGE_LAUNCH_WIRE_ID => (
+                        selector,
+                        "launch",
+                    ),
+                    eliot_blob_api::verification_wire::VERIFICATION_STAGE_LIFECYCLE_WIRE_ID => (
+                        selector,
+                        "lifecycle",
+                    ),
+                    eliot_blob_api::verification_wire::VERIFICATION_STAGE_READBACK_WIRE_ID => (
+                        selector,
+                        "readback",
+                    ),
+                    _ => ("", ""),
+                };
+                if !capability.is_empty() {
+                    if session.module_generation.module_id.as_str() != PROFILE_RESOLVER_MODULE_ID
+                        || frame.request_identity.is_some()
+                        || !session
+                            .capabilities
+                            .iter()
+                            .any(|entry| entry == capability)
+                        || !probe_ready_state_admitted(
+                            self.service_state()
+                                .map_err(|_| TransportError::SessionFenced)?,
+                        )
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    match route {
+                        "tool_probe" => {
+                            let request = serde_json::from_value::<
+                                eliot_blob_api::verification_wire::VerificationStageToolProbeRequest,
+                            >(payload)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                            request.validate().map_err(|_| TransportError::SessionFenced)?;
+                            return Ok(KernelFrameAction::ProfileResolverToolProbe {
+                                request_id,
+                                request,
+                            });
+                        }
+                        "launch" => {
+                            let request = serde_json::from_value::<
+                                eliot_blob_api::verification_wire::VerificationStageLaunchRequest,
+                            >(payload)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                            request.validate().map_err(|_| TransportError::SessionFenced)?;
+                            return Ok(KernelFrameAction::ProfileResolverLaunch {
+                                request_id,
+                                request,
+                            });
+                        }
+                        "lifecycle" => {
+                            let request = serde_json::from_value::<
+                                eliot_blob_api::verification_wire::VerificationStageLifecycleRequest,
+                            >(payload)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                            request.validate().map_err(|_| TransportError::SessionFenced)?;
+                            return Ok(KernelFrameAction::ProfileResolverLifecycle {
+                                request_id,
+                                request,
+                            });
+                        }
+                        "readback" => {
+                            let request = serde_json::from_value::<
+                                eliot_blob_api::verification_wire::VerificationStageReadbackRequest,
+                            >(payload)
+                            .map_err(|_| TransportError::SessionFenced)?;
+                            request.validate().map_err(|_| TransportError::SessionFenced)?;
+                            return Ok(KernelFrameAction::ProfileResolverReadback {
+                                request_id,
+                                request,
+                            });
+                        }
+                        _ => return Err(TransportError::SessionFenced),
+                    }
+                }
+            }
             // The dedicated Blob exchange has no generic RequestIdentity
             // because its per-Store identities are issued by Kernel from the
             // retained TestD grant. Keep this exact closed wire selector ahead
