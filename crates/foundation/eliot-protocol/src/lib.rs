@@ -1415,15 +1415,21 @@ pub enum ModuleControlEffect {
     ShutdownStarted,
     /// A fatal failure moved the module to `Failed`.
     FatalRecorded,
+    /// The module resumed `Quiesced` to `Active` on a correlated restart.
+    Resumed,
 }
 
 /// Explicit owner for the I7.4 quiesce/checkpoint/restore/drain/shutdown/fatal
-/// control flows (W4).
+/// control flows (W4) plus the correlated restart/resume tail (A1).
 ///
 /// Every control frame is validated first via [`Frame::validate`]; the
 /// request-bearing controls additionally require the validated
-/// [`RequestIdentity`] the frame carries. Illegal phase moves are rejected
-/// with a typed [`ProtocolError`]; nothing is inferred from process state.
+/// [`RequestIdentity`] the frame carries. A post-restart `RestoreCheckpoint`
+/// or correlated `Start` resume must carry the retained checkpoint's
+/// `idempotency_key`; a restart presenting any other key is rejected as a new
+/// uncorrelated request instead of being admitted. Illegal phase moves are
+/// rejected with a typed [`ProtocolError`]; nothing is inferred from process
+/// state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleLifecycle {
     phase: ModuleLifecyclePhase,
@@ -1471,6 +1477,7 @@ impl ModuleLifecycle {
             MessageType::DrainStatus => self.apply_drain(frame),
             MessageType::Shutdown => self.apply_shutdown(frame),
             MessageType::Fatal => self.apply_fatal(frame),
+            MessageType::Start => self.apply_resume(frame),
             _ => Err(ProtocolError::InvalidField {
                 field: "message_type",
                 reason: "not a module lifecycle control message",
@@ -1534,7 +1541,7 @@ impl ModuleLifecycle {
     }
 
     fn apply_restore(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
-        Self::control_identity(frame)?;
+        let identity = Self::control_identity(frame)?;
         if self.phase != ModuleLifecyclePhase::Quiesced {
             return Err(ProtocolError::InvalidField {
                 field: "module_lifecycle.phase",
@@ -1549,12 +1556,50 @@ impl ModuleLifecycle {
                 reason: "restore requires a retained checkpoint",
             })?;
         checkpoint.validate()?;
+        if identity.idempotency_key != checkpoint.idempotency_key {
+            return Err(ProtocolError::InvalidField {
+                field: "request_identity.idempotency_key",
+                reason: "restore must carry the checkpoint idempotency_key: a restart is correlated, not a new request",
+            });
+        }
         Ok(ModuleControlEffect::CheckpointRestored(checkpoint.clone()))
     }
 
     fn apply_drain(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
         Self::control_identity(frame)?;
         Ok(ModuleControlEffect::DrainReported(self.drain_report()))
+    }
+
+    fn apply_resume(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        let identity = Self::control_identity(frame)?;
+        if frame.kind != FrameKind::Request {
+            return Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "lifecycle resume requires a Start request carrying the checkpoint correlation",
+            });
+        }
+        if self.phase != ModuleLifecyclePhase::Quiesced {
+            return Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.phase",
+                reason: "resume requires the quiesced phase",
+            });
+        }
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .ok_or(ProtocolError::InvalidField {
+                field: "module_lifecycle.checkpoint",
+                reason: "resume requires a retained checkpoint",
+            })?;
+        checkpoint.validate()?;
+        if identity.idempotency_key != checkpoint.idempotency_key {
+            return Err(ProtocolError::InvalidField {
+                field: "request_identity.idempotency_key",
+                reason: "resume must carry the checkpoint idempotency_key: a restart is correlated, not a new request",
+            });
+        }
+        self.phase = ModuleLifecyclePhase::Active;
+        Ok(ModuleControlEffect::Resumed)
     }
 
     fn apply_shutdown(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
@@ -1588,6 +1633,78 @@ impl ModuleLifecycle {
 impl Default for ModuleLifecycle {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Idempotent disposition of one lifecycle `Execute` request (A2).
+///
+/// `New` carries the first-seen `request_id`; `Duplicate` carries the standing
+/// first-seen `request_id` so a retried `Execute` with the same idempotency
+/// identity observes the prior disposition instead of a second effect.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum LifecycleExecuteDisposition {
+    /// First receipt of this idempotency identity.
+    New(RequestId),
+    /// The same idempotency identity was already observed.
+    Duplicate(RequestId),
+}
+
+/// Explicit owner for lifecycle `Execute` idempotent disposition replay (A2).
+///
+/// Entries are keyed by the validated [`RequestIdentity::idempotency_key`];
+/// the first `request_id` is retained and replayed on every repeat, so a
+/// retry never produces a second effect. The ledger is owned by the lifecycle
+/// owner, never by a fenced session, and entries persist until an explicit
+/// `reap`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LifecycleExecuteLedger {
+    entries: BTreeMap<String, RequestId>,
+}
+
+impl LifecycleExecuteLedger {
+    /// Creates an empty execute ledger.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
+    /// Observes one validated lifecycle `Execute` frame by idempotency identity.
+    pub fn observe(&mut self, frame: &Frame) -> Result<LifecycleExecuteDisposition, ProtocolError> {
+        frame.validate()?;
+        if !matches!(
+            (frame.kind, frame.message_type),
+            (FrameKind::Request, MessageType::Execute)
+        ) {
+            return Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "lifecycle Execute dispatch requires a Request frame carrying an Execute message",
+            });
+        }
+        let identity = frame
+            .request_identity
+            .as_ref()
+            .ok_or(ProtocolError::InvalidField {
+                field: "request_identity",
+                reason: "required for lifecycle Execute requests",
+            })?;
+        identity.validate()?;
+        let request_id = frame.request_id.clone().ok_or(ProtocolError::InvalidField {
+            field: "request_id",
+            reason: "required for lifecycle Execute requests",
+        })?;
+        if let Some(prior) = self.entries.get(&identity.idempotency_key) {
+            return Ok(LifecycleExecuteDisposition::Duplicate(prior.clone()));
+        }
+        self.entries
+            .insert(identity.idempotency_key.clone(), request_id.clone());
+        Ok(LifecycleExecuteDisposition::New(request_id))
+    }
+
+    /// Removes one idempotency identity after its outcome is durably recorded.
+    pub fn reap(&mut self, idempotency_key: &str) {
+        self.entries.remove(idempotency_key);
     }
 }
 
