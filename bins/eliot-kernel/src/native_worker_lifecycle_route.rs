@@ -58,9 +58,9 @@ use eliot_kernel_service::{
     KernelServiceError, NATIVE_WORKER_CLAIM_WIRE_ID, NATIVE_WORKER_CLAIM_WIRE_VERSION,
     NATIVE_WORKER_CLAIM_WIRE_VERSION_V1, NATIVE_WORKER_EXECUTABLE_BINDING_EXPECTED_WIRE_VERSION,
     NATIVE_WORKER_EXECUTION_UNIT_SCHEMA_VERSION, NATIVE_WORKER_PROTOCOL_VERSION,
-    PROVIDER_CAPABILITY_WIRE_VERSION,
     NativeWorkerClaimBudget, NativeWorkerClaimRequest, NativeWorkerClaimResponse,
     NativeWorkerExecutableBinding, NativeWorkerExecutableExpectation,
+    PROVIDER_CAPABILITY_WIRE_VERSION,
 };
 use eliot_ors::{
     AdmissionReservationClaimRef, AdmissionReservationClaims, AdmissionReservationIdentityInput,
@@ -3315,10 +3315,9 @@ impl KernelComposition {
         }
         let claim_id = require_op_id(payload, "claim_id")?;
         let row = self.load_claim_record(&claim_id)?;
-        row.validate()
-            .map_err(|_| NativeWorkerRouteError::Fence {
-                field: "durable_claim",
-            })?;
+        row.validate().map_err(|_| NativeWorkerRouteError::Fence {
+            field: "durable_claim",
+        })?;
         // Same admission-evidence rule as the ORS owner's
         // `verified_executable_binding_digest`: an unadmitted intent verifies
         // nothing. Terminal rows keep their admission evidence and project
