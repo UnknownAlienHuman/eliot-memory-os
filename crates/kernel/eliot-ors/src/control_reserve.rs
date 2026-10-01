@@ -747,7 +747,7 @@ impl OrsReserve {
                 });
             }
         };
-        let (sequence, binding) =
+        let binding =
             self.mint_permit_binding(request, &owner, owner_generation, dimension, issued_at_ms);
         debug_assert!(
             binding.validate().is_ok(),
@@ -770,7 +770,7 @@ impl OrsReserve {
         owner_generation: ResourceGeneration,
         dimension: OrsDimension,
         issued_at_ms: u64,
-    ) -> (u64, CapacityPermitBinding) {
+    ) -> CapacityPermitBinding {
         let sequence = self.inner.permit_sequence.fetch_add(1, Ordering::AcqRel);
         let binding = CapacityPermitBinding {
             permit_id: format!(
