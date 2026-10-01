@@ -351,6 +351,7 @@ pub fn accept_after_stage_handle(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::supported_admission_contract_set_digest;
     use eliot_contracts::{
         ClockReading, EpochId, EpochLineageId, OperationId, ProductId, RequestId, RequestMetadata,
         ResourceGeneration, SourceId, StateFence,
@@ -392,7 +393,15 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            // The admission contract set digest is code-derived from this
+            // build's generated operation catalogue, and `validate` refuses
+            // any other value with `StoreError::ManifestMismatch`. A fixture
+            // must carry the real digest, not a placeholder: a placeholder
+            // is refused at `VersionedWriteSubmission::bind` before the
+            // ledger sees the submission, so it can never exercise replay,
+            // key reuse, or response-mode resolution.
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .expect("supported admission contract set digest"),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1928")
                 .expect("manifest digest"),
             semantic_commands: vec![NamedMutationRequest {

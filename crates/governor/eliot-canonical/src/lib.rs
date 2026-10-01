@@ -588,11 +588,16 @@ impl CanonicalWriteEnvelope {
     /// at every downstream recompute gate.
     ///
     /// This routes through the shared provider-neutral
-    /// [`eliot_store_api::canonical_request_hash`] over the
-    /// envelope-equivalent [`CanonicalRequestView`] (issue #63, RECHECK-63
-    /// slice A). The view is field-identical to the envelope, so the emitted
-    /// value is byte-identical to the previous envelope hash; Kernel/store
-    /// rebuild the same view from their transported apply values.
+    /// [`eliot_store_api::canonical_request_hash`] over the envelope-equivalent
+    /// [`CanonicalRequestView`] (issue #63, RECHECK-63 slice A). The view
+    /// carries the envelope's own fields PLUS the two derived sets the
+    /// transport needs to survive: `semantic_source_revisions` (rendered
+    /// expected revision heads) and `ordering_scopes` (rendered expected
+    /// ordering heads, added by #4728 so a scope edit forks the digest even
+    /// on legs with no ordering CAS expectations). It is therefore NOT
+    /// byte-identical to a hash of the bare envelope; the stable contract is
+    /// that Kernel/store rebuild this same view from their transported apply
+    /// values and recompute the same digest.
     pub fn canonical_request_hash(&self) -> Result<String, CanonicalError> {
         eliot_store_api::canonical_request_hash(&self.canonical_request_view())
             .map_err(CanonicalError::Store)

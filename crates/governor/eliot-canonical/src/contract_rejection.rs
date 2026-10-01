@@ -1101,6 +1101,7 @@ pub fn canonical_bytes_hash(view: &eliot_store_api::CanonicalRequestView) -> Opt
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::supported_admission_contract_set_digest;
     use eliot_contracts::{
         EpochId, EpochLineageId, OperationId, ProductId, RequestId, ResourceGeneration, SourceId,
         StateFence, canonical_json_bytes,
@@ -1139,7 +1140,12 @@ mod tests {
             task_id: None,
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
+            // Code-derived from this build's generated operation catalogue;
+            // `validate` refuses anything else as a manifest mismatch, so
+            // the CORRECTED envelope this test admits must carry the real
+            // digest rather than a placeholder.
+            admission_contract_set_digest: supported_admission_contract_set_digest()
+                .expect("supported admission contract set digest"),
             operation_manifest_digest: OperationManifestDigest::new("manifest-1796")
                 .expect("manifest"),
             semantic_commands: vec![NamedMutationRequest {
