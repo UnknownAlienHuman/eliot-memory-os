@@ -57,7 +57,7 @@ impl SkillCuratorService {
             usage_sources: vec![
                 "skill_lifecycle_record.success_count".to_owned(),
                 "skill_lifecycle_record.failure_count".to_owned(),
-                "canonical_skill_context_measurement".to_owned(),
+                "skill_lifecycle_record.context_measurement".to_owned(),
                 "skill_scope_rules".to_owned(),
             ],
             proposals,
