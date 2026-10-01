@@ -56,8 +56,8 @@ use eliot_contracts::{
 };
 #[cfg(windows)]
 use eliot_ors::{
-    AdmissionReservationState, CanonicalAdmissionResolution, OperationIdentity,
-    OperationalRecoveryStore, OrsError, StateFenceSnapshot, reconcile_canonical_admission,
+    AdmissionReservationRecord, AdmissionReservationState, CanonicalAdmissionResolution,
+    OperationIdentity, OrsError, StateFenceSnapshot, reconcile_canonical_admission,
     reload_staged_admission_reservation, stage_operation_identity,
 };
 #[cfg(windows)]
@@ -225,11 +225,34 @@ impl KernelComposition {
             canonical_json_bytes(staged.receipt()).map_err(|_| TransportError::SessionFenced)?,
         )
         .map_err(|_| TransportError::SessionFenced)?;
+        self.apply_staged_admission_transition(
+            &facts,
+            record,
+            receipt_json,
+            store_operation_id,
+            canonical_operation_id.as_str(),
+        )
+        .await
+    }
+
+    /// Builds the canonical transition for one validated staged record and
+    /// applies it through the retained store gateway. Separated so the
+    /// validate/adopt leg above stays within the line budget; behavior is
+    /// unchanged: same request identity, same transition, same observation.
+    async fn apply_staged_admission_transition(
+        &self,
+        facts: &ReservationAdmissionSubmitFacts,
+        record: &AdmissionReservationRecord,
+        receipt_json: String,
+        store_operation_id: eliot_contracts::OperationId,
+        canonical_operation_id: &str,
+    ) -> Result<(), TransportError> {
+        let gateway = self.retained_store_gateway()?;
         let context = RequestMetadata {
             // Stable retry identity: the same reservation always submits
             // under the same request, so a lost response resubmits the
             // byte-identical plan instead of a second admission.
-            request_id: RequestId::new(format!("{}-admission", canonical_operation_id.as_str()))
+            request_id: RequestId::new(format!("{canonical_operation_id}-admission"))
                 .map_err(|_| TransportError::SessionFenced)?,
             session_id: None,
             // Not task-relative: the reservation binds a work item, not a
@@ -245,9 +268,9 @@ impl KernelComposition {
         let admission = eliot_store_api::prepare_reservation_admission_transition(
             &eliot_store_api::ReservationAdmissionRequest {
                 operation_id: store_operation_id,
-                idempotency_key: reservation_id.as_str().to_owned(),
+                idempotency_key: facts.reservation_id.clone(),
                 request: context.clone(),
-                reservation_id: reservation_id.as_str().to_owned(),
+                reservation_id: facts.reservation_id.clone(),
                 work_item_id: record.work_item_id.as_str().to_owned(),
                 proposed_attempt_id: record.proposed_attempt_id.as_str().to_owned(),
                 claims: eliot_store_api::ReservationAdmissionClaims {

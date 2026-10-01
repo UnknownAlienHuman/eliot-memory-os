@@ -61,11 +61,10 @@ use serde_json::{Map, Value};
 
 use super::{CanonicalRequestView, SwarmOwnerAuthorization, SwarmOwnerRevisionBatch};
 use super::{
-    EventProjectionRelationIntents, OperationId, OperationIdentity,
-    OrderingHeadExpectation, PreparedTransition, RequestMeta, ScopeId, SecurityContext, StoreError,
-    TransitionClass, canonical_request_hash, generated_operation_manifests,
-    operation_manifest_set_digest, swarm_owner_revisions_request, validate_digest, validate_text,
-    verify_canonical_request_hash,
+    EventProjectionRelationIntents, OperationId, OperationIdentity, OrderingHeadExpectation,
+    PreparedTransition, RequestMeta, ScopeId, SecurityContext, StoreError, TransitionClass,
+    canonical_request_hash, generated_operation_manifests, operation_manifest_set_digest,
+    swarm_owner_revisions_request, validate_digest, validate_text, verify_canonical_request_hash,
 };
 use super::{SwarmOwnerRevision, SwarmSemanticOwnerKind, canonical_json_bytes, sha256_hex};
 
