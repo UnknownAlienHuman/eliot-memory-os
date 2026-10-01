@@ -156,6 +156,7 @@ fn isolated_plan_is_purge_first_suspended_and_fresh() {
     let planned = plan_isolated_restore(
         &bundle,
         target_context(),
+        "1873r/isolated-plan",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &root,
@@ -189,6 +190,10 @@ fn isolated_plan_is_purge_first_suspended_and_fresh() {
     let degraded_plan = plan_isolated_restore(
         &degraded,
         target_context(),
+        // The same test's restore-request identity over a different archive: the
+        // journal stream key already carries the bundle digest, so this is the
+        // same operation planning a second archive, not a second operation.
+        "1873r/isolated-plan",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &degraded_root,
@@ -206,6 +211,7 @@ fn cutover_needs_a_matching_owner_authorization() {
     let planned = plan_isolated_restore(
         &bundle,
         target_context(),
+        "1873r/cutover-authorized",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &root,
@@ -257,6 +263,7 @@ fn degraded_cutover_receipts_stay_canonical_only() {
     let planned = plan_isolated_restore(
         &degraded,
         target_context(),
+        "1873r/cutover-degraded-ceiling",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &root,

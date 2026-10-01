@@ -476,6 +476,8 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
         "target-cli",
         "--new-lineage",
         LINEAGE_NEW,
+        "--operation-id",
+        "1873e/issue-and-restore-run",
     ])?;
     assert_eq!(
         output.status.code(),
@@ -527,6 +529,8 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
         "target-cli",
         "--new-lineage",
         LINEAGE_NEW,
+        "--operation-id",
+        "1873e/issue-and-restore-run",
     ])?;
     assert_eq!(output.status.code(), Some(2));
     let report = stdout_json(&output)?;

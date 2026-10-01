@@ -251,6 +251,7 @@ fn runner_restores_real_bytes_with_receipt_in_temp_only() {
     let outcome = execute_isolated_restore(
         &bundle,
         target_context(),
+        "1873x/real-bytes-receipt",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &root,
@@ -307,6 +308,12 @@ fn runner_resumes_from_the_durable_journal_without_reapplying() {
     let first = execute_isolated_restore(
         &bundle,
         target_context(),
+        // This test's own restore-request identity: the resume below is the SAME
+        // operation re-run against the same root, so both calls bind this one
+        // value and address the same durable journal stream. A second identity
+        // here would address a second stream, which is a different operation and
+        // not a resume.
+        "1873x/durable-resume",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &root,
@@ -320,6 +327,10 @@ fn runner_resumes_from_the_durable_journal_without_reapplying() {
     let second = execute_isolated_restore(
         &bundle,
         target_context(),
+        // The SAME operation identity the first run bound: that equality is what
+        // makes this a resume of one durable stream rather than a second restore
+        // operation over the same bytes.
+        "1873x/durable-resume",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &reopened,
@@ -351,6 +362,7 @@ fn runner_refuses_tampered_blob_bytes() {
     let result = execute_isolated_restore(
         &bundle,
         target_context(),
+        "1873x/tampered-blob",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &root,
@@ -398,6 +410,7 @@ fn runner_degraded_run_stays_canonical_only() {
     let outcome = execute_isolated_restore(
         &bundle,
         target_context(),
+        "1873x/degraded-run",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &root,
@@ -423,6 +436,7 @@ fn runner_requires_key_coverage_for_blob_archives() {
             execute_isolated_restore(
                 &bundle,
                 target_context(),
+                "1873x/key-gate",
                 epoch(2),
                 ResourceGeneration::new(2).expect("generation"),
                 &root,
@@ -450,6 +464,7 @@ fn runner_refuses_stale_lineage_before_any_effect() {
             execute_isolated_restore(
                 &bundle,
                 stale,
+                "1873x/stale-lineage",
                 epoch(1),
                 ResourceGeneration::new(2).expect("generation"),
                 &root,
@@ -472,6 +487,7 @@ fn restore_leaves_runtime_state_non_active_without_owner_receipts() {
     let outcome = execute_isolated_restore(
         &bundle,
         target_context(),
+        "1873x/runtime-non-active",
         epoch(2),
         ResourceGeneration::new(2).expect("generation"),
         &root,

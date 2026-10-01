@@ -136,6 +136,29 @@ pub enum BackupCommand {
         /// the explicit triple. Mutually exclusive with the triple.
         #[arg(long)]
         new_lineage: Option<String>,
+        /// The correlated operation identity this restore runs under.
+        ///
+        /// Required, never defaulted, and never derived from the bundle or the
+        /// target. It is the value the operator holds to reconcile this exact
+        /// restore later, and `run_restore` carries it unchanged into the plan,
+        /// the durable journal stream key and the recorded transaction, so two
+        /// restore operations over byte-identical bundles address two streams
+        /// instead of one shared stream that would hand the second the first's
+        /// receipt.
+        ///
+        /// This subcommand is a direct argv front door: unlike
+        /// [`BackupCommand::RestoreTest`] it reads no admitted
+        /// [`CommandRequest`], so no correlated `RequestIdentity` reaches it and
+        /// the CLI must not mint one. The operator's own value is therefore the
+        /// operation identity this request carries — the same relation the
+        /// catalogued routes hold, where the admitted request's
+        /// `idempotency_key` is the operation identity. A blank or
+        /// control-bearing value is refused by `run_restore` itself as
+        /// [`BackupError::InvalidField`](eliot_backup::BackupError::InvalidField)
+        /// and reported as `BACKUP_RESTORE_RUN_INVALID`; no default, no
+        /// placeholder, and no fallback identity exists on this route.
+        #[arg(long)]
+        operation_id: String,
     },
     /// Route the advertised `backup-create` command through the
     /// authenticated Kernel front door.
@@ -298,6 +321,7 @@ pub fn run_backup(command: BackupCommand) -> Result<i32> {
             target_sequence,
             target_generation,
             new_lineage,
+            operation_id,
         } => run_restore_run(
             &bundle_json,
             key_manifest_json.as_deref(),
@@ -306,6 +330,7 @@ pub fn run_backup(command: BackupCommand) -> Result<i32> {
             target_sequence,
             target_generation,
             new_lineage.as_deref(),
+            &operation_id,
         ),
     }
 }
@@ -424,6 +449,7 @@ fn run_restore_run(
     target_sequence: Option<u64>,
     target_generation: Option<u64>,
     new_lineage: Option<&str>,
+    operation_id: &str,
 ) -> Result<i32> {
     let epoch_spec = match (
         new_lineage,
@@ -452,10 +478,18 @@ fn run_restore_run(
         .as_ref()
         .map(|path| read_json(path, "key manifest file"))
         .transpose()?;
+    // The operation identity the operator's request carries, handed to the
+    // restore owner unchanged. `run_restore` refuses a blank or control-bearing
+    // value with its own typed `BackupError::InvalidField` before any root is
+    // created, so this route supplies the request's own value and never a
+    // default: the identity is part of the durable journal stream key, and a
+    // defaulted one is exactly what let two operations over byte-identical
+    // bundles share a single stream and read back each other's receipts.
     match run_restore(
         &bundle_bytes,
         key_bytes.as_deref(),
         target_id,
+        operation_id,
         &epoch_spec,
         "backup-restore",
     ) {
