@@ -5682,20 +5682,20 @@ impl KernelComposition {
             eliot_kernel_core::UserAutomationOperation::NormalizeSchedule { .. }
                 | eliot_kernel_core::UserAutomationOperation::MigrateLegacySchedule { .. }
         ) {
-            let gateway = match self.retained_store_gateway() {
-                Ok(gateway) => gateway,
-                Err(_) => {
-                    return Self::bind_user_automation_operator_response(
-                        &request,
-                        &Self::user_automation_runtime_error_response(
-                            UserAutomationRuntimeError::Unavailable(
-                                "canonical UserAutomation Store owner is unavailable".to_owned(),
-                            ),
+            let Ok(gateway) = self.retained_store_gateway() else {
+                return Self::bind_user_automation_operator_response(
+                    &request,
+                    &Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Unavailable(
+                            "canonical UserAutomation Store owner is unavailable".to_owned(),
                         ),
-                    );
-                }
+                    ),
+                );
             };
-            return Self::user_automation_normalization_response(&gateway, &request).await;
+            return Box::pin(Self::user_automation_normalization_response(
+                &gateway, &request,
+            ))
+            .await;
         }
         let transition = match self
             .dispatch_user_automation_operator_transition(session, &request)
@@ -5744,7 +5744,7 @@ impl KernelComposition {
         request: &eliot_kernel_service::UserAutomationServiceRequest,
     ) -> Result<serde_json::Value, TransportError> {
         let (original_request, revision, normalization_receipt_envelope) =
-            match gateway.normalize_user_automation_schedule(request).await {
+            match Box::pin(gateway.normalize_user_automation_schedule(request)).await {
                 Ok(result) => result,
                 Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
                     return Self::bind_user_automation_operator_response(

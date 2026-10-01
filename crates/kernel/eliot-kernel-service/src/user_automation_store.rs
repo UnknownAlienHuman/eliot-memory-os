@@ -2850,8 +2850,10 @@ fn validate_retained_normalization_record(
     expected_revision.schedule =
         super::user_automation_compiler::normalize_schedule(&draft.schedule, occurrence_count)
             .map_err(|_| invalid())?;
-    expected_revision.schedule.normalization_receipt =
-        revision.schedule.normalization_receipt.clone();
+    expected_revision
+        .schedule
+        .normalization_receipt
+        .clone_from(&revision.schedule.normalization_receipt);
     if expected_revision != revision
         || revision.automation_id != record.automation_id
         || revision.revision != record.revision
