@@ -675,6 +675,22 @@ fn task_envelope(
         operation_id,
         request: identity.request.metadata.clone(),
         idempotency_key: identity.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued task record it
+        // transitions, addressed by the task identity. The per-attempt
+        // operation identity additionally binds the observed revision, so a
+        // typed correction of the same task redeclares the same intent while
+        // its operation identity rotates.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "task-lifecycle-transition",
+            record.task_id.as_str(),
+        )
+        .ok_or_else(|| {
+            TaskLifecycleError::Owner(TaskError::InvalidField(
+                "task_lifecycle has no owner-issued subject to declare",
+            ))
+        })?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
         task_id: identity
             .request

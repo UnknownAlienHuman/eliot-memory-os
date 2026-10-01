@@ -147,6 +147,10 @@ mod swarm_plan_attachment_ownership;
 mod swarm_plan_attachment_service;
 mod task_lifecycle;
 mod wasm_resolution;
+mod write_intent;
+pub use write_intent::{
+    GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION, admission_write_intent,
+};
 
 pub use activation_outcome::*;
 pub use campaign_source_publishers::{

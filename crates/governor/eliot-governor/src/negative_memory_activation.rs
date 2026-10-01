@@ -752,6 +752,17 @@ pub async fn commit_negative_memory_activation<P: KernelGenerationPort + ?Sized>
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
         idempotency_key: decoded.idempotency_key.clone(),
+        // #1925: this leg's stable intent is the owner-issued activation
+        // document it commits, not the per-attempt operation identity.
+        write_intent_id: crate::write_intent::admission_write_intent(
+            "negative-memory-activation",
+            &document.document_digest()?,
+        )
+        .ok_or_else(|| {
+            owner_error("activation document has no owner-issued subject to declare")
+        })?,
+        write_envelope_protocol_version:
+            crate::write_intent::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
         scope_id,
         task_id: None,
         transition_class: TransitionClass::CaptureCandidate,
