@@ -87,6 +87,43 @@ fn fixture_typed<T: serde::de::DeserializeOwned>(name: &str) -> T {
     serde_json::from_value(fixture_value(name)).unwrap()
 }
 
+/// Strips line and block comments from production Rust source.
+///
+/// The route-shape scans in this suite assert over *executable* structure —
+/// no retry, no loop, no fallback arm. Doc comments legitimately name those
+/// words while declaring their absence, so a raw text scan would read the
+/// module's own "no … retry …" sentence as a violation.
+fn route_code(source: &str) -> String {
+    let mut code = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_block = false;
+    while let Some(current) = chars.next() {
+        if in_block {
+            if current == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                in_block = false;
+            }
+            continue;
+        }
+        if current == '/' && chars.peek() == Some(&'/') {
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    code.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+        if current == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            in_block = true;
+            continue;
+        }
+        code.push(current);
+    }
+    code
+}
+
 fn handle(value: impl Into<String>) -> PlatformHandle {
     PlatformHandle::new(value).unwrap()
 }
@@ -580,6 +617,23 @@ fn config() -> StoreLaunchConfig {
 }
 
 fn client_hello_frame(config: &StoreLaunchConfig, extra_capabilities: &[&str]) -> Frame {
+    let mut capabilities: Vec<String> = eliot_store_api::CAPABILITIES
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect();
+    for extra in extra_capabilities {
+        capabilities.push((*extra).to_owned());
+    }
+    client_hello_frame_declaring(config, &capabilities)
+}
+
+/// Builds a `ClientHello` that declares exactly `capabilities`.
+///
+/// `admit_handshake` admits the intersection of the declared set and the
+/// store's advertised baseline (`lib.rs` `CAPABILITIES.filter(|capability|
+/// hello.capabilities...)`), so a session without `store.backup` is the
+/// fail-closed case the capability gate has to refuse.
+fn client_hello_frame_declaring(config: &StoreLaunchConfig, capabilities: &[String]) -> Frame {
     let module_id = ContractId::new(STORE_MODULE_IDENTITY).unwrap();
     let artifact_id = ArtifactId::new(config.approved_artifact_hash.as_str()).unwrap();
     let authority_epoch = config
@@ -588,13 +642,7 @@ fn client_hello_frame(config: &StoreLaunchConfig, extra_capabilities: &[&str]) -
         .authority_epoch
         .clone();
     let generation = config.runtime_launch.authority_generation;
-    let mut capabilities: Vec<String> = eliot_store_api::CAPABILITIES
-        .iter()
-        .map(|value| (*value).to_owned())
-        .collect();
-    for extra in extra_capabilities {
-        capabilities.push((*extra).to_owned());
-    }
+    let capabilities = capabilities.to_vec();
     let hello = ClientHello {
         protocol_range: ProtocolRange {
             minimum: ProtocolVersion::CURRENT,
@@ -662,6 +710,23 @@ fn admitted_session(
     (session, config)
 }
 
+/// Admits a session whose declared capability set excludes `store.backup`.
+///
+/// `admit_handshake` intersects the declared set with the advertised baseline,
+/// so withholding the declaration is what makes the per-session capability gate
+/// refuse a backup frame — the advertisement added by #3785 no longer does.
+fn withheld_backup_session() -> (eliot_store_surreal::StoreEbpSession, ServerHello) {
+    let config = config();
+    let identity = StoreHandshakeIdentity::new("manifest-test", json!({}));
+    let declared: Vec<String> = eliot_store_api::CAPABILITIES
+        .iter()
+        .filter(|capability| **capability != BACKUP_CAPABILITY)
+        .map(|capability| (*capability).to_owned())
+        .collect();
+    let frame = client_hello_frame_declaring(&config, &declared);
+    admit_handshake(frame, TransportLimits::default(), &config, &identity).unwrap()
+}
+
 fn transition_991() -> PreparedTransition {
     let entries = eliot_store_api::generated_operation_manifests().unwrap();
     let set_digest = eliot_store_api::operation_manifest_set_digest(&entries).unwrap();
@@ -725,6 +790,19 @@ struct ScriptTransport {
     drop_receive: bool,
 }
 
+/// Returns whether `frame` carries the backup operation under test.
+///
+/// The scripted fault — the delivery outcome and the post-send disconnect —
+/// belongs to that operation alone. I7.3's handshake `ClientHello` must be
+/// delivered for `EbpCanonicalStoreClient::connect` to proceed, and the
+/// schema-readiness probe `connect` then runs is not an operation, so neither
+/// may absorb the fault.
+fn is_scripted_backup_frame(frame: &Frame) -> bool {
+    frame.kind == FrameKind::Request
+        && eliot_store_api::decode_request_frame(frame)
+            .is_ok_and(|(_, _, request)| matches!(request, StoreRequest::Backup { .. }))
+}
+
 impl EbpStoreTransport for ScriptTransport {
     fn ensure_authenticated(
         &self,
@@ -739,21 +817,30 @@ impl EbpStoreTransport for ScriptTransport {
         _limits: TransportLimits,
     ) -> Result<DeliveryOutcome, StoreClientError> {
         self.log.lock().unwrap().push(frame.clone());
-        Ok(self.send_outcome)
+        if is_scripted_backup_frame(frame) {
+            return Ok(self.send_outcome);
+        }
+        Ok(DeliveryOutcome::Delivered)
     }
 
     async fn receive_frame(&mut self, _limits: TransportLimits) -> Result<Frame, StoreClientError> {
-        if self.drop_receive {
+        let log = self.log.lock().unwrap();
+        let last = log.last().expect("response needs a prior send");
+        if self.drop_receive && is_scripted_backup_frame(last) {
             return Err(StoreClientError::Transport(
                 "scripted disconnect before response".to_owned(),
             ));
         }
-        let log = self.log.lock().unwrap();
-        let last = log.last().expect("response needs a prior send");
         if last.kind == FrameKind::Control {
             let hello = ServerHello {
                 selected_protocol: ProtocolVersion::CURRENT,
-                session_principal_binding: "scripted-store-session".to_owned(),
+                // I7.3: the binding is the peer identity the requirement
+                // admitted, not a free-form label.
+                session_principal_binding: format!(
+                    "sid={};session={}",
+                    self.requirement.expected_peer_sid.as_str(),
+                    self.requirement.expected_peer_session_id
+                ),
                 allowed_capabilities: CAPABILITIES
                     .iter()
                     .map(|value| (*value).to_owned())
@@ -879,10 +966,14 @@ fn backup_denominator_covers_every_accepted_operation_end_to_end() {
     // outcome pinned in source and in the capability-denominator fixture.
     assert_eq!(CAPABILITY_STORE_BACKUP, BACKUP_CAPABILITY);
     assert_eq!(CAPABILITY_STORE_BACKUP, "store.backup");
-    assert!(
-        !CAPABILITIES.contains(&CAPABILITY_STORE_BACKUP),
-        "the backup capability is declared but never advertised without backend proof"
-    );
+    // #3785 (5b47cd832) bound the backup ports into the production Store
+    // composition and promoted `store.backup` into the advertised baseline:
+    // wire.rs now reads "Capability for the backup operation" and states that
+    // "Advertising the operation does not prove runtime readiness or grant a
+    // session its use: the authenticated handshake and request admission still
+    // apply." Advertisement is therefore the denominator's capability column;
+    // per-session use still requires an admitted capability.
+    assert!(CAPABILITIES.contains(&CAPABILITY_STORE_BACKUP));
 
     let begin = fixture_begin();
     assert!(begin.validate().is_ok());
@@ -1145,11 +1236,28 @@ async fn real_client_sends_typed_backup_operation_over_transport() {
     // one more typed operation.
     assert_eq!(sends.len(), 2, "connect + exactly one backup send");
     let (request_id, identity, request) = &sends[1];
-    assert_eq!(request_id, &context.request_id);
     let StoreRequest::Backup { request: envelope } = request else {
         panic!("client sent a non-backup operation: {request:?}");
     };
-    assert_eq!(envelope.context, context);
+    // #3949 (5fd445051) gave every backup call its own transport correlation
+    // (`backup_transport_context`: `{connection}:{operation}:{counter}`) instead
+    // of reusing the caller's `request_id`. The frame correlation is therefore
+    // the envelope's own, scoped to the admitted connection, and everything
+    // else in the caller's metadata crosses the transport unchanged.
+    assert_eq!(request_id, &envelope.context.request_id);
+    assert_ne!(
+        request_id, &context.request_id,
+        "the backup client mints its own transport correlation"
+    );
+    assert!(
+        request_id
+            .as_str()
+            .starts_with(client.requirement().connection_id.as_str()),
+        "the minted correlation is scoped to the admitted connection: {request_id}"
+    );
+    let mut expected_context = context.clone();
+    expected_context.request_id = envelope.context.request_id.clone();
+    assert_eq!(envelope.context, expected_context);
     let StoreBackupOperation::Begin(sent) = &envelope.operation else {
         panic!("client sent the wrong backup operation");
     };
@@ -1202,7 +1310,7 @@ fn production_dispatch_routes_backup_to_exactly_one_composition_call() {
             "composition owns the delegation target: {method}"
         );
     }
-    let lowered = route.to_lowercase();
+    let lowered = route_code(route).to_lowercase();
     assert!(!lowered.contains("retry"), "no retry on the backup route");
     assert!(!lowered.contains("loop"), "no loop on the backup route");
     assert!(
@@ -1232,18 +1340,35 @@ fn admission_rejects_before_any_backend_call() {
     let operation = StoreBackupOperation::Begin(begin.clone());
     let frame = backup_frame(&context, operation.clone());
 
-    // Capability gate: the handshake withholds the unadvertised backup
-    // capability, so the frame is refused before dispatch.
-    let (mut session, _) = admitted_session(&[]);
+    // Capability gate: since #3785 advertised `store.backup`, the fail-closed
+    // case is the handshake that never declares it. `admit_handshake` admits
+    // the intersection of the declared set and the advertised baseline, so the
+    // frame is refused before dispatch.
+    let (mut session, hello) = withheld_backup_session();
+    assert_eq!(
+        hello.allowed_capabilities,
+        eliot_store_api::CAPABILITIES
+            .iter()
+            .filter(|capability| **capability != BACKUP_CAPABILITY)
+            .map(|capability| (*capability).to_owned())
+            .collect::<Vec<_>>(),
+        "the session advertises exactly what it declared, minus the backup capability"
+    );
     assert_eq!(
         validate_request_frame(&mut session, &frame),
         Err(format!("capability is not admitted: {BACKUP_CAPABILITY}"))
     );
-    // Offering the capability does not enable it either.
+    // Offering a capability the store never advertises enables nothing.
     let (mut offered, hello) = {
         let config = config();
         let identity = StoreHandshakeIdentity::new("manifest-test", json!({}));
-        let frame = client_hello_frame(&config, &[BACKUP_CAPABILITY]);
+        let mut declared: Vec<String> = eliot_store_api::CAPABILITIES
+            .iter()
+            .filter(|capability| **capability != BACKUP_CAPABILITY)
+            .map(|capability| (*capability).to_owned())
+            .collect();
+        declared.push("store.future_x".to_owned());
+        let frame = client_hello_frame_declaring(&config, &declared);
         let (session, hello) =
             admit_handshake(frame, TransportLimits::default(), &config, &identity).unwrap();
         (session, hello)
@@ -1252,6 +1377,10 @@ fn admission_rejects_before_any_backend_call() {
         !hello
             .allowed_capabilities
             .contains(&BACKUP_CAPABILITY.to_owned())
+            && !hello
+                .allowed_capabilities
+                .contains(&"store.future_x".to_owned()),
+        "an unadvertised capability is never admitted, however it is offered"
     );
     assert_eq!(
         validate_request_frame(&mut offered, &frame),
@@ -1454,7 +1583,10 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
     );
 
     // After send: an unknown delivery outcome is possible effect for the
-    // admitted operation — MissingReceiptEnvelope, never success, one send.
+    // admitted operation — `StoreError::UnknownOutcome` carrying that exact
+    // admitted `OperationId` (#3796, fbf394a4d: "an unknown outcome retains the
+    // admitted `OperationId` in `StoreError::UnknownOutcome` with no second send
+    // and no retry"), never success, one send.
     let (unknown_client, unknown_log) = connected_client_with_outcome(
         backup_success_response(&operation),
         DeliveryOutcome::UnknownOutcome,
@@ -1468,10 +1600,11 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .expect_err("unknown delivery is possible effect, never success");
     assert!(
         matches!(
-            unknown,
-            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+            &unknown,
+            StoreBackupClientError::Store(StoreError::UnknownOutcome { operation_id })
+                if *operation_id == begin.operation.operation_id
         ),
-        "unknown delivery is a missing receipt envelope, got {unknown:?}"
+        "unknown delivery is an unknown outcome bound to the admitted operation, got {unknown:?}"
     );
     assert_eq!(
         sent_backup_requests(&unknown_log).len() - unknown_baseline,
@@ -1493,10 +1626,11 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .expect_err("disconnect after send is unknown, never success");
     assert!(
         matches!(
-            dropped,
-            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+            &dropped,
+            StoreBackupClientError::Store(StoreError::UnknownOutcome { operation_id })
+                if *operation_id == begin.operation.operation_id
         ),
-        "disconnect after send is a missing receipt envelope, got {dropped:?}"
+        "disconnect after send is an unknown outcome bound to the admitted operation, got {dropped:?}"
     );
     assert_eq!(
         sent_backup_requests(&dropped_log).len() - dropped_baseline,
@@ -1525,10 +1659,11 @@ async fn unknown_effect_triggers_no_new_operation_or_retry() {
         .expect_err("unknown stays unknown");
     assert!(
         matches!(
-            outcome,
-            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+            &outcome,
+            StoreBackupClientError::Store(StoreError::UnknownOutcome { operation_id })
+                if *operation_id == begin.operation.operation_id
         ),
-        "the projected outcome is a missing receipt envelope, got {outcome:?}"
+        "the projected outcome is an unknown outcome bound to the admitted operation, got {outcome:?}"
     );
     let mutating = sent_backup_requests(&log)
         .into_iter()
@@ -1634,9 +1769,17 @@ fn page_continuation_and_cumulative_bounds_hold_identity() {
     forked.cursor.handle_digest = "9".repeat(64);
     assert!(complete.validate_continuation(&forked).is_err());
     assert!(forked.validate_continuation(&partial).is_err());
-    // Cumulative bounds never reset along a continuation.
+    // Cumulative bounds never reset along a continuation. #3949 (5fd445051)
+    // replaced the two monotone `<` comparisons on the page-level fields with
+    // one exact-bound check on the continuation's *admitted cursor*
+    // (`self.cursor.cumulative_bytes == previous.cumulative_bytes &&
+    // self.cursor.cumulative_members == previous.coverage.cumulative_members`,
+    // "continuation must begin at the exact previous page bounds"). Both resets
+    // are therefore refused on the cursor the owner admitted; the page-level
+    // `cumulative_bytes` post-state is now covered by `validate()`, which
+    // requires it to equal `cursor.cumulative_bytes` plus this page's members.
     let mut reset = complete.clone();
-    reset.cumulative_bytes = partial.cumulative_bytes - 1;
+    reset.cursor.cumulative_bytes = partial.cumulative_bytes - 1;
     assert!(reset.validate_continuation(&partial).is_err());
     let mut reset_members = complete.clone();
     reset_members.cursor.cumulative_members = 0;
@@ -1845,11 +1988,14 @@ async fn verify_and_status_paths_cannot_restore_cut_over_or_unblock() {
 // WORK_UNIT_CASE: 975/14
 #[tokio::test]
 async fn absent_default_implementation_advertises_nothing_and_fails_closed() {
-    // A14: an absent/default implementation cannot advertise working
-    // capability or return success. The capability stays out of the
-    // advertised catalogue, the handshake withholds it even when offered,
-    // and every default port body refuses without effects.
-    assert!(!CAPABILITIES.contains(&BACKUP_CAPABILITY));
+    // A14: an absent/default implementation cannot claim working
+    // capability or return success. Since #3785 `store.backup` is part of
+    // the static advertised baseline — "Advertising the operation does not
+    // prove runtime readiness or grant a session its use" (wire.rs) — so the
+    // proof here is the ports: no speculative capability variant is
+    // advertised, only the exact declared-and-advertised set is enabled, and
+    // every default port body refuses without effects.
+    assert!(CAPABILITIES.contains(&BACKUP_CAPABILITY));
     assert!(!CAPABILITIES.contains(&"store.backup.future"));
     let config = config();
     let identity = StoreHandshakeIdentity::new("manifest-test", json!({}));
@@ -1864,10 +2010,18 @@ async fn absent_default_implementation_advertises_nothing_and_fails_closed() {
             .collect::<Vec<_>>(),
         "only the exact admitted set is enabled"
     );
+    // The capability is admitted, and admitting it still proves nothing: the
+    // absent default implementation is the refusal the caller meets.
+    assert!(
+        hello
+            .allowed_capabilities
+            .contains(&BACKUP_CAPABILITY.to_owned())
+    );
     assert!(
         !hello
             .allowed_capabilities
-            .contains(&BACKUP_CAPABILITY.to_owned())
+            .contains(&"store.future_x".to_owned()),
+        "an unadvertised capability is never admitted"
     );
 
     let backend = DefaultBackupBackend;

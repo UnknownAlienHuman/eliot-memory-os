@@ -51,7 +51,7 @@
     "transition_class": "capture_candidate",
     "requested_effect_ceiling": "CANDIDATE",
     "admission_contract_set_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "operation_manifest_digest": "51c1b8b56bab1a59ade0faff196b2fa79c93da1fb278aebb909ea797b3844caf",
+    "operation_manifest_digest": "7916a24a108bea6293a3199d06bb50fb6b05c4e9ee3f768f55f3c3dd11887643",
     "admission_digest": "b48873b17eff11b124a49ad35500d4352ef8e0f6af43589b5cbe023313005d6a",
     "mutation_plan_digest": "1d8b49a2e3bd0a42255f538bbe6ba12d454cc4f68c38aa700e9dea381927a78c",
     "semantic_source_revisions": [],
@@ -85,8 +85,8 @@
     "operation_id": "op-991-d1",
     "idempotency_key": "idem-991-d1",
     "canonical_request_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "prepared_transition_digest": "8dc9082ba9274eab76182e1f886ca4fed05ae7b45a16f2fb57048138535d7ddd",
-    "reservation_token_digest": "aed1b3ad5604918d35840cd60c9ce16d45d39cd3f99077d23f2456e528328437",
+    "prepared_transition_digest": "86c689f8c1b0871a2e484bca272df3a0d80d98aaf3cede557185288a4788e4d8",
+    "reservation_token_digest": "592610ad31d3021c8a3a1433982d0116dfb9b4f5340d2e791f0dc0e4109035ec",
     "scopes": [
       {
         "scope": "scope-991-d1",
