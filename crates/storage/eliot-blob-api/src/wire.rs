@@ -457,6 +457,16 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     /// the exact current scope from the authenticated submission context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_work_scope_ref: Option<String>,
+    /// Exact provider Module ID retained by the admitted TestD job, when the
+    /// submission carried verified catalog lifecycle provenance. It is only a
+    /// lookup expectation; the daemon must independently read the current
+    /// catalog and verify the generation admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_module_id: Option<String>,
+    /// Exact provider generation ID retained by the admitted TestD job, when
+    /// available. This is only a lookup expectation, never catalog authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation_id: Option<String>,
     /// Digest of the exact canonical source-root identity after Kernel checks it.
     pub source_root_identity_sha256: String,
     /// Authenticated outer request fence.
@@ -484,6 +494,12 @@ impl BlobProcessStreamOwnerFactsPullRequest {
         }
         if let Some(work_scope_ref) = &self.expected_work_scope_ref {
             validate_text("expected_work_scope_ref", work_scope_ref)?;
+        }
+        if let Some(module_id) = &self.expected_module_id {
+            validate_text("expected_module_id", module_id)?;
+        }
+        if let Some(generation_id) = &self.expected_generation_id {
+            validate_text("expected_generation_id", generation_id)?;
         }
         if let Some(session_id) = &self.session_id {
             validate_text("session_id", session_id)?;
@@ -692,6 +708,16 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 .is_some_and(|expected| expected != work_scope_ref)
         {
             return Err(WireValidationError::InvalidField("work_scope_binding"));
+        }
+        if matches!(
+            &self.outcome,
+            BlobProcessStreamOwnerFactsPullOutcome::Available { .. }
+        ) && (request.expected_module_id.is_none()
+            || request.expected_generation_id.is_none())
+        {
+            return Err(WireValidationError::InvalidField(
+                "provider_catalog_expectation",
+            ));
         }
         Ok(())
     }
