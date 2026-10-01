@@ -21,6 +21,7 @@ use eliot_testd_core::{
     TestdProviderCatalogLifecycle, TestdSourceObservationRange, TestdStreamDisposition,
     TestdStreamEvidenceBinding, TestdToolObservation,
 };
+use eliot_module_registry::ModuleCatalogSnapshot;
 use eliot_workscope::{
     GoverningSource, GoverningSourceRole, SourceStatus, WorkScopeBindingSnapshot,
 };
@@ -78,6 +79,13 @@ pub struct VerifiedTestdReplayContext {
     profile_registry: InstrumentRegistry,
     lifecycle: eliot_module_registry::VerifiedModuleCatalogGeneration,
     work_scope_binding: WorkScopeBindingSnapshot,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ModuleCatalogOwnerReadbackJson {
+    owner_revision: u64,
+    snapshot: ModuleCatalogSnapshot,
 }
 
 impl VerifiedTestdReplayContext {
@@ -217,12 +225,16 @@ impl VerifiedTestdReplayContext {
         work_scope_binding_json: &[u8],
         work_scope_binding_sha256: &str,
     ) -> Result<Self, ProfileReplayError> {
-        let readback: eliot_module_registry::ModuleCatalogOwnerReadback =
+        let readback_json: ModuleCatalogOwnerReadbackJson =
             decode_canonical_owner_json(
                 catalog_readback_json,
                 catalog_readback_sha256,
                 "Module Catalog owner readback",
             )?;
+        let readback = eliot_module_registry::ModuleCatalogOwnerReadback {
+            owner_revision: readback_json.owner_revision,
+            snapshot: readback_json.snapshot,
+        };
         let admission: eliot_module_registry::GenerationAdmission = decode_canonical_owner_json(
             generation_admission_json,
             generation_admission_sha256,
