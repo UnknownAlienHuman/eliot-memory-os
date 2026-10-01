@@ -137,6 +137,26 @@
    "workspace_admission": "admitted via #829 (T8-A0) root workspace membership"
   }
  },
+ "navigation_blockers": [
+  {
+   "claim": "package/target-local AGENTS.md route/block/handle closure in the generated package docs index",
+   "issue": 690,
+   "owned_by_829": false,
+   "owner": "code_navigation package index generator",
+   "recorded_for": "the navigation acceptance claim of this admission",
+   "resolution_required": "rerun the navigation cases after the generator owner is repaired and accepted",
+   "withheld": "docs/code-navigation target closure acceptance"
+  },
+  {
+   "claim": "the committed PACKAGE_DOCS_INDEX.md on this tree is stale for the eliot-instrument-runner and eliot-windows-ipc/eliot-types bin targets added by #1914 after the last index regeneration, so code_navigation check exits nonzero before this admission",
+   "issue": 1914,
+   "owned_by_829": false,
+   "owner": "code_navigation package index generator",
+   "recorded_for": "the navigation acceptance claim of this admission",
+   "resolution_required": "the index owner regenerates the index and this suite reruns; #829 does not regenerate an index it does not own and does not weaken the check to accept staleness",
+   "withheld": "the code_navigation check exit status of this admission"
+  }
+ ],
  "module_status_at_parent": {
   "crates/smart/eliot-context-contracts": {
    "agent_order": 15,
