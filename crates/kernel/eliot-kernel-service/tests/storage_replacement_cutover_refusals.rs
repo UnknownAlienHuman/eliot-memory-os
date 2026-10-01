@@ -287,7 +287,10 @@ fn begin_binds_to_the_pinned_canonical_store_scope_and_refuses_a_committed_candi
     // the pinned scope no matter what the caller presented.
     let bound = StorageReplacement::begin(&ors, "replacement-foreign-scope", None, generation(9))
         .expect("a foreign-scope cutover must not claim the candidate");
-    assert_eq!(bound.route_scope().route_scope_hash, pinned.route_scope_hash);
+    assert_eq!(
+        bound.route_scope().route_scope_hash,
+        pinned.route_scope_hash
+    );
     assert_eq!(bound.route_scope().capability, CANONICAL_STORE_CAPABILITY);
     assert_eq!(bound.route_scope().module_id, CANONICAL_STORE_MODULE_ID);
     assert_eq!(bound.route_scope().work_scope, pinned.work_scope);
@@ -386,15 +389,12 @@ fn replacement_stages_run_in_order_and_a_cutover_receipt_needs_a_committed_ors_r
         StateMigrationDecision::RetainCompatible,
     ))
     .expect("stage the genesis cutover");
-    ors.commit_cutover_ownership("cutover-genesis").expect("commit the genesis cutover");
+    ors.commit_cutover_ownership("cutover-genesis")
+        .expect("commit the genesis cutover");
 
-    let mut replacement = StorageReplacement::begin(
-        &ors,
-        "replacement-i2",
-        Some(generation(1)),
-        generation(2),
-    )
-    .expect("begin the replacement");
+    let mut replacement =
+        StorageReplacement::begin(&ors, "replacement-i2", Some(generation(1)), generation(2))
+            .expect("begin the replacement");
     assert_eq!(
         replacement.next_stage(),
         Some(StorageReplacementStage::InstallCandidateStoreBridge)
@@ -493,11 +493,7 @@ fn replacement_stages_run_in_order_and_a_cutover_receipt_needs_a_committed_ors_r
     // produce one.
     let (field, reason) = invalid_field(
         replacement
-            .commit_canonical_store_route_cutover(
-                &ors,
-                "cutover-i2",
-                "route cutover committed",
-            )
+            .commit_canonical_store_route_cutover(&ors, "cutover-i2", "route cutover committed")
             .expect_err("an unknown cutover identity must be refused"),
     );
     assert_eq!(field, "storage_replacement_cutover_record");
@@ -526,11 +522,7 @@ fn replacement_stages_run_in_order_and_a_cutover_receipt_needs_a_committed_ors_r
     .expect("stage the cutover without committing it");
     let (field, _) = invalid_field(
         replacement
-            .commit_canonical_store_route_cutover(
-                &ors,
-                "cutover-i2",
-                "route cutover committed",
-            )
+            .commit_canonical_store_route_cutover(&ors, "cutover-i2", "route cutover committed")
             .expect_err("a staged but uncommitted cutover must be refused"),
     );
     assert_eq!(
@@ -550,7 +542,8 @@ fn replacement_stages_run_in_order_and_a_cutover_receipt_needs_a_committed_ors_r
     // The same coordinator, against the now-committed row, produces the durable
     // cutover receipt: both store generations, the pinned route scope, and the
     // stage-5 canonical event tail transfer (NOT the stage-2 snapshot import).
-    ors.commit_cutover_ownership("cutover-i2").expect("commit the cutover");
+    ors.commit_cutover_ownership("cutover-i2")
+        .expect("commit the cutover");
     let receipt = replacement
         .commit_canonical_store_route_cutover(&ors, "cutover-i2", "route cutover committed")
         .expect("derive the receipt from the committed row");
@@ -560,7 +553,10 @@ fn replacement_stages_run_in_order_and_a_cutover_receipt_needs_a_committed_ors_r
     assert_eq!(receipt.route_scope, pinned);
     assert_eq!(receipt.transfer, ecxf_transfer(EVENT_TAIL_PAYLOAD));
     assert_ne!(receipt.transfer, ecxf_transfer(SNAPSHOT_PAYLOAD));
-    assert_eq!(receipt.committed_cutover.state, GenerationCutoverState::Committed);
+    assert_eq!(
+        receipt.committed_cutover.state,
+        GenerationCutoverState::Committed
+    );
     assert_eq!(receipt.committed_cutover.cutover_id, "cutover-i2");
     assert!(
         receipt
@@ -573,7 +569,10 @@ fn replacement_stages_run_in_order_and_a_cutover_receipt_needs_a_committed_ors_r
         receipt.irreversible_effects.is_empty(),
         "no irreversible effect was recorded for this replacement"
     );
-    assert_eq!(replacement.next_stage(), Some(StorageReplacementStage::CanaryReadsAndWrites));
+    assert_eq!(
+        replacement.next_stage(),
+        Some(StorageReplacementStage::CanaryReadsAndWrites)
+    );
 
     remove_ors(path, ors);
 }
@@ -606,7 +605,8 @@ fn irreversibility_is_tracked_before_rollback_and_contradicting_cutovers_are_ref
         StateMigrationDecision::RetainCompatible,
     ))
     .expect("stage the genesis cutover");
-    ors.commit_cutover_ownership("cutover-genesis").expect("commit the genesis cutover");
+    ors.commit_cutover_ownership("cutover-genesis")
+        .expect("commit the genesis cutover");
 
     // Two coordinators for the SAME candidate cutover: one whose irreversible
     // ledger is silent, one that has already observed an irreversible migration.
@@ -651,7 +651,8 @@ fn irreversibility_is_tracked_before_rollback_and_contradicting_cutovers_are_ref
         StateMigrationDecision::RetainCompatible,
     ))
     .expect("stage the retain-compatible cutover");
-    ors.commit_cutover_ownership("cutover-retain").expect("commit the retain-compatible cutover");
+    ors.commit_cutover_ownership("cutover-retain")
+        .expect("commit the retain-compatible cutover");
 
     // W3 refusal, first direction: the committed row declares the state migration
     // is compatible while the coordinator's own ledger records an irreversible
@@ -659,11 +660,7 @@ fn irreversibility_is_tracked_before_rollback_and_contradicting_cutovers_are_ref
     // is still available, so the cutover receipt is refused.
     let (field, reason) = invalid_field(
         irreversible
-            .commit_canonical_store_route_cutover(
-                &ors,
-                "cutover-retain",
-                "route cutover committed",
-            )
+            .commit_canonical_store_route_cutover(&ors, "cutover-retain", "route cutover committed")
             .expect_err("a migration decision contradicting the ledger must be refused"),
     );
     assert_eq!(field, "storage_replacement_migration");
@@ -723,8 +720,7 @@ fn irreversibility_is_tracked_before_rollback_and_contradicting_cutovers_are_ref
         generation(3),
     )
     .expect("begin the forward-repair replacement with an observed effect");
-    forward_observed
-        .record_irreversible_effect(IrreversibleStorageEffect::ExternalEffectIssued);
+    forward_observed.record_irreversible_effect(IrreversibleStorageEffect::ExternalEffectIssued);
     drive_to_route_cutover(&mut forward_silent);
     drive_to_route_cutover(&mut forward_observed);
     ors.stage_cutover_ownership(armed_cutover_row(
@@ -769,7 +765,10 @@ fn irreversibility_is_tracked_before_rollback_and_contradicting_cutovers_are_ref
         receipt.irreversible_effects,
         BTreeSet::from([IrreversibleStorageEffect::ExternalEffectIssued])
     );
-    assert_eq!(receipt.committed_cutover.migration, StateMigrationDecision::ForwardRepairRequired);
+    assert_eq!(
+        receipt.committed_cutover.migration,
+        StateMigrationDecision::ForwardRepairRequired
+    );
     assert_eq!(
         forward_observed.rollback_disposition(),
         StorageRollbackDisposition::ForwardRepairRequired {
@@ -818,7 +817,8 @@ fn cutover_receipt_validation_refuses_a_rebound_generation_pair() {
         StateMigrationDecision::RetainCompatible,
     ))
     .expect("stage the genesis cutover");
-    ors.commit_cutover_ownership("cutover-genesis").expect("commit the genesis cutover");
+    ors.commit_cutover_ownership("cutover-genesis")
+        .expect("commit the genesis cutover");
 
     let mut replacement = StorageReplacement::begin(
         &ors,
@@ -838,7 +838,8 @@ fn cutover_receipt_validation_refuses_a_rebound_generation_pair() {
         StateMigrationDecision::RetainCompatible,
     ))
     .expect("stage the cutover");
-    ors.commit_cutover_ownership("cutover-i2").expect("commit the cutover");
+    ors.commit_cutover_ownership("cutover-i2")
+        .expect("commit the cutover");
     let receipt = replacement
         .commit_canonical_store_route_cutover(&ors, "cutover-i2", "route cutover committed")
         .expect("derive the receipt");
