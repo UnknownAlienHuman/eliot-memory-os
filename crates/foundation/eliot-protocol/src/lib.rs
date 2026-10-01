@@ -989,8 +989,7 @@ fn is_identityless_blob_kernel_exchange(frame: &Frame) -> bool {
     let wire_id = payload.get("wire_id").and_then(Value::as_str);
     matches!(
         wire_id,
-        Some("eliot.kernel.blob-process-stream")
-            | Some("eliot.kernel.blob-process-stream-reconcile")
+        Some("eliot.kernel.blob-process-stream" | "eliot.kernel.blob-process-stream-reconcile")
     ) && payload.get("wire_revision").and_then(Value::as_u64) == Some(1)
 }
 
