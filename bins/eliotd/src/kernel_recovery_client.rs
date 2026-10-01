@@ -369,7 +369,7 @@ fn task_controller_owner_request_identity(
         || identity.session_id.as_deref() != Some(attempt.session_id.as_str())
         || identity.task_id.as_deref() != Some(claimed.invocation.task_id.as_str())
         || identity.work_scope_id.as_deref() != Some(attempt.scope_id.as_str())
-        || attempt.operation_id != claimed.operation_id
+        || attempt.operation_id != claimed.operation_id.as_str()
         || attempt.state_fence != claimed.envelope.state_fence
     {
         return Err(KernelPortError::Contract(
