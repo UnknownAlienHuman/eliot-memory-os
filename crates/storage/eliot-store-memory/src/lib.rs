@@ -2830,6 +2830,11 @@ struct AutomationPageSlice<T> {
 /// `last_row_id` is the identity of the last row actually returned, so a
 /// continuation is never minted from the probe row or from a row that
 /// truncation removed.
+///
+/// Issue #2860 W3: this post-truncation tail is the only row identity the
+/// owner may retain as a continuation boundary. Both payloads hand
+/// `page.last_row_id` to `automation_page_with_continuation`, never the
+/// discarded probe.
 fn automation_page_slice<T>(
     eligible: Vec<T>,
     limit: usize,
@@ -3416,6 +3421,10 @@ fn automation_verified_boundary(
 
 /// Mints the successor after page slicing, using the exact last returned row.
 /// Replaying a retained page returns its previously minted successor identifier.
+///
+/// Issue #2860 A6: exact replay therefore preserves the same page and cursor
+/// identity — the already-linked successor is reused, and a changed tail or
+/// binding fails closed instead of minting a fresh identity.
 fn memory_automation_continuation_mint(
     state: &mut MemoryState,
     request: &MemoryAutomationContinuationRequest<'_>,
@@ -3672,6 +3681,10 @@ fn memory_continuation_commit_mint(
 /// A truncated page that carried no successor cursor would be indistinguishable
 /// from a terminator, so the owner refuses rather than serving a page whose
 /// remainder has no address.
+///
+/// The boundary retained here is always the post-slice returned tail supplied
+/// by the caller. A truncated page with no tail is a typed refusal, never a
+/// probe-derived cursor (issue #2860 W3).
 fn automation_page_with_continuation(
     state: &mut MemoryState,
     mut completeness: Value,
