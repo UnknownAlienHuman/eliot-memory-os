@@ -251,6 +251,34 @@ impl<'a> ActivationObservation<'a> {
         observation.receipt = Some(fence.ready_receipt_digest.as_str());
         observation
     }
+
+    /// Binds the reconciled result from current post-commit durable
+    /// evidence: the immutable transaction linking back to the historical
+    /// pending input, plus the generation and commit-fence receipt proven
+    /// by the current readback. Never reports the pre-commit disposition
+    /// state: the pending row is gone, so there is no pending state to
+    /// project and no `for_pending` record may describe this completion.
+    /// The transaction is immutable across the transition, so the shared
+    /// `tx` value (not record order) binds this result to the historical
+    /// "reconcile requested"/"commit requested" input records, which keep
+    /// their pre-transition ceiling.
+    fn for_reconciled(
+        label: &'static str,
+        transaction: &'a str,
+        fence: &'a ActivationCommitFence,
+    ) -> Self {
+        Self {
+            label,
+            transaction: Some(transaction),
+            plan: None,
+            generation: Some(fence.generation.as_str()),
+            manifest: None,
+            state: None,
+            effect: None,
+            request: None,
+            receipt: Some(fence.ready_receipt_digest.as_str()),
+        }
+    }
 }
 
 /// Emits one identity-bound activation observation through the #889 facade.
@@ -337,9 +365,30 @@ impl HostComposition {
         self.commit_pending_durable(&pending, &host_capability)?;
         // WORK_UNIT_CASE: 893/14 — pending activation reconciled and
         // committed; abort/stale paths above emit no reconciled record.
-        host_activation_observe_bound(&ActivationObservation::for_pending(
+        // The pending row is gone after the proven commit, so the
+        // completion record is built from the current durable readback
+        // (`self.registry` now holds the exact post-commit durable proven
+        // inside `commit_pending_durable`: pending removed, active
+        // generation/approval advanced, commit fence stored), never from
+        // the pre-commit input. The transaction is immutable across the
+        // transition and links this result to the historical "reconcile
+        // requested"/"commit requested" input records, which keep their
+        // pre-transition ceiling; this record carries the post-commit
+        // ceiling (current generation plus commit-fence receipt, no
+        // pending-state claim).
+        let fence = self
+            .registry
+            .last_committed_activation_fence()
+            .ok_or_else(|| {
+                HostError::RecoveryRequired(
+                    "activation commit succeeded but the committed fence is missing from readback"
+                        .to_owned(),
+                )
+            })?;
+        host_activation_observe_bound(&ActivationObservation::for_reconciled(
             "host.activation reconciled",
-            &pending,
+            pending.transaction_id.as_str(),
+            fence,
         ));
         Ok(())
     }
