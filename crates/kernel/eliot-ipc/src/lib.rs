@@ -502,6 +502,51 @@ pub fn dispatch_lifecycle_event(
     }
 }
 
+/// Binds one incoming lifecycle `Cancel` frame to the existing cancellation
+/// registry (I7.4 cancel, I7.2 frame envelope).
+///
+/// The frame must validate as a typed `Cancel` (`FrameKind::Cancel` /
+/// `MessageType::Cancel`) carrying its `RequestIdentity`; any other
+/// kind/message or an invalid frame is rejected with the existing typed
+/// protocol failure and never touches the registry. The presented
+/// `RequestIdentity.cancellation_id` is applied through the existing
+/// [`CancellationRegistry::cancel_stable`] point, so a retried `Cancel`
+/// with the same idempotency identity observes the recorded terminal as
+/// [`CancellationDisposition::Duplicate`] instead of a second effect, and
+/// the recorded disposition survives retries and reconnects: the registry
+/// is owned by the lifecycle owner, never by the fenced session, and
+/// entries persist until an explicit `reap`. An unregistered identity
+/// reports [`CancellationDisposition::Unknown`] without minting state;
+/// observe the standing disposition without advancing state via
+/// [`CancellationRegistry::state`].
+///
+/// # Errors
+///
+/// Returns the existing typed protocol failure for invalid frames,
+/// non-`Cancel` frames, and identities that fail validation.
+pub fn dispatch_lifecycle_cancel(
+    frame: &Frame,
+    registry: &mut CancellationRegistry,
+) -> Result<CancellationDisposition, TransportError> {
+    frame.validate()?;
+    if !matches!(
+        (frame.kind, frame.message_type),
+        (FrameKind::Cancel, MessageType::Cancel)
+    ) {
+        return Err(TransportError::Protocol(ProtocolError::InvalidField {
+            field: "kind/message_type",
+            reason: "lifecycle Cancel dispatch requires a Cancel frame carrying a Cancel message",
+        }));
+    }
+    let identity = frame.request_identity.as_ref().ok_or_else(|| {
+        TransportError::Protocol(ProtocolError::InvalidField {
+            field: "request_identity",
+            reason: "required for request and cancel frames",
+        })
+    })?;
+    Ok(registry.cancel_stable(&identity.cancellation_id))
+}
+
 /// Transport failures are deliberately distinct from application outcomes.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransportError {
