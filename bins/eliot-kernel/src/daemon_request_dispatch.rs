@@ -3716,6 +3716,20 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_)) => {
+                            // Issue #2565 AUD14: unreachable on this path and
+                            // refused rather than answered. The variant is
+                            // constructed in exactly one place —
+                            // `KernelComposition::submit_observe_result` — and
+                            // this is the local-read leg, which reaches
+                            // `submit_claimed_result` and can never return it.
+                            // Fencing is the honest response: rendering
+                            // `possible_effect_retained_daemon_response` here
+                            // would report an observe-lane receipt on a
+                            // local-read request, a wrong-shape answer for an
+                            // operation this path knows nothing about.
+                            Err(TransportError::SessionFenced)
+                        }
                         Err(TransportError::Timeout) => {
                             // F-LOG-KERNEL-1 (#897 T19): timeout after
                             // possible work stays `unknown` in the diagnostic
@@ -3996,6 +4010,18 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_)) => {
+                            // Issue #2565 AUD14: the campaign-packet leg shares
+                            // `submit_claimed_result` with local read and is not
+                            // the observe lane, so it can never produce the
+                            // variant — its sole constructor is
+                            // `submit_observe_result`. Fenced rather than
+                            // answered: a possible-effect receipt is an
+                            // observe-lane observation, and serving one here
+                            // would attribute an owner receipt to a campaign
+                            // packet this path never evaluated.
+                            Err(TransportError::SessionFenced)
+                        }
                         Err(TransportError::Timeout) => {
                             // F-LOG-KERNEL-1 (#897 T19): timeout after
                             // possible work stays `unknown` in the diagnostic
@@ -4063,6 +4089,17 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_)) => {
+                            // Issue #2565 AUD14: `submit_task_controller_result`
+                            // has its own body in `daemon_claim_queue.rs` and
+                            // only ever yields `Persisted` or `StaleAttempt`, so
+                            // this arm cannot be reached. Fenced rather than
+                            // answered: the retained receipt would describe an
+                            // observe-lane result, and a task-controller
+                            // invocation must never be handed that as its
+                            // disposition.
+                            Err(TransportError::SessionFenced)
+                        }
                         Err(TransportError::Timeout) => {
                             // F-LOG-KERNEL-1 (#897 T19): timeout after
                             // possible work stays `unknown` in the diagnostic
@@ -4129,6 +4166,17 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_)) => {
+                            // Issue #2565 AUD14: `submit_finish_result` has its
+                            // own body in `daemon_claim_queue.rs` and only ever
+                            // yields `Persisted` or `StaleAttempt`, so this arm
+                            // cannot be reached. Fenced rather than answered:
+                            // `possible_effect` on a finish acknowledgement
+                            // would claim a possibly-effected observation
+                            // outcome for an `eliot.finish` candidate, which is
+                            // a different lifecycle entirely.
+                            Err(TransportError::SessionFenced)
+                        }
                         Err(TransportError::Timeout) => {
                             // F-LOG-KERNEL-1 (#897 T19): timeout after
                             // possible work stays `unknown` in the diagnostic

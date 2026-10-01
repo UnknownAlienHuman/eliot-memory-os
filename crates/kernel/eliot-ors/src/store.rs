@@ -10192,21 +10192,10 @@ impl RedbRecoveryStore {
         unpersisted_result_commitment_sha256: &str,
         owner_receipt: &crate::HostRequestRetainedLineage,
     ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
-        crate::model::validate_digest(
-            unpersisted_result_commitment_sha256,
-            "host_request_possible_effect_unpersisted_result_commitment_sha256",
-        )?;
-        if !matches!(
+        Self::validate_possible_effect_request(
             target,
-            crate::HostRequestState::PossiblyEffected
-                | crate::HostRequestState::Unknown
-                | crate::HostRequestState::Reconciling
-        ) {
-            return Err(OrsError::InvalidField {
-                field: "host_request_possible_effect_target",
-                reason: "a possible-effect reference belongs only to an unresolved state",
-            });
-        }
+            unpersisted_result_commitment_sha256,
+        )?;
         let key = format!("{}::{}", operation_id.as_str(), request_digest);
         let write = self.database.begin_write().map_err(storage)?;
         let existing: Option<crate::HostRequestRecord> = {
@@ -10236,16 +10225,7 @@ impl RedbRecoveryStore {
         if next.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
             return Err(OrsError::InvalidTransition);
         }
-        let retained: Option<crate::HostRequestPossibleEffectReference> = {
-            let table = write
-                .open_table(HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES)
-                .map_err(storage)?;
-            table
-                .get(key.as_str())
-                .map_err(storage)?
-                .map(|value| decode::<crate::HostRequestPossibleEffectReference>(value.value()))
-                .transpose()?
-        };
+        let retained = Self::load_possible_effect_reference(&write, key.as_str())?;
         if let Some(retained) = retained {
             if retained.unpersisted_result_commitment_sha256 != unpersisted_result_commitment_sha256
                 || retained.owner_receipt != *owner_receipt
@@ -10258,11 +10238,84 @@ impl RedbRecoveryStore {
             return Ok(Some(next));
         }
         next.state = next.state.transition_to(target)?;
+        let reference =
+            Self::build_possible_effect_reference(&next, unpersisted_result_commitment_sha256, owner_receipt)?;
+        reference.validate_for(&next)?;
+        next.validate()?;
+        Self::write_possible_effect_row(&write, key.as_str(), &next, &reference)?;
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Refuses a possible-effect advance whose target is a state that could be
+    /// re-dispatched, and whose owner commitment is not a digest at all.
+    ///
+    /// Split out of [`Self::advance_host_request_to_possible_effect`] as a pure
+    /// move: both refusals ran before any store access, both still do, and
+    /// neither check is weakened by living here. The state gate is what keeps
+    /// this entry from ever minting a claimable row, and it is deliberately
+    /// checked here rather than inferred from `transition_to` alone.
+    fn validate_possible_effect_request(
+        target: crate::HostRequestState,
+        unpersisted_result_commitment_sha256: &str,
+    ) -> Result<(), OrsError> {
+        crate::model::validate_digest(
+            unpersisted_result_commitment_sha256,
+            "host_request_possible_effect_unpersisted_result_commitment_sha256",
+        )?;
+        if !matches!(
+            target,
+            crate::HostRequestState::PossiblyEffected
+                | crate::HostRequestState::Unknown
+                | crate::HostRequestState::Reconciling
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_possible_effect_target",
+                reason: "a possible-effect reference belongs only to an unresolved state",
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads the reference already retained for one host-request key, if any.
+    ///
+    /// Split out of [`Self::advance_host_request_to_possible_effect`] as a pure
+    /// move so the monotonic-replay check below stays about MONOTONICITY rather
+    /// than about table access. Runs inside the caller's open write
+    /// transaction, so it observes the same snapshot the advance does.
+    fn load_possible_effect_reference(
+        write: &redb::WriteTransaction,
+        key: &str,
+    ) -> Result<Option<crate::HostRequestPossibleEffectReference>, OrsError> {
+        let table = write
+            .open_table(HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES)
+            .map_err(storage)?;
+        table
+            .get(key)
+            .map_err(storage)?
+            .map(|value| decode::<crate::HostRequestPossibleEffectReference>(value.value()))
+            .transpose()
+    }
+
+    /// Projects the owner's own evidence onto the row this same transaction
+    /// advances.
+    ///
+    /// Split out of [`Self::advance_host_request_to_possible_effect`] as a pure
+    /// move. Every identity, payload and attempt field is READ BACK off `next`
+    /// rather than taken from the caller, and the only caller-supplied values
+    /// are the owner's commitment and receipt, stored exactly as presented. That
+    /// is what keeps the reference a copy of the owner's evidence instead of a
+    /// digest computed over the row it describes.
+    fn build_possible_effect_reference(
+        next: &crate::HostRequestRecord,
+        unpersisted_result_commitment_sha256: &str,
+        owner_receipt: &crate::HostRequestRetainedLineage,
+    ) -> Result<crate::HostRequestPossibleEffectReference, OrsError> {
         let attempt = next.attempt.as_ref().ok_or(OrsError::InvalidField {
             field: "host_request_possible_effect_reference",
             reason: "a possible-effect reference must name the retained attempt that held custody",
         })?;
-        let reference = crate::HostRequestPossibleEffectReference {
+        Ok(crate::HostRequestPossibleEffectReference {
             operation_id: next.operation_id.clone(),
             request_digest: next.request_digest.clone(),
             payload_digest: next.payload_digest.clone(),
@@ -10270,13 +10323,28 @@ impl RedbRecoveryStore {
             attempt_generation: attempt.generation,
             unpersisted_result_commitment_sha256: unpersisted_result_commitment_sha256.to_owned(),
             owner_receipt: owner_receipt.clone(),
-        };
-        reference.validate_for(&next)?;
-        next.validate()?;
+        })
+    }
+
+    /// Writes the advanced row and its owner-receipt reference as one
+    /// transaction's two halves.
+    ///
+    /// Split out of [`Self::advance_host_request_to_possible_effect`] as a pure
+    /// move, and it is where the atomicity claim actually lives: both inserts
+    /// take the SAME open `write`, so a commit publishes them together and an
+    /// abort publishes neither. A durable possible-effect row can therefore
+    /// never exist without the owner's receipt beside it, and a receipt can
+    /// never be durable for a row the same commit did not advance.
+    fn write_possible_effect_row(
+        write: &redb::WriteTransaction,
+        key: &str,
+        next: &crate::HostRequestRecord,
+        reference: &crate::HostRequestPossibleEffectReference,
+    ) -> Result<(), OrsError> {
         {
             let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
-                .insert(key.as_str(), encode(&next)?.as_str())
+                .insert(key, encode(next)?.as_str())
                 .map_err(storage)?;
         }
         {
@@ -10284,11 +10352,10 @@ impl RedbRecoveryStore {
                 .open_table(HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES)
                 .map_err(storage)?;
             table
-                .insert(key.as_str(), encode(&reference)?.as_str())
+                .insert(key, encode(reference)?.as_str())
                 .map_err(storage)?;
         }
-        write.commit().map_err(storage)?;
-        Ok(Some(next))
+        Ok(())
     }
 
     fn validate_host_request_cancellation(
