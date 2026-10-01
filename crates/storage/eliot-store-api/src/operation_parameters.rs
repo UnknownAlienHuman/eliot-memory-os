@@ -482,6 +482,25 @@ static RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 3] = [
         required: true,
     },
 ];
+/// The initial signed Config/Policy owner image, committed against both its
+/// prior named-owner revision and original canonical value digest.
+static RECORD_POLICY_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "expected_policy_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_policy_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "revision",
@@ -1432,6 +1451,7 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
         NamedMutationOperation::RecordWorkScopeSnapshot => "RecordWorkScopeSnapshot",
+        NamedMutationOperation::RecordPolicySnapshot => "RecordPolicySnapshot",
         NamedMutationOperation::RecordBlobProcessSourceAdmission => {
             "RecordBlobProcessSourceAdmission"
         }
@@ -1469,6 +1489,7 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
         b"RecordWorkScopeSnapshot" => Some(NamedMutationOperation::RecordWorkScopeSnapshot),
+        b"RecordPolicySnapshot" => Some(NamedMutationOperation::RecordPolicySnapshot),
         b"RecordBlobProcessSourceAdmission" => {
             Some(NamedMutationOperation::RecordBlobProcessSourceAdmission)
         }
@@ -1655,6 +1676,7 @@ pub const fn declared_mutation_parameters(
             &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
         }
         NamedMutationOperation::RecordWorkScopeSnapshot => &RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS,
+        NamedMutationOperation::RecordPolicySnapshot => &RECORD_POLICY_SNAPSHOT_PARAMETERS,
         NamedMutationOperation::RecordBlobProcessSourceAdmission => {
             &RECORD_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS
         }

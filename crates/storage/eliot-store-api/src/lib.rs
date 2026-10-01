@@ -4055,6 +4055,9 @@ pub enum NamedMutationOperation {
     /// complete snapshot as opaque bytes; Governor validates its source and
     /// guard semantics before issuing the transition and after named readback.
     RecordWorkScopeSnapshot,
+    /// Persists the Governor-owned Policy snapshot and complete signed
+    /// initial-config envelope through a fenced owner revision CAS.
+    RecordPolicySnapshot,
     /// Persists a process-stream admission and attaches its whole-object Ready
     /// commitment through separate revisions of one keyed owner row.
     RecordBlobProcessSourceAdmission,
@@ -4208,6 +4211,7 @@ impl NamedMutationOperation {
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
             | Self::RecordWorkScopeSnapshot
+            | Self::RecordPolicySnapshot
             | Self::RecordBlobProcessSourceAdmission
             | Self::RecordAuthorityRevocation
             | Self::ApplyProblemOwnerState => TransitionClass::RecoverySchema,

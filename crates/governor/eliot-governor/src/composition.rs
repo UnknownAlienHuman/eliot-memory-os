@@ -60,7 +60,13 @@ use eliot_canonical::{
     FinishDecisionOutcome, FinishEvidence,
 };
 use eliot_change_monitor::ChangeMonitor;
-use eliot_config::ConfigPolicySnapshot;
+use eliot_config::{
+    ConfigPolicySnapshot,
+    initial_snapshot::{
+        InitialConfigSnapshotTrustAnchor, InitialSnapshotVerificationContext,
+        SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot,
+    },
+};
 use eliot_context_contracts::{CanonicalProjectionSet, ContextBinding};
 use eliot_contracts::{
     ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, OperationId,
@@ -4118,6 +4124,13 @@ pub struct PolicyOwnerSnapshot {
     pub policy_digest: String,
     /// The admitted immutable Config/Policy snapshot content.
     pub snapshot: ConfigPolicySnapshot,
+    /// Exact canonical signed initial-config envelope retained by the Policy
+    /// owner when this is the setup-created genesis snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_initial_config_envelope_json: Option<String>,
+    /// Canonical envelope digest for the retained signed setup snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_initial_config_envelope_sha256: Option<String>,
 }
 
 /// Policy projection bound to the Host-approved generation.
@@ -4132,6 +4145,8 @@ pub struct PolicyOwner {
     canonical_digest: String,
     snapshot_digest: String,
     snapshot: ConfigPolicySnapshot,
+    signed_initial_config_envelope: Option<SignedInitialConfigSnapshot>,
+    signed_initial_config_envelope_sha256: Option<String>,
 }
 
 impl PolicyOwner {
@@ -4202,6 +4217,66 @@ impl PolicyOwner {
                 "policy snapshot revision does not match its envelope revision".to_owned(),
             ));
         }
+        let signed_initial_config_envelope = match (
+            wire.signed_initial_config_envelope_json.as_deref(),
+            wire.signed_initial_config_envelope_sha256.as_deref(),
+        ) {
+            (None, None) => {
+                if wire.snapshot.settings.iter().any(|setting| {
+                    setting.key == eliot_config::GOVERNING_SOURCE_APPROVAL_KEY
+                }) {
+                    return Err(CompositionError::Recovery(
+                        "Policy approval Setting has no retained signed initial-config envelope"
+                            .to_owned(),
+                    ));
+                }
+                None
+            }
+            (Some(envelope_json), Some(envelope_sha256)) => {
+                let signed: SignedInitialConfigSnapshot = serde_json::from_str(envelope_json)
+                    .map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "signed initial-config envelope is malformed: {error}"
+                        ))
+                    })?;
+                signed.validate().map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "signed initial-config envelope is invalid: {error}"
+                    ))
+                })?;
+                let canonical = canonical_json_bytes(&signed).map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "signed initial-config envelope cannot be canonicalized: {error}"
+                    ))
+                })?;
+                let canonical_text = String::from_utf8(canonical).map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "signed initial-config envelope is not UTF-8: {error}"
+                    ))
+                })?;
+                let exact_digest = signed.envelope_digest().map_err(|error| {
+                    CompositionError::Recovery(format!(
+                        "signed initial-config envelope digest is invalid: {error}"
+                    ))
+                })?;
+                if canonical_text != envelope_json
+                    || exact_digest != envelope_sha256
+                    || signed.payload.snapshot != wire.snapshot
+                {
+                    return Err(CompositionError::Recovery(
+                        "signed initial-config envelope does not exactly bind the Policy snapshot"
+                            .to_owned(),
+                    ));
+                }
+                Some(signed)
+            }
+            _ => {
+                return Err(CompositionError::Recovery(
+                    "signed initial-config envelope and digest must be present together"
+                        .to_owned(),
+                ));
+            }
+        };
         let snapshot_bytes = canonical_json_bytes(&wire.snapshot).map_err(|error| {
             CompositionError::Recovery(format!(
                 "policy snapshot could not be canonicalized: {error}"
@@ -4218,6 +4293,9 @@ impl PolicyOwner {
             canonical_digest: reply.value_digest.clone(),
             snapshot_digest: wire.policy_digest,
             snapshot: wire.snapshot,
+            signed_initial_config_envelope,
+            signed_initial_config_envelope_sha256: wire
+                .signed_initial_config_envelope_sha256,
         })
     }
 
@@ -4249,6 +4327,39 @@ impl PolicyOwner {
     #[must_use]
     pub const fn snapshot(&self) -> &ConfigPolicySnapshot {
         &self.snapshot
+    }
+
+    /// Returns the exact canonical signed setup envelope retained by the
+    /// Policy owner, when the owner represents the first signed snapshot.
+    #[must_use]
+    pub const fn signed_initial_config_envelope(&self) -> Option<&SignedInitialConfigSnapshot> {
+        self.signed_initial_config_envelope.as_ref()
+    }
+
+    /// Verifies the retained envelope using an independently pinned
+    /// installation trust anchor and current caller context.
+    pub fn verify_signed_initial_config_envelope(
+        &self,
+        trust_anchor: &InitialConfigSnapshotTrustAnchor,
+        context: &InitialSnapshotVerificationContext,
+    ) -> Result<Option<VerifiedInitialConfigSnapshot>, CompositionError> {
+        let Some(signed) = &self.signed_initial_config_envelope else {
+            return Ok(None);
+        };
+        let verified = trust_anchor.verify(signed, context).map_err(|error| {
+            CompositionError::Recovery(format!(
+                "signed initial-config envelope failed independent verification: {error}"
+            ))
+        })?;
+        if Some(verified.envelope_digest())
+            != self.signed_initial_config_envelope_sha256.as_deref()
+        {
+            return Err(CompositionError::Recovery(
+                "verified signed initial-config digest differs from the Policy owner record"
+                    .to_owned(),
+            ));
+        }
+        Ok(Some(verified))
     }
 
     /// Recomputes the snapshot digest from the live retained snapshot.
@@ -4290,6 +4401,25 @@ impl PolicyOwner {
             revision: self.revision,
             policy_digest: self.snapshot_digest.clone(),
             snapshot: self.snapshot.clone(),
+            signed_initial_config_envelope_json: self
+                .signed_initial_config_envelope
+                .as_ref()
+                .map(|envelope| {
+                    let bytes = canonical_json_bytes(envelope).map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "retained signed initial-config envelope could not be serialized: {error}"
+                        ))
+                    })?;
+                    String::from_utf8(bytes).map_err(|error| {
+                        CompositionError::Recovery(format!(
+                            "retained signed initial-config envelope is not UTF-8: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            signed_initial_config_envelope_sha256: self
+                .signed_initial_config_envelope_sha256
+                .clone(),
         };
         let bytes = canonical_json_bytes(&wire).map_err(|error| {
             CompositionError::Recovery(format!(
@@ -5605,6 +5735,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || current.canonical_digest() != semantic.canonical_digest()
             || current.snapshot_digest() != semantic.snapshot_digest()
             || current.snapshot() != semantic.snapshot()
+            || current.signed_initial_config_envelope()
+                != semantic.signed_initial_config_envelope()
         {
             return Err(CompositionError::Recovery(
                 "fresh Store Policy owner read differs from the canonical Governor owner"
@@ -12053,6 +12185,8 @@ mod tests {
             revision: 1,
             policy_digest,
             snapshot,
+            signed_initial_config_envelope_json: None,
+            signed_initial_config_envelope_sha256: None,
         }
     }
 

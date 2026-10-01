@@ -501,7 +501,7 @@ struct ActivatedMutationDescriptor {
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -555,6 +555,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::RecordWorkScopeSnapshot,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordPolicySnapshot,
         transition_classes: &[TransitionClass::RecoverySchema],
         maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
@@ -968,12 +974,16 @@ pub fn validate_transition_against_catalogue(
             | NamedMutationOperation::RecordFinishDecision
             | NamedMutationOperation::RecordFinishEvidence
             | NamedMutationOperation::RecordModuleCatalogSnapshot
+            | NamedMutationOperation::RecordPolicySnapshot
             | NamedMutationOperation::UpdateTaskState
             | NamedMutationOperation::ApplyEpistemicRevision
             | NamedMutationOperation::ApplyErasure
             | NamedMutationOperation::ApplySwarmOwnerRevisions
             | NamedMutationOperation::ApplyInstrumentRegistryState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
+                if command.operation == NamedMutationOperation::RecordPolicySnapshot {
+                    validate_policy_snapshot_transition(transition, &command.parameters)?;
+                }
             }
             NamedMutationOperation::ApplyNotificationState => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
@@ -1019,6 +1029,151 @@ pub fn validate_transition_against_catalogue(
             }
         }
         validate_parameter_size(&command.parameters, entry.max_input_bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_policy_snapshot_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let text = |name: &'static str| {
+        parameters
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StoreError::InvalidField {
+                field: "policy.snapshot",
+                reason: "missing required text parameter",
+            })
+    };
+    let expected_revision = text("expected_policy_revision")?
+        .parse::<u64>()
+        .map_err(|_| StoreError::InvalidField {
+            field: "policy.expected_revision",
+            reason: "must be the exact non-zero decimal revision returned by the named owner read",
+        })?;
+    if expected_revision == 0 {
+        return Err(StoreError::InvalidField {
+            field: "policy.expected_revision",
+            reason: "must name the current non-zero Policy owner revision",
+        });
+    }
+    let expected_digest = text("expected_policy_digest")?;
+    validate_digest(expected_digest, "policy.expected_digest")?;
+    let snapshot_json = text("snapshot_json")?;
+    let row: serde_json::Value = serde_json::from_str(snapshot_json).map_err(|_| {
+        StoreError::InvalidField {
+            field: "policy.snapshot_json",
+            reason: "must be canonical JSON",
+        }
+    })?;
+    if !row.is_object()
+        || canonical_json_bytes(&row)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?
+            != snapshot_json.as_bytes()
+    {
+        return Err(StoreError::InvalidField {
+            field: "policy.snapshot_json",
+            reason: "must be a canonical JSON object",
+        });
+    }
+    let revision = row
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(StoreError::InvalidField {
+            field: "policy.revision",
+            reason: "must be a positive integer",
+        })?;
+    let next_revision = expected_revision.checked_add(1).ok_or(StoreError::InvalidField {
+        field: "policy.revision",
+        reason: "revision overflow",
+    })?;
+    let expected_fence = serde_json::to_value(&transition.state_fence)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    if revision != next_revision || row.get("state_fence") != Some(&expected_fence) {
+        return Err(StoreError::FenceMismatch);
+    }
+    let policy = row.get("snapshot").ok_or(StoreError::InvalidField {
+        field: "policy.snapshot",
+        reason: "complete ConfigPolicySnapshot is required",
+    })?;
+    let policy_bytes = canonical_json_bytes(policy)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let policy_digest = row
+        .get("policy_digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(StoreError::InvalidField {
+            field: "policy.policy_digest",
+            reason: "canonical snapshot digest is required",
+        })?;
+    if sha256_hex(&policy_bytes) != policy_digest {
+        return Err(StoreError::InvalidField {
+            field: "policy.policy_digest",
+            reason: "must bind the exact nested policy snapshot",
+        });
+    }
+
+    let envelope_json = row
+        .get("signed_initial_config_envelope_json")
+        .and_then(serde_json::Value::as_str);
+    let envelope_sha = row
+        .get("signed_initial_config_envelope_sha256")
+        .and_then(serde_json::Value::as_str);
+    let approval_setting = policy
+        .get("settings")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|settings| {
+            settings.iter().any(|setting| {
+                setting.get("key").and_then(serde_json::Value::as_str)
+                    == Some("governing_source.approval")
+            })
+        });
+    match (envelope_json, envelope_sha) {
+        (Some(envelope_json), Some(envelope_sha)) => {
+            validate_digest(envelope_sha, "policy.initial_config_envelope_sha256")?;
+            let envelope: serde_json::Value = serde_json::from_str(envelope_json).map_err(|_| {
+                StoreError::InvalidField {
+                    field: "policy.initial_config_envelope_json",
+                    reason: "must be canonical signed-envelope JSON",
+                }
+            })?;
+            if !envelope.is_object()
+                || canonical_json_bytes(&envelope)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?
+                    != envelope_json.as_bytes()
+                || sha256_hex(
+                    &canonical_json_bytes(&envelope)
+                        .map_err(|error| StoreError::Serialization(error.to_string()))?,
+                ) != envelope_sha
+                || envelope.pointer("/payload/snapshot") != Some(policy)
+            {
+                return Err(StoreError::InvalidField {
+                    field: "policy.initial_config_envelope_json",
+                    reason: "must canonically bind this exact Policy snapshot and digest",
+                });
+            }
+        }
+        (None, None) if !approval_setting => {}
+        _ => {
+            return Err(StoreError::InvalidField {
+                field: "policy.initial_config_envelope_json",
+                reason: "signed envelope and digest are required together for approved sources",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_digest(value: &str, field: &'static str) -> Result<(), StoreError> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(StoreError::InvalidField {
+            field,
+            reason: "must be lowercase SHA-256",
+        });
     }
     Ok(())
 }
