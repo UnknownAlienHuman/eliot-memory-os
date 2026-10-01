@@ -46,10 +46,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use eliot_agent_api::{
-    HOST_EVENT_DIGEST_ALGORITHM, QualifiedSourceDigest, RawSourceRecord,
-    RestrictedRawSourceHandle,
 };
-use eliot_contracts::{EpochId, LowercaseSha256, canonical_json_bytes};
+use eliot_contracts::{EpochId, canonical_json_bytes};
 use eliot_process::SecretRef;
 use eliot_user_broker_core::{
     OPENCODE_BRIDGE_CAPABILITY_MUTATION_GATE, OPENCODE_BRIDGE_CAPABILITY_OBSERVATION_SUBMIT,
@@ -57,7 +55,6 @@ use eliot_user_broker_core::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::endpoint::LoopbackEndpoint;
@@ -2050,46 +2047,6 @@ fn passive_envelope(
             "introduction_digest": introduction.introduction_digest.as_str(),
         }),
     );
-    // Keep the original native callback under the same durable privacy owner
-    // as the envelope. ORS will retain it only when the Kernel-resolved
-    // WorkScope disclosure verdict admits these exact bytes; otherwise its
-    // existing deterministic redaction path withholds both source and raw
-    // fields from the normalized projection.
-    if let Some(native_source) = object
-        .get("native_source")
-        .filter(|source| source.is_object())
-    {
-        envelope.insert("native_source".to_owned(), native_source.clone());
-        // The typed handle is minted from the actual immutable ORS row key,
-        // while the qualified semantic digest is recomputed over the native
-        // source object decoded from this authenticated request. It does not
-        // authorize retention: Kernel WorkScope disclosure remains the sole
-        // gate and a redacted ORS row exposes only the owner's redacted form.
-        if let (Ok(canonical), Ok(handle)) = (
-            canonical_json_bytes(native_source),
-            RestrictedRawSourceHandle::new(format!(
-                "bridge-event:{HOST_EVENTS_STREAM_ID}:{event_id}"
-            )),
-        ) {
-            let digest_hex = format!("{:x}", Sha256::digest(&canonical));
-            if let Ok(digest) = serde_json::from_value::<LowercaseSha256>(
-                serde_json::Value::String(digest_hex),
-            ) {
-                let record = RawSourceRecord {
-                    handle,
-                    digest: QualifiedSourceDigest {
-                        algorithm: HOST_EVENT_DIGEST_ALGORITHM.to_owned(),
-                        digest,
-                    },
-                };
-                if record.validate().is_ok()
-                    && let Ok(value) = serde_json::to_value(record)
-                {
-                    envelope.insert("raw_source_record".to_owned(), value);
-                }
-            }
-        }
-    }
     for field in [
         "native_emitted_at",
         "event_kind",

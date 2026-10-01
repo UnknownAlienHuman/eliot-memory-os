@@ -757,6 +757,7 @@ impl RegistryFixture {
             native_worker_executable_path: runtime_launch.native_worker_executable_path.clone(),
             user_broker_executable_path: runtime_launch.user_broker_executable_path.clone(),
             wasm_host_executable_path: runtime_launch.wasm_host_executable_path.clone(),
+            opencode_adapter: None,
             config_path: config_handle,
             dependency_closure_refs: vec![handle("evidence:dependency-closure")],
             license_refs: vec![handle("evidence:licenses")],

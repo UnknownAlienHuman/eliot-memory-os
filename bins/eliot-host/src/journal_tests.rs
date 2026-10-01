@@ -971,6 +971,7 @@ pub(super) fn liveness_manifest_with_distinct_store_digests()
         native_worker_executable_path: path(&portable, "eliot-native-worker.exe"),
         user_broker_executable_path: user_broker_path,
         wasm_host_executable_path: path(&portable, "eliot-wasm-host.exe"),
+        opencode_adapter: None,
         config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure")],
         license_refs: vec![handle("evidence:licenses")],

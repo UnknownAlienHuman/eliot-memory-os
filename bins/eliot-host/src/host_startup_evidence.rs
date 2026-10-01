@@ -640,6 +640,7 @@ mod tests {
             wasm_host_executable_path: handle(
                 dir.join("eliot-wasm-host.exe").to_string_lossy().as_ref(),
             ),
+            opencode_adapter: None,
             config_path: handle(dir.join("generation.json").to_string_lossy().as_ref()),
             dependency_closure_refs: vec![handle("evidence:dependency-closure")],
             license_refs: vec![handle("evidence:licenses")],

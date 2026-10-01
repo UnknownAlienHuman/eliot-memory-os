@@ -1723,6 +1723,7 @@ fn live_receipt_manifest(
         native_worker_executable_path: path("eliot-native-worker.exe"),
         user_broker_executable_path: path("eliot-user-broker.exe"),
         wasm_host_executable_path: path("eliot-wasm-host.exe"),
+        opencode_adapter: None,
         config_path: store_config_path,
         dependency_closure_refs: vec![handle("evidence:dependency-closure".to_owned())],
         license_refs: vec![handle("evidence:licenses".to_owned())],

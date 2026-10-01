@@ -14,7 +14,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentBridgeSourceMaterializationPlan, CandidateManifest, InstallationEpoch, InstallationError,
+    AgentBridgeSourceMaterializationPlan, CandidateManifest, OpenCodeAdapterArtifact,
+    InstallationEpoch, InstallationError,
     InstallationProfile, InstallationRoots, InstallationTransaction, InstallerAclPrincipal,
     InstallerEffectPlan, InstallerServiceAccount, InstallerServiceRole, LOCAL_SERVICE_SID,
     ManagedEnvironmentAction, ManagedEnvironmentChangeRequest, NoServiceProfileAuthorityProof,
@@ -78,6 +79,25 @@ pub(crate) const MODULE_BUILD_PROVENANCE_ROLES: [(&str, bool); 2] = [
     ("module.eliotd.provenance.json", false),
 ];
 
+/// Optional source-issued OpenCode plugin and capability descriptor. Both
+/// files are admitted together from the same retained signed source bundle.
+pub(crate) const OPENCODE_ADAPTER_ROLES: [(&str, bool); 2] = [
+    ("eliot.js", false),
+    ("plugin-bridge-contract.json", false),
+];
+
+fn opencode_adapter_present(
+    names: impl IntoIterator<Item = String>,
+) -> Result<bool, InstallationError> {
+    let names = names.into_iter().collect::<BTreeSet<_>>();
+    let has_plugin = names.contains("eliot.js");
+    let has_descriptor = names.contains("plugin-bridge-contract.json");
+    if has_plugin != has_descriptor {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(has_plugin)
+}
+
 pub(crate) fn package_inventory_roles(
     include_module_provenance: bool,
 ) -> Vec<(&'static str, bool)> {
@@ -105,7 +125,13 @@ fn package_roles_for_manifest(
 ) -> Result<Vec<(&'static str, bool)>, InstallationError> {
     let include_module_provenance =
         module_provenance_present(manifest.files.iter().map(|file| file.relative_path.clone()))?;
-    let roles = package_inventory_roles(include_module_provenance);
+    let include_opencode_adapter = opencode_adapter_present(
+        manifest.files.iter().map(|file| file.relative_path.clone()),
+    )?;
+    let mut roles = package_inventory_roles(include_module_provenance);
+    if include_opencode_adapter {
+        roles.extend(OPENCODE_ADAPTER_ROLES);
+    }
     if manifest.files.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
             "package manifest must contain the complete approved runtime inventory".to_owned(),
@@ -915,6 +941,40 @@ pub(crate) fn validate_exact_candidate_package_binding(
     if !USER_BROKER_STAGED_EXECUTABLE || !broker_spec.executable || broker_spec.expected_size == 0 {
         return Err(InstallationError::IdentityConflict);
     }
+    if let Some(adapter) = &candidate.opencode_adapter {
+        for (role, path, digest) in [
+            (
+                OPENCODE_ADAPTER_ROLES[0].0,
+                &adapter.artifact_path,
+                &adapter.artifact_digest,
+            ),
+            (
+                OPENCODE_ADAPTER_ROLES[1].0,
+                &adapter.descriptor_path,
+                &adapter.descriptor_digest,
+            ),
+        ] {
+            let filename = Path::new(path.as_str())
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if filename != role
+                || !candidate_paths.insert(path.as_str().to_ascii_lowercase())
+                || !expected_names.insert(role.to_ascii_lowercase())
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            crate::sha256_handle(digest, "candidate OpenCode adapter digest")?;
+            let spec = manifest
+                .files
+                .iter()
+                .find(|spec| spec.relative_path == role)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if spec.executable || spec.expected_size == 0 {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+    }
     for &(name, executable) in &roles {
         if !MODULE_BUILD_PROVENANCE_ROLES
             .iter()
@@ -1050,6 +1110,34 @@ pub(crate) fn validate_exact_expected_file_digests(
             if item.sha256 != candidate.user_broker_artifact_digest {
                 return Err(InstallationError::IdentityConflict);
             }
+            continue;
+        }
+        if OPENCODE_ADAPTER_ROLES
+            .iter()
+            .any(|(name, _)| *name == item.relative_path)
+        {
+            let adapter = candidate
+                .opencode_adapter
+                .as_ref()
+                .ok_or(InstallationError::IdentityConflict)?;
+            let (name, digest) = if item.relative_path == OPENCODE_ADAPTER_ROLES[0].0 {
+                (OPENCODE_ADAPTER_ROLES[0].0, &adapter.artifact_digest)
+            } else {
+                (OPENCODE_ADAPTER_ROLES[1].0, &adapter.descriptor_digest)
+            };
+            let spec = manifest
+                .files
+                .iter()
+                .find(|spec| spec.relative_path == name)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if spec.executable
+                || item.expected_size == 0
+                || item.expected_size != spec.expected_size
+                || item.sha256 != *digest
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+            crate::sha256_handle(&item.sha256, "expected OpenCode adapter digest")?;
             continue;
         }
         let Some((name, _, _, digest)) = bindings
@@ -1690,7 +1778,12 @@ impl GenerationPackagePlanner {
         let include_module_provenance = module_provenance_present(
             observed.files.iter().map(|file| file.relative_path.clone()),
         )?;
-        let package_roles = package_inventory_roles(include_module_provenance);
+        let include_opencode_adapter =
+            opencode_adapter_present(observed.files.iter().map(|file| file.relative_path.clone()))?;
+        let mut package_roles = package_inventory_roles(include_module_provenance);
+        if include_opencode_adapter {
+            package_roles.extend(OPENCODE_ADAPTER_ROLES);
+        }
         let governor_lease = source
             .retain_file("eliotd-governor.json")
             .map_err(|error| {
@@ -2119,6 +2212,7 @@ impl GenerationPackagePlanner {
             native_worker_executable_path: native_worker_path,
             wasm_host_executable_path: wasm_host_path,
             user_broker_executable_path: user_broker_path,
+            opencode_adapter: None,
             config_path,
             dependency_closure_refs: vec![
                 PlatformHandle::new(format!("evidence:phase-a-content:{phase_a_content_digest}"))
@@ -2633,7 +2727,12 @@ fn validate_exact_source_inventory(
 ) -> Result<(), InstallationError> {
     let include_module_provenance =
         module_provenance_present(observed.files.iter().map(|file| file.relative_path.clone()))?;
-    let roles = package_inventory_roles(include_module_provenance);
+    let include_opencode_adapter =
+        opencode_adapter_present(observed.files.iter().map(|file| file.relative_path.clone()))?;
+    let mut roles = package_inventory_roles(include_module_provenance);
+    if include_opencode_adapter {
+        roles.extend(OPENCODE_ADAPTER_ROLES);
+    }
     if observed.files.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
             "trusted source must contain the complete approved runtime inventory".to_owned(),
@@ -3375,6 +3474,7 @@ mod tests {
             ),
             wasm_host_executable_path: test_path(portable_root.as_str(), "eliot-wasm-host.exe"),
             user_broker_executable_path: test_path(portable_root.as_str(), USER_BROKER_STAGED_ROLE),
+            opencode_adapter: None,
             config_path: desc.store_config_path.clone(),
             dependency_closure_refs: vec![h("evidence:dep")],
             license_refs: vec![h("evidence:license")],

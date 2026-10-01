@@ -431,13 +431,6 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
     argument_keys: argumentKeys,
     attached_task: attachedTask(),
   }
-  // Preserve the host callback's original native event separately from the
-  // bounded public summary. The authenticated Kernel privacy owner decides
-  // whether these bytes may be retained; the adapter never treats them as a
-  // public projection or decides their retention class.
-  if (input.event && typeof input.event === "object" && !Array.isArray(input.event)) {
-    payload.native_source = input.event
-  }
   if (effectBinding !== null) {
     payload.effect_descriptor = effectBinding.descriptor
     payload.effect_digest = effectBinding.effectDigest

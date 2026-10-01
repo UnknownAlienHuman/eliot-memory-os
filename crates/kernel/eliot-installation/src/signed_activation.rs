@@ -7,6 +7,7 @@
 //! public CLI does not call this surface because it has no trusted key,
 //! elevation, SCM, or transaction-owner context.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -76,11 +77,15 @@ fn expected_elevation_evidence_digest(
     Ok(sha256_hex(&bytes))
 }
 
-fn require_exact_digest_set(
+fn require_exact_digest_set<K, V>(
     field: &str,
     observed: &[InstallationDigestBinding],
-    expected: &BTreeMap<&'static str, &str>,
-) -> Result<(), InstallationError> {
+    expected: &BTreeMap<K, V>,
+) -> Result<(), InstallationError>
+where
+    K: Borrow<str> + AsRef<str> + Ord,
+    V: AsRef<str>,
+{
     if observed.len() != expected.len() {
         return Err(binding_mismatch(format!(
             "{field} must contain exactly {} named bindings",
@@ -100,7 +105,7 @@ fn require_exact_digest_set(
                 "{field} contains an unknown binding name"
             )));
         };
-        if *expected_digest != binding.digest.as_str() {
+        if expected_digest.as_ref() != binding.digest.as_str() {
             return Err(binding_mismatch(format!(
                 "{field} digest does not match its exact named object"
             )));
@@ -111,8 +116,8 @@ fn require_exact_digest_set(
             )));
         }
     }
-    let expected_names = expected.keys().copied().collect::<BTreeSet<_>>();
-    if names != expected_names {
+    let expected_names = expected.keys().map(|name| name.as_ref()).collect::<BTreeSet<_>>();
+    if names.iter().copied().collect::<BTreeSet<_>>() != expected_names {
         return Err(binding_mismatch(format!(
             "{field} omits one or more required named objects"
         )));
@@ -122,7 +127,7 @@ fn require_exact_digest_set(
 
 fn expected_artifact_digests(
     manifest: &CandidateManifest,
-) -> Result<BTreeMap<&'static str, &str>, InstallationError> {
+) -> Result<BTreeMap<String, String>, InstallationError> {
     let runtime = &manifest.runtime_launch;
     let duplicate_manifest_bindings = [
         (
@@ -148,20 +153,19 @@ fn expected_artifact_digests(
     {
         return Err(InstallationError::IdentityConflict);
     }
-    Ok(BTreeMap::from([
-        (ARTIFACT_KERNEL, manifest.kernel_artifact_digest.as_str()),
-        (
-            ARTIFACT_STORE_BRIDGE,
-            manifest.store_bridge_artifact_digest.as_str(),
-        ),
-        (
-            ARTIFACT_CANONICAL_STORE,
-            manifest.canonical_store_artifact_digest.as_str(),
-        ),
-        (ARTIFACT_HOST, manifest.host_artifact_digest.as_str()),
-        (ARTIFACT_ELIOTD, runtime.eliotd_artifact_digest.as_str()),
-        (ARTIFACT_WATCHDOG, runtime.watchdog_artifact_digest.as_str()),
-    ]))
+    let mut expected = BTreeMap::from([
+        (ARTIFACT_KERNEL.to_owned(), manifest.kernel_artifact_digest.as_str().to_owned()),
+        (ARTIFACT_STORE_BRIDGE.to_owned(), manifest.store_bridge_artifact_digest.as_str().to_owned()),
+        (ARTIFACT_CANONICAL_STORE.to_owned(), manifest.canonical_store_artifact_digest.as_str().to_owned()),
+        (ARTIFACT_HOST.to_owned(), manifest.host_artifact_digest.as_str().to_owned()),
+        (ARTIFACT_ELIOTD.to_owned(), runtime.eliotd_artifact_digest.as_str().to_owned()),
+        (ARTIFACT_WATCHDOG.to_owned(), runtime.watchdog_artifact_digest.as_str().to_owned()),
+    ]);
+    if let Some(adapter) = &manifest.opencode_adapter {
+        expected.insert("opencode_adapter".to_owned(), adapter.artifact_digest.as_str().to_owned());
+        expected.insert("opencode_adapter_descriptor".to_owned(), adapter.descriptor_digest.as_str().to_owned());
+    }
+    Ok(expected)
 }
 
 fn expected_config_digests(manifest: &CandidateManifest) -> BTreeMap<&'static str, &str> {

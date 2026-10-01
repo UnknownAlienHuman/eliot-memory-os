@@ -1108,6 +1108,13 @@ pub struct CandidateManifest {
     pub user_broker_executable_path: PlatformHandle,
     /// Canonical installation-approved WASM-host executable path.
     pub wasm_host_executable_path: PlatformHandle,
+    /// Exact signed OpenCode host-adapter payload staged by this generation.
+    /// `None` means the generation does not install/admit that adapter; a
+    /// runtime host report cannot fill this gap. When present, both the
+    /// descriptor and executable bytes participate in the signed artifact
+    /// digest set and are checked by the installation activation owner.
+    #[serde(default)]
+    pub opencode_adapter: Option<OpenCodeAdapterArtifact>,
     /// Canonical installation-approved generation configuration path.
     pub config_path: PlatformHandle,
     /// Executable/dependency closure evidence.
@@ -1137,6 +1144,23 @@ pub struct CandidateManifest {
     pub runtime_state_roots_digest: PlatformHandle,
     /// Exact Host-owned runtime launch contour bound to this approval.
     pub runtime_launch: RuntimeLaunchDescriptor,
+}
+
+/// Exact OpenCode plugin artifact and capability descriptor in one admitted
+/// installation generation. Paths are immutable staged payload locations;
+/// digests are validated against the detached installation approval's named
+/// artifact bindings before the generation can activate.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeAdapterArtifact {
+    /// Staged OpenCode plugin source artifact path.
+    pub artifact_path: PlatformHandle,
+    /// SHA-256 of the exact staged plugin source bytes.
+    pub artifact_digest: PlatformHandle,
+    /// Staged source-issued capability descriptor path.
+    pub descriptor_path: PlatformHandle,
+    /// SHA-256 of the exact staged capability descriptor bytes.
+    pub descriptor_digest: PlatformHandle,
 }
 
 /// Strict Phase-B state for the installer-provisioned supervision authority.
@@ -2566,6 +2590,34 @@ impl CandidateManifest {
             &self.wasm_host_artifact_digest,
             "manifest.wasm_host_artifact_digest",
         )?;
+        if let Some(adapter) = &self.opencode_adapter {
+            approved_path(&adapter.artifact_path, "manifest.opencode_adapter.artifact_path")?;
+            approved_filename(
+                &adapter.artifact_path,
+                "eliot.js",
+                "manifest.opencode_adapter.artifact_path",
+            )?;
+            approved_path(
+                &adapter.descriptor_path,
+                "manifest.opencode_adapter.descriptor_path",
+            )?;
+            approved_filename(
+                &adapter.descriptor_path,
+                "plugin-bridge-contract.json",
+                "manifest.opencode_adapter.descriptor_path",
+            )?;
+            if adapter.artifact_path == adapter.descriptor_path {
+                return Err(InstallationError::IdentityConflict);
+            }
+            sha256_handle(
+                &adapter.artifact_digest,
+                "manifest.opencode_adapter.artifact_digest",
+            )?;
+            sha256_handle(
+                &adapter.descriptor_digest,
+                "manifest.opencode_adapter.descriptor_digest",
+            )?;
+        }
         approved_path(
             &self.kernel_executable_path,
             "manifest.kernel_executable_path",

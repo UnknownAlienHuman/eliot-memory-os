@@ -1693,6 +1693,7 @@ fn registering_transaction() -> InstallationTransaction {
         native_worker_executable_path: test_path(&root, "eliot-native-worker.exe"),
         user_broker_executable_path: test_path(&root, "eliot-user-broker.exe"),
         wasm_host_executable_path: test_path(&root, "eliot-wasm-host.exe"),
+        opencode_adapter: None,
         config_path: test_path(&root, "generation.json"),
         dependency_closure_refs: vec![test_handle("evidence:dependency-closure")],
         license_refs: vec![test_handle("evidence:licenses")],
