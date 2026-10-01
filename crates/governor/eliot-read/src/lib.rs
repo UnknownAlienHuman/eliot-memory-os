@@ -2193,18 +2193,25 @@ impl<C: CanonicalReadClient> ReadApi for ReadService<C> {
 ///   an authoritative statement that the projection is empty — it is `Unknown`;
 /// * for the operations whose Store contract types a page coverage statement
 ///   ([`ExperienceRangePage`]), the statement must first prove the read's exact
-///   bound fence, then decode, then describe the records it carries. A page
-///   whose own fence statement ([`EXPERIENCE_PAGE_STATE_FENCE`]) is absent,
-///   unreadable or bound to another fence is [`ReadError::CoverageFenceUnproven`]
-///   — not `Unknown`, because the source did answer, and not `Partial`, because
+///   bound fence, then decode, then describe the records it carries. All three
+///   of those steps are [`prove_page_coverage_statement`] — this function
+///   DELEGATES to it rather than repeating it — and a page whose own fence
+///   statement ([`EXPERIENCE_PAGE_STATE_FENCE`]) is absent, unreadable or
+///   bound to another fence is [`ReadError::CoverageFenceUnproven`] — not
+///   `Unknown`, because the source did answer, and not `Partial`, because
 ///   nothing in it claims rows exist past the bound. An undecodable or
-///   undescribed statement is `Unknown`, and a statement that proves further
-///   rows exist past the declared bound is `Partial`.
+///   self-contradictory statement is `Unknown`, and a statement that proves
+///   further rows exist past the declared bound is `Partial`.
 ///
-/// The fence is checked BEFORE any coverage member is read, and that order is
-/// the guarantee: a truncated flag on a page projected under another fence
-/// describes that other fence's rows, so reading it first would publish a
-/// bounded-subset fact about an identity this read never bound.
+/// The `Partial` verdict is the ONE thing this function adds on top of the
+/// shared rule, and it is added here rather than in
+/// [`prove_page_coverage_statement`] because this function serves a
+/// single-shot read that must publish a complete answer, while the shared rule
+/// is also used by multi-page enumeration lanes where a truncated page is
+/// contract-shaped. The fence is checked BEFORE any coverage member is read,
+/// and that order is the guarantee: a truncated flag on a page projected under
+/// another fence describes that other fence's rows, so reading it first would
+/// publish a bounded-subset fact about an identity this read never bound.
 ///
 /// Every other operation keeps its payload opaque here: its own consumer owns
 /// the payload contract, and this owner states only that the read is bound to
@@ -2220,37 +2227,57 @@ fn classify_payload_coverage(
     if !declares_store_coverage_statement(operation) {
         return Ok(());
     }
-    prove_page_state_fence(payload, bound_fence)?;
-    let page: ExperienceRangePage = serde_json::from_value(payload.clone())
-        .map_err(|_| ReadError::Outcome(ReadOutcome::Unknown))?;
-    if page.matched_total != page.records.len() {
-        return Err(ReadError::Outcome(ReadOutcome::Unknown));
-    }
+    let page = prove_page_coverage_statement(payload, bound_fence)?;
     if page.truncated {
         return Err(ReadError::Outcome(ReadOutcome::Partial));
     }
     Ok(())
 }
 
-/// Proves a bounded range page states the read's exact bound fence.
+/// Proves a bounded range page is the owner's own complete coverage statement
+/// for the read's exact bound fence, and returns the decoded page.
 ///
-/// This is the one fence-before-coverage rule of this owner, extracted from
+/// This is the one page-coverage rule of this owner, extracted from
 /// [`classify_payload_coverage`] so a consumer that is handed an owner-minted
-/// page by an edge which performed the read itself can prove the same fact
-/// instead of restating the rule. It is the whole rule and it is unchanged: a
-/// page whose own fence statement ([`EXPERIENCE_PAGE_STATE_FENCE`]) is absent,
-/// unreadable, or bound to another fence is [`ReadError::CoverageFenceUnproven`]
-/// — not `Unknown`, because the source did answer, and not `Partial`, because
-/// nothing in it claims rows exist past the bound.
+/// page by an edge which performed the read itself proves the same facts by
+/// CALLING this rather than restating them. It is the whole shared rule and it
+/// is unchanged from what it replaced, in this order:
 ///
-/// Nothing else is checked here. `matched_total`, `truncated` and the record
-/// set belong to [`classify_payload_coverage`], which decides what a proven
-/// page still may not be published as; a caller that needs that verdict calls
-/// it through the read owner rather than re-deriving it. Callers must invoke
-/// this BEFORE reading any coverage member of the page, because the ordering is
-/// the guarantee: a truncation flag on a page projected under another fence
-/// describes that other fence's rows.
-pub fn prove_page_state_fence(payload: &Value, bound_fence: &StateFence) -> Result<(), ReadError> {
+/// 1. the page's own fence statement ([`EXPERIENCE_PAGE_STATE_FENCE`]) must be
+///    present, readable, and equal to `bound_fence`, or
+///    [`ReadError::CoverageFenceUnproven`] — not `Unknown`, because the source
+///    did answer, and not `Partial`, because nothing in it claims rows exist
+///    past the bound;
+/// 2. the page must decode as the Store's own [`ExperienceRangePage`], or
+///    [`ReadError::Outcome`] of [`ReadOutcome::Unknown`];
+/// 3. the page's own count statement must be self-consistent:
+///    `matched_total == records.len()`, or `Unknown`. This is the owner's
+///    statement about the page in its own hand — not part of the enumeration
+///    contract — so a page that lies about it is malformed, and a page
+///    declaring 999 matches while carrying one row is refused rather than
+///    consumed as a complete one-row result.
+///
+/// Step 1 precedes steps 2 and 3 and that ORDER is the guarantee: a count on a
+/// page projected under another fence describes that other fence's rows, so
+/// reading it first would publish a bounded-subset fact about an identity this
+/// read never bound. [`classify_payload_coverage`] is written in terms of this
+/// order and no other ordering of these three steps is written anywhere.
+///
+/// `truncated` is deliberately NOT part of this shared rule. On the
+/// experience range lane a truncated page is a normal, contract-shaped step of
+/// a multi-page enumeration, so refusing it here would refuse the lane's own
+/// contract; a caller on an enumeration lane must therefore ignore the
+/// `truncated` member of the returned page rather than acting on it. Only
+/// [`classify_payload_coverage`], which serves a single-shot read that must
+/// publish a complete answer, adds `truncated` as [`ReadOutcome::Partial`] on
+/// top of this proof. That refusal is therefore owner-internal and has no
+/// caller-reachable seam here; a caller must not expect this function to
+/// produce `Partial`, and `CoverageFenceUnproven`, `Unknown` and `Partial` stay
+/// three distinct answers.
+pub fn prove_page_coverage_statement(
+    payload: &Value,
+    bound_fence: &StateFence,
+) -> Result<ExperienceRangePage, ReadError> {
     // The page's own fence member, read through the Store's exported key
     // constant rather than a spelling restated here. It is read before any
     // other member so that a page which states no readable fence keeps that
@@ -2264,7 +2291,14 @@ pub fn prove_page_state_fence(payload: &Value, bound_fence: &StateFence) -> Resu
     if page_fence != *bound_fence {
         return Err(ReadError::CoverageFenceUnproven);
     }
-    Ok(())
+    // Only now that the fence is proved may the page be decoded and its count
+    // statement read, in that order.
+    let page: ExperienceRangePage = serde_json::from_value(payload.clone())
+        .map_err(|_| ReadError::Outcome(ReadOutcome::Unknown))?;
+    if page.matched_total != page.records.len() {
+        return Err(ReadError::Outcome(ReadOutcome::Unknown));
+    }
+    Ok(page)
 }
 
 /// Returns whether the Store contract types a page coverage statement for this

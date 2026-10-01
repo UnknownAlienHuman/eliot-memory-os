@@ -68,7 +68,7 @@ use eliot_observation_contracts::{
 use eliot_protocol::RequestIdentity;
 use eliot_read::{
     NamedParameters, ReadApi, ReadError, ReadOrderingBinding, ReadService, StateRequest,
-    prove_page_state_fence,
+    prove_page_coverage_statement,
 };
 use eliot_receipts::{RequestBinding, WorkScopeId};
 use eliot_store_api::{
@@ -623,20 +623,36 @@ pub async fn run_experience_quality_event(
     };
     let mut ledger = ExperienceRevisionLedger::new();
     // #1144: both edge-supplied range pages are owner-minted
-    // `ExperienceRangePage` payloads, so the read owner's coverage gate applies
+    // `ExperienceRangePage` payloads, so the read owner's coverage rule applies
     // to them even though the edge performed the read rather than this entry.
-    // Each page's fence is proved FIRST, before any coverage member of that
-    // page is read: `bank_records_from_range_payload` below reads `records`
-    // and `range_next_cursor` reads `next_cursor`, and a truncation or cursor
-    // member on a page projected under another fence describes that other
-    // fence's rows. The proof is the owner's own rule, called rather than
-    // restated, so an absent or foreign `state_fence` member is
-    // `ReadError::CoverageFenceUnproven` and stays distinct from `Unknown`
-    // (the source answered) and from `Partial` (nothing claims rows past the
-    // bound). The bound compared against is `ctx.state_fence`, the same fence
-    // every projection below is assembled at.
-    prove_page_state_fence(&event.bank.payload, &ctx.state_fence)?;
-    prove_page_state_fence(&event.feedback.payload, &ctx.state_fence)?;
+    // Each page is proved FIRST by `prove_page_coverage_statement`, before any
+    // coverage member of that page is read: `bank_records_from_range_payload`
+    // below reads `records` and `range_next_cursor` reads `next_cursor`, and a
+    // count or cursor member on a page projected under another fence describes
+    // that other fence's rows. That one call is the owner's whole shared rule,
+    // called rather than restated: it proves the exact bound fence, decodes the
+    // page, and refuses the owner's own `matched_total != records.len()`
+    // inconsistency as `Unknown` — so a page declaring 999 matches while
+    // carrying one row is refused here exactly as the read owner refuses it,
+    // rather than being consumed as a complete one-row result. An absent or
+    // foreign `state_fence` member stays `ReadError::CoverageFenceUnproven`,
+    // distinct from `Unknown` (the source answered) and from `Partial` (nothing
+    // claims rows past the bound). The bound compared against is
+    // `ctx.state_fence`, the same fence every projection below is assembled at.
+    //
+    // The returned page is deliberately not inspected for `truncated` here:
+    // `bank_next_cursor` below is this lane's multi-page contract, and a
+    // truncated page with a minted `next_cursor` is that contract working, so
+    // refusing it here would refuse the lane's own enumeration. The returned
+    // value is dropped rather than bound for that reason.
+    drop(prove_page_coverage_statement(
+        &event.bank.payload,
+        &ctx.state_fence,
+    )?);
+    drop(prove_page_coverage_statement(
+        &event.feedback.payload,
+        &ctx.state_fence,
+    )?);
     let bank_records = bank_records_from_range_payload(&event.bank.payload)?;
     let bank_live = supply_bank_projection_from_store(
         &mut ledger,
