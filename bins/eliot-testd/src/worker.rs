@@ -68,7 +68,7 @@ use eliot_contracts::ClockReading;
 use eliot_instrument_api::{ExecutionStatus, KernelProcessAdmissionRequest};
 use eliot_process::{
     ExitDisposition, ExitStatus, OperationId, ProcessEvidence, ProcessEvidenceSink, ProcessExecutionView,
-    ProcessExecutor, ProcessLifecycle, ProcessRequest,
+    ProcessExecutor, ProcessLifecycle, ProcessRequest, ProcessStreamSinkOpenRequest,
 };
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
@@ -170,6 +170,7 @@ impl VerifiedStreamReplayPort for KernelReadbackVerifiedReplay {
         owner_facts
             .validate()
             .map_err(|error| format!("fresh Kernel owner facts were refused: {error}"))?;
+        validate_ready_process_source_admission(source, bytes, owner, &owner_facts)?;
         let owner_grant = observations
             .blob_process_stream_grant
             .as_ref()
@@ -203,9 +204,7 @@ impl VerifiedStreamReplayPort for KernelReadbackVerifiedReplay {
             return Err("fresh owner PULL no longer matches the immutable launch grant".to_owned());
         }
         let expected_fence = source.binding.state_fence();
-        let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry(
-            stage.registry_generation,
-        )
+        let profile_registry = eliot_instrument_runner::testd_builtin_profile_registry()
         .map_err(|error| format!("current closed TestD profile registry refused: {error}"))?;
         let replay = eliot_instrument_runner::VerifiedTestdReplayContext::from_canonical_owner_readback_json(
             profile_registry,
@@ -239,6 +238,120 @@ impl VerifiedStreamReplayPort for KernelReadbackVerifiedReplay {
             )
             .map_err(|error| error.to_string())
     }
+}
+
+fn validate_ready_process_source_admission(
+    source: &TestdStreamEvidenceBinding,
+    bytes: &EphemeralSourceBytes,
+    owner: &eliot_testd_core::TestdReplayOwnerReadback,
+    owner_facts: &eliot_blob_api::wire::BlobProcessStreamVerifiedOwnerFacts,
+) -> Result<(), String> {
+    use eliot_store_api::blob_process_source_admission::{
+        BlobProcessSourceAdmissionIdentity, BlobProcessSourceAdmissionPhase,
+        BlobProcessSourceAdmissionReadback,
+    };
+
+    let readback: BlobProcessSourceAdmissionReadback =
+        serde_json::from_str(&owner.process_source_admission_readback_json)
+            .map_err(|error| format!("process source admission is not typed JSON: {error}"))?;
+    let work_scope: serde_json::Value = serde_json::from_str(&owner_facts.work_scope_binding_json)
+        .map_err(|error| format!("fresh WorkScope snapshot is not JSON: {error}"))?;
+    let scope_ref = work_scope
+        .pointer("/binding/scope/scope_ref")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "fresh WorkScope snapshot omitted its exact scope identity".to_owned())?;
+    let work_scope_revision = work_scope
+        .get("owner_revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "fresh WorkScope snapshot omitted its owner revision".to_owned())?;
+    let work_scope_fence: eliot_contracts::StateFence = serde_json::from_value(
+        work_scope
+            .get("state_fence")
+            .cloned()
+            .ok_or_else(|| "fresh WorkScope snapshot omitted its fence".to_owned())?,
+    )
+    .map_err(|error| format!("fresh WorkScope fence is not typed: {error}"))?;
+    work_scope_fence
+        .validate()
+        .map_err(|error| format!("fresh WorkScope fence is invalid: {error}"))?;
+
+    let admission = &readback.admission;
+    let open: ProcessStreamSinkOpenRequest = serde_json::from_str(&admission.open_request_json)
+        .map_err(|error| format!("retained process Open request is not typed: {error}"))?;
+    open.validate()
+        .map_err(|error| format!("retained process Open request is invalid: {error}"))?;
+    let binding_bytes = eliot_contracts::canonical_json_bytes(&source.binding)
+        .map_err(|error| format!("process binding is not canonical: {error}"))?;
+    let binding_sha256 = eliot_testd_core::sha256_hex(&binding_bytes);
+    let identity = BlobProcessSourceAdmissionIdentity {
+        work_scope_ref: scope_ref.to_owned(),
+        session_id: open.session_id().as_str().to_owned(),
+        source_id: open.source_id().as_str().to_owned(),
+        process_binding_sha256: binding_sha256.clone(),
+    };
+    readback
+        .validate_for(&identity, source.binding.state_fence())
+        .map_err(|error| {
+            format!("process source admission failed exact identity/fence validation: {error}")
+        })?;
+
+    let canonical_open = eliot_contracts::canonical_json_bytes(&open)
+        .map_err(|error| format!("retained process Open request is not canonical: {error}"))?;
+    let work_scope_fence_matches = work_scope_fence == *source.binding.state_fence();
+    let expected_source_sha256 = source
+        .source_sha256
+        .as_deref()
+        .ok_or_else(|| "replayed source binding omitted its whole-source digest".to_owned())?;
+    let expected_source_byte_length = source
+        .source_byte_length
+        .ok_or_else(|| "replayed source binding omitted its whole-source length".to_owned())?;
+    let ready = admission
+        .ready
+        .as_ref()
+        .ok_or_else(|| "process source admission has no Ready commitment".to_owned())?;
+    let ready_receipt: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
+        .map_err(|error| format!("retained Blob Ready receipt is not JSON: {error}"))?;
+    let receipt_id = ready_receipt
+        .pointer("/receipt/identity/receipt_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "retained Blob Ready receipt omitted its identity".to_owned())?;
+    let expected_receipt_ref = source
+        .ready_receipt_ref
+        .as_deref()
+        .ok_or_else(|| "replayed source binding omitted its Ready receipt identity".to_owned())?;
+
+    let canonical_binding = String::from_utf8(binding_bytes)
+        .map_err(|error| format!("canonical process binding is not UTF-8: {error}"))?;
+    let canonical_open = String::from_utf8(canonical_open)
+        .map_err(|error| format!("canonical Open request is not UTF-8: {error}"))?;
+
+    if admission.phase != BlobProcessSourceAdmissionPhase::Ready
+        || readback.owner_revision != 2
+        || admission.owner_revision != 2
+        || admission.work_scope_owner_revision != work_scope_revision
+        || admission.state_fence != *source.binding.state_fence()
+        || !work_scope_fence_matches
+        || admission.owner_facts_sha256 != owner.owner_facts_sha256
+        || admission.owner_facts_json != owner.owner_facts_json
+        || admission.process_binding_sha256 != binding_sha256
+        || admission.process_binding_json != canonical_binding
+        || admission.open_request_sha256 != open.open_request_sha256()
+        || admission.open_request_json != canonical_open
+        || open.binding() != &source.binding
+        || open.policy() != &source.policy
+        || open.stream() != source.stream
+        || ready.whole_source_sha256 != expected_source_sha256
+        || ready.whole_source_byte_length != expected_source_byte_length
+        || expected_source_byte_length != bytes.len() as u64
+        || expected_source_sha256 != eliot_testd_core::sha256_hex(bytes.bytes())
+        || receipt_id != expected_receipt_ref
+    {
+        return Err(
+            "Ready process source admission does not bind this exact stream, WorkScope, receipt, and stored bytes"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Actual replay-time observations supplied by the productive TestD worker.
