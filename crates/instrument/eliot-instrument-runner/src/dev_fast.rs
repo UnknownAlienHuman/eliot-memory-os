@@ -784,6 +784,15 @@ pub fn dev_fast_disposition(
             "aggregate is not the admitted dev-fast revision".to_owned(),
         ));
     }
+    if let Some(run) = aggregate.runs.iter().find(|run| {
+        matches!(&run.evidence, StageEvidence::RetainedProcessStreams { .. })
+    }) {
+        return Err(DevFastError::MandatoryStage {
+            stage: run.stage.stage_id.clone(),
+            status: "ProfileResolver immutable-stream evidence is not dev-fast artifact evidence"
+                .to_owned(),
+        });
+    }
     if !matches!(aggregate.status, AggregateStatus::Succeeded) {
         let stage = aggregate
             .runs

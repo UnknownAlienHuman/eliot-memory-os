@@ -37,8 +37,8 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use eliot_contracts::{
-    ArtifactId, ContractId, ContractVersion, ProductId, RequestMetadata, StateFence,
-    TransactionSequence,
+    canonical_json_bytes, ArtifactId, ContractId, ContractVersion, ProductId, RequestMetadata,
+    StateFence, TransactionSequence,
 };
 use eliot_receipts::{
     ArtifactBinding, AuthorityBinding, CausalBinding, EffectClass, OperationBinding, OperationId,
@@ -48,15 +48,18 @@ use eliot_receipts::{
 use eliot_instrument_api::{ExecutionStatus, VerificationOutcome};
 use eliot_process::{
     ExitDisposition, ProcessEvidence, ProcessExecutionBinding, ProcessLifecycle,
+    ProcessStartReceipt,
     ProcessStreamEvidence,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::profile::{AdmittedProfile, ProfileError, ProfileScopeClasses, StageEnvironment};
+use crate::profile::{
+    AdmittedProfile, ProfileError, ProfileScopeClasses, StageEnvironment, PROFILE_ALIASES,
+};
 use crate::profile_run::{
-    AggregateStatus, ProfileAggregate, RetainedProcessStreamIdentity, RetainedToolIdentity,
-    StageEvidence,
+    AggregateStatus, KernelStageGrantEvidence, ProfileAggregate, RetainedProcessStreamIdentity,
+    RetainedToolIdentity, StageEvidence, StageTargetLayout,
 };
 use crate::registry::SupplyChainReceipt;
 
@@ -167,6 +170,9 @@ pub enum VerificationProfileError {
         /// Ceiling the receipt claims.
         observed: ProofCeiling,
     },
+    /// The receipt carries a different or legacy schema identity.
+    #[error("receipt schema identity is not the current terminal-evidence schema")]
+    SchemaIdentityMismatch,
     /// The aggregate records a different profile identity than the admitted
     /// profile it is being receipted against.
     #[error(
@@ -208,6 +214,14 @@ fn validate_digest(value: &str, field: &'static str) -> Result<(), VerificationP
         return Err(VerificationProfileError::InvalidDigest { field });
     }
     Ok(())
+}
+
+fn canonical_digest<T: Serialize>(value: &T) -> Result<String, VerificationProfileError> {
+    canonical_json_bytes(value)
+        .map(|bytes| sha256_hex(&bytes))
+        .map_err(|_| VerificationProfileError::InvalidDigest {
+            field: "canonical_evidence",
+        })
 }
 
 /// One declared environment difference a profile depends on (I18.21).
@@ -335,14 +349,38 @@ pub struct ProfileRunEvidence {
     pub evidence: StageEvidenceRecord,
     /// Machine-derived executable identity digest, when one was recorded.
     pub executable_digest: Option<String>,
-    /// Pre-launch admission grant digest, when the stage was admitted.
-    pub grant_digest: Option<String>,
+    /// Local profile/spec admission grant digest, when the stage was admitted.
+    pub profile_admission_grant_digest: Option<String>,
+    /// Closed ProfileResolver route alias used for the Kernel stage grant.
+    pub kernel_profile_id: Option<String>,
+    /// Exact immutable Kernel stage grant and server-computed digest.
+    pub kernel_stage_grant: Option<KernelStageGrantEvidence>,
+    /// Exact original Kernel process binding, retained even for unresolved runs.
+    pub kernel_process_binding: Option<ProcessExecutionBinding>,
+    /// SHA-256 of the exact canonical original Kernel process binding.
+    pub kernel_process_binding_sha256: Option<String>,
+    /// Exact Kernel-owned original process start receipt.
+    pub kernel_process_start_receipt: Option<ProcessStartReceipt>,
+    /// SHA-256 of the exact canonical original process start receipt.
+    pub kernel_process_start_receipt_sha256: Option<String>,
+    /// Kernel observation time for the accepted process start.
+    pub kernel_start_observed_at_unix_ms: Option<u64>,
     /// Exact owner-reconciled process binding, terminal view, and original
     /// raw stream evidence. Stream bytes remain in the immutable source owner.
     pub terminal_process_evidence: Option<ProcessEvidence>,
+    /// SHA-256 of the exact canonical Kernel-reconciled ProcessEvidence.
+    pub kernel_terminal_process_evidence_sha256: Option<String>,
     /// Last executor observation retained when terminal reconciliation was
     /// not reached, or the exact reconciled terminal view otherwise.
     pub last_process_observation: Option<eliot_process::ProcessExecutionView>,
+    /// Kernel observation time for the exact latest process view.
+    pub last_process_observation_at_unix_ms: Option<u64>,
+    /// SHA-256 of the exact canonical latest process view.
+    pub last_process_observation_sha256: Option<String>,
+    /// Kernel owner time at terminal reconciliation.
+    pub terminal_reconciled_at_unix_ms: Option<u64>,
+    /// Exact root/layout projection used by the admitted Kernel stage.
+    pub target_layout: Option<StageTargetLayout>,
 }
 
 /// Raw evidence state for one receipt-recorded stage run.
@@ -442,39 +480,177 @@ impl StageEvidenceRecord {
 }
 
 impl ProfileRunEvidence {
-    fn is_successful_verified_pass(&self) -> bool {
+    fn is_successful_verified_pass(&self, receipt: &VerificationProfileReceipt) -> bool {
+        let (
+            StageEvidenceRecord::RetainedProcessStreams {
+                stdout,
+                stderr,
+                tool: Some(tool),
+            },
+            Some(process),
+        ) = (&self.evidence, self.terminal_process_evidence.as_ref())
+        else {
+            return false;
+        };
         self.evidence.has_complete_verified_sources()
             && self.verification == Some(VerificationOutcome::Pass)
             && self.execution == format!("{:?}", ExecutionStatus::Succeeded)
-            && self.grant_digest.as_deref().is_some_and(|digest| {
-                validate_digest(digest, "grant_digest").is_ok()
+            && self
+                .profile_admission_grant_digest
+                .as_deref()
+                .is_some_and(|digest| validate_digest(digest, "profile_admission_grant_digest").is_ok())
+            && self.kernel_terminal_process_evidence_sha256.as_deref().is_some_and(|digest| {
+                canonical_digest(process).is_ok_and(|expected| expected == digest)
             })
-            && self.terminal_process_is_successful()
+            && self.terminal_process_is_successful(receipt, process, tool)
+            && stream_identity_matches_evidence(stdout, process.stdout(), process.binding())
+            && stream_identity_matches_evidence(stderr, process.stderr(), process.binding())
+            && self.kernel_readbacks_match(receipt, process, stdout, stderr)
     }
 
-    fn terminal_process_is_successful(&self) -> bool {
-        let (Some(operation_id), Some(process)) =
-            (self.operation_id.as_deref(), self.terminal_process_evidence.as_ref())
+    fn terminal_process_is_successful(
+        &self,
+        receipt: &VerificationProfileReceipt,
+        process: &ProcessEvidence,
+        tool: &RetainedToolIdentity,
+    ) -> bool {
+        let (
+            Some(operation_id),
+            Some(kernel_grant),
+            Some(kernel_profile_id),
+            Some(process_binding),
+            Some(process_binding_sha256),
+            Some(start),
+            Some(start_sha256),
+            Some(start_observed_at),
+            Some(terminal_observed_at),
+            Some(last_observed_at),
+            Some(last_observation),
+            Some(last_observation_sha256),
+            Some(target_layout),
+        ) = (
+            self.operation_id.as_deref(),
+            self.kernel_stage_grant.as_ref(),
+            self.kernel_profile_id.as_deref(),
+            self.kernel_process_binding.as_ref(),
+            self.kernel_process_binding_sha256.as_deref(),
+            self.kernel_process_start_receipt.as_ref(),
+            self.kernel_process_start_receipt_sha256.as_deref(),
+            self.kernel_start_observed_at_unix_ms,
+            self.terminal_reconciled_at_unix_ms,
+            self.last_process_observation_at_unix_ms,
+            self.last_process_observation.as_ref(),
+            self.last_process_observation_sha256.as_deref(),
+            self.target_layout.as_ref(),
+        )
         else {
             return false;
         };
-        if process.validate().is_err()
-            || process.operation_id().as_str() != operation_id
-            || process.view().lifecycle() != ProcessLifecycle::Exited
-            || self.last_process_observation.as_ref() != Some(process.view())
-            || !process.view().exit().is_some_and(|exit| {
-                exit.disposition() == ExitDisposition::Completed
-                    && serialized_exit_code(exit) == Some(0)
-            })
-        {
-            return false;
-        }
-        let StageEvidenceRecord::RetainedProcessStreams { stdout, stderr, .. } = &self.evidence
-        else {
+        let projection = &kernel_grant.projection;
+        let binding = &projection.binding;
+        let Some(alias) = PROFILE_ALIASES.iter().find(|alias| {
+            alias.alias == kernel_profile_id
+                && alias.profile == receipt.profile
+                && alias.revision == receipt.profile_revision
+        }) else {
             return false;
         };
-        stream_identity_matches_evidence(stdout, process.stdout(), process.binding())
-            && stream_identity_matches_evidence(stderr, process.stderr(), process.binding())
+        let binding_sha = canonical_digest(process.binding()).ok();
+        let start_sha = canonical_digest(start).ok();
+        let view_sha = canonical_digest(last_observation).ok();
+        let terminal_sha = canonical_digest(process).ok();
+        let argv_sha = canonical_digest(&tool.arguments).ok();
+        let source_root_sha = sha256_hex(target_layout.working_directory_observed.as_bytes());
+        let Some(exit) = process.view().exit() else {
+            return false;
+        };
+        alias.alias == binding.profile_id
+            && binding.profile_revision == receipt.profile_revision
+            && binding.profile_sha256 == receipt.profile_digest
+            && binding.dag_sha256 == receipt.dag_digest
+            && binding.stage_id == self.stage_id
+            && binding.tool_sha256 == self.executable_digest.as_deref().unwrap_or_default()
+            && binding.argv_sha256 == argv_sha.as_deref().unwrap_or_default()
+            && binding.environment_sha256 == tool.environment_digest
+            && binding.source_root_identity_sha256 == source_root_sha
+            && kernel_grant.projection.validate().is_ok()
+            && kernel_grant
+                .projection
+                .digest()
+                .is_ok_and(|digest| digest == kernel_grant.grant_sha256)
+            && process.validate().is_ok()
+            && process.operation_id().as_str() == operation_id
+            && projection.process_operation_id == operation_id
+            && process_binding == process.binding()
+            && binding_sha.as_deref() == Some(process_binding_sha256)
+            && projection.process_binding_sha256 == process_binding_sha256
+            && start.validate().is_ok()
+            && start.binding() == process_binding
+            && start.operation_id().as_str() == operation_id
+            && start_sha.as_deref() == Some(start_sha256)
+            && process_binding.state_fence().authority_epoch()
+                == &projection.state_fence.authority_epoch
+            && process_binding.state_fence().generation().get()
+                == projection.state_fence.resource_generation.value()
+            && projection.execution_ref.trim().len() > 0
+            && self.kernel_process_start_receipt.is_some()
+            && start_observed_at >= projection.issued_at_unix_ms
+            && start_observed_at <= projection.expires_at_unix_ms
+            && terminal_observed_at >= start_observed_at
+            && terminal_observed_at <= projection.expires_at_unix_ms
+            && last_observed_at == terminal_observed_at
+            && last_observation == process.view()
+            && view_sha.as_deref() == Some(last_observation_sha256)
+            && terminal_sha.as_deref()
+                == self.kernel_terminal_process_evidence_sha256.as_deref()
+            && process.view().lifecycle() == ProcessLifecycle::Exited
+            && exit.disposition() == ExitDisposition::Completed
+            && serialized_exit_code(exit) == Some(0)
+            && tool.exit.disposition == ExitDisposition::Completed
+            && tool.exit.code == Some(0)
+    }
+
+    fn kernel_readbacks_match(
+        &self,
+        _receipt: &VerificationProfileReceipt,
+        process: &ProcessEvidence,
+        stdout: &RetainedProcessStreamIdentity,
+        stderr: &RetainedProcessStreamIdentity,
+    ) -> bool {
+        let (Some(grant), Some(terminal_at), Some(process_binding_sha256)) = (
+            self.kernel_stage_grant.as_ref(),
+            self.terminal_reconciled_at_unix_ms,
+            self.kernel_process_binding_sha256.as_deref(),
+        ) else {
+            return false;
+        };
+        let projection = &grant.projection;
+        [stdout, stderr].into_iter().all(|stream| {
+            stream.is_complete_owner_readback()
+                && stream.process_binding_sha256() == process_binding_sha256
+                && stream.binding() == process.binding()
+                && match stream.stream() {
+                    eliot_process::ProcessStreamKind::Stdout => process.stdout(),
+                    eliot_process::ProcessStreamKind::Stderr => process.stderr(),
+                }
+                    .is_some_and(|evidence| evidence.policy() == stream.policy())
+                && stream.chunks().iter().all(|chunk| {
+                    let proof = &chunk.owner_proof;
+                    proof.validate().is_ok()
+                        && proof.digest().is_ok_and(|digest| digest == chunk.owner_proof_sha256)
+                        && proof.stage_grant_sha256 == grant.grant_sha256
+                        && proof.process_binding_sha256 == process_binding_sha256
+                        && proof.source_key.execution_ref == projection.execution_ref
+                        && proof.source_key.stream == stream.stream()
+                        && proof.scope_binding_json == projection.scope_binding_json
+                        && proof.scope_binding_sha256 == projection.scope_binding_sha256
+                        && proof.policy_binding_json == projection.policy_binding_json
+                        && proof.policy_binding_sha256 == projection.policy_binding_sha256
+                        && proof.observed_fence == projection.state_fence
+                        && proof.observed_at_unix_ms >= terminal_at
+                        && proof.observed_at_unix_ms <= projection.expires_at_unix_ms
+                })
+        })
     }
 
     /// Deterministic identity over one raw stage run.
@@ -512,18 +688,35 @@ impl ProfileRunEvidence {
             .and_then(|observation| serde_json::to_vec(observation).ok())
             .map(sha256_hex)
             .unwrap_or_default();
-        let material = format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}",
-            self.stage_id,
-            self.operation_id.as_deref().unwrap_or(""),
-            self.execution,
+        let material = [
+            self.stage_id.clone(),
+            self.operation_id.clone().unwrap_or_default(),
+            self.execution.clone(),
             evidence,
-            self.executable_digest.as_deref().unwrap_or(""),
-            self.grant_digest.as_deref().unwrap_or(""),
+            self.executable_digest.clone().unwrap_or_default(),
+            self.profile_admission_grant_digest.clone().unwrap_or_default(),
+            self.kernel_profile_id.clone().unwrap_or_default(),
+            self.kernel_stage_grant
+                .as_ref()
+                .map_or_else(String::new, |grant| grant.grant_sha256.clone()),
+            self.kernel_process_binding_sha256.clone().unwrap_or_default(),
+            self.kernel_process_start_receipt_sha256.clone().unwrap_or_default(),
+            self.kernel_start_observed_at_unix_ms
+                .map_or_else(String::new, |value| value.to_string()),
+            self.kernel_terminal_process_evidence_sha256
+                .clone()
+                .unwrap_or_default(),
+            self.last_process_observation_at_unix_ms
+                .map_or_else(String::new, |value| value.to_string()),
+            self.last_process_observation_sha256.clone().unwrap_or_default(),
+            self.terminal_reconciled_at_unix_ms
+                .map_or_else(String::new, |value| value.to_string()),
+            serde_json::to_string(&self.target_layout).unwrap_or_default(),
             terminal_digest,
             observation_digest,
-            self.verification,
-        );
+            format!("{:?}", self.verification),
+        ]
+        .join("\0");
         sha256_hex(material.as_bytes())
     }
 }
@@ -545,6 +738,8 @@ fn stream_identity_matches_evidence(
         evidence.stream() == identity.stream()
             && evidence.binding() == identity.binding()
             && evidence.binding() == binding
+            && evidence.policy() == identity.policy()
+            && identity.is_complete_owner_readback()
             && evidence.identity_sha256().is_ok_and(|digest| digest == identity.evidence_digest())
             && evidence.source() == Some(identity.source())
     })
@@ -598,8 +793,10 @@ pub struct ToolIdentityRecord {
     pub executable: String,
     /// Machine-derived executable identity digest recorded for the run.
     pub executable_digest: Option<String>,
-    /// Pre-launch admission grant digest recorded for the run.
-    pub grant_digest: Option<String>,
+    /// Local profile/spec admission grant digest recorded for the run.
+    pub profile_admission_grant_digest: Option<String>,
+    /// Authenticated Kernel stage-grant commitment, when launch was admitted.
+    pub kernel_stage_grant_sha256: Option<String>,
     /// Digest/provenance receipt pinning the external binary, when admitted.
     pub provenance: Option<ExternalToolProvenance>,
 }
@@ -636,7 +833,7 @@ pub const RECEIPT_SCHEMA: &str = "eliot.instrument.verification-profile-receipt"
 /// receipt requires complete exact stream sources, the original terminal
 /// zero-exit observation, and the launch grant; a bare retained artifact is
 /// insufficient.
-pub const RECEIPT_SCHEMA_VERSION: &str = "3.0.0";
+pub const RECEIPT_SCHEMA_VERSION: &str = "4.0.0";
 
 /// The one receipt schema shared by local and CI profile runs (I18.21).
 ///
@@ -717,6 +914,9 @@ impl VerificationProfileReceipt {
     /// [`VerificationProfileError::MissingExecutableIdentity`] when a PASS
     /// receipt records a run with no tool identity.
     pub fn validate(&self) -> Result<(), VerificationProfileError> {
+        if self.schema != Self::schema_identity() {
+            return Err(VerificationProfileError::SchemaIdentityMismatch);
+        }
         if self.proof_ceiling != PROFILE_PROOF_CEILING {
             return Err(VerificationProfileError::ProofCeilingMismatch {
                 observed: self.proof_ceiling,
@@ -725,15 +925,23 @@ impl VerificationProfileReceipt {
         if !self.outcome.is_pass() {
             return Ok(());
         }
+        validate_digest(&self.profile_digest, "profile_digest")?;
+        validate_digest(&self.dag_digest, "dag_digest")?;
+        validate_digest(&self.aggregate_digest, "aggregate_digest")?;
         for run in &self.runs {
-            if !run.is_successful_verified_pass() {
+            if !run.is_successful_verified_pass(self) {
                 return Err(VerificationProfileError::PassWithoutRetainedEvidence {
                     stage: run.stage_id.clone(),
                 });
             }
             let identified = run.executable_digest.is_some()
                 && self.tool_identities.iter().any(|identity| {
-                    identity.stage_id == run.stage_id && identity.executable_digest.is_some()
+                    identity.stage_id == run.stage_id
+                        && identity.executable_digest == run.executable_digest
+                        && identity.profile_admission_grant_digest
+                            == run.profile_admission_grant_digest
+                        && identity.kernel_stage_grant_sha256
+                            == run.kernel_stage_grant.as_ref().map(|grant| grant.grant_sha256.clone())
                 });
             if !identified {
                 return Err(VerificationProfileError::MissingExecutableIdentity {
@@ -786,12 +994,13 @@ impl VerificationProfileReceipt {
                         },
                     );
                     format!(
-                        "{}\0{}\0{}\0{}\0{}\0{provenance}",
+                        "{}\0{}\0{}\0{}\0{}\0{}\0{provenance}",
                         identity.stage_id,
                         identity.instrument,
                         identity.executable,
                         identity.executable_digest.as_deref().unwrap_or(""),
-                        identity.grant_digest.as_deref().unwrap_or(""),
+                        identity.profile_admission_grant_digest.as_deref().unwrap_or(""),
+                        identity.kernel_stage_grant_sha256.as_deref().unwrap_or(""),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -916,23 +1125,28 @@ pub fn require_provenance(
             .ok_or_else(|| VerificationProfileError::UndeclaredStage {
                 stage: stage.stage_id.clone(),
             })?;
-        let Some(executable_digest) = run.executable_digest.as_deref() else {
-            return Err(VerificationProfileError::MissingExecutableIdentity {
-                stage: stage.stage_id.clone(),
-            });
-        };
-        validate_digest(executable_digest, "executable_identity_digest")?;
-        if let Some(grant_digest) = run.grant_digest.as_deref() {
-            validate_digest(grant_digest, "grant_digest")?;
+        if let Some(executable_digest) = run.executable_digest.as_deref() {
+            validate_digest(executable_digest, "executable_identity_digest")?;
+        }
+        if let Some(grant_digest) = run.profile_admission_grant_digest.as_deref() {
+            validate_digest(grant_digest, "profile_admission_grant_digest")?;
+        }
+        if let Some(grant) = run.kernel_stage_grant.as_ref() {
+            validate_digest(&grant.grant_sha256, "kernel_stage_grant_sha256")?;
         }
         let provenance = match stage.supply_receipt.as_ref() {
             Some(receipt) => {
-                if receipt.content_digest != executable_digest {
+                if run
+                    .executable_digest
+                    .as_deref()
+                    .is_some_and(|digest| receipt.content_digest != digest)
+                {
                     return Err(VerificationProfileError::ProvenanceMismatch {
                         stage: stage.stage_id.clone(),
                         detail: format!(
-                            "receipt pins '{}', run recorded '{executable_digest}'",
-                            receipt.content_digest
+                            "receipt pins '{}', run recorded '{}'",
+                            receipt.content_digest,
+                            run.executable_digest.as_deref().unwrap_or("no observed executable")
                         ),
                     });
                 }
@@ -950,8 +1164,12 @@ pub fn require_provenance(
             stage_id: stage.stage_id.clone(),
             instrument: stage.spec.as_str().to_owned(),
             executable: stage.executable.clone(),
-            executable_digest: Some(executable_digest.to_owned()),
-            grant_digest: run.grant_digest.clone(),
+            executable_digest: run.executable_digest.clone(),
+            profile_admission_grant_digest: run.profile_admission_grant_digest.clone(),
+            kernel_stage_grant_sha256: run
+                .kernel_stage_grant
+                .as_ref()
+                .map(|grant| grant.grant_sha256.clone()),
             provenance,
         });
     }
@@ -1154,7 +1372,7 @@ fn disposition_for(
     let unretained = receipt
         .runs
         .iter()
-        .filter(|run| !run.is_successful_verified_pass())
+        .filter(|run| !run.is_successful_verified_pass(receipt))
         .collect::<Vec<_>>();
     let unresolved = unretained
         .iter()
@@ -1231,12 +1449,26 @@ pub fn build_verification_profile_receipt(
             verification: run.verification,
             evidence: StageEvidenceRecord::from(&run.evidence),
             executable_digest: run.executable_digest.clone(),
-            grant_digest: run.grant_digest.clone(),
+            profile_admission_grant_digest: run.profile_admission_grant_digest.clone(),
+            kernel_profile_id: run.kernel_profile_id.clone(),
+            kernel_stage_grant: run.kernel_stage_grant.clone(),
+            kernel_process_binding: run.kernel_process_binding.clone(),
+            kernel_process_binding_sha256: run.kernel_process_binding_sha256.clone(),
+            kernel_process_start_receipt: run.kernel_process_start_receipt.clone(),
+            kernel_process_start_receipt_sha256: run.kernel_process_start_receipt_sha256.clone(),
+            kernel_start_observed_at_unix_ms: run.kernel_start_observed_at_unix_ms,
             terminal_process_evidence: run.terminal_process_evidence.clone(),
+            kernel_terminal_process_evidence_sha256: run
+                .kernel_terminal_process_evidence_sha256
+                .clone(),
             last_process_observation: run.last_process_observation.clone(),
+            last_process_observation_at_unix_ms: run.last_process_observation_at_unix_ms,
+            last_process_observation_sha256: run.last_process_observation_sha256.clone(),
+            terminal_reconciled_at_unix_ms: run.terminal_reconciled_at_unix_ms,
+            target_layout: run.target_layout.clone(),
         })
         .collect::<Vec<_>>();
-    Ok(VerificationProfileReceipt {
+    let receipt = VerificationProfileReceipt {
         schema: VerificationProfileReceipt::schema_identity(),
         profile: admitted.name.clone(),
         profile_revision: admitted.revision,
@@ -1248,7 +1480,9 @@ pub fn build_verification_profile_receipt(
         runs,
         outcome: AggregateOutcome::from(aggregate.status),
         proof_ceiling: PROFILE_PROOF_CEILING,
-    })
+    };
+    receipt.validate()?;
+    Ok(receipt)
 }
 
 /// One typed local/CI parity outcome (I18.21).
@@ -1439,9 +1673,15 @@ fn tool_identity_divergence(
                 identity.stage_id
             ));
         }
-        if other.grant_digest != identity.grant_digest {
+        if other.profile_admission_grant_digest != identity.profile_admission_grant_digest {
             return Some(format!(
                 "stage '{0}' admission grant digest differs between local and CI",
+                identity.stage_id
+            ));
+        }
+        if other.kernel_stage_grant_sha256 != identity.kernel_stage_grant_sha256 {
+            return Some(format!(
+                "stage '{0}' Kernel process grant commitment differs between local and CI",
                 identity.stage_id
             ));
         }
@@ -1524,9 +1764,21 @@ mod terminal_receipt_tests {
                     tool,
                 },
                 executable_digest: Some("e".repeat(64)),
-                grant_digest: Some("f".repeat(64)),
+                profile_admission_grant_digest: Some("f".repeat(64)),
+                kernel_profile_id: None,
+                kernel_stage_grant: None,
+                kernel_process_binding: None,
+                kernel_process_binding_sha256: None,
+                kernel_process_start_receipt: None,
+                kernel_process_start_receipt_sha256: None,
+                kernel_start_observed_at_unix_ms: None,
                 terminal_process_evidence: None,
+                kernel_terminal_process_evidence_sha256: None,
                 last_process_observation: None,
+                last_process_observation_at_unix_ms: None,
+                last_process_observation_sha256: None,
+                terminal_reconciled_at_unix_ms: None,
+                target_layout: None,
             }],
             outcome: AggregateOutcome::Pass,
             proof_ceiling: PROFILE_PROOF_CEILING,

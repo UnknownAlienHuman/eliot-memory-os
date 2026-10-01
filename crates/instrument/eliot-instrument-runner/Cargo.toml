@@ -10,6 +10,7 @@ description = "Bounded provider-neutral instrument runner for ELIOT"
 eliot-build-test-graph = { path = "../eliot-build-test-graph", version = "0.1.0" }
 eliot-blob.workspace = true
 eliot-blob-api.workspace = true
+eliot-cli.workspace = true
 eliot-contracts.workspace = true
 eliot-instrument-api.workspace = true
 eliot-instrument-cargo = { path = "../eliot-instrument-cargo", version = "0.1.0" }
@@ -36,8 +37,8 @@ path = "src/bin/eliot-verifier-selfchange.rs"
 
 # The one production entry a local `verify.ps1` run and a CI run both execute
 # (issue #1914 W2/W4, I18.21). It resolves a closed profile ALIAS through
-# `resolve_verification_route`, runs the admitted stages as real processes under
-# the Kernel dispatch fence, and issues the shared
+# `resolve_verification_route`, runs the admitted stages through the authenticated
+# Kernel ProfileResolver process lane, and issues the shared
 # `VerificationProfileReceipt`. No thin invoker names a command list.
 [[bin]]
 name = "eliot-profile-resolver"

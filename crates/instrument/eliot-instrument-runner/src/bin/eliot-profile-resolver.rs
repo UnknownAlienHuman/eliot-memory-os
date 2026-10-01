@@ -46,21 +46,16 @@
 //!   no `PATH` fallback and no "resolve to whatever exists": a workspace with no
 //!   resolvable toolchain is refused rather than receipted against some ambient
 //!   binary;
-//! - every stage really starts as a real child through the sole
-//!   [`WindowsProcessExecutor`] under a Kernel-issued dispatch permit, so the
-//!   per-stage evidence the receipt carries came from a process this entry
-//!   executed rather than from a value it was handed. The `--version` read that
-//!   pins each tool's identity is launched the same way, under its own one-shot
-//!   permit, so this entry has no launch of any kind outside that single
-//!   executor. Each such child is observed to a terminal lifecycle before its
-//!   evidence is read, because the executor's `reconcile` is terminal-only: see
-//!   [`await_terminal_view`]. That stage launch is gated by
-//!   `StageOrchestrator::launch_plan_live`, which refuses to launch a plan
-//!   compiled against a replaced registry generation and admits each stage
-//!   through `AdmittedStage::admit_live` against the live [`InstrumentRegistry`]
-//!   this run assembled from the observed supply-chain receipts, so a spec,
-//!   parser, receipt, or route revoked since compilation fails closed before
-//!   any child exists;
+//! - every stage launch and tool-version probe crosses the authenticated
+//!   `ProfileResolverSession`; Kernel owns the process gateway, retained grant,
+//!   lifecycle supervision, and immutable stream owner. This entry validates
+//!   Kernel's original start/binding and terminal evidence, reads both complete
+//!   streams from that same owner, and evaluates the admitted parser over the
+//!   returned bytes. `StageOrchestrator::plan` preserves the exact admitted DAG
+//!   and `launch_plan_live_verified` admits every stage against the live
+//!   [`InstrumentRegistry`] assembled from observed supply-chain receipts. A
+//!   missing terminal view, source, owner proof, or successful parser result
+//!   remains a non-PASS outcome;
 //! - the receipt itself is issued by the shared
 //!   [`build_verification_profile_receipt`] through
 //!   [`resolve_verification_route`], which refuses a missing executable
@@ -76,7 +71,7 @@
 //! bootstrap build, then calls it with the same alias locally and in CI):
 //!
 //! ```text
-//! eliot-profile-resolver --alias package-verification --source-root <abs> \
+//! eliot-profile-resolver --alias package-verification-compile-only --source-root <abs> \
 //!     --target-root <abs> --cache-root <abs> [--declared-environment NAME]... \
 //!     [--receipt-out <path>] [--compare-against <counterpart-receipt.json>]
 //! ```
@@ -486,7 +481,6 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
     let admitted = compiler.compile_exact(&route.name, route.revision)?;
 
     let epoch = process_epoch()?;
-    let clock = observation_clock(now_unix_ms());
     // The workscope fence carries the same epoch and the same registry
     // generation every stage launch is sealed under, so one run has exactly one
     // admitted generation: a receipt whose scope fence and whose stage fences
@@ -539,36 +533,41 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
         environment.clone(),
     )?;
 
-    let cell = Arc::new(DispatchCell::activate()?);
-    let port = StagePort::seal_all(&cell, &epoch, &layout, &admitted)?;
-    let runner = InstrumentRunner::new(Arc::new(StageExecutor::with(&cell)));
-    let launcher = StageRoute {
-        epoch,
-        clock,
-        layout: layout.clone(),
-        port,
-    };
-    // The live registry is REQUIRED here, not optional. `launch_plan_live`
-    // first checks that this plan was compiled against exactly this registry's
-    // generation and digest — and records every stage as an explicit missing
-    // proof if it was not, so a plan from a replaced generation can never
-    // launch under revoked admission. It then admits every stage through
-    // `AdmittedStage::admit_live`, which runs `refuse_if_revoked` against that
-    // live registry before sealing the grant, so a spec, parser, supply-chain
-    // receipt, or route replaced since this run's compilation fails closed here
-    // and the stage becomes a visible missing run rather than a child process.
-    // The registry-free `run_profile_stages` walks the same plan but passes
-    // `None` for the live registry, so it never performs either the
-    // generation/digest binding or the per-stage revocation check. Passing that
-    // registry in — the real one this run built from the observed supply-chain
-    // receipts, at the same generation the receipt builder uses — is what makes
-    // this resolver's stage admission a live admission rather than a walk over a
-    // stale compiled one.
+    if request.alias != eliot_instrument_runner::profile::PACKAGE_VERIFICATION_COMPILE_ONLY_ALIAS {
+        return Err(CliError::Contract(
+            "the live ProfileResolver Kernel lane admits only package-verification-compile-only"
+                .to_owned(),
+        ));
+    }
+    let process_environment = isolated_projection(&layout)?;
     let plan = StageOrchestrator::plan(&admitted);
-    let runs = block_on(StageOrchestrator::launch_plan_live(
-        &runner, &registry, &plan, &launcher,
-    ));
-    let aggregate = ProfileAggregate::assemble(&plan, runs);
+    let kernel = eliot_cli::kernel_client::KernelClient::load_profile_resolver().map_err(|error| {
+        CliError::Contract(format!(
+            "authenticated ProfileResolver Kernel session is unavailable: {error}"
+        ))
+    })?;
+    let runs = eliot_instrument_runner::verification_executor::launch_plan_live_verified(
+        &kernel,
+        &registry,
+        &plan,
+        &layout,
+        &process_environment,
+        &request.alias,
+        |planned| {
+            let executable =
+                resolve_tool(&planned.stage.executable, &layout.source_root).map_err(|error| {
+                    format!("admitted executable '{}' is unavailable: {error}", planned.stage.executable)
+                })?;
+            let sha256 = file_digest(&executable).map_err(|error| {
+                format!("admitted executable '{}' cannot be hashed: {error}", executable.display())
+            })?;
+            Ok(eliot_instrument_runner::verification_executor::VerificationStageTool {
+                canonical_path: executable.to_string_lossy().into_owned(),
+                sha256,
+            })
+        },
+    );
+    let aggregate = ProfileAggregate::assemble_verified(&plan, runs);
     require_launched_stage(&admitted, &aggregate)?;
 
     // The same observed receipts travel into the receipt builder. It assembles
@@ -596,7 +595,7 @@ fn resolve_route(request: &Request) -> Result<VerificationProfileReceipt, CliErr
     Ok(receipt)
 }
 
-/// Requires at least one admitted stage to have really launched.
+/// Requires at least one stage to retain Kernel's original process start receipt.
 ///
 /// A run in which no stage produced a run record would hand the receipt builder
 /// an aggregate whose every stage is missing, and the only honest outcome of
@@ -618,15 +617,15 @@ fn require_launched_stage(
     admitted: &AdmittedProfile,
     aggregate: &ProfileAggregate,
 ) -> Result<(), CliError> {
-    let launched = aggregate
+    let started = aggregate
         .runs
         .iter()
-        .filter(|run| run.executable_digest.is_some())
+        .filter(|run| run.kernel_process_start_receipt.is_some())
         .count();
-    if launched == 0 {
+    if started == 0 {
         let refusals = stage_refusals(aggregate);
         return Err(CliError::Contract(format!(
-            "route '{}' revision {} launched no admitted stage; no tool identity was observed; {}",
+            "route '{}' revision {} retained no original Kernel process start receipt; no stage launch was verified; {}",
             admitted.name, admitted.revision, refusals
         )));
     }
@@ -1855,9 +1854,9 @@ fn seal_stage_request(
 /// `EnvironmentInheritance::None` is unchanged: the child receives no ambient
 /// variable and no inherited secret, and the executor still builds the child's
 /// environment block from exactly the names on this projection. What changed is
-/// that the projection is no longer EMPTY. A real admitted verification command
-/// — `cargo build`, `cargo clippy`, `cargo nextest run`, `cargo fmt --check` —
-/// locates its own `rustc`, its `rustup` shim, and any build-script interpreter
+/// that the projection is no longer EMPTY. The admitted verification commands
+/// — `cargo build --message-format=json` and `cargo fmt --all -- --check` —
+/// locate `rustc`, the `rustup` shim, and any build-script interpreter
 /// through `PATH`, and `scripts/verify.ps1` already resolves the resolver's own
 /// executable through that same `PATH`; with nothing declared, such a command had
 /// no toolchain at all and could not be a verification. `PATH` is read from the
