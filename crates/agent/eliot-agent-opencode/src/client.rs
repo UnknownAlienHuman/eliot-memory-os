@@ -2705,7 +2705,10 @@ mod tests {
         let observed_route = attest_message_route(info, &model)?;
         assert_ne!(observed_route, model);
         state.observe(&wrong_route)?;
-        assert_eq!(state.assistant_message_id.as_deref(), Some("msg_assistant_1"));
+        assert_eq!(
+            state.assistant_message_id.as_deref(),
+            Some("msg_assistant_1")
+        );
         assert!(!state.is_complete());
 
         let unbound_error = serde_json::from_value::<OpenCodeEvent>(serde_json::json!({
