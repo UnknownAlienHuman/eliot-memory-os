@@ -5,7 +5,7 @@
 //! so a consumer can surface an exact reason without crossing the secret
 //! boundary.
 
-use eliot_contracts::{AuthorityEpoch, ContractError, EpochId};
+use eliot_contracts::{ContractError, EpochId};
 use eliot_process::ContractError as ProcessContractError;
 use eliot_receipts::ReceiptError;
 use eliot_runtime_contracts::RuntimeContractError;
@@ -155,8 +155,8 @@ pub enum KernelError {
         operation_id: String,
         /// Owner that requested admission.
         owner: String,
-        /// Front-door epoch observed at denial.
-        epoch: AuthorityEpoch,
+        /// Front-door epoch tuple observed at denial.
+        epoch: EpochId,
     },
 
     /// The protected control reserve is exhausted at the named bottleneck.
@@ -177,8 +177,8 @@ pub enum KernelError {
         operation_id: String,
         /// Owner that requested admission.
         owner: String,
-        /// Front-door epoch observed at denial.
-        epoch: AuthorityEpoch,
+        /// Front-door epoch tuple observed at denial.
+        epoch: EpochId,
     },
 
     /// The preallocated emergency last-resort slot is unavailable.
@@ -199,8 +199,8 @@ pub enum KernelError {
         operation_id: String,
         /// Owner that requested admission.
         owner: String,
-        /// Front-door epoch observed at denial.
-        epoch: AuthorityEpoch,
+        /// Front-door epoch tuple observed at denial.
+        epoch: EpochId,
     },
 
     /// No control path remains: the system explicitly loses its control guarantee.
