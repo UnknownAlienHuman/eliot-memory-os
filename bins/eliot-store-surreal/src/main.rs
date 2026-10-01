@@ -239,7 +239,7 @@ async fn dispatch_blob_process_stream_sink(
                 _ => return reject(),
             };
             match composition
-                .blob_sink_finalize(
+                .blob_sink_finalize_with_ready_receipt(
                     transport,
                     identity,
                     &capability.reference,
@@ -248,12 +248,26 @@ async fn dispatch_blob_process_stream_sink(
                 )
                 .await
             {
-                Ok(terminal) => match encode(&terminal) {
-                    Ok(body) => Response::Finalized {
-                        body: Box::new(body),
-                    },
-                    Err(response) => response,
-                },
+                Ok((terminal, blob_ready_receipt_json, blob_ready_receipt_sha256)) => {
+                    if blob_ready_receipt_json.is_some() != blob_ready_receipt_sha256.is_some() {
+                        return reject();
+                    }
+                    match encode(&terminal) {
+                        Ok(body) => {
+                            let response = Response::Finalized {
+                                body: Box::new(body),
+                                blob_ready_receipt_json,
+                                blob_ready_receipt_sha256,
+                            };
+                            if response.validate().is_ok() {
+                                response
+                            } else {
+                                Response::Unknown
+                            }
+                        }
+                        Err(response) => response,
+                    }
+                }
                 Err(error) => failure(error),
             }
         }
