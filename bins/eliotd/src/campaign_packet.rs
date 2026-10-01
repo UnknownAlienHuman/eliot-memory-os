@@ -1164,8 +1164,9 @@ async fn resolve_compile_and_bind_result(
     // body comparison just below; handing it to the cells instead would compare
     // a row digest with a body digest and refuse every view, current or not.
     let context_recipe_record_digest =
-        match crate::campaign_context_owner::derive_context_recipe_record_digest(&context_recipe_body)
-        {
+        match crate::campaign_context_owner::derive_context_recipe_record_digest(
+            &context_recipe_body,
+        ) {
             Ok(digest) => digest,
             Err(_) => {
                 return campaign_packet_result_body(
