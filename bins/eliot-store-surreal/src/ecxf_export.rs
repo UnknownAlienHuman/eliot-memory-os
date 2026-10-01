@@ -36,13 +36,49 @@
 //! (the baseline declares no `scope_id` on a captured table), the source purge
 //! ledger, blob residency reachability, the externally sealed Architecture and
 //! `NormativePair` identities, a source-side export receipt, the store resource
-//! generation, this adapter's own identity and version, and the export's
-//! compression and encryption profiles. The owner states that in its own capture
-//! as a derived `missing_evidence` list, so the port returns the typed
-//! [`BackupError::UnobservedSourceMember`] refusal naming the first member the
-//! owner did not observe. Nothing is defaulted, no fence member is filled in,
-//! and no package is written. This command reports that refusal and exits
-//! nonzero; it never reports success over an incomplete view.
+//! generation, and the export's compression and encryption profiles. The owner
+//! states that in its own capture as a derived `missing_evidence` list, so the
+//! port returns the typed [`BackupError::UnobservedSourceMember`] refusal naming
+//! the first member the owner did not observe. Nothing is defaulted, no fence
+//! member is filled in, and no package is written. This command reports that
+//! refusal and exits nonzero; it never reports success over an incomplete view.
+//!
+//! # WHY NO SUCCESS PROJECTION IS WRITTEN HERE (#2569)
+//!
+//! This refusal is a measured property of the store's own evidence, not a
+//! missing line of code in this module, and the distinction decides whether a
+//! later change may close it. Five of the eight gaps are contributed
+//! unconditionally by the owner's own `observed_capture_gaps` — it appends
+//! `ExternalSourceIdentityEvidenceUnavailable`, `SourceExportReceiptUnavailable`,
+//! `StoreResourceGenerationUnavailable`, `SourceAdapterIdentityUnavailable` and
+//! `ExportProfileUnavailable` on every call, deriving them from no observation.
+//! The owner's `capture_completeness` then maps that non-empty list to
+//! `SnapshotCompleteness::Partial`, and [`export_ecxf_package`] refuses any view
+//! that is not complete before it reads a single member. So no assignment in
+//! this function can return `Ok`, and the other three gaps cannot be closed
+//! from this binary either: they are derived from the admitted generation's own
+//! baseline and from the vendor census, both of which live in the adapter.
+//!
+//! Writing the success projection anyway is the one move that is forbidden
+//! here. Four members have no possible source anywhere in the store —
+//! `architecture_source_digest`, `normative_pair_identity_receipt_digest`,
+//! `export_receipt` and `store_generation` (the identifier `store_generation`
+//! appears nowhere in the adapter crate), and three more have no captured class:
+//! `purge_ledger`, `blobs` and `reachable_blob_residency_keys`. Filling them
+//! would mean an empty string, an empty vector or a synthesised digest in a
+//! field `eliot-ecxf` then validates, which publishes a manifest whose fence
+//! nobody observed. An earlier attempt at exactly that is preserved on the
+//! unmerged branch `fix/1871-export-package-members-W3k5`
+//! (`c362f4cb0`), where those members were `String::new()` and `Vec::new()`;
+//! `fix/1871-export-reachable-command-W3k6` (`fb860c9a3`) withdrew the
+//! projection again once the independent reachability read was found to refuse
+//! on its own census. Neither branch is on `main` and neither is ported here.
+//!
+//! Closing this therefore needs the missing evidence to be *observed and
+//! carried*, not this module to project harder. An earlier version of this
+//! refusal over-stated the case by claiming the store had no adapter identity
+//! of its own: `ADAPTER_NAME` is a real declared value and is available. It is
+//! not enough on its own, because the four members above still have no source.
 
 use std::path::{Path, PathBuf};
 
@@ -142,6 +178,13 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
         // empty collection or a synthesized digest, and a fence member filled
         // that way is worse than the refusal, because it would publish a
         // manifest whose fence nobody observed.
+        //
+        // This is the measured blocker recorded in the module docs under
+        // "WHY NO SUCCESS PROJECTION IS WRITTEN HERE": the owner's gap list is
+        // never empty, so this arm cannot return `Ok` on any input, and the
+        // members a projection would still owe have no source in the store.
+        // Closing it means observing and carrying that evidence, not filling
+        // these fields in.
         Err(BackupError::UnobservedSourceMember {
             member: unobserved_member(&capture),
         })
@@ -163,10 +206,18 @@ impl EcxfSourceStore for StoreOwnerEcxfSource<'_> {
 /// would have had to supply. `StoreResourceGenerationUnavailable` names
 /// `store_generation` rather than `state_fence.resource_generation` because the
 /// fence's resource generation is the generation relevant to one decision, not
-/// the store's own. An owner that declares no gap at all has still not
-/// established the observed completeness itself, so that case names
-/// `completeness` — a source-view field whose counterpart in the fence is
-/// `consistent`, deliberately not the same word.
+/// the store's own.
+///
+/// The empty-list arm is the one case this mapping cannot describe. An owner
+/// that declares no gap has, by its own `capture_completeness` derivation, also
+/// declared `SnapshotCompleteness::Complete` — the two fields are derived from
+/// the same list and are deliberately not independent. Naming a member there
+/// would report a refusal over an owner verdict that says the opposite, so the
+/// arm names `completeness`, the one source-view field whose counterpart in the
+/// fence is `consistent`. Reaching it requires a generation that closes all
+/// eight gaps, which the five unconditional ones in `observed_capture_gaps`
+/// currently prevent; it names the member the projection would still owe rather
+/// than claiming the owner observed nothing.
 fn unobserved_member(capture: &EcxfSourceCapture) -> &'static str {
     match capture.missing_evidence.first() {
         Some(EcxfCaptureGap::RequestedScopeClosureUnproven) => "scope_id",
