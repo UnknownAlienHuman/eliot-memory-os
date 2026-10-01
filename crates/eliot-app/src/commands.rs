@@ -9,7 +9,7 @@ use crate::{
 };
 // Issue #1897: the engine patch/verifier lane's governed producer, used by the
 // CLI patch-apply and verifier-run routes in `commands/execution.rs`.
-use crate::verifier_lane::governed_verifier_lane;
+use crate::verifier_lane::{governed_verifier_lane, harness_with_measured_lane};
 use anyhow::{Context, Result, bail};
 use eliot_engine::{
     AdapterMemoryWriter, AdapterObservationBridge, AdapterObservationReport, AdapterRegistry,

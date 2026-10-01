@@ -8,7 +8,7 @@
 use super::*;
 // Issue #1897: the MCP patch-apply route verifies in the same measured governed
 // lane as the CLI route.
-use crate::verifier_lane::governed_verifier_lane;
+use crate::verifier_lane::{governed_verifier_lane, harness_with_measured_lane};
 
 pub(super) async fn dispatch_action_plan(state: &McpState, arguments: Value) -> Result<Value> {
     let input: ActionPlanToolInput = serde_json::from_value(arguments)?;
@@ -103,16 +103,24 @@ pub(super) async fn dispatch_patch_apply(state: &McpState, arguments: Value) -> 
     let repo_root = patch_repo_root(&lease)?;
     let runner = PatchRunner::new(&repo_root, Some(&blob_store));
     // Issue #1897 (AUD7): the MCP patch-apply route verifies in the same MEASURED
-    // governed lane as the CLI route. Deriving it here from this request's own
-    // identity and real checkout is what keeps a harness without a lane failing
-    // closed instead of building in the shared repository `target/` directory.
-    let lane = governed_verifier_lane(
-        &request.patch_request_id.to_string(),
-        &request.project_id.to_string(),
-        &repo_root,
-        &verifier_plan,
-    )?;
-    let verifier = VerifierHarness::new(&repo_root, Some(&blob_store)).with_governed_lane(&lane);
+    // governed lane as the CLI route. `harness_with_measured_lane` installs it
+    // when it can be measured and leaves the harness lane-less when it cannot, so
+    // the refusal is recorded instead of the build running in the shared
+    // repository `target/` directory.
+    let verifier = harness_with_measured_lane(
+        VerifierHarness::new(&repo_root, Some(&blob_store)),
+        governed_verifier_lane(
+            &request.patch_request_id.to_string(),
+            &request.project_id.to_string(),
+            &repo_root,
+            &verifier_plan,
+            // Issue #1897 (AUD7): this route holds no admitted Cargo target
+            // triple, so the lane refuses naming that field and the harness fails
+            // closed rather than building in the shared repository `target/`.
+            None,
+        ),
+        "mcp_stdio::work::dispatch_patch_apply",
+    );
     let incident_lockdown_active = IncidentService::new(&state.root).lockdown_active()?;
     let (mut patch_run, mut verifier_runs) = runner
         .apply(

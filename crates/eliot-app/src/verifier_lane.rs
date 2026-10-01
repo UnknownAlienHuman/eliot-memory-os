@@ -32,10 +32,20 @@
 //! lane genuinely has no admitted value, this returns an error rather than
 //! minting a plausible-looking one, because a governed-looking fingerprint that
 //! proves nothing is worse than an honest refusal.
+//!
+//! One such refusal is unconditional today. `BuildFingerprint.target` has no
+//! admitted source on this lane (see [`unobtainable_target`]), and no route can
+//! supply one, so [`governed_verifier_lane`] refuses on every call and the
+//! engine harness fails closed through its own refusal. That is the intended
+//! fail-closed state, not a gap: no Cargo verifier runs in the shared
+//! repository `target/` directory while no admitted target names it. The
+//! measurement below is complete and retained rather than deleted, so admitting
+//! the target field activates this lane instead of requiring it to be rewritten.
 
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
+use eliot_engine::VerifierHarness;
 use eliot_testd_core::{
     BuildClass, BuildFingerprint, BuildMode, GovernedWorkEnvelope, LaneIdentity,
     ResourceLeaseAllocator, ResourceWeight, RuntimeEnvironmentLease, TargetLayoutBinding,
@@ -69,20 +79,161 @@ const VERIFIER_CARGO_PROFILE: &str = "dev";
 /// two never share a fingerprint.
 const UNPINNED_TOOLCHAIN: &str = "unpinned-cargo-default";
 
+/// The one `BuildFingerprint` field this lane cannot measure, and why.
+///
+/// `BuildFingerprint.target` names the Cargo target triple the build resolves.
+/// On this lane it is unobtainable, and every candidate source was measured
+/// rather than assumed:
+///
+/// * `PatchRequest` (`eliot-types/src/memory.rs`), `ActionLease` and
+///   `PatchToolInput` carry **no** target field, so nothing a caller holds names
+///   one.
+/// * `crates/eliot-app/build.rs` could read Cargo's own `TARGET` hermetically,
+///   but that file belongs to `main` and already carries three `git` probes,
+///   which makes it a `clippy::disallowed-methods` site (issue #748 / I10.8.2).
+///   Editing it surfaces six violations owned by code this lane does not, in a
+///   package this issue does not own.
+/// * `std::env::consts` yields `ARCH` and `OS` only. Composing
+///   `x86_64-pc-windows-msvc` from those would be inference, not observation.
+/// * `DevFastCandidate::target_triple` (`eliot-instrument-runner/src/dev_fast.rs`)
+///   is caller-supplied, and `git grep DevFastCandidate::bind` returns zero
+///   callers, so no producer exists to read.
+/// * Spawning `rustc --print` would be a fourth direct process launch, which is
+///   the very thing `clippy::disallowed-methods` forbids.
+/// * `cargo-nextest` does accept `--target <TRIPLE>`, but
+///   `eliot_engine::patch`'s fixed verifier command map never passes it, so the
+///   resolved target is Cargo's **host default** — exactly the value nobody in
+///   this workspace can name without a probe or a build-script edit.
+///
+/// **The owner that must supply it:** the `ActionLease` admission path, which
+/// already issues the scope and the `VerifierPlan` this lane admits. A `target`
+/// field there, carried to `PatchRunnerInput` beside `VerifierPlan`, makes the
+/// value admitted material — the same way the productive `TestD` lane reads
+/// `InstrumentInvocation::target` in `admitted_lane_identity`. Wiring it requires
+/// a change to `eliot-types`, which this issue does not own.
+///
+/// **Why an error and not `None`:** `build_script_digest` and `proc_macro_digest`
+/// are `None` because *nothing observes them*. `target` is different in kind — a
+/// real value exists and matters, this lane simply has no admitted source for
+/// it — so `None` would understate it. Minting a plausible triple instead would
+/// key every governed build root under this lane by a value no work item holds,
+/// which is precisely the inert-fingerprint defect class this issue exists to
+/// remove.
+fn unobtainable_target() -> anyhow::Error {
+    anyhow!(
+        "BuildFingerprint.target is unobtainable on the engine verifier lane (issue #1897, \
+         AUD7): the fixed verifier command map never passes --target, so the resolved target is \
+         Cargo's host default, and no admitted input names it. PatchRequest, ActionLease and \
+         PatchToolInput carry no target field; eliot-app/build.rs belongs to main and is a \
+         clippy::disallowed-methods site (issue #748); std::env::consts yields only ARCH and OS; \
+         DevFastCandidate::target_triple has zero callers. Owner: add a target field to the \
+         ActionLease admission path and carry it to PatchRunnerInput beside VerifierPlan, so \
+         this value arrives admitted rather than probed. Until then the governed lane is dormant \
+         and every caller fails closed through VerifierHarness."
+    )
+}
+
 /// Builds the retained governed lane for one engine verifier work item.
+///
+/// This lane is currently DORMANT, and that is the fail-closed path working, not
+/// a gap: `target` is the one fingerprint field it cannot measure for itself
+/// (see [`unobtainable_target`]), and no route can supply it yet, so every caller
+/// passes `None` and receives that typed refusal. Each caller then takes
+/// `VerifierHarness`'s own fail-closed refusal, so no Cargo verifier runs in the
+/// shared repository `target/` directory and none pretends to be governed.
+///
+/// The measurement behind this refusal is complete and retained, not deleted, so
+/// that whoever admits the `ActionLease` target field activates a working lane
+/// rather than writing one: passing `Some(target)` is the whole change.
 ///
 /// # Errors
 ///
-/// Returns an error when the checkout cannot be canonicalized or has no
-/// readable `Cargo.toml`, when the admitted project or checkout identity is not
-/// derivable, when the live lease allocator refuses the fixture claim, or when
-/// the resulting tuple is not a valid envelope. Every refusal happens before
-/// any Cargo process exists.
+/// [`unobtainable_target`] when `target` is `None`, which is every route today.
+/// Otherwise an error when `target` is blank or control-bearing, when the
+/// checkout cannot be canonicalized or has no readable `Cargo.toml`, when the
+/// admitted project or checkout identity is not derivable, when the live lease
+/// allocator refuses the fixture claim, or when the resulting tuple is not a
+/// valid envelope. Every refusal happens before any Cargo process exists.
 pub fn governed_verifier_lane(
     work_item_id: &str,
     project_id: &str,
     repo_root: &Path,
     plan: &VerifierPlan,
+    target: Option<&str>,
+) -> Result<GovernedWorkEnvelope> {
+    // The one field this lane cannot measure for itself. `None` means the caller
+    // holds no admitted target either, which is the case on every route today,
+    // so this refuses before any filesystem work and no partial tuple is built
+    // and then discarded.
+    let Some(target) = target else {
+        return Err(unobtainable_target());
+    };
+    if target.trim().is_empty() || target.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "the admitted Cargo target triple must be a non-blank, control-free name \
+             (issue #1897, BuildFingerprint.target)"
+        ));
+    }
+    measure_verifier_lane(work_item_id, project_id, repo_root, plan, target)
+}
+
+/// Installs the governed lane on a harness when one was measurable, and fails
+/// closed when it was not.
+///
+/// A harness with no lane admits no build: every Cargo requirement on it resolves
+/// to `ungoverned_verifier_run`, so the requirement is recorded as a refusal and
+/// no `cargo` process is launched. That is the state this repository must be in
+/// whenever a lane cannot be measured, because the alternative is a governed
+/// fingerprint that proves nothing while the build still runs in the shared
+/// repository `target/` directory.
+///
+/// The refusal is reported rather than discarded, so an operator reading the logs
+/// learns which field is missing instead of seeing an unexplained ungoverned run.
+/// It is deliberately NOT propagated: propagating would abort the enclosing
+/// `PatchRunner::apply` after `git apply` had already mutated the checkout, which
+/// loses the rollback containment the harness's own refusal preserves.
+#[must_use]
+pub fn harness_with_measured_lane<'a>(
+    harness: VerifierHarness<'a>,
+    lane: Result<GovernedWorkEnvelope>,
+    route: &'static str,
+) -> VerifierHarness<'a> {
+    match lane {
+        Ok(lane) => harness.with_governed_lane(&lane),
+        Err(refusal) => {
+            tracing::warn!(
+                route,
+                error = %refusal,
+                "no governed verifier lane was admitted, so every Cargo requirement on this \
+                 route fails closed as an ungoverned verifier run"
+            );
+            harness
+        }
+    }
+}
+
+/// Measures every `BuildFingerprint` field this lane observes.
+///
+/// This is the complete, correct measurement for all but the `target` field it is
+/// handed: workspace, candidate, toolchain, profile, features, environment class,
+/// manifest digest, source-closure digest, build class and contract revision,
+/// each read from real admitted material. It is reachable the moment a caller can
+/// supply `target`, and it is a named function rather than inline code in the
+/// refusing entry point so that whoever admits the `ActionLease` target field
+/// activates this work instead of rewriting it.
+///
+/// # Errors
+///
+/// Returns an error when the checkout cannot be canonicalized or has no readable
+/// `Cargo.toml`, when the admitted project or checkout identity is not derivable,
+/// when the live lease allocator refuses the fixture claim, or when the
+/// resulting tuple is not a valid envelope.
+fn measure_verifier_lane(
+    work_item_id: &str,
+    project_id: &str,
+    repo_root: &Path,
+    plan: &VerifierPlan,
+    target: &str,
 ) -> Result<GovernedWorkEnvelope> {
     let local_app_data =
         eliot_platform_windows::current_user_local_app_data_root().map_err(|error| {
@@ -127,6 +278,9 @@ pub fn governed_verifier_lane(
         checkout_text.as_str(),
         requirements.as_slice(),
     ))?);
+    // Every field of this fingerprint is measured from real admitted material;
+    // `target` is the one value the caller had to admit, because no source on
+    // this lane can observe it. See [`unobtainable_target`].
     let identity = LaneIdentity {
         work_item_id: work_item_id.to_owned(),
         workspace_id: workspace_id.clone(),
@@ -139,7 +293,11 @@ pub fn governed_verifier_lane(
             // patch request names exactly one candidate diff.
             candidate: work_item_id.to_owned(),
             toolchain: declared_toolchain(&canonical_checkout),
-            target: env!("ELIOT_BUILD_TARGET").to_owned(),
+            // Admitted by the caller because nothing on this lane observes it.
+            // No caller can supply one today, so this body is unreachable; see
+            // [`unobtainable_target`] for why it is a parameter rather than a
+            // constant or an `env!`.
+            target: target.to_owned(),
             profile: VERIFIER_CARGO_PROFILE.to_owned(),
             // The fixed verifier command map admits no caller feature selection,
             // so the empty set is the observed declaration.
