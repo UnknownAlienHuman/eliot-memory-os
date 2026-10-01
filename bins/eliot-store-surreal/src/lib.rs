@@ -1976,7 +1976,9 @@ mod tests {
         ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, EpochLineageId, ProductId,
         RequestId, ResourceGeneration, SourceId,
     };
-    use eliot_installation::{InstallationEpoch, RuntimeStateRoots};
+    use eliot_installation::{
+        INSTALLATION_ROOT_BINDING_VERSION, InstallationEpoch, InstallationRoots, RuntimeStateRoots,
+    };
     use eliot_runtime_contracts::{
         HealthVector, ModuleContract, ModuleGeneration, ModuleGenerationState,
     };
@@ -2160,6 +2162,20 @@ mod tests {
         roots
     }
 
+    fn system_profile_roots(roots: &RuntimeStateRoots) -> InstallationRoots {
+        // I3.1: `system_service` shares one user_config/user_cache root, and
+        // carries the typed runtime topology through unchanged.
+        let installer_user_root = r"C:\Users\eliot-installer\AppData\Local\Eliot";
+        InstallationRoots {
+            binding_version: INSTALLATION_ROOT_BINDING_VERSION,
+            immutable_binaries: r"C:\Program Files\Eliot\eliot\test-version".to_owned(),
+            durable_data: roots.installation_root.as_str().to_owned(),
+            user_config: installer_user_root.to_owned(),
+            user_cache: installer_user_root.to_owned(),
+            runtime_state_roots: roots.clone(),
+        }
+    }
+
     fn reseal_runtime_launch(descriptor: &mut RuntimeLaunchDescriptor) {
         *descriptor = descriptor
             .clone()
@@ -2174,6 +2190,24 @@ mod tests {
         let authority_state_fence = StateFence::new(test_epoch(1), authority_generation);
         let mut descriptor = RuntimeLaunchDescriptor {
             profile: InstallationProfile::SystemService,
+            // The I3.1 four-root binding is derived from the same
+            // `runtime_state_roots` this descriptor already carries, so the
+            // compatibility projection and the retained binding are the same
+            // fixture value rather than two independently chosen ones. These are
+            // the owner-derived values the package's integration fixtures
+            // already use for this profile; they are not filler.
+            profile_component: handle("eliot"),
+            profile_version: handle("test-version"),
+            profile_installation_key: Some(handle(
+                roots
+                    .installation_root
+                    .as_str()
+                    .rsplit('\\')
+                    .next()
+                    .expect("installation root has a final segment")
+                    .to_owned(),
+            )),
+            profile_governed_roots: system_profile_roots(&roots),
             portable_root: None,
             installation_epoch: InstallationEpoch {
                 installation: handle("installation-test"),

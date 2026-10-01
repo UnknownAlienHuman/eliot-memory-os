@@ -14,11 +14,98 @@ use std::num::NonZeroU64;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence, sha256_hex};
 use eliot_research_exchange_api::{DisclosureClass, SourceClass};
 use eliot_researcher::evidence_portfolio::*;
+use eliot_researcher::{
+    AdmittedExcerpt, AdmittedExcerptParams, ExcerptPosition, RetainedSourceRevision,
+    RetainedSourceRevisionParams, audit_claim_with_excerpts,
+};
 
 const GOLDEN: &str = include_str!("data/evidence_portfolio.json");
 
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// The exact retained bytes of every source record this suite builds.
+///
+/// `AuditedClaim.excerpts` is the field that makes I21.8's
+/// `excerpt_supports_requirement` decidable for its occurrence half: without
+/// the quoted bytes on this side of the boundary, cropped negation and
+/// snippet-as-quote were unrepresentable rather than merely unchecked. A claim
+/// audited here therefore offers the exact excerpt of the admitted revision
+/// rather than no excerpt, and the occurrence check runs against the retained
+/// original the governed source-admission/persistence owner committed.
+///
+/// This is deliberately a **single line with nothing before it**, and that is a
+/// measured property rather than a convenience: the occurrence is anchored at
+/// byte offset 0, so the governing leading window the cropped-negation arm
+/// reads is empty, and a one-line quote has no further heading for the
+/// stitching arm to find. A fixture that padded this with a preamble would be
+/// asserting `NegationCropped` for reasons that have nothing to do with the
+/// property each case is actually about.
+const SOURCE_TEXT: &str = "the alloy survives the qualified thermal cycle";
+
+/// The retained original for one admitted source handle, as the governed
+/// source-admission/persistence owner would commit it.
+///
+/// Its `content_digest` is the digest of [`SOURCE_TEXT`], which is also what
+/// [`source_params`] puts on the record, so the foreign-revision check compares
+/// two independently produced values rather than a label with itself.
+fn retained(handle: &str) -> RetainedSourceRevision {
+    RetainedSourceRevision::retain(RetainedSourceRevisionParams {
+        source_handle: handle.to_owned(),
+        artifact_ref: format!("artifact::{handle}"),
+        content_digest: sha256_hex(SOURCE_TEXT.as_bytes()),
+        bytes: SOURCE_TEXT.as_bytes().to_vec(),
+        snippet_regions: Vec::new(),
+    })
+    .expect("retained source revision")
+}
+
+/// The retained originals for exactly the handles a claim's excerpts name.
+///
+/// Keyed by the excerpt's own `source_handle`, so the audit resolves each
+/// excerpt against the revision that admitted handle committed rather than
+/// against whatever revision happened to be in the map.
+fn retained_for(handles: &[&str]) -> BTreeMap<String, RetainedSourceRevision> {
+    handles
+        .iter()
+        .map(|handle| ((*handle).to_owned(), retained(handle)))
+        .collect()
+}
+
+/// The exact excerpt one admitted source handle offers, at the offset it was
+/// measured at.
+fn excerpt(handle: &str) -> AdmittedExcerpt {
+    AdmittedExcerpt::offer(AdmittedExcerptParams {
+        source_handle: handle.to_owned(),
+        excerpt: SOURCE_TEXT.to_owned(),
+        position: ExcerptPosition::ByteOffset { offset: 0 },
+    })
+    .expect("admitted excerpt")
+}
+
+/// Audits one claim whose excerpts are the retained originals named by
+/// `handles`.
+///
+/// This is the entry point that actually compares quoted bytes with the
+/// admitted original. The four-argument [`audit_claim`] deliberately has no
+/// retained revision in hand, so every excerpt it audits is `NoRetainedRevision`
+/// — a real finding, not a skip, but not a measurement either. A case whose
+/// subject is source classification rather than excerpt occurrence would be
+/// reporting that finding instead of the one it means to test.
+fn audit_with_excerpts(
+    claim: &AuditedClaim,
+    portfolio: &EvidencePortfolio,
+    binding: &AuditReferenceBinding,
+    handles: &[&str],
+) -> ClaimVerdict {
+    audit_claim_with_excerpts(
+        claim,
+        portfolio,
+        binding,
+        1_700_000_300_000,
+        &retained_for(handles),
+    )
+}
 
 const EXPECTED_GRADE_ORDER: [&str; 4] = ["ORIENTING", "GROUNDED", "CORROBORATED", "SCIENCE_GRADE"];
 const EXPECTED_DENOMINATOR_SIZE: usize = 4;
@@ -105,7 +192,12 @@ fn source_params(handle: &str) -> SourceRecordParams {
         class: SourceClass::Paper,
         title: format!("title for {handle}"),
         locator: format!("snapshot::{handle}"),
-        content_digest: DIGEST_A.to_owned(),
+        // The admitted record's own content digest, which is the independent
+        // expected value the foreign-revision check compares a retained
+        // revision against. It is the digest of `SOURCE_TEXT`, so the record and
+        // the retained original agree because both describe the same bytes, not
+        // because the fixture reused one placeholder for both.
+        content_digest: sha256_hex(SOURCE_TEXT.as_bytes()),
         operation_id: format!("op-{handle}"),
         receipt_handle: format!("rcpt-{handle}"),
         acquisition: SourceDisposition::Observed,
@@ -494,8 +586,14 @@ fn source_outside_claim_authority_domain() {
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        // The claim quotes the admitted revision it cites, so the excerpt
+        // obligation is decided by the occurrence check rather than reported as
+        // unsatisfied for want of a retained original. This case is about
+        // authority-domain coverage, and leaving the excerpt unmeasured would
+        // replace its finding with a stronger, unrelated one.
+        excerpts: vec![excerpt("foreign-src")],
     };
-    let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
+    let verdict = audit_with_excerpts(&claim, &portfolio, &manifest, &["foreign-src"]);
     assert_eq!(verdict.outcome, ClaimOutcome::Unsupported);
     assert!(
         verdict
@@ -558,8 +656,9 @@ fn stale_partial_and_contested_sources_limit_grade() {
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: vec![excerpt("base-src")],
     };
-    let verdict = audit_claim(&claim, &portfolio, &manifest, 1_700_000_300_000);
+    let verdict = audit_with_excerpts(&claim, &portfolio, &manifest, &["base-src"]);
     // The old fixture listed `rival-src` as a citation AND as a counterclaim and
     // expected CONTRADICTED. That is the defect #2874 closes: listing a handle
     // contests nothing. With no opposition relation supplied the honest class is
@@ -955,8 +1054,9 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         unknown_refs: vec!["unread-dossier-9".to_owned()],
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: vec![excerpt("base-src")],
     };
-    let verdict = audit_claim(&hidden_unknown, &portfolio, &manifest, 1_700_000_300_000);
+    let verdict = audit_with_excerpts(&hidden_unknown, &portfolio, &manifest, &["base-src"]);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
     assert_eq!(verdict.unknowns, vec!["unread-dossier-9".to_owned()]);
     assert_eq!(verdict.evidence_map, vec!["base-src".to_owned()]);
@@ -971,8 +1071,13 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        // No excerpt, because there is no admitted citation to quote one from.
+        // An excerpt naming an unadmitted handle would be refused as fabricated
+        // and would replace the "records no citations" finding this case is
+        // about with a different one.
+        excerpts: Vec::new(),
     };
-    let verdict = audit_claim(&bare, &portfolio, &manifest, 1_700_000_300_000);
+    let verdict = audit_with_excerpts(&bare, &portfolio, &manifest, &[]);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
     let clean = AuditedClaim {
         claim_id: "claim-clean".to_owned(),
@@ -985,12 +1090,13 @@ fn hidden_counterevidence_and_unknowns_keep_accounting_open() {
         unknown_refs: Vec::new(),
         frozen_identities: Vec::new(),
         opposition_relations: Vec::new(),
+        excerpts: vec![excerpt("base-src")],
     };
     // A claim with no frozen identity cannot be released as supported: there is
     // nothing to check its wording and revision against, so `MethodArtifact-
     // Alignment` fails by construction. The internal outcome stays
     // INCOMPLETE_ACCOUNTING rather than acquiring a new terminal class.
-    let verdict = audit_claim(&clean, &portfolio, &manifest, 1_700_000_300_000);
+    let verdict = audit_with_excerpts(&clean, &portfolio, &manifest, &["base-src"]);
     assert_eq!(verdict.outcome, ClaimOutcome::IncompleteAccounting);
     assert_eq!(
         verdict.public_class(),

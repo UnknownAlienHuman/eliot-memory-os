@@ -4935,6 +4935,10 @@ mod tests {
                         Request::ReconcileExternal {} => "reconcile_external",
                         Request::RecoveryProjectionPage { .. } => "recovery_projection_page",
                         Request::RecoverNextPage {} => "recover_next_page",
+                        // The serde tag is snake_case (`rename_all = "snake_case"`),
+                        // so this is the exact wire spelling the decode cases
+                        // below compare against.
+                        Request::ResourceRead { .. } => "resource_read",
                         Request::Reconnect { .. } => "reconnect",
                         Request::Detach { .. } => "detach",
                         Request::Status => "status",
@@ -5134,7 +5138,7 @@ mod tests {
         };
         attach_auto_bootstrap(&mut runner, &mut first);
         let Response::Forwarded {
-            bootstrap: Some(ref bootstrap),
+            bootstrap: Some(ref carried),
             ..
         } = first
         else {

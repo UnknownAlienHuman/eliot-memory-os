@@ -277,6 +277,16 @@ fn backup_issue_and_restore_run_round_trip_isolated() -> TestResult {
             admission_digest: "e".repeat(64),
             mutation_plan_digest: "f".repeat(64),
             semantic_source_revisions: Vec::new(),
+            // I5.19: no `PreparedTransition` is in scope for this standalone
+            // seed, so the receipt names the store contract's own in-force
+            // identities instead of an invented revision. `fence()` carries no
+            // policy binding, so `policy_revision` is `None` and still agrees
+            // with the fence `WriteReceipt::validate` compares it against.
+            policy_config_schema_versions: eliot_store_api::PolicyConfigSchemaVersions {
+                policy_revision: fence().policy_revision,
+                config_profile: eliot_store_api::OPERATION_CATALOGUE_PROFILE.to_owned(),
+                schema_revision: eliot_store_api::CONTRACT_VERSION,
+            },
             error_code: None,
             resubmission: Resubmission::None,
             committed_at: Some("commit-sequence-0000000000000001".to_owned()),

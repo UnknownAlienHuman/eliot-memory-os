@@ -279,8 +279,9 @@ fn dispatch_denied(error: &ContractViolation) -> DreamerError {
 /// admitted class, carried from the validation stage; `None` for Curation,
 /// which owns its separate carrier, and for refused classes, which never
 /// reach validation), and the two pipeline-produced records the Orientation
-/// carrier joins (read only on the Orientation arm). Returns the owner-typed
-/// [`DreamResult`].
+/// carrier joins (read only on the Orientation arm, and therefore optional for
+/// exactly the same reason the validated candidate is — see the parameter
+/// documentation below). Returns the owner-typed [`DreamResult`].
 ///
 /// Fail-closed: the admission/job binding is verified first, then the class
 /// parameter is bound against the semantic job, then the exhaustive nine-arm
@@ -303,7 +304,25 @@ pub(crate) fn dispatch_admitted(
     carriers: OwnerCarriers<'_>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
-    pipeline: PipelineOrientationRecords<'_>,
+    // The two records the Orientation composer joins, or `None` for every
+    // class whose Orientation pipeline never runs.
+    //
+    // Optional for the same structural reason as `validated`, and because of
+    // one owner rule: the A-05 gate rejects `JobClass::Curation`
+    // unconditionally
+    // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+    // `validate_family` → `UnsupportedJobShape`, "Curation requires its
+    // separate typed post-handler carrier"). A Curation job therefore never
+    // produces a `ValidatedGroundingCandidate`, so this record is
+    // **unconstructible** for it — there is nothing to hand over, not a value
+    // that was merely left out. Requiring it would force a caller to
+    // fabricate a receipt that the owner refuses to issue, which is why it is
+    // `Option` here and why the Curation arm never reads it.
+    //
+    // The Curation arm deliberately does not inspect this value at all: it
+    // never branches on `Some`/`None`, so `None` is not a new refusal there.
+    // Only the Orientation arm consumes it.
+    pipeline: Option<PipelineOrientationRecords<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
     if job.job_class != job_class {
@@ -336,7 +355,16 @@ pub(crate) fn dispatch_admitted(
             let Some(candidate) = validated else {
                 return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
             };
-            dispatch_orientation(admission, job, candidate, carriers.orientation, pipeline)
+            // The pipeline record carries the structured A-05 validated draft
+            // this composer joins, so its absence is the SAME missing-receipt
+            // condition the arm above already refuses. This reuses that typed
+            // refusal rather than introducing a second reason code for one
+            // condition. It is a fail-closed backstop, not a new outcome:
+            // production and every Orientation case supply the record.
+            let Some(records) = pipeline else {
+                return Err(DreamerError::InvalidAdmission(VALIDATION_RECEIPT_REFUSAL));
+            };
+            dispatch_orientation(admission, job, candidate, carriers.orientation, records)
         }
         // Native owner: eliot-dreamer-research-synthesis `synthesize`. The
         // owner takes its own `SynthesisRequest` vocabulary (a
@@ -1867,12 +1895,26 @@ mod slice_7_native_owner_tests {
     }
 
     /// Runs the genuine admitted chain up to the structured A-05 gate for one
-    /// fixture job, returning the validated receipt dispatch requires.
+    /// fixture job, returning the validated receipt dispatch requires **and**
+    /// the grounding request the pipeline ran under.
+    ///
+    /// Both are returned because `dispatch_admitted` takes
+    /// [`PipelineOrientationRecords`], which joins by reference the exact
+    /// grounding request and validated candidate this chain produced. Handing
+    /// it a rebuilt lookalike instead would let a later edit move the real
+    /// grounding stage without the Orientation carrier noticing, which is
+    /// precisely the "rebuild a lookalike" failure the owner's contract
+    /// forbids. The grounding owner consumes its request by value, so this
+    /// retains a clone exactly as production does.
+    ///
     /// Every stage genuinely invokes its owner; any refusal fails the proof.
     fn validated_for(
         admission: &KernelJobAdmission,
         job: &DreamJobInput,
-    ) -> eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate {
+    ) -> (
+        GroundingRequest,
+        eliot_dreamer_contracts::validation::structured::ValidatedGroundingCandidate,
+    ) {
         let model_inputs = match crate::model_stage::resolve_model_inputs(admission, job) {
             Ok(inputs) => inputs,
             Err(error) => panic!("fixture model inputs must resolve, got {error:?}"),
@@ -1886,7 +1928,7 @@ mod slice_7_native_owner_tests {
             Ok(request) => request,
             Err(error) => panic!("fixture grounding must resolve, got {error:?}"),
         };
-        let grounded = match crate::grounding_stage::ground_admitted_draft(request) {
+        let grounded = match crate::grounding_stage::ground_admitted_draft(request.clone()) {
             Ok(grounded) => grounded,
             Err(error) => panic!("fixture grounding must prove, got {error:?}"),
         };
@@ -1897,8 +1939,29 @@ mod slice_7_native_owner_tests {
                 Err(error) => panic!("fixture carrier must build, got {error:?}"),
             };
         match crate::validation_stage::validate_admitted_draft(&carrier) {
-            Ok(validated) => validated,
+            Ok(validated) => (request, validated),
             Err(error) => panic!("fixture carrier must validate, got {error:?}"),
+        }
+    }
+
+    /// The owner carriers these cases exercise.
+    ///
+    /// `screen` and `curation_protection` are members of
+    /// [`OwnerCarriers`] rather than separate `dispatch_admitted` parameters:
+    /// both are derived from one screened binding, so passing them separately
+    /// let a caller supply a protection set with no binding behind it. Each case
+    /// names which carriers it supplies so the refusal it asserts stays the
+    /// refusal the arm under test produces.
+    fn carriers(
+        curation: Option<CurationExecutionCarrier<'_>>,
+        screen: Option<ScreenBinding>,
+        curation_protection: Option<CurationProtectionSet>,
+    ) -> OwnerCarriers<'_> {
+        OwnerCarriers {
+            curation,
+            screen,
+            curation_protection,
+            orientation: None,
         }
     }
 
@@ -1911,15 +1974,14 @@ mod slice_7_native_owner_tests {
     fn orientation_projects_packet_with_g4_preserved() {
         let admission = admission();
         let job = semantic_job(JobClass::Orientation);
-        let validated = validated_for(&admission, &job);
+        let (grounding, validated) = validated_for(&admission, &job);
         let result = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Orientation,
             Some(&validated),
-            None,
+            Some(PipelineOrientationRecords::new(&grounding, &validated)),
         );
         let Ok(DreamResult::Packet(packet)) = result else {
             panic!("orientation must project, got {result:?}");
@@ -1982,15 +2044,14 @@ mod slice_7_native_owner_tests {
         let admission = admission();
         let mut job = semantic_job(JobClass::Orientation);
         job.evidence_handles.clear();
-        let validated = validated_for(&admission, &job);
+        let (grounding, validated) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Orientation,
             Some(&validated),
-            None,
+            Some(PipelineOrientationRecords::new(&grounding, &validated)),
         );
         assert!(
             matches!(
@@ -2011,14 +2072,21 @@ mod slice_7_native_owner_tests {
     /// architecturally impossible through this seam.
     #[test]
     fn orientation_without_validated_refuses_receipt_gate() {
+        let admission = admission();
+        let job = semantic_job(JobClass::Orientation);
+        // The pipeline record is built and supplied while the `validated`
+        // receipt is deliberately withheld. That is what makes this case prove
+        // the gate ORDER: an available pipeline record does not substitute for
+        // the structured A-05 receipt, so the refusal is the receipt gate and
+        // not the arm quietly proceeding on the record alone.
+        let (grounding, validated) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
-            &admission(),
-            &semantic_job(JobClass::Orientation),
-            None,
-            None,
+            &admission,
+            &job,
+            carriers(None, None, None),
             JobClass::Orientation,
             None,
-            None,
+            Some(PipelineOrientationRecords::new(&grounding, &validated)),
         );
         assert!(
             matches!(
@@ -2044,10 +2112,14 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission,
             &job,
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Orientation,
             None,
+            // No pipeline record, and none can exist: the caller switched the
+            // job identity, so `resolve_model_inputs` fails its
+            // `verify_admitted_binding` check before any stage runs. That
+            // refusal IS this case's subject, so building a record here would
+            // mean asserting a pipeline that never executed.
             None,
         );
         assert_eq!(
@@ -2060,14 +2132,20 @@ mod slice_7_native_owner_tests {
     /// class binding before any owner work (and before the receipt gate).
     #[test]
     fn class_parameter_mismatch_refuses_at_binding() {
+        let admission = admission();
+        let job = semantic_job(JobClass::Orientation);
+        // The job is a real Orientation job, so the pipeline genuinely runs and
+        // the record is genuine. The `job_class` argument is what disagrees; the
+        // refusal must come from the binding check before that argument routes
+        // anything, which is only observable when a valid record is present.
+        let (grounding, validated) = validated_for(&admission, &job);
         let refused = dispatch_admitted(
-            &admission(),
-            &semantic_job(JobClass::Orientation),
-            None,
-            None,
+            &admission,
+            &job,
+            carriers(None, None, None),
             JobClass::Curation,
             None,
-            None,
+            Some(PipelineOrientationRecords::new(&grounding, &validated)),
         );
         assert!(
             matches!(
@@ -2086,10 +2164,16 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            None,
+            carriers(None, Some(valid_screen()), None),
             JobClass::Curation,
             None,
+            // Unconstructible for Curation, not merely omitted: the A-05 gate
+            // rejects `JobClass::Curation` unconditionally
+            // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+            // `validate_family` → `UnsupportedJobShape`), so no Curation job ever
+            // yields a `ValidatedGroundingCandidate` and this record cannot be
+            // built. Supplying one would mean fabricating a receipt the owner
+            // refuses to issue.
             None,
         );
         assert!(
@@ -2122,10 +2206,16 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            None,
-            None,
+            carriers(None, None, None),
             JobClass::Curation,
             None,
+            // Unconstructible for Curation, not merely omitted: the A-05 gate
+            // rejects `JobClass::Curation` unconditionally
+            // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+            // `validate_family` → `UnsupportedJobShape`), so no Curation job ever
+            // yields a `ValidatedGroundingCandidate` and this record cannot be
+            // built. Supplying one would mean fabricating a receipt the owner
+            // refuses to issue.
             None,
         );
         assert!(
@@ -2149,10 +2239,16 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            None,
-            Some(harness.carrier()),
+            carriers(Some(harness.carrier()), None, None),
             JobClass::Curation,
             None,
+            // Unconstructible for Curation, not merely omitted: the A-05 gate
+            // rejects `JobClass::Curation` unconditionally
+            // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+            // `validate_family` → `UnsupportedJobShape`), so no Curation job ever
+            // yields a `ValidatedGroundingCandidate` and this record cannot be
+            // built. Supplying one would mean fabricating a receipt the owner
+            // refuses to issue.
             None,
         );
         assert!(
@@ -2183,10 +2279,16 @@ mod slice_7_native_owner_tests {
         let refused = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            Some(carrier),
+            carriers(Some(carrier), Some(valid_screen()), None),
             JobClass::Curation,
             None,
+            // Unconstructible for Curation, not merely omitted: the A-05 gate
+            // rejects `JobClass::Curation` unconditionally
+            // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+            // `validate_family` → `UnsupportedJobShape`), so no Curation job ever
+            // yields a `ValidatedGroundingCandidate` and this record cannot be
+            // built. Supplying one would mean fabricating a receipt the owner
+            // refuses to issue.
             None,
         );
         assert!(
@@ -2221,10 +2323,16 @@ mod slice_7_native_owner_tests {
         let result = dispatch_admitted(
             &admission(),
             &semantic_job(JobClass::Curation),
-            Some(valid_screen()),
-            Some(harness.carrier()),
+            carriers(Some(harness.carrier()), Some(valid_screen()), None),
             JobClass::Curation,
             None,
+            // Unconstructible for Curation, not merely omitted: the A-05 gate
+            // rejects `JobClass::Curation` unconditionally
+            // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+            // `validate_family` → `UnsupportedJobShape`), so no Curation job ever
+            // yields a `ValidatedGroundingCandidate` and this record cannot be
+            // built. Supplying one would mean fabricating a receipt the owner
+            // refuses to issue.
             None,
         );
         let Ok(DreamResult::Curation {
@@ -2319,9 +2427,15 @@ mod slice_7_native_owner_tests {
         ] {
             let admission = admission();
             let job = semantic_job(class);
-            let validated = validated_for(&admission, &job);
-            let refused =
-                dispatch_admitted(&admission, &job, None, None, class, Some(&validated), None);
+            let (grounding, validated) = validated_for(&admission, &job);
+            let refused = dispatch_admitted(
+                &admission,
+                &job,
+                carriers(None, None, None),
+                class,
+                Some(&validated),
+                Some(PipelineOrientationRecords::new(&grounding, &validated)),
+            );
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
                 "class {class:?} must name its governed input, got {refused:?}"
@@ -2347,14 +2461,23 @@ mod slice_7_native_owner_tests {
             JobClass::OrchestrationPlanning,
             JobClass::ConfigurationAssistance,
         ] {
+            let admission = admission();
+            let job = semantic_job(class);
+            // These five classes are NOT rejected by the A-05 gate: `job_class`
+            // appears exactly once in the whole structured validation module and
+            // rejects only `Curation`. The pipeline therefore genuinely runs for
+            // each of them and the record is real, so it is built and supplied
+            // rather than passed as `None`. Supplying it is what makes the case
+            // prove the ORDER: an available, valid pipeline record still cannot
+            // route a class that `submit` never admits.
+            let (grounding, validated) = validated_for(&admission, &job);
             let refused = dispatch_admitted(
-                &admission(),
-                &semantic_job(class),
-                None,
-                None,
+                &admission,
+                &job,
+                carriers(None, None, None),
                 class,
                 None,
-                None,
+                Some(PipelineOrientationRecords::new(&grounding, &validated)),
             );
             assert!(
                 matches!(refused, Err(DreamerError::UnsupportedJobClass(refused_class)) if refused_class == class),
