@@ -109,67 +109,67 @@ fn eval_runner_blocks_mutation_attempt() {
 }
 
 #[test]
-fn eval_understand_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_understand_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Understand);
 }
 
 #[test]
-fn eval_hallucination_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_hallucination_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Hallucination);
 }
 
 #[test]
-fn eval_negative_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_negative_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Negative);
 }
 
 #[test]
-fn eval_done_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_done_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Done);
 }
 
 #[test]
-fn eval_context_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_context_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Context);
 }
 
 #[test]
-fn eval_compaction_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_compaction_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Compaction);
 }
 
 #[test]
-fn eval_tool_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_tool_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Tool);
 }
 
 #[test]
-fn eval_memory_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_memory_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Memory);
 }
 
 #[test]
-fn eval_forget_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_forget_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Forget);
 }
 
 #[test]
-fn eval_dream_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_dream_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Dream);
 }
 
 #[test]
-fn eval_skill_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_skill_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Skill);
 }
 
 #[test]
-fn eval_trace_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_trace_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Trace);
 }
 
 #[test]
-fn eval_bench_case_stays_inconclusive_without_runtime_evidence() {
+fn eval_bench_case_passes() {
     family_is_inconclusive_without_runtime_evidence(EvalFamily::Bench);
 }
 

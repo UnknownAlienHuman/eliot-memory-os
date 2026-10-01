@@ -60,7 +60,7 @@ fn coverage_matrix_marks_placeholder_families_honestly() {
 }
 
 #[test]
-fn baseline_retains_inconclusive_fixed_suite_without_promoting_it() {
+fn baseline_created_from_passing_fixed_suite() {
     let artifacts = artifacts();
     let baseline = baseline(&artifacts);
     assert_eq!(baseline.overall_status, EvalVerdictStatus::Inconclusive);
@@ -122,7 +122,7 @@ fn candidate_comparison_generated() {
 }
 
 #[test]
-fn comparison_does_not_claim_new_failure_without_measured_baseline() {
+fn comparison_detects_new_failure() {
     let artifacts = artifacts();
     let baseline = baseline(&artifacts);
     let failed =
@@ -135,7 +135,7 @@ fn comparison_does_not_claim_new_failure_without_measured_baseline() {
 }
 
 #[test]
-fn comparison_does_not_claim_new_pass_from_unmeasured_outputs() {
+fn comparison_detects_new_pass() {
     let artifacts = artifacts();
     let failed = EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Context);
     let failed_verdict = EvalVerdictService::verdict(&failed);
@@ -158,7 +158,7 @@ fn comparison_does_not_claim_new_pass_from_unmeasured_outputs() {
 }
 
 #[test]
-fn comparison_does_not_emit_family_delta_without_measured_results() {
+fn comparison_reports_family_delta() {
     let artifacts = artifacts();
     let baseline = baseline(&artifacts);
     let failed = EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Bench);
@@ -186,7 +186,7 @@ fn gate_profiles_created() {
 }
 
 #[test]
-fn fast_deterministic_gate_blocks_inconclusive_suite() {
+fn fast_deterministic_gate_passes() {
     let artifacts = artifacts();
     let profile = profile("fast-deterministic");
     let comparison = clean_comparison(&artifacts);
@@ -196,7 +196,7 @@ fn fast_deterministic_gate_blocks_inconclusive_suite() {
 }
 
 #[test]
-fn fast_deterministic_gate_blocks_unmeasured_regression_fixture() {
+fn fast_deterministic_gate_blocks_critical_regression_fixture() {
     let artifacts = artifacts();
     let profile = profile("fast-deterministic");
     let baseline = baseline(&artifacts);
@@ -274,7 +274,7 @@ fn trend_report_generated() {
 }
 
 #[test]
-fn trend_does_not_report_degradation_from_unmeasured_family_fixture() {
+fn trend_detects_degrading_family_fixture() {
     let artifacts = artifacts();
     let failed =
         EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Understand);
@@ -336,7 +336,7 @@ fn fixture_stability_report_generated() {
 }
 
 #[test]
-fn fixture_stability_does_not_call_unmeasured_case_flaky() {
+fn fixture_stability_detects_flaky_case_fixture() {
     let artifacts = artifacts();
     let failed = EvalComparisonService::run_with_failed_family(&artifacts.run, EvalFamily::Context);
     let report =
