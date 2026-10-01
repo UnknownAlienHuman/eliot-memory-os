@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use eliot_agent_coordinator::OwnerLoadedClaimRow;
 #[cfg(windows)]
 use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
@@ -46,6 +47,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
+use eliot_ors::OperationIdentity;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
@@ -87,6 +89,20 @@ use super::{
 
 const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
 
+/// Reads the sealed durable claim-row projection bound to one exact claim
+/// identity (issue #1108, A4/A5 daemon row source).
+///
+/// Daemon-target operation of the Kernel claim-row read arm
+/// (`bins/eliot-kernel/src/provider_capability_route.rs::handle_provider_capability_claim_row_read`):
+/// the request carries only `wire_version` plus `claim_id`, and every
+/// projected field is loaded from the Kernel-held ORS row, never echoed from
+/// presented values.
+const PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION: &str =
+    "native_worker.provider_capability.claim_row.read";
+
+/// Expected `kind` of the sealed claim-row read reply body (issue #1108).
+const PROVIDER_CAPABILITY_CLAIM_ROW_KIND: &str = "native_worker_provider_capability_claim_row";
+
 /// Renders the release builder's `eliotd` manifest from the exact contract
 /// constructor used by the live Kernel handshake.
 ///
@@ -125,6 +141,32 @@ struct ProviderCapabilityReceiptWire {
     worker_generation: u64,
     fence_digest: String,
     verified_at_unix_ms: u64,
+    receipt_digest: String,
+}
+
+/// Sealed durable claim-row projection for one exact claim identity (issue
+/// #1108, A4/A5 daemon row source).
+///
+/// Mirrors the Kernel claim-row read reply body
+/// (`bins/eliot-kernel/src/provider_capability_route.rs::ProviderCapabilityContext::read_claim_row`,
+/// sealed by `seal_capability_receipt`): the `kind` discriminator, the
+/// capability wire version, the exact durable fields shaped for
+/// [`OwnerLoadedClaimRow::new`], the read timestamp, and the seal digest.
+/// `deny_unknown_fields` keeps a widened reply a typed failure, never a
+/// silently accepted row.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderClaimRowReadWire {
+    kind: String,
+    wire_version: String,
+    claim_id: String,
+    attempt_id: String,
+    operation_id: String,
+    binding_digest: String,
+    executable_binding_digest: String,
+    worker_generation: u64,
+    fence_digest: String,
+    read_at_unix_ms: u64,
     receipt_digest: String,
 }
 
@@ -1680,6 +1722,98 @@ impl DaemonKernelClient {
             ));
         }
         Ok(())
+    }
+
+    /// Loads the sealed durable claim row bound to one exact claim identity
+    /// (issue #1108, A4/A5 daemon row source).
+    ///
+    /// Sends [`PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION`] with only
+    /// `wire_version` plus `claim_id` over the existing [`transact_async`](Self::transact_async)
+    /// path, then parses the sealed reply into the seven
+    /// [`OwnerLoadedClaimRow::new`] arguments (claim, attempt, operation,
+    /// binding and executable digests, claiming-worker generation, fence
+    /// digest). The claim identity is validated pre-transport with the same
+    /// owner the Kernel read arm enforces (`eliot_ors::OperationIdentity`),
+    /// and the call requires an already-validated Kernel owner session, so a
+    /// row never loads without live session evidence. The transport identity
+    /// minted inside `transact_async` already binds the live State Fence, so
+    /// no fence bytes travel in the payload.
+    ///
+    /// Fail-closed, never synthesized: a missing or invalid seal digest, a
+    /// reply that does not decode under `deny_unknown_fields`, a wrong kind
+    /// or wire version, a claim echo that does not equal the requested lookup
+    /// key, a zero read timestamp, or loaded fields that fail
+    /// [`OwnerLoadedClaimRow::new`] shape validation all return typed
+    /// [`KernelClientError`] failures. No row is invented from presented
+    /// values — this method takes none — and no freshness or generation gate
+    /// is applied here: the Kernel returns the row verbatim and those gates
+    /// stay with the verifier and the downstream
+    /// `AdmittedProviderFactory`, which fail closed on the exact loaded
+    /// evidence.
+    ///
+    /// No production caller yet: the later builder-migration slice calls this
+    /// to feed `AdmittedProviderFactory::new` before
+    /// `crate::provider_capability::admit_provider_capability` migrates off
+    /// presented halves (that migration is out of this slice; the builders
+    /// stay as-is).
+    pub(super) async fn load_provider_claim_row_async(
+        &self,
+        claim_id: &str,
+    ) -> Result<OwnerLoadedClaimRow, KernelClientError> {
+        let claim = OperationIdentity::new(claim_id)
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        self.owner_session_facts().ok_or_else(|| {
+            KernelClientError::Contract(
+                "provider claim-row read requires an already validated Kernel owner session"
+                    .to_owned(),
+            )
+        })?;
+        let payload = serde_json::json!({
+            "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "claim_id": claim.as_str(),
+        });
+        let response = self
+            .transact_async(PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION, payload)
+            .await?;
+        let mut body = response.clone();
+        let receipt_digest = body
+            .as_object_mut()
+            .and_then(|object| object.remove("receipt_digest"))
+            .and_then(|digest| digest.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                KernelClientError::Unknown(
+                    "Kernel claim-row reply has no sealed digest".to_owned(),
+                )
+            })?;
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if sha256_hex(&body_bytes) != receipt_digest {
+            return Err(KernelClientError::Unknown(
+                "Kernel claim-row reply digest is invalid".to_owned(),
+            ));
+        }
+        let row: ProviderClaimRowReadWire = serde_json::from_value(response)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if row.kind != PROVIDER_CAPABILITY_CLAIM_ROW_KIND
+            || row.wire_version != PROVIDER_CAPABILITY_WIRE_VERSION
+            || row.receipt_digest != receipt_digest
+            || row.claim_id != claim.as_str()
+            || row.read_at_unix_ms == 0
+        {
+            return Err(KernelClientError::Unknown(
+                "Kernel claim-row reply does not bind the requested claim".to_owned(),
+            ));
+        }
+        OwnerLoadedClaimRow::new(
+            row.claim_id,
+            row.attempt_id,
+            row.operation_id,
+            row.binding_digest,
+            row.executable_binding_digest,
+            row.worker_generation,
+            row.fence_digest,
+        )
+        .map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
 
     /// Clones the retained validated binding string, if any. A poisoned slot
