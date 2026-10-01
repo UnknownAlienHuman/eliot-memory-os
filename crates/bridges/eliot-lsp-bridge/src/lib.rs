@@ -26,14 +26,26 @@
 
 #![forbid(unsafe_code)]
 
+mod generation;
+mod removal;
 mod scip_cache;
 
+pub use generation::{
+    ActiveGeneration, AdmittedLine, CanaryVerdict, GenerationError, InFlightLedger,
+    StagedGeneration, shadow_admits,
+};
+pub use removal::{
+    BridgeStatusProjection, ObservedHealth, OperationStatusRow, OwnedSidecar, RemovalError,
+    RemovalPhase, RemovalPlan, RemovalReceipt, RevocationKind, RevocationRecord,
+};
 pub use scip_cache::{
     CachedProjection, CachedScipItems, ScipIndexerProvenance, ScipProjectionCache,
 };
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use eliot_evidence::{
     AbsenceVerdict, EvidenceCoverage, EvidenceFreshness, UnknownOutcome,
@@ -1742,12 +1754,66 @@ fn gate_lsp_call(
 /// no CodeCortex-private execution path around it.
 pub struct LspBridge<E> {
     executor: Arc<E>,
+    stitch: Mutex<StitchState>,
+}
+
+/// Dispatch-held stitch state for the generation/removal sequence.
+///
+/// The bridge never stages generations or attests canaries itself: staged
+/// values come from [`lsp_application_obligations`] through
+/// [`LspBridge::stage_generation`] with a caller-observed upstream identity
+/// line, and the canary-gated switch stays with the composition owner
+/// holding the [`AdmittedLine`]. What dispatch owns is fence consultation,
+/// exact-identity in-flight tracking across the launch/reconcile boundary
+/// (a launch notes the operation identity with its admitted first-argv
+/// token; reconcile settles it and feeds the observed exit), and
+/// receipt-exit evidence — recorded here under one lock that is never held
+/// across an executor call. A poisoned lock fails the call that still needs
+/// the state; paths whose outcome is already decided settle best-effort
+/// instead.
+#[derive(Debug, Default)]
+struct StitchState {
+    removal: RemovalPlan,
+    ledger: InFlightLedger,
+    pending_tokens: BTreeMap<String, String>,
+    per_operation_exits: BTreeMap<String, i32>,
+    last_exit: Option<i32>,
 }
 
 impl<E> LspBridge<E> {
     /// Creates a bridge over the supplied process implementation.
     pub fn new(executor: Arc<E>) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            stitch: Mutex::new(StitchState::default()),
+        }
+    }
+
+    /// Stages one generation candidate bound to this bridge's declaration.
+    ///
+    /// The admitted-operation snapshot comes from
+    /// [`lsp_application_obligations`], so the declaration and the staged
+    /// generation cannot drift apart. The upstream identity line is the
+    /// caller-observed `rust-analyzer --version` output, validated through
+    /// the original identity parser: staging records it and never installs
+    /// anything. The route is the default analyzer executable; an explicitly
+    /// pinned route is staged directly by the composition owner holding the
+    /// [`AdmittedLine`], as is the canary-gated switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationError::BlankField`] on a blank identity line, or
+    /// [`GenerationError::UpstreamIdentity`] when the line is not an exact
+    /// analyzer version line.
+    pub fn stage_generation(
+        upstream_version_line: &str,
+    ) -> Result<StagedGeneration, GenerationError> {
+        let obligations = lsp_application_obligations();
+        StagedGeneration::stage(
+            RUST_ANALYZER_EXECUTABLE,
+            upstream_version_line,
+            obligations.supported_operations,
+        )
     }
 }
 
@@ -1769,15 +1835,26 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         if !command.matches_request(&request) {
             return Err(BridgeError::CommandMismatch);
         }
+        let Some(first) = command.arguments.first() else {
+            return Err(BridgeError::OperationNotAdmitted {
+                operation: "<empty argv>".to_owned(),
+            });
+        };
         let operation_id = request.operation_id().clone();
+        let identity = operation_id.as_str().to_owned();
+        self.note_launched(&identity, first)?;
         let request_digest = request.invocation_digest().to_owned();
         let generation = request.generation().get();
-        let receipt = self.executor.start(request, sink).await.map_err(|error| {
-            BridgeError::ProcessLaunch {
-                invocation: command.describe(),
-                error,
+        let receipt = match self.executor.start(request, sink).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.settle_unstarted(&identity);
+                return Err(BridgeError::ProcessLaunch {
+                    invocation: command.describe(),
+                    error,
+                });
             }
-        })?;
+        };
         if receipt.operation_id() != &operation_id
             || receipt.request_digest() != request_digest
             || receipt.accepted_generation().get() != generation
@@ -1810,8 +1887,128 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
     }
 
     /// Reconciles durable process evidence without inventing analyzer output.
+    ///
+    /// Settling is exact-identity: the operation noted at launch is settled
+    /// here and its observed exit feeds the per-operation evidence. An
+    /// identity this bridge never launched (or already reconciled) still
+    /// returns its evidence unmodified — evidence readback repeats under the
+    /// same identity, but only this bridge's own launches attribute exits.
     pub async fn reconcile(&self, operation: &OperationId) -> Result<ProcessEvidence, BridgeError> {
-        Ok(self.executor.reconcile(operation.clone()).await?)
+        let evidence = self.executor.reconcile(operation.clone()).await?;
+        self.settle_reconciled(operation.as_str(), &evidence);
+        Ok(evidence)
+    }
+
+    /// Refuses fenced launches and notes one exact operation identity with
+    /// its admitted first-argv token.
+    ///
+    /// Runs after the call gate and the request match, before the executor
+    /// start, so refused calls are never noted and noted calls always reach
+    /// the executor. The token lets [`LspBridge::reconcile`] attribute the
+    /// observed exit to the admitted operation that produced it.
+    fn note_launched(&self, identity: &str, token: &str) -> Result<(), BridgeError> {
+        let mut stitch = self.stitch.lock().map_err(|_| {
+            BridgeError::Process(ProcessExecutionError::Unavailable(
+                "bridge stitch state lock poisoned".to_owned(),
+            ))
+        })?;
+        if stitch.removal.blocks_new_calls() {
+            return Err(BridgeError::RemovalFenced);
+        }
+        stitch.ledger.note_dispatched(identity);
+        stitch
+            .pending_tokens
+            .insert(identity.to_owned(), token.to_owned());
+        Ok(())
+    }
+
+    /// Settles one noted launch whose executor start never completed.
+    ///
+    /// Best-effort: the start was refused atomically, so nothing was
+    /// dispatched and there is nothing to reconcile. The pending token goes
+    /// back with the identity; a later reconcile under the same identity
+    /// still returns its evidence unmodified, only without exit attribution.
+    fn settle_unstarted(&self, identity: &str) {
+        let Ok(mut stitch) = self.stitch.lock() else {
+            return;
+        };
+        stitch.pending_tokens.remove(identity);
+        let _ = stitch.ledger.note_settled(identity);
+    }
+
+    /// Settles one launched identity against its reconciled evidence,
+    /// feeding the observed exit into the per-operation evidence.
+    ///
+    /// Only launches this bridge noted attribute exits: an identity with no
+    /// pending token is either already reconciled or belongs to another
+    /// bridge sharing the executor, so its evidence is returned untouched
+    /// and nothing is recorded. Exit recording itself is total — an evidence
+    /// without an observed exit code leaves the previous evidence in place.
+    fn settle_reconciled(&self, identity: &str, evidence: &ProcessEvidence) {
+        let Ok(mut stitch) = self.stitch.lock() else {
+            return;
+        };
+        let Some(token) = stitch.pending_tokens.remove(identity) else {
+            return;
+        };
+        let _ = stitch.ledger.note_settled(identity);
+        if let Some(code) = Self::exit_code(evidence) {
+            stitch.per_operation_exits.insert(token, code);
+            stitch.last_exit = Some(code);
+        }
+    }
+
+    /// Fences new launches for removal.
+    ///
+    /// Held by the composition owner: dispatch consults
+    /// [`RemovalPlan::blocks_new_calls`] on every launch and refuses fenced
+    /// launches with [`BridgeError::RemovalFenced`] before any process
+    /// starts. Draining, owner revocation, and artifact release stay with
+    /// the owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Removal`] when the plan is already fenced, or
+    /// [`BridgeError::Process`] when the stitch lock is poisoned.
+    pub fn fence_new_calls(&self) -> Result<(), BridgeError> {
+        self.stitch
+            .lock()
+            .map_err(|_| {
+                BridgeError::Process(ProcessExecutionError::Unavailable(
+                    "bridge stitch state lock poisoned".to_owned(),
+                ))
+            })?
+            .removal
+            .fence_new_calls()?;
+        Ok(())
+    }
+
+    /// Projects declared-versus-observed status against the owner's line.
+    ///
+    /// The declaration side comes from the caller-held [`AdmittedLine`];
+    /// the evidence side (overall and per-operation exits) is dispatch's own
+    /// reconciled evidence recorded on this bridge. Operations with no
+    /// observed exit stay explicitly unknown instead of inheriting bridge
+    /// health.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BridgeError::Process`] when the stitch lock is poisoned.
+    pub fn status_against(
+        &self,
+        line: &AdmittedLine,
+    ) -> Result<BridgeStatusProjection, BridgeError> {
+        let stitch = self.stitch.lock().map_err(|_| {
+            BridgeError::Process(ProcessExecutionError::Unavailable(
+                "bridge stitch state lock poisoned".to_owned(),
+            ))
+        })?;
+        Ok(BridgeStatusProjection::project(
+            line.current(),
+            line.retained(),
+            ObservedHealth::from_last_exit(stitch.last_exit),
+            &stitch.per_operation_exits,
+        ))
     }
 
     /// Returns captured stdout preview bytes, or an empty slice when the
@@ -1948,6 +2145,12 @@ pub enum BridgeError {
     /// Shared process layer failed.
     #[error(transparent)]
     Process(#[from] ProcessExecutionError),
+    /// Removal fenced new launches: dispatch refused before any process ran.
+    #[error("bridge fenced for removal: new launches refused")]
+    RemovalFenced,
+    /// A removal-plan step refused the call.
+    #[error(transparent)]
+    Removal(#[from] RemovalError),
 }
 
 impl From<eliot_instrument_scip::ScipError> for BridgeError {
