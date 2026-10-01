@@ -44,7 +44,7 @@ pub(crate) enum DaemonRuntimeStatus {
     /// The bounded restart budget for this exact process lineage is spent.
     /// The exact process receipt or durable restart-disposition key remains
     /// attached until an explicit replacement owner admits a new lineage.
-    Quarantined(DaemonQuarantineEvidence),
+    Quarantined(Box<DaemonQuarantineEvidence>),
 }
 
 /// Original daemon identity retained when restart exhaustion is observed.
@@ -56,7 +56,7 @@ pub(crate) enum DaemonRuntimeStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonQuarantineLineage {
     /// Exact active process receipt retained from this Kernel lifetime.
-    ProcessReceipt(ProcessStartReceipt),
+    ProcessReceipt(Box<ProcessStartReceipt>),
     /// Exact durable restart-disposition key recovered before first launch.
     DurableRestartBudget { module_id: String, generation: u64 },
 }

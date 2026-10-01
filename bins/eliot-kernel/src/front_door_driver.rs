@@ -556,7 +556,7 @@ async fn serve_connection(
                 }
                 Ok(ControlFlow::Continue(()))
             });
-        let action_outcome = crate::kernel_audit::scope_audit_request_identity(
+        let action_outcome = eliot_kernel::kernel_audit::scope_audit_request_identity(
             frame.request_identity.clone(),
             action_future,
         )

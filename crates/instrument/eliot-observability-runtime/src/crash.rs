@@ -1233,6 +1233,13 @@ pub fn install_crash_reporter(
 static REPORTER: OnceLock<Arc<CrashReporterState>> = OnceLock::new();
 static REPORTER_INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+struct PanicOperationSnapshot {
+    context: CrashRuntimeContext,
+    operation_id: Option<String>,
+    operation_owner_evidence: Option<String>,
+    operation_scope_status: Option<String>,
+}
+
 impl CrashReporterState {
     fn next_report_id(&self) -> String {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1275,21 +1282,16 @@ impl CrashReporterState {
         Some((symbol_artifact, runtime_profile))
     }
 
-    fn capture_panic(&self) {
-        let report_id = self.next_report_id();
-        let Some((symbol_artifact, runtime_profile)) = self.panic_artifact_and_profile(&report_id)
-        else {
-            return;
-        };
+    fn panic_operation_context(&self, report_id: &str) -> Option<PanicOperationSnapshot> {
         if OPERATION_CONTEXT_INSTALL_FAILED
             .try_with(Cell::get)
             .unwrap_or(true)
         {
             self.enqueue_gap(
-                report_id,
+                report_id.to_owned(),
                 CrashTelemetryGapReason::ActiveOperationContextUnavailable,
             );
-            return;
+            return None;
         }
         let operation_context = match ACTIVE_OPERATION_CONTEXT.try_with(|current| {
             current
@@ -1301,22 +1303,22 @@ impl CrashReporterState {
             Ok(context) => context,
             Err(_) => Some(CrashOperationContext::Unavailable),
         };
-        let (mut context, operation_id, operation_owner_evidence, operation_scope_status) =
+        let (context, operation_id, operation_owner_evidence, operation_scope_status) =
             match operation_context {
                 Some(CrashOperationContext::Unavailable) => {
                     self.enqueue_gap(
-                        report_id,
+                        report_id.to_owned(),
                         CrashTelemetryGapReason::ActiveOperationContextUnavailable,
                     );
-                    return;
+                    return None;
                 }
                 Some(CrashOperationContext::UnavailableWithOwnerEvidence(evidence)) => {
                     self.enqueue_gap_with_owner_evidence(
-                        report_id,
+                        report_id.to_owned(),
                         CrashTelemetryGapReason::ActiveOperationContextUnavailable,
                         evidence,
                     );
-                    return;
+                    return None;
                 }
                 Some(CrashOperationContext::Current {
                     runtime_context,
@@ -1331,30 +1333,48 @@ impl CrashReporterState {
                 None | Some(CrashOperationContext::NoActiveOperation) => {
                     if self.context_gap.load(Ordering::Acquire) {
                         self.enqueue_gap(
-                            report_id,
+                            report_id.to_owned(),
                             CrashTelemetryGapReason::RuntimeContextUnavailable,
                         );
-                        return;
+                        return None;
                     }
                     let context = if let Ok(context) = self.context.try_read() {
                         context.clone()
                     } else {
                         self.enqueue_gap(
-                            report_id,
+                            report_id.to_owned(),
                             CrashTelemetryGapReason::RuntimeContextUnavailable,
                         );
-                        return;
+                        return None;
                     };
                     if self.context_gap.load(Ordering::Acquire) {
                         self.enqueue_gap(
-                            report_id,
+                            report_id.to_owned(),
                             CrashTelemetryGapReason::RuntimeContextUnavailable,
                         );
-                        return;
+                        return None;
                     }
                     (context, None, None, Some("no_active_operation".to_owned()))
                 }
             };
+        Some(PanicOperationSnapshot {
+            context,
+            operation_id,
+            operation_owner_evidence,
+            operation_scope_status,
+        })
+    }
+
+    fn capture_panic(&self) {
+        let report_id = self.next_report_id();
+        let Some((symbol_artifact, runtime_profile)) = self.panic_artifact_and_profile(&report_id)
+        else {
+            return;
+        };
+        let Some(snapshot) = self.panic_operation_context(&report_id) else {
+            return;
+        };
+        let mut context = snapshot.context;
         if self.journal_head_gap.load(Ordering::Acquire) {
             context.journal_head = None;
             context.journal_head_gap = true;
@@ -1369,9 +1389,9 @@ impl CrashReporterState {
             fault_site: "panic_hook".to_owned(),
             symbol_artifact,
             runtime_context: context,
-            operation_id,
-            operation_owner_evidence,
-            operation_scope_status,
+            operation_id: snapshot.operation_id,
+            operation_owner_evidence: snapshot.operation_owner_evidence,
+            operation_scope_status: snapshot.operation_scope_status,
         };
         let capture = match CrashReport::new(&report_id, metadata) {
             Ok(report) => CrashCapture::Report(Box::new(report)),

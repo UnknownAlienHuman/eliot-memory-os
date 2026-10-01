@@ -77,7 +77,7 @@ thread_local! {
 
 /// Polls one already-admitted action with its exact original Frame identity
 /// installed for Kernel audit appends made synchronously by that action.
-pub(crate) fn scope_audit_request_identity<F>(
+pub fn scope_audit_request_identity<F>(
     identity: Option<RequestIdentity>,
     future: F,
 ) -> impl Future<Output = F::Output>
@@ -93,9 +93,6 @@ where
         type Output = F::Output;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let this = self.as_mut().get_mut();
-            let previous = ACTIVE_AUDIT_REQUEST_IDENTITY
-                .with(|active| std::mem::replace(&mut *active.borrow_mut(), this.identity.clone()));
             struct Restore(Option<RequestIdentity>);
             impl Drop for Restore {
                 fn drop(&mut self) {
@@ -104,6 +101,9 @@ where
                     });
                 }
             }
+            let this = self.as_mut().get_mut();
+            let previous = ACTIVE_AUDIT_REQUEST_IDENTITY
+                .with(|active| std::mem::replace(&mut *active.borrow_mut(), this.identity.clone()));
             let _restore = Restore(previous);
             this.future.as_mut().poll(cx)
         }
@@ -2599,7 +2599,7 @@ impl KernelAuditChain {
         let mut lineage = draft.lineage;
         if lineage.request_identity.is_none() {
             ACTIVE_AUDIT_REQUEST_IDENTITY.with(|active| {
-                lineage.request_identity = active.borrow().clone();
+                lineage.request_identity.clone_from(&active.borrow());
             });
         }
         lineage.finalize(seq);
@@ -3071,6 +3071,97 @@ fn append_missing_result_leg(
     true
 }
 
+fn bound_frame_host_request_envelope(
+    session: &Session,
+    frame: &eliot_protocol::Frame,
+    identity: &RequestIdentity,
+) -> Result<Option<HostRequestEnvelope>, ()> {
+    let host_request_envelope = match &frame.payload {
+        ProtocolPayload::Json(payload) if payload.get("envelope").is_some() => {
+            match crate::host_request_route::host_request_envelope_from_payload(payload) {
+                Ok(envelope) => Some(envelope),
+                Err(_) => return Err(()),
+            }
+        }
+        _ => None,
+    };
+    if let Some(envelope) = &host_request_envelope {
+        let request_metadata = &identity.request.metadata;
+        if envelope.connection_id != session.connection_id
+            || envelope.identity.request_id != identity.request.metadata.request_id
+            || envelope.state_fence != identity.request.state_fence
+            || envelope.identity.idempotency_key != identity.idempotency_key
+            || envelope.identity.cancellation_id != identity.cancellation_id
+            || envelope.identity.deadline_unix_ms != identity.deadline_unix_ms
+            || envelope.identity.task_id.as_deref()
+                != request_metadata
+                    .task_id
+                    .as_ref()
+                    .map(eliot_contracts::TaskId::as_str)
+            || envelope.identity.session_id.as_deref()
+                != request_metadata
+                    .session_id
+                    .as_ref()
+                    .map(eliot_contracts::SessionId::as_str)
+        {
+            return Err(());
+        }
+    }
+    Ok(host_request_envelope)
+}
+
+fn frame_crash_lineage(
+    identity: &RequestIdentity,
+    action_operation_id: Option<&String>,
+    owner_record: Option<&AuditRecord>,
+) -> AuditLineage {
+    let mut lineage = AuditLineage::empty();
+    lineage.trace_id = Some(identity.request.metadata.request_id.to_string());
+    lineage.request_identity = Some(identity.clone());
+    lineage.state_fence = Some(identity.request.state_fence.clone());
+    lineage.module_generation = Some(
+        identity
+            .request
+            .state_fence
+            .resource_generation
+            .value()
+            .to_string(),
+    );
+    lineage.authority_epoch = Some(authority_epoch_text(
+        &identity.request.state_fence.authority_epoch,
+    ));
+    lineage.task_id = identity
+        .request
+        .metadata
+        .task_id
+        .as_ref()
+        .map(ToString::to_string);
+    lineage.session_id = identity
+        .request
+        .metadata
+        .session_id
+        .as_ref()
+        .map(ToString::to_string);
+    if let Some(owner_record) = owner_record {
+        let owner = &owner_record.lineage;
+        if owner.state_fence.as_ref() == Some(&identity.request.state_fence)
+            && owner.module_generation.as_deref() == lineage.module_generation.as_deref()
+            && owner.authority_epoch.as_deref() == lineage.authority_epoch.as_deref()
+            && owner.task_id == lineage.task_id
+            && owner.session_id == lineage.session_id
+        {
+            lineage.operation_id = action_operation_id
+                .cloned()
+                .or_else(|| owner.operation_id.clone());
+            lineage.work_scope.clone_from(&owner.work_scope);
+        }
+    }
+    if lineage.operation_id.is_none() {
+        lineage.operation_id = action_operation_id.cloned();
+    }
+    lineage
+}
+
 impl crate::KernelComposition {
     /// Builds operation context directly from the original validated host
     /// request envelope before its admitted dispatch/effect leg begins.
@@ -3195,36 +3286,11 @@ impl crate::KernelComposition {
         {
             return unavailable;
         }
-        let host_request_envelope = match &frame.payload {
-            ProtocolPayload::Json(payload) if payload.get("envelope").is_some() => {
-                match crate::host_request_route::host_request_envelope_from_payload(payload) {
-                    Ok(envelope) => Some(envelope),
-                    Err(_) => return unavailable,
-                }
-            }
-            _ => None,
+        let Ok(host_request_envelope) = bound_frame_host_request_envelope(session, frame, identity)
+        else {
+            return unavailable;
         };
         if let Some(envelope) = &host_request_envelope {
-            let request_metadata = &identity.request.metadata;
-            if envelope.connection_id != session.connection_id
-                || &envelope.identity.request_id != request_id
-                || &envelope.state_fence != &identity.request.state_fence
-                || envelope.identity.idempotency_key != identity.idempotency_key
-                || envelope.identity.cancellation_id != identity.cancellation_id
-                || envelope.identity.deadline_unix_ms != identity.deadline_unix_ms
-                || envelope.identity.task_id.as_deref()
-                    != request_metadata
-                        .task_id
-                        .as_ref()
-                        .map(|value| value.as_str())
-                || envelope.identity.session_id.as_deref()
-                    != request_metadata
-                        .session_id
-                        .as_ref()
-                        .map(|value| value.as_str())
-            {
-                return unavailable;
-            }
             return self.crash_operation_context_for_host_request(session, frame, envelope);
         }
         let (action_kind, action_operation_id) = match action {
@@ -3260,60 +3326,7 @@ impl crate::KernelComposition {
                     })
             })
         });
-        let mut lineage = AuditLineage::empty();
-        lineage.trace_id = Some(request_id.to_string());
-        lineage.request_identity = Some(identity.clone());
-        lineage.state_fence = Some(identity.request.state_fence.clone());
-        lineage.module_generation = Some(
-            identity
-                .request
-                .state_fence
-                .resource_generation
-                .value()
-                .to_string(),
-        );
-        lineage.authority_epoch = Some(authority_epoch_text(
-            &identity.request.state_fence.authority_epoch,
-        ));
-        lineage.task_id = identity
-            .request
-            .metadata
-            .task_id
-            .as_ref()
-            .map(ToString::to_string);
-        lineage.session_id = identity
-            .request
-            .metadata
-            .session_id
-            .as_ref()
-            .map(ToString::to_string);
-        if let Some(owner_record) = owner_record {
-            let owner = &owner_record.lineage;
-            if owner.state_fence.as_ref() == Some(&identity.request.state_fence)
-                && owner.module_generation.as_deref() == lineage.module_generation.as_deref()
-                && owner.authority_epoch.as_deref() == lineage.authority_epoch.as_deref()
-                && identity
-                    .request
-                    .metadata
-                    .task_id
-                    .as_ref()
-                    .is_none_or(|task| owner.task_id.as_deref() == Some(task.as_str()))
-                && identity
-                    .request
-                    .metadata
-                    .session_id
-                    .as_ref()
-                    .is_none_or(|session| owner.session_id.as_deref() == Some(session.as_str()))
-            {
-                lineage.operation_id = action_operation_id
-                    .clone()
-                    .or_else(|| owner.operation_id.clone());
-                lineage.work_scope = owner.work_scope.clone();
-            }
-        }
-        if lineage.operation_id.is_none() {
-            lineage.operation_id = action_operation_id.clone();
-        }
+        let lineage = frame_crash_lineage(identity, action_operation_id.as_ref(), owner_record);
         let Ok(original_owner_evidence) = serde_json::to_string(&serde_json::json!({
             "owner_source": "validated_admitted_frame_and_kernel_action",
             "action_kind": action_kind,
@@ -3371,16 +3384,15 @@ impl crate::KernelComposition {
         &self,
         handle: eliot_observability_runtime::CrashReporterHandle,
     ) -> Result<(), eliot_observability_runtime::CrashReportError> {
-        let attached = match self.crash_reporter.lock() {
-            Ok(binding) => binding.is_some(),
-            Err(_) => {
-                handle.invalidate_runtime_context();
-                return Err(
-                    eliot_observability_runtime::CrashReportError::InvalidMetadata(
-                        "crash_reporter.binding_poisoned",
-                    ),
-                );
-            }
+        let attached = if let Ok(binding) = self.crash_reporter.lock() {
+            binding.is_some()
+        } else {
+            handle.invalidate_runtime_context();
+            return Err(
+                eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                    "crash_reporter.binding_poisoned",
+                ),
+            );
         };
         if attached {
             handle.invalidate_runtime_context();
@@ -3394,16 +3406,13 @@ impl crate::KernelComposition {
             handle.invalidate_runtime_context();
             return Err(error);
         }
-        let mut binding = match self.crash_reporter.lock() {
-            Ok(binding) => binding,
-            Err(_) => {
-                handle.invalidate_runtime_context();
-                return Err(
-                    eliot_observability_runtime::CrashReportError::InvalidMetadata(
-                        "crash_reporter.binding_poisoned",
-                    ),
-                );
-            }
+        let Ok(mut binding) = self.crash_reporter.lock() else {
+            handle.invalidate_runtime_context();
+            return Err(
+                eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                    "crash_reporter.binding_poisoned",
+                ),
+            );
         };
         if binding.is_some() {
             handle.invalidate_runtime_context();
@@ -3515,17 +3524,16 @@ impl crate::KernelComposition {
             .lock()
             .ok()
             .and_then(|binding| binding.as_ref().map(|binding| binding.handle.clone()));
-        if let Some(handle) = handle {
-            if handle
+        if let Some(handle) = handle
+            && handle
                 .update_context(self.crash_runtime_context(true))
                 .is_err()
-            {
-                tracing::warn!(
-                    target: "eliot::crash_reporter",
-                    event = "kernel_context_update_failed",
-                    "Kernel crash context is unavailable; a later panic will emit an explicit gap"
-                );
-            }
+        {
+            tracing::warn!(
+                target: "eliot::crash_reporter",
+                event = "kernel_context_update_failed",
+                "Kernel crash context is unavailable; a later panic will emit an explicit gap"
+            );
         }
     }
 

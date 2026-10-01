@@ -9230,7 +9230,7 @@ impl HostComposition {
                 true,
                 process_incarnation
                     .as_ref()
-                    .map(|registration| registration.record()),
+                    .map(eliot_host_state::HostProcessIncarnationRegistration::record),
             ),
         ) {
             handle.invalidate_runtime_context();
@@ -9246,7 +9246,7 @@ impl HostComposition {
                     sequence,
                     digest,
                 });
-                let _ = journal_reporter.update_journal_head(journal_head);
+                journal_reporter.update_journal_head(journal_head);
             }))
             .is_err()
         {
@@ -9394,7 +9394,7 @@ impl HostComposition {
                         journal_head_current,
                         process_incarnation
                             .as_ref()
-                            .map(|registration| registration.record()),
+                            .map(eliot_host_state::HostProcessIncarnationRegistration::record),
                     ),
                 )
                 .is_err()

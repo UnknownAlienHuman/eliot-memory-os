@@ -764,99 +764,18 @@ fn validate_release_symbols(
             SymbolExecutableRole::Kernel,
         ),
     ] {
-        let matching = runtime_symbols
-            .iter()
-            .filter(|entry| entry.get("role").and_then(serde_json::Value::as_str) == Some(role))
-            .collect::<Vec<_>>();
-        if matching.len() != 1 {
-            return Err(MaterializeError::Invalid(format!(
-                "release symbol role {role} is missing or duplicated"
-            )));
-        }
-        let entry = matching[0];
-        let executable_path = format!("runtime/{executable_name}");
-        let executable_record = runtime_artifacts
-            .iter()
-            .filter(|item| {
-                item.get("path").and_then(serde_json::Value::as_str)
-                    == Some(executable_path.as_str())
-                    && item.get("package").and_then(serde_json::Value::as_str) == Some(package)
-                    && item.get("binary").and_then(serde_json::Value::as_str) == Some(package)
-                    && item.get("role").and_then(serde_json::Value::as_str) == Some(role)
-            })
-            .collect::<Vec<_>>();
-        let exe = executables
-            .iter()
-            .find(|item| item.name == executable_name)
-            .ok_or_else(|| MaterializeError::Invalid(format!("missing {executable_name}")))?;
-        let exe_sha = json_string(entry, "executable_sha256")?;
-        if executable_record.len() != 1
-            || json_string(entry, "package")? != package
-            || json_string(entry, "binary")? != package
-            || json_string(entry, "executable_path")? != executable_path
-            || json_string(entry, "build_fingerprint")? != source_commit
-            || json_string(entry, "build_profile")? != "release"
-            || json_string(entry, "artifact_ref")? != reference
-            || json_string(entry, "retention_reference")? != "SHA256SUMS.json"
-            || !valid_lower_sha256(exe_sha)
-            || json_string(executable_record[0], "sha256")? != exe_sha
-            || exe.sha256 != exe_sha
-        {
-            return Err(MaterializeError::Invalid(format!(
-                "release symbol role {role} does not bind its exact admitted executable"
-            )));
-        }
-        let symbol_sha = json_string(entry, "sha256")?;
-        let symbol_bytes = entry
-            .get("bytes")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| MaterializeError::Invalid(format!("{role} PDB byte length missing")))?;
-        if !valid_lower_sha256(symbol_sha) || symbol_bytes == 0 {
-            return Err(MaterializeError::Invalid(format!(
-                "release symbol role {role} has invalid PDB identity"
-            )));
-        }
-        let (bytes, source_identity) = read_release_file(root, reference, MAX_EXECUTABLE_BYTES)?;
-        if bytes.len() as u64 != symbol_bytes || sha256_hex(&bytes) != symbol_sha {
-            return Err(MaterializeError::Invalid(format!(
-                "retained PDB bytes differ from the {role} release symbol receipt"
-            )));
-        }
-        let checksum_entry = checksum_file(&checksum, reference)?;
-        if json_string(checksum_entry, "sha256")? != symbol_sha
-            || checksum_entry
-                .get("bytes")
-                .and_then(serde_json::Value::as_u64)
-                != Some(symbol_bytes)
-        {
-            return Err(MaterializeError::Invalid(format!(
-                "SHA256SUMS.json does not retain exact {role} PDB bytes"
-            )));
-        }
-        let executable_checksum = checksum_file(&checksum, &executable_path)?;
-        if json_string(executable_checksum, "sha256")? != exe_sha {
-            return Err(MaterializeError::Invalid(format!(
-                "SHA256SUMS.json does not bind final signed {role} executable"
-            )));
-        }
-        let binding = AdmittedSymbolBinding {
-            role: symbol_role,
-            executable_sha256: make_digest(exe_sha.to_owned(), "symbol executable digest")?,
-            build_fingerprint: make_digest(source_commit.to_owned(), "symbol build fingerprint")?,
-            build_profile: make_digest("release".to_owned(), "symbol build profile")?,
-            symbol_artifact_ref: make_digest(reference.to_owned(), "symbol artifact ref")?,
-            symbol_artifact_sha256: make_digest(symbol_sha.to_owned(), "symbol artifact digest")?,
-            retention_reference: make_digest(
-                json_string(entry, "retention_reference")?.to_owned(),
-                "symbol retention reference",
-            )?,
-            retention_id: input.generation.clone(),
-        };
-        let artifact = ValidatedSymbolArtifact {
-            binding,
-            bytes,
-            source_identity,
-        };
+        let artifact = validate_release_symbol_role(
+            input,
+            executables,
+            &ReleaseSymbolOwnerInputs {
+                root,
+                source_commit,
+                checksum: &checksum,
+                symbols: runtime_symbols,
+                runtime_artifacts,
+            },
+            (role, package, executable_name, reference, symbol_role),
+        )?;
         match symbol_role {
             SymbolExecutableRole::Host => result.host = Some(artifact),
             SymbolExecutableRole::Kernel => result.kernel = Some(artifact),
@@ -868,6 +787,144 @@ fn validate_release_symbols(
         ));
     }
     Ok(result)
+}
+
+struct ReleaseSymbolOwnerInputs<'a> {
+    root: &'a Path,
+    source_commit: &'a str,
+    checksum: &'a serde_json::Value,
+    symbols: &'a [serde_json::Value],
+    runtime_artifacts: &'a [serde_json::Value],
+}
+
+fn validate_release_symbol_role(
+    input: &CanarySourceBundleMaterializeInput,
+    executables: &[ValidatedExecutable],
+    owners: &ReleaseSymbolOwnerInputs<'_>,
+    role_binding: (&str, &str, &str, &str, SymbolExecutableRole),
+) -> Result<ValidatedSymbolArtifact, MaterializeError> {
+    let (role, package, executable_name, reference, symbol_role) = role_binding;
+    let ReleaseSymbolOwnerInputs {
+        root,
+        source_commit,
+        checksum,
+        symbols: runtime_symbols,
+        runtime_artifacts,
+    } = *owners;
+    let matching = runtime_symbols
+        .iter()
+        .filter(|entry| entry.get("role").and_then(serde_json::Value::as_str) == Some(role))
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(MaterializeError::Invalid(format!(
+            "release symbol role {role} is missing or duplicated"
+        )));
+    }
+    let entry = matching[0];
+    let executable_path = format!("runtime/{executable_name}");
+    let executable_record = runtime_artifacts
+        .iter()
+        .filter(|item| {
+            item.get("path").and_then(serde_json::Value::as_str) == Some(executable_path.as_str())
+                && item.get("package").and_then(serde_json::Value::as_str) == Some(package)
+                && item.get("binary").and_then(serde_json::Value::as_str) == Some(package)
+                && item.get("role").and_then(serde_json::Value::as_str) == Some(role)
+        })
+        .collect::<Vec<_>>();
+    let exe = executables
+        .iter()
+        .find(|item| item.name == executable_name)
+        .ok_or_else(|| MaterializeError::Invalid(format!("missing {executable_name}")))?;
+    let exe_sha = json_string(entry, "executable_sha256")?;
+    if executable_record.len() != 1
+        || json_string(entry, "package")? != package
+        || json_string(entry, "binary")? != package
+        || json_string(entry, "executable_path")? != executable_path
+        || json_string(entry, "build_fingerprint")? != source_commit
+        || json_string(entry, "build_profile")? != "release"
+        || json_string(entry, "artifact_ref")? != reference
+        || json_string(entry, "retention_reference")? != "SHA256SUMS.json"
+        || !valid_lower_sha256(exe_sha)
+        || json_string(executable_record[0], "sha256")? != exe_sha
+        || exe.sha256 != exe_sha
+    {
+        return Err(MaterializeError::Invalid(format!(
+            "release symbol role {role} does not bind its exact admitted executable"
+        )));
+    }
+    let symbol_sha = json_string(entry, "sha256")?;
+    let (bytes, source_identity) = validate_retained_release_symbol(
+        owners,
+        entry,
+        reference,
+        role,
+        exe_sha,
+        &executable_path,
+    )?;
+    let binding = AdmittedSymbolBinding {
+        role: symbol_role,
+        executable_sha256: make_digest(exe_sha.to_owned(), "symbol executable digest")?,
+        build_fingerprint: make_digest(source_commit.to_owned(), "symbol build fingerprint")?,
+        build_profile: make_digest("release".to_owned(), "symbol build profile")?,
+        symbol_artifact_ref: make_digest(reference.to_owned(), "symbol artifact ref")?,
+        symbol_artifact_sha256: make_digest(symbol_sha.to_owned(), "symbol artifact digest")?,
+        retention_reference: make_digest(
+            json_string(entry, "retention_reference")?.to_owned(),
+            "symbol retention reference",
+        )?,
+        retention_id: input.generation.clone(),
+    };
+    Ok(ValidatedSymbolArtifact {
+        binding,
+        bytes,
+        source_identity,
+    })
+}
+
+fn validate_retained_release_symbol(
+    owners: &ReleaseSymbolOwnerInputs<'_>,
+    entry: &serde_json::Value,
+    reference: &str,
+    role: &str,
+    exe_sha: &str,
+    executable_path: &str,
+) -> Result<(Vec<u8>, FileIdentity), MaterializeError> {
+    let root = owners.root;
+    let checksum = owners.checksum;
+    let symbol_sha = json_string(entry, "sha256")?;
+    let symbol_bytes = entry
+        .get("bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| MaterializeError::Invalid(format!("{role} PDB byte length missing")))?;
+    if !valid_lower_sha256(symbol_sha) || symbol_bytes == 0 {
+        return Err(MaterializeError::Invalid(format!(
+            "release symbol role {role} has invalid PDB identity"
+        )));
+    }
+    let (bytes, source_identity) = read_release_file(root, reference, MAX_EXECUTABLE_BYTES)?;
+    if bytes.len() as u64 != symbol_bytes || sha256_hex(&bytes) != symbol_sha {
+        return Err(MaterializeError::Invalid(format!(
+            "retained PDB bytes differ from the {role} release symbol receipt"
+        )));
+    }
+    let checksum_entry = checksum_file(checksum, reference)?;
+    if json_string(checksum_entry, "sha256")? != symbol_sha
+        || checksum_entry
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            != Some(symbol_bytes)
+    {
+        return Err(MaterializeError::Invalid(format!(
+            "SHA256SUMS.json does not retain exact {role} PDB bytes"
+        )));
+    }
+    let executable_checksum = checksum_file(checksum, executable_path)?;
+    if json_string(executable_checksum, "sha256")? != exe_sha {
+        return Err(MaterializeError::Invalid(format!(
+            "SHA256SUMS.json does not bind final signed {role} executable"
+        )));
+    }
+    Ok((bytes, source_identity))
 }
 
 fn validate_role_inventory(roles: &[(&str, bool)]) -> Result<(), MaterializeError> {

@@ -698,12 +698,12 @@ impl KernelComposition {
     #[cfg(windows)]
     fn quarantine_daemon_lineage(
         &self,
-        lineage: DaemonQuarantineLineage,
+        lineage: &DaemonQuarantineLineage,
     ) -> Result<bool, KernelServiceError> {
         let reason_handle = PlatformHandle::new("eliotd-restart-budget-exhausted".to_owned())
             .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
         let receipt = lineage.process_receipt();
-        let audit_detail = match &lineage {
+        let audit_detail = match lineage {
             DaemonQuarantineLineage::ProcessReceipt(_) => {
                 "restart_budget_exhausted; process_tree_closure=unproven".to_owned()
             }
@@ -721,18 +721,18 @@ impl KernelComposition {
             if matches!(state.status, DaemonRuntimeStatus::Quarantined(_)) {
                 return Ok(false);
             }
-            match (&lineage, state.receipt.as_ref()) {
+            match (lineage, state.receipt.as_ref()) {
                 (DaemonQuarantineLineage::ProcessReceipt(expected), Some(actual))
-                    if expected == actual => {}
+                    if expected.as_ref() == actual => {}
                 (DaemonQuarantineLineage::DurableRestartBudget { .. }, None)
                     if state.status == DaemonRuntimeStatus::NotLaunched => {}
                 _ => return Err(KernelServiceError::ReadinessNotProven),
             }
-            state.status = DaemonRuntimeStatus::Quarantined(DaemonQuarantineEvidence {
+            state.status = DaemonRuntimeStatus::Quarantined(Box::new(DaemonQuarantineEvidence {
                 recovery_evidence_handle: lineage.recovery_evidence_handle(),
                 original_lineage: lineage.clone(),
                 process_tree_closure_proven: false,
-            });
+            }));
             state.supervision = None;
             state.live_ready = None;
         }
@@ -792,7 +792,7 @@ impl KernelComposition {
         if recorded.is_none() {
             return Ok(false);
         }
-        self.quarantine_daemon_lineage(DaemonQuarantineLineage::DurableRestartBudget {
+        self.quarantine_daemon_lineage(&DaemonQuarantineLineage::DurableRestartBudget {
             module_id: ACTIVE_DAEMON_CALLER.to_owned(),
             generation,
         })
@@ -967,11 +967,12 @@ impl KernelComposition {
             if let Some(refusal) = refused {
                 let reason = daemon_restart_refusal_reason(&refusal);
                 observe_daemon_runtime("kernel.daemon.restart_refused", reason);
-                if matches!(refusal, DaemonRestartRefusal::RestartBudgetExhausted) {
-                    if let Some(receipt) = previous_receipt.as_ref() {
-                        *child_terminal_owned = true;
-                        self.quarantine_daemon_lineage(DaemonQuarantineLineage::ProcessReceipt(
-                            receipt.clone(),
+                if matches!(refusal, DaemonRestartRefusal::RestartBudgetExhausted)
+                    && let Some(receipt) = previous_receipt.as_ref()
+                {
+                    *child_terminal_owned = true;
+                    self.quarantine_daemon_lineage(&DaemonQuarantineLineage::ProcessReceipt(
+                            Box::new(receipt.clone()),
                         ))
                         .map_err(|_| {
                             KernelBuildError::Service(
@@ -979,11 +980,10 @@ impl KernelComposition {
                                     .to_owned(),
                             )
                         })?;
-                        return Err(KernelBuildError::Service(
+                    return Err(KernelBuildError::Service(
                             "eliotd restart budget exhausted; lineage quarantined for explicit recovery/requalification"
                                 .to_owned(),
                         ));
-                    }
                 }
                 return Err(self
                     .daemon_failure_error(format!("eliotd automatic restart refused: {reason}")));

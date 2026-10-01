@@ -1071,18 +1071,7 @@ pub(crate) fn validate_exact_expected_file_digests(
             .iter()
             .any(|(name, _)| *name == item.relative_path)
         {
-            let spec = manifest
-                .files
-                .iter()
-                .find(|spec| spec.relative_path == item.relative_path)
-                .ok_or(InstallationError::IdentityConflict)?;
-            if spec.executable
-                || item.expected_size == 0
-                || item.expected_size != spec.expected_size
-            {
-                return Err(InstallationError::IdentityConflict);
-            }
-            crate::sha256_handle(&item.sha256, "expected module proof digest")?;
+            validate_exact_module_proof_digest(manifest, item)?;
             continue;
         }
         if RELEASE_SYMBOL_ROLES
@@ -1139,6 +1128,22 @@ pub(crate) fn validate_exact_expected_file_digests(
     if seen != expected_names {
         return Err(InstallationError::IdentityConflict);
     }
+    Ok(())
+}
+
+fn validate_exact_module_proof_digest(
+    manifest: &PackageManifest,
+    item: &PackageArtifactDigest,
+) -> Result<(), InstallationError> {
+    let spec = manifest
+        .files
+        .iter()
+        .find(|spec| spec.relative_path == item.relative_path)
+        .ok_or(InstallationError::IdentityConflict)?;
+    if spec.executable || item.expected_size == 0 || item.expected_size != spec.expected_size {
+        return Err(InstallationError::IdentityConflict);
+    }
+    crate::sha256_handle(&item.sha256, "expected module proof digest")?;
     Ok(())
 }
 
