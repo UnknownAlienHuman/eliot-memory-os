@@ -52,13 +52,12 @@ use super::{KernelComposition, TransportError};
 
 #[cfg(windows)]
 use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-    canonical_json_bytes,
+    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence, canonical_json_bytes,
 };
 #[cfg(windows)]
 use eliot_ors::{
-    AdmissionReservationState, CanonicalAdmissionResolution, OperationalRecoveryStore,
-    OperationIdentity, OrsError, StateFenceSnapshot, reconcile_canonical_admission,
+    AdmissionReservationState, CanonicalAdmissionResolution, OperationIdentity,
+    OperationalRecoveryStore, OrsError, StateFenceSnapshot, reconcile_canonical_admission,
     reload_staged_admission_reservation, stage_operation_identity,
 };
 #[cfg(windows)]
@@ -130,10 +129,10 @@ impl KernelComposition {
     ) -> Result<(), TransportError> {
         let facts: ReservationAdmissionSubmitFacts =
             serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
-        let reservation_id =
-            OperationIdentity::new(&facts.reservation_id).map_err(|_| TransportError::SessionFenced)?;
-        let canonical_operation_id = stage_operation_identity(&reservation_id)
+        let reservation_id = OperationIdentity::new(&facts.reservation_id)
             .map_err(|_| TransportError::SessionFenced)?;
+        let canonical_operation_id =
+            stage_operation_identity(&reservation_id).map_err(|_| TransportError::SessionFenced)?;
         if facts.canonical_operation_id != canonical_operation_id.as_str() {
             observe_canonical_submit(
                 "kernel.admission_reservation.submit_rejected:identity",
@@ -141,9 +140,8 @@ impl KernelComposition {
             );
             return Err(TransportError::IdentityConflict);
         }
-        let store_operation_id =
-            eliot_contracts::OperationId::new(canonical_operation_id.as_str())
-                .map_err(|_| TransportError::SessionFenced)?;
+        let store_operation_id = eliot_contracts::OperationId::new(canonical_operation_id.as_str())
+            .map_err(|_| TransportError::SessionFenced)?;
         let gateway = self.retained_store_gateway()?;
 
         // Adopt, never re-submit: the owner's own receipt for the ORIGINAL
@@ -160,10 +158,7 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?;
         match resolution {
             CanonicalAdmissionResolution::Committed => {
-                observe_canonical_submit(
-                    "kernel.admission_reservation.submit_adopted",
-                    "adopted",
-                );
+                observe_canonical_submit("kernel.admission_reservation.submit_adopted", "adopted");
                 return Ok(());
             }
             CanonicalAdmissionResolution::TerminalFailure { .. } => {
@@ -227,24 +222,21 @@ impl KernelComposition {
         }
 
         let receipt_json = String::from_utf8(
-            canonical_json_bytes(staged.receipt())
-                .map_err(|_| TransportError::SessionFenced)?,
+            canonical_json_bytes(staged.receipt()).map_err(|_| TransportError::SessionFenced)?,
         )
         .map_err(|_| TransportError::SessionFenced)?;
         let context = RequestMetadata {
             // Stable retry identity: the same reservation always submits
             // under the same request, so a lost response resubmits the
             // byte-identical plan instead of a second admission.
-            request_id: RequestId::new(format!(
-                "{}-admission",
-                canonical_operation_id.as_str()
-            ))
-            .map_err(|_| TransportError::SessionFenced)?,
+            request_id: RequestId::new(format!("{}-admission", canonical_operation_id.as_str()))
+                .map_err(|_| TransportError::SessionFenced)?,
             session_id: None,
             // Not task-relative: the reservation binds a work item, not a
             // task, so no task binding is claimed.
             task_id: None,
-            product_id: ProductId::new("eliot-kernel").map_err(|_| TransportError::SessionFenced)?,
+            product_id: ProductId::new("eliot-kernel")
+                .map_err(|_| TransportError::SessionFenced)?,
             source_id: SourceId::new(super::ACTIVE_DAEMON_CALLER)
                 .map_err(|_| TransportError::SessionFenced)?,
             state_fence: facts.state_fence.clone(),
@@ -297,16 +289,10 @@ impl KernelComposition {
             )
             .await
             .map_err(|_| {
-                observe_canonical_submit(
-                    "kernel.admission_reservation.submit_failed",
-                    "rejected",
-                );
+                observe_canonical_submit("kernel.admission_reservation.submit_failed", "rejected");
                 TransportError::SessionFenced
             })?;
-        observe_canonical_submit(
-            "kernel.admission_reservation.submit_committed",
-            "success",
-        );
+        observe_canonical_submit("kernel.admission_reservation.submit_committed", "success");
         Ok(())
     }
 }

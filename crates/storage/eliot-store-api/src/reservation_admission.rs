@@ -59,14 +59,14 @@
 
 use serde_json::{Map, Value};
 
-use super::{
-    EffectClass, EventProjectionRelationIntents, OperationId,
-    OperationIdentity, OrderingHeadExpectation, PreparedTransition, RequestMeta,
-    ScopeId, SecurityContext, StoreError, TransitionClass, canonical_request_hash,
-    generated_operation_manifests, operation_manifest_set_digest, swarm_owner_revisions_request,
-    validate_digest, validate_text, verify_canonical_request_hash,
-};
 use super::{CanonicalRequestView, SwarmOwnerAuthorization, SwarmOwnerRevisionBatch};
+use super::{
+    EffectClass, EventProjectionRelationIntents, OperationId, OperationIdentity,
+    OrderingHeadExpectation, PreparedTransition, RequestMeta, ScopeId, SecurityContext, StoreError,
+    TransitionClass, canonical_request_hash, generated_operation_manifests,
+    operation_manifest_set_digest, swarm_owner_revisions_request, validate_digest, validate_text,
+    verify_canonical_request_hash,
+};
 use super::{SwarmOwnerRevision, SwarmSemanticOwnerKind, canonical_json_bytes, sha256_hex};
 
 /// Domain separator for the admitted-definition digest: the staged claim set
@@ -121,11 +121,13 @@ pub struct ReservationAdmissionClaims {
 impl ReservationAdmissionClaims {
     /// Validates every staged claim reference without interpreting owners.
     fn validate(&self) -> Result<(), StoreError> {
-        self.resources.validate("reservation_admission.claims.resources")?;
+        self.resources
+            .validate("reservation_admission.claims.resources")?;
         self.lane.validate("reservation_admission.claims.lane")?;
         self.environment
             .validate("reservation_admission.claims.environment")?;
-        self.effects.validate("reservation_admission.claims.effects")?;
+        self.effects
+            .validate("reservation_admission.claims.effects")?;
         self.quota_view
             .validate("reservation_admission.claims.quota_view")?;
         Ok(())
@@ -174,10 +176,11 @@ pub struct ReservationAdmissionRequest {
 impl ReservationAdmissionRequest {
     /// Validates the admitted-input shape without issuing any authority.
     pub fn validate(&self) -> Result<(), StoreError> {
-        validate_text(&self.idempotency_key, "reservation_admission.idempotency_key")?;
-        self.request
-            .validate()
-            .map_err(StoreError::Foundation)?;
+        validate_text(
+            &self.idempotency_key,
+            "reservation_admission.idempotency_key",
+        )?;
+        self.request.validate().map_err(StoreError::Foundation)?;
         validate_text(&self.reservation_id, "reservation_admission.reservation_id")?;
         validate_text(&self.work_item_id, "reservation_admission.work_item_id")?;
         validate_text(
@@ -236,7 +239,9 @@ pub struct ReservationAdmissionSubmission {
 /// the five staged `reference:digest` claim pairs and the expiry boundary
 /// under [`RESERVATION_DEFINITION_DIGEST_DOMAIN`]. Anyone holding the staged
 /// row recomputes the same digest from the same staged values.
-fn reservation_definition_digest(request: &ReservationAdmissionRequest) -> Result<String, StoreError> {
+fn reservation_definition_digest(
+    request: &ReservationAdmissionRequest,
+) -> Result<String, StoreError> {
     let mut preimage = Map::new();
     preimage.insert(
         "domain".to_owned(),
@@ -295,9 +300,7 @@ fn reservation_admission_record(
     );
     ceilings.insert(
         "route_classes".to_owned(),
-        Value::Array(vec![Value::String(
-            request.claims.lane.reference.clone(),
-        )]),
+        Value::Array(vec![Value::String(request.claims.lane.reference.clone())]),
     );
     for name in ["max_depth", "max_fanout", "max_wip"] {
         ceilings.insert(name.to_owned(), Value::Number(serde_json::Number::from(1)));
@@ -444,13 +447,9 @@ pub fn prepare_reservation_admission_transition(
         admission_contract_set_digest: transition.admission_contract_set_digest.clone(),
         operation_manifest_digest: transition.operation_manifest_digest.clone(),
         semantic_commands: transition.named_operations.clone(),
-        event_projection_relation_intents: transition
-            .event_projection_relation_intents
-            .clone(),
+        event_projection_relation_intents: transition.event_projection_relation_intents.clone(),
         security: transition.security.clone(),
-        required_proof_and_approval_refs: transition
-            .required_proof_and_approval_refs
-            .clone(),
+        required_proof_and_approval_refs: transition.required_proof_and_approval_refs.clone(),
         semantic_source_revisions: transition.semantic_source_revisions.clone(),
         ordering_scopes: transition.ordering_scopes.clone(),
         expected_revision_heads: expected_revision_heads.clone(),
