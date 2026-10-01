@@ -942,6 +942,7 @@ impl KernelTestdBlobStreamClient {
 pub struct KernelBlobStreamCallSequence {
     client: KernelTestdBlobStreamClient,
     capability: ProcessStreamSinkCapabilityRef,
+    sequence_lock: Arc<Mutex<()>>,
     tokens: Arc<Mutex<VecDeque<BlobProcessStreamCallToken>>>,
     job_id: String,
     store: TestdStore,
@@ -1006,6 +1007,7 @@ impl KernelBlobStreamCallSequence {
         Ok(Self {
             client,
             capability,
+            sequence_lock: Arc::new(Mutex::new(())),
             tokens: Arc::new(Mutex::new(values)),
             job_id: job_id.to_owned(),
             store,
@@ -1104,6 +1106,16 @@ impl KernelBlobStreamCallSequence {
     /// Sends one validated semantic operation with its next distinct owner
     /// token. No transport, Unknown, or Unavailable result is retried.
     pub fn exchange(
+        &self,
+        operation: BlobProcessStreamKernelOperationRequest,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _sequence = self.sequence_lock.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
+        })?;
+        self.exchange_under_sequence(operation)
+    }
+
+    fn exchange_under_sequence(
         &self,
         operation: BlobProcessStreamKernelOperationRequest,
     ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
@@ -1263,6 +1275,17 @@ impl KernelBlobStreamCallSequence {
         token: BlobProcessStreamCallToken,
         operation_sha256: &str,
     ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _sequence = self.sequence_lock.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
+        })?;
+        self.reconcile_under_sequence(token, operation_sha256)
+    }
+
+    fn reconcile_under_sequence(
+        &self,
+        token: BlobProcessStreamCallToken,
+        operation_sha256: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
         let request = eliot_blob_api::wire::BlobProcessStreamKernelReconcileRequest {
             wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID.to_owned(),
             wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION,
@@ -1297,6 +1320,15 @@ impl KernelBlobStreamCallSequence {
     /// Reconciles the exact call attached to the durable current token head.
     /// No semantic operation is constructed or dispatched on this path.
     pub fn reconcile_current_call(&self) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _sequence = self.sequence_lock.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
+        })?;
+        self.reconcile_current_call_under_sequence()
+    }
+
+    fn reconcile_current_call_under_sequence(
+        &self,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
         let _tokens = self.tokens.lock().map_err(|_| {
             TestdIpcError::Transport("Blob token sequence lock poisoned".to_owned())
         })?;
@@ -1332,15 +1364,18 @@ impl KernelBlobStreamCallSequence {
         &self,
         request: eliot_blob_api::wire::BlobProcessStreamKernelSourceReadbackRequest,
     ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let _sequence = self.sequence_lock.lock().map_err(|_| {
+            TestdIpcError::Transport("Blob operation sequence lock poisoned".to_owned())
+        })?;
         let operation = BlobProcessStreamKernelOperationRequest::SourceReadback {
             request: request.clone(),
         };
-        match self.exchange(operation.clone()) {
+        match self.exchange_under_sequence(operation.clone()) {
             Err(TestdIpcError::BlobCallOperationConflict) => {
                 // The exact original call must remain reconcilable under the
                 // live Kernel grant/fence before allocating a fresh read.
                 self.deadline_for_budget(1)?;
-                let retained = self.reconcile_current_call()?;
+                let retained = self.reconcile_current_call_under_sequence()?;
                 match &retained.outcome {
                     BlobProcessStreamKernelOutcome::Completed { .. }
                         if retained.next_call_token.is_some() => {}
@@ -1357,7 +1392,7 @@ impl KernelBlobStreamCallSequence {
                         ));
                     }
                 }
-                self.exchange(operation)
+                self.exchange_under_sequence(operation)
             }
             result => result,
         }
