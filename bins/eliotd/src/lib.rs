@@ -52,7 +52,7 @@ pub use campaign_owner_matrix::assemble_authenticated_campaign_owner_publication
 pub use daemon_kernel_client::FinishSubmitOutcome;
 pub use finish_attempt::serve_finish_claim;
 pub mod canonical_config_precedence;
-mod capability_admission;
+pub mod capability_admission;
 mod capability_evidence_wiring;
 pub mod capability_outcome;
 pub mod causal_outcome_caller;

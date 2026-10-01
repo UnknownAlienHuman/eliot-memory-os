@@ -4897,7 +4897,10 @@ impl std::fmt::Display for SubmitReplacePreferencePolicyError {
                 "replace-preference-policy submit refused: invalid {detail}"
             ),
             Self::Stale(detail) => {
-                write!(f, "replace-preference-policy submit refused: stale {detail}")
+                write!(
+                    f,
+                    "replace-preference-policy submit refused: stale {detail}"
+                )
             }
             Self::Conflict(detail) => write!(
                 f,
@@ -4957,16 +4960,11 @@ impl From<eliot_host_state::ModelPreferenceStoreError> for SubmitReplacePreferen
 /// refusal lands before any store access, and every owner refusal aborts
 /// before any commit.
 ///
-/// Sequence (the same owner seam as the
-/// `capability_admission::publish_replace_preference_policy_candidate`
-/// publisher, reached through the settings-owner API directly because that
-/// entry point is not re-exported past the `eliotd` library boundary:
-/// sealed-candidate gate, live-fence liveness, then
-/// `eliot_host_state::ModelPreferenceStore::open`, a fresh
-/// `load_model_preferences`, anchor-pin via
-/// `PreferenceCasExpected::from_candidate_anchor`, atomic
-/// `compare_and_swap_model_preferences`, and
-/// `read_publication_receipt`). `Committed` carries the newly committed
+/// Sequence (the single owner seam, shared with the
+/// `eliotd::capability_admission::publish_replace_preference_policy_candidate`
+/// publisher, which this leg calls below: sealed-candidate gate,
+/// live-fence liveness, then the publisher's open, fresh load,
+/// anchor-pin, atomic CAS, and receipt readback). `Committed` carries the newly committed
 /// store revision with the prior revision/digest link recorded in the
 /// receipt; `Replayed` names the unchanged retained revision. On `Stale`
 /// the caller reloads, re-pins against a recompiled candidate, and
@@ -5007,19 +5005,14 @@ pub fn submit_replace_preference_policy_candidate(
     if !eliot_contracts::fences_match_exact(&candidate.view_fence, live_fence) {
         return Err(SubmitReplacePreferencePolicyError::Stale("live-fence"));
     }
-    let store = eliot_host_state::ModelPreferenceStore::open(store_path)?;
-    let current = store.load_model_preferences()?;
-    let expected = eliot_host_state::PreferenceCasExpected::from_candidate_anchor(
-        current.as_ref(),
+    eliotd::capability_admission::publish_replace_preference_policy_candidate(
+        store_path,
         expected_policy_id,
         expected_policy_revision,
         expected_policy_digest,
-    )?;
-    let outcome = store.compare_and_swap_model_preferences(&expected, policy)?;
-    let receipt = store
-        .read_publication_receipt()?
-        .ok_or(eliot_host_state::ModelPreferenceStoreError::Unavailable)?;
-    Ok((outcome, receipt))
+        policy,
+    )
+    .map_err(SubmitReplacePreferencePolicyError::from)
 }
 
 /// What one settled observe poll step produced (issue #2565).

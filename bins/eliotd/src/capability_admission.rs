@@ -639,22 +639,19 @@ fn is_capability_name(value: &str) -> bool {
 /// surfaces as [`ModelPreferenceStoreError::Unavailable`] instead of an
 /// invented receipt.
 ///
-/// STITCH status: this is the production entry point the owner's module docs
-/// name as the separate daemon/publication wiring. It is not yet reached
-/// from the live submit leg; that wiring arrives with its own review and
-/// must pass the sealed candidate's triple and replacement through — never
-/// a second settings store, a caller-recomputed digest, or a direct store
-/// write around the owner.
+/// Live caller: the daemon submit leg
+/// (`daemon_runtime::submit_replace_preference_policy_candidate`), which
+/// threads the sealed candidate's triple and replacement through this entry
+/// point — never a second settings store, a caller-recomputed digest, or a
+/// direct store write around the owner.
 pub fn publish_replace_preference_policy_candidate(
     store_path: &Path,
     expected_policy_id: &str,
     expected_policy_revision: &str,
     expected_policy_digest: &str,
     replacement: &HumanModelPreferencePolicy,
-) -> Result<
-    (ModelPreferenceCasOutcome, ModelPreferencePublicationReceipt),
-    ModelPreferenceStoreError,
-> {
+) -> Result<(ModelPreferenceCasOutcome, ModelPreferencePublicationReceipt), ModelPreferenceStoreError>
+{
     let store = ModelPreferenceStore::open(store_path)?;
     let current = store.load_model_preferences()?;
     let expected = PreferenceCasExpected::from_candidate_anchor(
