@@ -78,27 +78,25 @@ pub fn project_canonical_store_write_status(
 ) -> CanonicalStoreWriteStatus {
     if let Err(refusal) = host {
         if !matches!(refusal, CanonicalStoreWriteRefusal::SemanticallyNotReady) {
-            return CanonicalStoreWriteStatus::Refused(
-                CanonicalStoreWriteStatusRefusal::Host(refusal),
-            );
+            return CanonicalStoreWriteStatus::Refused(CanonicalStoreWriteStatusRefusal::Host(
+                refusal,
+            ));
         }
     } else if semantic.is_ready() {
         return CanonicalStoreWriteStatus::Ready;
     }
-    CanonicalStoreWriteStatus::Refused(match (
-        semantic.version,
-        semantic.schema,
-        semantic.transaction,
-    ) {
-        (SemanticDimension::Incompatible, _, _) => {
-            CanonicalStoreWriteStatusRefusal::VersionIncompatible
-        }
-        (_, SemanticDimension::Incompatible, _) => {
-            CanonicalStoreWriteStatusRefusal::SchemaIncompatible
-        }
-        (_, _, SemanticDimension::Incompatible) => {
-            CanonicalStoreWriteStatusRefusal::TransactionNotViable
-        }
-        _ => CanonicalStoreWriteStatusRefusal::SemanticUnobserved,
-    })
+    CanonicalStoreWriteStatus::Refused(
+        match (semantic.version, semantic.schema, semantic.transaction) {
+            (SemanticDimension::Incompatible, _, _) => {
+                CanonicalStoreWriteStatusRefusal::VersionIncompatible
+            }
+            (_, SemanticDimension::Incompatible, _) => {
+                CanonicalStoreWriteStatusRefusal::SchemaIncompatible
+            }
+            (_, _, SemanticDimension::Incompatible) => {
+                CanonicalStoreWriteStatusRefusal::TransactionNotViable
+            }
+            _ => CanonicalStoreWriteStatusRefusal::SemanticUnobserved,
+        },
+    )
 }
