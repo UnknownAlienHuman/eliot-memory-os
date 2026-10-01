@@ -4468,7 +4468,8 @@ mod tests {
     };
     use eliot_kernel_core::{
         AutomationExecutionReference, AutomationFailureNotificationProjection,
-        UserAutomationConfigurationState,
+        UserAutomationConfigurationState, UserAutomationOperation,
+        UserAutomationOperatorIntent,
     };
     use eliot_protocol::JobState;
     use eliot_receipts::ReceiptEnvelope;
@@ -4582,7 +4583,7 @@ mod tests {
                 idempotency_key: format!("idem-{normalization_operation_id}"),
                 canonical_request_hash: String::new(),
             },
-            intent: crate::user_automation::UserAutomationOperatorIntent {
+            intent: UserAutomationOperatorIntent {
                 intent_id: format!("intent-{normalization_operation_id}"),
                 principal_ref: "human-1".to_owned(),
                 state_fence: context.state_fence.clone(),

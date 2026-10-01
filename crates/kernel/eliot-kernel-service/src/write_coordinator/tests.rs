@@ -233,7 +233,7 @@ fn request(
             .zip(heads)
             .map(|(scope, expected_head)| {
                 Ok(ScopeReservationRequest {
-                    scope: label(scope)?,
+                    scope,
                     expected_head,
                 })
             })
