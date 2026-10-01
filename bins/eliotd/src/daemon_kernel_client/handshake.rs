@@ -10,7 +10,6 @@ use eliot_contracts::EpochId;
 #[cfg(windows)]
 use eliot_contracts::{ArtifactId, ContractId, ContractVersion, ResourceGeneration};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
-use eliot_store_api::StoreFailure;
 #[cfg(windows)]
 use eliot_protocol::{
     ClientHello, Frame, FrameKind, MessageType, ProtocolPayload, ProtocolRange, ProtocolVersion,
@@ -20,6 +19,7 @@ use eliot_protocol::{
 use eliot_runtime_contracts::{
     ModuleContract, ModuleGeneration, ModuleGenerationState, compare_published_projection,
 };
+use eliot_store_api::StoreFailure;
 use serde::Deserialize;
 use thiserror::Error;
 

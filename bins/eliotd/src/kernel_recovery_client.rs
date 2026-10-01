@@ -35,15 +35,15 @@ use eliot_protocol::RequestIdentity;
 use eliot_protocol::TaskControllerAction;
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
-    CONTRACT_VERSION, RecoveryRecord, RecoveryRecordKey, ScopeRevisionView, StoreGenesisRequest,
-    StoreFailure, StoreFailureDisposition, StoreRecoveryRequest, StoreRecoverySnapshot,
+    CONTRACT_VERSION, RecoveryRecord, RecoveryRecordKey, ScopeRevisionView, StoreFailure,
+    StoreFailureDisposition, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
     StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, WriteReceipt,
     validate_genesis_receipt_envelope,
 };
 
 use super::{
-    DaemonKernelClient, SERVICE_NAME, TaskControllerClaimedInvocation, WireOutcome, kind_value,
-    kernel_port_error, unix_ms, unix_ms_i64,
+    DaemonKernelClient, SERVICE_NAME, TaskControllerClaimedInvocation, WireOutcome,
+    kernel_port_error, kind_value, unix_ms, unix_ms_i64,
 };
 
 const OWNER_RECOVERY_NAMESPACE: &str = "owner";
@@ -485,9 +485,7 @@ impl DaemonKernelClient {
         record
             .validate_for_fence(state_fence)
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-        if record.record_key() != key
-            || record.state_fence != *state_fence
-            || record.revision == 0
+        if record.record_key() != key || record.state_fence != *state_fence || record.revision == 0
         {
             return Err(KernelPortError::Contract(
                 "WorkScope owner recovery read returned an invalid named row".to_owned(),
@@ -574,21 +572,17 @@ impl DaemonKernelClient {
                         expected: Some(expected.clone()),
                     });
                 }
-                let failure = failure.ok_or_else(|| {
-                    WorkScopeOwnerWriteFailure::Kernel {
-                        error: KernelPortError::Contract(
-                            "Kernel Store failure omitted its typed failure contract".to_owned(),
-                        ),
-                        expected: Some(expected.clone()),
-                    }
+                let failure = failure.ok_or_else(|| WorkScopeOwnerWriteFailure::Kernel {
+                    error: KernelPortError::Contract(
+                        "Kernel Store failure omitted its typed failure contract".to_owned(),
+                    ),
+                    expected: Some(expected.clone()),
                 })?;
                 failure
                     .validate()
-                    .map_err(|error| {
-                        WorkScopeOwnerWriteFailure::Kernel {
-                            error: KernelPortError::Contract(error.to_string()),
-                            expected: Some(expected.clone()),
-                        }
+                    .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
+                        error: KernelPortError::Contract(error.to_string()),
+                        expected: Some(expected.clone()),
                     })?;
                 if failure.request_id.as_ref() != Some(&claimed.envelope.identity.request_id)
                     || failure.operation_id.as_ref() != Some(&claimed.operation_id)
