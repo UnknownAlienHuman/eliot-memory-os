@@ -1478,7 +1478,9 @@ fn causal_outcome_record_key(
             .map_err(|error| ImprovementDispatchError::Contract(error.to_string()))?,
     );
     let candidate_id = appended.candidate_id.trim();
-    Ok(format!("causal-intervention-outcome:{candidate_id}:{outcome_digest}"))
+    Ok(format!(
+        "causal-intervention-outcome:{candidate_id}:{outcome_digest}"
+    ))
 }
 
 /// Derives the closed store handle of one durable terminal decision.
