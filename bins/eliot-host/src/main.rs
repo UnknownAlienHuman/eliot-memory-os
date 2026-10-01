@@ -740,6 +740,25 @@ fn run_profile_supervisor(
         }
     }
 
+    // #1771 AUD4: `user_mode` supervision is the current-user launcher plus its
+    // Task Scheduler task, and it is registered from the Host process rather
+    // than from the installer transaction because only a process that exists
+    // *after* Phase-B can observe the published authority digest. By this point
+    // Phase-B has published `authority.json` and Host has read it back, so the
+    // digest the adapter re-pins is a live observation, never the Phase-A
+    // pending marker. `portable_dev` registers nothing: it is the disposable
+    // repository-local contour, and this call refuses any non-`UserMode`
+    // profile rather than composing a second supervision path.
+    if profile == InstallationProfile::UserMode {
+        if let Err(error) = eliot_host::register_user_mode_launcher(&host) {
+            // A missing or unattributable live registration leaves `user_mode`
+            // without its launcher, so this is terminal for this supervisor
+            // rather than a degraded continuation.
+            let _ = host.stop();
+            return Err(error);
+        }
+    }
+
     // Neither admitted profile enters the SystemService credential-control
     // endpoint, which requires Administrators and opens ProgramData.
     // `open_for_profile` has bound this launch descriptor to the approved

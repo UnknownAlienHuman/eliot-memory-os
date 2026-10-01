@@ -2226,6 +2226,8 @@ pub enum HostBranchDisposition {
 
 #[cfg(windows)]
 mod readiness_gate;
+#[cfg(windows)]
+mod user_mode_launcher;
 #[cfg(all(windows, test))]
 use readiness_gate::{DEFAULT_READINESS_CADENCE, ReadinessFailureKind};
 #[cfg(windows)]
@@ -2233,6 +2235,8 @@ use readiness_gate::{
     HostReadinessGate, ReadinessCadence, ReadinessContourIdentity, ReadinessGateAction,
     readiness_failure_kind, reconcile_authenticated_readiness,
 };
+#[cfg(windows)]
+pub use user_mode_launcher::register_user_mode_launcher;
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7825,6 +7829,28 @@ impl HostComposition {
     #[must_use]
     pub const fn host_epoch(&self) -> &HostInstallationEpoch {
         &self.host
+    }
+
+    /// Returns the completed Phase-B materialization retained by this
+    /// composition, when one exists.
+    ///
+    /// This is the post-publication record: its
+    /// `authority_descriptor_digest` is the digest Host read back from the
+    /// published `authority.json`, not a value recomputed by the caller. The
+    /// current-user launcher registration (#1771 AUD4) reads it from here and
+    /// joins it to the durable committed Phase-B binding before it registers.
+    #[cfg(windows)]
+    pub(crate) fn phase_b_materialization(&self) -> Option<&HostPhaseBMaterialization> {
+        self.phase_b.as_ref()
+    }
+
+    /// Returns the retained canonical Host state root for this composition.
+    ///
+    /// Durable receipts published under it stay inside the selected profile's
+    /// own current-user contour; no `UserMode` receipt ever leaves it.
+    #[cfg(windows)]
+    pub(crate) fn launch_state_root(&self) -> &Path {
+        self.launch_options.host_state_root()
     }
 
     /// Creates the credential control only from this live Host composition's
