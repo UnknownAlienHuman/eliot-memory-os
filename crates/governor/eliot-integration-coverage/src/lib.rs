@@ -376,7 +376,7 @@ fn summarize_source_readback(
             roster,
             streams,
             next,
-        } => summarize_available_source_readback(selectors, roster, streams, next),
+        } => summarize_available_source_readback(selectors, roster, streams, next.as_ref()),
     }
 }
 
@@ -384,7 +384,7 @@ fn summarize_available_source_readback(
     selectors: &ObservationSelectors,
     roster: &ObservationRosterPage,
     streams: &[ObservationStreamReadback],
-    next: &Option<ObservationContinuation>,
+    next: Option<&ObservationContinuation>,
 ) -> Result<(String, Vec<String>, usize), CoverageError> {
     validate_roster(roster)?;
     if selectors.page_limit == 0 {
