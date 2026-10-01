@@ -4580,7 +4580,7 @@ mod tests {
                 operation_id: OperationId::new(normalization_operation_id)
                     .expect("normalization operation"),
                 idempotency_key: format!("idem-{normalization_operation_id}"),
-                canonical_request_hash: "0".repeat(64),
+                canonical_request_hash: String::new(),
             },
             intent: crate::user_automation::UserAutomationOperatorIntent {
                 intent_id: format!("intent-{normalization_operation_id}"),

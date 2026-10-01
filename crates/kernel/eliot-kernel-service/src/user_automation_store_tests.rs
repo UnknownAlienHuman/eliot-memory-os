@@ -150,7 +150,7 @@ fn normalized_revision_and_receipt(
             operation_id: OperationId::new(format!("normalize-{operation_id}"))
                 .expect("normalization operation"),
             idempotency_key: format!("idem-normalize-{operation_id}"),
-            canonical_request_hash: "0".repeat(64),
+            canonical_request_hash: String::new(),
         },
         intent: intent(UserAutomationOperation::NormalizeSchedule {
             revision: Box::new(revision),

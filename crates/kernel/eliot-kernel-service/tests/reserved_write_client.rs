@@ -50,6 +50,7 @@ use eliot_store_api::{
     StoreResponse, TransitionClass, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
     WriteReceiptStatus, WriterEpochBinding, generated_operation_manifests,
     issue_store_receipt_envelope, operation_manifest_set_digest, response_frame,
+    supported_admission_contract_set_digest,
 };
 use serde_json::json;
 
@@ -113,7 +114,7 @@ fn transition_with(tag: &str) -> PreparedTransition {
         ordering_scopes: vec![OrderingScopeId::new(format!("scope-991-{tag}")).unwrap()],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        admission_contract_set_digest: supported_admission_contract_set_digest().unwrap(),
         operation_manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).
@@ -249,6 +250,8 @@ fn fixture_request() -> ReservedWriteRequest {
     // The frozen input predates the current catalogue and transition digest
     // binders. Preserve its reservation, scope, and head evidence, then
     // re-derive the producer-owned digests through the current Store API.
+    request.transition.admission_contract_set_digest =
+        supported_admission_contract_set_digest().unwrap();
     request.transition.operation_manifest_digest = operation_manifest_set_digest(
         &generated_operation_manifests().expect("operation catalogue generates"),
     )

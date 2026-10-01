@@ -75,7 +75,7 @@ use eliot_store_api::{
     Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreRequest,
     StoreResponse, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_request_hash,
     decode_request_frame, generated_operation_manifests, operation_manifest_set_digest,
-    response_frame,
+    response_frame, supported_admission_contract_set_digest,
 };
 use serde_json::json;
 
@@ -145,7 +145,8 @@ fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        admission_contract_set_digest: supported_admission_contract_set_digest()
+            .expect("994-kr admission contract set digest"),
         operation_manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).
