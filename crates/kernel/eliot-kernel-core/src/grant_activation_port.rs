@@ -4096,13 +4096,18 @@ fn check_ceiling(
     Ok(())
 }
 
-/// Rejects an expiry that is not strictly later than issuance, and an intent
-/// that is already expired at the observation time.
+/// Rejects an intent outside its issuance-to-expiry validity window.
 fn check_expiry(
     issued_at_ms: i64,
     expires_at_ms: Option<i64>,
     now_ms: i64,
 ) -> Result<(), KernelError> {
+    if issued_at_ms > now_ms {
+        return Err(KernelError::InvalidField {
+            field: "issued_at_ms",
+            reason: "activation cannot precede issuance",
+        });
+    }
     if let Some(expires) = expires_at_ms {
         if expires <= issued_at_ms {
             return Err(KernelError::InvalidField {
@@ -7522,6 +7527,24 @@ pub(crate) mod tests {
             port.revocation_closure("op-revoke-root"),
             Some(vec!["grant-restart-root".to_owned()])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn grant_activation_refuses_before_issued_at_without_committing() -> Result<(), KernelError> {
+        let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
+        let binding = restart_test_binding(&epoch)?;
+        let port = GrantActivationPort::new();
+        let intent = restart_root_intent(&binding);
+
+        assert!(matches!(
+            port.activate_grant(&intent, epoch, FIXTURE_ISSUED_AT_MS - 1),
+            Err(KernelError::InvalidField {
+                field: "issued_at_ms",
+                reason: "activation cannot precede issuance",
+            })
+        ));
+        assert!(port.committed_activation(&intent.grant_id).is_none());
         Ok(())
     }
 
