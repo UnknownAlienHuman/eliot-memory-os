@@ -382,7 +382,10 @@ fn transition() -> PreparedTransition {
         ordering_scopes: vec![OrderingScopeId::new("scope-991-d1").unwrap()],
         transition_class: eliot_store_api::TransitionClass::CaptureCandidate,
         requested_effect_ceiling: eliot_store_api::EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        // #1927/#4781: the receiving build's supported admission-contract
+        // identity, compared by content; a placeholder no longer validates.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .unwrap(),
         operation_manifest_digest: set_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).

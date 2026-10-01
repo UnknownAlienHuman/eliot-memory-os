@@ -2076,7 +2076,11 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1927-b").expect("ordering scope")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            // #1927/#4781: the receiving build's supported admission-contract
+            // identity, compared by content; a placeholder no longer validates.
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("supported admission contract set digest"),
             operation_manifest_digest: set_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
@@ -2788,6 +2792,11 @@ mod tests {
                 eliot_store_api::CAPABILITY_DREAMER_JOB_STATUS,
                 eliot_store_api::CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
                 eliot_store_api::CAPABILITY_DREAMER_JOB_RECONCILE,
+                // #1680 (#4785) and #975 (#3785) extended the advertised
+                // baseline past the former `reconcile` tail.
+                eliot_store_api::CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY,
+                eliot_store_api::CAPABILITY_DREAMER_JOB_RECORD_ADMISSION,
+                eliot_store_api::CAPABILITY_STORE_BACKUP,
             ]
         );
     }
@@ -3205,7 +3214,11 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-bridge").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            // #1927/#4781: the receiving build's supported admission-contract
+            // identity, compared by content; a placeholder no longer validates.
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("supported admission contract set digest"),
             operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
                 .expect("manifest digest"),
             // Issue-#18 digests are derived, never defaulted; no semantic
@@ -3282,7 +3295,11 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-bridge").expect("ordering")],
             transition_class: TransitionClass::Erasure,
             requested_effect_ceiling: EffectClass::ReversibleMutation,
-            admission_contract_set_digest: "b".repeat(64),
+            // #1927/#4781: the receiving build's supported admission-contract
+            // identity, compared by content; a placeholder no longer validates.
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("supported admission contract set digest"),
             operation_manifest_digest: OperationManifestDigest::new(manifest_digest)
                 .expect("manifest digest"),
             // Issue-#18 digests are derived below, never defaulted.

@@ -736,21 +736,55 @@ impl EbpStoreTransport for ScriptTransport {
         _limits: TransportLimits,
     ) -> Result<DeliveryOutcome, StoreClientError> {
         self.log.lock().unwrap().push(frame.clone());
+        // The scripted outcome describes the backup request under test. The
+        // handshake `ClientHello` and the connect-time readiness read are
+        // always delivered: the client fails the whole connect closed when
+        // the handshake crosses an unknown delivery boundary, and readiness is
+        // what proves the connection is usable, so both are outside the leg
+        // under test.
+        if frame.kind == FrameKind::Control {
+            return Ok(DeliveryOutcome::Delivered);
+        }
+        if let Ok((_, _, request)) = eliot_store_api::decode_request_frame(frame) {
+            if matches!(request, StoreRequest::Readiness) {
+                return Ok(DeliveryOutcome::Delivered);
+            }
+        }
         Ok(self.send_outcome)
     }
 
     async fn receive_frame(&mut self, _limits: TransportLimits) -> Result<Frame, StoreClientError> {
+        // A scripted disconnect applies to the backup request under test, not
+        // to the handshake or the connect-time readiness read: both of those
+        // must succeed for the connection to exist at all.
         if self.drop_receive {
-            return Err(StoreClientError::Transport(
-                "scripted disconnect before response".to_owned(),
-            ));
+            let log = self.log.lock().unwrap();
+            let last = log.last().expect("response needs a prior send");
+            let is_handshake = last.kind == FrameKind::Control;
+            let is_readiness = !is_handshake
+                && eliot_store_api::decode_request_frame(last)
+                    .map(|(_, _, request)| matches!(request, StoreRequest::Readiness))
+                    .unwrap_or(false);
+            if !is_handshake && !is_readiness {
+                return Err(StoreClientError::Transport(
+                    "scripted disconnect before response".to_owned(),
+                ));
+            }
         }
         let log = self.log.lock().unwrap();
         let last = log.last().expect("response needs a prior send");
         if last.kind == FrameKind::Control {
             let hello = ServerHello {
                 selected_protocol: ProtocolVersion::CURRENT,
-                session_principal_binding: "scripted-store-session".to_owned(),
+                // #975 (#3839): the client checks the hello's session-principal
+                // binding against its own requirement's peer SID and session
+                // id, so a scripted hello must carry the exact derived
+                // string rather than a placeholder.
+                session_principal_binding: format!(
+                    "sid={};session={}",
+                    self.requirement.expected_peer_sid.as_str(),
+                    self.requirement.expected_peer_session_id
+                ),
                 allowed_capabilities: CAPABILITIES
                     .iter()
                     .map(|value| (*value).to_owned())
@@ -876,9 +910,14 @@ fn backup_denominator_covers_every_accepted_operation_end_to_end() {
     // outcome pinned in source and in the capability-denominator fixture.
     assert_eq!(CAPABILITY_STORE_BACKUP, BACKUP_CAPABILITY);
     assert_eq!(CAPABILITY_STORE_BACKUP, "store.backup");
+    // #975 (#3785): the closed backup operation is bound to the production
+    // Surreal snapshot/isolated-restore ports and is advertised. The
+    // advertisement is the same static baseline every store process hands the
+    // handshake, so it proves no runtime readiness; a backend without the
+    // ports still refuses every leg before any effect.
     assert!(
-        !CAPABILITIES.contains(&CAPABILITY_STORE_BACKUP),
-        "the backup capability is declared but never advertised without backend proof"
+        CAPABILITIES.contains(&CAPABILITY_STORE_BACKUP),
+        "the production-bound backup capability is advertised"
     );
 
     let begin = fixture_begin();
@@ -1142,11 +1181,36 @@ async fn real_client_sends_typed_backup_operation_over_transport() {
     // one more typed operation.
     assert_eq!(sends.len(), 2, "connect + exactly one backup send");
     let (request_id, identity, request) = &sends[1];
-    assert_eq!(request_id, &context.request_id);
+    // The transport correlation is a client-derived fresh id
+    // (`{connection_id}:store-backup-begin:{counter}`), deliberately distinct
+    // from the caller's request id; `fresh_correlation_stays_distinct_from_
+    // stable_identity` (A7) pins that separation. What must be preserved here
+    // is the stable admitted identity.
+    assert_ne!(
+        request_id, &context.request_id,
+        "transport correlation is fresh, not the caller's request id"
+    );
+    // The correlation is `{connection_id}:store-backup-begin:{counter}` with a
+    // monotonic per-connection counter. The exact value is not pinned here;
+    // A7 pins that it is fresh per send and distinct from the caller's
+    // request id.
+    assert!(
+        request_id.as_str().starts_with(&format!(
+            "{}:store-backup-begin:",
+            client.requirement().connection_id.as_str()
+        )),
+        "the transport correlation is connection-scoped and operation-tagged: {request_id}"
+    );
     let StoreRequest::Backup { request: envelope } = request else {
         panic!("client sent a non-backup operation: {request:?}");
     };
-    assert_eq!(envelope.context, context);
+    // The envelope carries the fresh transport context, and every other
+    // context field is the caller's context verbatim.
+    assert_eq!(envelope.context.request_id, *request_id);
+    assert_eq!(envelope.context.session_id, context.session_id);
+    assert_eq!(envelope.context.product_id, context.product_id);
+    assert_eq!(envelope.context.source_id, context.source_id);
+    assert_eq!(envelope.context.state_fence, context.state_fence);
     let StoreBackupOperation::Begin(sent) = &envelope.operation else {
         panic!("client sent the wrong backup operation");
     };
@@ -1199,9 +1263,28 @@ fn production_dispatch_routes_backup_to_exactly_one_composition_call() {
             "composition owns the delegation target: {method}"
         );
     }
+    // No automatic retry on the backup route. #975 added the closed
+    // `StoreBackupOperation::Reconcile` leg (#952 unknown-outcome
+    // reconciliation by exact identity), whose `backup_reconcile` delegation
+    // is a distinct admitted operation, not a re-dispatch of the failed one.
+    // The guarantee under test is that the route never re-sends an operation
+    // on its own: no retry/backoff call and no loop construct.
     let lowered = route.to_lowercase();
-    assert!(!lowered.contains("retry"), "no retry on the backup route");
+    assert!(
+        !lowered.contains("retry(")
+            && !lowered.contains("retry_loop")
+            && !lowered.contains("backoff")
+            && !lowered.contains("resend")
+            && !lowered.contains("retryable"),
+        "no automatic retry on the backup route"
+    );
     assert!(!lowered.contains("loop"), "no loop on the backup route");
+    // The reconcile leg delegates exactly once, to its own composition method.
+    assert_eq!(
+        route.matches(".backup_reconcile(").count(),
+        1,
+        "the reconcile leg routes to exactly one composition call"
+    );
     assert!(
         !route.contains("Request::Apply")
             && !route.contains("apply_prepared")
@@ -1463,13 +1546,18 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .backup_begin(&backup_context("request-975-a8-unknown"), begin.clone())
         .await
         .expect_err("unknown delivery is possible effect, never success");
-    assert!(
-        matches!(
-            unknown,
-            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+    // #975: an unknown outcome retains the admitted `OperationId` in
+    // `StoreError::UnknownOutcome` with no second send and no retry, which is
+    // the reconciliation key. `MissingReceiptEnvelope` was the superseded
+    // spelling and carried no operation identity, so it could not be
+    // reconciled by exact identity.
+    match unknown {
+        StoreBackupClientError::Store(StoreError::UnknownOutcome { operation_id }) => assert_eq!(
+            operation_id, begin.operation.operation_id,
+            "the unknown outcome names the admitted operation"
         ),
-        "unknown delivery is a missing receipt envelope, got {unknown:?}"
-    );
+        other => panic!("unknown delivery is an unknown outcome, got {other:?}"),
+    }
     assert_eq!(
         sent_backup_requests(&unknown_log).len() - unknown_baseline,
         1,
@@ -1488,13 +1576,13 @@ async fn pre_send_refusal_is_distinct_from_post_send_possible_effect() {
         .backup_begin(&backup_context("request-975-a8-dropped"), begin.clone())
         .await
         .expect_err("disconnect after send is unknown, never success");
-    assert!(
-        matches!(
-            dropped,
-            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+    match dropped {
+        StoreBackupClientError::Store(StoreError::UnknownOutcome { operation_id }) => assert_eq!(
+            operation_id, begin.operation.operation_id,
+            "the disconnect names the same admitted operation"
         ),
-        "disconnect after send is a missing receipt envelope, got {dropped:?}"
-    );
+        other => panic!("disconnect after send is an unknown outcome, got {other:?}"),
+    }
     assert_eq!(
         sent_backup_requests(&dropped_log).len() - dropped_baseline,
         1
@@ -1520,13 +1608,13 @@ async fn unknown_effect_triggers_no_new_operation_or_retry() {
         .backup_begin(&backup_context("request-975-a9"), begin.clone())
         .await
         .expect_err("unknown stays unknown");
-    assert!(
-        matches!(
-            outcome,
-            StoreBackupClientError::Store(StoreError::MissingReceiptEnvelope)
+    match outcome {
+        StoreBackupClientError::Store(StoreError::UnknownOutcome { operation_id }) => assert_eq!(
+            operation_id, begin.operation.operation_id,
+            "the projected unknown names the admitted operation"
         ),
-        "the projected outcome is a missing receipt envelope, got {outcome:?}"
-    );
+        other => panic!("the projected outcome is an unknown outcome, got {other:?}"),
+    }
     let mutating = sent_backup_requests(&log)
         .into_iter()
         .filter(|(_, _, request)| {
@@ -1546,7 +1634,7 @@ async fn unknown_effect_triggers_no_new_operation_or_retry() {
         })
         .count();
     // Only Backup mutations are counted, and readiness is not one of them.
-    assert_eq!(mutating, 1, "no second mutation after unknown: {outcome}");
+    assert_eq!(mutating, 1, "no second mutation after unknown");
 }
 
 // WORK_UNIT_CASE: 975/10
@@ -1631,10 +1719,21 @@ fn page_continuation_and_cumulative_bounds_hold_identity() {
     forked.cursor.handle_digest = "9".repeat(64);
     assert!(complete.validate_continuation(&forked).is_err());
     assert!(forked.validate_continuation(&partial).is_err());
-    // Cumulative bounds never reset along a continuation.
+    // Cumulative bounds never reset along a continuation. The bound a
+    // continuation is checked against is the admitted cursor it must begin
+    // at, so the reset is applied to that cursor rather than to the page's
+    // own cumulative total (which is the total *after* this page).
     let mut reset = complete.clone();
-    reset.cumulative_bytes = partial.cumulative_bytes - 1;
+    reset.cursor.cumulative_bytes = partial.cumulative_bytes - 1;
     assert!(reset.validate_continuation(&partial).is_err());
+    // The page's own cumulative total is a distinct field and does not
+    // participate in the continuation join.
+    let mut page_total_only = complete.clone();
+    page_total_only.cumulative_bytes = partial.cumulative_bytes - 1;
+    assert!(
+        page_total_only.validate_continuation(&partial).is_ok(),
+        "the page cumulative total is not the continuation join key"
+    );
     let mut reset_members = complete.clone();
     reset_members.cursor.cumulative_members = 0;
     assert!(reset_members.validate_continuation(&partial).is_err());
@@ -1843,10 +1942,11 @@ async fn verify_and_status_paths_cannot_restore_cut_over_or_unblock() {
 #[tokio::test]
 async fn absent_default_implementation_advertises_nothing_and_fails_closed() {
     // A14: an absent/default implementation cannot advertise working
-    // capability or return success. The capability stays out of the
-    // advertised catalogue, the handshake withholds it even when offered,
-    // and every default port body refuses without effects.
-    assert!(!CAPABILITIES.contains(&BACKUP_CAPABILITY));
+    // capability or return success. #975 (#3785) made `store.backup` part of
+    // the static advertised baseline, so advertisement itself is no longer
+    // the proof under test; the handshake still enables exactly the admitted
+    // set and withholds anything unoffered, and every default port body
+    // refuses without effects.
     assert!(!CAPABILITIES.contains(&"store.backup.future"));
     let config = config();
     let identity = StoreHandshakeIdentity::new("manifest-test", json!({}));
@@ -1864,7 +1964,8 @@ async fn absent_default_implementation_advertises_nothing_and_fails_closed() {
     assert!(
         !hello
             .allowed_capabilities
-            .contains(&BACKUP_CAPABILITY.to_owned())
+            .contains(&"store.future_x".to_owned()),
+        "an unoffered capability is never enabled by the handshake"
     );
 
     let backend = DefaultBackupBackend;
@@ -2127,21 +2228,25 @@ fn reserved_write_dreamer_and_ordinary_operations_stay_compatible() {
         );
     }
 
-    // Dreamer capability family is intact: all twelve per-operation
-    // capabilities remain advertised, and backup registration adds none.
+    // Dreamer capability family is intact: the twelve original per-operation
+    // capabilities remain advertised alongside the applicability/admission
+    // pair #1680 (#4785) added.
     assert_eq!(
         CAPABILITIES
             .iter()
             .filter(|capability| capability.starts_with("store.dreamer_job."))
             .count(),
-        12
+        14
     );
-    assert_eq!(CAPABILITIES.len(), 22);
-    assert!(
-        !CAPABILITIES
-            .iter()
-            .any(|capability| capability.contains("backup"))
-    );
+    // #975 (#3785) bound the closed backup operation to the production Surreal
+    // snapshot/isolated-restore ports, so `store.backup` is now part of the
+    // static advertised baseline. Advertisement still proves nothing about
+    // runtime readiness and grants no session its use: the authenticated
+    // handshake and per-request admission still apply, and a backend without
+    // the ports refuses every leg (see
+    // `absent_default_implementation_advertises_nothing_and_fails_closed`).
+    assert_eq!(CAPABILITIES.len(), 25);
+    assert!(CAPABILITIES.contains(&CAPABILITY_STORE_BACKUP));
 }
 
 // WORK_UNIT_CASE: 975/17
