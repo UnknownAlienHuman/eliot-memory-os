@@ -1544,6 +1544,189 @@ const _: () = assert!(
     propagated_exclusions_cover_table(),
     "propagated exclusion drift in HOST_LIFECYCLE_BOUNDARY_TABLE",
 );
+
+/// Case-1/22 fixture-consumption proof for the frozen boundary table (#891 W1).
+///
+/// The integration target pins facade behavior but never reads
+/// `fixture["boundary_table"]` or `fixture["allowed_diff"]`, so a duplicated
+/// name list in JSON could drift from the real table without failing a gate.
+/// These tests close that gap by consuming both keys against the actual
+/// [`HOST_LIFECYCLE_BOUNDARY_TABLE`]: names must match in source order, the
+/// emitting/propagated split and exclusions must match exactly, every emitting
+/// event must resolve through the same `boundary_by_event` binding the
+/// production `BOUNDARY_*` identifiers use, and every `allowed_diff` promise
+/// must hold against this source file. Unknown vocabulary cannot pass: an
+/// unlisted event fails `boundary_by_event` at build time, and any table
+/// drift fails the order-sensitive comparison here.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "case-1/22 fixture proof reads tracked files like the integration probes"
+)]
+mod host_lifecycle_boundary_table_tests {
+    fn lifecycle_fixture() -> serde_json::Value {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/host_lifecycle_diagnostics.json");
+        let bytes = std::fs::read(&path).expect("lifecycle fixture must be readable");
+        serde_json::from_slice(&bytes).expect("lifecycle fixture must be valid JSON")
+    }
+
+    fn lib_source() -> String {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let source = std::fs::read_to_string(&path).expect("tracked lib.rs must be readable");
+        // Self-exclusion: this proof lives in the file it audits, so audit
+        // only the production source above the test module. The assertion
+        // literals below would otherwise match their own spellings and keep
+        // the proof always-red.
+        let marker = "\nmod host_lifecycle_boundary_table_tests {";
+        let end = source.find(marker).expect("test module marker must exist");
+        source[..end].to_owned()
+    }
+
+    // WORK_UNIT_CASE: 891/1
+    #[test]
+    fn case_1_frozen_table_binds_fixture() {
+        let fixture = lifecycle_fixture();
+        let table = super::HOST_LIFECYCLE_BOUNDARY_TABLE;
+        // The fixture names its source; the pointer must name this table.
+        assert_eq!(
+            fixture["boundary_table"]["source"].as_str(),
+            Some("bins/eliot-host/src/lib.rs::HOST_LIFECYCLE_BOUNDARY_TABLE"),
+            "fixture must point at the actual frozen table"
+        );
+        // Order-sensitive: the fixture consumes the actual table, it does not
+        // duplicate its names.
+        let source_names: Vec<&str> = table.iter().map(|row| row.name).collect();
+        let fixture_names: Vec<&str> = fixture["boundary_table"]["names"]
+            .as_array()
+            .expect("fixture must pin boundary_table.names")
+            .iter()
+            .map(|name| name.as_str().expect("boundary name must be a string"))
+            .collect();
+        assert_eq!(
+            source_names.len(),
+            fixture_names.len(),
+            "fixture must pin one name per table row"
+        );
+        let first_drift = source_names
+            .iter()
+            .zip(fixture_names.iter())
+            .position(|(source, pinned)| source != pinned);
+        assert!(
+            first_drift.is_none(),
+            "fixture names must equal the table in source order"
+        );
+        // Split and counts: propagated rows own no emission.
+        let propagated_names: Vec<&str> = table
+            .iter()
+            .filter(|row| row.event.starts_with("propagated:"))
+            .map(|row| row.name)
+            .collect();
+        let rows = u64::try_from(table.len()).expect("table fits u64");
+        let propagated = u64::try_from(propagated_names.len()).expect("table fits u64");
+        assert_eq!(
+            fixture["boundary_table"]["rows"].as_u64(),
+            Some(rows),
+            "fixture must pin the row count"
+        );
+        assert_eq!(
+            fixture["boundary_table"]["emitting"].as_u64(),
+            Some(rows - propagated),
+            "fixture must pin the emitting count"
+        );
+        assert_eq!(
+            fixture["boundary_table"]["propagated"].as_u64(),
+            Some(propagated),
+            "fixture must pin the propagated count"
+        );
+        let exclusions: Vec<&str> = fixture["boundary_table"]["propagated_exclusions"]
+            .as_array()
+            .expect("fixture must pin propagated exclusions")
+            .iter()
+            .map(|name| name.as_str().expect("exclusion must be a string"))
+            .collect();
+        for name in &propagated_names {
+            assert!(
+                exclusions.contains(name),
+                "propagated row {name:?} must be an explicit exclusion"
+            );
+        }
+        assert_eq!(
+            exclusions.len(),
+            propagated_names.len(),
+            "exclusions must cover every propagated row and nothing else"
+        );
+        // Every emitting event resolves through the production binding, and
+        // the resolved row is exactly the table row: unknown IDs cannot
+        // silently become new production vocabulary.
+        for row in table
+            .iter()
+            .filter(|row| !row.event.starts_with("propagated:"))
+        {
+            let resolved = super::boundary_by_event(row.event);
+            assert_eq!(
+                resolved.name, row.name,
+                "event {:?} must resolve to its exact table row",
+                row.event
+            );
+        }
+    }
+
+    // WORK_UNIT_CASE: 891/22
+    #[test]
+    fn case_22_allowed_diff_binds_source() {
+        let fixture = lifecycle_fixture();
+        let allowed = &fixture["allowed_diff"];
+        for key in [
+            "no_duplicate_evaluation",
+            "no_lifecycle_delta",
+            "no_new_visibility",
+            "no_mutable_global_dedup",
+            "single_terminal_per_failed_op",
+        ] {
+            assert_eq!(
+                allowed[key].as_bool(),
+                Some(true),
+                "allowed_diff[{key}] must stay pinned true"
+            );
+        }
+        let lib = lib_source();
+        // no_duplicate_evaluation: observation calls pass static BOUNDARY_*
+        // identifiers, never string literals that could bypass the table.
+        for helper in [
+            "host_lifecycle_observe_requested(\"",
+            "host_lifecycle_observe_scm(\"",
+            "host_lifecycle_observe_drain(\"",
+            "host_lifecycle_observe_terminal(\"",
+            "host_lifecycle_observe_identity(\"",
+        ] {
+            assert!(
+                !lib.contains(helper),
+                "observation calls must pass BOUNDARY_* identifiers, never string literals"
+            );
+        }
+        // no_new_visibility: no new public logging surface.
+        assert!(
+            !lib.contains("pub fn host_lifecycle_"),
+            "no new public logging surface may exist"
+        );
+        // no_mutable_global_dedup: one terminal per failed operation is
+        // enforced by the single outermost guard, never a dedup cache.
+        assert!(
+            !lib.contains("static DEDUP"),
+            "no mutable global dedup cache may exist"
+        );
+        // no_lifecycle_delta and single_terminal_per_failed_op: the exact
+        // table binding in case 1 is the guard — any new boundary, renamed
+        // event, or second terminal code breaks the order-sensitive table
+        // proof above before it can reach production vocabulary.
+        assert!(
+            lib.contains("struct HostTerminalGuard"),
+            "the single-terminal guard must remain the terminal mechanism"
+        );
+    }
+}
+
 /// Returns the frozen `event` spelling for the selected boundary row.
 ///
 /// Every production observation passes its static [`HOST_LIFECYCLE_BOUNDARY_TABLE`]
