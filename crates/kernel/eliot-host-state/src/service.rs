@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use eliot_platform::PlatformHandle;
 
@@ -31,6 +31,16 @@ impl<B: JournalBackend> HostStateJournalService<B> {
 
     pub fn snapshot(&self) -> Result<HostState, JournalError> {
         self.journal.snapshot()
+    }
+
+    /// Registers the composition-owned non-authoritative observer for exact
+    /// durable journal heads. The observer runs after journal locks are
+    /// released and receives `None` whenever commit status is unknown.
+    pub fn set_append_observer(
+        &self,
+        observer: Arc<dyn Fn(Option<(u64, String)>) + Send + Sync>,
+    ) -> Result<(), JournalError> {
+        self.journal.set_append_observer(observer)
     }
 
     /// Read-only snapshot of the current Host installation epoch.

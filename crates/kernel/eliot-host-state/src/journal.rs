@@ -1442,6 +1442,7 @@ fn validate_prepared_descriptor<B: JournalBackend>(
 pub struct HostStateJournal<B> {
     backend: Mutex<B>,
     state: Mutex<HostState>,
+    append_observer: Mutex<Option<Arc<dyn Fn(Option<(u64, String)>) + Send + Sync>>>,
 }
 
 impl<B: JournalBackend> HostStateJournal<B> {
@@ -1453,7 +1454,68 @@ impl<B: JournalBackend> HostStateJournal<B> {
         Ok(Self {
             backend: Mutex::new(backend),
             state: Mutex::new(state),
+            append_observer: Mutex::new(None),
         })
+    }
+
+    /// Registers the one composition-owned, non-authoritative read-model
+    /// observer for exact committed journal heads. The callback receives
+    /// `None` when an append or reconciliation leaves commit outcome unknown.
+    /// It is always called after backend and reducer locks have been released.
+    pub fn set_append_observer(
+        &self,
+        observer: Arc<dyn Fn(Option<(u64, String)>) + Send + Sync>,
+    ) -> Result<(), JournalError> {
+        *self
+            .append_observer
+            .lock()
+            .map_err(|_| JournalError::Synchronization)? = Some(observer);
+        Ok(())
+    }
+
+    fn notify_append_observer(&self, head: Option<(u64, String)>) {
+        let observer = self
+            .append_observer
+            .lock()
+            .ok()
+            .and_then(|observer| observer.clone());
+        if let Some(observer) = observer {
+            observer(head);
+        }
+    }
+
+    fn observe_append_result(&self, result: &Result<AppendReceipt, JournalError>) {
+        match result {
+            Ok(_) => {
+                let head = self.snapshot().ok().and_then(|state| {
+                    state
+                        .last_checksum
+                        .map(|checksum| (state.sequence, checksum))
+                });
+                self.notify_append_observer(head);
+            }
+            Err(JournalError::OutcomeUnknown { .. }) => self.notify_append_observer(None),
+            Err(_) => {}
+        }
+    }
+
+    fn observe_reconcile_result(
+        &self,
+        result: &Result<(ReconcileOutcome, Option<IdempotencyIdentity>), JournalError>,
+    ) {
+        match result {
+            Ok((ReconcileOutcome::StillUnknown, _)) | Err(_) => {
+                self.notify_append_observer(None);
+            }
+            Ok(_) => {
+                let head = self.snapshot().ok().and_then(|state| {
+                    state
+                        .last_checksum
+                        .map(|checksum| (state.sequence, checksum))
+                });
+                self.notify_append_observer(head);
+            }
+        }
     }
 
     pub fn replay_bytes(
@@ -1498,7 +1560,9 @@ impl<B: JournalBackend> HostStateJournal<B> {
                 "readiness observations require exact approved-contour admission".into(),
             ));
         }
-        self.append_inner(record)
+        let result = self.append_inner(record);
+        self.observe_append_result(&result);
+        result
     }
 
     pub fn append_readiness_observation(
@@ -1507,7 +1571,9 @@ impl<B: JournalBackend> HostStateJournal<B> {
         expected: &crate::ReadinessApprovedContour,
     ) -> Result<AppendReceipt, JournalError> {
         observation.validate_approved_contour(expected)?;
-        self.append_inner(HostStateRecord::ReadinessObservation(observation))
+        let result = self.append_inner(HostStateRecord::ReadinessObservation(observation));
+        self.observe_append_result(&result);
+        result
     }
 
     pub fn prepare_reactive_context(
@@ -1845,6 +1911,15 @@ impl<B: JournalBackend> HostStateJournal<B> {
     }
 
     pub(crate) fn reconcile_with_descriptor(
+        &self,
+        transaction_id: &PlatformHandle,
+    ) -> Result<(ReconcileOutcome, Option<IdempotencyIdentity>), JournalError> {
+        let result = self.reconcile_with_descriptor_locked(transaction_id);
+        self.observe_reconcile_result(&result);
+        result
+    }
+
+    fn reconcile_with_descriptor_locked(
         &self,
         transaction_id: &PlatformHandle,
     ) -> Result<(ReconcileOutcome, Option<IdempotencyIdentity>), JournalError> {

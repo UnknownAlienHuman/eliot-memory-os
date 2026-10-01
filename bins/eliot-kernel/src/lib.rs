@@ -548,6 +548,7 @@ use eliot_protocol::{
     EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload, RequestIdentity,
 };
 use eliot_runtime::{Runtime, RuntimeConfig, ShutdownOutcome};
+use eliot_observability_runtime::CrashReporterHandle;
 #[cfg(test)]
 pub use eliot_runtime_contracts::SupervisionLeasePredecessorIdentity;
 #[cfg(windows)]
@@ -658,6 +659,11 @@ const AGENT_ACTIVATION_CLAIM_LEASE_MS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct KernelStoreRebindProductionBoundary;
+
+struct CrashReporterBinding {
+    handle: CrashReporterHandle,
+    kernel_process_generation: Option<String>,
+}
 
 const fn probe_ready_state_admitted(state: KernelServiceState) -> bool {
     matches!(
@@ -915,6 +921,9 @@ pub struct KernelComposition {
     /// acquires no other Kernel lock. Opened once at assembly over the
     /// audit-spool directory; failed appends retain through it.
     pub(crate) audit_fallback: Mutex<KernelAuditFallback>,
+    /// Optional non-authoritative crash context sink installed by the binary
+    /// after the Host-injected Kernel generation has been validated.
+    crash_reporter: Mutex<Option<CrashReporterBinding>>,
     /// The latest retained Diagnostic Brief (issue #1844; I16.7).
     /// Leaf lock: problem owners retain through
     /// [`KernelComposition::observe_diagnostic_problem`] and the health

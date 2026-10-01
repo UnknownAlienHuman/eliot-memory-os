@@ -415,6 +415,9 @@ impl KernelComposition {
                     StateFence::new(request.candidate.kernel_epoch.clone(), request.generation);
             }
         }
+        // Publish the fence only after both policy and service locks leave
+        // scope; the panic hook reads only the reporter's bounded snapshot.
+        self.publish_crash_context();
         // I1.5 (#1750): a new candidate activation contour invalidates the
         // recorded independent-supervision evidence. The previous observation
         // belonged to the previous activation generation, host epoch, and

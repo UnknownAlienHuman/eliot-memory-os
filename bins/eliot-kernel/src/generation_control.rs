@@ -864,6 +864,7 @@ impl KernelComposition {
             }
         };
         drop(poison);
+        self.publish_crash_context();
         if let Some(observations) = persistence_observations {
             observations.emit(result.is_ok(), decision.cutover_id());
         }
