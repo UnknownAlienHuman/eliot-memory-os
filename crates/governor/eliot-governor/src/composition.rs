@@ -135,7 +135,7 @@ use eliot_workscope::{
     WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
     WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
     evaluate_material_request, issue_resolution_receipt, produce_attach_receipt,
-    rebind_with_receipt,
+    rebind_with_receipt, observed_scope_binding,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -7116,20 +7116,17 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Admits the initial binding for a newly resolved scope (issue #1787,
     /// bootstrap-constructor entry).
     ///
-    /// Used when no retained owner exists yet: the bootstrap caller supplies
-    /// the described scope, the binding it actually read, the current
-    /// observation, and the source closure that authenticates it. Admission
-    /// mints the owner only after descriptor agreement, clear identity legs,
-    /// and a fresh `MATCHED` guard check at the retained fence. Persist the
-    /// minted owner with [`Self::install_admitted_work_scope_owner`]. Live
-    /// status: no production caller. `git grep -n admit_initial_scope_binding`
-    /// returns only this definition and one intra-doc link in
-    /// [`Self::install_admitted_work_scope_owner`]'s own doc. The nearest live
-    /// rebind entry is [`Self::admit_observed_scope_attach`], reached from the
-    /// daemon scope-attach ingress and persisting through the same
-    /// installer; no bootstrap ingress supplies the described scope this entry
-    /// requires. Whether one is wired to it or this entry is retired is an
-    /// owner decision.
+    /// Used when no retained owner exists yet: the authenticated explicit
+    /// binding caller supplies the original descriptor and resolved binding,
+    /// the mechanically observed resources from the independent Host probe,
+    /// and the original source/privacy closure. The observed binding is
+    /// derived here from the Host observation; callers cannot satisfy the
+    /// independent-observation check by copying the proposed binding.
+    /// Admission mints the owner only after descriptor agreement, clear
+    /// identity legs, and a fresh `MATCHED` guard check at the retained fence.
+    /// Install the minted owner with [`Self::install_admitted_work_scope_owner`].
+    /// The observed resources must come from the independent Host observation
+    /// for that request.
     ///
     /// Ported-from: work/1787-workscope-identity@443e39841049b0f80a25bebca813f470f8ad311c.
     pub fn admit_initial_scope_binding(
@@ -7137,7 +7134,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         descriptor: &WorkScopeDescriptor,
         owner_revision: u64,
         binding: &ScopeBinding,
-        observed: &ScopeBinding,
+        observed: &ObservedScopeResources,
         sources: &GoverningSourceSet,
         privacy: &PrivacyProfile,
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
@@ -7145,19 +7142,26 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Err(CompositionError::NotReady);
         }
         let fence = self.snapshot.state_fence();
+        let observed_binding = observed_scope_binding(
+            binding,
+            observed,
+            binding.privacy_class,
+            binding.governing_source_generation,
+        )
+        .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         admit_initial_binding(
             descriptor,
             owner_revision,
             &fence,
             binding,
-            observed,
+            &observed_binding,
             sources,
             privacy,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))
     }
 
-    /// Persists an admitted `WorkScope` owner as the retained binding
+    /// Installs an admitted `WorkScope` owner as the in-memory binding
     /// (issue #1787, rebind/attach persistence).
     ///
     /// Installs the owner minted by [`Self::admit_scope_relocation`],
@@ -7167,7 +7171,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// the binding on every identity field, and the binding generation equals
     /// the fence generation, so the same operation is admitted afterwards
     /// only with that instance identity and generation fence. Anything else
-    /// fails without touching the retained binding.
+    /// fails without touching the retained binding. This is not durable
+    /// recovery publication; the caller must retain and read back the exact
+    /// returned snapshot through the Kernel owner store before acknowledging
+    /// the binding.
     pub fn install_admitted_work_scope_owner(
         &mut self,
         owner: WorkScopeBindingOwner,
@@ -7440,6 +7447,213 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             | TaskBindingState::Stale { .. }
             | TaskBindingState::Ambiguous { .. } => Ok((None, receipt)),
         }
+    }
+
+    /// Captures the validated owner selection before the caller performs the
+    /// asynchronous canonical acceptance-set read.
+    pub fn prepare_task_selection_for_request(
+        &self,
+        now: u64,
+        authenticated_principal_ref: &str,
+        request_session_ref: &str,
+        request_task_ref: &str,
+        request_scope_ref: &str,
+        request_fence: &StateFence,
+    ) -> Result<PendingTaskSelectionRequest, CompositionError> {
+        request_fence
+            .validate()
+            .map_err(|error| CompositionError::Owner(error.to_string()))?;
+        let live_fence = self.snapshot.state_fence();
+        if !fences_match_exact(&live_fence, request_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
+        if !fences_match_exact(&activation.state_fence, request_fence)
+            || activation.principal_id != authenticated_principal_ref
+            || activation.session_id != request_session_ref
+            || activation.task_id.as_str() != request_task_ref
+            || activation.work_scope_id != request_scope_ref
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let work_scope_owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
+        let work_scope = work_scope_owner
+            .read_current(request_fence)
+            .map_err(CompositionError::ScanDisclosure)?;
+        ensure_snapshot_fresh(
+            &work_scope,
+            "Task Controller WorkScope is not freshly matched",
+        )?;
+        if work_scope.binding.scope.scope_ref != request_scope_ref {
+            return Err(CompositionError::ActivationScopeSelectionRequired);
+        }
+        let source_closure = work_scope_owner
+            .read_current_source_closure(request_fence)
+            .map_err(CompositionError::ScanDisclosure)?;
+
+        Ok(PendingTaskSelectionRequest {
+            now,
+            activation,
+            selected,
+            work_scope,
+            source_closure,
+        })
+    }
+
+    /// Completes a pending request using the exact canonical owner-read result.
+    /// A second live owner read rejects any selection/scope/fence change that
+    /// occurred while the caller awaited the Kernel.
+    pub fn finish_task_selection_for_request(
+        &self,
+        pending: PendingTaskSelectionRequest,
+        now: u64,
+        acceptance: TaskContractAcceptanceSet,
+    ) -> Result<TaskSelectionAdmissionBinding, CompositionError> {
+        if now < pending.now {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
+        let work_scope_owner = self
+            .owners
+            .work_scope
+            .as_ref()
+            .ok_or(CompositionError::ActivationScopeSelectionRequired)?;
+        let current_scope = work_scope_owner
+            .read_current(&pending.activation.state_fence)
+            .map_err(CompositionError::ScanDisclosure)?;
+        let source_closure = work_scope_owner
+            .read_current_source_closure(&pending.activation.state_fence)
+            .map_err(CompositionError::ScanDisclosure)?;
+        ensure_snapshot_fresh(
+            &current_scope,
+            "Task Controller WorkScope changed during acceptance read",
+        )?;
+        if activation != pending.activation
+            || selected != pending.selected
+            || current_scope != pending.work_scope
+            || source_closure != pending.source_closure
+            || !fences_match_exact(
+                &self.snapshot.state_fence(),
+                &pending.activation.state_fence,
+            )
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        acceptance.validate()?;
+        if acceptance.task_id != activation.task_id
+            || acceptance.task_revision != activation.task_revision
+            || !fences_match_exact(&acceptance.read_state_fence, &activation.state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let acceptance_digest = acceptance.acceptance_digest.clone();
+        let evidence = TaskSelectionEvidence {
+            task_ref: activation.task_id.to_string(),
+            task_revision: activation.task_revision,
+            acceptance_digest: acceptance.acceptance_digest,
+            work_scope_ref: activation.work_scope_id.clone(),
+            selection_source_ref: selected.lease.lease_id.clone(),
+            evidence_ref: selected.work_item.work_item_id.clone(),
+            contamination_flags: Vec::new(),
+        };
+        evidence.validate()?;
+        Ok(TaskSelectionAdmissionBinding {
+            selection_source_ref: evidence.selection_source_ref.clone(),
+            evidence_ref: evidence.evidence_ref.clone(),
+            evidence,
+            principal_ref: activation.principal_id,
+            session_ref: activation.session_id,
+            task_ref: activation.task_id.to_string(),
+            task_revision: activation.task_revision,
+            acceptance_digest,
+            work_scope: pending.work_scope,
+            source_closure,
+            state_fence: activation.state_fence,
+        })
+    }
+
+    /// Produces immutable task-selection evidence from the exact unique active
+    /// owner selection and the `TaskContract` acceptance record at that fence.
+    ///
+    /// The explicit Task Controller scope-binding action uses this before the
+    /// first `WorkScope` owner exists: it proves that the authenticated task,
+    /// principal, session and scope are still the unique live owner selection,
+    /// then reads and validates the original task acceptance set. This is
+    /// owner evidence for source-authority admission, not permission to skip
+    /// the later observed-scope and source/privacy checks.
+    ///
+    /// The `WorkLease` is the selection source and its linked `WorkItem` is the
+    /// retained evidence handle. Both are returned by the same validated
+    /// coordination read that joins the authenticated principal/session to
+    /// the task and `WorkScope`. The owner's recorded acceptance digest is
+    /// copied verbatim; it is never recomputed from caller data or a task id.
+    pub async fn issue_task_selection_evidence_for_binding(
+        &self,
+        now: u64,
+        authenticated_identity: (&str, &str),
+        work_scope_ref: &str,
+        state_fence: &StateFence,
+        task_binding: (&str, u64, Option<&str>),
+    ) -> Result<(TaskSelectionEvidence, String), CompositionError> {
+        let (principal_ref, session_ref) = authenticated_identity;
+        let (task_ref, task_revision, expected_acceptance_digest) = task_binding;
+        let (activation, selected) = self.read_unique_agent_activation_with_selection(now)?;
+        if !fences_match_exact(&activation.state_fence, state_fence)
+            || !fences_match_exact(&self.snapshot.state_fence(), state_fence)
+            || activation.principal_id != principal_ref
+            || activation.session_id != session_ref
+            || activation.task_id.as_str() != task_ref
+            || activation.task_revision != task_revision
+            || state_fence.task_revision.map(TaskRevision::value) != Some(task_revision)
+            || activation.work_scope_id != work_scope_ref
+            || selected.work_item.work_item_id != activation.work_unit_id
+            || selected.work_item.task_id != activation.task_id.as_str()
+            || selected.work_item.state_fence != activation.state_fence
+            || selected.work_item.owner_session_id.as_deref()
+                != Some(activation.session_id.as_str())
+            || selected.lease.work_item_id != selected.work_item.work_item_id
+            || selected.lease.holder_session_id != activation.session_id
+            || selected.lease.state_fence != activation.state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let acceptance = self
+            .kernel
+            .task_contract_acceptance_set(
+                &activation.task_id,
+                activation.task_revision,
+                &activation.state_fence,
+            )
+            .await?;
+        acceptance.validate()?;
+        if acceptance.task_id != activation.task_id
+            || acceptance.task_revision != activation.task_revision
+            || expected_acceptance_digest
+                .is_some_and(|expected| acceptance.acceptance_digest != expected)
+            || !fences_match_exact(&acceptance.read_state_fence, &activation.state_fence)
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+
+        let owner_acceptance_digest = acceptance.acceptance_digest.clone();
+        let evidence = TaskSelectionEvidence {
+            task_ref: activation.task_id.to_string(),
+            task_revision: activation.task_revision,
+            acceptance_digest: acceptance.acceptance_digest,
+            work_scope_ref: activation.work_scope_id,
+            selection_source_ref: selected.lease.lease_id,
+            evidence_ref: selected.work_item.work_item_id,
+            contamination_flags: Vec::new(),
+        };
+        evidence.validate()?;
+        Ok((evidence, owner_acceptance_digest))
     }
 
     /// Admits one scope-sensitive canonical write whose observed binding and
