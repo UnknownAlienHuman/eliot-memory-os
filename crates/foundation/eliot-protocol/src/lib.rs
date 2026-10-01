@@ -986,8 +986,12 @@ fn is_identityless_blob_kernel_exchange(frame: &Frame) -> bool {
     let ProtocolPayload::Json(payload) = &frame.payload else {
         return false;
     };
-    payload.get("wire_id").and_then(Value::as_str) == Some("eliot.kernel.blob-process-stream")
-        && payload.get("wire_revision").and_then(Value::as_u64) == Some(1)
+    let wire_id = payload.get("wire_id").and_then(Value::as_str);
+    matches!(
+        wire_id,
+        Some("eliot.kernel.blob-process-stream")
+            | Some("eliot.kernel.blob-process-stream-reconcile")
+    ) && payload.get("wire_revision").and_then(Value::as_u64) == Some(1)
 }
 
 /// Durable event delivery class from the EBP event envelope.

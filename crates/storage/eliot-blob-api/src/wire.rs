@@ -4,7 +4,7 @@
 //! stage context, filesystem path, or caller-issued receipt. The Store binds
 //! each request to the owner-retained stream session before consulting Blob.
 
-use eliot_contracts::StateFence;
+use eliot_contracts::{StateFence, canonical_json_bytes};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -31,8 +31,18 @@ pub const BLOB_PROCESS_STREAM_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 /// authenticated by the established Kernel session and is accepted before
 /// ordinary request-identity decoding only for the exact `TestD` peer role.
 pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_ID: &str = "eliot.kernel.blob-process-stream";
+/// Dedicated no-effect selector for reconciling a consumed call token.
+pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID: &str =
+    "eliot.kernel.blob-process-stream-reconcile";
+/// Separate read-only selector for retrieving an already-consumed call result.
+pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID: &str =
+    "eliot.kernel.blob-process-stream-reconcile";
 /// Current revision for the narrow `TestD`-to-Kernel capability exchange.
 pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION: u16 = 1;
+/// Current reconciliation selector revision.
+pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION: u16 = 1;
+/// Revision of the read-only consumed-call reconciliation selector.
+pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION: u16 = 1;
 /// Maximum encoded Kernel capability-exchange frame.
 pub const BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 /// Closed daemon owner-facts exchange requested by Kernel over its authenticated
@@ -146,6 +156,9 @@ impl BlobProcessStreamFrameResponse {
         if encoded_len > BLOB_PROCESS_STREAM_MAX_FRAME_BYTES {
             return Err(WireValidationError::InvalidField("frame"));
         }
+        if let BlobProcessStreamOperationResponse::SourceReadback { response } = &self.operation {
+            response.validate()?;
+        }
         Ok(())
     }
 }
@@ -197,6 +210,71 @@ pub struct BlobProcessStreamKernelRequest {
     pub operation_sha256: String,
     /// Exact closed semantic operation, without Store RequestIdentity or fence.
     pub operation: BlobProcessStreamKernelOperationRequest,
+}
+
+/// Read-only request for the retained result of one already-consumed token.
+/// It can never authorize a Store exchange or mint an effect token.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamKernelReconcileRequest {
+    /// Dedicated read-only selector.
+    pub wire_id: String,
+    /// Closed selector revision.
+    pub wire_revision: u16,
+    /// Original Kernel-issued capability.
+    pub capability: ProcessStreamSinkCapabilityRef,
+    /// Exact already-consumed token reference and ordinal.
+    pub call_token: BlobProcessStreamCallToken,
+    /// Digest of the original closed operation.
+    pub operation_sha256: String,
+}
+
+impl BlobProcessStreamKernelReconcileRequest {
+    /// Validates exact selector, capability and original operation binding.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.wire_id != BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID
+            || self.wire_revision != BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION
+        {
+            return Err(WireValidationError::UnsupportedRevision);
+        }
+        self.capability.validate()?;
+        self.call_token.validate()?;
+        validate_digest("operation_sha256", &self.operation_sha256)
+    }
+}
+
+/// Read-only recovery request for a previously consumed effect token.
+///
+/// This selector never authorizes a Store exchange. Kernel looks up the
+/// original capability/token/digest tuple in ORS and returns its retained
+/// Completed response, NotStarted, or Unknown disposition.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamKernelReconcileRequest {
+    /// Dedicated read-only selector.
+    pub wire_id: String,
+    /// Closed selector revision.
+    pub wire_revision: u16,
+    /// Original Kernel-issued capability.
+    pub capability: ProcessStreamSinkCapabilityRef,
+    /// Exact already-consumed effect token.
+    pub call_token: BlobProcessStreamCallToken,
+    /// Digest of the exact original operation.
+    pub operation_sha256: String,
+}
+
+impl BlobProcessStreamKernelReconcileRequest {
+    /// Validates exact closed selectors and original call binding.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.wire_id != BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID
+            || self.wire_revision != BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION
+        {
+            return Err(WireValidationError::UnsupportedRevision);
+        }
+        self.capability.validate()?;
+        self.call_token.validate()?;
+        validate_digest("operation_sha256", &self.operation_sha256)
+    }
 }
 
 /// One closed semantic operation accepted from `TestD` by Kernel.
@@ -912,6 +990,7 @@ impl BlobProcessStreamOwnerFactsPullResponse {
         }
         Ok(())
     }
+
 }
 
 impl BlobProcessStreamKernelRequest {
@@ -923,7 +1002,7 @@ impl BlobProcessStreamKernelRequest {
         operation: BlobProcessStreamKernelOperationRequest,
     ) -> Result<Self, WireValidationError> {
         operation.validate()?;
-        let operation_bytes = serde_json::to_vec(&operation)
+        let operation_bytes = canonical_json_bytes(&operation)
             .map_err(|_| WireValidationError::InvalidField("operation"))?;
         let request = Self {
             wire_id: BLOB_PROCESS_STREAM_KERNEL_WIRE_ID.to_owned(),
@@ -948,7 +1027,7 @@ impl BlobProcessStreamKernelRequest {
         self.call_token.validate()?;
         self.operation.validate()?;
         validate_digest("operation_sha256", &self.operation_sha256)?;
-        let operation = serde_json::to_vec(&self.operation)
+        let operation = canonical_json_bytes(&self.operation)
             .map_err(|_| WireValidationError::InvalidField("operation"))?;
         if sha256_hex(&operation) != self.operation_sha256 {
             return Err(WireValidationError::InvalidField("operation_sha256"));
@@ -974,6 +1053,8 @@ pub enum BlobProcessStreamKernelOutcome {
     Completed {
         /// Digest of the original operation body.
         operation_sha256: String,
+        /// Opaque ORS key retaining this exact call and its outcome.
+        response_ref: String,
         /// Exact closed Store/Blob result.
         response: Box<BlobProcessStreamFrameResponse>,
         /// Original terminal request, retained verbatim when this outcome
@@ -1059,7 +1140,8 @@ impl BlobProcessStreamKernelResponse {
             if !matches!(
                 &self.outcome,
                 BlobProcessStreamKernelOutcome::Completed { .. }
-            ) || next_call_token.ordinal <= self.call_token.ordinal
+            )
+                || self.call_token.ordinal.checked_add(1) != Some(next_call_token.ordinal)
                 || next_call_token.reference == self.call_token.reference
             {
                 return Err(WireValidationError::InvalidField("next_call_token"));
@@ -1068,11 +1150,13 @@ impl BlobProcessStreamKernelResponse {
         match &self.outcome {
             BlobProcessStreamKernelOutcome::Completed {
                 operation_sha256,
+                response_ref,
                 response,
                 original_terminal_request,
                 original_terminal_operation_sha256,
             } => {
                 validate_digest("operation_sha256", operation_sha256)?;
+                validate_text("response_ref", response_ref)?;
                 response.validate()?;
                 match (
                     original_terminal_request,
@@ -1085,9 +1169,12 @@ impl BlobProcessStreamKernelResponse {
                             request.as_ref(),
                             BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
                                 | BlobProcessStreamKernelOperationRequest::SinkAbort { .. }
-                        ) || sha256_hex(&serde_json::to_vec(request).map_err(|_| {
-                            WireValidationError::InvalidField("original_terminal_request")
-                        })?) != *original_sha256
+                        ) || sha256_hex(
+                            &canonical_json_bytes(request)
+                                .map_err(|_| WireValidationError::InvalidField(
+                                    "original_terminal_request",
+                                ))?,
+                        ) != *original_sha256
                         {
                             return Err(WireValidationError::InvalidField(
                                 "original_terminal_request",
@@ -1143,6 +1230,28 @@ impl BlobProcessStreamKernelResponse {
             return Err(WireValidationError::InvalidField(
                 "response_operation_sha256",
             ));
+        }
+        Ok(())
+    }
+
+    /// Validates a retained response against a read-only reconciliation.
+    pub fn validate_for_reconcile(
+        &self,
+        request: &BlobProcessStreamKernelReconcileRequest,
+    ) -> Result<(), WireValidationError> {
+        self.validate()?;
+        request.validate()?;
+        if self.capability != request.capability || self.call_token != request.call_token {
+            return Err(WireValidationError::InvalidField("reconcile_binding"));
+        }
+        let operation_sha256 = match &self.outcome {
+            BlobProcessStreamKernelOutcome::Completed { operation_sha256, .. }
+            | BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
+            | BlobProcessStreamKernelOutcome::Unavailable { operation_sha256, .. }
+            | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => operation_sha256,
+        };
+        if operation_sha256 != &request.operation_sha256 {
+            return Err(WireValidationError::InvalidField("reconcile_operation"));
         }
         Ok(())
     }
@@ -1621,11 +1730,88 @@ pub enum ProcessStreamSourceReadbackResponse {
         observed_fence: StateFence,
         /// Unix-millisecond time observed by the owner.
         observed_at_unix_ms: u64,
+        /// Fresh canonical owner-facts envelope used to authorize this read.
+        owner_facts_json: String,
+        /// SHA-256 of the exact owner-facts bytes above.
+        owner_facts_sha256: String,
+        /// Fresh canonical ModuleCatalog owner readback at the same fence.
+        module_catalog_owner_readback_json: String,
+        /// SHA-256 of the exact ModuleCatalog owner readback.
+        module_catalog_owner_readback_sha256: String,
+        /// Exact selected accepted GenerationAdmission at the same fence.
+        generation_admission_json: String,
+        /// SHA-256 of the exact GenerationAdmission bytes above.
+        generation_admission_sha256: String,
     },
     /// Exact original intent is durably reserved and no stage effect began.
     NotStarted,
     /// The original operation result cannot be determined safely.
     Unknown,
+}
+
+impl ProcessStreamSourceReadbackResponse {
+    /// Validates chunk integrity and the fresh owner-context commitments.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        let Self::Ready {
+            bytes,
+            whole_source_sha256,
+            whole_source_byte_length,
+            chunk_offset,
+            observed_sha256,
+            observed_byte_length,
+            ready_receipt_ref,
+            source_owner_generation,
+            readback_receipt_id,
+            observed_fence,
+            observed_at_unix_ms,
+            owner_facts_json,
+            owner_facts_sha256,
+            module_catalog_owner_readback_json,
+            module_catalog_owner_readback_sha256,
+            generation_admission_json,
+            generation_admission_sha256,
+        } = self else {
+            return Ok(());
+        };
+        validate_digest("whole_source_sha256", whole_source_sha256)?;
+        validate_digest("observed_sha256", observed_sha256)?;
+        validate_digest("owner_facts_sha256", owner_facts_sha256)?;
+        validate_digest(
+            "module_catalog_owner_readback_sha256",
+            module_catalog_owner_readback_sha256,
+        )?;
+        validate_digest("generation_admission_sha256", generation_admission_sha256)?;
+        for (field, value) in [
+            ("ready_receipt_ref", ready_receipt_ref.as_str()),
+            ("readback_receipt_id", readback_receipt_id.as_str()),
+        ] {
+            validate_text(field, value)?;
+        }
+        observed_fence
+            .validate()
+            .map_err(|_| WireValidationError::InvalidField("observed_fence"))?;
+        if bytes.len() > PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES as usize
+            || *observed_byte_length != bytes.len() as u64
+            || sha256_hex(bytes) != *observed_sha256
+            || chunk_offset.saturating_add(*observed_byte_length) > *whole_source_byte_length
+            || *source_owner_generation == 0
+            || *observed_at_unix_ms == 0
+        {
+            return Err(WireValidationError::InvalidField("readback_chunk"));
+        }
+        validate_canonical_owner_json("owner_facts_json", owner_facts_json, owner_facts_sha256)?;
+        validate_canonical_owner_json(
+            "module_catalog_owner_readback_json",
+            module_catalog_owner_readback_json,
+            module_catalog_owner_readback_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "generation_admission_json",
+            generation_admission_json,
+            generation_admission_sha256,
+        )?;
+        Ok(())
+    }
 }
 
 /// Shape and bounded-text error for this closed wire contract.
