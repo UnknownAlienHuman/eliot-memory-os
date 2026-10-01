@@ -34,6 +34,7 @@
 
 mod activation_outcome;
 mod attention_evaluation_commit;
+mod bridge_event_privacy_owner;
 mod campaign_source_publishers;
 mod campaign_task_sources;
 mod canonical_projections;
@@ -60,6 +61,13 @@ pub use attention_evaluation_commit::{
     check_attention_commit_receipt, collect_attention_evidence_refs,
     produce_and_commit_attention_evaluation, resolve_attention_lost_acknowledgement,
     validate_attention_evaluation_request, verify_attention_evaluation_readback,
+};
+pub use bridge_event_privacy_owner::{
+    BRIDGE_EVENT_PRIVACY_OWNER_SCHEMA_VERSION, BridgeEventDisclosureClosureOwner,
+    BridgeEventDisclosureDomainRule, BridgeEventPrivacyDecision, BridgeEventPrivacyError,
+    BridgeEventPrivacyOwnerSnapshot, BridgeEventPrivacyRecipient, BridgeEventRetentionDisposition,
+    BridgeEventRetentionPolicy, BridgeEventRetentionRule, BridgeEventSourcePrivacyClass,
+    decide_bridge_event_disclosure,
 };
 pub use cold_start_surface::ColdStartHumanBoardView;
 pub use cold_start_trigger::ColdStartTriggerCompilation;
