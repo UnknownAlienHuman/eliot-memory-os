@@ -93,6 +93,7 @@ pub use profile_run::{
 pub use profile_replay::{
     ProfileReplayError, ProfileReplayReceipt, ReplayObservedInputs, VerifiedTestdReplayContext,
     current_testd_provider_registry, observed_invalidation_set, replay_profile_stream,
+    testd_builtin_profile_registry,
 };
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
