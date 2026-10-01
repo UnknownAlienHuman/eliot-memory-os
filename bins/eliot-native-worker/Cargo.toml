@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 eliot-agent-claude = { path = "../../crates/agent/eliot-agent-claude", version = "0.1.0" }
+eliot-agent-api = { path = "../../crates/agent/eliot-agent-api", version = "0.1.0" }
 eliot-agent-codex = { path = "../../crates/agent/eliot-agent-codex", version = "0.1.0" }
 eliot-agent-opencode = { path = "../../crates/agent/eliot-agent-opencode", version = "0.1.0" }
 eliot-cli.workspace = true

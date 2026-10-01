@@ -34,6 +34,9 @@ mod kernel_admission_client;
 /// would fork the types and void the proof.
 pub mod adapter_registry;
 
+/// Retained per-attempt Claude execution behind owner-issued provider input.
+pub mod retained_claude;
+
 /// Governed action envelope for declared external-adapter operations
 /// (issue #1911, A10.1/A10.2/A10.3/A10.8). Added here so the `tests/`
 /// contract proof addresses the identical gate the contour drives.
@@ -2025,6 +2028,9 @@ pub mod admitted_material {
             "attempt_id": request.get("attempt_id").cloned().unwrap_or(serde_json::Value::Null),
             "operation_id": request.get("operation_id").cloned().unwrap_or(serde_json::Value::Null),
             "route_class": request.get("route_class").cloned().unwrap_or(serde_json::Value::Null),
+            "visibility": request.get("visibility").cloned().unwrap_or(serde_json::Value::Null),
+            "privacy_class": request.get("privacy_class").cloned().unwrap_or(serde_json::Value::Null),
+            "swarm_id": request.get("swarm_id").cloned().unwrap_or(serde_json::Value::Null),
             "budget": request.get("budget").cloned().unwrap_or(serde_json::Value::Null),
             "deadline_unix_ms": request.get("deadline_unix_ms").cloned().unwrap_or(serde_json::Value::Null),
             "cancellation_policy_id": request.get("cancellation_policy_id").cloned().unwrap_or(serde_json::Value::Null),
@@ -2285,6 +2291,11 @@ pub mod admitted_material {
                 "execute".to_owned(),
                 "inspect".to_owned(),
             ]),
+            // Owner-published legs echo the admitted claim verbatim (or
+            // `None` when the owner has not published them); never invented.
+            visibility: claim.visibility.clone(),
+            privacy_class: claim.privacy_class,
+            swarm_id: claim.swarm_id.clone(),
         };
 
         // Worker-originated reconcile and readiness for the exact admitted
@@ -2602,6 +2613,9 @@ mod tests {
             state_fence: fence(),
             wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
             executable_binding: with_join.then(|| join(route, adapter, nonce)),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
             binding_digest: "f".repeat(64),
         }
     }
@@ -2621,6 +2635,9 @@ mod tests {
             state_fence: fence(),
             route_ref: route.to_owned(),
             requested_capabilities: BTreeSet::from(["inspect".to_owned()]),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
         }
     }
 

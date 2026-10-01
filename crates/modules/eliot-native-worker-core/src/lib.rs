@@ -13,6 +13,7 @@ mod generated {
 }
 mod ports;
 mod protocol;
+mod retained_execution;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -64,6 +65,10 @@ pub use protocol::{
     NativeWorkerRegistration, PROTOCOL_VERSION, ReadinessBlockDimension, ReconnectRequest,
     WorkerEventDraft, WorkerEventEnvelope, WorkerEventPayload, WorkerFrame, WorkerFrameBody,
     WorkerHello, WorkerLifecycle, WorkerReady, WorkerRecovery, WorkerRequest,
+};
+pub use retained_execution::{
+    MAX_RETAINED_RESULT_BYTES, NativeWorkerRetainedOperationIdentity,
+    NativeWorkerRetainedOperationOutcome, NativeWorkerRetainedOutcomeKind,
 };
 
 pub const PROCESS_CONTRACT_VERSION: &str = PROCESS_CONTRACT_SCHEMA_VERSION;

@@ -45,8 +45,8 @@ use eliot_agent_api::{
 };
 use eliot_process::{
     CancellationReceipt, CancellationStatus, OperationId, ProcessEvidence, ProcessEvidenceSink,
-    ProcessExecutionError, ProcessExecutionView, ProcessExecutor, ProcessLifecycle, ProcessRequest,
-    SecretRef,
+    FencingToken, Generation, ProcessExecutionError, ProcessExecutionView, ProcessExecutor,
+    ProcessLifecycle, ProcessRequest, SecretRef,
 };
 
 use crate::{
@@ -462,6 +462,69 @@ pub struct ClaudeRunningSidecar {
     deadline_ms: u64,
     terminal_seen: bool,
     binding: ProviderExecutionBinding,
+}
+
+/// Reconstructs the local streaming cursor for an already-launched operation
+/// whose start acknowledgement was lost. The caller must first reconcile the
+/// exact operation; this function compares the returned ProcessEvidence to
+/// the independently saved operation, invocation digest, fence, generation,
+/// and original request before creating a parser cursor. It launches no
+/// process and accepts no caller-provided output bytes.
+pub fn restore_running_sidecar_after_reconcile(
+    binding: ProviderExecutionBinding,
+    request: ClaudeSidecarRequest,
+    operation_id: OperationId,
+    process_request_digest: &str,
+    process_fence: &FencingToken,
+    process_generation: Generation,
+    evidence: &ProcessEvidence,
+    started_at_ms: u64,
+) -> Result<ClaudeRunningSidecar, ClaudeSidecarError> {
+    request.validate()?;
+    validate_binding_for_claude(&binding)?;
+    if request.kind != ClaudeRequestKind::Query {
+        return Err(ClaudeSidecarError::MalformedFrame(
+            "factory admits query requests only",
+        ));
+    }
+    let plan = request
+        .launch_plan
+        .as_ref()
+        .ok_or(ClaudeSidecarError::EmptyField("launch_plan"))?;
+    if started_at_ms == 0 {
+        return Err(ClaudeSidecarError::ZeroField("started_at_ms"));
+    }
+    if evidence.operation_id() != &operation_id
+        || evidence.request_digest() != process_request_digest
+        || evidence.view().fence() != process_fence
+        || process_generation.get() != binding.runtime_generation.get()
+    {
+        return Err(ClaudeSidecarError::OperationMismatch {
+            expected: operation_id.as_str().to_owned(),
+            observed: evidence.operation_id().as_str().to_owned(),
+        });
+    }
+    let plan_bytes = serde_json::to_vec(plan)
+        .map_err(|_| ClaudeSidecarError::MalformedFrame("plan not serializable"))?;
+    let deadline_ms = started_at_ms
+        .checked_add(plan.wall_time_ms)
+        .ok_or(ClaudeSidecarError::TimeOutOfRange(
+            started_at_ms,
+            MIN_WALL_TIME_MS,
+            MAX_WALL_TIME_MS,
+        ))?;
+    Ok(ClaudeRunningSidecar {
+        operation_id,
+        invocation_digest: process_request_digest.to_owned(),
+        attempt_id: binding.attempt_id.as_str().to_owned(),
+        request_id: request.request_id,
+        plan_digest: claude_local_digest_256_hex(&plan_bytes),
+        prev_sequence: None,
+        frames_ingested: 0,
+        deadline_ms,
+        terminal_seen: false,
+        binding,
+    })
 }
 
 impl ClaudeRunningSidecar {
@@ -1056,14 +1119,27 @@ impl<E: ProcessExecutor + 'static> ClaudeSidecarFactory<E> {
         &self,
         running: &ClaudeRunningSidecar,
     ) -> Result<ProcessExecutionView, ClaudeSidecarError> {
+        self.inspect_same_operation(running.operation_id(), &running.attempt_id)
+            .await
+    }
+
+    /// Inspect one retained operation by its original operation and attempt
+    /// identities. This form also covers a lost start receipt, where no
+    /// `ClaudeRunningSidecar` handle could be returned but the process owner
+    /// still retains the operation.
+    pub async fn inspect_same_operation(
+        &self,
+        operation: &OperationId,
+        attempt_id: &str,
+    ) -> Result<ProcessExecutionView, ClaudeSidecarError> {
         let view = self
             .executor
-            .inspect(running.operation_id.clone())
+            .inspect(operation.clone())
             .await
-            .map_err(|error| map_executor(error, &running.attempt_id))?;
-        if view.operation_id() != &running.operation_id {
+            .map_err(|error| map_executor(error, attempt_id))?;
+        if view.operation_id() != operation {
             return Err(ClaudeSidecarError::OperationMismatch {
-                expected: running.operation_id.as_str().to_owned(),
+                expected: operation.as_str().to_owned(),
                 observed: view.operation_id().as_str().to_owned(),
             });
         }
@@ -1082,8 +1158,21 @@ impl<E: ProcessExecutor + 'static> ClaudeSidecarFactory<E> {
         running: &ClaudeRunningSidecar,
         envelope: &CancellationEnvelope,
     ) -> Result<ClaudeCancelRecord, ClaudeSidecarError> {
+        self.cancel_same_operation(running.operation_id(), &running.attempt_id, envelope)
+            .await
+    }
+
+    /// Cancel one retained operation by its original operation and attempt
+    /// identities. This form is used after a lost start receipt; it still
+    /// calls `cancel` on the exact operation held by the process executor.
+    pub async fn cancel_same_operation(
+        &self,
+        operation: &OperationId,
+        attempt_id: &str,
+        envelope: &CancellationEnvelope,
+    ) -> Result<ClaudeCancelRecord, ClaudeSidecarError> {
         envelope.validate()?;
-        if envelope.attempt_id != running.attempt_id {
+        if envelope.attempt_id != attempt_id {
             return Err(ClaudeSidecarError::BindingMismatch(
                 "cancellation envelope addresses another attempt".to_owned(),
             ));
@@ -1091,9 +1180,9 @@ impl<E: ProcessExecutor + 'static> ClaudeSidecarFactory<E> {
         let requested = request_cancel(envelope);
         let receipt: CancellationReceipt = self
             .executor
-            .cancel(running.operation_id.clone())
+            .cancel(operation.clone())
             .await
-            .map_err(|error| map_executor(error, &running.attempt_id))?;
+            .map_err(|error| map_executor(error, attempt_id))?;
         let acknowledged = acknowledge(requested);
         let cleanup = if receipt.lifecycle().is_terminal() {
             terminate(acknowledged)
@@ -1101,7 +1190,7 @@ impl<E: ProcessExecutor + 'static> ClaudeSidecarFactory<E> {
             acknowledged
         };
         Ok(ClaudeCancelRecord {
-            operation_id: running.operation_id.clone(),
+            operation_id: operation.clone(),
             status: receipt.status(),
             lifecycle: receipt.lifecycle(),
             no_effect_proven: receipt.no_effect_proven(),
@@ -1124,6 +1213,55 @@ impl<E: ProcessExecutor + 'static> ClaudeSidecarFactory<E> {
         attempt_id: &str,
         gate: &mut UnknownOutcomeGate,
     ) -> Result<ClaudeReconciled, ClaudeSidecarError> {
+        self.reconcile_same_operation_with_evidence(operation, attempt_id, gate)
+            .await
+            .map(|(reconciled, _evidence)| reconciled)
+    }
+
+    /// Reconcile and return the exact evidence observed for the same
+    /// operation. The evidence is the immutable executor output source used
+    /// by bounded provider parsers; it is never replaced by a preview or a
+    /// second operation. The retry gate is admitted only after operation
+    /// identity and the evidence-derived digest validate.
+    pub async fn reconcile_same_operation_with_evidence(
+        &self,
+        operation: &OperationId,
+        attempt_id: &str,
+        gate: &mut UnknownOutcomeGate,
+    ) -> Result<(ClaudeReconciled, ProcessEvidence), ClaudeSidecarError> {
+        self.reconcile_same_operation_inner(operation, attempt_id, None, gate)
+            .await
+    }
+
+    /// Reconcile against the exact process request retained by the caller.
+    /// The original invocation digest, fence, and generation are compared
+    /// before the unknown-outcome gate opens; a same-operation id alone is
+    /// not enough to release the original attempt.
+    pub async fn reconcile_same_operation_bound_with_evidence(
+        &self,
+        operation: &OperationId,
+        attempt_id: &str,
+        expected_request_digest: &str,
+        expected_fence: &FencingToken,
+        expected_generation: Generation,
+        gate: &mut UnknownOutcomeGate,
+    ) -> Result<(ClaudeReconciled, ProcessEvidence), ClaudeSidecarError> {
+        self.reconcile_same_operation_inner(
+            operation,
+            attempt_id,
+            Some((expected_request_digest, expected_fence, expected_generation)),
+            gate,
+        )
+        .await
+    }
+
+    async fn reconcile_same_operation_inner(
+        &self,
+        operation: &OperationId,
+        attempt_id: &str,
+        expected_process: Option<(&str, &FencingToken, Generation)>,
+        gate: &mut UnknownOutcomeGate,
+    ) -> Result<(ClaudeReconciled, ProcessEvidence), ClaudeSidecarError> {
         gate.validate()?;
         if gate.attempt_id != attempt_id {
             return Err(ClaudeSidecarError::BindingMismatch(
@@ -1141,17 +1279,30 @@ impl<E: ProcessExecutor + 'static> ClaudeSidecarFactory<E> {
                 observed: evidence.operation_id().as_str().to_owned(),
             });
         }
+        evidence.validate().map_err(map_process_contract)?;
+        if let Some((request_digest, fence, generation)) = expected_process
+            && (evidence.request_digest() != request_digest
+                || evidence.view().fence() != fence
+                || evidence.binding().generation() != generation)
+        {
+            return Err(ClaudeSidecarError::BindingMismatch(
+                "reconcile evidence differs from the original process request".to_owned(),
+            ));
+        }
         let bytes = serde_json::to_vec(&evidence).map_err(|_| {
             ClaudeSidecarError::ExecutorRejected("reconcile evidence not serializable".to_owned())
         })?;
         let digest = claude_local_digest_256_hex(&bytes);
         gate.admit_retry(&digest)?;
-        Ok(ClaudeReconciled {
-            operation_id: operation.clone(),
-            evidence_digest: digest,
-            stdout_present: evidence.stdout().is_some(),
-            stderr_present: evidence.stderr().is_some(),
-        })
+        Ok((
+            ClaudeReconciled {
+                operation_id: operation.clone(),
+                evidence_digest: digest,
+                stdout_present: evidence.stdout().is_some(),
+                stderr_present: evidence.stderr().is_some(),
+            },
+            evidence,
+        ))
     }
 }
 
@@ -2149,6 +2300,73 @@ mod tests {
             ClaudeFactoryOutcome::Prepared(_) => {}
             ClaudeFactoryOutcome::ReplayDuplicate { .. } => panic!("fresh key must prepare"),
         }
+        assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_operation_reconcile_returns_original_evidence_and_refuses_foreign_operation()
+    -> TestResult {
+        let (executor, factory) = factory();
+        let mut prepared = prepared_fixture()?;
+        let running = launched(&factory, &mut prepared).await?;
+        let operation = running.operation_id().clone();
+        let process_request = process_request_fixture()?;
+        let request_digest = process_request.invocation_digest().to_owned();
+        let fence = process_request.fence().clone();
+        let generation = process_request.generation();
+        drop(process_request);
+
+        let mut gate = UnknownOutcomeGate::new("attempt-claude-1".to_owned());
+        let (reconciled, evidence) = factory
+            .reconcile_same_operation_bound_with_evidence(
+                &operation,
+                "attempt-claude-1",
+                &request_digest,
+                &fence,
+                generation,
+                &mut gate,
+            )
+            .await?;
+        assert_eq!(reconciled.operation_id().as_str(), operation.as_str());
+        assert_eq!(evidence.operation_id(), &operation);
+        assert_eq!(evidence.request_digest(), request_digest.as_str());
+        assert_eq!(evidence.view().fence(), &fence);
+        assert!(gate.block_retry_or_route_switch().is_ok());
+
+        let restored = restore_running_sidecar_after_reconcile(
+            binding_fixture()?,
+            request_fixture(),
+            operation.clone(),
+            &request_digest,
+            &fence,
+            generation,
+            &evidence,
+            1_000,
+        )?;
+        assert_eq!(restored.operation_id(), &operation);
+        assert_eq!(restored.invocation_digest(), request_digest.as_str());
+        assert_eq!(restored.attempt_id(), "attempt-claude-1");
+
+        let mut foreign_gate = UnknownOutcomeGate::new("attempt-claude-1".to_owned());
+        let foreign = eliot_process::OperationId::new("op-claude-foreign")?;
+        assert!(matches!(
+            factory
+                .reconcile_same_operation_bound_with_evidence(
+                    &foreign,
+                    "attempt-claude-1",
+                    &request_digest,
+                    &fence,
+                    generation,
+                    &mut foreign_gate,
+                )
+                .await,
+            Err(ClaudeSidecarError::OperationNotFound)
+        ));
+        assert!(matches!(
+            foreign_gate.block_retry_or_route_switch(),
+            Err(ClaudeSidecarError::UnknownOutcomeRequiresReconcile { .. })
+        ));
         assert_eq!(executor.starts.load(Ordering::SeqCst), 1);
         Ok(())
     }

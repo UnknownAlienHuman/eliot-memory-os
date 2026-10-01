@@ -463,7 +463,7 @@ fn validate_adapter_id_shape(adapter_id: &str) -> Result<(), RegistryError> {
 }
 
 /// Bounds third-party error detail carried into typed failures.
-fn truncate_detail(detail: &str) -> String {
+pub(crate) fn truncate_detail(detail: &str) -> String {
     detail.chars().take(MAX_DETAIL_CHARS).collect()
 }
 
@@ -668,6 +668,21 @@ impl FactoryLedger {
         self.calls.push(call);
         Ok(())
     }
+
+    /// Conservatively reserves one provider construction against this exact
+    /// validated dispatch before the external start boundary. Unknown starts
+    /// remain recorded, so a later caller cannot issue a duplicate launch.
+    pub(crate) fn record_attempt_before_launch(
+        &mut self,
+        adapter: AdapterIdentity,
+        validated: &ValidatedDispatch,
+    ) -> Result<(), RegistryError> {
+        self.record(FactoryCall {
+            adapter,
+            operation_id: validated.operation_id.clone(),
+            claim_id: validated.claim_id.clone(),
+        })
+    }
 }
 
 /// Deterministic event entry bound to the admitted attempt stream.
@@ -792,7 +807,7 @@ fn finish_attempt(adapter: AdapterIdentity, validated: &ValidatedDispatch) -> Fa
 /// Checks the ledger before any factory effect, resolves the validated
 /// projection to exactly one entry, and refuses when the resolved factory
 /// differs from the invoked one.
-fn begin_invoke(
+pub(crate) fn begin_invoke(
     registry: &AdapterRegistry,
     validated: &ValidatedDispatch,
     factory: AdapterIdentity,

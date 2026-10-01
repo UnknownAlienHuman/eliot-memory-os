@@ -1955,6 +1955,56 @@ impl WindowsProcessExecutor {
         }
     }
 
+    /// Reads back the exact retained stdout bytes for one reconciled process
+    /// operation. The process owner remains the only source of the bytes: the
+    /// capture must have reached EOF without truncation, and its byte count
+    /// and SHA-256 must match the independently returned typed evidence. A
+    /// policy-withheld or transformed preview is refused before raw bytes are
+    /// exposed; callers receive no partial prefix as a provider result.
+    ///
+    /// # Errors
+    /// Returns `UnknownOutcome` when identity, completion, privacy, or byte
+    /// commitments do not prove that the retained output is complete.
+    pub fn readback_complete_stdout_bytes(
+        &self,
+        id: &OperationId,
+        evidence: &ProcessEvidence,
+    ) -> Result<Vec<u8>, ProcessExecutionError> {
+        evidence.validate()?;
+        if evidence.operation_id() != id {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let stdout = evidence
+            .stdout()
+            .ok_or(ProcessExecutionError::UnknownOutcome)?;
+        let preview = stdout.preview();
+        if stdout.stream() != ProcessStreamKind::Stdout
+            || stdout.transport() != StreamTransportStatus::Complete
+            || preview.representation() != eliot_process::StreamPreviewRepresentation::TransportBytes
+            || stdout.gaps().iter().any(|gap| {
+                matches!(
+                    gap,
+                    eliot_process::StreamEvidenceGap::PolicyProhibited
+                        | eliot_process::StreamEvidenceGap::RedactionFailed
+                )
+            })
+        {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        let (captured, _) = self.captured_output(id)?;
+        if !captured.captured
+            || !captured.complete
+            || captured.truncated
+            || captured.total_bytes != stdout.observed_bytes()
+            || short_digest(&captured.bytes) != stdout.observed_sha256()
+            || u64::try_from(preview.bytes().len()).ok() != Some(preview.retained_bytes())
+            || !captured.bytes.starts_with(preview.bytes())
+        {
+            return Err(ProcessExecutionError::UnknownOutcome);
+        }
+        Ok(captured.bytes)
+    }
+
     /// Removes terminal operations after their descendants and streams have
     /// been observed.  The executor remains the sole owner of this cleanup;
     /// callers never receive a raw child or Job handle.
@@ -5143,6 +5193,26 @@ mod tests {
         stderr_limit: u64,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessEvidence, Box<dyn std::error::Error>> {
+        let (_, _, evidence) = start_and_reconcile_with_capture_limit(
+            op_tag,
+            argv,
+            stdout_limit,
+            stderr_limit,
+            sink,
+            DEFAULT_CAPTURE_LIMIT,
+        )?;
+        Ok(evidence)
+    }
+
+    #[cfg(windows)]
+    fn start_and_reconcile_with_capture_limit(
+        op_tag: &str,
+        argv: Vec<String>,
+        stdout_limit: u64,
+        stderr_limit: u64,
+        sink: Arc<dyn ProcessEvidenceSink>,
+        capture_limit: usize,
+    ) -> Result<(WindowsProcessExecutor, OperationId, ProcessEvidence), Box<dyn std::error::Error>> {
         let executable = r"C:\Windows\System32\cmd.exe";
         let digest = super::sha256_file(std::path::Path::new(executable))?;
         let working_directory = std::env::temp_dir().to_string_lossy().into_owned();
@@ -5202,7 +5272,7 @@ mod tests {
             authority: Mutex::new(authority),
             context,
         };
-        let executor = WindowsProcessExecutor::new(Arc::new(port));
+        let executor = WindowsProcessExecutor::with_capture_limit(Arc::new(port), capture_limit);
         let _receipt = block_on(executor.start(request, sink))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -5219,7 +5289,8 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        Ok(block_on(executor.reconcile(operation_id.clone()))?)
+        let evidence = block_on(executor.reconcile(operation_id.clone()))?;
+        Ok((executor, operation_id, evidence))
     }
 
     #[cfg(windows)]
@@ -5304,6 +5375,131 @@ mod tests {
             small_stdout.observed_sha256()
         );
         let _ = std::fs::remove_file(&bat_path);
+        Ok(())
+    }
+
+    /// #22 Work/Acceptance: exercise the named full-output readback target.
+    /// Positive corpus: complete raw stdout larger than the inline preview
+    /// but smaller than the admitted capture ceiling. Refusal cases: foreign
+    /// operation identity, policy-withheld bytes, and policy-transformed
+    /// bytes never expose the raw capture.
+    #[test]
+    #[cfg(windows)]
+    fn complete_stdout_readback_requires_exact_complete_raw_owner_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use eliot_process::{
+            DurableProcessStreamSource, DurableStreamLocatorKind, ProcessStreamEvidence,
+            ProcessStreamKind, ProcessStreamPrefixPreview, ProcessStreamTransformationBinding,
+            StreamEvidenceGap, StreamPersistenceStatus, StreamTransportStatus,
+        };
+
+        let payload_len = super::EVIDENCE_PREVIEW_CEILING + 512;
+        let payload = vec![b'x'; payload_len];
+        let payload_path = std::env::temp_dir().join(format!(
+            "eliot-readback-{}-{}.txt",
+            std::process::id(),
+            super::now_ms()
+        ));
+        std::fs::write(&payload_path, &payload)?;
+        let capture_limit = payload_len + 1_024;
+        let stdout_limit = u64::try_from(capture_limit)?;
+        let (executor, operation_id, evidence) = start_and_reconcile_with_capture_limit(
+            "complete-readback",
+            vec![
+                "/c".to_owned(),
+                "type".to_owned(),
+                format!("\"{}\"", payload_path.to_string_lossy()),
+            ],
+            stdout_limit,
+            4_096,
+            Arc::new(RecordingSink::default()),
+            capture_limit,
+        )?;
+        let stdout = evidence
+            .stdout()
+            .ok_or("complete stdout evidence is required")?;
+        assert_eq!(stdout.transport(), StreamTransportStatus::Complete);
+        assert_eq!(stdout.preview().retained_bytes(), super::EVIDENCE_PREVIEW_CEILING as u64);
+        assert!(stdout.preview().is_truncated());
+        assert_eq!(
+            executor.readback_complete_stdout_bytes(&operation_id, &evidence)?,
+            payload
+        );
+
+        let foreign_operation = OperationId::new("foreign-readback-operation")?;
+        assert!(matches!(
+            executor.readback_complete_stdout_bytes(&foreign_operation, &evidence),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+
+        let withheld_stdout = ProcessStreamEvidence::new_raw(
+            stdout.binding().clone(),
+            ProcessStreamKind::Stdout,
+            stdout.policy().clone(),
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::SourceUnavailable,
+            stdout.observed_sha256().to_owned(),
+            stdout.observed_bytes(),
+            ProcessStreamPrefixPreview::withheld_by_policy(),
+            None,
+            vec![StreamEvidenceGap::PolicyProhibited],
+        )?;
+        let withheld = ProcessEvidence::new_typed(
+            evidence.view().clone(),
+            Some(withheld_stdout),
+            evidence.stderr().cloned(),
+            evidence.axes(),
+        )?;
+        assert!(matches!(
+            executor.readback_complete_stdout_bytes(&operation_id, &withheld),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+
+        let transformed_bytes = b"redacted-output";
+        let transformed_digest = super::short_digest(transformed_bytes);
+        let transformation = ProcessStreamTransformationBinding::new(
+            "receipt:readback-redaction",
+            stdout.observed_sha256(),
+            stdout.observed_bytes(),
+            transformed_digest.clone(),
+            u64::try_from(transformed_bytes.len())?,
+            stdout.policy().policy_ref(),
+            stdout.policy().redaction_ref(),
+        )?;
+        let transformed_source = DurableProcessStreamSource::policy_transformed(
+            DurableStreamLocatorKind::Blob,
+            format!("eliot://readback/{transformed_digest}"),
+            "receipt:readback-source-ready",
+            transformed_digest,
+            u64::try_from(transformed_bytes.len())?,
+            transformation,
+        )?;
+        let transformed_stdout = ProcessStreamEvidence::new_raw(
+            stdout.binding().clone(),
+            ProcessStreamKind::Stdout,
+            stdout.policy().clone(),
+            StreamTransportStatus::Complete,
+            StreamPersistenceStatus::CompleteSource,
+            stdout.observed_sha256().to_owned(),
+            stdout.observed_bytes(),
+            ProcessStreamPrefixPreview::from_source_prefix(
+                transformed_bytes.to_vec(),
+                u64::try_from(transformed_bytes.len())?,
+            )?,
+            Some(transformed_source),
+            Vec::new(),
+        )?;
+        let transformed = ProcessEvidence::new_typed(
+            evidence.view().clone(),
+            Some(transformed_stdout),
+            evidence.stderr().cloned(),
+            evidence.axes(),
+        )?;
+        assert!(matches!(
+            executor.readback_complete_stdout_bytes(&operation_id, &transformed),
+            Err(ProcessExecutionError::UnknownOutcome)
+        ));
+        let _ = std::fs::remove_file(payload_path);
         Ok(())
     }
 
