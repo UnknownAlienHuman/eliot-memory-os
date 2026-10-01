@@ -2,6 +2,7 @@ use crate::{
     EngineError, WriteAdmissionService, WriterHandle, codecortex_report_ref,
     context::CompletionGate, guard_work_lease_for_files, work::WorkLeaseGuardError,
 };
+use eliot_build_test_graph::{CARGO_TARGET_DIR_ENV, GovernedWorkEnvelope};
 use eliot_instrument_api::InstrumentKind;
 use eliot_instrument_runner::profile::{AdmittedProfile, InstrumentRegistry, ProfileCompiler};
 use eliot_instrument_runner::{BuildProjectionError, CargoOrigin, restrict_agent_argv};
@@ -41,6 +42,12 @@ pub struct VerifierHarness<'a> {
     repo_root: PathBuf,
     blob_store: Option<&'a BlobStore>,
     timeout_seconds: u64,
+    /// The admitted I2.22 lane this harness verifies in (issue #1897, AUD7).
+    ///
+    /// `None` means no lane was admitted for this verification, and a harness
+    /// without one launches no Cargo at all: see
+    /// [`VerifierHarness::with_governed_lane`].
+    lane: Option<GovernedWorkEnvelope>,
 }
 
 pub struct PatchRunnerInput<'a> {
@@ -99,7 +106,7 @@ impl<'a> PatchRunner<'a> {
         };
 
         let diff_path = write_temp_diff(&input.request.diff.text)?;
-        let check = run_bounded_command(
+        let check = run_bounded_git_command(
             "git",
             &git_apply_args(&self.repo_root, true, false, &diff_path),
             &self.repo_root,
@@ -166,7 +173,7 @@ impl<'a> PatchRunner<'a> {
         };
 
         let diff_path = write_temp_diff(&input.request.diff.text)?;
-        let check_output = run_bounded_command(
+        let check_output = run_bounded_git_command(
             "git",
             &git_apply_args(&self.repo_root, true, false, &diff_path),
             &self.repo_root,
@@ -194,7 +201,7 @@ impl<'a> PatchRunner<'a> {
             ));
         }
 
-        let apply_output = run_bounded_command(
+        let apply_output = run_bounded_git_command(
             "git",
             &git_apply_args(&self.repo_root, false, false, &diff_path),
             &self.repo_root,
@@ -269,7 +276,7 @@ impl<'a> PatchRunner<'a> {
             ));
         }
 
-        let rollback_output = run_bounded_command(
+        let rollback_output = run_bounded_git_command(
             "git",
             &git_apply_args(&self.repo_root, false, true, &diff_path),
             &self.repo_root,
@@ -423,7 +430,33 @@ impl<'a> VerifierHarness<'a> {
             repo_root: repo_root.into(),
             blob_store,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            lane: None,
         }
+    }
+
+    /// Admits the governed I2.22 lane this harness verifies in.
+    ///
+    /// Issue #1897 (AUD7): a Cargo verifier requirement is a mutating build, and
+    /// I2.22 states that governed instruments do not use the repository
+    /// `target/` directory by default. The only target root this lane may use is
+    /// the one its retained [`GovernedWorkEnvelope`] derives, so the retained
+    /// envelope — not the repository layout, the project id, or a counter — is
+    /// what this harness installs. The tuple is admitted with
+    /// [`GovernedWorkEnvelope::admit`] before the first launch, so a lane with
+    /// no declared claim, an unleased claim, or a lease held by another work
+    /// item cannot execute.
+    ///
+    /// Every product caller builds the envelope from the work item it already
+    /// holds — that item's own identity, its real canonical checkout, the
+    /// SHA-256 of that checkout's real manifest, and a live
+    /// `eliot_testd_core::ResourceLeaseAllocator` grant — so the governed lane
+    /// is measured rather than a named constant. A caller that installs no lane
+    /// keeps the fail-closed refusal recorded by
+    /// [`ungoverned_verifier_run`].
+    #[must_use]
+    pub fn with_governed_lane(mut self, lane: &GovernedWorkEnvelope) -> Self {
+        self.lane = Some(lane.clone());
+        self
     }
 
     #[must_use]
@@ -541,12 +574,46 @@ impl<'a> VerifierHarness<'a> {
                 ));
             }
         };
-        let output = run_bounded_command(
+        // Issue #1897 (AUD7): this is the lane's only mutating build launch, and it
+        // must run under the governed target root its retained envelope derives.
+        // `admit` is the complete gate — a non-empty claim set, every claim
+        // leased, every lease claimed, every lease granted to this work item —
+        // so an unadmitted lane never reaches a process. Without a lane there is
+        // no governed root at all, and a Cargo invocation with no
+        // `CARGO_TARGET_DIR` falls back to the repository `target/` directory;
+        // that shared directory is the collision this item exists to remove, so
+        // nothing launches instead.
+        let Some(lane) = self.lane.as_ref() else {
+            return Ok(ungoverned_verifier_run(
+                project_id,
+                task_id,
+                agent_id,
+                requirement,
+                started_at,
+            ));
+        };
+        lane.admit()
+            .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
+        // The lane binds BOTH governed halves: the Cargo roots this invocation
+        // needs, and the fixture pair whose physical directory the namespace
+        // owns. Emitting the fixture bindings here is what makes the namespace an
+        // input to real fixture isolation on this lane rather than a stored
+        // label, and it is the same one derivation the `TestD` lane reads, so
+        // there is one fixture-root authority in the workspace.
+        let mut cargo_environment = lane
+            .cargo_environment()
+            .map_err(|error| EngineError::WriteRejected(error.to_string()))?;
+        cargo_environment.extend(
+            lane.fixture_environment()
+                .map_err(|error| EngineError::WriteRejected(error.to_string()))?,
+        );
+        let output = run_bounded_instrument_command(
             &admitted[0],
             &admitted[1..],
             &self.repo_root,
             self.timeout_seconds,
             self.blob_store,
+            &cargo_environment,
         )
         .await?;
         let status = if output.timed_out {
@@ -574,6 +641,42 @@ impl<'a> VerifierHarness<'a> {
             started_at,
         ))
     }
+}
+
+/// The refusal a Cargo verifier requirement records when no lane was admitted.
+///
+/// Issue #1897 (AUD7): there is no governed target root to build in without a
+/// retained [`GovernedWorkEnvelope`], and a Cargo invocation launched without one
+/// falls back to the repository `target/` directory that two work items in
+/// separate worktrees share. The requirement therefore fails closed before any
+/// process exists. It is a `Failed` run, not a pass and not a pass-shaped
+/// absence, and it stays quarantined (`QUARANTINED_LEGACY_LANE`) so it can never
+/// certify finish.
+fn ungoverned_verifier_run(
+    project_id: eliot_types::ProjectId,
+    task_id: eliot_types::TaskId,
+    agent_id: eliot_types::AgentId,
+    requirement: &VerifierRequirement,
+    started_at: OffsetDateTime,
+) -> VerifierRun {
+    verifier_run(
+        project_id,
+        task_id,
+        agent_id,
+        requirement,
+        VerifierStatus::Failed,
+        None,
+        0,
+        None,
+        None,
+        format!(
+            "{QUARANTINED_LEGACY_LANE} no admitted GovernedWorkEnvelope supplies a governed \
+             target root, and an ungoverned invocation would build in the shared repository \
+             target/ directory (issue #1897, I2.22 target roots); this requirement fails closed \
+             without launching a process"
+        ),
+        started_at,
+    )
 }
 
 impl PatchMemoryWriter {
@@ -876,10 +979,16 @@ fn fixed_verifier_command(kind: VerifierCommandKind) -> Option<FixedCommand> {
 /// equal the argv of a live [`ProjectedBuild`](eliot_instrument_runner::ProjectedBuild),
 /// and neither verifier lane owns an admitted work-item declaration to present
 /// one — no [`DeclaredWorkItem`](eliot_instrument_runner::DeclaredWorkItem)
-/// producer, no admitted [`GovernedWorkEnvelope`](eliot_instrument_runner::GovernedWorkEnvelope),
-/// and no [`BuildTestGraph`](eliot_build_test_graph::BuildTestGraph) source
-/// exists at either seam — so claiming that origin here would be an unbacked
-/// assertion rather than an admission.
+/// producer and no [`BuildTestGraph`](eliot_build_test_graph::BuildTestGraph)
+/// source exists at either seam — so claiming that origin here would be an
+/// unbacked assertion rather than an admission.
+///
+/// Issue #1897 (AUD7) separates the two guarantees this admission point was
+/// asked for. The projected origin above is still absent, because it needs a
+/// work-item declaration producer. The governed TARGET ROOT is not absent: it is
+/// supplied by the retained [`GovernedWorkEnvelope`] the caller installs through
+/// [`VerifierHarness::with_governed_lane`], and a requirement with no such lane
+/// fails closed instead of building in the repository `target/` directory.
 ///
 /// # Errors
 ///
@@ -1187,7 +1296,7 @@ async fn target_file_dirty(repo_root: &Path, file: &str) -> Result<bool, EngineE
         file.to_owned(),
     ];
     let output =
-        run_bounded_command("git", &args, repo_root, DEFAULT_TIMEOUT_SECONDS, None).await?;
+        run_bounded_git_command("git", &args, repo_root, DEFAULT_TIMEOUT_SECONDS, None).await?;
     if !output.success {
         return Err(EngineError::WriteRejected(
             "git status failed for patch target".to_owned(),
@@ -1205,7 +1314,7 @@ async fn git_head(repo_root: &Path) -> Result<Option<String>, EngineError> {
         "HEAD".to_owned(),
     ];
     let output =
-        run_bounded_command("git", &args, repo_root, DEFAULT_TIMEOUT_SECONDS, None).await?;
+        run_bounded_git_command("git", &args, repo_root, DEFAULT_TIMEOUT_SECONDS, None).await?;
     if !output.success {
         return Ok(None);
     }
@@ -1233,12 +1342,74 @@ fn git_apply_args(repo_root: &Path, check: bool, reverse: bool, diff_path: &Path
     args
 }
 
-async fn run_bounded_command<S>(
+async fn run_bounded_git_command<S>(
     program: &str,
     args: &[S],
     cwd: &Path,
     timeout_seconds: u64,
     blob_store: Option<&BlobStore>,
+) -> Result<BoundedCommandOutput, EngineError>
+where
+    S: AsRef<str>,
+{
+    // Issue #1897 (AUD7): `git` is the source lane, not a build lane.
+    // `apply`/`status`/`rev-parse` read and mutate the checkout itself and
+    // consult no Cargo environment, so this launcher deliberately takes no
+    // environment parameter at all: the governed Cargo binding cannot be
+    // (mis)applied to it, and `git` can never be handed a target root it does
+    // not own. The binding the shared launcher used to install for Cargo was
+    // `<cwd>/target`, which for every mutating engine caller is the REPOSITORY
+    // `target/` directory — a predictable name, not isolation.
+    spawn_bounded_command(program, args, cwd, timeout_seconds, blob_store, &[]).await
+}
+
+async fn run_bounded_instrument_command<S>(
+    program: &str,
+    args: &[S],
+    cwd: &Path,
+    timeout_seconds: u64,
+    blob_store: Option<&BlobStore>,
+    cargo_environment: &[(String, String)],
+) -> Result<BoundedCommandOutput, EngineError>
+where
+    S: AsRef<str>,
+{
+    // Issue #1897 (AUD7): this is the mutating build lane. I2.22 states
+    // governed instruments do not use the repository `target/` directory by
+    // default, and an invocation that does not bind `CARGO_TARGET_DIR` falls
+    // back to exactly that shared directory. A predictable name is not
+    // ownership either, so the environment is not computed here: the caller
+    // passes the bindings its retained `GovernedWorkEnvelope` derives, and this
+    // refuses anything that does not bind the target root rather than
+    // launching into the shared fallback.
+    if !cargo_environment
+        .iter()
+        .any(|(variable, _)| variable == CARGO_TARGET_DIR_ENV)
+    {
+        return Err(EngineError::WriteRejected(
+            "governed Cargo invocation has no admitted target root (issue #1897, I2.22 target \
+             roots)"
+                .to_owned(),
+        ));
+    }
+    spawn_bounded_command(
+        program,
+        args,
+        cwd,
+        timeout_seconds,
+        blob_store,
+        cargo_environment,
+    )
+    .await
+}
+
+async fn spawn_bounded_command<S>(
+    program: &str,
+    args: &[S],
+    cwd: &Path,
+    timeout_seconds: u64,
+    blob_store: Option<&BlobStore>,
+    environment: &[(String, String)],
 ) -> Result<BoundedCommandOutput, EngineError>
 where
     S: AsRef<str>,
@@ -1252,8 +1423,14 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if program == "cargo" {
-        command.env("CARGO_TARGET_DIR", cwd.join("target"));
+    // Issue #1897 (AUD7): the repository `target/` assignment this launcher
+    // used to install for every Cargo verifier is GONE. Concurrent patch work in
+    // separate worktrees collided through one shared repository target, which is
+    // a collision and not merely a governance violation. The governed bindings
+    // arrive from the caller's retained envelope and are applied verbatim; this
+    // function invents none.
+    for (variable, value) in environment {
+        command.env(variable, value);
     }
     let child = command.spawn()?;
     let result = tokio::time::timeout(

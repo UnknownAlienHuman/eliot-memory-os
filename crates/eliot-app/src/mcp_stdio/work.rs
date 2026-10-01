@@ -6,6 +6,9 @@
 //! chain lives in one module.
 
 use super::*;
+// Issue #1897: the MCP patch-apply route verifies in the same measured governed
+// lane as the CLI route.
+use crate::verifier_lane::governed_verifier_lane;
 
 pub(super) async fn dispatch_action_plan(state: &McpState, arguments: Value) -> Result<Value> {
     let input: ActionPlanToolInput = serde_json::from_value(arguments)?;
@@ -99,7 +102,17 @@ pub(super) async fn dispatch_patch_apply(state: &McpState, arguments: Value) -> 
     let work_lease = patch_work_lease(&lease, &report, &verifier_plan);
     let repo_root = patch_repo_root(&lease)?;
     let runner = PatchRunner::new(&repo_root, Some(&blob_store));
-    let verifier = VerifierHarness::new(&repo_root, Some(&blob_store));
+    // Issue #1897 (AUD7): the MCP patch-apply route verifies in the same MEASURED
+    // governed lane as the CLI route. Deriving it here from this request's own
+    // identity and real checkout is what keeps a harness without a lane failing
+    // closed instead of building in the shared repository `target/` directory.
+    let lane = governed_verifier_lane(
+        &request.patch_request_id.to_string(),
+        &request.project_id.to_string(),
+        &repo_root,
+        &verifier_plan,
+    )?;
+    let verifier = VerifierHarness::new(&repo_root, Some(&blob_store)).with_governed_lane(&lane);
     let incident_lockdown_active = IncidentService::new(&state.root).lockdown_active()?;
     let (mut patch_run, mut verifier_runs) = runner
         .apply(

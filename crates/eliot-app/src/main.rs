@@ -21,6 +21,7 @@ mod runtime_instance;
 mod runtime_integrity;
 mod security_scan;
 mod ul_cross_agent_runner;
+mod verifier_lane;
 mod windows_service;
 
 use anyhow::{Context as _, Result};
