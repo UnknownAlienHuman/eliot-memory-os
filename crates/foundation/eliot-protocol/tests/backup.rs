@@ -24,13 +24,23 @@
 //! | `BackupArchiveValidityAttestation` | `eliot.protocol.backup.archive-validity-attestation` |
 //! | `BackupCutoverReceipt` | `eliot.protocol.backup.cutover-receipt` |
 //!
-//! Role table (authenticated role travels as a separate fn argument):
+//! Role table (authenticated role travels as a separate fn argument).
+//!
+//! The permitted set of every role is the closed projection of
+//! [`BackupRole::capabilities`] in `eliot-protocol::backup`, and the table below
+//! is documentation of that owner, never a second source for it: the roles that
+//! need separating from their neighbours are named individually below and the
+//! assertion in `backup_vocabulary_round_trips_catalogues` reads the owner's own
+//! projection for all of them, so a change to the owner's table fails here
+//! instead of leaving this prose quietly divergent. A role that is not named
+//! below carries exactly what the owner says it carries.
 //!
 //! | Role | Permitted operations |
 //! |---|---|
 //! | REQUESTER | REQUEST_CAPTURE, READ_SNAPSHOT_PAGE, VERIFY_ARCHIVE, PREPARE_ISOLATED_RESTORE, RESTORE_STATUS, RECONCILE_RESTORE (no success receipts) |
 //! | CAPTURE_OWNER | own bounded snapshot only |
-//! | STORE_OWNER / ORS_OWNER / SPOOL_OWNER | own phase only (RESTORE_STEP, RESTORE_STATUS, RECONCILE_RESTORE) |
+//! | STORE_OWNER / ORS_OWNER | own phase only (RESTORE_STEP, RESTORE_STATUS, RECONCILE_RESTORE) |
+//! | SPOOL_OWNER | the owner's narrower projection: READ_SNAPSHOT_PAGE, RECONCILE_RESTORE — it applies no restore step (Store/Ors owner work) and holds no restore-status projection |
 //! | VERIFIER | VERIFY_ARCHIVE + COMPLETE_REHEARSAL only |
 //! | INSTALLATION_AUTHORITY | PREPARE_ISOLATED_RESTORE + ADMIT_CUTOVER alone |
 //! | HOST_FORENSIC | observe-only; never active authority |
