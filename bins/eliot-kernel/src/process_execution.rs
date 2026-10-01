@@ -1097,7 +1097,7 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
                             Ok(_) => {
                                 unresolved_any = true;
                                 "unresolved"
-                            },
+                            }
                             Err(change_monitor::ChangeMonitorError::LedgerPoisoned) => {
                                 return Err(GovernedProcessEffectPortError::LedgerPoisoned);
                             }
@@ -1118,7 +1118,10 @@ impl GovernedProcessEffectPort for KernelGovernedProcessEffectPort {
             observe_process("kernel.process.effect_readback_failed", "persist_failed");
         }
         if unresolved_any && change_monitor::persist_observation_transfer().is_err() {
-            observe_process("kernel.process.effect_readback_failed", "transfer_persist_failed");
+            observe_process(
+                "kernel.process.effect_readback_failed",
+                "transfer_persist_failed",
+            );
         }
         Ok(GovernedProcessChangeReceipt {
             targets,
