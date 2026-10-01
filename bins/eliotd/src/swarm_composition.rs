@@ -1341,8 +1341,9 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
     ///
     /// Returns the attach-class errors on canonical disagreement plus
     /// [`SwarmCompositionError::StaleLineage`],
-    /// [`SwarmCompositionError::InternalContract`], or
-    /// [`SwarmCompositionError::OwnerFailure`] from the runner.
+    /// [`SwarmCompositionError::InternalContract`],
+    /// [`SwarmCompositionError::DuplicateSlot`] for a ledger that names one
+    /// slot twice, or [`SwarmCompositionError::OwnerFailure`] from the runner.
     pub fn rehydrate_after_restart(
         &mut self,
         sealed: &AttachedPlan,
@@ -1415,11 +1416,20 @@ impl<'a, L: LaunchIntentLedger, R: ChildRunner> SwarmComposition<'a, L, R> {
         // stale route authority; a persisted intent whose operation, attempt,
         // cancellation, or fence lineage does not match the sealed
         // attachment is refused rather than reconciled under drifted
-        // lineage.
+        // lineage. A slot the ledger names twice is refused as well: the
+        // denominator is a finite closed set with one intent per slot, so a
+        // duplicated slot would double-count one child and corrupt restart
+        // accounting rather than reconcile.
         let persisted = self.ledger.intents();
         let mut children = Vec::with_capacity(persisted.len());
         let mut bindings: Vec<RouteBindingPin> = Vec::new();
+        let mut seen_slots = BTreeSet::new();
         for intent in &persisted {
+            if !seen_slots.insert(intent.slot.as_str()) {
+                return Err(SwarmCompositionError::DuplicateSlot {
+                    slot: intent.slot.clone(),
+                });
+            }
             reconcile_persisted_intent(intent, sealed, &mut bindings)?;
             let state = self.runner.observe(&intent.slot)?;
             children.push((intent.clone(), state));
