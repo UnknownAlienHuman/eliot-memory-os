@@ -19624,14 +19624,13 @@ impl RedbRecoveryStore {
         }
         // The custody-transfer guarantee is an explicit positive claim by the
         // receiving owner's contract: absence never reads as granted.
-        let custody_guaranteed =
-            request
-                .get("custody_guaranteed")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or(OrsError::InvalidField {
-                    field: "custody_guaranteed",
-                    reason: "owner receipt must state its custody-transfer guarantee explicitly",
-                })?;
+        let custody_guaranteed = request
+            .get("custody_guaranteed")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(OrsError::InvalidField {
+                field: "custody_guaranteed",
+                reason: "owner receipt must state its custody-transfer guarantee explicitly",
+            })?;
         let key = format!("{namespace}::{event_id}");
         let now_ms = current_unix_ms_u64()?;
         let write = self.database.begin_write().map_err(storage)?;
@@ -19707,12 +19706,11 @@ impl RedbRecoveryStore {
         {
             return Err(OrsError::DuplicateConflict);
         }
-        let record = Self::peek_bridge_event_row_in(write, key)?.ok_or(
-            OrsError::IntegrityProblem {
+        let record =
+            Self::peek_bridge_event_row_in(write, key)?.ok_or(OrsError::IntegrityProblem {
                 record_type: "bridge_event_record",
                 reason: "retained handoff lost its retained source".to_owned(),
-            },
-        )?;
+            })?;
         record.validate()?;
         if record.owner_namespace != access.namespace
             || record.stream_id != owner.local_stream
@@ -19793,8 +19791,7 @@ impl RedbRecoveryStore {
                     let resolves = stored.receiver_disposition
                         == BRIDGE_EVENT_HANDOFF_DISPOSITION_UNKNOWN
                         && (receiver_disposition == BRIDGE_EVENT_HANDOFF_DISPOSITION_APPLIED
-                            || receiver_disposition
-                                == BRIDGE_EVENT_HANDOFF_DISPOSITION_REJECTED);
+                            || receiver_disposition == BRIDGE_EVENT_HANDOFF_DISPOSITION_REJECTED);
                     if !resolves {
                         return Err(OrsError::DuplicateConflict);
                     }
@@ -20245,9 +20242,7 @@ impl RedbRecoveryStore {
                 });
             }
             if !row.retirement_eligible(owner, cursor.last_acked_sequence)
-                || !Self::bridge_handoff_receiver_terminal_in(
-                    write, access, owner, &row, &record,
-                )?
+                || !Self::bridge_handoff_receiver_terminal_in(write, access, owner, &row, &record)?
             {
                 // A nonterminal event stops the range: later positions
                 // are never terminalized past it.
@@ -20830,9 +20825,7 @@ impl RedbRecoveryStore {
             }
             Self::require_bridge_event_relation_in(write, &record, record_key.as_str())?;
             if !row.retirement_eligible(&owner, acked)
-                || !Self::bridge_handoff_receiver_terminal_in(
-                    write, &access, &owner, row, &record,
-                )?
+                || !Self::bridge_handoff_receiver_terminal_in(write, &access, &owner, row, &record)?
             {
                 continue;
             }
