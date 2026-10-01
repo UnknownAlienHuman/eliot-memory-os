@@ -1439,10 +1439,13 @@ fn validate_prepared_descriptor<B: JournalBackend>(
     }
 }
 
+/// Composition-owned callback for an exact durable journal head, or an unknown outcome.
+pub type JournalAppendObserver = Arc<dyn Fn(Option<(u64, String)>) + Send + Sync>;
+
 pub struct HostStateJournal<B> {
     backend: Mutex<B>,
     state: Mutex<HostState>,
-    append_observer: Mutex<Option<Arc<dyn Fn(Option<(u64, String)>) + Send + Sync>>>,
+    append_observer: Mutex<Option<JournalAppendObserver>>,
 }
 
 impl<B: JournalBackend> HostStateJournal<B> {
@@ -1462,10 +1465,7 @@ impl<B: JournalBackend> HostStateJournal<B> {
     /// observer for exact committed journal heads. The callback receives
     /// `None` when an append or reconciliation leaves commit outcome unknown.
     /// It is always called after backend and reducer locks have been released.
-    pub fn set_append_observer(
-        &self,
-        observer: Arc<dyn Fn(Option<(u64, String)>) + Send + Sync>,
-    ) -> Result<(), JournalError> {
+    pub fn set_append_observer(&self, observer: JournalAppendObserver) -> Result<(), JournalError> {
         *self
             .append_observer
             .lock()

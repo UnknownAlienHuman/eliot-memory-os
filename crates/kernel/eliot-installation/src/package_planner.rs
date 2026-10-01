@@ -99,7 +99,7 @@ pub(crate) fn package_inventory_roles(
     roles
 }
 
-fn release_symbols_present(
+pub(crate) fn release_symbols_present(
     names: impl IntoIterator<Item = String>,
 ) -> Result<bool, InstallationError> {
     let names = names.into_iter().collect::<BTreeSet<_>>();

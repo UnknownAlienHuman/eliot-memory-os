@@ -34,8 +34,8 @@ pub use error::{BackendError, JournalError, ReconcileOutcome};
 pub use journal::{
     AppendDisposition, AppendReceipt, EpochRetirementObservation, EpochRetirementQuery,
     EpochRetirementQueryError, HostStateJournal, JOURNAL_MAGIC, JOURNAL_VERSION,
-    WakeCancellationBatchObservation, WakeCancellationBatchQuery, WakeCancellationBatchQueryError,
-    readonly_project_host_state, record_checksum,
+    JournalAppendObserver, WakeCancellationBatchObservation, WakeCancellationBatchQuery,
+    WakeCancellationBatchQueryError, readonly_project_host_state, record_checksum,
 };
 pub use legacy::{LegacyHostStateImporter, LegacyHostStateSnapshot};
 pub use model::{
