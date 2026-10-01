@@ -60,6 +60,11 @@ pub use stop_census::{StoreStopObligationCensus, StoreStopObligationCounts};
 use crate::cutover_ownership::{
     GenerationCutoverOwnership, GenerationCutoverOwnershipReceipt, StoredCutoverOwnership,
 };
+use crate::model::{
+    BACKUP_VERIFY_SUCCESSION_GRANT_RECORD_TYPE, BackupVerifySuccessionDisposition,
+    BackupVerifySuccessionGrant, BackupVerifySuccessionGrantDisposition,
+    BackupVerifySuccessionRedemption,
+};
 use crate::{
     AcceptedPending, ActivationLifecycleRecord, ActivationLifecycleState,
     ActivationRecoverySnapshot, ActivationResultRetentionPhase, ActivationResultRetentionRecord,
@@ -296,6 +301,26 @@ const COLD_START_READINESS_BINDINGS: TableDefinition<&str, &str> =
 /// admitted write attempt.
 const BACKUP_VERIFICATION_RESULTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_backup_verification_results_v1");
+/// Durable owner-issued, single-use `backup.verify` succession grants (issue
+/// #2883 instruction 4).
+///
+/// One row per reconciliation the capture owner has authorized for a decided
+/// verification operation, keyed by a digest the OWNER derives from the
+/// operation's own identity, its own archive digest and the authenticated
+/// principal, scope and authority lineage allowed to succeed it. It is a new
+/// table in the existing ORS family with the Kernel capture owner as its one
+/// writer, beside [`BACKUP_VERIFICATION_RESULTS`] rather than inside it: the grant
+/// is a lifecycle artifact that outlives no answer and is never projected as one,
+/// and it must not become a mutable member of a row whose `reply_digest` and
+/// `same_binding` contract the verification answer already depends on.
+///
+/// Its size is bounded by the family beside it, not by callers: the key is
+/// derived from the binding content, so one decided operation can hold at most one
+/// grant and re-issuing is a refusal to re-arm. Eviction, TTL and export
+/// disposition stay with the operational retention owner that already owns
+/// `RowFamilyKind::BackupVerificationResults`; this delivery adds no deletion.
+const BACKUP_VERIFY_SUCCESSION_GRANTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_backup_verify_succession_grants_v1");
 /// Durable purge-ledger rows (issue #960; I5.13:44, A12.08, A13.7).
 ///
 /// One row per applied purge, keyed by the ledger entry's `purge_id`, holding
@@ -5459,6 +5484,22 @@ impl persistence_codec::PersistedValue for BackupVerificationResultRecord {
         self.validate()
     }
 }
+
+/// Binds the durable backup-verify succession grant to the ORS codec, so its row
+/// is encoded, decoded and re-validated exactly like every other record family in
+/// this store: the same JSON codec, the same `IntegrityProblem` record-type
+/// envelope on a bad decode, and the same fail-closed `validate()` gate on every
+/// read — which for this record re-derives its own key and its own integrity
+/// digest from the RECORDED binding, so a grant whose binding was rewritten in
+/// place fails its read instead of authorizing a reconciliation.
+impl persistence_codec::PersistedValue for BackupVerifySuccessionGrant {
+    const RECORD_TYPE: &'static str = BACKUP_VERIFY_SUCCESSION_GRANT_RECORD_TYPE;
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
 fn doctor_storage(error: impl std::fmt::Display) -> crate::DoctorLedgerError {
     crate::DoctorLedgerError::Storage(error.to_string())
 }
@@ -7468,6 +7509,181 @@ impl RedbRecoveryStore {
         };
         write.commit().map_err(storage)?;
         Ok(disposition)
+    }
+
+    /// Durably records the owner-issued, single-use succession grant for one
+    /// decided `backup.verify` operation (issue #2883 instruction 4).
+    ///
+    /// This is the WRITE half of the explicit owner-authorized
+    /// succession/recovery contract, and the caller of it is the capture owner,
+    /// not the transport caller: the grant's content is decided from the owner's
+    /// own archive report and the accepted request identity it was called under,
+    /// and the durable key is DERIVED from that content by
+    /// [`BackupVerifySuccessionGrant`]. No field of the row can be supplied or
+    /// influenced by a transport caller, so this method is the only way a
+    /// reconciliation grant comes into existence and a caller holding the
+    /// predecessor digest pair still holds nothing.
+    ///
+    /// It is written in one write transaction and is single-use BY CONSTRUCTION
+    /// rather than by a flag a later writer could reset: the key is a function of
+    /// the binding, so a second issuance of the same succession addresses the same
+    /// row and is answered
+    /// [`BackupVerifySuccessionGrantDisposition::AlreadyBound`] with no write at
+    /// all. A grant that was already consumed therefore cannot be re-armed by
+    /// re-verifying the same operation, and there is no code path that clears
+    /// `consumed_at_unix_ms`.
+    ///
+    /// An existing row at this key is decoded and re-validated through
+    /// [`persistence_codec::PersistedValue::validate_persisted`], which IS
+    /// `validate()`: it re-derives the row's own key and integrity digest from its
+    /// RECORDED binding, so a row whose binding was rewritten in place is an
+    /// integrity failure rather than a silent re-arm, and a row whose recorded
+    /// digest contradicts its own key is refused the same way.
+    pub fn issue_backup_verify_succession_grant(
+        &self,
+        grant: &BackupVerifySuccessionGrant,
+    ) -> Result<BackupVerifySuccessionGrantDisposition, OrsError> {
+        grant.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = grant.record_key();
+        let disposition = {
+            let mut table = write
+                .open_table(BACKUP_VERIFY_SUCCESSION_GRANTS)
+                .map_err(storage)?;
+            let staged_bytes = table
+                .get(key)
+                .map_err(storage)?
+                .map(|value| value.value().to_owned());
+            match staged_bytes {
+                None => {
+                    let payload = encode(grant)?;
+                    table.insert(key, payload.as_str()).map_err(storage)?;
+                    drop(table);
+                    BackupVerifySuccessionGrantDisposition::Issued
+                }
+                Some(bytes) => {
+                    let existing: BackupVerifySuccessionGrant = decode(&bytes)?;
+                    // The key IS the digest, so an existing row here is the same
+                    // binding by construction; anything else is a row that does not
+                    // agree with its own address, which is corruption and never a
+                    // reason to overwrite.
+                    if existing.grant_digest != grant.grant_digest {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: BACKUP_VERIFY_SUCCESSION_GRANT_RECORD_TYPE,
+                            reason: "existing succession grant contradicts its own durable key"
+                                .to_owned(),
+                        });
+                    }
+                    // Nothing is written in this arm, so the recorded consumption
+                    // of an already-spent grant stays exactly as it is.
+                    BackupVerifySuccessionGrantDisposition::AlreadyBound
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(disposition)
+    }
+
+    /// Redeems the owner-issued succession grant authorizing ONE `backup.verify`
+    /// reconciliation, consuming it durably in the same transaction
+    /// (issue #2883 instruction 4, acceptance clause 3).
+    ///
+    /// Everything that decides the answer is read and written inside ONE write
+    /// transaction, which is what makes the single-use property real rather than
+    /// advisory: two concurrent sessions presenting the same grant serialize here,
+    /// the second one reads the first one's committed consumption and is refused.
+    /// There is no read-then-write window in which both could proceed.
+    ///
+    /// The order of the gates is deliberate, and every one of them can fail:
+    ///
+    /// 1. the redemption's own field shapes, through
+    ///    [`BackupVerifySuccessionRedemption::validate`], so a malformed
+    ///    redemption is a typed refusal rather than a lookup under a nonsense key;
+    /// 2. the durable key, derived here from the redemption's own terms, so a
+    ///    caller that guesses names a key nothing is filed under;
+    /// 3. the grant row, decoded and re-validated from its RECORDED binding;
+    /// 4. [`BackupVerifySuccessionGrant::binds`] — every recorded predecessor and
+    ///    successor term against the presented ones;
+    /// 5. unspent, through [`BackupVerifySuccessionGrant::is_consumed`];
+    /// 6. the DUE ORDER: the redeeming session's transport fence must be strictly
+    ///    greater than the issuing session's, which excludes the issuing session
+    ///    and every earlier session;
+    /// 7. the named operation must be a real stored verification result whose OWN
+    ///    key, canonical request hash and archive digest are exactly the three the
+    ///    grant and the redemption name. This is what makes the grant non-forgeable
+    ///    by key: a grant that points at no row, or at a row holding different
+    ///    recorded values, is refused and NOTHING is consumed.
+    ///
+    /// Every refusal is [`BackupVerifySuccessionDisposition::NotAuthorized`], a
+    /// unit variant with no field, so this path cannot carry a stored value, a
+    /// stored digest or a distinction between the gates out of the store. A store
+    /// failure is a typed [`OrsError`] instead, and it is not downgraded to a
+    /// refusal: the caller must be able to tell an authorization answer from an
+    /// outage.
+    ///
+    /// The named result row is re-read here as an AUTHORIZATION CHECK and its
+    /// value is deliberately not returned. The route keeps projecting from the row
+    /// it read through
+    /// [`Self::load_backup_verification_result`], so there is exactly one source of
+    /// the projection on that path; this read exists to prove the grant names a
+    /// real operation, not to hand out a second copy of the answer.
+    pub fn redeem_backup_verify_succession_grant(
+        &self,
+        redemption: &BackupVerifySuccessionRedemption,
+    ) -> Result<BackupVerifySuccessionDisposition, OrsError> {
+        redemption.validate()?;
+        let key = redemption.grant_key()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let Some(staged_bytes) = (write
+            .open_table(BACKUP_VERIFY_SUCCESSION_GRANTS)
+            .map_err(storage)?
+            .get(key.as_str())
+            .map_err(storage)?
+            .map(|value| value.value().to_owned()))
+        else {
+            return Ok(BackupVerifySuccessionDisposition::NotAuthorized);
+        };
+        let mut grant: BackupVerifySuccessionGrant = decode(&staged_bytes)?;
+        if grant.is_consumed()
+            || !grant.binds(redemption)
+            || redemption.redeeming_session_epoch <= grant.issued_by_session_epoch
+        {
+            return Ok(BackupVerifySuccessionDisposition::NotAuthorized);
+        }
+        {
+            let table = write
+                .open_table(BACKUP_VERIFICATION_RESULTS)
+                .map_err(storage)?;
+            let Some(row_bytes) = table
+                .get(redemption.predecessor_namespace_digest.as_str())
+                .map_err(storage)?
+            else {
+                return Ok(BackupVerifySuccessionDisposition::NotAuthorized);
+            };
+            let row: BackupVerificationResultRecord = decode(row_bytes.value())?;
+            if row.record_key()? != redemption.predecessor_namespace_digest
+                || row.identity.identity_digest != redemption.predecessor_identity_digest
+                || row.archive_sha256 != redemption.predecessor_archive_sha256
+            {
+                return Ok(BackupVerifySuccessionDisposition::NotAuthorized);
+            }
+        }
+        grant.consumed_at_unix_ms = Some(redemption.observed_at_unix_ms);
+        grant.consumed_by_session_id = Some(redemption.redeeming_session_id.clone());
+        grant.validate()?;
+        {
+            let mut table = write
+                .open_table(BACKUP_VERIFY_SUCCESSION_GRANTS)
+                .map_err(storage)?;
+            let payload = encode(&grant)?;
+            table
+                .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(BackupVerifySuccessionDisposition::Redeemed {
+            grant: Box::new(grant),
+        })
     }
 
     /// Stages one P-04 host-request operation before any acknowledgement.
@@ -27609,6 +27825,27 @@ impl RedbRecoveryStore {
         Ok(())
     }
 
+    /// Materializes the durable `backup.verify` succession-grant table (issue
+    /// #2883 instruction 4).
+    ///
+    /// It is part of the base family beside
+    /// [`BACKUP_VERIFICATION_RESULTS`] and is created empty on every open exactly
+    /// like every other base table, so a redemption on a store where no owner ever
+    /// issued a grant reads authoritatively unauthorized instead of failing on a
+    /// missing table. No row is ever backfilled, inferred, migrated or upgraded
+    /// here: a grant exists only where the capture owner issued one, and a store
+    /// upgraded from a build that had no grant table has nothing to certify.
+    fn materialize_backup_verify_succession_grant_table(
+        write: &redb::WriteTransaction,
+    ) -> Result<(), OrsError> {
+        drop(
+            write
+                .open_table(BACKUP_VERIFY_SUCCESSION_GRANTS)
+                .map_err(storage)?,
+        );
+        Ok(())
+    }
+
     /// Materializes the base ORS table family and, when the store is new or
     /// already carries the exact v1 stage-resolution provenance, the
     /// stage-resolution schema marker.
@@ -27679,6 +27916,10 @@ impl RedbRecoveryStore {
         // every other base table, so a lookup on a store that never verified an
         // archive reads authoritatively absent. No row is backfilled or inferred.
         Self::materialize_backup_verification_table(write)?;
+        // #2883 instruction 4: the owner-issued succession-grant family, beside
+        // the verification results it authorizes reconciliations of and empty on
+        // every open for the same reason.
+        Self::materialize_backup_verify_succession_grant_table(write)?;
         drop(write.open_table(NATIVE_WORKER_CLAIMS).map_err(storage)?);
         drop(
             write
