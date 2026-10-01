@@ -71,7 +71,7 @@ use eliot_process::{
 };
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    Lease, NormalizedEvidence, RawArtifactStream, SourceObservationGitPort, TestJob, TestdError,
+    Lease, SourceObservationGitPort, TestJob, TestdError,
     TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
     evaluate_testd_verification, issue_process_admission,
 };
@@ -99,15 +99,6 @@ const SUPERVISION_CANCEL_GRACE_MS: u64 = 5_000;
 /// Reasons carry no secrets, paths, or raw output; they name the
 /// deterministic rule that produced the disposition.
 const MAX_REASON_CHARS: usize = 512;
-
-/// Prefix for raw-artifact handles synthesized from inline stream previews.
-///
-/// Inline previews have no durable locator; the handle only keys the exact
-/// retained bytes inside this shot's receipt. Resolving `Blob` /
-/// `OmittedPayload` durable locators into handles is future work that changes
-/// no semantics here: unresolvable streams are simply not recorded, and every
-/// recorded artifact keeps exactly one normalized reference either way.
-const INLINE_STREAM_HANDLE_PREFIX: &str = "testd-inline-stream";
 
 /// The governed physical-process contour for one admitted shot.
 ///
@@ -735,27 +726,6 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
         ..
     } = outcome;
     let finished_at = observation_clock(current_clock_ms());
-    let records = collector.snapshot();
-    let synthetic = match capture_inline_previews(
-        collector,
-        &claimed.invocation.profile,
-        &records,
-        finished_at,
-    ) {
-        Ok(synthetic) => synthetic,
-        Err(error) => {
-            finish_unknown(
-                store,
-                claimed,
-                lease,
-                collector,
-                format!(
-                    "raw capture failed after execution; outcome rescheduled as unknown: {error}"
-                ),
-            )?;
-            return Ok(());
-        }
-    };
     let (source_observation, observation_fault) =
         observe_terminal_source(observed, contour, &mut execution);
     if let Some(message) = observation_fault {
@@ -764,14 +734,6 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     let mut receipt =
         collector.verification_receipt_at(claimed, execution, started_at, finished_at);
     receipt.source_observation = source_observation;
-    for handle in &synthetic {
-        receipt.normalized.push(NormalizedEvidence {
-            kind: "process.observation".to_owned(),
-            summary: format!("one-shot worker observed inline stream {handle}"),
-            raw_handles: vec![handle.clone()],
-            execution,
-        });
-    }
     if receipt.validate(claimed).is_err() {
         finish_unknown(
             store,
@@ -908,66 +870,6 @@ fn observation_reason(view: &ProcessExecutionView) -> &'static str {
             "one-shot admitted drive mapped a non-terminal observation without effect"
         }
     }
-}
-
-/// Captures inline stream previews observed on the evidence sink as raw
-/// artifacts, preserving the exact bytes plus the truncated flag.
-///
-/// Raw capture is bytes-first: the digest stored with each artifact is always
-/// over the retained bytes, never over handle text. Streams with no retained
-/// bytes and no truncation carry nothing and are skipped; streams whose bytes
-/// live behind a durable `Blob` / omitted locator (or are withheld by
-/// policy) are left for future handle resolution and change no semantics.
-/// Returns the synthesized handles so the caller can reference each exactly
-/// once from normalized evidence.
-fn capture_inline_previews(
-    collector: &EvidenceCollector,
-    profile: &str,
-    records: &[ProcessEvidence],
-    captured_at: ClockReading,
-) -> Result<Vec<String>, TestdError> {
-    let mut synthetic = Vec::new();
-    for (index, record) in records.iter().enumerate() {
-        for (stream, evidence) in [("stdout", record.stdout()), ("stderr", record.stderr())]
-            .into_iter()
-            .filter_map(|(stream, evidence)| evidence.map(|evidence| (stream, evidence)))
-        {
-            let preview = evidence.preview();
-            let bytes = preview.bytes();
-            if bytes.is_empty() && !preview.is_truncated() {
-                continue;
-            }
-            let handle = format!("{INLINE_STREAM_HANDLE_PREFIX}-{index}-{stream}");
-            let stream_kind = if stream == "stdout" {
-                RawArtifactStream::Stdout
-            } else {
-                RawArtifactStream::Stderr
-            };
-            // Content domains stay disjoint per profile: discovery
-            // stdout is inventory, never run events, so it must never
-            // reach the run-event parser. Literals mirror the nextest
-            // owner's content-type constants without a dependency.
-            let content_type = if stream_kind == RawArtifactStream::Stdout {
-                if profile == eliot_testd_core::TESTD_LIST_PROFILE {
-                    "application/x-nextest-list-json"
-                } else {
-                    "application/x-nextest-libtest-json-plus"
-                }
-            } else {
-                "text/plain"
-            };
-            collector.record_raw_artifact_at(
-                handle.clone(),
-                content_type,
-                bytes.to_vec(),
-                preview.is_truncated(),
-                stream_kind,
-                captured_at,
-            )?;
-            synthetic.push(handle);
-        }
-    }
-    Ok(synthetic)
 }
 
 fn observation_clock(now: u64) -> ClockReading {
@@ -1130,175 +1032,3 @@ pub(crate) fn block_on_one_shot<F: Future>(future: F) -> F::Output {
     }
 }
 
-#[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test fixtures intentionally panic when construction invariants fail"
-)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-    use std::num::NonZeroU64;
-
-    use eliot_contracts::{EpochId, EpochLineageId};
-    use eliot_instrument_api::EvidenceAxes;
-    use eliot_platform::ClockObservation;
-    use eliot_process::{
-        ActionLeaseRef, DispatchAuthorityId, DispatchPermitAuthority, DispatchValidationContext,
-        EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation, ImageId, JobId,
-        KernelDispatchKey, PermitIssuance, PhysicalProcessBinding, ProcessHealth,
-        ProcessHealthStatus, ProcessId, ProcessIntent, ProcessState, ProcessStreamEvidence,
-        ProcessStreamKind, ProcessStreamPolicyBinding, ProcessStreamPrefixPreview, ProcessTreeId,
-        ResourceLimits, SessionId, StreamEvidenceGap, StreamPersistenceStatus,
-        StreamTransportStatus, SuspendedProcessIdentity,
-    };
-
-    fn admitted_test_view() -> ProcessExecutionView {
-        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
-            .expect("canonical test lineage");
-        let epoch = EpochId::new(lineage, NonZeroU64::new(7).expect("non-zero test sequence"))
-            .expect("valid test epoch");
-        let generation = Generation::new(1).expect("non-zero test generation");
-        let fence =
-            FencingToken::new(epoch.clone(), generation, "fence-1").expect("valid test fence");
-        let heads = BTreeMap::from([
-            ("authority".to_owned(), "a".repeat(64)),
-            ("state".to_owned(), "b".repeat(64)),
-        ]);
-        let intent = ProcessIntent::new(
-            OperationId::new("operation-1").expect("valid test operation"),
-            ProcessTreeId::new("tree-1").expect("valid test tree"),
-            JobId::new("job-1").expect("valid test job"),
-            ImageId::new("image-1").expect("valid test image"),
-            SessionId::new("session-1").expect("valid test session"),
-            generation,
-            "C:\\tools\\worker.exe",
-            "c".repeat(64),
-            vec!["--check".to_owned()],
-            "C:\\work",
-            EnvironmentProjection::new(
-                BTreeMap::from([("PATH".to_owned(), "C:\\Windows".to_owned())]),
-                Vec::new(),
-                EnvironmentInheritance::None,
-            )
-            .expect("valid test environment"),
-            ResourceLimits::new(10_000, Some(5_000), Some(1_048_576), 4096, 4096, 4)
-                .expect("valid test limits"),
-        )
-        .expect("valid test intent");
-        let authority_id = DispatchAuthorityId::new("authority-1").expect("valid test authority");
-        let key = KernelDispatchKey::from_secret_bytes([0x5a; 32]).expect("valid test key");
-        let mut authority = DispatchPermitAuthority::activate(authority_id, key);
-        let issuance = PermitIssuance::new(
-            ActionLeaseRef::new("lease-1").expect("valid test lease"),
-            fence.clone(),
-            heads.clone(),
-            100,
-            200,
-            "nonce-1",
-        )
-        .expect("valid test issuance");
-        let permit = authority
-            .issue(&intent, issuance)
-            .expect("authority issues the test permit");
-        let observed = SuspendedProcessIdentity::new(
-            ProcessId::new("process-1").expect("valid test process"),
-            ProcessTreeId::new("tree-1").expect("valid test tree"),
-            JobId::new("job-1").expect("valid test job"),
-            ImageId::new("image-1").expect("valid test image"),
-            SessionId::new("session-1").expect("valid test session"),
-            generation,
-            PhysicalProcessBinding::new(
-                4242,
-                11,
-                "C:\\tools\\worker.exe",
-                "Local\\Eliot-Process-Test",
-            )
-            .expect("valid physical binding"),
-            120,
-            "c".repeat(64),
-        )
-        .expect("valid observed identity");
-        let context = DispatchValidationContext::new(
-            ClockObservation {
-                valid_time_ms: Some(150),
-                known_time_ms: Some(150),
-                transaction_sequence: None,
-                monotonic_ns: Some(1),
-            },
-            fence,
-            epoch,
-            heads,
-            41,
-        )
-        .expect("valid validation context");
-        let request = ProcessRequest::new(intent, permit).expect("valid test process request");
-        let validated = authority
-            .validate_and_consume(request, observed, &context)
-            .expect("consumed test dispatch validates");
-        let mut state = ProcessState::from_validated(&validated);
-        state
-            .mark_resumed(
-                151,
-                ProcessHealth::new(ProcessHealthStatus::Healthy, true, 151, None)
-                    .expect("valid test health"),
-            )
-            .expect("test child resumes");
-        state.view()
-    }
-
-    #[test]
-    fn legacy_bearing_evidence_still_yields_native_synthetic_handle() {
-        let view = admitted_test_view();
-        let binding = view.binding().clone();
-        let stdout_bytes = b"inline-stdout-bytes".to_vec();
-        let stdout_total = u64::try_from(stdout_bytes.len()).expect("preview length fits u64");
-        let stdout = ProcessStreamEvidence::new_raw(
-            binding.clone(),
-            ProcessStreamKind::Stdout,
-            ProcessStreamPolicyBinding::new(
-                "p04:stream-policy:transport-preview-v1",
-                "p04:privacy:raw-transport-preview",
-                "p04:visibility:operation-diagnostic",
-                "p04:retention:bounded-prefix-only",
-                "p04:redaction:none-raw-preview",
-            )
-            .expect("valid test stream policy"),
-            StreamTransportStatus::Complete,
-            StreamPersistenceStatus::SourceUnavailable,
-            eliot_testd_core::sha256_hex(&stdout_bytes),
-            stdout_total,
-            ProcessStreamPrefixPreview::from_transport_prefix(stdout_bytes, stdout_total)
-                .expect("valid test preview"),
-            None,
-            vec![StreamEvidenceGap::PersistenceUnavailable],
-        )
-        .expect("valid inline stdout evidence");
-        let stderr = ProcessStreamEvidence::new_legacy_raw_reference(
-            binding,
-            ProcessStreamKind::Stderr,
-            "raw:legacy-stderr",
-        )
-        .expect("valid legacy stderr evidence");
-        let evidence =
-            ProcessEvidence::new_typed(view, Some(stdout), Some(stderr), EvidenceAxes::observed())
-                .expect("mixed legacy-bearing evidence validates");
-        assert_eq!(evidence.stdout_ref(), None);
-        assert_eq!(evidence.stderr_ref(), Some("raw:legacy-stderr"));
-
-        let collector = EvidenceCollector::default();
-        let synthetic = capture_inline_previews(
-            &collector,
-            eliot_testd_core::TESTD_PRODUCTIVE_PROFILE,
-            std::slice::from_ref(&evidence),
-            observation_clock(current_clock_ms()),
-        )
-        .expect("inline capture succeeds");
-        assert_eq!(synthetic, vec!["testd-inline-stream-0-stdout".to_owned()]);
-        assert!(
-            !synthetic.iter().any(|handle| handle == "raw:legacy-stderr"),
-            "synthetic handles stay on the native path; legacy text never becomes a handle"
-        );
-    }
-}

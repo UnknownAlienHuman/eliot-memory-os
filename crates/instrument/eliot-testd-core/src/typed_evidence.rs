@@ -31,6 +31,8 @@ use eliot_process::{
     StreamTransportStatus,
 };
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use thiserror::Error;
 
 use super::{TestdError, sha256_hex};
@@ -849,6 +851,28 @@ pub trait ProcessStreamSourceReadbackPort: Send + Sync {
     ) -> Result<ProcessStreamSourceReadbackObservation, TestdEvidenceError>;
 }
 
+/// Future returned by the asynchronous source-readback boundary.
+pub type ProcessStreamSourceReadbackFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<ProcessStreamSourceReadbackObservation, TestdEvidenceError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Asynchronous provider-neutral immutable-source readback port.
+///
+/// Production storage clients are asynchronous. This boundary lets Testd
+/// await their owner-produced bytes and receipt directly instead of blocking
+/// a daemon/runtime thread or fabricating a synchronous observation.
+pub trait AsyncProcessStreamSourceReadbackPort: Send + Sync {
+    /// Resolves one admitted immutable source without blocking its caller.
+    fn resolve<'a>(
+        &'a self,
+        request: &'a ProcessStreamSourceReadbackRequest,
+    ) -> ProcessStreamSourceReadbackFuture<'a>;
+}
+
 /// Ephemeral resolved source bytes for immediate parser input.
 ///
 /// Deliberately not serializable, so resolved bytes cannot be embedded in a
@@ -1311,6 +1335,31 @@ impl TestdStreamEvidenceBinding {
         port: &dyn ProcessStreamSourceReadbackPort,
         context: &TestdReadbackContext,
     ) -> Result<EphemeralSourceBytes, TestdEvidenceError> {
+        self.ensure_readback_eligible()?;
+        let request = self.readback_request(context)?;
+        request.validate()?;
+        let observation = port.resolve(&request)?;
+        self.apply_readback_observation(context, &request, observation)
+    }
+
+    /// Resolves and verifies source bytes through the asynchronous owner port.
+    ///
+    /// The same disposition, fence, ready-receipt, digest, and exact-length
+    /// checks as [`resolve_source`](Self::resolve_source) run before bytes are
+    /// returned to a parser. The provider future is awaited directly.
+    pub async fn resolve_source_async(
+        &mut self,
+        port: &dyn AsyncProcessStreamSourceReadbackPort,
+        context: &TestdReadbackContext,
+    ) -> Result<EphemeralSourceBytes, TestdEvidenceError> {
+        self.ensure_readback_eligible()?;
+        let request = self.readback_request(context)?;
+        request.validate()?;
+        let observation = port.resolve(&request).await?;
+        self.apply_readback_observation(context, &request, observation)
+    }
+
+    fn ensure_readback_eligible(&self) -> Result<(), TestdEvidenceError> {
         match self.disposition {
             TestdStreamDisposition::ReadbackPending
             | TestdStreamDisposition::PartialSource
@@ -1366,10 +1415,16 @@ impl TestdStreamEvidenceBinding {
                 });
             }
         }
-        let request = self.readback_request(context)?;
-        request.validate()?;
-        let observation = port.resolve(&request)?;
-        if let Err(error) = observation.verify_against(&request) {
+        Ok(())
+    }
+
+    fn apply_readback_observation(
+        &mut self,
+        context: &TestdReadbackContext,
+        request: &ProcessStreamSourceReadbackRequest,
+        observation: ProcessStreamSourceReadbackObservation,
+    ) -> Result<EphemeralSourceBytes, TestdEvidenceError> {
+        if let Err(error) = observation.verify_against(request) {
             self.disposition = disposition_for_readback_error(&error);
             return Err(error);
         }
@@ -1858,6 +1913,19 @@ impl TestdProcessEvidenceBundle {
         self.disposition = derive_evidence_disposition(&self.stdout, &self.stderr);
         outcomes
     }
+
+    /// Asynchronously resolves both explicit stream slots through the
+    /// provider port, preserving stdout/stderr independently and in order.
+    pub async fn resolve_pending_async(
+        &mut self,
+        port: &dyn AsyncProcessStreamSourceReadbackPort,
+        context: &TestdReadbackContext,
+    ) -> Vec<TestdStreamResolution> {
+        let stdout = resolve_slot_async(&mut self.stdout, port, context).await;
+        let stderr = resolve_slot_async(&mut self.stderr, port, context).await;
+        self.disposition = derive_evidence_disposition(&self.stdout, &self.stderr);
+        vec![stdout, stderr]
+    }
 }
 
 /// Explicit per-stream outcome of one readback resolution.
@@ -1955,6 +2023,100 @@ fn resolve_slot(
             stream: slot.stream,
             reason: "the admitted source already failed integrity verification",
         },
+        TestdStreamDisposition::Stale => TestdEvidenceError::SourceStale {
+            stream: slot.stream,
+            reason: "the admitted source is already stale",
+        },
+        TestdStreamDisposition::ReadbackPending
+        | TestdStreamDisposition::PartialSource
+        | TestdStreamDisposition::CompleteSource
+        | TestdStreamDisposition::UnknownOutcome => TestdEvidenceError::SourceUnknownOutcome {
+            stream: slot.stream,
+            reason: "unreachable resolvable disposition",
+        },
+    };
+    TestdStreamResolution::Refused {
+        stream: slot.stream,
+        error,
+    }
+}
+
+/// Async counterpart to `resolve_slot`; it never blocks the caller while the
+/// durable owner resolves immutable source bytes.
+async fn resolve_slot_async(
+    slot: &mut TestdStreamSlot,
+    port: &dyn AsyncProcessStreamSourceReadbackPort,
+    context: &TestdReadbackContext,
+) -> TestdStreamResolution {
+    let Some(binding) = slot.binding.as_mut() else {
+        return TestdStreamResolution::Refused {
+            stream: slot.stream,
+            error: TestdEvidenceError::SourceUnavailable {
+                stream: slot.stream,
+                reason: "the requested stream was never emitted",
+            },
+        };
+    };
+    if binding.needs_readback()
+        || matches!(
+            binding.disposition,
+            TestdStreamDisposition::CompleteSource | TestdStreamDisposition::UnknownOutcome
+        )
+    {
+        return match binding.resolve_source_async(port, context).await {
+            Ok(bytes) => {
+                slot.disposition = binding.disposition;
+                TestdStreamResolution::Resolved {
+                    stream: slot.stream,
+                    bytes,
+                }
+            }
+            Err(error) => {
+                slot.disposition = binding.disposition;
+                TestdStreamResolution::Refused {
+                    stream: slot.stream,
+                    error,
+                }
+            }
+        };
+    }
+    let error = match binding.disposition {
+        TestdStreamDisposition::LegacyMigrationRequired => {
+            TestdEvidenceError::LegacyStreamEvidenceUnavailable {
+                stream: slot.stream,
+                reason: "a legacy reference can never be expanded or satisfy verification",
+            }
+        }
+        TestdStreamDisposition::SourceUnavailable | TestdStreamDisposition::StreamNotEmitted => {
+            TestdEvidenceError::SourceUnavailable {
+                stream: slot.stream,
+                reason: "no durable source is admitted for this stream",
+            }
+        }
+        TestdStreamDisposition::PolicyProhibited => TestdEvidenceError::SourcePolicyProhibited {
+            stream: slot.stream,
+            reason: "policy forbids readback before any provider call",
+        },
+        TestdStreamDisposition::RedactionFailed => TestdEvidenceError::SourceRedactionFailed {
+            stream: slot.stream,
+            reason: "redaction failed before any provider call",
+        },
+        TestdStreamDisposition::Purged => TestdEvidenceError::SourcePurged {
+            stream: slot.stream,
+            reason: "the admitted source is already purged",
+        },
+        TestdStreamDisposition::RetentionBlocked => {
+            TestdEvidenceError::SourceRetentionBlocked {
+                stream: slot.stream,
+                reason: "retention still blocks readback of the admitted source",
+            }
+        }
+        TestdStreamDisposition::IntegrityBroken => {
+            TestdEvidenceError::SourceIntegrityBroken {
+                stream: slot.stream,
+                reason: "the admitted source already failed integrity verification",
+            }
+        }
         TestdStreamDisposition::Stale => TestdEvidenceError::SourceStale {
             stream: slot.stream,
             reason: "the admitted source is already stale",
