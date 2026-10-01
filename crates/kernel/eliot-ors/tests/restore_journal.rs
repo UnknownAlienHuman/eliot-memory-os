@@ -7,7 +7,8 @@
 //! files. No second database is created, `eliot-backup` is never imported, and
 //! no phase semantics, authority, or effect mutation lives here.
 
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eliot_contracts::sha256_hex;
@@ -17,6 +18,7 @@ use eliot_ors::{
     RESTORE_JOURNAL_SCHEMA_VERSION, RecoveryAccessClass, RecoveryEnvelopeContext,
     RecoveryPayloadEnvelope, RedbRecoveryStore, RestoreJournalArchiveClass,
     RestoreJournalOperation, RestoreJournalResult, RestoreJournalStreamBinding, StateFenceSnapshot,
+    test_support::{KernelFixtureDirectory, kernel_fixture_dir},
 };
 use eliot_platform::SecretReference;
 use eliot_security_contracts::{InstructionTaint, PrivacyClass};
@@ -117,23 +119,42 @@ fn read_fixture(name: &str) -> Result<serde_json::Value, Box<dyn std::error::Err
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn temp_db(case: &str) -> PathBuf {
-    let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(_) => 0,
-    };
-    std::env::temp_dir().join(format!(
-        "eliot-957-{case}-{}-{nanos}.redb",
-        std::process::id()
-    ))
+struct OwnedTempDb {
+    directory: KernelFixtureDirectory,
+    path: PathBuf,
 }
 
-fn open_db(case: &str) -> Result<(RedbRecoveryStore, PathBuf), Box<dyn std::error::Error>> {
-    let path = temp_db(case);
-    let _ = std::fs::remove_file(&path);
+impl OwnedTempDb {
+    fn new(case: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let directory = kernel_fixture_dir(&format!("restore-journal-{case}"))?;
+        let path = directory.join("journal.redb");
+        Ok(Self { directory, path })
+    }
+
+    fn directory(&self) -> &Path {
+        self.directory.as_ref()
+    }
+}
+
+impl Deref for OwnedTempDb {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for OwnedTempDb {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn open_db(case: &str) -> Result<(OwnedTempDb, RedbRecoveryStore), Box<dyn std::error::Error>> {
+    let path = OwnedTempDb::new(case)?;
     let store = RedbRecoveryStore::open(&path)?;
     store.ensure_restore_journal_schema()?;
-    Ok((store, path))
+    Ok((path, store))
 }
 
 fn binding(transaction: &str, writer: &str) -> RestoreJournalStreamBinding {
@@ -180,7 +201,7 @@ fn predecessor_of(sequence: u64, digest_value: &str) -> JournalPredecessor {
 // WORK_UNIT_CASE: 957/1
 #[test]
 fn exact_owner_neutral_transaction_identity() -> TestResult {
-    let (store, path) = open_db("01")?;
+    let (path, store) = open_db("01")?;
     let stream = "stream-957-01";
     let fixture: RestoreJournalStreamBinding =
         serde_json::from_value(read_fixture("stream-binding.json")?)?;
@@ -201,7 +222,7 @@ fn exact_owner_neutral_transaction_identity() -> TestResult {
 // WORK_UNIT_CASE: 957/2
 #[test]
 fn wrong_writer_fence_source_destination_archive_rejected() -> TestResult {
-    let (store, path) = open_db("02")?;
+    let (path, store) = open_db("02")?;
     let stream = "stream-957-02";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     for mutated in [
@@ -243,7 +264,7 @@ fn wrong_writer_fence_source_destination_archive_rejected() -> TestResult {
 // WORK_UNIT_CASE: 957/3
 #[test]
 fn durable_intent_append_and_reopen() -> TestResult {
-    let (store, path) = open_db("03")?;
+    let (path, store) = open_db("03")?;
     let stream = "stream-957-03";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let first_operation = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -275,7 +296,7 @@ fn durable_intent_append_and_reopen() -> TestResult {
 // WORK_UNIT_CASE: 957/4
 #[test]
 fn durable_result_index_sequence_atomicity() -> TestResult {
-    let (store, path) = open_db("04")?;
+    let (path, store) = open_db("04")?;
     let stream = "stream-957-04";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let verify_operation = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -309,7 +330,7 @@ fn durable_result_index_sequence_atomicity() -> TestResult {
 // WORK_UNIT_CASE: 957/5
 #[test]
 fn two_writers_same_predecessor_one_advance() -> TestResult {
-    let (store, path) = open_db("05")?;
+    let (path, store) = open_db("05")?;
     let stream = "stream-957-05";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let head_operation = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -337,7 +358,7 @@ fn two_writers_same_predecessor_one_advance() -> TestResult {
 // WORK_UNIT_CASE: 957/6
 #[test]
 fn exact_replay_returns_identical_receipt() -> TestResult {
-    let (store, path) = open_db("06")?;
+    let (path, store) = open_db("06")?;
     let stream = "stream-957-06";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let genesis = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -363,7 +384,7 @@ fn exact_replay_returns_identical_receipt() -> TestResult {
 // WORK_UNIT_CASE: 957/7
 #[test]
 fn changed_same_operation_payload_conflicts() -> TestResult {
-    let (store, path) = open_db("07")?;
+    let (path, store) = open_db("07")?;
     let stream = "stream-957-07";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let genesis = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -380,7 +401,7 @@ fn changed_same_operation_payload_conflicts() -> TestResult {
 // WORK_UNIT_CASE: 957/8
 #[test]
 fn lost_acknowledgement_reconciles_by_readback() -> TestResult {
-    let (store, path) = open_db("08")?;
+    let (path, store) = open_db("08")?;
     let stream = "stream-957-08";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let genesis = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -398,7 +419,7 @@ fn lost_acknowledgement_reconciles_by_readback() -> TestResult {
 // WORK_UNIT_CASE: 957/9
 #[test]
 fn acknowledged_record_survives_reopen_nothing_phantom() -> TestResult {
-    let (store, path) = open_db("09")?;
+    let (path, store) = open_db("09")?;
     let stream = "stream-957-09";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     assert!(
@@ -425,7 +446,7 @@ fn acknowledged_record_survives_reopen_nothing_phantom() -> TestResult {
 // WORK_UNIT_CASE: 957/10
 #[test]
 fn stale_missing_and_unbounded_history_fail_closed() -> TestResult {
-    let (store, path) = open_db("10")?;
+    let (path, store) = open_db("10")?;
     let stream = "stream-957-10";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let stale_operation = operation(
@@ -463,7 +484,7 @@ fn stale_missing_and_unbounded_history_fail_closed() -> TestResult {
 // WORK_UNIT_CASE: 957/11
 #[test]
 fn known_empty_distinct_from_unavailable() -> TestResult {
-    let (store, path) = open_db("11")?;
+    let (path, store) = open_db("11")?;
     let stream = "stream-957-11";
     let expected_binding = binding("tx-957-a", "writer-957-a");
     store.bind_restore_journal_stream(stream, &expected_binding)?;
@@ -489,7 +510,7 @@ fn known_empty_distinct_from_unavailable() -> TestResult {
 // WORK_UNIT_CASE: 957/12
 #[test]
 fn bounds_hold_and_prune_retains_unresolved() -> TestResult {
-    let (store, path) = open_db("12")?;
+    let (path, store) = open_db("12")?;
     let stream = "stream-957-12";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let verify_operation = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -592,7 +613,7 @@ fn bounds_hold_and_prune_retains_unresolved() -> TestResult {
 // WORK_UNIT_CASE: 957/13
 #[test]
 fn additive_schema_migration_replays_compatibly() -> TestResult {
-    let (store, path) = open_db("13")?;
+    let (path, store) = open_db("13")?;
     assert_eq!(
         store.ensure_restore_journal_schema()?,
         RESTORE_JOURNAL_SCHEMA_VERSION
@@ -630,7 +651,7 @@ fn additive_schema_migration_replays_compatibly() -> TestResult {
 // WORK_UNIT_CASE: 957/14
 #[test]
 fn payload_integrity_and_diagnostic_redaction() -> TestResult {
-    let (store, path) = open_db("14")?;
+    let (path, store) = open_db("14")?;
     let stream = "stream-957-14";
     store.bind_restore_journal_stream(stream, &binding("tx-957-a", "writer-957-a"))?;
     let genesis = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -662,7 +683,7 @@ fn payload_integrity_and_diagnostic_redaction() -> TestResult {
 // WORK_UNIT_CASE: 957/15
 #[test]
 fn temp_redb_concurrent_cas_and_reopen() -> TestResult {
-    let (store, path) = open_db("15")?;
+    let (path, store) = open_db("15")?;
     let stream = "stream-957-15".to_owned();
     store.bind_restore_journal_stream(&stream, &binding("tx-957-a", "writer-957-a"))?;
     let head_operation = operation("tx-957-a", "verify", 'a', 'b', None);
@@ -713,13 +734,9 @@ fn temp_redb_concurrent_cas_and_reopen() -> TestResult {
 // WORK_UNIT_CASE: 957/16
 #[test]
 fn guard_excludes_second_db_backup_dep_and_authority() -> TestResult {
-    let nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(_) => 0,
-    };
-    let dir = std::env::temp_dir().join(format!("eliot-957-16-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("journal.redb");
+    let owned = OwnedTempDb::new("16")?;
+    let dir = owned.directory();
+    let path = owned.as_ref().to_path_buf();
     let store = RedbRecoveryStore::open(&path)?;
     store.ensure_restore_journal_schema()?;
     let stream = "stream-957-16";
@@ -752,6 +769,5 @@ fn guard_excludes_second_db_backup_dep_and_authority() -> TestResult {
     ));
     drop(reopened);
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_dir(&dir);
     Ok(())
 }

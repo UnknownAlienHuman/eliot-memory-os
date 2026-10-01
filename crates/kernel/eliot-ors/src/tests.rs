@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use eliot_contracts::{
@@ -43,8 +43,6 @@ fn test_epoch(sequence: u64) -> EpochId {
     )
     .expect("epoch")
 }
-
-static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
 /// Provider for operational-surface projection tests (appendix P4).
 ///
@@ -140,7 +138,7 @@ impl CanonicalEvidenceProvider for GenesisHeadEvidence {
 }
 
 fn coordinator_with_evidence(
-    path: &PathBuf,
+    path: &Path,
     evidence: Arc<dyn CanonicalEvidenceProvider>,
 ) -> Result<OrsCoordinator, OrsError> {
     Ok(OrsCoordinator::new(RedbRecoveryStore::open_with_evidence(
@@ -148,20 +146,47 @@ fn coordinator_with_evidence(
     )?))
 }
 
-fn coordinator(path: &PathBuf) -> Result<OrsCoordinator, OrsError> {
+fn coordinator(path: &Path) -> Result<OrsCoordinator, OrsError> {
     coordinator_with_evidence(path, Arc::new(crate::test_support::KernelRouteEvidence))
 }
 
-fn database_path(label: &str) -> PathBuf {
-    let serial = NEXT_DATABASE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "eliot-ors-{label}-{}-{serial}.redb",
-        std::process::id()
-    ))
+struct TestDatabase {
+    _directory: crate::test_support::KernelFixtureDirectory,
+    path: PathBuf,
 }
 
-fn cleanup(path: &PathBuf) {
-    let _ignored = std::fs::remove_file(path);
+impl TestDatabase {
+    fn new(label: &str) -> Self {
+        let directory = crate::test_support::kernel_fixture_dir(label)
+            .expect("test database directory is exclusively owned");
+        let path = directory.join("ors.redb");
+        Self {
+            _directory: directory,
+            path,
+        }
+    }
+}
+
+impl Deref for TestDatabase {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TestDatabase {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn database_path(label: &str) -> TestDatabase {
+    TestDatabase::new(label)
+}
+
+fn cleanup(path: &TestDatabase) {
+    let _ignored = std::fs::remove_file(path.as_ref());
 }
 
 fn activation_result_record(
@@ -3404,7 +3429,7 @@ fn open_bound_replay_stream(
     generation: u64,
     epoch: u64,
     fence_digest: &str,
-) -> TestResult<(PathBuf, RedbRecoveryStore, String)> {
+) -> TestResult<(TestDatabase, RedbRecoveryStore, String)> {
     let path = database_path(label);
     cleanup(&path);
     let store = RedbRecoveryStore::open(&path)?;

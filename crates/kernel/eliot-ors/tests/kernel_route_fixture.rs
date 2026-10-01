@@ -166,8 +166,9 @@ fn kernel_route_fixture_binds_evidence_and_drives_reserve_eligible() {
 
 #[test]
 fn store_without_evidence_rejects_reservation() {
-    let dir = kernel_fixture_dir("2031-unbound").expect("2031 temp dir builds");
-    let plain = RedbRecoveryStore::open(dir.join("ors.redb")).expect("2031 plain store opens");
+    let dir = kernel_fixture_dir("2031-unbound").expect("2031 owned temp dir builds");
+    let plain = RedbRecoveryStore::open(dir.join("ors.redb"))
+        .expect("2031 plain store opens");
     let error = plain
         .stage_and_reserve(reservation_request("unbound"))
         .expect_err("2031 unbound store must refuse");
@@ -175,7 +176,7 @@ fn store_without_evidence_rejects_reservation() {
         matches!(error, OrsError::CanonicalEvidence(_)),
         "2031 refusal names the missing canonical evidence: {error}"
     );
-    let _ = std::fs::remove_dir_all(dir);
+    drop(plain);
 }
 
 #[test]
