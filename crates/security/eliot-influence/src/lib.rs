@@ -894,14 +894,40 @@ impl BoundedRevocationOutcome {
     ///
     /// The binding covers the dependent projections as well as the request
     /// identity. `affected_refs` is re-derived from the request's own
-    /// qualified-edge graph (see `permitted_dependent_closure`) and compared
+    /// qualified-edge graph (see `DeclaredEdgeClosure::propagating_closure`)
+    /// and compared
     /// by content, because no digest in this outcome covers that field; a
     /// receipt naming a dependent the request's graph cannot reach from the
     /// origin, repeating one, or omitting the origin itself refuses. The check
     /// is a superset test, so a paged or bound-truncated outcome is never
-    /// refused for being short. `frontier` and `omissions` are deliberately
-    /// excluded, since an omitted dependent is retained in the frontier
-    /// exactly when its edge was never propagated.
+    /// refused for being short.
+    ///
+    /// `omissions` and `frontier` are covered here too, against the same
+    /// independently derived expected set. Before this they were excluded on
+    /// the reading that an omitted dependent is retained in the frontier
+    /// exactly when its edge was never propagated — which is true, and is
+    /// exactly why excluding them left the guard blind. Both fields are
+    /// projections of the request's DECLARED dispositions, and no digest in
+    /// this outcome covers either one: `request_digest` binds the request,
+    /// `continuation_digest` binds the continuation, and a COMPLETE outcome
+    /// carries no continuation at all. A receipt whose omissions were stripped
+    /// therefore still carried every digest compared above and still passed,
+    /// while its affected set, the request's declared edge dispositions, and
+    /// the engine's own honest report disagreed. That disagreement is what an
+    /// authority consumer acts on: an omission is the only evidence that a
+    /// declared dependent was NOT revoked, and an empty omission set over a
+    /// graph that declares non-propagating edges reports a clear closure over
+    /// a denominator it never covered. Covering the projection is what makes
+    /// the documented purpose of this function true.
+    ///
+    /// Every recorded omission must name a declared edge whose own declared
+    /// disposition is the cause recorded for it, and — when `complete` — the
+    /// recorded set must EQUAL the expected set, because a complete traversal
+    /// expanded every admitted node and so examined every one of its declared
+    /// edges. An incomplete outcome is only required to be a subset: a page
+    /// that stopped before expanding a node legitimately never examined that
+    /// node's edges. `frontier` must be empty on a complete outcome, since
+    /// `frontier` is current unresolved work and a finished traversal has none.
     pub fn verify_binding(
         &self,
         request: &BoundedRevocationRequest,
@@ -932,20 +958,15 @@ impl BoundedRevocationOutcome {
         // the request the consumer holds, because nothing else in this outcome
         // authenticates them. `request_digest` and `bounds_digest` bind the
         // REQUEST; `continuation_digest` binds the continuation; no digest
-        // covers `affected_refs`. An outcome whose affected set was shortened
-        // or widened after the fact therefore carried every digest compared
-        // above and still passed, which made this guard the one place where a
-        // stored or foreign outcome became usable as a revocation's dependent
-        // closure while that closure was the one field the guard did not
-        // prove. Deriving it here is what makes the documented purpose of this
+        // covers `affected_refs`, `omissions` or `frontier`. A rewritten
+        // projection therefore carried every digest compared above and still
+        // passed, which made this guard the one place where a stored or
+        // foreign outcome became usable as a revocation's dependent closure
+        // while that closure was the one thing the guard did not prove.
+        // Deriving it here is what makes the documented purpose of this
         // function true.
-        //
-        // Only `affected_refs` is checked. `frontier` and `omissions` are
-        // deliberately NOT: an omitted dependent is retained in the frontier
-        // precisely when its edge was never propagated, so requiring frontier
-        // membership in the implied closure would refuse every honest
-        // cross-scope or stale omission.
-        let implied = permitted_dependent_closure(request);
+        let declared = declared_edge_closure(request)?;
+        let implied = declared.propagating_closure(&request.root_ref);
         let mut affected = BTreeSet::new();
         for reference in &self.affected_refs {
             // A duplicate would let one member of a rewritten set read as two
@@ -965,35 +986,164 @@ impl BoundedRevocationOutcome {
                 "outcome.affected_refs",
             ));
         }
+        // The omitted set is the OTHER half of the same projection: it is the
+        // only evidence that a declared dependent was examined and NOT revoked.
+        // Every recorded omission must name an edge this request declared, and
+        // the cause recorded must be the cause that edge's OWN declared
+        // disposition produces — never one the request does not state, and
+        // never a different cause for the same position.
+        //
+        // A `BoundsExhausted` omission is the one cause no declared disposition
+        // produces, because it is produced by a limit this engine enforced
+        // rather than by a disposition the caller declared. It is still
+        // bounded here: it must name a declared PERMITTED-CURRENT edge (only a
+        // propagating edge can consume admission budget) whose dependent the
+        // receipt did NOT report as affected, since a bound that stopped
+        // emission is precisely the case where a reachable dependent is
+        // withheld. An omission naming any other cause must match its declared
+        // disposition exactly.
+        let mut omitted: BTreeMap<(String, String), OmissionCause> = BTreeMap::new();
+        for omission in &self.omissions {
+            let position = (
+                omission.edge_source.clone(),
+                omission.edge_dependent.clone(),
+            );
+            if omitted.insert(position.clone(), omission.cause).is_some() {
+                return Err(InfluenceError::OutcomeBindingMismatch("outcome.omissions"));
+            }
+            let declared_cause = declared.cause_at(&position);
+            let consistent = match declared_cause {
+                Some(cause) => cause == omission.cause,
+                None => {
+                    omission.cause == OmissionCause::BoundsExhausted
+                        && declared.disposition_at(&position)
+                            == Some(InfluenceEdgeDisposition::PermittedCurrent)
+                        && !affected.contains(omission.edge_dependent.as_str())
+                }
+            };
+            if !consistent {
+                return Err(InfluenceError::OutcomeBindingMismatch("outcome.omissions"));
+            }
+        }
+        // On a COMPLETE outcome the recorded omissions must be the whole
+        // expected set. A complete traversal expanded every node it admitted,
+        // so it examined every declared edge leaving those nodes, and every
+        // non-propagating one of them was recorded. A missing entry is a
+        // declared dependent that was silently reported as neither revoked nor
+        // unresolved. An INCOMPLETE outcome is only required to be a subset: a
+        // page that stopped before expanding a node never examined its edges.
+        if self.complete {
+            let expected = declared.expected_omissions(&implied);
+            if omitted.len() != expected.len()
+                || expected
+                    .iter()
+                    .any(|(position, cause)| omitted.get(position) != Some(cause))
+            {
+                return Err(InfluenceError::OutcomeBindingMismatch("outcome.omissions"));
+            }
+            // `frontier` is CURRENT unresolved work, not a historical trace,
+            // and a traversal that finished within bounds has none. An omitted
+            // dependent is named by its omission, not by a residual frontier.
+            if !self.frontier.is_empty() {
+                return Err(InfluenceError::OutcomeBindingMismatch("outcome.frontier"));
+            }
+        }
         Ok(())
     }
 }
 
-/// The dependent set this request's own qualified-edge graph implies.
+/// The dependent projections the request's own DECLARED edge dispositions
+/// imply, derived once and reused by every comparison in `verify_binding`.
 ///
-/// Recomputed from the request the consumer holds and never read back from
-/// the receipt, so the comparison in `BoundedRevocationOutcome::verify_binding`
-/// is against an independent expected set rather than a second copy of the
-/// caller's own list. Only
-/// [`InfluenceEdgeDisposition::PermittedCurrent`] edges propagate, which is
-/// exactly the filter the bounded engine applies before it admits a
-/// dependent, so this set is a superset of anything a legitimate engine run
-/// can emit under any bound: bounds only ever shrink the admitted set, never
-/// widen it. A legitimately paged or truncated outcome is therefore never
-/// refused here.
-fn permitted_dependent_closure(request: &BoundedRevocationRequest) -> BTreeSet<String> {
-    let edges = request
-        .edges
-        .iter()
-        .filter(|edge| edge.disposition == InfluenceEdgeDisposition::PermittedCurrent)
-        .map(|edge| InfluenceEdge {
-            source_ref: edge.source_ref.clone(),
-            dependent_ref: edge.dependent_ref.clone(),
-        })
-        .collect::<Vec<_>>();
-    traverse_dependency_closure(&request.root_ref, &edges)
-        .into_iter()
-        .collect()
+/// Every lookup here is a direct index into the edge multiset the request
+/// carries. Nothing walks a map by iteration order to decide membership: an
+/// edge is found because the request declared that exact source/dependent
+/// position, never because it happened to be visited first.
+struct DeclaredEdgeClosure {
+    /// Every declared source/dependent position, with the disposition the
+    /// request states for it.
+    positions: BTreeMap<(String, String), InfluenceEdgeDisposition>,
+}
+
+impl DeclaredEdgeClosure {
+    /// The disposition the request declared at one exact edge position.
+    fn disposition_at(&self, position: &(String, String)) -> Option<InfluenceEdgeDisposition> {
+        self.positions.get(position).copied()
+    }
+
+    /// The omission cause the request's own declared disposition produces at
+    /// one exact edge position, or `None` when the declared disposition
+    /// propagates.
+    fn cause_at(&self, position: &(String, String)) -> Option<OmissionCause> {
+        self.disposition_at(position).and_then(omission_cause_for)
+    }
+
+    /// The references a complete traversal of this request must have admitted:
+    /// the transitive closure from `root` over the edges the request declared
+    /// PERMITTED-CURRENT, which is exactly the filter the bounded engine
+    /// applies before it admits a dependent. Bounds only ever shrink the
+    /// admitted set, never widen it, so this is a superset of anything a
+    /// legitimate run under any bound can emit and a paged outcome is never
+    /// refused here for being short.
+    fn propagating_closure(&self, root: &str) -> BTreeSet<String> {
+        let edges = self
+            .positions
+            .iter()
+            .filter(|(_, disposition)| **disposition == InfluenceEdgeDisposition::PermittedCurrent)
+            .map(|((source_ref, dependent_ref), _)| InfluenceEdge {
+                source_ref: source_ref.clone(),
+                dependent_ref: dependent_ref.clone(),
+            })
+            .collect::<Vec<_>>();
+        traverse_dependency_closure(root, &edges)
+            .into_iter()
+            .collect()
+    }
+
+    /// The omissions a complete traversal of this request must have recorded:
+    /// every declared non-propagating edge whose source the traversal reached.
+    fn expected_omissions(
+        &self,
+        admitted: &BTreeSet<String>,
+    ) -> BTreeMap<(String, String), OmissionCause> {
+        self.positions
+            .iter()
+            .filter_map(|((source_ref, dependent_ref), disposition)| {
+                let cause = omission_cause_for(*disposition)?;
+                admitted
+                    .contains(source_ref.as_str())
+                    .then(|| ((source_ref.clone(), dependent_ref.clone()), cause))
+            })
+            .collect()
+    }
+}
+
+/// The declared edge positions of one request, indexed for exact lookup.
+///
+/// A repeated position stating two DIFFERENT dispositions is refused with the
+/// same [`InfluenceError::DuplicateEdge`] the bounded engine refuses it with,
+/// rather than silently resolving to whichever copy came last: this guard is
+/// reachable on a request the caller never ran, so it must not pick a winner
+/// for a contradiction in the request it is being asked to prove. A repeated
+/// position stating the SAME disposition is one edge declared twice and is
+/// absorbed, matching `dedup_qualified_edges`.
+fn declared_edge_closure(
+    request: &BoundedRevocationRequest,
+) -> Result<DeclaredEdgeClosure, InfluenceError> {
+    let mut positions: BTreeMap<(String, String), InfluenceEdgeDisposition> = BTreeMap::new();
+    for edge in &request.edges {
+        let key = (edge.source_ref.clone(), edge.dependent_ref.clone());
+        match positions.get(&key) {
+            Some(existing) if *existing != edge.disposition => {
+                return Err(InfluenceError::DuplicateEdge);
+            }
+            Some(_) => {}
+            None => {
+                positions.insert(key, edge.disposition);
+            }
+        }
+    }
+    Ok(DeclaredEdgeClosure { positions })
 }
 
 impl<'de> Deserialize<'de> for BoundedRevocationOutcome {
