@@ -419,10 +419,8 @@ pub async fn scan_authority_revocation_ingress(
             // bytes plus the live admitted fence this pass is bound to, or
             // refuses it with a closed reason. The recovered status beside it
             // stays diagnostic-only and never enters the admission.
-            let admission = AdmittedMaintenanceRevocation::readmit_pending_closure(
-                &plan.state_fence,
-                &closure,
-            );
+            let admission =
+                AdmittedMaintenanceRevocation::readmit_pending_closure(&plan.state_fence, &closure);
             let admission = match admission {
                 Ok(admitted) => PendingRevocationAdmission::Admitted(Box::new(admitted)),
                 Err(error) => PendingRevocationAdmission::Refused {
