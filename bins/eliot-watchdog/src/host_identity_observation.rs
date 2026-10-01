@@ -7,6 +7,9 @@
 //! canonical authority; and spool, composition, self-admission, or SCM
 //! authority. It emits observation evidence only.
 
+use eliot_installation::{
+    CandidateManifest, InstallerServiceRegistrationApproval, InstallerServiceRole,
+};
 use eliot_platform::PlatformHandle;
 #[cfg(test)]
 use eliot_platform_windows::WindowsAdapterError;
@@ -696,8 +699,10 @@ impl HostResponsiveness {
 /// failure threshold, budget window, cooldown, concurrent-attempt exclusion,
 /// and audit-failure disposition. The read-only challenge permission must
 /// remain usable while the Host is hung; it cannot require a fresh grant from
-/// the very Host being recovered. Policy loading itself is STITCH (installer
-/// owner, out of scope for this lane).
+/// the very Host being recovered. Policy loading reads the installer-owned
+/// approval projection through [`load_installed_recovery_policy`]; the
+/// recovery envelope itself has no installer-authored source on this contour
+/// yet, so the loader fails closed (`None`) instead of inventing approval.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovedRecoveryPolicy {
     /// Installation under recovery.
@@ -743,6 +748,86 @@ impl ApprovedRecoveryPolicy {
         }
         Ok(())
     }
+}
+
+/// Installer-owned recovery-policy loader (#1757 step 3).
+///
+/// Read-only against installer state: the process SCM bootstrap argv rendered
+/// by the installer selects the installation registry, whose selected
+/// manifest binds the Host-role [`InstallerServiceRegistrationApproval`]
+/// (`eliot_installation` owner). `recovery_policy_from_host_approval()` then
+/// projects the installation-approved policy. This is the production source
+/// the Watchdog composition tick reads: its `load_installed_recovery_policy`
+/// seam delegates here, so there is exactly one loader scheme.
+///
+/// Fail-closed: returns `None` when this process has no installer SCM
+/// bootstrap, when the registry/manifest/approval readback is absent or
+/// unbound, and — on this contour — always for the envelope itself, because
+/// the installer schema carries no installer-authored recovery envelope
+/// (failure threshold, budget window, cooldown, concurrent-attempt exclusion,
+/// audit-failure disposition). The Host registration approval authorizes the
+/// service registration, never recovery effects or their budget, so a policy
+/// is never fabricated from a constant and no approval is invented.
+#[must_use]
+pub fn load_installed_recovery_policy() -> Option<ApprovedRecoveryPolicy> {
+    let _span = tracing::debug_span!("watchdog.load_recovery_policy").entered();
+    let bootstrap = crate::scm_launch::parse_watchdog_process_argv(
+        std::env::args_os().skip(1).collect::<Vec<_>>(),
+    )
+    .inspect_err(|_| {
+        tracing::debug!(
+            event = "watchdog.recovery_policy_bootstrap_unavailable",
+            observation = "refused",
+            "process argv is not the installer SCM bootstrap; refusing to invent a policy"
+        );
+    })
+    .ok()?;
+    let (manifest, approval, _) =
+        crate::service_registration_projection::read_approved_service_registration(
+            &bootstrap,
+            InstallerServiceRole::Host,
+        )
+        .inspect_err(|_| {
+            tracing::debug!(
+                event = "watchdog.recovery_policy_approval_unavailable",
+                observation = "refused",
+                "installer Host registration approval is absent or unbound; refusing effects"
+            );
+        })
+        .ok()?;
+    recovery_policy_from_host_approval(&manifest, &approval)
+}
+
+/// Projects the installation-approved recovery policy from the bound Host
+/// registration approval (documented callee of
+/// [`load_installed_recovery_policy`]).
+///
+/// Revalidates that the approval generation is still the selected manifest
+/// generation before projecting anything: a substitution between the registry
+/// read and this projection fails closed. Returns `None` on this contour
+/// because the installer-authored recovery envelope has no record in
+/// installer state yet — see the loader contract above. When the installer
+/// lane authors that grant, this function is where its fields are projected
+/// and [`ApprovedRecoveryPolicy::validate`] is where they are refused if
+/// shapeless; no second loader is needed.
+fn recovery_policy_from_host_approval(
+    manifest: &CandidateManifest,
+    approval: &InstallerServiceRegistrationApproval,
+) -> Option<ApprovedRecoveryPolicy> {
+    if approval.generation() != &manifest.generation {
+        tracing::debug!(
+            event = "watchdog.recovery_policy_generation_unbound",
+            observation = "refused",
+            "Host approval generation left the selected manifest; refusing effects"
+        );
+        return None;
+    }
+    tracing::debug!(
+        event = "watchdog.recovery_policy_envelope_absent",
+        observation = "refused",
+        "no installer-authored recovery envelope in installer state; journaling nothing and refusing effects"
+    );
+    None
 }
 
 /// Pure recovery-budget decision. Only [`RecoveryBudgetDecision::Admitted`]
