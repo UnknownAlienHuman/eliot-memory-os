@@ -187,7 +187,10 @@ pub use integration_discovery::{
     load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
 };
 pub use initial_config_snapshot::{
-    ProtectedInitialSnapshotSigner, publish_verified_initial_config_snapshot,
+    InitialSnapshotKeyRecord, ProtectedInitialSnapshotSigner,
+    create_or_reopen_initial_snapshot_signer,
+    load_verified_initial_config_snapshot, open_retained_initial_snapshot_signer,
+    publish_verified_initial_config_snapshot,
 };
 
 pub use managed_change_plan::{
