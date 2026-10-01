@@ -1078,6 +1078,19 @@ fn consume_startup_wake_demand(
     }
 }
 
+/// Carries the dispatch stop disposition into console shutdown (audit
+/// 5910117501 item 2, cases 10-12).
+///
+/// Latched when `dispatch` actually invoked `HostComposition::stop()` for a
+/// Stop request; consumed once by `finish_console_shutdown`. An
+/// admission-refused stop returns before touching the host and stays
+/// unlatched. The latch lets shutdown prohibit the second semantic stop
+/// call: one terminal, unchanged callback/cleanup count. A plain process
+/// static keeps this channel out of `run_console`, whose outcome hunks
+/// belong to the sibling slice.
+static CONSOLE_STOP_ATTEMPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn dispatch(
     host: &mut HostComposition,
     line: &str,
@@ -1148,6 +1161,14 @@ fn dispatch(
                     Some(HostConsoleRequest::Stop),
                 );
             }
+            // Audit 5910117501 item 2 (cases 10-12): latch that dispatch
+            // executed the one semantic stop for this request, so
+            // `finish_console_shutdown` prohibits the second semantic call
+            // (one terminal, unchanged callback/cleanup count). Latched
+            // before the call so a Stop whose frame never reaches the peer
+            // still prohibits it; an admission-refused stop returns above
+            // without touching the host and stays unlatched.
+            CONSOLE_STOP_ATTEMPTED.store(true, std::sync::atomic::Ordering::Release);
             (
                 match host.stop() {
                     Ok(()) => {
@@ -1246,6 +1267,10 @@ fn finish_console_shutdown(
         eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
         cause,
     );
+    // Audit 5910117501 item 2 (cases 10-12): consume the dispatch stop
+    // disposition first, so every exit below (including the already-stopped
+    // early return) resets the latch for the next run.
+    let stop_attempted = CONSOLE_STOP_ATTEMPTED.swap(false, std::sync::atomic::Ordering::AcqRel);
     if !host.running() {
         // #889 projection: the drain outcome rests on actual shutdown
         // state. A clean already-stopped drain stands committed; a prior
@@ -1268,6 +1293,30 @@ fn finish_console_shutdown(
             .with_launch_options(options),
         );
         return true;
+    }
+    if stop_attempted {
+        // Audit 5910117501 item 2: dispatch already executed the one
+        // semantic stop for this request and lib.rs emitted its single
+        // terminal there. The host is still running only because that stop
+        // failed, so a second `host.stop()` here would arm a fresh
+        // `HostTerminalGuard` (duplicate terminal) and rerun semantic
+        // cleanup. Report the drain failed without re-calling: static words
+        // only, no error payload (I15.4, I07.20).
+        eliot_host::host_diagnostics::observe_entrypoint_with_detail(
+            eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+            "durable_shutdown_failed",
+        );
+        // #889 projection: the drain stop was already attempted and failed,
+        // so no request identity is re-derived; the non-`Host` detail stays
+        // out of the reason, mirroring the read-failure precedent.
+        observe_host_request(
+            &HostRequestProjection::failed_without_reason(
+                eliot_host::host_diagnostics::EntrypointStage::ShutdownDrain,
+            )
+            .with_operation(AdmittedEvent::ServiceStop)
+            .with_launch_options(options),
+        );
+        return false;
     }
     match host.stop() {
         Ok(()) => {
