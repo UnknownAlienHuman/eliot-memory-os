@@ -4349,3 +4349,10 @@ mod backup_verify_tests_948 {
         ));
     }
 }
+
+// Issue #2569 item 2: the kernel `ExportFence`'s refusal vocabulary for the
+// interchange-fence projection. Re-exported here (rather than folded into the
+// `ecxf_export` group above) so the append shifts no frozen serde-boundary
+// inventory anchor in this file; see
+// `crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml`.
+pub use ecxf_export::FenceBridgeRefusal;
