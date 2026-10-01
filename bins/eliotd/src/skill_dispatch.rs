@@ -652,6 +652,22 @@ fn build_execution_assessment(
 ///
 /// The caller snapshots `admitted_fence` under a short composition lock and
 /// commits the owned plan under a fresh lock after this async function ends.
+///
+/// W3 first-task-event guard (`caller: STITCH`, issue #1746).
+///
+/// The I4.2.1 seam for this boundary is the Governor-owned
+/// `require_matched_guard_at_use_boundary` with `FirstToolEvent`: observe the
+/// explicit root through the task-binding admission observer, run the seam
+/// against the retained binding read at the admitted fence, and project a
+/// withheld report through the existing skill owner, which already carries the
+/// typed scope-guard failure. It is not called here yet: this plan carries no
+/// explicit workspace root (the envelope's claimed task/scope strings and the
+/// attempt's Kernel-admission scope label must not stand in for a live
+/// observation) and no retained binding, privacy class, or governing source
+/// closure (Governor onboarding owners; the plan holds no composition borrow
+/// by design). Minting a binding here, or inferring a latest task to stand in
+/// for the retained one, would fake the guard, so the stitch lands with the
+/// caller that can supply owner-read inputs, not here.
 pub async fn plan_skill_pair(
     kernel: &DaemonKernelClient,
     admitted_fence: StateFence,
