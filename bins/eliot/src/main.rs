@@ -3652,11 +3652,27 @@ fn run_installation_effect(
     let mut coordinator = WindowsInstallationCoordinator::new(store);
     let outcome = if recover {
         if preflight_transaction.has_activation_projection_intent() {
-            rollback_with_activation_owner(
-                &mut coordinator,
-                &preflight_transaction,
-                &transaction_id,
-            )
+            // s37/#1339 ownership: the CLI only wires already-owned
+            // capabilities — the protected Host root bounds the registry opens
+            // while the installation-wide Host lease supplies the non-forgeable
+            // mutation proof — and the installation owner executes the abort.
+            // No caller-supplied approval or registry revision is accepted, and
+            // the root is not caller-supplied either: it is read from the
+            // durable transaction's own candidate manifest, never from argv,
+            // environment, or a prompt.
+            let host_state_root = Path::new(
+                preflight_transaction
+                    .candidate_manifest
+                    .runtime_launch
+                    .runtime_state_roots
+                    .host_state_root
+                    .as_str(),
+            );
+            let owner =
+                HostOwnerLease::acquire(&preflight_transaction.installation_epoch.installation)
+                    .map_err(|error| InstallationError::Platform(error.to_string()))?;
+            let host = owner.activation_capability();
+            coordinator.rollback_with_activation_owner(host_state_root, &host, &transaction_id)
         } else {
             coordinator.rollback(&transaction_id)
         }
@@ -3970,38 +3986,6 @@ fn run_installation_effect(
         Some(overall_status),
     )?;
     Ok(installation_command_exit_code(overall_status))
-}
-
-/// Re-enters the installation owner's pre-no-return rollback seam for a
-/// durable activation intent.  The CLI only wires already-owned capabilities:
-/// the protected Host root bounds the registry opens while the
-/// installation-wide Host lease supplies the non-forgeable mutation proof.
-/// No caller-supplied approval or registry revision is accepted, and the root
-/// is not caller-supplied either: it is read from the durable transaction's
-/// own candidate manifest, never from argv, environment, or a prompt.
-///
-/// s37/#1339 ownership: the coordinator opens one short-lived registry writer
-/// per abort-phase touch (`open_existing_at` with the single typed bounded
-/// `AlreadyOpen` retry) and drops it before the transaction compare-and-save
-/// and the external rollback effects, so this seam never retains the
-/// exclusive writer across them.
-fn rollback_with_activation_owner(
-    coordinator: &mut WindowsInstallationCoordinator<RedbInstallationTransactionStore>,
-    transaction: &InstallationTransaction,
-    transaction_id: &PlatformHandle,
-) -> Result<InstallationStepOutcome, InstallationError> {
-    let host_state_root = Path::new(
-        transaction
-            .candidate_manifest
-            .runtime_launch
-            .runtime_state_roots
-            .host_state_root
-            .as_str(),
-    );
-    let owner = HostOwnerLease::acquire(&transaction.installation_epoch.installation)
-        .map_err(|error| InstallationError::Platform(error.to_string()))?;
-    let host = owner.activation_capability();
-    coordinator.rollback_with_activation_owner(host_state_root, &host, transaction_id)
 }
 
 /// Reconciles only an exact Host-committed registry terminal.  A missing
