@@ -148,7 +148,13 @@ pub enum StagedEnvelopeReservationBinding {
         reservation_id: Option<OperationIdentity>,
         /// The durable problem ORS retained for this staged operation identity,
         /// when it could be bound.
-        problem: Option<RecoveryProblem>,
+        ///
+        /// Boxed: [`RecoveryProblem`] is the one large variant payload in this
+        /// enum, and the `Resolved` arm beside it is small. Boxing keeps the
+        /// whole enumeration entry small enough to hold a page of them, which is
+        /// what the bounded scan exists to do. The indirection costs nothing on
+        /// the resolution path, because the common arm never touches it.
+        problem: Option<Box<RecoveryProblem>>,
         /// Bounded operator-visible cause owned by ORS, never payload text.
         cause: OpaqueLabel,
     },
@@ -352,7 +358,7 @@ fn reconcile_one_staged_envelope(
             ..
         } => {
             return Ok(StagedWriteReconciliation::RecoveryProblem {
-                problem: problem.clone(),
+                problem: problem.as_ref().clone(),
             });
         }
         // No reservation resolved, so there is no receipt to compare and no
