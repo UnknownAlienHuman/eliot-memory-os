@@ -279,8 +279,7 @@ impl TraceManifest {
         // the exact retained references; an absent one stays absent.
         let lineage = persisted.result_lineage.as_ref();
         let principal = lineage.and_then(|retained| retained.producer_ref.clone());
-        let verifier_result =
-            lineage.and_then(|retained| retained.output_artifact_ref.clone());
+        let verifier_result = lineage.and_then(|retained| retained.output_artifact_ref.clone());
         // The Active View/packet manifest is the admitted campaign-view
         // publication the result carries; the result leg that admits it has
         // already proved it against the stored capability, task, scope, and
