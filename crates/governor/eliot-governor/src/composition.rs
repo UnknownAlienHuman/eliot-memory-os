@@ -7655,10 +7655,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// surfaces its typed [`WorkScopeError`] cause through
     /// [`CompositionError::ScanDisclosure`] instead of a completed outcome
     /// (issue #2900 B2/B6).
-    /// Live status: owning thin entry for attach/onboarding ingress; no live
-    /// attach ingress builds the scanner inputs yet (BLOCKED-BY
-    /// attach-transport: `bins/eliotd` `ScopeAttachIngress` carries no
-    /// discovery lease).
+    /// Live status: owning thin entry for attach/onboarding ingress. Live
+    /// caller for `AttachOrLaunch` (1 of 6 I4.4.1 events):
+    /// `bins/eliotd/src/daemon_runtime.rs::trigger_cold_start_controller`,
+    /// reached post-Kernel-ACK from `dispatch_agent_activation_result` via
+    /// `trigger_accepted_cold_start`; the full scan leg additionally needs
+    /// the installation contour, owner binding and admitted privacy, else
+    /// the trigger keeps the storelless question leg. Residual: the other
+    /// five triggers have no producer anywhere in the tree, and the
+    /// lease/join/compile legs still need lease inputs no ingress builds
+    /// (BLOCKED-BY attach-transport/source-owners).
     #[allow(
         clippy::too_many_arguments,
         reason = "trigger scan carries the trigger, lease, key, owner store, owner binding, privacy, evidence, and identity inputs in one fail-closed entry"
