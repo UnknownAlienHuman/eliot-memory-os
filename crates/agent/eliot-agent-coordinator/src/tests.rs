@@ -182,7 +182,6 @@ fn admitted_capability(tag: &str, minimum_sequence: u64) -> TestResult<AdmittedP
         "capacity-rev-3",
         1,
         1,
-        1,
         minimum_sequence,
     )
 }
@@ -4058,7 +4057,6 @@ fn production_revoked_capability_fails_closed_without_mutation() -> TestResult {
         "capacity-rev-3",
         1,
         1,
-        1,
         0,
     )?;
     let mut coordinator = AgentCoordinator::new_with_admitted_provider(config(2, 2), revoked)?;
@@ -4096,7 +4094,6 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
         "capacity-rev-3",
         1,
         1,
-        1,
         0,
     )?;
     let mut coordinator =
@@ -4129,7 +4126,6 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
         "capacity-rev-3",
         "route-rev-7",
         "capacity-rev-3",
-        1,
         1,
         1,
         0,
@@ -4275,7 +4271,6 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
                 "capacity-rev-3",
                 1,
                 1,
-                1,
                 0,
             )?,
         )
@@ -4309,7 +4304,6 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
                 "capacity-rev-3",
                 "route-rev-7",
                 "capacity-rev-3",
-                1,
                 1,
                 1,
                 0,
