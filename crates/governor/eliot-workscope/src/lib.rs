@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::StateFence;
+use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::{
     FreshnessStatus, IntegrityStatus, ObservationDomainRef, PrivacyClass, QuarantineState,
     SourceAssurance,
@@ -505,6 +506,8 @@ pub enum WorkScopeError {
     UnresolvedSourceConflict,
     #[error("task promotion requires the decision owner or a delegated binding")]
     TaskAuthorityDenied,
+    #[error("owner-issued task selection evidence is invalid or contaminated")]
+    InvalidTaskSelectionEvidence,
     #[error("source privacy class is outside the admitted boundary")]
     PrivacyDenied,
     #[error("state fence is invalid")]
@@ -1190,6 +1193,12 @@ pub struct OnboardingReadinessReceipt {
     pub lineage: Option<RepositoryLineageIdentity>,
     pub scope_resolution: ScopeResolutionState,
     pub task_binding: TaskBindingState,
+    /// Original owner-issued evidence for the exact current task selection.
+    ///
+    /// Older receipts may omit this field; newly compiled owner-selected task
+    /// receipts retain the complete evidence object for later revalidation.
+    #[serde(default)]
+    pub task_selection_evidence: Option<TaskSelectionEvidence>,
     pub state_fence: StateFence,
     pub governing_source_set_ref: String,
     pub governing_source_generation: u64,
@@ -1291,6 +1300,7 @@ impl OnboardingReadinessReceipt {
             .validate()
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
         self.validate_task_binding()?;
+        self.validate_task_selection_evidence()?;
         if self.limiting_integration_evidence.is_empty()
             || self.limiting_integration_evidence.len() > 8
         {
@@ -1376,6 +1386,40 @@ impl OnboardingReadinessReceipt {
         }
     }
 
+    fn validate_task_selection_evidence(&self) -> Result<(), WorkScopeError> {
+        let Some(evidence) = &self.task_selection_evidence else {
+            return Ok(());
+        };
+        evidence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidTaskSelectionEvidence)?;
+        if evidence.is_contaminated() {
+            return Err(WorkScopeError::InvalidTaskSelectionEvidence);
+        }
+        let TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+            selection_source_ref,
+            evidence_ref,
+        } = &self.task_binding
+        else {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        };
+        if evidence.task_ref != *task_ref
+            || evidence.task_revision != *task_revision
+            || evidence.acceptance_digest != *acceptance_digest
+            || evidence.selection_source_ref != *selection_source_ref
+            || evidence.evidence_ref != *evidence_ref
+            || evidence.work_scope_ref != self.scope.scope_ref
+            || self.state_fence.task_revision.map(|revision| revision.value())
+                != Some(evidence.task_revision)
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        Ok(())
+    }
+
     /// Validates the store, seed, and maintenance views of one receipt.
     ///
     /// # Errors
@@ -1408,10 +1452,20 @@ impl OnboardingReadinessReceipt {
     ///
     /// # Errors
     ///
-    /// Returns an error when a present scan receipt reference is blank.
+    /// Returns an error when a present scan receipt reference is blank or a
+    /// ready receipt lacks the durable scan commitment.
     fn validate_scan_evidence(&self) -> Result<(), WorkScopeError> {
-        if let Some(scan_receipt) = &self.scan_receipt_ref {
-            text(scan_receipt, "scan_receipt_ref")?;
+        match &self.scan_receipt_ref {
+            Some(scan_receipt) => text(scan_receipt, "scan_receipt_ref")?,
+            None
+                if matches!(
+                    self.readiness,
+                    ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
+                ) =>
+            {
+                return Err(WorkScopeError::ScanReceiptMissing);
+            }
+            None => (),
         }
         Ok(())
     }
@@ -1515,6 +1569,8 @@ pub enum TaskBindingInput {
         /// Exact intake evidence that produced the selection.
         evidence_ref: String,
     },
+    /// Exact task-selection evidence issued by the live Governor owner path.
+    Selected(TaskSelectionEvidence),
     AmbiguousCandidates(Vec<String>),
     Stale {
         task_ref: String,
@@ -1642,6 +1698,20 @@ impl ColdStartController {
         let projection_source_ref = projection_source_ref.into();
         Self::check_lease_and_identities(lease, scope, instance, lineage, candidate, sources, now)?;
         Self::check_fence_sources_privacy(state_fence, sources, scope, candidate, privacy, lease)?;
+        let task_selection_evidence = match &task {
+            TaskBindingInput::Selected(evidence) => Some(evidence.clone()),
+            _ => None,
+        };
+        let task = match task {
+            TaskBindingInput::Selected(evidence) => TaskBindingInput::Current {
+                task_ref: evidence.task_ref,
+                task_revision: evidence.task_revision,
+                acceptance_digest: evidence.acceptance_digest,
+                selection_source_ref: evidence.selection_source_ref,
+                evidence_ref: evidence.evidence_ref,
+            },
+            other => other,
+        };
         let (task_binding, scope_resolution, readiness, missing_inputs, next_safe_action) =
             Self::resolve_task_binding(task)?;
         let scan_receipt_ref = scan_receipt
@@ -1672,6 +1742,7 @@ impl ColdStartController {
             lineage: lineage.cloned(),
             scope_resolution,
             task_binding: task_binding.clone(),
+            task_selection_evidence,
             state_fence: state_fence.clone(),
             governing_source_set_ref: governing_source_set_ref.clone(),
             governing_source_generation: sources.generation,
@@ -2026,6 +2097,7 @@ impl ColdStartController {
                 selection_source_ref,
                 evidence_ref,
             ),
+            TaskBindingInput::Selected(_) => Err(WorkScopeError::InvalidTaskSelectionEvidence),
             TaskBindingInput::AmbiguousCandidates(handles) => {
                 Self::check_ambiguous_handles(handles)
             }
@@ -2778,6 +2850,36 @@ pub enum CompileDriverError {
     Compile(#[from] WorkScopeError),
 }
 
+fn verify_ready_scan_receipt(
+    receipt: &OnboardingReadinessReceipt,
+    scan_receipt: Option<&ScanReceiptHandle>,
+    scan_readback: Option<(&dyn ScanDisclosureStore, &ScanDisclosureOwnerBinding)>,
+    discovery_lease: Option<&DiscoveryReadLease>,
+) -> Result<(), WorkScopeError> {
+    if !matches!(
+        receipt.readiness,
+        ReadinessLifecycle::ReadyMaterial | ReadinessLifecycle::ReadyReadOnly
+    ) {
+        return Ok(());
+    }
+    let handle = scan_receipt.ok_or(WorkScopeError::ScanReceiptMissing)?;
+    let (store, binding) = scan_readback.ok_or(WorkScopeError::ScanReceiptMissing)?;
+    if binding.principal_ref != receipt.principal_ref
+        || binding.session_ref != receipt.session_ref
+        || discovery_lease.is_some_and(|lease| {
+            binding.lease_ref != lease.lease_ref
+                || binding.candidate_root_ref != lease.candidate_root_ref
+        })
+    {
+        return Err(WorkScopeError::ScanContourNotAdmitted);
+    }
+    if receipt.scan_receipt_ref.as_deref() != Some(handle.record_commitment.as_str()) {
+        return Err(WorkScopeError::ScanReceiptReplaced);
+    }
+    store.readback(handle, binding)?;
+    Ok(())
+}
+
 impl OnboardingSingleFlight {
     /// Drives one live attach trigger end to end: join, compile, publish.
     ///
@@ -2805,7 +2907,9 @@ impl OnboardingSingleFlight {
     /// ambiguous task binding publishes `Ambiguous`, and any other compiled
     /// but incomplete receipt publishes `Failed` — the exact missing
     /// question stays in the terminal surface, and the next trigger starts a
-    /// new lease revision rather than mutating this one.
+    /// new lease revision rather than mutating this one. A ready terminal is
+    /// returned only after authenticated owner readback of its exact scan
+    /// receipt; incomplete readiness does not require scan readback.
     ///
     /// # Errors
     ///
@@ -2842,13 +2946,17 @@ impl OnboardingSingleFlight {
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
+        scan_readback: Option<(&dyn ScanDisclosureStore, &ScanDisclosureOwnerBinding)>,
         now: u64,
     ) -> Result<LeaseJoin, CompileDriverError> {
         let created_ref = proposed.lease_ref.clone();
-        match self
+        let joined = self
             .join(trigger, discovery_lease, proposed, now)
-            .map_err(CompileDriverError::Lease)?
-        {
+            .map_err(CompileDriverError::Lease)?;
+        if let LeaseJoin::JoinedTerminal { receipt, .. } = &joined {
+            verify_ready_scan_receipt(receipt, scan_receipt, scan_readback, None)?;
+        }
+        match joined {
             already @ (LeaseJoin::JoinedTerminal { .. } | LeaseJoin::Joined { .. }) => Ok(already),
             LeaseJoin::Created { .. } => {
                 let lease = self
@@ -2883,6 +2991,12 @@ impl OnboardingSingleFlight {
                     task,
                     scan_receipt,
                     now,
+                )?;
+                verify_ready_scan_receipt(
+                    &receipt,
+                    scan_receipt,
+                    scan_readback,
+                    Some(discovery_lease),
                 )?;
                 if let Some(entry) = self
                     .entries
@@ -2990,6 +3104,7 @@ impl OnboardingSingleFlight {
         privacy: &PrivacyProfile,
         task: TaskBindingInput,
         scan_receipt: Option<&ScanReceiptHandle>,
+        scan_readback: Option<(&dyn ScanDisclosureStore, &ScanDisclosureOwnerBinding)>,
         now: u64,
     ) -> Result<LeaseJoin, CompileDriverError> {
         match self.invalidate(lease_ref, observed, now)? {
@@ -3003,6 +3118,7 @@ impl OnboardingSingleFlight {
                     .terminal
                     .clone()
                     .ok_or(WorkScopeError::BindingReceiptMismatch)?;
+                verify_ready_scan_receipt(&terminal, scan_receipt, scan_readback, None)?;
                 let surface = terminal.surface(&entry.lease)?;
                 Ok(LeaseJoin::JoinedTerminal {
                     lease_ref,
@@ -3065,6 +3181,12 @@ impl OnboardingSingleFlight {
                     task,
                     scan_receipt,
                     now,
+                )?;
+                verify_ready_scan_receipt(
+                    &receipt,
+                    scan_receipt,
+                    scan_readback,
+                    Some(discovery_lease),
                 )?;
                 self.publish_fresh(&created_ref, receipt, now)
             }
