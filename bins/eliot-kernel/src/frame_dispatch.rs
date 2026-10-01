@@ -25,6 +25,7 @@ use super::front_door_session::{DOCTOR_MODULE_ID, TESTD_MODULE_ID};
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, GENERATION_CUTOVER_OPERATION,
 };
+use super::integration_bridge::INTEGRATION_BRIDGE_APPLY_NAME;
 use super::native_worker_lifecycle_route::is_native_worker_operation;
 use super::request_dispatch::is_backup_operation;
 use super::user_broker_registration_route::USER_BROKER_MODULE_ID;
@@ -1622,6 +1623,18 @@ fn is_daemon_operation(operation: &str) -> bool {
             // generic `ProcessExecutionRequest` decode.
             | "finish_claim"
             | "finish_result"
+            // Issue #1818 W3: the governed bridge-apply ingress. The marker is
+            // the one string the admitted dispatch arm already serves
+            // (`INTEGRATION_BRIDGE_APPLY_NAME`); it was absent here, so the
+            // frame fell through every predicate, failed the
+            // `ProcessExecutionRequest` decode, and fenced the session before
+            // the arm was ever entered (same "recognized but unreached"
+            // caveat as the resume arm). The entry only lets the frame reach
+            // the arm: the arm still proves the module binding, the peer
+            // principal, and the exact session State Fence, and routes
+            // through the existing owner path (W1 read, W2 lease first) with
+            // every refusal answered typed and nothing applied.
+            | INTEGRATION_BRIDGE_APPLY_NAME
     )
 }
 
