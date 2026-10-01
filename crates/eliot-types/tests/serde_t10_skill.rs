@@ -27,8 +27,8 @@ fn case(name: &str) -> Value {
 
 #[test]
 fn nine_known_fields_decode() {
-    let decoded: EvalIntegrityFingerprintSet = serde_json::from_value(case("nine_field_accept"))
-        .expect("nine known fields must decode");
+    let decoded: EvalIntegrityFingerprintSet =
+        serde_json::from_value(case("nine_field_accept")).expect("nine known fields must decode");
     assert_eq!(decoded.harness_fingerprint, "eliot-engine-eval-case-schema");
     assert_eq!(decoded.oracle_version, "0.1.0");
     assert_eq!(
@@ -61,8 +61,9 @@ fn missing_version_and_product_decode_empty_and_compare_stale() {
     assert_eq!(decoded.product_identity, "");
     let current = EvalIntegrityFingerprintSet {
         oracle_version: "0.1.0".to_owned(),
-        product_identity: "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001"
-            .to_owned(),
+        product_identity:
+            "eliot-memory-os/eliot-engine-eval:product:01920000-0000-7000-8000-000000000001"
+                .to_owned(),
         ..decoded.clone()
     };
     assert!(
