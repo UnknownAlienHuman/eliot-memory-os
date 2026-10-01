@@ -463,6 +463,25 @@ static RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 2] = [
         required: true,
     },
 ];
+/// The exact matched WorkScope owner image, committed against both its prior
+/// durable revision and prior canonical value digest.
+static RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS: [ParameterDeclaration; 3] = [
+    ParameterDeclaration {
+        name: "expected_work_scope_revision",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "expected_work_scope_digest",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+    ParameterDeclaration {
+        name: "snapshot_json",
+        shape: ParameterShape::Subject,
+        required: true,
+    },
+];
 static NO_PARAMETERS: [ParameterDeclaration; 0] = [];
 static EPISTEMIC_REVISION_PARAMETERS: [ParameterDeclaration; 1] = [ParameterDeclaration {
     name: "revision",
@@ -1254,6 +1273,18 @@ static GET_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS: [ParameterDeclaration; 2] = 
         required: true,
     },
 ];
+static GET_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS: [ParameterDeclaration; 4] = [
+    ParameterDeclaration { name: "work_scope_ref", shape: ParameterShape::Subject, required: true },
+    ParameterDeclaration { name: "session_id", shape: ParameterShape::Subject, required: true },
+    ParameterDeclaration { name: "source_id", shape: ParameterShape::Subject, required: true },
+    ParameterDeclaration { name: "process_binding_sha256", shape: ParameterShape::Subject, required: true },
+];
+static RECORD_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS: [ParameterDeclaration; 4] = [
+    ParameterDeclaration { name: "admission_ref", shape: ParameterShape::Subject, required: true },
+    ParameterDeclaration { name: "expected_revision", shape: ParameterShape::Subject, required: true },
+    ParameterDeclaration { name: "expected_digest", shape: ParameterShape::Subject, required: true },
+    ParameterDeclaration { name: "snapshot_json", shape: ParameterShape::Subject, required: true },
+];
 static BLACKBOARD_ITEM_LOOKUP_PARAMETERS: [ParameterDeclaration; 2] = [
     ParameterDeclaration {
         name: "task_id",
@@ -1307,6 +1338,7 @@ pub const fn named_read_operation_name(operation: NamedReadOperation) -> &'stati
         NamedReadOperation::GetAuthorityRevocationHistory => "GetAuthorityRevocationHistory",
         NamedReadOperation::GetCapabilityEvidenceRecordRange => "GetCapabilityEvidenceRecordRange",
         NamedReadOperation::GetTaskContractAcceptanceSet => "GetTaskContractAcceptanceSet",
+        NamedReadOperation::GetBlobProcessSourceAdmission => "GetBlobProcessSourceAdmission",
     }
 }
 
@@ -1348,6 +1380,9 @@ pub const fn named_read_operation_by_name(name: &str) -> Option<NamedReadOperati
             Some(NamedReadOperation::GetCapabilityEvidenceRecordRange)
         }
         b"GetTaskContractAcceptanceSet" => Some(NamedReadOperation::GetTaskContractAcceptanceSet),
+        b"GetBlobProcessSourceAdmission" => {
+            Some(NamedReadOperation::GetBlobProcessSourceAdmission)
+        }
         _ => None,
     }
 }
@@ -1366,6 +1401,10 @@ pub const fn named_mutation_operation_name(operation: NamedMutationOperation) ->
         NamedMutationOperation::RecordFinishDecision => "RecordFinishDecision",
         NamedMutationOperation::RecordFinishEvidence => "RecordFinishEvidence",
         NamedMutationOperation::RecordModuleCatalogSnapshot => "RecordModuleCatalogSnapshot",
+        NamedMutationOperation::RecordWorkScopeSnapshot => "RecordWorkScopeSnapshot",
+        NamedMutationOperation::RecordBlobProcessSourceAdmission => {
+            "RecordBlobProcessSourceAdmission"
+        }
         NamedMutationOperation::AppendAuditEvent => "AppendAuditEvent",
         NamedMutationOperation::RecordAuthorityRevocation => "RecordAuthorityRevocation",
         NamedMutationOperation::ApplyErasure => "ApplyErasure",
@@ -1399,6 +1438,10 @@ pub const fn named_mutation_operation_by_name(name: &str) -> Option<NamedMutatio
         b"RecordFinishDecision" => Some(NamedMutationOperation::RecordFinishDecision),
         b"RecordFinishEvidence" => Some(NamedMutationOperation::RecordFinishEvidence),
         b"RecordModuleCatalogSnapshot" => Some(NamedMutationOperation::RecordModuleCatalogSnapshot),
+        b"RecordWorkScopeSnapshot" => Some(NamedMutationOperation::RecordWorkScopeSnapshot),
+        b"RecordBlobProcessSourceAdmission" => {
+            Some(NamedMutationOperation::RecordBlobProcessSourceAdmission)
+        }
         b"AppendAuditEvent" => Some(NamedMutationOperation::AppendAuditEvent),
         b"RecordAuthorityRevocation" => Some(NamedMutationOperation::RecordAuthorityRevocation),
         b"ApplyErasure" => Some(NamedMutationOperation::ApplyErasure),
@@ -1498,6 +1541,9 @@ pub const fn declared_read_parameters(
         NamedReadOperation::GetTaskContractAcceptanceSet => {
             &GET_TASK_CONTRACT_ACCEPTANCE_SET_PARAMETERS
         }
+        NamedReadOperation::GetBlobProcessSourceAdmission => {
+            &GET_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS
+        }
         NamedReadOperation::GetRevisionHeads
         | NamedReadOperation::GetScopeRevisionView
         | NamedReadOperation::GetOrderingHeads
@@ -1577,6 +1623,12 @@ pub const fn declared_mutation_parameters(
         NamedMutationOperation::RecordFinishEvidence => &RECORD_FINISH_EVIDENCE_PARAMETERS,
         NamedMutationOperation::RecordModuleCatalogSnapshot => {
             &RECORD_MODULE_CATALOG_SNAPSHOT_PARAMETERS
+        }
+        NamedMutationOperation::RecordWorkScopeSnapshot => {
+            &RECORD_WORK_SCOPE_SNAPSHOT_PARAMETERS
+        }
+        NamedMutationOperation::RecordBlobProcessSourceAdmission => {
+            &RECORD_BLOB_PROCESS_SOURCE_ADMISSION_PARAMETERS
         }
         NamedMutationOperation::UpdateTaskState => &UPDATE_TASK_STATE_PARAMETERS,
         NamedMutationOperation::ApplySwarmOwnerRevisions => &APPLY_SWARM_OWNER_REVISION_PARAMETERS,

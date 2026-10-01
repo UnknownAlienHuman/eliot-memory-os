@@ -43,6 +43,7 @@ use thiserror::Error;
 mod architecture_self_model;
 mod backup_io;
 mod blackboard;
+pub mod blob_process_source_admission;
 pub mod canonical_event;
 mod dreamer_job;
 pub mod epistemic_revision;
@@ -3827,6 +3828,8 @@ pub enum NamedReadOperation {
     /// persisted nothing at that exact revision; it never answers with an empty
     /// set, and no consumer may synthesize the set locally.
     GetTaskContractAcceptanceSet,
+    /// Exact fenced lookup of one process-stream admission / Ready commitment.
+    GetBlobProcessSourceAdmission,
 }
 
 /// Schema identifier of the neutral `TaskContract` acceptance-set payload.
@@ -4047,6 +4050,14 @@ pub enum NamedMutationOperation {
     /// opaque bytes and only arbitrates the fixed `owner/module_registry`
     /// revision. Admission currentness remains a Governor readback decision.
     RecordModuleCatalogSnapshot,
+    /// Persists the Governor-owned WorkScope binding and original admitted
+    /// source closure through a fenced owner revision CAS. Store treats the
+    /// complete snapshot as opaque bytes; Governor validates its source and
+    /// guard semantics before issuing the transition and after named readback.
+    RecordWorkScopeSnapshot,
+    /// Persists a process-stream admission and attaches its whole-object Ready
+    /// commitment through separate revisions of one keyed owner row.
+    RecordBlobProcessSourceAdmission,
     AppendAuditEvent,
     /// Durable authority-revocation record (issue #686). Known-but-
     /// unsupported until a store-owned slice activates its catalogue row
@@ -4196,6 +4207,8 @@ impl NamedMutationOperation {
             | Self::RecordFinishDecision
             | Self::RecordFinishEvidence
             | Self::RecordModuleCatalogSnapshot
+            | Self::RecordWorkScopeSnapshot
+            | Self::RecordBlobProcessSourceAdmission
             | Self::RecordAuthorityRevocation
             | Self::ApplyProblemOwnerState => TransitionClass::RecoverySchema,
             Self::ApplyErasure => TransitionClass::Erasure,

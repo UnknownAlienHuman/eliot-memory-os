@@ -81,6 +81,13 @@ impl KernelRecoveryPort for DaemonKernelClient {
         }))
     }
 
+    fn store_named_read(
+        &self,
+        request: eliot_store_api::NamedReadRequest,
+    ) -> Result<eliot_store_api::NamedReadResponse, KernelPortError> {
+        self.store_named_blocking(request)
+    }
+
     fn initialize_governor_genesis(
         &self,
         request: &GovernorGenesisRequest,

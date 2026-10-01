@@ -13,6 +13,8 @@ use super::surreal_automation::{AutomationWrites, automation_write_statements};
 use super::surreal_experience::{ExperienceWrites, experience_write_statements};
 use super::surreal_learning::{LearningWrites, learning_write_statements};
 use super::surreal_reactive::{ReactiveWrites, reactive_write_statements};
+use super::recovery_owner_update::append_work_scope_owner_statement;
+use super::blob_process_source_admission::append_blob_process_source_admission;
 use crate::client;
 use crate::config::SurrealAdapterConfig;
 use crate::error::AdapterError;
@@ -941,6 +943,8 @@ fn build_apply_statements(
     // rows under the same fenced compare-and-set contract.
     append_capability_evidence_owner_statements(&mut sql, &mut bindings, transition)?;
     append_module_registry_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_work_scope_owner_statement(&mut sql, &mut bindings, transition)?;
+    append_blob_process_source_admission(&mut sql, &mut bindings, transition)?;
     append_finish_evidence_owner_statement(&mut sql, &mut bindings, transition)?;
     append_finish_owner_statement(&mut sql, &mut bindings, transition)?;
 

@@ -407,6 +407,9 @@ async fn named_read_payload(
         NamedReadOperation::GetTaskContractAcceptanceSet => {
             task_contract_acceptance_set_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetBlobProcessSourceAdmission => {
+            blob_process_source_admission_payload(db, &adapter.config, query, state_fence).await
+        }
         NamedReadOperation::GetAuditRange => {
             audit_range_payload(db, &adapter.config, query, state_fence).await
         }
@@ -419,6 +422,76 @@ async fn named_read_payload(
 const READ_BLACKBOARD_ITEM_HEAD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blackboard_namespace AND key = $blackboard_key LIMIT 1;";
 
 const READ_TASK_CONTRACT_ACCEPTANCE_RECORD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $acceptance_namespace AND key = $acceptance_key LIMIT 1;";
+
+const READ_BLOB_PROCESS_SOURCE_ADMISSION: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blob_process_source_namespace AND key = $blob_process_source_key LIMIT 1;";
+
+async fn blob_process_source_admission_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let selector = |name: &'static str| {
+        query
+            .parameters
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or(AdapterError::Store(StoreError::ManifestMismatch))
+    };
+    let identity = eliot_store_api::BlobProcessSourceAdmissionIdentity {
+        work_scope_ref: selector("work_scope_ref")?.to_owned(),
+        session_id: selector("session_id")?.to_owned(),
+        source_id: selector("source_id")?.to_owned(),
+        process_binding_sha256: selector("process_binding_sha256")?.to_owned(),
+    };
+    identity.validate().map_err(AdapterError::Store)?;
+    let key = identity.record_key().map_err(AdapterError::Store)?;
+    let mut bindings = Map::new();
+    bindings.insert(
+        "blob_process_source_namespace".to_owned(),
+        json!(key.namespace),
+    );
+    bindings.insert("blob_process_source_key".to_owned(), json!(key.key));
+    let mut response = client::query(
+        db,
+        config,
+        "read.blob_process_source_admission",
+        READ_BLOB_PROCESS_SOURCE_ADMISSION,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<eliot_store_api::RecoveryRecord>(&mut response, 0)?;
+    let Some(row) = rows.first() else {
+        return Ok(Value::Null);
+    };
+    if row.namespace != key.namespace
+        || row.key != key.key
+        || row.schema != eliot_store_api::BLOB_PROCESS_SOURCE_ADMISSION_ROW_SCHEMA
+        || row.state_fence != *state_fence
+        || row.revision == 0
+        || row.revision > i64::MAX as u64
+        || eliot_store_api::sha256_hex(&row.payload) != row.value_digest
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let admission: eliot_store_api::BlobProcessSourceAdmission =
+        serde_json::from_slice(&row.payload)
+            .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    admission.validate().map_err(AdapterError::Store)?;
+    if admission.identity != identity
+        || admission.state_fence != *state_fence
+        || admission.owner_revision != row.revision
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let readback = eliot_store_api::BlobProcessSourceAdmissionReadback {
+        state_fence: row.state_fence.clone(),
+        owner_revision: row.revision,
+        value_digest: row.value_digest.clone(),
+        admission,
+    };
+    to_value(&readback)
+}
 
 /// Serves one task's owner-persisted `TaskContract` acceptance-item set at the
 /// exact task revision the caller was admitted against (issue #325 P1, I7.9).

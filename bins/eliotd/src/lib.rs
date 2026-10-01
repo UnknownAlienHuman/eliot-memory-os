@@ -2016,6 +2016,24 @@ impl DaemonComposition {
         Ok(Some(snapshot))
     }
 
+    /// Freshly resolves the exact process-stream admission row selected by
+    /// WorkScope, session, stream source ID, and ProcessExecutionBinding
+    /// digest. The Governor joins it to the current named WorkScope owner's
+    /// stored revision and original digest; callers must still validate the
+    /// returned Pending/Ready phase against the operation they are serving.
+    pub fn current_testd_blob_process_source_admission(
+        &self,
+        identity: &eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionIdentity,
+        state_fence: &StateFence,
+    ) -> Result<
+        Option<eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionReadback>,
+        String,
+    > {
+        self.governor
+            .read_current_blob_process_source_admission(identity, state_fence)
+            .map_err(|error| format!("fresh process-source admission read failed: {error}"))
+    }
+
     /// Independently reads the canonical Module Registry owner for an
     /// authenticated owner-facts pull. The returned outer revision and
     /// semantic snapshot come from one fresh Kernel named read and are

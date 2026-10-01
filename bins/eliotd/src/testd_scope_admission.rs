@@ -1,8 +1,9 @@
 //! Authenticated owner-facts pull handling for process-stream admission.
 //!
 //! The daemon re-reads current named owners before answering a Kernel pull.
-//! TestD request metadata is used only to select an already admitted source
-//! and catalog generation; it never creates those facts.
+//! TestD request metadata can select an already retained catalog generation,
+//! but the generated process-stream source ID requires its own durable,
+//! pre-capture admission; it is not a governing-document source reference.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -50,7 +51,7 @@ pub struct CurrentWorkScopeSourceReceipt {
 /// receipt identity or content digest.
 pub fn canonical_current_work_scope_source_receipt(
     snapshot: &eliot_governor::WorkScopeBindingSnapshot,
-    source_id: &str,
+    governing_source_ref: &str,
 ) -> Result<CurrentWorkScopeSourceReceipt, String> {
     snapshot
         .validate()
@@ -62,8 +63,8 @@ pub fn canonical_current_work_scope_source_receipt(
         .sources
         .sources
         .iter()
-        .find(|item| item.source_ref == source_id)
-        .ok_or_else(|| "current WorkScope admission omits the requested source".to_owned())?;
+        .find(|item| item.source_ref == governing_source_ref)
+        .ok_or_else(|| "current WorkScope admission omits the requested governing source".to_owned())?;
     let work_scope_bytes = canonical_json_bytes(snapshot)
         .map_err(|error| format!("canonical WorkScope owner encoding failed: {error}"))?;
     let guard_bytes = canonical_json_bytes(&snapshot.guard_receipt)
@@ -170,10 +171,13 @@ fn unix_ms() -> u64 {
 
 /// Produces a closed owner answer for one Kernel-retained pull.
 ///
-/// A positive result requires a canonical source receipt and Blob-specific
-/// policy, residency, causal, and authority owners in addition to the checked
-/// WorkScope guard. Since the source-receipt owner is not present on this
-/// composition, a matched scope still cannot produce an `Available` result.
+/// A positive result requires process-source admission that binds the
+/// stream's generated source ID to the exact admitted process operation,
+/// WorkScope, and governing-source closure, plus Blob-specific policy,
+/// residency, causal, and authority owners. WorkScope governing-document
+/// references are a distinct identity domain from process-stream source IDs.
+/// Until the independent process-source owner is installed, this composition
+/// cannot produce an `Available` result.
 pub fn resolve_blob_owner_facts(
     composition: &DaemonComposition,
     request: &BlobProcessStreamOwnerFactsPullRequest,
@@ -203,51 +207,17 @@ pub fn resolve_blob_owner_facts(
                         Some(source)
                             if source.sources.scope_ref != snapshot.binding.scope.scope_ref
                                 || source.sources.generation
-                                    != snapshot.binding.governing_source_generation
-                                || !source
-                                    .sources
-                                    .sources
-                                    .iter()
-                                    .any(|item| item.source_ref == request.source_id) =>
+                                    != snapshot.binding.governing_source_generation =>
                         {
                             BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
                         }
                         Some(_) => {
-                            // The job's module/generation tuple is only a
-                            // selector. The independent current named read
-                            // must return that exact enabled accepted row;
-                            // no recovered startup scalar can substitute.
-                            if read_current_module_catalog_generation(
-                                composition,
-                                &request.state_fence,
-                                request.expected_module_id.as_deref(),
-                                request.expected_generation_id.as_deref(),
-                            )
-                            .is_err()
-                            {
-                                BlobProcessStreamOwnerFactsUnavailableReason::AuthorityUnavailable
-                            } else {
-                                match composition.current_testd_blob_policy_owner_readback(
-                                    &request.state_fence,
-                                ) {
-                                    Err(_) | Ok(None) => {
-                                        BlobProcessStreamOwnerFactsUnavailableReason::PolicyUnavailable
-                                    }
-                                    Ok(Some(_current_policy)) => {
-                                        // Current WorkScope source provenance,
-                                        // catalog lifecycle and generic Policy
-                                        // owner are independently read. The
-                                        // Policy owner has no Blob-specific
-                                        // retention/residency contract, so it
-                                        // cannot be projected into Blob policy
-                                        // fields. Actual cause and process
-                                        // authority owners are also still
-                                        // required; request values/defaults
-                                        // cannot fill those gaps.
-                                        BlobProcessStreamOwnerFactsUnavailableReason::PolicyUnavailable
-                                    }
-                                }
-                            }
+                            // request.source_id is minted for this output
+                            // stream, not selected from the governing source
+                            // document set. It needs a separate durable
+                            // pre-capture admission bound to the process
+                            // operation and this WorkScope.
+                            BlobProcessStreamOwnerFactsUnavailableReason::SourceReceiptUnavailable
                         }
                     },
                 }
