@@ -2547,12 +2547,13 @@ fn encode_component(value: &str) -> String {
 mod tests {
     use super::{
         CorrelatedEventState, OpenCodeClient, OpenCodeRunError, OpenCodeRunPolicy,
-        encode_component, generate_message_id,
+        attest_message_route, encode_component, generate_message_id,
     };
     use crate::{
         AuthorityCeiling, BasicAuth, LoopbackEndpoint, LoopbackHttpError, ModelSelection,
         OpenCodeEvent, OpenCodeWireRouteState, ReadOnlyRunRequest, RunStatus,
     };
+    use serde_json::Value;
     use secrecy::SecretString;
     use std::collections::VecDeque;
     use std::path::Path;
