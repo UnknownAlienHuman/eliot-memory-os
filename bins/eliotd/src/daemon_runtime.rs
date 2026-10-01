@@ -5690,7 +5690,7 @@ async fn complete_initial_task_scope_binding(
     let mut response = body.response;
     response["cold_start"] = match cold_start {
         Ok(value) => value,
-        Err(error) => serde_json::json!({"status":"refused","reason":error.to_string()}),
+        Err(error) => cold_start_refusal(error),
     };
     task_controller_result_body(&claimed, response)
 }
@@ -7678,9 +7678,43 @@ fn scan_owner_error(error: eliot_ors::OrsError) -> ColdStartIngressError {
         | eliot_ors::OrsError::StagingCommitOutcomeUnknown { .. } => {
             eliot_workscope::WorkScopeError::ScanReceiptUnknownCommit
         }
-        _ => eliot_workscope::WorkScopeError::ScanReceiptInaccessible,
+        other => {
+            return ColdStartIngressError::Owner {
+                owner: "scan disclosure owner",
+                detail: other.to_string(),
+            };
+        }
     };
     ColdStartIngressError::WorkScope(cause)
+}
+
+fn cold_start_refusal(error: ColdStartIngressError) -> serde_json::Value {
+    use eliot_workscope::WorkScopeError as Failure;
+    let code = match &error {
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptMissing) => {
+            "SCAN_RECEIPT_MISSING"
+        }
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptInaccessible) => {
+            "SCAN_RECEIPT_INACCESSIBLE"
+        }
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptCorrupt) => "SCAN_RECEIPT_CORRUPT",
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptReplaced) => {
+            "SCAN_RECEIPT_REPLACED"
+        }
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptStale) => "SCAN_RECEIPT_STALE",
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptInvalidated) => {
+            "SCAN_RECEIPT_INVALIDATED"
+        }
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptUnknownCommit) => {
+            "SCAN_RECEIPT_UNKNOWN_COMMIT"
+        }
+        _ => "COLD_START_REFUSED",
+    };
+    serde_json::json!({
+        "status": "refused",
+        "code": code,
+        "reason": error.to_string(),
+    })
 }
 
 async fn trigger_cold_start_controller(
@@ -7769,24 +7803,21 @@ async fn trigger_cold_start_controller(
                 &ticket_id,
                 proof,
             )
-            .map_err(|error| error.to_string())
+            .map_err(scan_owner_error)
         } else {
             eliotd::task_binding_admission::request_scan_disclosure_binding(
                 &route_kernel,
                 &connection_id,
                 &ticket_id,
             )
+            .map_err(scan_owner_error)
         }
     })
     .await
     .map_err(|error| ColdStartIngressError::Owner {
         owner: "scan disclosure binding worker",
         detail: error.to_string(),
-    })?
-    .map_err(|detail| ColdStartIngressError::Owner {
-        owner: "scan disclosure binding",
-        detail,
-    })?;
+    })??;
     let owner = Arc::new(if let Some(proof) = proof {
         eliotd::task_binding_admission::KernelScanDisclosureRecordOwner::new_initial(
             Arc::clone(kernel),
