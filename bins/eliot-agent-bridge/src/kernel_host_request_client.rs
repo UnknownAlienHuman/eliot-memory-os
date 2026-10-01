@@ -22,11 +22,11 @@
 //! kernel admission/dispatch, gateway validation/correlation, and any durable ledger.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_contracts::{
     ClockReading, HostCorrelationDomain, HostCorrelationProjection, HostJsonRpcCorrelationId,
-    HostRequestLogicalKind, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
+    HostRequestLogicalKind, ProductId, RequestId, RequestMetadata, SourceId, StateFence, TaskId,
     canonical_json_bytes, host_request_legacy_presence_key, host_request_logical_key, sha256_hex,
 };
 use eliot_kernel_core::KernelRuntimeHealthEvidence;
@@ -43,7 +43,9 @@ use eliot_protocol::{
     HostRequestResultClass, HostRequestResultLineage, MessageType, ProtocolPayload,
     ProtocolVersion, REACTIVE_RESTORE_CAPABILITY, REACTIVE_RESTORE_OPERATION,
     REACTIVE_RESTORE_PAYLOAD_SCHEMA_ID, ReactiveRestoreQuery, ReactiveRestoreReply,
-    RequestIdentity, host_request_operation_id, restore_correlation,
+    RequestIdentity, TASK_CONTROLLER_INVOCATION_WIRE_ID,
+    TASK_CONTROLLER_INVOCATION_WIRE_VERSION, TaskControllerAction, TaskControllerInvocation,
+    host_request_operation_id, restore_correlation,
 };
 use eliot_receipts::RequestBinding;
 use serde::Deserialize;
@@ -56,6 +58,10 @@ use crate::{ActivatedTaskBinding, KernelTransportOwner, SharedTransport};
 /// wiring); the literal is repeated here because the constant is `pub(crate)`
 /// to that binary and this crate takes no new dependencies.
 const AGENT_HOST_REQUEST_SUBMIT_OPERATION: &str = "agent_host_request_submit";
+/// Closed host-request capability and schema for the explicit pre-scope
+/// Task Controller binding lane.
+const TASK_CONTROLLER_CAPABILITY: &str = "eliot.task-controller";
+const TASK_CONTROLLER_PAYLOAD_SCHEMA_ID: &str = "eliot.task-controller.invoke.v1";
 /// Closed kernel entry that invokes one local read with its canonical tool
 /// bytes (Implements #18: local read result).
 ///
@@ -185,6 +191,22 @@ pub(super) struct TransportFacts {
     /// the authenticated identity an invocation envelope binds; it is never
     /// read from host request text and never defaulted.
     pub(super) task_binding: Option<ActivatedTaskBinding>,
+    /// Owner-produced pre-scope proof from the same decoded activation result.
+    /// It authorizes only a later explicit BIND_SCOPE request and remains
+    /// distinct from authenticated session/task binding.
+    pub(super) bind_scope_evidence: Option<eliot_protocol::AgentActivationBindScopeEvidence>,
+}
+
+/// Owner-confirmed outcome of the original BIND_SCOPE operation. An admitted
+/// envelope is never promoted to a successful binding: only its retained
+/// result body can produce `owner_result` and a fresh admitted connection.
+pub(crate) struct BindScopeReadback {
+    pub(crate) receipt: HostRequestAdmissionReceipt,
+    pub(crate) durable_state: String,
+    pub(crate) owner_result: Option<serde_json::Value>,
+    pub(crate) owner_result_digest: Option<String>,
+    pub(crate) new_connection_id: Option<String>,
+    pub(crate) recovery: Option<PortFailure>,
 }
 
 /// Exact owner-derived facts retained beside one bridge-local resource URI.
@@ -571,6 +593,7 @@ impl KernelTransportOwner {
             receipt_sha256: self.admitted.receipt.receipt_sha256.clone(),
             session: self.activated_session.clone(),
             task_binding: self.activated_task_binding.clone(),
+            bind_scope_evidence: self.bind_scope_evidence.clone(),
         }
     }
 
@@ -700,6 +723,7 @@ impl KernelHostRequestClient {
             .exchange_host_request_frame(frame)
     }
 
+
     /// Records that the Kernel settled one exact host operation through this
     /// client (issue #77 W8).
     ///
@@ -749,6 +773,248 @@ impl KernelHostRequestClient {
             return false;
         };
         owner.replay_cache.values().any(|entry| entry.owner_settled)
+
+    }
+
+
+    /// Submits one explicit initial WorkScope binding under the owner proof
+    /// retained from this connection's exact `ScopeSelectionRequired`
+    /// activation response. This is deliberately separate from generic tool
+    /// invocation: it consumes no activated Session/task binding and accepts
+    /// no caller-supplied semantic identity.
+    pub fn bind_scope(
+        &mut self,
+        correlation_id: &str,
+        task_input: serde_json::Value,
+    ) -> Result<BindScopeReadback, PortFailure> {
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let evidence = facts
+            .bind_scope_evidence
+            .as_ref()
+            .ok_or_else(plan_gap_no_session)?;
+        evidence.validate().map_err(|_| request_failure())?;
+        if facts.session.is_some()
+            || facts.task_binding.is_some()
+            || facts.state_fence != evidence.state_fence
+        {
+            return Err(request_failure());
+        }
+
+        let task_id = TaskId::new(evidence.task_id.clone()).map_err(|_| request_failure())?;
+        let invocation = TaskControllerInvocation {
+            wire_id: TASK_CONTROLLER_INVOCATION_WIRE_ID.to_owned(),
+            wire_version: TASK_CONTROLLER_INVOCATION_WIRE_VERSION,
+            action: TaskControllerAction::BindScope,
+            task_id,
+            work_scope_id: evidence.work_scope_id.clone(),
+            task_input,
+            learning_state_view_recipe: serde_json::Value::Null,
+            context_campaign_recipe_catalogue: serde_json::Value::Null,
+            context_campaign_recipe: serde_json::Value::Null,
+            context_input: serde_json::Value::Null,
+            prior_delivery_selector: None,
+            campaign_owner_materials: None,
+            bind_scope_evidence: Some(evidence.clone()),
+        };
+        invocation.validate().map_err(|_| request_failure())?;
+        let tool = serde_json::json!({
+            "name": TASK_CONTROLLER_CAPABILITY,
+            "arguments": invocation,
+        });
+        let payload_bytes = canonical_json_bytes(&tool).map_err(|_| request_failure())?;
+        let payload_digest = sha256_hex(&payload_bytes);
+
+        // The explicit caller correlation plus the immutable owner proof and
+        // request body produce a stable envelope across exact retries. The
+        // original ticket deadline is part of that response-sealed proof;
+        // retries never extend or rebase that authority window.
+        let request_id = RequestId::new(correlation_id).map_err(|_| request_failure())?;
+        let deadline_unix_ms = evidence.ticket_deadline_unix_ms;
+        if unix_ms()? >= deadline_unix_ms {
+            return Err(PortFailure::DeadlineExceeded);
+        }
+        let projection = HostCorrelationProjection::Opaque {
+            domain: HostCorrelationDomain::Request,
+            occurrence: correlation_id.to_owned(),
+        };
+        let replay_label = if correlation_id.len() <= 480 {
+            correlation_id.to_owned()
+        } else {
+            format!("bind-scope:{}", sha256_hex(correlation_id.as_bytes()))
+        };
+        let identity = HostRequestIdentity {
+            request_id,
+            correlation_projection: Some(projection),
+            idempotency_key: format!("{replay_label}:bind-scope"),
+            cancellation_id: format!("{replay_label}:bind-scope:cancel"),
+            parent_operation_id: None,
+            deadline_unix_ms,
+            capability: TASK_CONTROLLER_CAPABILITY.to_owned(),
+            session_id: Some(evidence.session_id.clone()),
+            task_id: Some(evidence.task_id.clone()),
+            work_scope_id: Some(evidence.work_scope_id.clone()),
+            payload_schema_id: TASK_CONTROLLER_PAYLOAD_SCHEMA_ID.to_owned(),
+            payload_sha256: payload_digest,
+        };
+        let envelope = finish_envelope(&facts, HostRequestKind::Invocation, identity)?;
+        let frame = host_request_task_controller_frame(&tool, &envelope, &facts)?;
+        let reply = self.exchange(&frame).map_err(|error| {
+            retain_agent_response(error, unknown_outcome(&envelope.envelope_sha256))
+        })?;
+        if is_legacy_correlation_unresolved_reply(&reply, &envelope) {
+            return Err(PortFailure::LegacyCorrelationUnresolved);
+        }
+        if is_idempotency_conflict_reply(&reply, &envelope) {
+            return Err(PortFailure::IdempotencyConflict);
+        }
+        let Some((receipt, record)) = decode_admitted_reply(&reply, &envelope) else {
+            return Err(unknown_outcome(&envelope.envelope_sha256));
+        };
+        let mut readback = BindScopeReadback {
+            receipt,
+            durable_state: host_request_record_state_name(record.state).to_owned(),
+            owner_result: None,
+            owner_result_digest: None,
+            new_connection_id: None,
+            recovery: None,
+        };
+        loop {
+            let record = match self.rehydrate_bind_scope(&facts, &envelope, &readback.receipt) {
+                Ok(record) => record,
+                Err(error) => {
+                    readback.recovery = Some(error);
+                    return Ok(readback);
+                }
+            };
+            readback.durable_state = host_request_record_state_name(record.state).to_owned();
+            match record.state {
+                HostRequestRecordState::ResultReceived | HostRequestRecordState::Terminal => {
+                    readback.owner_result_digest = record.result_digest.clone();
+                    let Some(owner_result) = record.result_response else {
+                        readback.recovery = Some(unknown_outcome(&envelope.envelope_sha256));
+                        return Ok(readback);
+                    };
+                    let status = owner_result.get("status").and_then(serde_json::Value::as_str);
+                    if status == Some("rejected") {
+                        readback.owner_result = Some(owner_result);
+                        return Ok(readback);
+                    }
+                    let result_revision = owner_result
+                        .get("work_scope_owner_revision")
+                        .and_then(serde_json::Value::as_u64);
+                    let result_digest = owner_result
+                        .get("work_scope_owner_digest")
+                        .and_then(serde_json::Value::as_str);
+                    let valid_digest = result_digest.is_some_and(|value| {
+                        value.len() == 64
+                            && value
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    });
+                    if status != Some("admitted") || result_revision.is_none_or(|value| value == 0)
+                        || !valid_digest
+                    {
+                        readback.owner_result = Some(owner_result);
+                        readback.recovery = Some(request_failure());
+                        return Ok(readback);
+                    }
+                    readback.owner_result = Some(owner_result);
+                    readback.new_connection_id =
+                        match crate::reopen_kernel_transport(&self.shared) {
+                            Ok(connection_id) => Some(connection_id),
+                            Err(error) => {
+                                readback.recovery = Some(error);
+                                None
+                            }
+                        };
+                    return Ok(readback);
+                }
+                HostRequestRecordState::Expired => {
+                    readback.recovery = Some(PortFailure::DeadlineExceeded);
+                    return Ok(readback);
+                }
+                HostRequestRecordState::Cancelled => {
+                    readback.recovery = Some(PortFailure::Cancelled);
+                    return Ok(readback);
+                }
+                HostRequestRecordState::Conflicted => {
+                    readback.recovery = Some(PortFailure::IdempotencyConflict);
+                    return Ok(readback);
+                }
+                HostRequestRecordState::Requested
+                | HostRequestRecordState::Admitted
+                | HostRequestRecordState::Routed
+                | HostRequestRecordState::Submitted
+                | HostRequestRecordState::PossiblyEffected
+                | HostRequestRecordState::Unknown
+                | HostRequestRecordState::Reconciling => {
+                    let now = match unix_ms() {
+                        Ok(now) => now,
+                        Err(error) => {
+                            readback.recovery = Some(error);
+                            return Ok(readback);
+                        }
+                    };
+                    let remaining_ms = deadline_unix_ms.saturating_sub(now);
+                    if remaining_ms == 0 {
+                        readback.recovery = Some(PortFailure::DeadlineExceeded);
+                        return Ok(readback);
+                    }
+                    std::thread::sleep(Duration::from_millis(remaining_ms.min(100)));
+                }
+            }
+        }
+    }
+
+    fn rehydrate_bind_scope(
+        &mut self,
+        original_facts: &TransportFacts,
+        envelope: &HostRequestEnvelope,
+        receipt: &HostRequestAdmissionReceipt,
+    ) -> Result<AdmittedReplyView, PortFailure> {
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let evidence = facts
+            .bind_scope_evidence
+            .as_ref()
+            .ok_or_else(request_failure)?;
+        if facts.session.is_some()
+            || facts.task_binding.is_some()
+            || facts.connection_id != envelope.connection_id
+            || facts.connection_id != original_facts.connection_id
+            || facts.state_fence != evidence.state_fence
+            || envelope.state_fence != evidence.state_fence
+            || envelope.descriptor_sha256 != facts.descriptor_sha256
+            || envelope.peer_admission_receipt_sha256 != facts.receipt_sha256
+            || envelope.identity.session_id.as_deref() != Some(evidence.session_id.as_str())
+            || envelope.identity.task_id.as_deref() != Some(evidence.task_id.as_str())
+            || envelope.identity.work_scope_id.as_deref()
+                != Some(evidence.work_scope_id.as_str())
+        {
+            return Err(request_failure());
+        }
+        receipt
+            .validate_envelope(envelope)
+            .map_err(|_| request_failure())?;
+        let digest = envelope.envelope_sha256.clone();
+        let frame = host_request_rehydrate_frame(
+            envelope,
+            receipt,
+            &facts,
+            Some(evidence),
+        )?;
+        let reply = self
+            .exchange(&frame)
+            .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
+        decode_rehydrated_reply(&reply, envelope).ok_or_else(|| unknown_outcome(&digest))
+
     }
 
     /// Captures owner-verified source-result and attach facts for a resource
@@ -1932,6 +2198,44 @@ fn host_request_user_automation_frame(
     Ok(frame)
 }
 
+/// Builds the existing host invoke-read frame for the one explicit pre-scope
+/// Task Controller operation. That closed owner entry both queues the typed
+/// invocation for the daemon claim path and returns the exact admission pair.
+fn host_request_task_controller_frame(
+    tool: &serde_json::Value,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    let mut frame = host_request_frame_for_envelope(
+        AGENT_HOST_REQUEST_INVOKE_READ_OPERATION,
+        envelope,
+        facts,
+    )?;
+    let ProtocolPayload::Json(payload) = &mut frame.payload else {
+        return Err(request_failure());
+    };
+    payload["tool"] = tool.clone();
+    frame.validate().map_err(|_| request_failure())?;
+    Ok(frame)
+}
+
+fn host_request_record_state_name(state: HostRequestRecordState) -> &'static str {
+    match state {
+        HostRequestRecordState::Requested => "requested",
+        HostRequestRecordState::Admitted => "admitted",
+        HostRequestRecordState::Routed => "routed",
+        HostRequestRecordState::Submitted => "submitted",
+        HostRequestRecordState::PossiblyEffected => "possibly_effected",
+        HostRequestRecordState::ResultReceived => "result_received",
+        HostRequestRecordState::Cancelled => "cancelled",
+        HostRequestRecordState::Expired => "expired",
+        HostRequestRecordState::Conflicted => "conflicted",
+        HostRequestRecordState::Unknown => "unknown",
+        HostRequestRecordState::Reconciling => "reconciling",
+        HostRequestRecordState::Terminal => "terminal",
+    }
+}
+
 /// Builds the Observe submit frame carrying the exact canonical tool bytes
 /// (issue #2565).
 ///
@@ -2540,6 +2844,7 @@ fn host_request_rehydrate_frame(
     envelope: &HostRequestEnvelope,
     receipt: &HostRequestAdmissionReceipt,
     facts: &TransportFacts,
+    bind_scope_evidence: Option<&eliot_protocol::AgentActivationBindScopeEvidence>,
 ) -> Result<Frame, PortFailure> {
     let mut frame =
         host_request_frame_for_envelope(AGENT_HOST_REQUEST_REHYDRATE_OPERATION, envelope, facts)?;
@@ -2548,6 +2853,10 @@ fn host_request_rehydrate_frame(
         return Err(request_failure());
     };
     payload["receipt"] = receipt_value;
+    if let Some(evidence) = bind_scope_evidence {
+        payload["bind_scope_evidence"] =
+            serde_json::to_value(evidence).map_err(|_| request_failure())?;
+    }
     frame.validate().map_err(|_| request_failure())?;
     Ok(frame)
 }
@@ -3874,7 +4183,7 @@ impl KernelHostRequestClient {
             });
         }
         let digest = envelope.envelope_sha256.clone();
-        let frame = host_request_rehydrate_frame(envelope, receipt, &facts)?;
+        let frame = host_request_rehydrate_frame(envelope, receipt, &facts, None)?;
         let reply = self
             .exchange(&frame)
             .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
@@ -4063,6 +4372,7 @@ mod tests {
             // exists, so both members stay absent exactly as they are in
             // production before a `Resolved` activation.
             task_binding: None,
+            bind_scope_evidence: None,
         }
     }
 

@@ -5,9 +5,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -136,6 +134,7 @@ fn decode_declaration_bytes(bytes: &[u8]) -> Result<AgentBridgeClientDeclaration
 
 struct LoadedAgentBridgeDeclaration {
     declaration: AgentBridgeClientDeclaration,
+    path: PathBuf,
     #[cfg(windows)]
     _lease: eliot_platform_windows::AgentBridgeDeclarationReadLease,
 }
@@ -153,8 +152,10 @@ struct AdmittedConnection {
 
 /// Single retained transport owner behind both kernel faces.
 ///
-/// Exactly one admitted transport, one tokio runtime, one declaration lease,
-/// and one activation one-shot guard live here. `KernelHostActivationPort`
+/// Exactly one current admitted transport, one tokio runtime, one declaration
+/// lease, and one activation one-shot guard live here. After an owner-stored
+/// BIND_SCOPE result, a fresh challenge/hello/admission may replace these as
+/// one unit; `KernelHostActivationPort`
 /// (runner side) and `KernelHostRequestClient` (host-gateway side) each hold
 /// a `SharedTransport`; no second transport, runtime, or lease is ever
 /// constructed. `activated_session` keeps the kernel-issued semantic session
@@ -169,9 +170,10 @@ struct AdmittedConnection {
 /// traffic.
 ///
 /// Durability boundary: `replay_cache`, `activated_session` and
-/// `activated_task_binding` are process
-/// memory only; all three die with this process, which spans exactly one admitted
-/// connection. Durable idempotency and unknown-outcome settlement belong to
+/// `activated_task_binding` are process memory only; all three die with this
+/// admitted connection and are reset only when the exact durable BIND_SCOPE
+/// result permits a fresh connection to replace it. Durable idempotency and
+/// unknown-outcome settlement belong to
 /// the Kernel ORS record, reachable after re-attach through the reconcile and
 /// restore entries owned by `KernelHostRequestClient`
 /// (`agent_host_request_reconcile`, `REACTIVE_RESTORE_OPERATION`). Neither
@@ -191,6 +193,11 @@ struct KernelTransportOwner {
     /// `activated_session`; a pre-activation envelope therefore still carries
     /// no task identity and the Kernel's own gate keeps refusing it.
     activated_task_binding: Option<ActivatedTaskBinding>,
+    /// Pre-scope semantic owner proof returned with the original
+    /// ScopeSelectionRequired activation denial. This is not an activated
+    /// session or task binding; only the explicit BIND_SCOPE lane may consume
+    /// it, on this retained transport connection.
+    bind_scope_evidence: Option<eliot_protocol::AgentActivationBindScopeEvidence>,
     replay_cache: HashMap<String, ReplayCacheEntry>,
     /// Bridge-held digest-verified durable event receipts per stream.
     /// Receipts remain unbound until an exact owner recovery page matches
@@ -4660,6 +4667,7 @@ fn load_declaration(path: &Path) -> Result<LoadedAgentBridgeDeclaration, Runtime
             decode_declaration_bytes(&bytes).map_err(RuntimeBuildError::KernelClient)?;
         Ok(LoadedAgentBridgeDeclaration {
             declaration,
+            path,
             _lease: lease,
         })
     }
@@ -4805,6 +4813,7 @@ fn kernel_faces_from_admission(
         limits,
         activated_session: None,
         activated_task_binding: None,
+        bind_scope_evidence: None,
         replay_cache: HashMap::new(),
         delivered_sequences: BTreeMap::new(),
         owner_acked: BTreeMap::new(),
@@ -4821,6 +4830,73 @@ fn kernel_faces_from_admission(
         shared: owner.clone(),
     });
     (host, host_request, fwd)
+}
+
+/// Re-admits the exact declared Bridge client on a new genuine front-door
+/// pipe after a stored BIND_SCOPE result. The original shared owner pointer
+/// stays in place for every existing Bridge face; only its admitted transport
+/// and one-shot activation state are replaced from the new Kernel challenge,
+/// hello, and receipt.
+pub(crate) fn reopen_kernel_transport(
+    shared: &SharedTransport,
+) -> Result<String, eliot_mcp::PortFailure> {
+    let (declaration_path, original_declaration) = {
+        let current = shared
+            .try_borrow()
+            .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
+                reason: "Kernel transport owner is busy during fresh admission".to_owned(),
+            })?;
+        (
+            current._loaded.path.clone(),
+            current._loaded.declaration.clone(),
+        )
+    };
+    let (activation, fresh_client, forwarding) =
+        kernel_ports_with_declaration(&declaration_path).map_err(|error| {
+            eliot_mcp::PortFailure::TransportBindingRejected {
+                reason: format!("fresh declared Kernel admission failed: {error}"),
+            }
+        })?;
+    let fresh_shared = fresh_client.shared.clone();
+    let fresh_declaration_matches = fresh_shared
+        .try_borrow()
+        .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
+            reason: "fresh Kernel transport owner is busy after admission".to_owned(),
+        })?
+        ._loaded
+        .declaration
+        == original_declaration;
+    if !fresh_declaration_matches {
+        return Err(eliot_mcp::PortFailure::TransportBindingRejected {
+            reason: "fresh Kernel admission did not retain the original client declaration".to_owned(),
+        });
+    }
+    let connection_id = fresh_shared
+        .try_borrow()
+        .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
+            reason: "fresh Kernel transport owner is busy after admission".to_owned(),
+        })?
+        .admitted
+        .receipt
+        .connection_id
+        .clone();
+    let mut current = shared
+        .try_borrow_mut()
+        .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
+            reason: "Kernel transport owner is busy during replacement".to_owned(),
+        })?;
+    let mut fresh = fresh_shared
+        .try_borrow_mut()
+        .map_err(|_| eliot_mcp::PortFailure::TransportBindingRejected {
+            reason: "fresh Kernel transport owner is busy during replacement".to_owned(),
+        })?;
+    std::mem::swap(&mut *current, &mut *fresh);
+    drop(fresh);
+    drop(current);
+    drop(fresh_client);
+    drop(activation);
+    drop(forwarding);
+    Ok(connection_id)
 }
 
 /// Projects a reactive delivery-record failure onto the closed bridge error

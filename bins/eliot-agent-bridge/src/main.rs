@@ -13,7 +13,7 @@ use eliot_agent_bridge::{
 };
 use eliot_agent_bridge_core::{
     ACTIVATION_DISPOSITION_INVALID_REQUEST, ACTIVATION_DISPOSITION_STALE_OR_CONFLICT,
-    ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachRequest, BridgeError, ConnectionId,
+    ACTIVATION_DISPOSITION_UNAVAILABLE_OR_CAPACITY, AttachKind, AttachRequest, BridgeError, ConnectionId,
     CoverageGap, DemandId, EventForwardStatus, FencingToken, Generation, HostEventEnvelope,
     ReconnectRequest, RecoveryProjectionPage, ResourceHandle, SessionId,
 };
@@ -137,6 +137,14 @@ const AGENT_HOST_REQUEST_REHYDRATE_OPERATION: &str = "agent_host_request_rehydra
 enum Request {
     Attach {
         request: AttachRequest,
+    },
+    /// Explicit operator proposal for the exact initial WorkScope selected
+    /// by the retained pre-scope activation proof. Only the proposal body and
+    /// its stable request correlation come from this caller; task/session/
+    /// scope/fence authority is copied from the original owner response.
+    BindScope {
+        correlation_id: String,
+        task_input: Value,
     },
     Invoke {
         request: HostInvocationRequest,
@@ -316,6 +324,22 @@ enum Response {
         bootstrap: Option<UnderstandingBootstrap>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cold_start_question: Option<eliot_protocol::AgentActivationColdStartQuestion>,
+    },
+    /// Exact Kernel admission receipt for the explicit BIND_SCOPE operation.
+    /// Admission is not a completed scan receipt or terminal readiness claim.
+    BindScope {
+        receipt: eliot_protocol::HostRequestAdmissionReceipt,
+        durable_state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_result: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_result_digest: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_connection_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<PortFailure>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activation: Option<Box<Response>>,
     },
     Reconnected {
         previous_connection_id: String,
@@ -865,6 +889,10 @@ fn main() {
     // Both counters use checked arithmetic so neither can wrap into a bypass.
     let mut total_records: u64 = 0;
     let mut consecutive_invalid: u32 = 0;
+    // Preserve only the caller's original typed attach inputs so a committed
+    // BIND_SCOPE can enter the real activation flow on the next genuine
+    // Kernel-admitted pipe connection.
+    let mut attach_template: Option<AttachRequest> = None;
     loop {
         let outcome = match read_bounded_record(&mut stdin_lock, REQUEST_INPUT_PROFILE) {
             Ok(outcome) => outcome,
@@ -967,29 +995,93 @@ fn main() {
         };
         total_records = next_total;
         let mut response = match decode_bounded_request(text) {
-            Ok(Request::Attach { request }) => match runner.attach(request) {
-                Ok(view) => {
-                    let cold_start_question = view.cold_start_question().cloned();
-                    // Best-effort durable restore for the fresh attach: a
-                    // refused or absent restore keeps the current empty-ledger
-                    // behavior and is reported on stderr without failing the
-                    // attach that already succeeded.
-                    if let Err(error) = reactive_runtime_composition::restore_reactive_runtime(
-                        &mut runner,
-                        &mut host_request_client,
-                        &[],
-                    ) {
-                        emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
+            Ok(Request::Attach { request }) => {
+                if attach_template.is_none() {
+                    attach_template = Some(request.clone());
+                }
+                match runner.attach(request) {
+                    Ok(view) => {
+                        let cold_start_question = view.cold_start_question().cloned();
+                        // Best-effort durable restore for the fresh attach: a
+                        // refused or absent restore keeps the current empty-ledger
+                        // behavior and is reported on stderr without failing the
+                        // attach that already succeeded.
+                        if let Err(error) = reactive_runtime_composition::restore_reactive_runtime(
+                            &mut runner,
+                            &mut host_request_client,
+                            &[],
+                        ) {
+                            emit_error("REACTIVE_RESTORE_REFUSED", &error.to_string());
+                        }
+                        Response::Attached {
+                            bootstrap: None,
+                            cold_start_question,
+                        }
                     }
-                    Response::Attached {
-                        bootstrap: None,
-                        cold_start_question,
+                    Err(error) => {
+                        provider_failure |= matches!(error, BridgeError::PlanGap(_));
+                        bridge_error(&error)
                     }
                 }
-                Err(error) => {
-                    provider_failure |= matches!(error, BridgeError::PlanGap(_));
-                    bridge_error(&error)
+            }
+            Ok(Request::BindScope {
+                correlation_id,
+                task_input,
+            }) => match host_request_client.bind_scope(&correlation_id, task_input) {
+                Ok(outcome) => {
+                    let mut activation = None;
+                    if let Some(connection_id) = outcome.new_connection_id.as_deref() {
+                        match attach_template
+                            .as_ref()
+                            .ok_or_else(|| {
+                                BridgeError::ProviderContract(
+                                    "original typed attach request is unavailable for fresh activation".to_owned(),
+                                )
+                            })
+                            .and_then(|template| {
+                                attach_request_on_connection(template, connection_id)
+                            })
+                        {
+                            Ok(request) => {
+                                attach_template = Some(request.clone());
+                                match runner.attach(request) {
+                                    Ok(view) => {
+                                        let cold_start_question =
+                                            view.cold_start_question().cloned();
+                                        if let Err(error) =
+                                            reactive_runtime_composition::restore_reactive_runtime(
+                                                &mut runner,
+                                                &mut host_request_client,
+                                                &[],
+                                            )
+                                        {
+                                            emit_error(
+                                                "REACTIVE_RESTORE_REFUSED",
+                                                &error.to_string(),
+                                            );
+                                        }
+                                        activation = Some(Box::new(Response::Attached {
+                                            bootstrap: None,
+                                            cold_start_question,
+                                        }));
+                                    }
+                                    Err(error) => activation = Some(Box::new(bridge_error(&error))),
+                                }
+                            }
+                            Err(error) => activation = Some(Box::new(bridge_error(&error))),
+                        }
+                    }
+                    Response::BindScope {
+                        receipt: outcome.receipt,
+                        durable_state: outcome.durable_state,
+                        owner_result: outcome.owner_result,
+                        owner_result_digest: outcome.owner_result_digest,
+                        new_connection_id: outcome.new_connection_id,
+                        recovery: outcome.recovery,
+                        activation,
+                    }
                 }
+                Err(error) => host_gateway_error(&HostGatewayError::from(error)),
             },
             Ok(Request::Invoke { request }) => {
                 let mut response =
@@ -1291,6 +1383,7 @@ fn response_bootstrap_slot(response: &mut Response) -> Option<&mut Option<Unders
         | Response::RecoveryProjectionPage { bootstrap, .. }
         | Response::Stopped { bootstrap, .. } => Some(bootstrap),
         Response::Bootstrap { .. }
+        | Response::BindScope { .. }
         | Response::ResourceChunk { .. }
         | Response::Backpressure { .. }
         | Response::TransportBackpressure { .. }
@@ -1337,6 +1430,38 @@ fn decode_bounded_request(text: &str) -> Result<Request, String> {
             });
         }
         _ => {}
+    }
+    Ok(request)
+}
+
+/// Carries the exact caller attach intent onto a freshly Kernel-admitted
+/// connection. Only the connection identity is replaced, and that value is
+/// copied from the new peer-admission receipt.
+fn attach_request_on_connection(
+    template: &AttachRequest,
+    connection_id: &str,
+) -> Result<AttachRequest, BridgeError> {
+    let connection = ConnectionId::new(connection_id).map_err(|_| {
+        BridgeError::ProviderContract(
+            "fresh Kernel admission returned an invalid connection identity".to_owned(),
+        )
+    })?;
+    let mut request = match template.attach_kind() {
+        AttachKind::Managed => AttachRequest::managed(template.demand_id().clone(), connection),
+        AttachKind::External => AttachRequest::external(
+            template.demand_id().clone(),
+            connection,
+            template
+                .pre_attach_blind_interval()
+                .cloned()
+                .ok_or(BridgeError::InvalidContract {
+                    field: "pre_attach_blind_interval",
+                    reason: "original external attach omitted its declared interval",
+                })?,
+        )?,
+    };
+    if let Some(selector) = template.workspace_selector() {
+        request = request.with_workspace_selector(selector.to_owned())?;
     }
     Ok(request)
 }
@@ -4976,6 +5101,7 @@ mod tests {
                     };
                     let seen = match request {
                         Request::Attach { .. } => "attach",
+                        Request::BindScope { .. } => "bind_scope",
                         Request::Invoke { .. } => "invoke",
                         Request::Cancel { .. } => "cancel",
                         Request::DryRunInvoke { .. } => "dry_run_invoke",
