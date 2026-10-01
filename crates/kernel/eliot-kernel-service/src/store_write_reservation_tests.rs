@@ -12,6 +12,17 @@
 //! downstream crates; a downstream-shaped `compile_fail` doctest on
 //! `ResolvedSendOutcome` proves the boundary. Recovery pages to exhaustion.
 //!
+//! Issue #1925: `reconcile_receipt` refuses on this base, because the store
+//! client exposes no read of the committed ordering link that ORS pins as the
+//! committed head evidence. Every case below that used to drive a successful
+//! close now asserts the REFUSAL by name and reason, plus the guarantee the
+//! success path used to imply in its still-true form: no reservation is
+//! finalized and none is released while the committed head evidence is absent,
+//! and the durable ORS record is read back to prove it. No case here mints a
+//! committed link, because none is honestly reachable — this fixture records no
+//! canonical event, no `event_id` and no `payload_digest`, so `ordering_link_hash`
+//! has no preimage that an owner did not produce.
+//!
 //! Case map:
 //! - 01 exact two-constructor injection and production gateway→ORS→Store map.
 //! - 02 unbound/foreign canonical verifier or ORS owner rejected.
@@ -23,15 +34,19 @@
 //! - 08 reserved capability absent does not fall back to unreserved write.
 //! - 09 queued normal work holds no provider/Kernel-lock/protected-control resource.
 //! - 10 cancellation before possible submission releases only its exact reservation.
-//! - 11 cancellation/timeout after possible submission retains reconciliation.
-//! - 12 canonical committed receipt finalizes the complete exact scope set.
-//! - 13 proved-not-applied release versus still-unknown remains distinct.
-//! - 14 forged/foreign/partial/stale receipt cannot release/finalize.
+//! - 11 cancellation/timeout after possible submission retains reconciliation,
+//!   and an exact committed receipt still cannot finalize it (#1925).
+//! - 12 the reserved write reaches the Store once under its complete exact
+//!   scope set, never falls back to `Apply`, and is refused the close (#1925).
+//! - 13 proved-not-applied versus still-unknown stays distinct: the two refuse
+//!   with two different typed reasons and neither is released (#1925).
+//! - 14 forged/foreign/partial/stale receipt cannot release/finalize; a
+//!   rejecting provider is never bypassed into a close (#1925).
 //! - 15 old executor cannot finalize another generation's token.
 //! - 16 exact replay versus changed operation content.
 //! - 17 ORS reopen/rebind recovers unresolved reservations before new allocation.
 //! - 18 one reconciling scope leaves unrelated work eligible and migration drain
-//!   remains honest.
+//!   remains honest, force-releasing nothing when the close is refused (#1925).
 //! - 19 source/error/cancellation paths preserve identity and redaction without
 //!   a second state/authority owner.
 //! - 20 actual call-chain and bounded fault-sequence proof: no orphaned token,
@@ -39,12 +54,14 @@
 //! - 21 recovery pagination reports every unresolved token across bounded pages.
 //! - 22 cancel-before-send happy path releases and unblocks the same-scope
 //!   successor with no terminal receipt.
-//! - 23 ordinary committed lifecycle finalizes without ambiguity and unblocks
-//!   the queue at once.
+//! - 23 the ordinary committed lifecycle reaches the Store but its close is
+//!   refused, so the queue is NOT unblocked onto an unproven head (#1925).
 //! - 24 durable rebind recovers identity/order/state, fences stale writers,
-//!   rejects invalid continuation without loss, then finalizes on exact evidence.
+//!   rejects invalid continuation without loss, and retains the recovered token
+//!   unresolved when the close is refused (#1925).
 //! - 25 terminal status without envelope not-applied proof stays unknown;
-//!   proved `Rejected`/`DeadLetter` release.
+//!   proved `Rejected`/`DeadLetter` are refused for the missing head evidence
+//!   rather than released (#1925).
 //! - 26 non-zero drain fails closed with the exact count and zero force-release.
 //! - 27 truncated drain report fails closed distinctly with zero force-release.
 //! - 28 a caller holding only `(owner, token)` never reaches `Executing`
@@ -74,7 +91,7 @@ use crate::{
     CompositionReservation, ObservedHead, RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER,
     RESERVATION_VISIBILITY, ReservationSeed, ReservationWriteError, ReservedSubmission,
     ResolvedSendOutcome, SealedReservation, begin_execute_after_send, cancel_before_send,
-    ensure_eligible, finalize_reservation, mark_unknown_outcome, project_reserved_write,
+    ensure_eligible, mark_unknown_outcome, project_reserved_write,
     reconcile_receipt, reserve_for_transition,
 };
 use eliot_contracts::{
@@ -895,6 +912,67 @@ fn reservation_error_code(error: &ReservationWriteError) -> &'static str {
     }
 }
 
+/// Asserts the one refusal `reconcile_receipt` returns on this base (issue
+/// #1925): the store client exposes no read of the committed ordering link, so
+/// the closure is never built and the exact `Unsupported` refusal names that
+/// missing owner read.
+///
+/// This is the translated form of the guarantee every positive reconciliation
+/// case used to assert by calling `.expect(...)` and observing a `Finalized` or
+/// `Released` token. The refusal is asserted BY NAME and for the right reason —
+/// not merely "some error" — so a later change that makes reconciliation refuse
+/// for a different reason fails here instead of silently satisfying the case.
+/// The variant match is itself part of the assertion: `Unknown` means the
+/// outcome is still undecided, while `Unsupported` means the evidence required
+/// to decide it is not reachable at all, and only the latter is the documented
+/// ceiling. The detail match then pins the reason to that exact missing read.
+fn assert_head_evidence_refusal(error: &ReservationWriteError, tag: &str) {
+    let ReservationWriteError::Unsupported { detail, .. } = error else {
+        panic!(
+            "{tag} reconciliation refuses for the missing head-evidence read, got {error:?} \
+             (a refusal for any other reason is a different defect)"
+        );
+    };
+    assert!(
+        detail.contains("no read of the committed ordering link"),
+        "{tag} refusal names the missing owner read of the committed ordering link, got {detail}"
+    );
+}
+
+/// Asserts the reservation is left exactly as the refusal found it: still in
+/// the unresolved set under its own identity, still `Reconciling` (or the state
+/// it already held), with NO terminal receipt bound.
+///
+/// This is the "none is finalized and none is released" half of the
+/// translated guarantee. It is deliberately stronger than "the call returned an
+/// error": it reads the durable ORS state back, so a producer that refused
+/// correctly but still advanced or freed the token would fail here.
+fn assert_neither_finalized_nor_released(
+    owner: &CompositionReservation,
+    token: &eliot_ors::WriterReservationToken,
+    expected_state: ReservationState,
+    tag: &str,
+) {
+    let pending = unresolved(owner);
+    let record = pending
+        .iter()
+        .find(|record| record.token.reservation_id == token.reservation_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "{tag} refused reservation {} is retained unresolved",
+                token.reservation_id.as_str()
+            )
+        });
+    assert_eq!(
+        record.state, expected_state,
+        "{tag} refused reservation keeps its exact state and is neither finalized nor released"
+    );
+    assert!(
+        record.terminal_receipt_id.is_none(),
+        "{tag} refused reservation binds no terminal receipt: it neither finalized nor released"
+    );
+}
+
 // WORK_UNIT_CASE: 992/2
 #[test]
 fn unbound_or_foreign_verifier_or_owner_is_rejected() {
@@ -1280,10 +1358,11 @@ fn stale_epoch_fence_expiry_or_changed_digest_cannot_dispatch() {
 #[test]
 fn cancellation_or_timeout_after_possible_submission_retains_reconciliation() {
     // Once execution starts, release is rejected and identity is preserved:
-    // the token stays `Executing` through the refused cancel, moves to
-    // `Reconciling` on the unknown outcome, and only exact receipt evidence
-    // finalizes it. Cancellation, timeout, and socket replacement can neither
-    // finalize nor free it.
+    // the token stays `Executing` through the refused cancel and moves to
+    // `Reconciling` on the unknown outcome. Cancellation, timeout, and socket
+    // replacement can neither finalize nor free it — and since #1925 neither
+    // can an exact committed receipt, because the store exposes no read of
+    // the committed ordering link that ORS pins as the head evidence.
     let (ors, _dir) = temp_ors("11", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
@@ -1321,17 +1400,20 @@ fn cancellation_or_timeout_after_possible_submission_retains_reconciliation() {
     let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
         .expect("992/11 projection seals");
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let reconciliation = reconcile_receipt(&sealed.token, &receipt).expect("992/11 evidence binds");
-    let closed =
-        finalize_reservation(&owner, &reconciliation).expect("992/11 exact receipt closes");
-    assert_eq!(
-        closed.state,
-        ReservationState::Finalized,
-        "992/11 only exact evidence finalizes"
-    );
-    assert!(
-        closed.terminal_receipt_id.is_some(),
-        "992/11 terminal receipt is bound"
+    // Issue #1925: an exact committed receipt is still refused here, because
+    // the store exposes no read of the committed ordering link and ORS pins
+    // that link as the head evidence. The guarantee this case exists for is
+    // that cancellation/timeout/socket-replacement can neither finalize nor
+    // free a possibly-submitted token; it now also holds against an exact
+    // receipt, which is the stronger statement, not a weaker one.
+    let error = reconcile_receipt(&sealed.token, &receipt)
+        .expect_err("992/11 exact committed receipt still cannot close the token");
+    assert_head_evidence_refusal(&error, "992/11");
+    assert_neither_finalized_nor_released(
+        &owner,
+        &sealed.token,
+        ReservationState::Reconciling,
+        "992/11",
     );
 }
 
@@ -1352,18 +1434,22 @@ fn proved_not_applied_release_stays_distinct_from_still_unknown() {
     let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
         .expect("992/13 projection seals");
     let cancelled = receipt_for(&request, WriteReceiptStatus::Cancelled);
-    let reconciliation =
-        reconcile_receipt(&sealed.token, &cancelled).expect("992/13 evidence binds");
-    let released =
-        finalize_reservation(&owner, &reconciliation).expect("992/13 proved-not-applied closes");
-    assert_eq!(
-        released.state,
-        ReservationState::Released,
-        "992/13 proved-not-applied releases"
-    );
-    assert!(
-        released.terminal_receipt_id.is_some(),
-        "992/13 release binds its terminal receipt"
+    // Issue #1925: the proved-not-applied arm no longer reaches `Released`,
+    // because the store exposes no read of the committed ordering link that
+    // ORS pins. The distinction this case proves is UNCHANGED and in fact
+    // sharper: the two arms now refuse with two different TYPED reasons.
+    // Proved-not-applied passes the envelope gate and is refused only for the
+    // absent head evidence (`Unsupported`); the envelopeless arm is refused
+    // earlier, as `Unknown`, because its outcome is genuinely undecided. They
+    // are still never confused, and neither is finalized or released.
+    let error = reconcile_receipt(&sealed.token, &cancelled)
+        .expect_err("992/13 proved-not-applied cannot release without head evidence");
+    assert_head_evidence_refusal(&error, "992/13");
+    assert_neither_finalized_nor_released(
+        &owner,
+        &sealed.token,
+        ReservationState::Reconciling,
+        "992/13",
     );
 
     let (u_context, u_transition, u_revision, u_ordering, u_sealed) =
@@ -1382,6 +1468,12 @@ fn proved_not_applied_release_stays_distinct_from_still_unknown() {
     assert!(
         matches!(error, ReservationWriteError::Unknown { .. }),
         "992/13 still-unknown is typed unknown, got {error:?}"
+    );
+    assert_neither_finalized_nor_released(
+        &owner,
+        &u_sealed.token,
+        ReservationState::Reconciling,
+        "992/13b",
     );
     let retained =
         begin_execute_after_send(&owner, &u_sealed.token, &send_evidence(&u_sealed.token))
@@ -1516,16 +1608,23 @@ fn forged_foreign_partial_or_stale_receipt_cannot_release_or_finalize() {
         project_reserved_write(&r_sealed, &r_context, &r_transition, r_revision, r_ordering)
             .expect("992/14c projection seals");
     let r_receipt = receipt_for(&r_request, WriteReceiptStatus::Committed);
-    let r_reconciliation =
-        reconcile_receipt(&r_sealed.token, &r_receipt).expect("992/14c evidence binds");
-    let error = finalize_reservation(&reject_owner, &r_reconciliation)
-        .expect_err("992/14 rejecting provider must refuse the close");
-    assert!(
-        matches!(
-            error,
-            ReservationWriteError::Ors(OrsError::CanonicalEvidence(_))
-        ),
-        "992/14 provider rejection fails closed, got {error:?}"
+    // Issue #1925: the rejecting provider is still bound and still consulted
+    // for ordering heads, but no readback verdict is ever requested, because
+    // `reconcile_receipt` refuses before a closure exists — the store exposes
+    // no read of the committed ordering link. The guarantee this arm states is
+    // therefore carried in its still-true form: a rejecting provider can never
+    // be silently bypassed into a close, because no close is attempted at all,
+    // and the refusal is identical to the accepting provider's. (The provider
+    // verdict itself is exercised against ORS in `eliot-ors`, where the
+    // readback closure is the unit under test.)
+    let error = reconcile_receipt(&r_sealed.token, &r_receipt)
+        .expect_err("992/14c a rejecting provider still cannot be closed past");
+    assert_head_evidence_refusal(&error, "992/14c");
+    assert_neither_finalized_nor_released(
+        &reject_owner,
+        &r_sealed.token,
+        ReservationState::Executing,
+        "992/14c",
     );
 }
 
@@ -1786,14 +1885,16 @@ fn cancel_before_send_releases_and_unblocks_the_same_scope_successor() {
 
 // WORK_UNIT_CASE: 992/23
 #[test]
-fn ordinary_committed_lifecycle_finalizes_without_ambiguity() {
+fn ordinary_committed_lifecycle_refuses_to_finalize_without_head_evidence() {
     // The normal committed execution path with no unknown outcome: reserve,
-    // eligible, post-send execute, project, exact committed receipt,
-    // finalize. The token finalizes with its terminal bound, leaves the
-    // unresolved set, and the same-scope successor is eligible at once.
+    // eligible, post-send execute, project, exact committed receipt — and then
+    // the close is refused (#1925), because the store exposes no read of the
+    // committed ordering link. The token is retained `Executing` with no
+    // terminal, and the same-scope successor stays blocked rather than being
+    // admitted onto a head no owner committed.
     // Revert check: skipping any step (e.g. executing without post-send
-    // evidence, or finalizing without the receipt) fails to compile or fails
-    // closed, and the `Finalized` assertion fails.
+    // evidence) fails to compile or fails closed, and a producer that closed
+    // the token anyway fails the retained-state readback.
     let (ors, _dir) = temp_ors("23", Arc::new(KernelRouteEvidence));
     let owner = owner_for(&ors);
     let (context, transition, revision, ordering, sealed) =
@@ -1814,57 +1915,41 @@ fn ordinary_committed_lifecycle_finalizes_without_ambiguity() {
     let request = project_reserved_write(&sealed, &context, &transition, revision, ordering)
         .expect("992/23 projection seals");
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let reconciliation = reconcile_receipt(&sealed.token, &receipt).expect("992/23 evidence binds");
-    let closed =
-        finalize_reservation(&owner, &reconciliation).expect("992/23 exact receipt closes");
-    assert_eq!(
-        closed.state,
-        ReservationState::Finalized,
-        "992/23 exact committed evidence finalizes"
-    );
-    assert!(
-        closed.terminal_receipt_id.is_some(),
-        "992/23 terminal receipt is bound"
+    // Issue #1925: the ordinary committed path is refused here, because the
+    // store exposes no read of the committed ordering link that ORS pins as
+    // the head evidence. The queue consequence below is the honest one: the
+    // scope does NOT unblock, and no successor is admitted onto a head that no
+    // owner committed.
+    let error = reconcile_receipt(&sealed.token, &receipt)
+        .expect_err("992/23 an exact committed receipt still cannot close the token");
+    assert_head_evidence_refusal(&error, "992/23");
+    assert_neither_finalized_nor_released(
+        &owner,
+        &sealed.token,
+        ReservationState::Executing,
+        "992/23",
     );
     let pending = unresolved(&owner);
-    assert!(
-        pending.is_empty(),
-        "992/23 committed token leaves no unresolved work"
+    assert_eq!(
+        pending.len(),
+        1,
+        "992/23 refused committed token stays in the unresolved set"
     );
-    // The same-scope successor observes the committed head: the next expected
-    // sequence with the receipt's canonical digest. It reserves and becomes
-    // eligible at once, proving the queue unblocked.
-    let committed_sha = receipt
-        .envelope
-        .as_ref()
-        .expect("992/23 envelope binds")
-        .identity
-        .canonical_sha256
-        .clone();
+    // The same-scope successor observes the head that actually exists — the
+    // unchanged frozen head, because nothing was proven committed — and is
+    // refused behind its unclosed predecessor. Before #1925 this reserved on
+    // the receipt envelope's `canonical_sha256` as the "committed head", which
+    // is the forged identity this issue removes; the assertion is now the
+    // stronger one: the queue stays blocked rather than unblocking on a head
+    // no owner ever committed.
     let successor_fixture = fixture_992();
-    // The successor extends the committed head: one past the observed
-    // sequence, both coordinates consumed from the fixture.
-    let advanced = successor_fixture.expected_sequence + 1;
     let context_b = context_for("23b");
     let mut transition_b = transition_for("23b", &[successor_fixture.scope_a.as_str()]);
-    let revision_b = vec![RevisionHeadExpectation {
-        key: RevisionKey::new(format!("{}23b", successor_fixture.revision_key_prefix)).unwrap(),
-        expected_revision: successor_fixture.expected_revision,
-        state_fence: fence_with(&successor_fixture),
-    }];
-    let ordering_b = vec![OrderingHeadExpectation {
-        scope: OrderingScopeId::new(successor_fixture.scope_a.clone()).unwrap(),
-        expected_sequence: advanced,
-        state_fence: fence_with(&successor_fixture),
-    }];
+    let (revision_b, ordering_b) = heads_for("23b", &[successor_fixture.scope_a.as_str()]);
     seal(&context_b, &mut transition_b, &revision_b, &ordering_b);
-    let heads_b = vec![ObservedHead {
-        scope: successor_fixture.scope_a.clone(),
-        expected_sequence: advanced,
-        expected_head_digest: committed_sha,
-        revision_head: None,
-    }];
-    let seed_b = seed_with_heads("23b", transition_b.identity.operation_id.as_str(), heads_b);
+    let seed_b = seed_for("23b", transition_b.identity.operation_id.as_str(), &[
+        successor_fixture.scope_a.as_str(),
+    ]);
     let next = reserve_for_transition(
         &owner,
         &seed_b,
@@ -1873,12 +1958,15 @@ fn ordinary_committed_lifecycle_finalizes_without_ambiguity() {
         &revision_b,
         &ordering_b,
     )
-    .expect("992/23 same-scope successor reserves on the committed head");
-    let next_eligible = ensure_eligible(&owner, &next.token).expect("992/23 successor is eligible");
-    assert_eq!(
-        next_eligible.state,
-        ReservationState::Eligible,
-        "992/23 committed close unblocks the queue at once"
+    .expect("992/23 same-scope successor reserves on the unchanged head");
+    let blocked = ensure_eligible(&owner, &next.token)
+        .expect_err("992/23 an unproven head must not unblock the queue");
+    assert!(
+        matches!(
+            blocked,
+            ReservationWriteError::Ors(OrsError::PredecessorPending)
+        ),
+        "992/23 successor stays blocked behind the unclosed predecessor, got {blocked:?}"
     );
 }
 
@@ -1988,18 +2076,24 @@ fn durable_rebind_recovers_identity_and_fences_stale_writers() {
     let request = project_reserved_write(&replayed, &context, &transition, revision, ordering)
         .expect("992/24 request rebuilds");
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let reconciliation =
-        reconcile_receipt(&replayed.token, &receipt).expect("992/24 evidence binds");
-    let closed =
-        finalize_reservation(&recovered, &reconciliation).expect("992/24 recovery finalizes");
-    assert_eq!(
-        closed.state,
-        ReservationState::Finalized,
-        "992/24 recovered token finalizes on exact evidence"
+    // Issue #1925: recovery cannot close the token either. The rebind above
+    // (identity, order, fencing, invalid continuation) is unaffected; only the
+    // final close is refused, and the recovered token is retained exactly as
+    // recovery found it rather than finalized on an unread head.
+    let error = reconcile_receipt(&replayed.token, &receipt)
+        .expect_err("992/24 recovery cannot close without the committed link");
+    assert_head_evidence_refusal(&error, "992/24");
+    assert_neither_finalized_nor_released(
+        &recovered,
+        &replayed.token,
+        ReservationState::Reconciling,
+        "992/24",
     );
     assert!(
-        unresolved(&recovered).is_empty(),
-        "992/24 no unresolved token remains"
+        unresolved(&recovered)
+            .iter()
+            .any(|record| record.token.reservation_id == sealed.token.reservation_id),
+        "992/24 recovered token is retained unresolved, not orphaned"
     );
 }
 
@@ -2052,17 +2146,19 @@ fn terminal_status_without_not_applied_proof_stays_unknown() {
         WriteReceiptStatus::Rejected,
         cancelled_disposition(),
     );
-    let reconciliation =
-        reconcile_receipt(&sealed.token, &cancelled_proof).expect("992/25 proved binds");
-    let released = finalize_reservation(&owner, &reconciliation).expect("992/25 proved releases");
-    assert_eq!(
-        released.state,
-        ReservationState::Released,
-        "992/25 proved-not-applied releases"
-    );
-    assert!(
-        released.terminal_receipt_id.is_some(),
-        "992/25 release binds its terminal receipt"
+    // Issue #1925: proved-not-applied no longer releases. The typed distinction
+    // this case exists to prove is preserved and is now the whole point: the
+    // unproved arm above is refused as `Unknown` (outcome undecided), while
+    // this proved arm is refused as `Unsupported` (evidence not reachable).
+    // Neither is finalized nor released.
+    let error = reconcile_receipt(&sealed.token, &cancelled_proof)
+        .expect_err("992/25 proved-not-applied cannot release without head evidence");
+    assert_head_evidence_refusal(&error, "992/25");
+    assert_neither_finalized_nor_released(
+        &owner,
+        &sealed.token,
+        ReservationState::Reconciling,
+        "992/25",
     );
     // A `Failure`-kind envelope proves not-applied for a `DeadLetter` status.
     let (d_context, d_transition, d_revision, d_ordering, d_sealed) =
@@ -2079,17 +2175,14 @@ fn terminal_status_without_not_applied_proof_stays_unknown() {
         WriteReceiptStatus::DeadLetter,
         failure_disposition(),
     );
-    let d_reconciliation = reconcile_receipt(&d_sealed.token, &dead).expect("992/25b proved binds");
-    let d_released =
-        finalize_reservation(&owner, &d_reconciliation).expect("992/25b proved releases");
-    assert_eq!(
-        d_released.state,
-        ReservationState::Released,
-        "992/25 dead-letter with failure proof releases"
-    );
-    assert!(
-        d_released.terminal_receipt_id.is_some(),
-        "992/25 dead-letter release binds its terminal receipt"
+    let error = reconcile_receipt(&d_sealed.token, &dead)
+        .expect_err("992/25b proved dead-letter cannot release without head evidence");
+    assert_head_evidence_refusal(&error, "992/25b");
+    assert_neither_finalized_nor_released(
+        &owner,
+        &d_sealed.token,
+        ReservationState::Reconciling,
+        "992/25b",
     );
 }
 
@@ -2241,21 +2334,45 @@ fn queued_normal_work_holds_no_provider_lock_or_protected_resource() {
         project_reserved_write(&sealed_b, &context_b, &transition_b, revision_b, ordering_b)
             .expect("992/9b projection seals");
     let receipt_b = receipt_for(&request_b, WriteReceiptStatus::Committed);
-    let reconciliation_b =
-        reconcile_receipt(&sealed_b.token, &receipt_b).expect("992/9b evidence binds");
-    let closed_b =
-        finalize_reservation(&owner, &reconciliation_b).expect("992/9b disjoint work finalizes");
-    assert_eq!(
-        closed_b.state,
-        ReservationState::Finalized,
-        "992/9 disjoint work completes beside the waiter"
+    // Issue #1925: the disjoint scope cannot be closed either. The property
+    // this case actually proves — a reconciling scope blocks only its OWN
+    // scopes, never a disjoint one — is unaffected and still asserted below:
+    // both tokens coexist, each in its own scope, neither finalized nor
+    // released, and neither starved by the other.
+    let error = reconcile_receipt(&sealed_b.token, &receipt_b)
+        .expect_err("992/9b disjoint work cannot close without head evidence");
+    assert_head_evidence_refusal(&error, "992/9b");
+    assert_neither_finalized_nor_released(
+        &owner,
+        &sealed_b.token,
+        ReservationState::Executing,
+        "992/9b",
     );
     let pending = unresolved(&owner);
-    assert_eq!(pending.len(), 1, "992/9 only the waiter remains");
     assert_eq!(
-        pending[0].token.reservation_id.as_str(),
-        format!("{}09a", fixture_992().reservation_id_prefix),
-        "992/9 waiter identity preserved"
+        pending.len(),
+        2,
+        "992/9 both the waiter and the disjoint scope remain, neither closed"
+    );
+    let waiter = pending
+        .iter()
+        .find(|record| {
+            record.token.reservation_id.as_str()
+                == format!("{}09a", fixture_992().reservation_id_prefix)
+        })
+        .expect("992/9 waiter identity preserved");
+    assert_eq!(
+        waiter.state,
+        ReservationState::Reconciling,
+        "992/9 waiter identity and state preserved beside the disjoint scope"
+    );
+    assert!(
+        waiter
+            .token
+            .scopes
+            .iter()
+            .all(|scope| scope.scope.as_str() == fixture_992().scope_a),
+        "992/9 the reconciling waiter holds only its own scope: the disjoint scope is never blocked by it"
     );
 }
 
@@ -2378,21 +2495,26 @@ fn mutated_fixture_prefix_controls_generated_reservation_identity() {
         "992/29 projection carries the mutated identity"
     );
     let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-    let reconciliation = reconcile_receipt(&sealed.token, &receipt).expect("992/29 evidence binds");
-    let closed =
-        finalize_reservation(&owner, &reconciliation).expect("992/29 exact receipt closes");
+    // Issue #1925: the close is refused, but that does not weaken what this
+    // case proves. The mutated fixture must control the generated identity
+    // end to end, and the retained unresolved record is read back for that
+    // identity — so the mutation is still proven authoritative past the
+    // reservation, through the projection, and into durable ORS state.
+    let error = reconcile_receipt(&sealed.token, &receipt)
+        .expect_err("992/29 mutated reservation cannot close without head evidence");
+    assert_head_evidence_refusal(&error, "992/29");
+    assert_neither_finalized_nor_released(
+        &owner,
+        &sealed.token,
+        ReservationState::Executing,
+        "992/29",
+    );
+    let pending = unresolved(&owner);
+    assert_eq!(pending.len(), 1, "992/29 the mutated reservation is retained");
     assert_eq!(
-        closed.state,
-        ReservationState::Finalized,
-        "992/29 mutated reservation finalizes"
-    );
-    assert!(
-        closed.terminal_receipt_id.is_some(),
-        "992/29 terminal receipt is bound"
-    );
-    assert!(
-        unresolved(&owner).is_empty(),
-        "992/29 mutated reservation leaves no unresolved work"
+        pending[0].token.reservation_id.as_str(),
+        format!("{mutated_prefix}{tag}"),
+        "992/29 the durable record carries the mutated fixture identity"
     );
 }
 
@@ -3086,41 +3208,66 @@ mod gateway_cases {
 
     // WORK_UNIT_CASE: 992/12
     #[tokio::test]
-    async fn canonical_committed_receipt_finalizes_the_complete_scope_set() {
-        // The full gateway path commits through the Store once and finalizes
-        // every reserved scope atomically; the released admission lease lets
-        // the next write through.
+    async fn canonical_committed_receipt_reaches_the_store_over_the_complete_scope_set() {
+        // The full gateway path commits through the Store once, covering every
+        // reserved scope, and never falls back to an unreserved `Apply`. The
+        // close is then refused (#1925) with the whole reserved scope set
+        // retained together — never partially closed — while the released
+        // admission lease still lets the next write through.
         let (ors, _dir) = temp_ors("12", Arc::new(KernelRouteEvidence));
         let setup = loopback(ServerMode::CommitSuccess, "12", Some(Arc::clone(&ors))).await;
         let (context, transition, revision, ordering, seed) =
             apply_inputs("12a", &["scope-992-a", "scope-992-b"]);
-        let receipt = setup
+        // Issue #1925: the gateway propagates the head-evidence refusal, so the
+        // committed path returns `Err` after exactly one Store send. The
+        // guarantee this case carries — the reserved write reaches the Store
+        // once, under its complete exact scope set, and never falls back to an
+        // unreserved `Apply` — is unaffected and still asserted. The refusal
+        // is checked to be the typed one, so a gateway that failed for any
+        // other reason could not satisfy this case.
+        let error = setup
             .gateway
             .apply_reserved(&context, transition, revision, ordering, seed)
             .await
-            .expect("992/12 committed write applies");
-        assert_eq!(
-            receipt.status,
-            WriteReceiptStatus::Committed,
-            "992/12 receipt commits"
-        );
-        assert_eq!(
-            receipt.ordering_sequences.len(),
-            2,
-            "992/12 receipt covers the complete scope set"
+            .expect_err("992/12 committed write cannot finalize without head evidence");
+        assert!(
+            error.contains("no read of the committed ordering link"),
+            "992/12 gateway surfaces the missing head-evidence read, got {error}"
         );
         assert_eq!(
             setup.log.reserved.load(Ordering::SeqCst),
             1,
             "992/12 exactly one Store send"
         );
-        let pending = unresolved(&owner_for(&ors));
-        assert!(
-            pending.is_empty(),
-            "992/12 committed token leaves no unresolved scope"
+        assert_eq!(
+            setup.log.apply.load(Ordering::SeqCst),
+            0,
+            "992/12 the refused reserved write never falls back to Apply"
         );
-        // The admission lease released deterministically: a later write on an
-        // untouched scope dispatches through the same gateway.
+        let pending = unresolved(&owner_for(&ors));
+        assert_eq!(
+            pending.len(),
+            1,
+            "992/12 the refused token is retained, not orphaned"
+        );
+        assert_eq!(
+            pending[0].state,
+            ReservationState::Executing,
+            "992/12 the refused token is retained executing: neither finalized nor released"
+        );
+        assert!(
+            pending[0].terminal_receipt_id.is_none(),
+            "992/12 the refused token binds no terminal receipt"
+        );
+        assert_eq!(
+            pending[0].token.scopes.len(),
+            2,
+            "992/12 the whole reserved scope set is retained together, never partially closed"
+        );
+        // The admission lease released deterministically despite the refusal:
+        // a later write on an untouched scope still dispatches through the same
+        // gateway. It reaches the Store exactly once and is refused the same
+        // way, which is what lease release means here.
         let (c2_context, c2_transition, c2_revision, c2_ordering, c2_seed) =
             apply_inputs_fresh_scope("12b", &fixture_992().scope_c);
         let second = setup
@@ -3133,11 +3280,10 @@ mod gateway_cases {
                 c2_seed,
             )
             .await
-            .expect("992/12 second call proves lease release");
-        assert_eq!(
-            second.status,
-            WriteReceiptStatus::Committed,
-            "992/12 second write commits"
+            .expect_err("992/12 second call proves lease release");
+        assert!(
+            second.contains("no read of the committed ordering link"),
+            "992/12 the second write is refused for the same measured reason, got {second}"
         );
         assert_eq!(
             setup.log.reserved.load(Ordering::SeqCst),
@@ -3253,34 +3399,61 @@ mod gateway_cases {
             project_reserved_write(&replayed, &context_a, &transition_a, revision_a, ordering_a)
                 .expect("992/18 request rebuilds");
         let receipt_a = receipt_for(&request_a, WriteReceiptStatus::Committed);
-        let reconciliation_a =
-            reconcile_receipt(&replayed.token, &receipt_a).expect("992/18 evidence binds");
-        let closed = finalize_reservation(&owner, &reconciliation_a)
-            .expect("992/18 recovery finalizes at the durable owner");
-        assert_eq!(
-            closed.state,
-            ReservationState::Finalized,
-            "992/18 recovery finalizes"
+        // Issue #1925: recovery at the durable owner refuses for the same
+        // measured reason, so the drain cannot go quiet. The honest count is
+        // asserted instead of a quiet drain: the reconciling token is retained
+        // (never finalized, never force-released), the unrelated probe is
+        // released by its own permitted pre-send cancel, and a fresh gateway
+        // reports exactly the one remaining open token — with no forced
+        // release, which is the guarantee this case exists to protect.
+        let error = reconcile_receipt(&replayed.token, &receipt_a)
+            .expect_err("992/18 recovery cannot finalize at the durable owner");
+        assert_head_evidence_refusal(&error, "992/18");
+        assert_neither_finalized_nor_released(
+            &owner,
+            &replayed.token,
+            ReservationState::Reconciling,
+            "992/18",
         );
-        // The unrelated probe stood down, so nothing remains: the fresh
-        // gateway drains quiet with nothing forced.
         cancel_before_send(&owner, &sealed_b.token).expect("992/18 probe releases");
         finish(setup).await;
         let setup2 = loopback(ServerMode::NoSend, "18b", Some(Arc::clone(&ors))).await;
-        setup2
+        let error = setup2
             .gateway
             .drain_reserved(Duration::from_secs(5))
             .await
-            .expect("992/18 drain goes quiet after reconciliation");
+            .expect_err("992/18 drain still blocks on the unclosed reconciling token");
+        assert_eq!(
+            error,
+            "migration drain blocked: 1 unresolved reservations remain; reconcile by exact receipt before exclusivity (no forced release)",
+            "992/18 drain reports the honest remaining count and force-releases nothing"
+        );
+        let rest = unresolved(&owner);
+        assert_eq!(
+            rest.len(),
+            1,
+            "992/18 exactly the unclosed reconciling token remains"
+        );
+        assert_eq!(
+            rest[0].state,
+            ReservationState::Reconciling,
+            "992/18 the retained token is never force-released to satisfy the drain"
+        );
+        assert!(
+            rest[0].terminal_receipt_id.is_none(),
+            "992/18 the retained token binds no terminal receipt"
+        );
         finish(setup2).await;
     }
 
     // WORK_UNIT_CASE: 992/20
     #[tokio::test]
     async fn bounded_fault_sequence_leaves_no_orphan_retry_or_mutation() {
-        // One unknown send reconciles to exactly one finalized token: a
+        // One unknown send leaves exactly one open token and one order: a
         // single Store send, zero receipt queries, zero retries, the
-        // transition bytes bit-identical, and every scope terminal together.
+        // transition bytes bit-identical, and no partial scope release. The
+        // close is refused (#1925), so the token is retained reconciling with
+        // no terminal rather than finalized.
         let (ors, _dir) = temp_ors("20", Arc::new(KernelRouteEvidence));
         let setup = loopback(ServerMode::UnknownOutcome, "20", Some(Arc::clone(&ors))).await;
         let (context, transition, revision, ordering, seed) =
@@ -3312,14 +3485,20 @@ mod gateway_cases {
         let request = project_reserved_write(&replayed, &context, &transition, revision, ordering)
             .expect("992/20 request rebuilds");
         let receipt = receipt_for(&request, WriteReceiptStatus::Committed);
-        let closed = setup
+        // Issue #1925: gateway reconciliation refuses for the same measured
+        // reason, so the token does not finalize. This case's actual guarantee
+        // — one send, no hidden retry, no hidden receipt query, bit-identical
+        // transition bytes, one order and no partial scope release, no orphan —
+        // is unaffected by the refusal and is asserted in full below. The
+        // refusal is additionally checked to be the typed head-evidence
+        // refusal rather than any other error.
+        let error = setup
             .gateway
             .reconcile_reserved(&replayed.token, &request, &receipt)
-            .expect("992/20 exact receipt reconciles");
-        assert_eq!(
-            closed.state,
-            ReservationState::Finalized,
-            "992/20 token finalizes"
+            .expect_err("992/20 exact receipt still cannot reconcile");
+        assert!(
+            error.contains("no read of the committed ordering link"),
+            "992/20 gateway surfaces the missing head-evidence read, got {error}"
         );
         assert_eq!(
             setup.log.reserved.load(Ordering::SeqCst),
@@ -3336,14 +3515,28 @@ mod gateway_cases {
             digest_before, digest_after,
             "992/20 transition bytes never mutated"
         );
+        let pending = unresolved(&owner);
+        let record = pending
+            .iter()
+            .find(|record| record.token.operation_id.as_str() == op)
+            .unwrap_or_else(|| panic!("992/20 no orphaned token remains for {op}"));
         assert_eq!(
-            closed.token.reservation_order, replayed.token.reservation_order,
+            record.token.reservation_order, replayed.token.reservation_order,
             "992/20 one order, no partial release"
         );
-        let pending = unresolved(&owner);
+        assert_eq!(
+            record.state,
+            ReservationState::Reconciling,
+            "992/20 the refused token is retained reconciling, neither finalized nor released"
+        );
         assert!(
-            pending.is_empty(),
-            "992/20 no orphaned token remains for {op}"
+            record.terminal_receipt_id.is_none(),
+            "992/20 the refused token binds no terminal receipt"
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "992/20 exactly one open token remains; none is orphaned or freed"
         );
         finish(setup).await;
     }
@@ -3990,8 +4183,14 @@ fn stage_executing(
 #[tokio::test]
 async fn startup_reconciliation_finalizes_resolved_pending_work() {
     // Two pre-restart Executing operations with exact committed receipts
-    // observed: the producer reconciles and finalizes both through the
-    // real receipt path and reports Ready with an empty remainder.
+    // observed. Issue #1925: the producer cannot reconcile either one, because
+    // the store exposes no read of the committed ordering link, so both are
+    // reported `Pending` with the refusal reason and readiness is `Blocked`.
+    // The guarantee this case owns is unchanged and still asserted in full:
+    // the scan completes over both tokens, observes exactly both receipts,
+    // reports an honest remainder rather than an empty or synthetic one, binds
+    // no terminal receipt, and leaves every token retained — never finalized,
+    // never released, never retried or replayed.
     let fixture = KernelRouteStoreFixture::open("1967-su-ready").expect("startup fixture opens");
     let owner = owner_for(fixture.store());
     let fixture_992 = fixture_992();
@@ -4021,16 +4220,57 @@ async fn startup_reconciliation_finalizes_resolved_pending_work() {
         .expect("startup scan completes");
     assert_eq!(report.scanned, 2);
     assert!(!report.truncated);
-    assert!(report.pending.is_empty() && report.unknown.is_empty());
+    assert_eq!(
+        answers
+            .receipt_queries
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both committed receipts are observed exactly once; the refusal is not an unobserved skip"
+    );
+    assert!(
+        report.unknown.is_empty(),
+        "both tokens were Executing, so neither is reported as an unknown outcome"
+    );
+    assert_eq!(
+        report.pending.len(),
+        2,
+        "both refusals are reported pending; neither is silently dropped"
+    );
+    for item in &report.pending {
+        assert_eq!(
+            item.reason, "reconciliation refused",
+            "each pending entry carries the honest refusal reason"
+        );
+        assert_eq!(
+            item.scopes.len(),
+            1,
+            "each pending entry preserves its own reserved scope"
+        );
+    }
     assert_eq!(
         report.readiness(),
-        StartupReconciliationReadiness::Ready,
-        "resolved remainder admits step 6"
+        StartupReconciliationReadiness::Blocked,
+        "an unresolved remainder blocks step 6 rather than admitting it"
     );
     assert_eq!(report.fence, fence());
     assert!(!report.digest.is_empty());
     let rest = unresolved_reservations(&owner, 64).expect("post-scan reads");
-    assert!(rest.is_empty(), "finalized work leaves no remainder");
+    assert_eq!(
+        rest.len(),
+        2,
+        "both tokens are retained; the refusal finalizes none and releases none"
+    );
+    for record in &rest {
+        assert_eq!(
+            record.state,
+            ReservationState::Executing,
+            "each retained token keeps its exact pre-restart state"
+        );
+        assert!(
+            record.terminal_receipt_id.is_none(),
+            "no retained token binds a terminal receipt"
+        );
+    }
     finish_startup_route(route).await;
 }
 
