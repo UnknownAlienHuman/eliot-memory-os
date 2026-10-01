@@ -2507,18 +2507,33 @@ mod owner_closure_provider_tests {
     }
 
     fn grant_entry(fence: &StateFence, grant_id: &str, parent: Option<&str>) -> CapabilityGrant {
+        // A delegation child is issued BY its parent's holder and must be a
+        // STRICT narrowing of the parent on every axis
+        // (`check_narrowing`: issuer == parent holder, authority is a strict
+        // subset, expiry and `max_uses` never widen). The root is issued by the
+        // root issuer; the child is issued by the root's holder and drops one
+        // operation from the root's two, so the edge narrows honestly instead
+        // of being refused as `GrantNotNarrower`. `grant_params` compiles the
+        // child's transition/data classes from the child's own one-entry
+        // admitted set.
+        let (issuer, operations) = match parent {
+            Some(_) => (
+                PrincipalRef::new("principal:holder").expect("issuer"),
+                vec!["op.read".to_owned()],
+            ),
+            None => (
+                PrincipalRef::new("principal:issuer").expect("issuer"),
+                vec!["op.read".to_owned(), "op.write".to_owned()],
+            ),
+        };
         CapabilityGrant {
             grant_id: GrantId::new(grant_id).expect("id"),
             parent_grant_id: parent.map(|id| GrantId::new(id).expect("parent")),
             authority_root_ref: "root:alpha".to_owned(),
-            issuer: PrincipalRef::new("principal:issuer").expect("issuer"),
+            issuer,
             holder: PrincipalRef::new("principal:holder").expect("holder"),
-            authority: AuthoritySet::new(
-                ["op.read".to_owned()],
-                ["res:1".to_owned()],
-                EffectClass::Read,
-            )
-            .expect("authority"),
+            authority: AuthoritySet::new(operations, ["res:1".to_owned()], EffectClass::Read)
+                .expect("authority"),
             inherited_source_ceiling: None,
             binding: binding(fence),
             // The canonical lifetime the compiled mechanical subset commits to.
@@ -2533,22 +2548,91 @@ mod owner_closure_provider_tests {
         }
     }
 
-    fn owner_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
-        let graph = GrantGraph::from_grants(
+    /// The root grant id the fixtures admit as the graph authority root.
+    const ROOT_GRANT_ID: &str = "grant:origin";
+    /// The idempotency identity the seeded root hydration was admitted under.
+    const ROOT_OPERATION_ID: &str = "op-restore-root";
+    /// The observation time the seeded root hydration was admitted at.
+    const ROOT_OBSERVED_AT_MS: i64 = 1_000;
+
+    fn grant_graph(fence: &StateFence) -> GrantGraph {
+        GrantGraph::from_grants(
             [
-                grant_entry(fence, "grant:origin", None),
-                grant_entry(fence, "grant:child", Some("grant:origin")),
+                grant_entry(fence, ROOT_GRANT_ID, None),
+                grant_entry(fence, "grant:child", Some(ROOT_GRANT_ID)),
             ],
             7,
         )
-        .expect("graph");
-        let effect_authorizer = EffectAuthorizer::default().snapshot().expect("authorizer");
-        AuthorityOwnerSnapshot::new(
+        .expect("graph")
+    }
+
+    /// The root hydration these fixtures carry in the authority-owner payload.
+    ///
+    /// `AuthorityOwnerSnapshot::validate` refuses a non-empty grant graph that
+    /// carries no grant hydration, so the durable owner must hold the REAL
+    /// compiled `grant:origin` root record. It is produced by the production
+    /// admission path (`admit_grant_root` on a provider restored from the same
+    /// graph and fence), not hand-written, so a test re-admitting it exercises
+    /// a genuine round trip and the registry entry is the exact record the
+    /// owner would have persisted.
+    fn owner_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
+        let graph = grant_graph(fence);
+        // Bootstrap on the ROOT-ONLY graph: it has no parent edge, so it needs
+        // no child narrowing to validate, and it is the one graph shape a bare
+        // owner payload can carry. Admit the real root hydration through the
+        // production path against that graph, then read the exact canonical
+        // hydration registry back out through the production export seam.
+        let root_only = GrantGraph::from_grants([grant_entry(fence, ROOT_GRANT_ID, None)], 7)
+            .expect("root-only graph");
+        let mut admitted = provider_over(fence, raw_authority_snapshot(fence, &root_only))
+            .expect("provider over root-only owner");
+        admitted
+            .admit_grant_root(
+                &grant_params(fence, ROOT_OPERATION_ID, ROOT_GRANT_ID, None),
+                &secret(),
+                ROOT_OBSERVED_AT_MS,
+            )
+            .expect("root hydration admitted");
+        let hydrations: AdmittedHydrationsSnapshot = serde_json::from_slice(
+            &admitted.export_registry().expect("registry export"),
+        )
+        .expect("canonical hydration registry");
+        // The child grant narrows the root, and its owner record is the durable
+        // graph; the root hydration registry entry is unchanged by it, so the
+        // final payload is the same root record the owner admitted.
+        AuthorityOwnerSnapshot::new_with_owner_hydrations(
             fence.clone(),
             graph.recovery_snapshot().expect("snapshot"),
-            effect_authorizer,
+            EffectAuthorizer::default().snapshot().expect("authorizer"),
+            hydrations,
         )
         .expect("owner snapshot")
+    }
+
+    /// The bare authority-owner payload these fixtures bootstrap from: an
+    /// EMPTY grant graph with an empty but shape-valid hydration registry at
+    /// the exact same fence and graph revision. This is the only graph shape a
+    /// bare owner payload may carry, because
+    /// `AuthorityOwnerSnapshot::validate` refuses a non-empty grant graph that
+    /// has no grant hydration and `AuthorityOwnerSnapshot::new` refuses to
+    /// substitute an empty registry for one.
+    fn raw_authority_snapshot(fence: &StateFence) -> AuthorityOwnerSnapshot {
+        let graph = GrantGraph::from_grants(std::iter::empty(), 7).expect("empty graph");
+        AuthorityOwnerSnapshot::new_with_owner_hydrations(
+            fence.clone(),
+            graph.recovery_snapshot().expect("snapshot"),
+            EffectAuthorizer::default().snapshot().expect("authorizer"),
+            AdmittedHydrationsSnapshot::empty(fence.clone(), graph.revision())
+                .expect("empty hydration registry"),
+        )
+        .expect("graph-only owner snapshot")
+    }
+
+    fn provider_over(
+        fence: &StateFence,
+        snapshot: AuthorityOwnerSnapshot,
+    ) -> Result<OwnerClosureProvider, CompositionError> {
+        OwnerClosureProvider::restore(snapshot, Some(history(fence)), fence, operation())
     }
 
     fn history(fence: &StateFence) -> RevocationHistoryEvidence {
@@ -2605,8 +2689,14 @@ mod owner_closure_provider_tests {
             token_id: format!("token-{grant_id}"),
             // The canonical grant entry these fixtures already admit names
             // `op.read` on `res:1`, so the compiled transition and data classes
-            // are that same vocabulary rather than a new label.
-            transition_classes: vec!["op.read".to_owned()],
+            // are that same vocabulary rather than a new label. The root admits
+            // both `op.read` and `op.write`; the child narrows to `op.read`
+            // alone, so each admission compiles against its own grant record.
+            transition_classes: if parent.is_some() {
+                vec!["op.read".to_owned()]
+            } else {
+                vec!["op.read".to_owned(), "op.write".to_owned()]
+            },
             data_classes: vec!["res:1".to_owned()],
             policy_revision: FIXTURE_REVISION.to_owned(),
             configuration_revision: FIXTURE_REVISION.to_owned(),

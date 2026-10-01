@@ -73,7 +73,7 @@ const MAX_NONCE_LEN: usize = 256;
 ///
 /// This derives the ref from the validated source contract rather than
 /// duplicating its identity/version/digest spelling in Governor.
-pub(crate) fn canonical_native_worker_facet_ref() -> Result<String, String> {
+pub fn canonical_native_worker_facet_ref() -> Result<String, String> {
     eliot_contracts::native_worker_resource_facet_v1()
         .and_then(|facet| facet.canonical_ref())
         .map_err(|error| format!("cannot derive canonical native-worker facet ref: {error}"))

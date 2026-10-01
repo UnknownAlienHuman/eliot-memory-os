@@ -164,7 +164,8 @@ pub use genesis_owner_packet::{
 mod native_worker_binding;
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
-    NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
+    NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding,
+    canonical_native_worker_facet_ref, process_invocation_digest_for,
 };
 
 /// Canonical write result kept together with the negative-memory decision
@@ -14000,7 +14001,7 @@ mod tests {
                 &"e".repeat(64),
                 &"f".repeat(64),
                 "cmd-1",
-                "facet-1",
+                &canonical_native_worker_facet_ref().expect("canonical native-worker facet ref"),
                 eliot_contracts::CapabilityCellId::new("native-worker-core").expect("cell id"),
                 vec!["intro-1".to_owned()],
                 vec!["grant-1".to_owned()],
