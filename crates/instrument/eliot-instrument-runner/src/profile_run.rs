@@ -1451,6 +1451,11 @@ pub fn stage_request(
         } else {
             StageExecutionKind::Process
         },
+        stage_command: Some(eliot_testd_core::InstrumentStageCommand {
+            executable: stage.command.executable.clone(),
+            argv: stage.command.argv.clone(),
+            spec_digest: stage.spec_digest.clone(),
+        }),
     })
 }
 

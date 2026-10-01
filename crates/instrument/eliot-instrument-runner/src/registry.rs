@@ -31,7 +31,7 @@ use eliot_instrument_cargo::{
 };
 use eliot_instrument_dotnet::{CONTRACT_ID as DOTNET_CONTRACT_ID, DOTNET_EXECUTABLE};
 use eliot_instrument_nextest::{MAX_NEXTEST_OUTPUT_BYTES, NEXTEST_INSTRUMENT};
-use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_EXECUTABLE, RUSTC_INSTRUMENT};
+use eliot_instrument_rustc::{MAX_RUSTC_OUTPUT_BYTES, RUSTC_INSTRUMENT};
 use eliot_instrument_rustfmt::{MAX_RUSTFMT_OUTPUT_BYTES, RUSTFMT_INSTRUMENT};
 use eliot_instrument_scip::{MAX_SCIP_BYTES, SCIP_INSTRUMENT};
 use eliot_module_registry::VerifiedModuleCatalogGeneration;
@@ -1459,9 +1459,9 @@ fn cargo_entry(
         environment_class: ISOLATED_PROCESS.to_owned(),
         resource_contract: resource_contract.to_owned(),
         cancellation_contract: cancellation_contract.to_owned(),
-        parser: diagnostic_id()?,
+        parser: contract_id(CARGO_CONTRACT_NAME)?,
         normalizer: diagnostic_id()?,
-        evaluator: diagnostic_id()?,
+        evaluator: contract_id(CARGO_CONTRACT_NAME)?,
         evaluator_version: ContractVersion::new(1, 0, 0),
         normative_pair_digest: String::new(),
         verifier: verifier_id()?,
@@ -1486,9 +1486,9 @@ fn cargo_entry(
 
 /// Rustc entry: build only.
 ///
-/// Kind and executable follow `RustcAdapter::launch` and `RUSTC_EXECUTABLE`;
-/// the parser and evaluator follow the in-adapter `parse_jsonl` projection
-/// and `RustcReport::execution_status` algebra.
+/// The compiler profile's Rustc-class stage is the exact Cargo Clippy command
+/// from `builtin_specs`; the parser is Clippy's JSON projection over that
+/// process stream.
 fn rustc_entry(
     fingerprints: &InvalidationSet,
     generation: u64,
@@ -1505,11 +1505,16 @@ fn rustc_entry(
         kinds: vec![InstrumentKind::Build],
         adapter: RUSTC_INSTRUMENT.to_owned(),
         adapter_version: ContractVersion::new(1, 0, 0),
+        // The admitted compiler profile resolves this Rustc-class stage to
+        // the exact Cargo Clippy command in builtin_specs (cargo clippy
+        // --message-format=json ...). Keep the provider executable identity
+        // aligned with that registered command; rustc is the semantic
+        // subject, not the executable process launched for this stage.
         executable: ExecutableIdentity::process(
-            RUSTC_EXECUTABLE,
-            "rust-toolchain (rustc distribution)",
+            "cargo",
+            "rust-toolchain composition-root port request for the admitted Clippy stage",
         ),
-        toolchain: "rustc".to_owned(),
+        toolchain: "cargo (rust toolchain)".to_owned(),
         targets: worktree_targets(),
         environment_class: ISOLATED_PROCESS.to_owned(),
         resource_contract: resource_contract.clone(),
@@ -1524,14 +1529,14 @@ fn rustc_entry(
         identities: ProfileIdentities::new(ProfileIdentityParams {
             source: fingerprints.source.clone(),
             lock: fingerprints.lock.clone(),
-            toolchain: "rustc".to_owned(),
-            executable: RUSTC_EXECUTABLE.to_owned(),
+            toolchain: "cargo (rust toolchain)".to_owned(),
+            executable: "cargo".to_owned(),
             features: ADMITTED_FEATURES.to_owned(),
             environment: ISOLATED_PROCESS.to_owned(),
             artifact: "rustc emits no artifact; diagnostics stream through the raw evidence handle"
                 .to_owned(),
             fence: ADMITTED_FENCE.to_owned(),
-            operation: "P-03 OperationId for the admitted rustc stage".to_owned(),
+            operation: "P-03 OperationId for the admitted cargo clippy stage".to_owned(),
             timeout: ADMITTED_TIMEOUT.to_owned(),
             cancellation: cancellation_contract.to_owned(),
             resource: resource_contract,
@@ -2223,4 +2228,3 @@ mod tests {
         ));
     }
 }
-
