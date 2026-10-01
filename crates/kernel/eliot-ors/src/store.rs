@@ -18000,6 +18000,15 @@ impl RedbRecoveryStore {
     /// happened. No atomicity with the separate Governor store is
     /// claimed: handoff reconciliation stays a separate step owned by the
     /// route.
+    ///
+    /// Issue #2731: this batch consumes no row budget, so it emits no
+    /// capacity pressure. Items are deduplicated per namespace and the
+    /// batch holds at most [`MAX_BRIDGE_ACK_BATCH`] of them; per namespace
+    /// the transaction performs only fixed-cardinality single-row upserts
+    /// (one cursor row, one recovery-revision row, one scope counter, one
+    /// cursor reconcile rebind), never inserts that scale with the batch.
+    /// The `u64` saturation guards on the revision counters stay bare
+    /// integer defenses: no row budget exhausts here.
     pub fn acknowledge_bridge_event_batch(
         &self,
         batch: &serde_json::Value,
@@ -21167,6 +21176,11 @@ impl RedbRecoveryStore {
         }
         let mut moved = false;
         let mut stream_pages = Vec::with_capacity(stream_owners.len());
+        // Issue #2731: defensive-only tripwire, not caller-reachable
+        // capacity. The selector parser clamps `stream_limit` to this same
+        // maximum, the owner page caps its rows at the passed limit, and
+        // the single-stream selector pushes exactly one owner, so more
+        // entries here means an internal paging invariant broke.
         if stream_owners.len() > MAX_BRIDGE_RECOVERY_STREAMS_PER_PAGE {
             return Err(OrsError::ProjectionLimitExceeded);
         }
@@ -21364,6 +21378,9 @@ impl RedbRecoveryStore {
                     &mut read_budget,
                 )?;
                 for (index, gap) in page.iter_mut().enumerate() {
+                    // Issue #2731: defensive-only shape guard. The page rows
+                    // are store-built JSON objects, so a non-object here
+                    // means an internal encoding invariant broke.
                     let object = gap
                         .as_object_mut()
                         .ok_or(OrsError::ProjectionLimitExceeded)?;
@@ -21637,10 +21654,18 @@ impl RedbRecoveryStore {
                 });
             }
             if positions >= MAX_BRIDGE_POSITION_LIVE_PER_NAMESPACE as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeEventCapacityExceeded(
+                    eliot_contracts::BridgeEventCapacityPressure::position_rows(
+                        eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                    ),
+                ));
             }
             if value.value().len() > MAX_BRIDGE_POSITION_RECORD_BYTES {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeEventCapacityExceeded(
+                    eliot_contracts::BridgeEventCapacityPressure::position_rows(
+                        eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                    ),
+                ));
             }
             read_budget.charge(key.as_bytes(), value.value().as_bytes())?;
             let position: BridgeEventPosition = decode(value.value())?;
@@ -21666,7 +21691,11 @@ impl RedbRecoveryStore {
                 read_budget,
             )?;
             if pending_events + event_count > MAX_BRIDGE_EVENT_RECORDS as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeEventCapacityExceeded(
+                    eliot_contracts::BridgeEventCapacityPressure::event_records(
+                        eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                    ),
+                ));
             }
             pending_events += event_count;
             pending_event_bytes += event_bytes;
@@ -21720,7 +21749,11 @@ impl RedbRecoveryStore {
                 });
             }
             if gaps >= MAX_BRIDGE_EVENT_GAPS_PER_STREAM as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeEventCapacityExceeded(
+                    eliot_contracts::BridgeEventCapacityPressure::scoped_gaps(
+                        eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                    ),
+                ));
             }
             gaps += 1;
             gap_bytes += (key.len() + value.value().len()) as u64;
@@ -21769,7 +21802,11 @@ impl RedbRecoveryStore {
                 });
             }
             if count >= MAX_BRIDGE_EVENT_HANDOFFS as u64 {
-                return Err(OrsError::ProjectionLimitExceeded);
+                return Err(OrsError::BridgeEventCapacityExceeded(
+                    eliot_contracts::BridgeEventCapacityPressure::pending_handoffs(
+                        eliot_contracts::BridgeEventLocalPhase::NotCommitted,
+                    ),
+                ));
             }
             count += 1;
             bytes += (key.len() + value.value().len()) as u64;
