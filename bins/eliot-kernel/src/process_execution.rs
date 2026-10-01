@@ -2940,13 +2940,12 @@ impl ProcessExecutionGateway {
     ) -> Result<eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse, ProcessExecutionError>
     {
         use eliot_blob_api::wire::{
-            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
-            BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullRequest,
-            BlobProcessStreamOwnerFactsPullResponse,
+            BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullPurpose,
+            BlobProcessStreamOwnerFactsPullRequest,
+            BlobProcessStreamOwnerFactsPullResponse, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID,
+            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
         };
-        use eliot_contracts::{
-            ContractId, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex,
-        };
+        use eliot_contracts::{ContractId, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex};
         use eliot_ors::{
             BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullRecord,
             BlobProcessStreamOwnerFactsPullState,
@@ -3057,6 +3056,7 @@ impl ProcessExecutionGateway {
             wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
             wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
             pull_ref: pull_ref.clone(),
+            purpose: BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant,
             job_id: process.job_id().as_str().to_owned(),
             invocation_id: invocation_id.to_owned(),
             process_binding_json,
@@ -3084,6 +3084,13 @@ impl ProcessExecutionGateway {
             expected_module_id,
             expected_generation_id,
             source_root_identity_sha256: source_root_identity_sha256.to_owned(),
+            source_admission_operation_id: None,
+            open_request_json: None,
+            open_request_sha256: None,
+            owner_update_identity_json: None,
+            owner_update_identity_sha256: None,
+            source_admission_json: None,
+            source_admission_sha256: None,
             state_fence,
             deadline_ms,
         };

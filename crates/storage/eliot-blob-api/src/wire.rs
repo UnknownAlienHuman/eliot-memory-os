@@ -34,14 +34,9 @@ pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_ID: &str = "eliot.kernel.blob-process-
 /// Dedicated no-effect selector for reconciling a consumed call token.
 pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID: &str =
     "eliot.kernel.blob-process-stream-reconcile";
-/// Separate read-only selector for retrieving an already-consumed call result.
-pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID: &str =
-    "eliot.kernel.blob-process-stream-reconcile";
 /// Current revision for the narrow `TestD`-to-Kernel capability exchange.
 pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION: u16 = 1;
 /// Current reconciliation selector revision.
-pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION: u16 = 1;
-/// Revision of the read-only consumed-call reconciliation selector.
 pub const BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION: u16 = 1;
 /// Maximum encoded Kernel capability-exchange frame.
 pub const BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
@@ -231,40 +226,6 @@ pub struct BlobProcessStreamKernelReconcileRequest {
 
 impl BlobProcessStreamKernelReconcileRequest {
     /// Validates exact selector, capability and original operation binding.
-    pub fn validate(&self) -> Result<(), WireValidationError> {
-        if self.wire_id != BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID
-            || self.wire_revision != BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION
-        {
-            return Err(WireValidationError::UnsupportedRevision);
-        }
-        self.capability.validate()?;
-        self.call_token.validate()?;
-        validate_digest("operation_sha256", &self.operation_sha256)
-    }
-}
-
-/// Read-only recovery request for a previously consumed effect token.
-///
-/// This selector never authorizes a Store exchange. Kernel looks up the
-/// original capability/token/digest tuple in ORS and returns its retained
-/// Completed response, NotStarted, or Unknown disposition.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BlobProcessStreamKernelReconcileRequest {
-    /// Dedicated read-only selector.
-    pub wire_id: String,
-    /// Closed selector revision.
-    pub wire_revision: u16,
-    /// Original Kernel-issued capability.
-    pub capability: ProcessStreamSinkCapabilityRef,
-    /// Exact already-consumed effect token.
-    pub call_token: BlobProcessStreamCallToken,
-    /// Digest of the exact original operation.
-    pub operation_sha256: String,
-}
-
-impl BlobProcessStreamKernelReconcileRequest {
-    /// Validates exact closed selectors and original call binding.
     pub fn validate(&self) -> Result<(), WireValidationError> {
         if self.wire_id != BLOB_PROCESS_STREAM_RECONCILE_WIRE_ID
             || self.wire_revision != BLOB_PROCESS_STREAM_RECONCILE_WIRE_REVISION
@@ -532,6 +493,17 @@ fn validate_body(body: &serde_json::Value) -> Result<(), WireValidationError> {
 /// Exact Kernel request for a fresh owner-side WorkScope/source/policy facts
 /// read. The request uses only already admitted job/process identities and
 /// carries no candidate owner facts from `TestD`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamOwnerFactsPullPurpose {
+    /// Launch-time WorkScope/catalog/policy admission for an immutable grant.
+    LaunchGrant,
+    /// Before-Open source admission write and exact named readback.
+    OpenAdmission,
+    /// Fresh current owner/catalog/source admission read for replay bytes.
+    SourceReadback,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobProcessStreamOwnerFactsPullRequest {
@@ -541,6 +513,8 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     pub wire_revision: u16,
     /// Kernel-generated durable pull reference.
     pub pull_ref: String,
+    /// Separates launch admission from per-stream source admission/readback.
+    pub purpose: BlobProcessStreamOwnerFactsPullPurpose,
     /// Exact durable `TestD` job identity.
     pub job_id: String,
     /// Exact admitted invocation identity.
@@ -589,6 +563,27 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     pub expected_generation_id: Option<String>,
     /// Digest of the exact canonical source-root identity after Kernel checks it.
     pub source_root_identity_sha256: String,
+    /// Exact operation identity for the pre-Open source admission transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission_operation_id: Option<String>,
+    /// Exact canonical ProcessStreamSinkOpenRequest for OpenAdmission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_request_json: Option<String>,
+    /// SHA-256 of the canonical Open request bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_request_sha256: Option<String>,
+    /// Exact Kernel-created prepared-transition RequestIdentity for OpenAdmission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_update_identity_json: Option<String>,
+    /// SHA-256 of the exact owner-update RequestIdentity bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_update_identity_sha256: Option<String>,
+    /// Previously retained source-admission identity for a fresh readback pull.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission_json: Option<String>,
+    /// SHA-256 of the exact source-admission record bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_admission_sha256: Option<String>,
     /// Authenticated outer request fence.
     pub state_fence: StateFence,
     /// Absolute Unix-millisecond deadline.
@@ -611,6 +606,60 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             ("source_id", self.source_id.as_str()),
         ] {
             validate_text(field, value)?;
+        }
+        match self.purpose {
+            BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant
+                if self.source_admission_operation_id.is_none()
+                    && self.open_request_json.is_none()
+                    && self.open_request_sha256.is_none()
+                    && self.owner_update_identity_json.is_none()
+                    && self.owner_update_identity_sha256.is_none()
+                    && self.source_admission_json.is_none()
+                    && self.source_admission_sha256.is_none() => {}
+            BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission
+                if self.source_admission_operation_id.is_some()
+                    && self.open_request_json.is_some()
+                    && self.open_request_sha256.is_some()
+                    && self.owner_update_identity_json.is_some()
+                    && self.owner_update_identity_sha256.is_some()
+                    && self.source_admission_json.is_none()
+                    && self.source_admission_sha256.is_none() =>
+            {
+                validate_text(
+                    "source_admission_operation_id",
+                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "open_request_json",
+                    self.open_request_json.as_deref().unwrap_or_default(),
+                    self.open_request_sha256.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "owner_update_identity_json",
+                    self.owner_update_identity_json.as_deref().unwrap_or_default(),
+                    self.owner_update_identity_sha256.as_deref().unwrap_or_default(),
+                )?;
+            }
+            BlobProcessStreamOwnerFactsPullPurpose::SourceReadback
+                if self.source_admission_operation_id.is_some()
+                    && self.source_admission_json.is_some()
+                    && self.source_admission_sha256.is_some()
+                    && self.open_request_json.is_none()
+                    && self.open_request_sha256.is_none()
+                    && self.owner_update_identity_json.is_none()
+                    && self.owner_update_identity_sha256.is_none() =>
+            {
+                validate_text(
+                    "source_admission_operation_id",
+                    self.source_admission_operation_id.as_deref().unwrap_or_default(),
+                )?;
+                validate_canonical_owner_json(
+                    "source_admission_json",
+                    self.source_admission_json.as_deref().unwrap_or_default(),
+                    self.source_admission_sha256.as_deref().unwrap_or_default(),
+                )?;
+            }
+            _ => return Err(WireValidationError::InvalidField("pull_purpose_fields")),
         }
         if let Some(work_scope_ref) = &self.expected_work_scope_ref {
             validate_text("expected_work_scope_ref", work_scope_ref)?;
@@ -672,6 +721,8 @@ pub struct BlobProcessStreamOwnerFactsPullResponse {
     pub wire_revision: u16,
     /// Exact pull reference answered by the daemon owner.
     pub pull_ref: String,
+    /// Purpose echoed from the exact pending request.
+    pub purpose: BlobProcessStreamOwnerFactsPullPurpose,
     /// Exact job identity answered.
     pub job_id: String,
     /// Exact invocation identity answered.
@@ -813,6 +864,18 @@ pub enum BlobProcessStreamOwnerFactsPullOutcome {
         generation_admission_json: String,
         /// SHA-256 of the exact GenerationAdmission JSON.
         generation_admission_sha256: String,
+        /// Exact canonical ProcessSourceAdmission record for per-stream flows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_source_admission_json: Option<String>,
+        /// SHA-256 of the exact ProcessSourceAdmission bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        process_source_admission_sha256: Option<String>,
+        /// Exact WriteReceipt proving the pre-Open Pending CAS, if this is OpenAdmission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_admission_write_receipt_json: Option<String>,
+        /// SHA-256 of the exact Pending WriteReceipt bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_admission_write_receipt_sha256: Option<String>,
     },
     /// The owner lacks one or more independent facts or the exact binding is stale.
     Unavailable {
@@ -878,6 +941,10 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             module_catalog_owner_readback_sha256,
             generation_admission_json,
             generation_admission_sha256,
+            process_source_admission_json,
+            process_source_admission_sha256,
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
         } = &self.outcome
         {
             for (field, value) in [
@@ -927,6 +994,16 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 serde_json::from_str(owner_facts_json)
                     .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
             owner_facts.validate()?;
+            validate_optional_canonical_owner_json_pair(
+                "process_source_admission",
+                process_source_admission_json,
+                process_source_admission_sha256,
+            )?;
+            validate_optional_canonical_owner_json_pair(
+                "source_admission_write_receipt",
+                source_admission_write_receipt_json,
+                source_admission_write_receipt_sha256,
+            )?;
             if serde_json::to_string(&owner_facts).ok().as_deref()
                 != Some(owner_facts_json.as_str())
                 || sha256_hex(owner_facts_json.as_bytes()) != *owner_facts_sha256
@@ -937,10 +1014,6 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 || owner_facts.residency_sha256 != *residency_sha256
                 || owner_facts.causal_binding_sha256 != *causal_receipt_sha256
                 || owner_facts.authority_binding_sha256 != *authority_sha256
-                || owner_facts.causal_binding_json != request.kernel_causal_binding_json
-                || owner_facts.causal_binding_sha256 != request.kernel_causal_binding_sha256
-                || owner_facts.authority_binding_json != request.kernel_authority_binding_json
-                || owner_facts.authority_binding_sha256 != request.kernel_authority_binding_sha256
                 || owner_facts.currentness_sha256 != *currentness_sha256
             {
                 return Err(WireValidationError::InvalidField("owner_facts_commitment"));
@@ -962,6 +1035,7 @@ impl BlobProcessStreamOwnerFactsPullResponse {
         request.validate()?;
         self.validate()?;
         if self.pull_ref != request.pull_ref
+            || self.purpose != request.purpose
             || self.job_id != request.job_id
             || self.invocation_id != request.invocation_id
             || self.process_binding_sha256 != request.process_binding_sha256
@@ -969,6 +1043,33 @@ impl BlobProcessStreamOwnerFactsPullResponse {
             || self.observed_state_fence != request.state_fence
         {
             return Err(WireValidationError::InvalidField("owner_facts_binding"));
+        }
+        if let BlobProcessStreamOwnerFactsPullOutcome::Available {
+            process_source_admission_json,
+            process_source_admission_sha256,
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
+            ..
+        } = &self.outcome
+        {
+            let has_admission = process_source_admission_json.is_some()
+                && process_source_admission_sha256.is_some();
+            let has_write_receipt = source_admission_write_receipt_json.is_some()
+                && source_admission_write_receipt_sha256.is_some();
+            let valid = match request.purpose {
+                BlobProcessStreamOwnerFactsPullPurpose::LaunchGrant => {
+                    !has_admission && !has_write_receipt
+                }
+                BlobProcessStreamOwnerFactsPullPurpose::OpenAdmission => {
+                    has_admission && has_write_receipt
+                }
+                BlobProcessStreamOwnerFactsPullPurpose::SourceReadback => {
+                    has_admission && !has_write_receipt
+                }
+            };
+            if !valid {
+                return Err(WireValidationError::InvalidField("purpose_result"));
+            }
         }
         if let BlobProcessStreamOwnerFactsPullOutcome::Available { work_scope_ref, .. } =
             &self.outcome
@@ -978,6 +1079,23 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 .is_some_and(|expected| expected != work_scope_ref)
         {
             return Err(WireValidationError::InvalidField("work_scope_binding"));
+        }
+        if let BlobProcessStreamOwnerFactsPullOutcome::Available {
+            owner_facts_json,
+            ..
+        } = &self.outcome
+        {
+            let owner_facts: BlobProcessStreamVerifiedOwnerFacts = serde_json::from_str(
+                owner_facts_json,
+            )
+            .map_err(|_| WireValidationError::InvalidField("owner_facts_json"))?;
+            if owner_facts.causal_binding_json != request.kernel_causal_binding_json
+                || owner_facts.causal_binding_sha256 != request.kernel_causal_binding_sha256
+                || owner_facts.authority_binding_json != request.kernel_authority_binding_json
+                || owner_facts.authority_binding_sha256 != request.kernel_authority_binding_sha256
+            {
+                return Err(WireValidationError::InvalidField("owner_authority_binding"));
+            }
         }
         if matches!(
             &self.outcome,
@@ -1741,6 +1859,10 @@ pub enum ProcessStreamSourceReadbackResponse {
         generation_admission_json: String,
         /// SHA-256 of the exact GenerationAdmission bytes above.
         generation_admission_sha256: String,
+        /// Fresh named readback of the exact durable source-admission row.
+        process_source_admission_readback_json: String,
+        /// SHA-256 of the exact source-admission readback bytes.
+        process_source_admission_readback_sha256: String,
     },
     /// Exact original intent is durably reserved and no stage effect began.
     NotStarted,
@@ -1769,8 +1891,9 @@ impl ProcessStreamSourceReadbackResponse {
             module_catalog_owner_readback_sha256,
             generation_admission_json,
             generation_admission_sha256,
-        } = self
-        else {
+            process_source_admission_readback_json,
+            process_source_admission_readback_sha256,
+        } = self else {
             return Ok(());
         };
         validate_digest("whole_source_sha256", whole_source_sha256)?;
@@ -1781,6 +1904,10 @@ impl ProcessStreamSourceReadbackResponse {
             module_catalog_owner_readback_sha256,
         )?;
         validate_digest("generation_admission_sha256", generation_admission_sha256)?;
+        validate_digest(
+            "process_source_admission_readback_sha256",
+            process_source_admission_readback_sha256,
+        )?;
         for (field, value) in [
             ("ready_receipt_ref", ready_receipt_ref.as_str()),
             ("readback_receipt_id", readback_receipt_id.as_str()),
@@ -1809,6 +1936,11 @@ impl ProcessStreamSourceReadbackResponse {
             "generation_admission_json",
             generation_admission_json,
             generation_admission_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "process_source_admission_readback_json",
+            process_source_admission_readback_json,
+            process_source_admission_readback_sha256,
         )?;
         Ok(())
     }
@@ -1851,15 +1983,29 @@ fn validate_canonical_owner_json(
     digest: &str,
 ) -> Result<(), WireValidationError> {
     validate_digest(field, digest)?;
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|_| WireValidationError::InvalidField(field))?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| WireValidationError::InvalidField(field))?;
+    let canonical = serde_json::to_string(&value)
+        .map_err(|_| WireValidationError::InvalidField(field))?;
     if !matches!(&value, serde_json::Value::Object(_))
-        || serde_json::to_string(&value).as_bytes() != json.as_bytes()
+        || canonical.as_bytes() != json.as_bytes()
         || sha256_hex(json.as_bytes()) != digest
     {
         return Err(WireValidationError::InvalidField(field));
     }
     Ok(())
+}
+
+fn validate_optional_canonical_owner_json_pair(
+    field: &'static str,
+    json: &Option<String>,
+    digest: &Option<String>,
+) -> Result<(), WireValidationError> {
+    match (json, digest) {
+        (Some(json), Some(digest)) => validate_canonical_owner_json(field, json, digest),
+        (None, None) => Ok(()),
+        _ => Err(WireValidationError::InvalidField(field)),
+    }
 }
 
 fn json_object(value: &str) -> bool {

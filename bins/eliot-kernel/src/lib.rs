@@ -1777,6 +1777,65 @@ impl KernelComposition {
                 operation_sha256: request.operation_sha256.clone(),
             };
         }
+        let non_success = match &owner_response.operation {
+            eliot_blob_api::wire::BlobProcessStreamOperationResponse::Sink { response } => {
+                match response {
+                    eliot_blob_api::wire::ProcessStreamSinkWireResponse::NotStarted => {
+                        Some((
+                            BlobProcessStreamCallState::NotStarted,
+                            BlobProcessStreamKernelOutcome::NotStarted {
+                                operation_sha256: request.operation_sha256.clone(),
+                            },
+                        ))
+                    }
+                    eliot_blob_api::wire::ProcessStreamSinkWireResponse::Unknown => Some((
+                        BlobProcessStreamCallState::Unknown,
+                        BlobProcessStreamKernelOutcome::Unknown {
+                            operation_sha256: request.operation_sha256.clone(),
+                        },
+                    )),
+                    eliot_blob_api::wire::ProcessStreamSinkWireResponse::Unavailable { .. } => {
+                        Some((
+                            BlobProcessStreamCallState::Unavailable,
+                            BlobProcessStreamKernelOutcome::Unavailable {
+                                operation_sha256: request.operation_sha256.clone(),
+                                reason: eliot_blob_api::wire::BlobProcessStreamUnavailableReason::ServiceUnavailable,
+                            },
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+            eliot_blob_api::wire::BlobProcessStreamOperationResponse::SourceReadback { response } => {
+                match response {
+                    eliot_blob_api::wire::ProcessStreamSourceReadbackResponse::NotStarted => {
+                        Some((
+                            BlobProcessStreamCallState::NotStarted,
+                            BlobProcessStreamKernelOutcome::NotStarted {
+                                operation_sha256: request.operation_sha256.clone(),
+                            },
+                        ))
+                    }
+                    eliot_blob_api::wire::ProcessStreamSourceReadbackResponse::Unknown => Some((
+                        BlobProcessStreamCallState::Unknown,
+                        BlobProcessStreamKernelOutcome::Unknown {
+                            operation_sha256: request.operation_sha256.clone(),
+                        },
+                    )),
+                    eliot_blob_api::wire::ProcessStreamSourceReadbackResponse::Ready { .. } => None,
+                }
+            }
+        };
+        if let Some((state, outcome)) = non_success {
+            let mut terminal = dispatched;
+            terminal.state = state;
+            if self.p07_ors.complete_blob_process_stream_call(&terminal).is_err() {
+                return BlobProcessStreamKernelOutcome::Unknown {
+                    operation_sha256: request.operation_sha256.clone(),
+                };
+            }
+            return outcome;
+        }
         let next_ordinal = match request.call_token.ordinal.checked_add(1) {
             Some(value) => value,
             None => {
