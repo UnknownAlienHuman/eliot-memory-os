@@ -27,6 +27,14 @@ pub const BLOB_PROCESS_STREAM_CAPABILITY: &str = "blob.process-stream";
 pub const BLOB_PROCESS_STREAM_WIRE_REVISION: u16 = 1;
 /// Bound for one encoded Blob process-stream JSON payload.
 pub const BLOB_PROCESS_STREAM_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
+/// Narrow TestD-to-Kernel capability exchange selector. This frame is
+/// authenticated by the established Kernel session and is accepted before
+/// ordinary request-identity decoding only for the exact TestD peer role.
+pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_ID: &str = "eliot.kernel.blob-process-stream";
+/// Current revision for the narrow TestD-to-Kernel capability exchange.
+pub const BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION: u16 = 1;
+/// Maximum encoded Kernel capability-exchange frame.
+pub const BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 
 /// Operation tag inside the distinct Blob EBP channel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -122,6 +130,196 @@ impl BlobProcessStreamFrameResponse {
             .len();
         if encoded_len > BLOB_PROCESS_STREAM_MAX_FRAME_BYTES {
             return Err(WireValidationError::InvalidField("frame"));
+        }
+        Ok(())
+    }
+}
+
+/// One-use opaque call reference issued by Kernel for a retained process-stream
+/// capability. The server binds it to an operation sequence and body digest;
+/// the token contains no request identity or signing material.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamCallToken {
+    /// Opaque, bounded lookup reference retained by Kernel.
+    pub reference: String,
+    /// Operation ordinal fixed by Kernel when the token is issued.
+    pub ordinal: u32,
+}
+
+impl BlobProcessStreamCallToken {
+    /// Validates the opaque reference and nonzero operation ordinal.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.reference.trim().is_empty()
+            || self.reference.len() > 128
+            || self.reference.chars().any(char::is_control)
+            || self.ordinal == 0
+        {
+            return Err(WireValidationError::InvalidField("call_token"));
+        }
+        Ok(())
+    }
+}
+
+/// Narrow authenticated TestD-to-Kernel request for one Blob process-stream
+/// operation. The established session supplies peer authentication; Kernel
+/// resolves both references against its retained job capability and issues
+/// the Store-facing RequestIdentity internally.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamKernelRequest {
+    /// Closed wire selector.
+    pub wire_id: String,
+    /// Closed wire revision.
+    pub wire_revision: u16,
+    /// Opaque Kernel-issued process-stream capability.
+    pub capability: ProcessStreamSinkCapabilityRef,
+    /// Opaque one-use Kernel-issued operation token.
+    pub call_token: BlobProcessStreamCallToken,
+    /// Digest of the exact typed operation envelope below.
+    pub operation_sha256: String,
+    /// Exact closed Blob process-stream operation.
+    pub operation: BlobProcessStreamFrameRequest,
+}
+
+impl BlobProcessStreamKernelRequest {
+    /// Constructs a narrow Kernel exchange with a digest over the exact
+    /// typed operation envelope.
+    pub fn new(
+        capability: ProcessStreamSinkCapabilityRef,
+        call_token: BlobProcessStreamCallToken,
+        operation: BlobProcessStreamFrameRequest,
+    ) -> Result<Self, WireValidationError> {
+        let operation_bytes = serde_json::to_vec(&operation)
+            .map_err(|_| WireValidationError::InvalidField("operation"))?;
+        let request = Self {
+            wire_id: BLOB_PROCESS_STREAM_KERNEL_WIRE_ID.to_owned(),
+            wire_revision: BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION,
+            capability,
+            call_token,
+            operation_sha256: sha256_hex(&operation_bytes),
+            operation,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Validates exact selectors, opaque references, body digest, and limits.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.wire_id != BLOB_PROCESS_STREAM_KERNEL_WIRE_ID
+            || self.wire_revision != BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION
+        {
+            return Err(WireValidationError::UnsupportedRevision);
+        }
+        self.capability.validate()?;
+        self.call_token.validate()?;
+        self.operation.validate()?;
+        validate_digest("operation_sha256", &self.operation_sha256)?;
+        let operation = serde_json::to_vec(&self.operation)
+            .map_err(|_| WireValidationError::InvalidField("operation"))?;
+        if sha256_hex(&operation) != self.operation_sha256 {
+            return Err(WireValidationError::InvalidField("operation_sha256"));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|_| WireValidationError::InvalidField("frame"))?;
+        if encoded.len() > BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES {
+            return Err(WireValidationError::InvalidField("frame"));
+        }
+        Ok(())
+    }
+}
+
+/// Result of one narrow authenticated TestD-to-Kernel capability operation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum BlobProcessStreamKernelOutcome {
+    /// Exact typed owner response retained for this token and operation digest.
+    Completed {
+        /// Digest of the original operation body.
+        operation_sha256: String,
+        /// Exact closed Store/Blob result.
+        response: BlobProcessStreamFrameResponse,
+    },
+    /// Kernel proved that the original token was reserved and no Store call began.
+    NotStarted {
+        /// Original operation digest.
+        operation_sha256: String,
+    },
+    /// Kernel cannot prove whether the original Store call completed.
+    Unknown {
+        /// Original operation digest.
+        operation_sha256: String,
+    },
+}
+
+/// Closed response to [`BlobProcessStreamKernelRequest`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamKernelResponse {
+    /// Closed wire selector.
+    pub wire_id: String,
+    /// Closed wire revision.
+    pub wire_revision: u16,
+    /// Echo of the opaque capability reference.
+    pub capability: ProcessStreamSinkCapabilityRef,
+    /// Echo of the one-use token reference and ordinal.
+    pub call_token: BlobProcessStreamCallToken,
+    /// Retained outcome for this exact operation.
+    pub outcome: BlobProcessStreamKernelOutcome,
+}
+
+impl BlobProcessStreamKernelResponse {
+    /// Validates response selectors and bounded encoded size.
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self.wire_id != BLOB_PROCESS_STREAM_KERNEL_WIRE_ID
+            || self.wire_revision != BLOB_PROCESS_STREAM_KERNEL_WIRE_REVISION
+        {
+            return Err(WireValidationError::UnsupportedRevision);
+        }
+        self.capability.validate()?;
+        self.call_token.validate()?;
+        match &self.outcome {
+            BlobProcessStreamKernelOutcome::Completed {
+                operation_sha256,
+                response,
+            } => {
+                validate_digest("operation_sha256", operation_sha256)?;
+                response.validate()?;
+            }
+            BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
+            | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => {
+                validate_digest("operation_sha256", operation_sha256)?;
+            }
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|_| WireValidationError::InvalidField("frame"))?;
+        if encoded.len() > BLOB_PROCESS_STREAM_KERNEL_MAX_FRAME_BYTES {
+            return Err(WireValidationError::InvalidField("frame"));
+        }
+        Ok(())
+    }
+
+    /// Validates that this response belongs to the exact request token and
+    /// operation digest, preventing cross-token or stale result acceptance.
+    pub fn validate_for_request(
+        &self,
+        request: &BlobProcessStreamKernelRequest,
+    ) -> Result<(), WireValidationError> {
+        self.validate()?;
+        request.validate()?;
+        if self.capability != request.capability || self.call_token != request.call_token {
+            return Err(WireValidationError::InvalidField("response_binding"));
+        }
+        let operation_sha256 = match &self.outcome {
+            BlobProcessStreamKernelOutcome::Completed {
+                operation_sha256,
+                ..
+            }
+            | BlobProcessStreamKernelOutcome::NotStarted { operation_sha256 }
+            | BlobProcessStreamKernelOutcome::Unknown { operation_sha256 } => operation_sha256,
+        };
+        if operation_sha256 != &request.operation_sha256 {
+            return Err(WireValidationError::InvalidField("response_operation_sha256"));
         }
         Ok(())
     }
@@ -489,7 +687,7 @@ impl ProcessStreamSinkWireRequest {
 }
 
 /// Closed owner outcomes for process-stream sink operations.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
 pub enum ProcessStreamSinkWireResponse {
     /// Open accepted under the exact original binding.
