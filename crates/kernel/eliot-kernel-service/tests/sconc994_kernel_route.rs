@@ -70,11 +70,12 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CommitId, EffectClass,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationIdentity, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
+    OperationIdentity, OrderingHead, OrderingHeadExpectation,
     OrderingScopeId, PreparedTransition, ReadinessReceipt, RequestMeta, ReservedWriteRequest,
     Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreRequest,
     StoreResponse, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_request_hash,
-    decode_request_frame, response_frame,
+    decode_request_frame, generated_operation_manifests, operation_manifest_set_digest,
+    response_frame,
 };
 use serde_json::json;
 
@@ -124,6 +125,10 @@ fn context_for(tag: &str) -> RequestMeta {
 
 fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
     let operation_id = format!("op-994-kr-{tag}");
+    let operation_manifest_digest = operation_manifest_set_digest(
+        &generated_operation_manifests().expect("994-kr operation catalogue generates"),
+    )
+    .expect("994-kr operation catalogue set digest");
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
@@ -141,8 +146,7 @@ fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
-        operation_manifest_digest: OperationManifestDigest::new(format!("manifest-994-kr-{tag}"))
-            .expect("994-kr manifest digest"),
+        operation_manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).
         admission_digest: String::new(),

@@ -43,12 +43,13 @@ use eliot_protocol::{
 };
 use eliot_store_api::{
     CanonicalStoreClient, CommitId, EffectClass, EventProjectionRelationIntents,
-    NamedMutationOperation, NamedMutationRequest, OperationIdentity, OperationManifestDigest,
+    NamedMutationOperation, NamedMutationRequest, OperationIdentity,
     OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition, RequestMeta,
     ReservedScopeBinding, ReservedWriteRequest, Resubmission, RevisionHeadExpectation, RevisionKey,
     ScopeId, SecurityContext, StoreError, StoreFailure, StoreFailureIdentityContext, StoreRequest,
     StoreResponse, TransitionClass, WriteAdmissionParams, WriteAdmissionProjection, WriteReceipt,
-    WriteReceiptStatus, WriterEpochBinding, issue_store_receipt_envelope, response_frame,
+    WriteReceiptStatus, WriterEpochBinding, generated_operation_manifests,
+    issue_store_receipt_envelope, operation_manifest_set_digest, response_frame,
 };
 use serde_json::json;
 
@@ -95,6 +96,10 @@ fn context_with(tag: &str) -> RequestMeta {
 }
 
 fn transition_with(tag: &str) -> PreparedTransition {
+    let operation_manifest_digest = operation_manifest_set_digest(
+        &generated_operation_manifests().expect("operation catalogue generates"),
+    )
+    .expect("operation catalogue set digest");
     let mut transition = PreparedTransition {
         contract_version: eliot_store_api::CONTRACT_VERSION,
         identity: OperationIdentity {
@@ -109,8 +114,7 @@ fn transition_with(tag: &str) -> PreparedTransition {
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
         admission_contract_set_digest: "b".repeat(64),
-        operation_manifest_digest: OperationManifestDigest::new(format!("manifest-991-{tag}"))
-            .unwrap(),
+        operation_manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).
         admission_digest: String::new(),
@@ -241,7 +245,34 @@ fn receipt_for(request: &ReservedWriteRequest) -> WriteReceipt {
 
 fn fixture_request() -> ReservedWriteRequest {
     let text = include_str!("data/reserved-write/request.json");
-    let request: ReservedWriteRequest = serde_json::from_str(text).unwrap();
+    let mut request: ReservedWriteRequest = serde_json::from_str(text).unwrap();
+    // The frozen input predates the current catalogue and transition digest
+    // binders. Preserve its reservation, scope, and head evidence, then
+    // re-derive the producer-owned digests through the current Store API.
+    request.transition.operation_manifest_digest = operation_manifest_set_digest(
+        &generated_operation_manifests().expect("operation catalogue generates"),
+    )
+    .expect("operation catalogue set digest");
+    eliot_store_api::bind_issue18_digests(&mut request.transition).unwrap();
+    let admission = &request.admission;
+    request.admission = WriteAdmissionProjection::bind(
+        &request.transition,
+        WriteAdmissionParams {
+            reservation_id: admission.reservation_id.clone(),
+            reservation_order: admission.reservation_order,
+            operation_id: admission.operation_id.clone(),
+            idempotency_key: admission.idempotency_key.clone(),
+            canonical_request_hash: admission.canonical_request_hash.clone(),
+            scopes: admission.scopes.clone(),
+            writer_epoch: admission.writer_epoch.clone(),
+            state_fence: admission.state_fence.clone(),
+            source_id: admission.source_id.clone(),
+            created_at_ms: admission.created_at_ms,
+            expires_at_ms: admission.expires_at_ms,
+            recovery_owner: admission.recovery_owner.clone(),
+        },
+    )
+    .unwrap();
     assert_eq!(
         request,
         valid_request(),
@@ -250,9 +281,31 @@ fn fixture_request() -> ReservedWriteRequest {
     request
 }
 
-fn fixture_receipt() -> WriteReceipt {
+fn fixture_receipt(request: &ReservedWriteRequest) -> WriteReceipt {
     let text = include_str!("data/reserved-write/receipt.json");
-    serde_json::from_str(text).unwrap()
+    let mut receipt: WriteReceipt = serde_json::from_str(text).unwrap();
+    let rebound = receipt_for(request);
+    // The receipt fixture predates the current operation catalogue and
+    // Issue-18 transition bindings. Refresh only those producer-owned fields
+    // and the canonical envelope; keep its committed identity and outcome as
+    // the fixed response under test.
+    receipt.operation_manifest_digest = rebound.operation_manifest_digest.clone();
+    receipt.admission_digest = rebound.admission_digest.clone();
+    receipt.mutation_plan_digest = rebound.mutation_plan_digest.clone();
+    receipt.semantic_source_revisions = rebound.semantic_source_revisions.clone();
+    receipt.policy_config_schema_versions = rebound.policy_config_schema_versions.clone();
+    receipt.envelope = rebound.envelope.clone();
+    receipt.validate().unwrap();
+    assert_eq!(receipt, rebound, "fixture matches the current receipt producer");
+    receipt
+}
+
+fn session_principal_binding(requirement: &HostStoreBootstrapRequirement) -> String {
+    format!(
+        "sid={};session={}",
+        requirement.expected_peer_sid.as_str(),
+        requirement.expected_peer_session_id
+    )
 }
 
 #[derive(Clone, Default)]
@@ -324,7 +377,7 @@ impl EbpStoreTransport for FakeTransport {
         if frame.kind == FrameKind::Control {
             let hello = ServerHello {
                 selected_protocol: ProtocolVersion::CURRENT,
-                session_principal_binding: "fake-store-session".to_owned(),
+                session_principal_binding: session_principal_binding(&self.requirement),
                 allowed_capabilities: eliot_store_api::CAPABILITIES
                     .iter()
                     .map(|value| (*value).to_owned())
@@ -586,7 +639,7 @@ async fn one_valid_dispatch_invokes_the_selected_backend_exactly_once() {
     // the exact enveloped receipt; the ordinary-`Apply` route is never
     // touched (the fake panics on it).
     let request = fixture_request();
-    let receipt = fixture_receipt();
+    let receipt = fixture_receipt(&request);
     assert_eq!(receipt, receipt_for(&request));
     let counters = Counters::default();
     let requirement = requirement();
