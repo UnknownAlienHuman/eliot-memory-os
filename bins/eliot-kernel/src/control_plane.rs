@@ -288,6 +288,19 @@ impl KernelComposition {
                         (control_request_terminal_code(&error), error, false)
                     }
                 };
+                // I1.13 / #1972 AUD4: every failed control access classifies
+                // its lifecycle outcome without confirming termination. A
+                // missing response — including a timeout or a cancellation —
+                // stays `outcome_unknown`; only a competent-owner
+                // termination receipt may report `stopped_confirmed`.
+                observe_control_in_context(
+                    "kernel.control.access_termination_classified",
+                    crate::kernel_unavailability::classify_kernel_access_failure(
+                        &transport_error,
+                    )
+                    .observation_code(),
+                    &context,
+                );
                 if emit_terminal {
                     super::kernel_diagnostics::observe_terminal_error_in_context(
                         terminal_code,

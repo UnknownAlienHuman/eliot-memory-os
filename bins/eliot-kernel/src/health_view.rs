@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 
 use super::kernel_audit::AuditEventKind;
 use super::kernel_unavailability::{
-    KernelAvailability, RecoveryDeferral, RecoveryView, semantic_task_recovery_deferral,
+    KernelAvailability, ObservedHostRecovery, ObservedWatchdogRecovery, RecoveryDeferral,
+    RecoveryView, RetainedOrsSummary, route_failed_kernel_access_to_recovery_view,
+    semantic_task_recovery_deferral,
 };
 use super::*;
 
@@ -448,6 +450,31 @@ impl KernelComposition {
     pub fn recovery_view_response(view: &RecoveryView) -> serde_json::Value {
         observe_health("kernel.health.recovery_view_projected", "known");
         view.to_json()
+    }
+
+    /// Routes one failed Kernel access to the bounded unavailable view
+    /// (I1.13, #1972 AUD2/AUD4).
+    ///
+    /// Serving leg for [`Self::recovery_view_response`]: the surviving
+    /// control/status path calls this with the transport failure and the
+    /// competent-owner observations it retains, instead of treating the
+    /// missing response as confirmed process termination. A timeout or
+    /// cancellation stays `OutcomeUnknown`; only a termination receipt
+    /// confirms the stop, and semantic task recovery still waits for
+    /// canonical access via [`Self::deferred_semantic_recovery`].
+    pub fn unavailable_view_for_failed_access(
+        error: &TransportError,
+        observed_host: &ObservedHostRecovery,
+        observed_watchdog: &ObservedWatchdogRecovery,
+        retained_ors_summary: Option<&RetainedOrsSummary>,
+    ) -> serde_json::Value {
+        let routed = route_failed_kernel_access_to_recovery_view(
+            error,
+            observed_host,
+            observed_watchdog,
+            retained_ors_summary,
+        );
+        Self::recovery_view_response(&routed.view)
     }
 
     /// Defers semantic task recovery pending canonical access (I1.13).
