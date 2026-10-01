@@ -1414,10 +1414,25 @@ impl KernelProcessStreamSinkClient {
         if original_terminal.as_ref() != Some(&operation) {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         }
-        let ProcessStreamSinkWireResponse::Finalized { body, .. } = owner else {
+        let ProcessStreamSinkWireResponse::Finalized {
+            body,
+            blob_ready_receipt_json,
+            blob_ready_receipt_sha256,
+        } = owner
+        else {
             return Err(ProcessStreamSinkError::ProviderUnavailable);
         };
-        terminal_from_projection(&session, TerminalCommand::Finalize(request), *body)
+        let terminal = terminal_from_projection(
+            &session,
+            TerminalCommand::Finalize(request),
+            *body,
+        )?;
+        validate_finalized_blob_ready_receipt(
+            &terminal,
+            blob_ready_receipt_json.as_deref(),
+            blob_ready_receipt_sha256.as_deref(),
+        )?;
+        Ok(terminal)
     }
 
     fn abort_sync(
@@ -1495,7 +1510,11 @@ impl KernelProcessStreamSinkClient {
                     BlobProcessStreamOperationResponse::Sink { response } => response,
                 };
                 match owner {
-                    ProcessStreamSinkWireResponse::Finalized { body, .. } => {
+                    ProcessStreamSinkWireResponse::Finalized {
+                        body,
+                        blob_ready_receipt_json,
+                        blob_ready_receipt_sha256,
+                    } => {
                         let operation = original_terminal
                             .as_ref()
                             .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
@@ -1509,6 +1528,11 @@ impl KernelProcessStreamSinkClient {
                             &session,
                             operation,
                             *body,
+                        )?;
+                        validate_finalized_blob_ready_receipt(
+                            &terminal,
+                            blob_ready_receipt_json.as_deref(),
+                            blob_ready_receipt_sha256.as_deref(),
                         )?;
                         Ok(ProcessStreamSinkReadback::Terminal { terminal })
                     }
@@ -1828,6 +1852,52 @@ fn terminal_from_retained_operation(
             terminal_from_projection(session, TerminalCommand::Abort(request), body)
         }
         _ => Err(ProcessStreamSinkError::ProviderUnavailable),
+    }
+}
+
+fn validate_finalized_blob_ready_receipt(
+    terminal: &ProcessStreamSinkTerminal,
+    receipt_json: Option<&str>,
+    receipt_sha256: Option<&str>,
+) -> Result<(), ProcessStreamSinkError> {
+    let is_complete_source = terminal.state() == ProcessStreamSinkState::CompleteSource;
+    match (is_complete_source, receipt_json, receipt_sha256) {
+        (true, Some(receipt_json), Some(receipt_sha256)) => {
+            let value: serde_json::Value =
+                serde_json::from_str(receipt_json).map_err(|_| sink_invalid())?;
+            let canonical = eliot_contracts::canonical_json_bytes(&value)
+                .map_err(|_| sink_invalid())?;
+            if String::from_utf8(canonical.clone()).ok().as_deref() != Some(receipt_json)
+                || sha256_hex(&canonical) != receipt_sha256
+            {
+                return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+            }
+            let receipt_identity = value
+                .pointer("/receipt/identity/receipt_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+            let source = terminal
+                .evidence()
+                .source()
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+            let plaintext_sha256 = value
+                .get("plaintext_sha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+            let plaintext_length = value
+                .get("plaintext_length")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(ProcessStreamSinkError::TerminalIdentityConflict)?;
+            if receipt_identity != source.ready_receipt_ref()
+                || plaintext_sha256 != source.sha256()
+                || plaintext_length != source.byte_length()
+            {
+                return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+            }
+            Ok(())
+        }
+        (false, None, None) => Ok(()),
+        _ => Err(ProcessStreamSinkError::TerminalIdentityConflict),
     }
 }
 

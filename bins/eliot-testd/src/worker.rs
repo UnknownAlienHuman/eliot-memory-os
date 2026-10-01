@@ -311,6 +311,53 @@ fn validate_ready_process_source_admission(
         .ready
         .as_ref()
         .ok_or_else(|| "process source admission has no Ready commitment".to_owned())?;
+    let ready_write_receipt: eliot_store_api::WriteReceipt = serde_json::from_str(
+        &owner.source_admission_write_receipt_json,
+    )
+    .map_err(|error| format!("Ready CAS receipt is not a typed Store WriteReceipt: {error}"))?;
+    ready_write_receipt
+        .validate()
+        .map_err(|error| format!("Ready CAS WriteReceipt failed owner validation: {error}"))?;
+    let ready_write_receipt_envelope = ready_write_receipt
+        .require_reconciliation_envelope()
+        .map_err(|error| format!("Ready CAS WriteReceipt lacks its committed receipt envelope: {error}"))?;
+    let ready_request_identity: eliot_protocol::RequestIdentity = serde_json::from_str(
+        &ready.ready_request_identity_json,
+    )
+    .map_err(|error| format!("Ready CAS request identity is not typed: {error}"))?;
+    ready_request_identity
+        .validate()
+        .map_err(|error| format!("Ready CAS request identity is invalid: {error}"))?;
+    let ready_request_identity_bytes = eliot_contracts::canonical_json_bytes(
+        &ready_request_identity,
+    )
+    .map_err(|error| format!("Ready CAS request identity is not canonical: {error}"))?;
+    if ready_request_identity_bytes != ready.ready_request_identity_json.as_bytes()
+        || eliot_testd_core::sha256_hex(&ready_request_identity_bytes)
+            != ready.ready_request_identity_sha256
+    {
+        return Err("Ready CAS request identity differs from its retained canonical commitment".to_owned());
+    }
+    let ready_request_binding = serde_json::to_value(&ready_request_identity.request)
+        .map_err(|error| format!("Ready CAS request binding is invalid: {error}"))?;
+    let receipt_request_binding = serde_json::to_value(&ready_write_receipt_envelope.core.request)
+    .map_err(|error| format!("Ready CAS receipt request binding is invalid: {error}"))?;
+    let receipt_operation_id = serde_json::to_value(
+        &ready_write_receipt_envelope.core.operation.operation_id,
+    )
+    .map_err(|error| format!("Ready CAS receipt operation identity is invalid: {error}"))?;
+    let receipt_operation_request_id = serde_json::to_value(
+        &ready_write_receipt_envelope.core.operation.request_id,
+    )
+    .map_err(|error| format!("Ready CAS receipt request identity is invalid: {error}"))?;
+    let expected_request_id = serde_json::to_value(
+        &ready_request_identity.request.metadata.request_id,
+    )
+    .map_err(|error| format!("Ready CAS request identity is invalid: {error}"))?;
+    let receipt_idempotency_key = &ready_write_receipt_envelope.core.operation.idempotency_key;
+    let expected_ready_operation_id = serde_json::Value::String(ready.ready_operation_id.clone());
+    let write_receipt_operation_id = serde_json::to_value(&ready_write_receipt.operation_id)
+        .map_err(|error| format!("Ready CAS WriteReceipt operation identity is invalid: {error}"))?;
     let ready_receipt: serde_json::Value = serde_json::from_str(&ready.blob_ready_receipt_json)
         .map_err(|error| format!("retained Blob Ready receipt is not JSON: {error}"))?;
     let receipt_id = ready_receipt
@@ -345,6 +392,14 @@ fn validate_ready_process_source_admission(
         || open.stream() != source.stream
         || ready.whole_source_sha256 != expected_source_sha256
         || ready.whole_source_byte_length != expected_source_byte_length
+        || ready_write_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+        || write_receipt_operation_id != expected_ready_operation_id
+        || receipt_operation_id != expected_ready_operation_id
+        || receipt_operation_request_id != expected_request_id
+        || ready_write_receipt.idempotency_key != ready_request_identity.idempotency_key
+        || receipt_idempotency_key != &ready_request_identity.idempotency_key
+        || receipt_request_binding != ready_request_binding
+        || ready_write_receipt.state_fence != *source.binding.state_fence()
         || expected_source_byte_length != bytes.len() as u64
         || expected_source_sha256 != eliot_testd_core::sha256_hex(bytes.bytes())
         || receipt_id != expected_receipt_ref

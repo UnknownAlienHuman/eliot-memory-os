@@ -662,6 +662,10 @@ pub struct TestdReplayOwnerReadback {
     pub process_source_admission_readback_json: String,
     /// SHA-256 of the exact canonical process-source-admission bytes.
     pub process_source_admission_readback_sha256: String,
+    /// Exact Store WriteReceipt for the revision-2 Ready CAS.
+    pub source_admission_write_receipt_json: String,
+    /// SHA-256 of the exact canonical Ready-CAS WriteReceipt bytes.
+    pub source_admission_write_receipt_sha256: String,
     /// Canonical verified WorkScope/source/policy owner facts.
     pub owner_facts_json: String,
     /// SHA-256 of the exact canonical owner-facts JSON bytes.
@@ -695,7 +699,8 @@ impl std::fmt::Debug for TestdReplayOwnerReadback {
 
 impl TestdReplayOwnerReadback {
     /// Validates exact canonical JSON and SHA-256 pairings for the per-stream
-    /// source-admission readback and all three authenticated owner readbacks.
+    /// source-admission readback, its Ready-CAS receipt, and all three
+    /// authenticated owner readbacks.
     pub fn validate(&self) -> Result<(), TestdEvidenceError> {
         for (json_field, json, digest_field, digest) in [
             (
@@ -703,6 +708,12 @@ impl TestdReplayOwnerReadback {
                 self.process_source_admission_readback_json.as_str(),
                 "source_readback.process_source_admission_readback_sha256",
                 self.process_source_admission_readback_sha256.as_str(),
+            ),
+            (
+                "source_readback.source_admission_write_receipt_json",
+                self.source_admission_write_receipt_json.as_str(),
+                "source_readback.source_admission_write_receipt_sha256",
+                self.source_admission_write_receipt_sha256.as_str(),
             ),
             (
                 "source_readback.owner_facts_json",
