@@ -1053,7 +1053,7 @@ fn blob_store_sink_request(
             ProcessStreamSinkWireRequest::Open {
                 capability: capability.clone(),
                 body: Box::new(open_json),
-                owner_facts: owner_facts.clone(),
+                owner_facts: Box::new(owner_facts.clone()),
                 process_source_admission_readback_json: process_source_admission_readback_json
                     .to_owned(),
                 process_source_admission_readback_sha256: process_source_admission_readback_sha256
@@ -1152,7 +1152,9 @@ fn blob_store_sink_request(
     let request = BlobProcessStreamFrameRequest {
         wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),
         wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_REVISION,
-        operation: BlobProcessStreamOperationRequest::Sink { request: sink },
+        operation: BlobProcessStreamOperationRequest::Sink {
+            request: Box::new(sink),
+        },
     };
     request.validate().map_err(|error| error.to_string())?;
     Ok(request)
@@ -1235,10 +1237,8 @@ impl KernelComposition {
             }
             let facts_match = matches!(
                 &pull_response.outcome,
-                BlobProcessStreamOwnerFactsPullOutcome::Available {
-                    owner_facts_sha256,
-                    ..
-                } if owner_facts_sha256 == &grant.owner_facts_sha256
+                BlobProcessStreamOwnerFactsPullOutcome::Available(available)
+                    if available.owner_facts_sha256 == grant.owner_facts_sha256
             );
             facts_match.then_some((pull_request, pull_response))
         };
@@ -1477,11 +1477,9 @@ impl KernelComposition {
                             && pull_response.invocation_id == grant.invocation_id
                             && pull_response.process_binding_sha256 == grant.process_binding_sha256
                             && matches!(
-                                pull_response.outcome,
-                                BlobProcessStreamOwnerFactsPullOutcome::Available {
-                                    owner_facts_sha256,
-                                    ..
-                                } if owner_facts_sha256 == grant.owner_facts_sha256
+                                &pull_response.outcome,
+                                BlobProcessStreamOwnerFactsPullOutcome::Available(available)
+                                    if available.owner_facts_sha256 == grant.owner_facts_sha256
                             ))
                         .then_some(())
                     })
@@ -1749,12 +1747,10 @@ impl KernelComposition {
                     .validate_for_request(&pull_request)
                     .map_err(|error| error.to_string())?;
                 if !matches!(
-                    response.outcome,
-                    BlobProcessStreamOwnerFactsPullOutcome::Available {
-                        process_source_admission_json: Some(_),
-                        source_admission_write_receipt_json: Some(_),
-                        ..
-                    }
+                    &response.outcome,
+                    BlobProcessStreamOwnerFactsPullOutcome::Available(available)
+                        if available.process_source_admission_json.is_some()
+                            && available.source_admission_write_receipt_json.is_some()
                 ) {
                     return Err(
                         "daemon did not persist the exact Pending source admission".to_owned()
@@ -1808,18 +1804,32 @@ impl KernelComposition {
             source_admission_write_receipt_json,
             source_admission_write_receipt_sha256,
         ) = match &admission_response.outcome {
-            BlobProcessStreamOwnerFactsPullOutcome::Available {
-                process_source_admission_json: Some(admission_json),
-                process_source_admission_sha256: Some(admission_sha256),
-                source_admission_write_receipt_json: Some(receipt_json),
-                source_admission_write_receipt_sha256: Some(receipt_sha256),
-                ..
-            } => (
-                admission_json.clone(),
-                admission_sha256.clone(),
-                receipt_json.clone(),
-                receipt_sha256.clone(),
-            ),
+            BlobProcessStreamOwnerFactsPullOutcome::Available(available) => {
+                match (
+                    &available.process_source_admission_json,
+                    &available.process_source_admission_sha256,
+                    &available.source_admission_write_receipt_json,
+                    &available.source_admission_write_receipt_sha256,
+                ) {
+                    (
+                        Some(admission_json),
+                        Some(admission_sha256),
+                        Some(receipt_json),
+                        Some(receipt_sha256),
+                    ) => (
+                        admission_json.clone(),
+                        admission_sha256.clone(),
+                        receipt_json.clone(),
+                        receipt_sha256.clone(),
+                    ),
+                    _ => {
+                        return Err(
+                            "Pending source admission lacks its exact readback and write receipt"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
             _ => {
                 return Err(
                     "Pending source admission lacks its exact readback and write receipt"
@@ -2002,12 +2012,10 @@ impl KernelComposition {
                     .validate_for_request(&store_open_request)
                     .map_err(|error| error.to_string())?;
                 if !matches!(
-                    response.outcome,
-                    BlobProcessStreamOwnerFactsPullOutcome::Available {
-                        process_source_admission_json: Some(_),
-                        source_admission_write_receipt_json: Some(_),
-                        ..
-                    }
+                    &response.outcome,
+                    BlobProcessStreamOwnerFactsPullOutcome::Available(available)
+                        if available.process_source_admission_json.is_some()
+                            && available.source_admission_write_receipt_json.is_some()
                 ) {
                     return Err("Store Open owner facts are unavailable".to_owned());
                 }
@@ -2258,11 +2266,9 @@ impl KernelComposition {
         let pull_request = effective_pull_request.as_ref().unwrap_or(pull_request);
 
         let owner_facts_json = match &effective_pull_response.outcome {
-            BlobProcessStreamOwnerFactsPullOutcome::Available {
-                owner_facts_json,
-                owner_facts_sha256,
-                ..
-            } if sha256_hex(owner_facts_json.as_bytes()) == *owner_facts_sha256 => owner_facts_json,
+            BlobProcessStreamOwnerFactsPullOutcome::Available(available)
+                if sha256_hex(available.owner_facts_json.as_bytes())
+                    == available.owner_facts_sha256 => &available.owner_facts_json,
             _ => {
                 mark_unknown(&dispatched);
                 return BlobProcessStreamKernelOutcome::Unknown {
@@ -2281,19 +2287,17 @@ impl KernelComposition {
                 }
             };
         let process_source_admission_readback = match &effective_pull_response.outcome {
-            BlobProcessStreamOwnerFactsPullOutcome::Available {
-                process_source_admission_json: Some(json),
-                process_source_admission_sha256: Some(sha256),
-                ..
-            } => Some((json.as_str(), sha256.as_str())),
+            BlobProcessStreamOwnerFactsPullOutcome::Available(available) => available
+                .process_source_admission_json
+                .as_deref()
+                .zip(available.process_source_admission_sha256.as_deref()),
             _ => None,
         };
         let source_admission_write_receipt = match &effective_pull_response.outcome {
-            BlobProcessStreamOwnerFactsPullOutcome::Available {
-                source_admission_write_receipt_json: Some(json),
-                source_admission_write_receipt_sha256: Some(sha256),
-                ..
-            } => Some((json.as_str(), sha256.as_str())),
+            BlobProcessStreamOwnerFactsPullOutcome::Available(available) => available
+                .source_admission_write_receipt_json
+                .as_deref()
+                .zip(available.source_admission_write_receipt_sha256.as_deref()),
             _ => None,
         };
         let store_request = match blob_store_sink_request(
@@ -2364,7 +2368,7 @@ impl KernelComposition {
                 }
             }
             eliot_blob_api::wire::BlobProcessStreamOperationResponse::SourceReadback { response } => {
-                match response {
+                match response.as_ref() {
                     eliot_blob_api::wire::ProcessStreamSourceReadbackResponse::NotStarted => {
                         Some((
                             BlobProcessStreamCallState::NotStarted,
@@ -2379,7 +2383,7 @@ impl KernelComposition {
                             operation_sha256: request.operation_sha256.clone(),
                         },
                     )),
-                    eliot_blob_api::wire::ProcessStreamSourceReadbackResponse::Ready { .. } => None,
+                    eliot_blob_api::wire::ProcessStreamSourceReadbackResponse::Ready(_) => None,
                 }
             }
         };

@@ -386,7 +386,7 @@ async fn dispatch_blob_process_stream(
                     composition,
                     transport,
                     identity,
-                    request,
+                    *request,
                 )
                 .await,
             }
@@ -396,7 +396,7 @@ async fn dispatch_blob_process_stream(
                 ProcessStreamSourceReadbackResponse::Unknown
             } else {
                 match composition
-                    .blob_source_readback(transport, identity, request.clone())
+                    .blob_source_readback(transport, identity, (*request).clone())
                     .await
                 {
                     Ok(response) => {
@@ -420,7 +420,9 @@ async fn dispatch_blob_process_stream(
                     Err(error) => return Err(error.to_string()),
                 }
             };
-            BlobProcessStreamOperationResponse::SourceReadback { response }
+            BlobProcessStreamOperationResponse::SourceReadback {
+                response: Box::new(response),
+            }
         }
     };
     let response = BlobProcessStreamFrameResponse {
@@ -438,33 +440,34 @@ fn validate_source_readback_response(
     response: &eliot_blob_api::wire::ProcessStreamSourceReadbackResponse,
 ) -> Result<(), String> {
     use eliot_blob_api::wire::{
-        PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES, ProcessStreamSourceReadbackResponse,
+        PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES, ProcessStreamSourceReadbackReady,
+        ProcessStreamSourceReadbackResponse,
     };
 
-    if let ProcessStreamSourceReadbackResponse::Ready {
-        bytes,
-        whole_source_sha256,
-        whole_source_byte_length,
-        chunk_offset,
-        observed_sha256,
-        observed_byte_length,
-        ready_receipt_ref,
-        source_owner_generation,
-        readback_receipt_id,
-        observed_fence,
-        observed_at_unix_ms,
-        owner_facts_json,
-        owner_facts_sha256,
-        module_catalog_owner_readback_json,
-        module_catalog_owner_readback_sha256,
-        generation_admission_json,
-        generation_admission_sha256,
-        process_source_admission_readback_json,
-        process_source_admission_readback_sha256,
-        source_admission_write_receipt_json,
-        source_admission_write_receipt_sha256,
-    } = response
-    {
+    if let ProcessStreamSourceReadbackResponse::Ready(ready) = response {
+        let ProcessStreamSourceReadbackReady {
+            bytes,
+            whole_source_sha256,
+            whole_source_byte_length,
+            chunk_offset,
+            observed_sha256,
+            observed_byte_length,
+            ready_receipt_ref,
+            source_owner_generation,
+            readback_receipt_id,
+            observed_fence,
+            observed_at_unix_ms,
+            owner_facts_json,
+            owner_facts_sha256,
+            module_catalog_owner_readback_json,
+            module_catalog_owner_readback_sha256,
+            generation_admission_json,
+            generation_admission_sha256,
+            process_source_admission_readback_json,
+            process_source_admission_readback_sha256,
+            source_admission_write_receipt_json,
+            source_admission_write_receipt_sha256,
+        } = ready.as_ref();
         use sha2::{Digest, Sha256};
         let expected_owner_facts_json = String::from_utf8(
             eliot_contracts::canonical_json_bytes(&request.owner_facts)

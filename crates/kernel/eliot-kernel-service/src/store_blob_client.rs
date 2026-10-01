@@ -7,7 +7,7 @@ use eliot_blob_api::wire::{
     BlobProcessStreamOperationRequest, BlobProcessStreamOperationResponse,
     PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES, ProcessStreamSinkWireRequest,
     ProcessStreamSinkWireResponse, ProcessStreamSourceReadbackRequest,
-    ProcessStreamSourceReadbackResponse,
+    ProcessStreamSourceReadbackReady, ProcessStreamSourceReadbackResponse,
 };
 use eliot_contracts::StateFence;
 use eliot_ipc::DeliveryOutcome;
@@ -127,7 +127,9 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 BlobProcessStreamFrameRequest {
                     wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),
                     wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_REVISION,
-                    operation: BlobProcessStreamOperationRequest::Sink { request },
+                    operation: BlobProcessStreamOperationRequest::Sink {
+                        request: Box::new(request),
+                    },
                 },
                 identity,
             )
@@ -181,7 +183,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                     wire_id: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_ID.to_owned(),
                     wire_revision: eliot_blob_api::wire::BLOB_PROCESS_STREAM_WIRE_REVISION,
                     operation: BlobProcessStreamOperationRequest::SourceReadback {
-                        request: request.clone(),
+                        request: Box::new(request.clone()),
                     },
                 },
                 identity,
@@ -198,7 +200,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         if !valid_chunk_response(&request, &decoded) {
             return Ok(ProcessStreamSourceReadbackResponse::Unknown);
         }
-        Ok(decoded)
+        Ok(*decoded)
     }
 }
 
@@ -262,17 +264,19 @@ fn valid_chunk_response(
     match response {
         ProcessStreamSourceReadbackResponse::NotStarted
         | ProcessStreamSourceReadbackResponse::Unknown => true,
-        ProcessStreamSourceReadbackResponse::Ready {
-            bytes,
-            chunk_offset,
-            observed_sha256,
-            observed_byte_length,
-            ready_receipt_ref,
-            source_owner_generation,
-            readback_receipt_id,
-            observed_fence,
-            observed_at_unix_ms,
-        } => {
+        ProcessStreamSourceReadbackResponse::Ready(ready) => {
+            let ProcessStreamSourceReadbackReady {
+                bytes,
+                chunk_offset,
+                observed_sha256,
+                observed_byte_length,
+                ready_receipt_ref,
+                source_owner_generation,
+                readback_receipt_id,
+                observed_fence,
+                observed_at_unix_ms,
+                ..
+            } = ready.as_ref();
             *chunk_offset == request.offset
                 && bytes.len() <= PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES as usize
                 && chunk_offset.saturating_add(bytes.len() as u64) <= request.expected_byte_length

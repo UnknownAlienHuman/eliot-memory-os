@@ -3310,7 +3310,7 @@ impl ProcessExecutionGateway {
                     .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
                 if !matches!(
                     response.outcome,
-                    BlobProcessStreamOwnerFactsPullOutcome::Available { .. }
+                    BlobProcessStreamOwnerFactsPullOutcome::Available(_)
                 ) {
                     return Err(ProcessExecutionError::Unavailable(
                         "daemon owner-facts resolver did not return all required current facts"
@@ -4024,9 +4024,9 @@ impl KernelComposition {
             )
             .await?;
         let owner_facts_sha256 = match &response.outcome {
-            BlobProcessStreamOwnerFactsPullOutcome::Available {
-                owner_facts_sha256, ..
-            } => owner_facts_sha256.clone(),
+            BlobProcessStreamOwnerFactsPullOutcome::Available(available) => {
+                available.owner_facts_sha256.clone()
+            }
             BlobProcessStreamOwnerFactsPullOutcome::Unavailable { .. } => {
                 return Err(ProcessExecutionError::Unavailable(
                     "daemon owner-facts pull did not supply all required Blob authority".to_owned(),
@@ -4034,33 +4034,25 @@ impl KernelComposition {
             }
         };
         let owner_projection = match &response.outcome {
-            BlobProcessStreamOwnerFactsPullOutcome::Available {
-                owner_facts_json,
-                owner_facts_sha256,
-                policy_sha256,
-                currentness_sha256,
-                work_scope_snapshot_sha256,
-                module_catalog_owner_readback_json,
-                module_catalog_owner_readback_sha256,
-                generation_admission_json,
-                generation_admission_sha256,
-                ..
-            } => {
+            BlobProcessStreamOwnerFactsPullOutcome::Available(available) => {
                 let fence_json = canonical_json_bytes(&response.observed_state_fence)
                     .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
                 KernelBlobProcessStreamOwnerProjection {
-                    owner_facts_json: owner_facts_json.clone(),
-                    owner_facts_sha256: owner_facts_sha256.clone(),
+                    owner_facts_json: available.owner_facts_json.clone(),
+                    owner_facts_sha256: available.owner_facts_sha256.clone(),
                     process_binding_sha256: response.process_binding_sha256.clone(),
                     fence_sha256: sha256_hex(&fence_json),
-                    policy_sha256: policy_sha256.clone(),
-                    owner_currentness_sha256: currentness_sha256.clone(),
-                    work_scope_snapshot_sha256: work_scope_snapshot_sha256.clone(),
-                    module_catalog_owner_readback_json: module_catalog_owner_readback_json.clone(),
-                    module_catalog_owner_readback_sha256: module_catalog_owner_readback_sha256
+                    policy_sha256: available.policy_sha256.clone(),
+                    owner_currentness_sha256: available.currentness_sha256.clone(),
+                    work_scope_snapshot_sha256: available.work_scope_snapshot_sha256.clone(),
+                    module_catalog_owner_readback_json: available
+                        .module_catalog_owner_readback_json
                         .clone(),
-                    generation_admission_json: generation_admission_json.clone(),
-                    generation_admission_sha256: generation_admission_sha256.clone(),
+                    module_catalog_owner_readback_sha256: available
+                        .module_catalog_owner_readback_sha256
+                        .clone(),
+                    generation_admission_json: available.generation_admission_json.clone(),
+                    generation_admission_sha256: available.generation_admission_sha256.clone(),
                 }
             }
             BlobProcessStreamOwnerFactsPullOutcome::Unavailable { .. } => {

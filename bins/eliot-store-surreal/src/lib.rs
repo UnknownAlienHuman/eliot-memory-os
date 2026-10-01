@@ -1215,19 +1215,21 @@ impl StoreComposition {
         let observed_sha256 = format!("{:x}", Sha256::digest(&bytes));
         let observed_byte_length =
             u64::try_from(bytes.len()).map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
-        Ok(ProcessStreamSourceReadbackResponse::Ready {
-            bytes,
-            whole_source_sha256: readback.ready_receipt().plaintext_sha256().to_owned(),
-            whole_source_byte_length: readback.ready_receipt().plaintext_length(),
-            chunk_offset: request.offset,
-            observed_sha256,
-            observed_byte_length,
-            ready_receipt_ref: request.ready_receipt_ref,
-            source_owner_generation: readback.ready_receipt().root_generation(),
-            readback_receipt_id: readback.receipt().identity.receipt_id.to_string(),
-            observed_fence: identity.request.state_fence.clone(),
-            observed_at_unix_ms: current_unix_ms(),
-        })
+        Ok(ProcessStreamSourceReadbackResponse::Ready(Box::new(
+            eliot_blob_api::wire::ProcessStreamSourceReadbackReady {
+                bytes,
+                whole_source_sha256: readback.ready_receipt().plaintext_sha256().to_owned(),
+                whole_source_byte_length: readback.ready_receipt().plaintext_length(),
+                chunk_offset: request.offset,
+                observed_sha256,
+                observed_byte_length,
+                ready_receipt_ref: request.ready_receipt_ref,
+                source_owner_generation: readback.ready_receipt().root_generation(),
+                readback_receipt_id: readback.receipt().identity.receipt_id.to_string(),
+                observed_fence: identity.request.state_fence.clone(),
+                observed_at_unix_ms: current_unix_ms(),
+            },
+        )))
     }
 
     pub async fn blob_sink_reconcile(
