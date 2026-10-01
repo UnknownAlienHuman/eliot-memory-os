@@ -603,7 +603,7 @@ async fn persist_or_reconcile_work_scope_owner(
             if reconciled
                 .validate_for_fence(&claimed.envelope.state_fence)
                 .is_err()
-                || reconciled != expected
+                || reconciled != *expected
             {
                 return Err(WorkScopeOwnerWriteFailure::Store { failure, expected });
             }
@@ -628,7 +628,7 @@ async fn persist_or_reconcile_work_scope_owner(
             if reconciled
                 .validate_for_fence(&claimed.envelope.state_fence)
                 .is_err()
-                || reconciled != expected
+                || reconciled != *expected
             {
                 return Err(WorkScopeOwnerWriteFailure::Kernel {
                     error,
@@ -643,40 +643,15 @@ async fn persist_or_reconcile_work_scope_owner(
 
 async fn admit_initial_scope_owner(
     composition: &tokio::sync::Mutex<DaemonComposition>,
-    claimed: &TaskControllerClaimedInvocation,
-    request: &InitialWorkScopeBindingRequest,
-    observed: &ObservedScopeResources,
-    fence: &StateFence,
-    retained_snapshot: Option<&eliot_governor::WorkScopeBindingSnapshot>,
-    owner_revision: u64,
-    task_revision: u64,
-    session_ref: &str,
-    now: u64,
+    admission: InitialScopeBindingAdmissionRequest<'_>,
 ) -> Result<eliot_governor::WorkScopeBindingOwner, &'static str> {
     let guard = composition.lock().await;
-    if guard.governor_kernel_fence() != *fence {
+    if guard.governor_kernel_fence() != *admission.state_fence {
         return Err("TASK_SCOPE_INCOMPATIBLE");
     }
     guard
         .governor
-        .admit_initial_scope_binding(InitialScopeBindingAdmissionRequest {
-            now,
-            authenticated_identity: (claimed.authenticated_principal.as_str(), session_ref),
-            task_binding: (claimed.invocation.task_id.as_str(), task_revision),
-            work_scope_ref: claimed.invocation.work_scope_id.as_str(),
-            state_fence: fence,
-            descriptor: &request.descriptor,
-            owner_revision,
-            retained_snapshot,
-            binding: &request.binding,
-            observed,
-            sources: &request.sources,
-            privacy: &request.privacy,
-            source_candidates: &request.source_candidates,
-            declared_precedences: &request.declared_precedences,
-            absence_reason_ref: request.absence_reason_ref.as_deref(),
-            admission_deadline: request.admission_deadline,
-        })
+        .admit_initial_scope_binding(admission)
         .await
         .map_err(|error| {
             task_selection_composition_reason_code(&error).unwrap_or("SCOPE_AUTHORITY_REQUIRED")
@@ -740,6 +715,16 @@ fn initial_scope_task_revision(
 /// Admits and durably installs one explicit initial `WorkScope` binding. The
 /// Store CAS/readback completes before the in-memory Governor owner changes;
 /// the result acknowledges only the exact snapshot both owners retained.
+fn task_controller_store_failure_result(
+    claimed: &TaskControllerClaimedInvocation,
+    failure: &eliot_store_api::StoreFailure,
+) -> Result<TaskControllerResultBody, String> {
+    task_controller_result_body(
+        claimed,
+        json!({"status": "rejected", "store_failure": failure}),
+    )
+}
+
 pub async fn complete_initial_work_scope_binding(
     kernel: &DaemonKernelClient,
     composition: &tokio::sync::Mutex<DaemonComposition>,
@@ -779,15 +764,24 @@ pub async fn complete_initial_work_scope_binding(
     let now = unix_ms();
     let owner = match admit_initial_scope_owner(
         composition,
-        &claimed,
-        &request,
-        &observed,
-        fence,
-        retained_snapshot.as_ref(),
-        owner_revision,
-        task_revision,
-        session_ref,
-        now,
+        InitialScopeBindingAdmissionRequest {
+            now,
+            authenticated_identity: (claimed.authenticated_principal.as_str(), session_ref),
+            task_binding: (claimed.invocation.task_id.as_str(), task_revision),
+            work_scope_ref: claimed.invocation.work_scope_id.as_str(),
+            state_fence: fence,
+            descriptor: &request.descriptor,
+            owner_revision,
+            retained_snapshot: retained_snapshot.as_ref(),
+            binding: &request.binding,
+            observed: &observed,
+            sources: &request.sources,
+            privacy: &request.privacy,
+            source_candidates: &request.source_candidates,
+            declared_precedences: &request.declared_precedences,
+            absence_reason_ref: request.absence_reason_ref.as_deref(),
+            admission_deadline: request.admission_deadline,
+        },
     )
     .await
     {
@@ -813,10 +807,7 @@ pub async fn complete_initial_work_scope_binding(
         {
             Ok(record) => record,
             Err(WorkScopeOwnerWriteFailure::Store { failure, .. }) => {
-                return task_controller_result_body(
-                    &claimed,
-                    json!({"status": "rejected", "store_failure": failure}),
-                );
+                return task_controller_store_failure_result(&claimed, &failure);
             }
             Err(WorkScopeOwnerWriteFailure::Kernel { error, .. }) => {
                 return Err(error.to_string());
