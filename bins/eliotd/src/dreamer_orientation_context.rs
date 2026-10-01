@@ -103,7 +103,10 @@ pub fn compile_dreamer_orientation_context<'owner, 'source>(
     {
         return Err(DreamerOrientationCompilationError::SupplierReadbackMismatch);
     }
-    suppliers.validate_for_recipe(&reconstruction.context_recipe.body.recipe)?;
+    suppliers.validate_for_recipe(
+        &reconstruction.context_recipe.body.recipe,
+        &reconstruction.context_recipe.body.catalogue,
+    )?;
     let source = reconstruction
         .context_recipe
         .read

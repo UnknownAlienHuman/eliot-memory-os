@@ -115,7 +115,7 @@ pub struct ContextCampaignRecipeBody {
     /// rows omit this field and therefore remain explicitly unavailable for a
     /// live compilation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compiler_suppliers: Option<ContextCompilerSupplierProfileV1>,
+    pub compiler_suppliers: Option<ContextCompilerSupplierProfileV2>,
 }
 
 /// Versioned native owner inputs for one campaign Context compilation.
@@ -126,8 +126,8 @@ pub struct ContextCampaignRecipeBody {
 /// receipt or digest scheme.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ContextCompilerSupplierProfileV1 {
-    /// Closed profile version, currently exactly `1`.
+pub struct ContextCompilerSupplierProfileV2 {
+    /// Closed profile version, currently exactly `2`.
     pub schema_version: u32,
     /// Exact existing immutable learning-state view selected for this
     /// compilation. The authenticated named read validates its current
@@ -147,7 +147,7 @@ pub struct ContextCompilerSupplierProfileV1 {
     pub measurement_params: MeasurementParams,
 }
 
-impl PartialEq for ContextCompilerSupplierProfileV1 {
+impl PartialEq for ContextCompilerSupplierProfileV2 {
     fn eq(&self, other: &Self) -> bool {
         self.schema_version == other.schema_version
             && self.campaign_learning_state_view_id == other.campaign_learning_state_view_id
@@ -159,23 +159,27 @@ impl PartialEq for ContextCompilerSupplierProfileV1 {
             && self.admission_parts.measurement_profile == other.admission_parts.measurement_profile
             && self.admission_parts.supplied_omissions == other.admission_parts.supplied_omissions
             && self.admission_parts.measurements == other.admission_parts.measurements
+            && self.admission_parts.unit_boundaries == other.admission_parts.unit_boundaries
+            && self.admission_parts.section_budgets == other.admission_parts.section_budgets
             && self.quality_scorecard == other.quality_scorecard
             && self.assembly_policy == other.assembly_policy
             && self.measurement_params == other.measurement_params
     }
 }
 
-impl Eq for ContextCompilerSupplierProfileV1 {}
+impl Eq for ContextCompilerSupplierProfileV2 {}
 
-impl ContextCompilerSupplierProfileV1 {
+impl ContextCompilerSupplierProfileV2 {
     /// Validate intrinsic supplier contracts and their exact recipe binding.
     pub fn validate_for_recipe(
         &self,
         recipe: &ContextRecipe,
+        catalogue: &ApprovedRecipeCatalogue,
     ) -> Result<(), ContextPublicationError> {
-        if self.schema_version != 1 {
+        if self.schema_version != 2 {
             return Err(ContextPublicationError::CompilerSupplierInvalid);
         }
+        let resolved = resolve_executable(catalogue, recipe)?;
         if ArtifactId::new(self.campaign_learning_state_view_id.as_str().to_owned()).is_err() {
             return Err(ContextPublicationError::CompilerSupplierInvalid);
         }
@@ -225,6 +229,19 @@ impl ContextCompilerSupplierProfileV1 {
                 return Err(ContextPublicationError::CompilerSupplierInvalid);
             }
         }
+        parts
+            .unit_boundaries
+            .validate(&eliot_context_contracts::assembly_boundary_limits())
+            .map_err(|_| ContextPublicationError::CompilerSupplierInvalid)?;
+        if parts
+            .unit_boundaries
+            .units
+            .iter()
+            .any(|unit| unit.binding != recipe.binding)
+            || parts.section_budgets != resolved.policy.section_budgets
+        {
+            return Err(ContextPublicationError::CompilerSupplierInvalid);
+        }
 
         if self.candidate_request.binding != recipe.binding
             || self.quality_scorecard.binding != recipe.binding
@@ -273,7 +290,7 @@ pub struct ContextToolPolicyProjectionV1 {
     /// Exact recipe mirrored from the `ContextRecipe` owner read.
     pub recipe: ContextRecipe,
     /// Exact original compiler supplier profile.
-    pub compiler_suppliers: ContextCompilerSupplierProfileV1,
+    pub compiler_suppliers: ContextCompilerSupplierProfileV2,
 }
 
 /// Store-neutral immutable source publication derived from Context owner data.
@@ -446,13 +463,13 @@ pub fn context_recipe_publication_with_compiler_suppliers(
     recipe: &ContextRecipe,
     catalogue: &ApprovedRecipeCatalogue,
     compiler_input: &ContextInput,
-    compiler_suppliers: Option<&ContextCompilerSupplierProfileV1>,
+    compiler_suppliers: Option<&ContextCompilerSupplierProfileV2>,
 ) -> Result<ContextSourcePublication, ContextPublicationError> {
     resolve_executable(catalogue, recipe)?;
     compiler_input.validate()?;
     validate_recipe_input_binding(recipe, compiler_input)?;
     if let Some(suppliers) = compiler_suppliers {
-        suppliers.validate_for_recipe(recipe)?;
+        suppliers.validate_for_recipe(recipe, catalogue)?;
     }
 
     let document = ContextSourceDocument::Recipe(Box::new(ContextCampaignRecipeBody {
@@ -596,7 +613,7 @@ pub fn context_recipe_body_digest(
     body.compiler_input.validate()?;
     validate_recipe_input_binding(&body.recipe, &body.compiler_input)?;
     if let Some(suppliers) = &body.compiler_suppliers {
-        suppliers.validate_for_recipe(&body.recipe)?;
+        suppliers.validate_for_recipe(&body.recipe, &body.catalogue)?;
     }
     let bytes = canonical_json_bytes(body)
         .map_err(|error| ContextPublicationError::Serialization(error.to_string()))?;

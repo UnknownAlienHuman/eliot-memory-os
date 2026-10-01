@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AdmissionDisposition, AdmissionRecord, CONTEXT_CONTRACT_VERSION, CapacityLimits,
-    ContextBinding, ContextCandidate, ContextCandidateSet, ContextEconomyReceipt, ContextError,
-    ContextOutcome, ContextRecipe, DecisionContextIncomplete, DecisionRevision,
+    BoundaryMetadataSet, ContextBinding, ContextCandidate, ContextCandidateSet,
+    ContextEconomyReceipt, ContextError, ContextOutcome, ContextRecipe, ContextSectionBudget,
+    DecisionContextIncomplete, DecisionRevision,
     DecisionSafetyFloor, ExpansionHandle, LearningAdmissionTicket, LossPolicy,
     NonRecoverableReason, OmissionRecord, RepresentationKind, StuEstimate, TokenizerObservation,
     canonical_digest, canonical_render_serializer, validate_digest, validate_text,
@@ -1115,4 +1116,11 @@ pub struct PacketAdmissionParts {
     pub supplied_omissions: Vec<SuppliedOmissionBinding>,
     /// Caller-supplied measurements the decision must close over.
     pub measurements: Vec<AdmissionMeasurement>,
+    /// Original publisher's candidate-keyed whole-unit metadata. It is joined
+    /// against the exact candidate set before selection; it is never derived
+    /// from the admitted or rendered output.
+    pub unit_boundaries: BoundaryMetadataSet,
+    /// Section budgets from the same `ApprovedRecipeCatalogue::resolve` that
+    /// authorized the recipe used by this compilation.
+    pub section_budgets: Vec<ContextSectionBudget>,
 }

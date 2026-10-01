@@ -234,7 +234,7 @@ impl TaskControllerOrientationInput {
         {
             return Err(ProtocolError::InvalidField {
                 field: "task_controller_invocation.orientation.context_compilation_input",
-                reason: "must use ContextCompilerSupplierProfileV1",
+                reason: "must use ContextCompilerSupplierProfileV2",
             });
         }
         structured_object(

@@ -10,7 +10,7 @@
 //! unrelated missing owner publication.
 
 use eliot_context::campaign_publication::{
-    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV1,
+    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV2,
 };
 use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
@@ -156,7 +156,7 @@ fn validate_invocation_context_recipe(
     work_scope_id: &str,
     state_fence: &StateFence,
 ) -> Result<ContextCampaignRecipeBody, String> {
-    let compiler_suppliers: Option<ContextCompilerSupplierProfileV1> = context_compilation_input
+    let compiler_suppliers: Option<ContextCompilerSupplierProfileV2> = context_compilation_input
         .map(|input| serde_json::from_value(input.clone()))
         .transpose()
         .map_err(|_| "Task Controller Context compiler supplier profile is invalid".to_owned())?;

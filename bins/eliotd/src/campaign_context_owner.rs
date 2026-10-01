@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 
 use eliot_context::campaign_publication::{
-    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV1, ContextPublicationError,
+    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV2, ContextPublicationError,
     ContextSourcePublication, ContextToolPolicyProjectionV1, context_delivery_publication,
     context_recipe_publication_with_compiler_suppliers,
 };
@@ -369,7 +369,7 @@ pub(crate) fn validate_context_owner_bodies(
 pub(crate) fn validate_context_tool_policy_source_record(
     recipe_body: &ContextCampaignRecipeBody,
     source: &CampaignSourceRecord,
-) -> Result<Option<ContextCompilerSupplierProfileV1>, String> {
+) -> Result<Option<ContextCompilerSupplierProfileV2>, String> {
     let recipe_owner = context_recipe_publication_with_compiler_suppliers(
         &recipe_body.recipe,
         &recipe_body.catalogue,

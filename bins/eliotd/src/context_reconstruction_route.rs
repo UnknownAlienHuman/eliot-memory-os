@@ -79,7 +79,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use eliot_context::campaign_publication::{
-    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV1,
+    ContextCampaignRecipeBody, ContextCompilerSupplierProfileV2,
 };
 use eliot_context_contracts::ContextBinding;
 use eliot_contracts::{
@@ -562,7 +562,7 @@ pub(crate) struct AuthenticatedContextToolPolicy {
     /// Typed suppliers decoded only after the exact current source row passed
     /// its original ContextToolPolicy receipt and recipe-derived projection
     /// comparison. Absence remains `None`.
-    pub(crate) compiler_suppliers: Option<ContextCompilerSupplierProfileV1>,
+    pub(crate) compiler_suppliers: Option<ContextCompilerSupplierProfileV2>,
     /// Original typed current source row and owner receipt.
     pub(crate) read: CampaignSourceRevisionRead,
     /// Original named response, including payload and observed revision heads.
