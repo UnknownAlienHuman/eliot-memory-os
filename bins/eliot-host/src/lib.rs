@@ -5426,8 +5426,9 @@ mod runtime_restart_state;
 #[cfg(windows)]
 use runtime_restart_state::{
     RuntimeRestartPendingPublication, has_runtime_restart_pending, load_durable_runtime_restarts,
-    persist_runtime_restart_pending, persist_runtime_restart_receipt,
-    read_bounded_runtime_restart_file, rebind_runtime_restart_receipt,
+    load_restart_budget, persist_restart_budget, persist_runtime_restart_pending,
+    persist_runtime_restart_receipt, read_bounded_runtime_restart_file,
+    rebind_runtime_restart_receipt,
 };
 #[cfg(all(windows, test))]
 use runtime_restart_state::{
@@ -7512,12 +7513,28 @@ impl HostComposition {
                 .map_err(|error| HostError::ProcessContour(error.to_string()))?;
         }
         #[cfg(windows)]
-        let jobs = if store_recovery_startup_fence.is_fenced() {
+        let mut jobs = if store_recovery_startup_fence.is_fenced() {
             HostJobBranches::new_fenced(&host)
         } else {
             HostJobBranches::new(&host)
         }
         .map_err(|error| HostError::Platform(error.to_string()))?;
+        #[cfg(windows)]
+        {
+            // W5/A5 (#1801): the in-memory episode counters zeroed by the
+            // constructors above cannot survive a supervisor replacement on
+            // their own. Rehydrate them from the Host-owned durable restart
+            // store when the retained record binds this startup's approved
+            // generation. A foreign generation starts a fresh episode, so no
+            // reset call is needed on the approved-start path.
+            let retained_budget = load_restart_budget(&host_state_root)?;
+            if let Some(budget) = retained_budget
+                && budget.is_bound_to(startup_manifest.generation.as_str())
+            {
+                jobs.kernel_restart_attempts = budget.kernel_restart_attempts;
+                jobs.store_restart_attempts = budget.store_restart_attempts;
+            }
+        }
         #[cfg(all(windows, test))]
         let _ = &profile_root_leases;
         let mut composition = Self {
@@ -10694,6 +10711,35 @@ impl HostComposition {
         Ok(tick)
     }
 
+    /// Writes through the Host-owned restart-budget episode when the live
+    /// counters no longer match `before`. W5/A5 (#1801): a Kernel relaunch
+    /// bound or Store recovery attempt spent in memory must reach the
+    /// durable restart store, so replacing this Host process cannot reset an
+    /// exhausted loop. The write runs only when the counters moved, carries
+    /// the already-proved active generation, and fails the pass rather than
+    /// diverging from the retained budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable budget record cannot be retained.
+    #[cfg(windows)]
+    fn persist_spent_restart_budget(
+        &self,
+        generation: &PlatformHandle,
+        before: (u8, u8),
+    ) -> Result<(), HostError> {
+        let after = (self.jobs.kernel_restart_attempts, self.jobs.store_restart_attempts);
+        if after != before {
+            persist_restart_budget(
+                self.launch_options.host_state_root(),
+                generation.as_str(),
+                after.0,
+                after.1,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Reconciles the approved contour and records fresh process observations.
     ///
     /// # Errors
@@ -10810,7 +10856,12 @@ impl HostComposition {
         let reconciled = if store_requires_restart {
             None
         } else {
-            Some(self.jobs.reconcile(
+            #[cfg(windows)]
+            let budget_before = (
+                self.jobs.kernel_restart_attempts,
+                self.jobs.store_restart_attempts,
+            );
+            let reconciled = Some(self.jobs.reconcile(
                 &active.manifest.generation,
                 &materialized_config_digest,
                 &config_path,
@@ -10820,7 +10871,10 @@ impl HostComposition {
                 kernel_artifact,
                 store_artifact,
                 &self.host,
-            ))
+            ));
+            #[cfg(windows)]
+            self.persist_spent_restart_budget(&active.manifest.generation, budget_before)?;
+            reconciled
         };
         // Re-observe after generic reconciliation.  A Store can die after
         // the outer liveness check and the generic guard; only this shared
@@ -10831,6 +10885,11 @@ impl HostComposition {
         );
         let request = self
             .scm_store_recovery_request(&active.manifest.generation, &materialized_config_digest)?;
+        #[cfg(windows)]
+        let budget_before_recovery = (
+            self.jobs.kernel_restart_attempts,
+            self.jobs.store_restart_attempts,
+        );
         let route = route_scm_store_recovery(
             ScmStoreRecoveryObservation {
                 store_requires_restart,
@@ -10842,6 +10901,8 @@ impl HostComposition {
             &request,
             |request| self.execute_store_recovery(request).map(|_| ()),
         )?;
+        #[cfg(windows)]
+        self.persist_spent_restart_budget(&active.manifest.generation, budget_before_recovery)?;
         let disposition = match route {
             ScmStoreRecoveryRoute::Recovered => {
                 let disposition = self.reconcile_branch_readiness_at(

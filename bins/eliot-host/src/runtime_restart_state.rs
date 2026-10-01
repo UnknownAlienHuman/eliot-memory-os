@@ -162,6 +162,15 @@ pub(super) fn load_durable_runtime_restarts(
         let pending_digest = file_name
             .strip_suffix(".pending.json")
             .filter(|digest| valid_sha256_text(digest));
+        // The Host-owned restart-budget episode record shares the durable
+        // restart store directory but is not a restart receipt: it carries
+        // the retained episode/attempt state for the current owner, never a
+        // per-mutation outcome, so receipt adoption must skip it here. It is
+        // read only through `load_restart_budget`.
+        if file_name == RESTART_BUDGET_FILE_NAME {
+            host_restart_observe("host.restart budget not adopted observed");
+            continue;
+        }
         if pending_digest.is_some() {
             // Pending records are validated by the bounded reader below. They
             // are not receipts and therefore never enter the adoption map.
@@ -560,6 +569,130 @@ pub(super) fn rebind_runtime_restart_receipt(
     rebound.validate().map_err(HostError::Platform)?;
     host_restart_observe("host.restart rebind observed");
     Ok(rebound)
+}
+
+#[cfg(windows)]
+const RESTART_BUDGET_FILE_NAME: &str = "restart-budget.json";
+
+/// Durable Host-owned restart-budget episode for one approved generation.
+///
+/// This carries the applicable episode/attempt state behind issue #1801 Work
+/// 5 that the in-memory `u8` counters on `HostJobBranches` cannot retain
+/// across a supervisor replacement: the approved generation the episode
+/// belongs to, plus each Host-managed branch's spent restart attempts.
+/// Exhaustion stays the existing `attempts >= 1` bound evaluated over these
+/// retained counters, so an exhausted episode remains exhausted after any
+/// Host process replacement for the same generation, and repeated failure
+/// reaches the retained Problem State instead of looping forever (A13.2). A
+/// newly approved generation binds a fresh episode: the generation check in
+/// `is_bound_to` refuses to adopt a foreign record, so no reset call is
+/// needed on the approved-start path.
+///
+/// There is no cooldown timer in the current Host owner (the reconcile and
+/// store-recovery paths retry at most once, immediately), so no cooldown
+/// state exists to persist; this record carries exactly the applicable
+/// episode/attempt state.
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestartBudgetLedger {
+    pub(super) generation: String,
+    pub(super) kernel_restart_attempts: u8,
+    pub(super) store_restart_attempts: u8,
+}
+
+#[cfg(windows)]
+impl RestartBudgetLedger {
+    /// Returns true only when this record binds the given approved
+    /// generation. An absent record never binds, so a fresh generation (or
+    /// a store that never recorded an episode) starts with zeroed counters.
+    pub(super) fn is_bound_to(&self, generation: &str) -> bool {
+        !self.generation.is_empty() && self.generation == generation
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.generation.is_empty()
+            || self.generation.len() > 512
+            || self.generation.chars().any(char::is_control)
+        {
+            return Err("restart budget generation is not valid text".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Loads the retained restart-budget episode, if any, from the Host-owned
+/// durable restart store. An absent record is a fresh episode (`Ok(None)`),
+/// never an error; a malformed or invalid record fails closed so an
+/// ambiguous budget can never admit an extra restart.
+#[cfg(windows)]
+pub(super) fn load_restart_budget(
+    host_state_root: &Path,
+) -> Result<Option<RestartBudgetLedger>, HostError> {
+    const MAX_RESTART_BUDGET_BYTES: u64 = 1024;
+    host_restart_observe("host.restart budget load requested");
+    let path = runtime_restart_store_dir(host_state_root).join(RESTART_BUDGET_FILE_NAME);
+    if !path.exists() {
+        host_restart_observe("host.restart budget absent observed");
+        return Ok(None);
+    }
+    let bytes =
+        read_bounded_runtime_restart_file(&path, MAX_RESTART_BUDGET_BYTES, "restart budget")?;
+    let ledger = serde_json::from_slice::<RestartBudgetLedger>(&bytes).map_err(|error| {
+        HostError::RecoveryRequired(format!("restart budget record is malformed: {error}"))
+    })?;
+    ledger.validate().map_err(|error| {
+        HostError::RecoveryRequired(format!("restart budget record is invalid: {error}"))
+    })?;
+    host_restart_observe("host.restart budget loaded observed");
+    Ok(Some(ledger))
+}
+
+/// Persists the current episode spend for `generation`, replacing the
+/// previous record atomically. The rename publishes either the old or the
+/// new record, never a torn file; a crash before the rename retains the
+/// previous spend, and the next spend re-persists. Callers write through
+/// the live in-memory counters with the generation they already proved, so
+/// the durable record never invents an episode.
+#[cfg(windows)]
+pub(super) fn persist_restart_budget(
+    host_state_root: &Path,
+    generation: &str,
+    kernel_restart_attempts: u8,
+    store_restart_attempts: u8,
+) -> Result<(), HostError> {
+    host_restart_observe("host.restart budget persist requested");
+    let ledger = RestartBudgetLedger {
+        generation: generation.to_owned(),
+        kernel_restart_attempts,
+        store_restart_attempts,
+    };
+    ledger.validate().map_err(HostError::RecoveryRequired)?;
+    let dir = runtime_restart_store_dir(host_state_root);
+    std::fs::create_dir_all(&dir).map_err(|e| HostError::Platform(e.to_string()))?;
+    let bytes = serde_json::to_vec(&ledger).map_err(|e| HostError::Platform(e.to_string()))?;
+    let tmp = dir.join(format!(".restart-budget.{}.tmp", Uuid::new_v4().simple()));
+    write_durable_file(&tmp, &bytes)?;
+    let published = std::fs::rename(&tmp, dir.join(RESTART_BUDGET_FILE_NAME));
+    // A stranded temporary would fail the strict store enumeration on the
+    // next open, so it is removed on every path before reporting.
+    let cleanup = std::fs::remove_file(&tmp);
+    let sync_after_cleanup = sync_runtime_restart_store_dir(&dir);
+    let () = match published {
+        Err(error) => return Err(HostError::Platform(error.to_string())),
+        Ok(()) => match cleanup {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(HostError::RecoveryRequired(format!(
+                    "restart budget temporary cleanup failed: {error}"
+                )));
+            }
+        },
+    };
+    sync_after_cleanup?;
+    host_restart_observe("host.restart budget persisted observed");
+    Ok(())
 }
 
 #[cfg(test)]
