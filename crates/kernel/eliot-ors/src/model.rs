@@ -7987,8 +7987,9 @@ impl HostRequestRecord {
         }
         if let Some(binding) = &self.finish_replay_binding {
             if !binding.is_object()
-                || serde_json::to_vec(binding)
-                    .map_or(true, |bytes| bytes.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES)
+                || serde_json::to_vec(binding).map_or(true, |bytes| {
+                    bytes.len() > MAX_HOST_REQUEST_RESULT_RESPONSE_BYTES
+                })
             {
                 return Err(OrsError::InvalidField {
                     field: "host_request_finish_replay_binding",

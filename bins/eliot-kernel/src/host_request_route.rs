@@ -745,8 +745,10 @@ impl KernelComposition {
             && envelope.kind == HostRequestKind::Invocation
             && envelope.identity.capability == "eliot.finish"
             && existing.as_ref().is_some_and(|record| {
-                matches!(record.state, HostRequestState::ResultReceived | HostRequestState::Terminal)
-                    && record.result_digest.is_some()
+                matches!(
+                    record.state,
+                    HostRequestState::ResultReceived | HostRequestState::Terminal
+                ) && record.result_digest.is_some()
                     && record.result_response.is_some()
                     && record.same_binding(&requested)
             });
@@ -1566,15 +1568,12 @@ impl KernelComposition {
                 .lock()
                 .map_err(|_| TransportError::SessionFenced)?;
             let owner = self.finish_owner_binding_for_pair(envelope, tool, &pending)?;
-            finish_replay_binding = Some(
-                serde_json::json!({
-                    "envelope": envelope,
-                    "tool": tool,
-                    "owner": owner,
-                }),
-            );
+            finish_replay_binding = Some(serde_json::json!({
+                "envelope": envelope,
+                "tool": tool,
+                "owner": owner,
+            }));
         }
-<<<<<<< HEAD
         // Issue #77 W2: Kernel-owned bind/dispatch leg runs BEFORE the
         // route's own admit staging. The binder's `admit_and_stage` advances
         // `Requested -> Admitted` itself, and only the call that stages first
@@ -1584,12 +1583,10 @@ impl KernelComposition {
         // and `EffectCeiling::CandidateOnly`. A route-first staging would
         // reduce every fresh envelope to a replay inside `invoke_admitted`,
         // so the Kernel-owned identity would never be minted. The leg is
-        // fail-closed: any non-dispatched disposition falls through to the
-        // existing admit-and-queue path below unchanged.
-        // Finish has its own durable daemon-claim lane and requires its exact
-        // original owner binding in the first ORS row; the generic read
-        // binder cannot retain that binding, so it stays on the route's
-        // tool-bound admission path.
+        // fail-closed for the existing read lane. Finish uses its own durable
+        // daemon-claim lane and its exact original owner binding in the first
+        // ORS row; the generic read binder cannot retain that binding, so it
+        // stays on the route's tool-bound admission path.
         let binder_dispatched = if envelope.identity.capability == "eliot.finish" {
             false
         } else {
@@ -1614,13 +1611,6 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)?
                 .ok_or(TransportError::SessionFenced)?;
         }
-=======
-        let (receipt, record) = self.admit_host_request_envelope_with_tool_binding_under_transition(
-            envelope,
-            None,
-            finish_replay_binding,
-        )?;
->>>>>>> 3cc1db6e4 (fix(finish): retain owner for reconnect replay)
         // Queue each admitted shape in its Kernel-owned lane. Query and Skill
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
@@ -6576,7 +6566,10 @@ impl KernelComposition {
                     );
                 }
             };
-            if matches!(record.state, HostRequestState::ResultReceived | HostRequestState::Terminal) {
+            if matches!(
+                record.state,
+                HostRequestState::ResultReceived | HostRequestState::Terminal
+            ) {
                 if record.result_digest.is_none() || record.result_response.is_none() {
                     return Err(TransportError::SessionFenced);
                 }
@@ -6592,7 +6585,12 @@ impl KernelComposition {
                 });
             }
             let value = host_request_admitted_response(&admission_receipt, &record);
-            return Self::host_request_correlated_reply(session, request_id, protocol_version, value);
+            return Self::host_request_correlated_reply(
+                session,
+                request_id,
+                protocol_version,
+                value,
+            );
         }
         #[cfg(windows)]
         if operation == AGENT_HOST_REQUEST_RESOLVE_OPERATION {
@@ -6684,17 +6682,17 @@ impl KernelComposition {
         {
             return Ok(None);
         }
-        let Some(record_value) = response
-            .get("value")
-            .and_then(|value| value.get("record"))
-        else {
+        let Some(record_value) = response.get("value").and_then(|value| value.get("record")) else {
             return Ok(None);
         };
         let record: HostRequestRecord = serde_json::from_value(record_value.clone())
             .map_err(|_| TransportError::SessionFenced)?;
         if record.kind != OrsHostRequestKind::Invocation
             || record.capability_ref.as_str() != "eliot.finish"
-            || !matches!(record.state, HostRequestState::ResultReceived | HostRequestState::Terminal)
+            || !matches!(
+                record.state,
+                HostRequestState::ResultReceived | HostRequestState::Terminal
+            )
         {
             return Ok(None);
         }
@@ -6702,8 +6700,8 @@ impl KernelComposition {
             .finish_replay_binding
             .clone()
             .ok_or(TransportError::UnknownRequest)?;
-        let retained: PersistedFinishReplayBinding = serde_json::from_value(binding)
-            .map_err(|_| TransportError::SessionFenced)?;
+        let retained: PersistedFinishReplayBinding =
+            serde_json::from_value(binding).map_err(|_| TransportError::SessionFenced)?;
         let logical_key = match query.get("form").and_then(serde_json::Value::as_str) {
             Some("logical-key") => {
                 let key = resolve_digest_field(

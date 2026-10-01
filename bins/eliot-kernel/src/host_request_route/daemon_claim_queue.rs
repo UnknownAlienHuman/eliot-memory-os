@@ -145,7 +145,8 @@ impl KernelComposition {
         let receipt = gateway
             .receipt(
                 &envelope.state_fence,
-                OperationId::new(operation_id.clone()).map_err(|_| TransportError::SessionFenced)?,
+                OperationId::new(operation_id.clone())
+                    .map_err(|_| TransportError::SessionFenced)?,
             )
             .await
             .map_err(|_| TransportError::SessionFenced)?
@@ -164,12 +165,7 @@ impl KernelComposition {
         }
         let operation = OperationIdentity::new(operation_id.clone())
             .map_err(|_| TransportError::SessionFenced)?;
-        if !committed_finish_receipt_matches_owner(
-            &receipt,
-            &operation,
-            &envelope,
-            &owner_after,
-        ) {
+        if !committed_finish_receipt_matches_owner(&receipt, &operation, &envelope, &owner_after) {
             return Err(TransportError::IdentityConflict);
         }
         let value = if let Some(key) = logical_key.as_deref() {
@@ -234,8 +230,7 @@ impl KernelComposition {
         if !matches!(
             expected_record.state,
             HostRequestState::ResultReceived | HostRequestState::Terminal
-        )
-            || expected_record.result_digest.is_none()
+        ) || expected_record.result_digest.is_none()
             || expected_record.result_response.is_none()
             || expected_record.payload_body.as_ref() != Some(tool)
         {
@@ -248,7 +243,10 @@ impl KernelComposition {
                 .ok_or(TransportError::UnknownRequest)?,
         )
         .map_err(|_| TransportError::SessionFenced)?;
-        if persisted.envelope != *envelope || persisted.tool != *tool || persisted.owner != *original_owner {
+        if persisted.envelope != *envelope
+            || persisted.tool != *tool
+            || persisted.owner != *original_owner
+        {
             return Err(TransportError::IdentityConflict);
         }
         let operation_id = host_request_operation_id(envelope);
@@ -272,9 +270,11 @@ impl KernelComposition {
         if !stored.same_binding(&expected) {
             return Err(TransportError::IdentityConflict);
         }
-        let retained_attempt = stored.attempt.as_ref().ok_or(TransportError::SessionFenced)?;
-        if retained_attempt.phase != eliot_ors::HostRequestAttemptPhase::ResponseReceived
-        {
+        let retained_attempt = stored
+            .attempt
+            .as_ref()
+            .ok_or(TransportError::SessionFenced)?;
+        if retained_attempt.phase != eliot_ors::HostRequestAttemptPhase::ResponseReceived {
             return Err(TransportError::SessionFenced);
         }
         let _transition = self.agent_bridge_transition_read()?;
@@ -334,13 +334,33 @@ impl KernelComposition {
             || !original
                 .authority_epoch
                 .is_same_authority(&persisted.envelope.state_fence.authority_epoch)
-            || original.session_id != persisted.envelope.identity.session_id.as_deref().unwrap_or_default()
-            || original.task_id != persisted.envelope.identity.task_id.as_deref().unwrap_or_default()
-            || original.work_scope_id != persisted.envelope.identity.work_scope_id.as_deref().unwrap_or_default()
+            || original.session_id
+                != persisted
+                    .envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .unwrap_or_default()
+            || original.task_id
+                != persisted
+                    .envelope
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .unwrap_or_default()
+            || original.work_scope_id
+                != persisted
+                    .envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .unwrap_or_default()
             || original.principal_id.trim().is_empty()
-            || reconnect_envelope.identity.session_id.as_deref() != Some(original.session_id.as_str())
+            || reconnect_envelope.identity.session_id.as_deref()
+                != Some(original.session_id.as_str())
             || reconnect_envelope.identity.task_id.as_deref() != Some(original.task_id.as_str())
-            || reconnect_envelope.identity.work_scope_id.as_deref() != Some(original.work_scope_id.as_str())
+            || reconnect_envelope.identity.work_scope_id.as_deref()
+                != Some(original.work_scope_id.as_str())
             || HostRequestAdmissionReceipt::issue(&persisted.envelope)
                 .map_err(|_| TransportError::SessionFenced)?
                 != *admission_receipt
@@ -365,11 +385,7 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         if !KernelComposition::activation_result_still_retained_in(&pending, original)
-            || !self.activation_result_still_retained(
-                &pending,
-                original,
-                &lifecycle.connection_id,
-            )
+            || !self.activation_result_still_retained(&pending, original, &lifecycle.connection_id)
         {
             return Err(TransportError::SessionFenced);
         }
@@ -377,7 +393,9 @@ impl KernelComposition {
             || current.session_id != original.session_id
             || current.task_id != original.task_id
             || current.work_scope_id != original.work_scope_id
-            || !current.authority_epoch.is_same_authority(&original.authority_epoch)
+            || !current
+                .authority_epoch
+                .is_same_authority(&original.authority_epoch)
             || current.activation_generation != original.activation_generation
             || expected_record.operation_id.as_str()
                 != host_request_operation_id(&persisted.envelope)
@@ -402,7 +420,10 @@ impl KernelComposition {
         requested.finish_replay_binding = expected_record.finish_replay_binding.clone();
         if stored != *expected_record
             || !stored.same_binding(&requested)
-            || !matches!(stored.state, HostRequestState::ResultReceived | HostRequestState::Terminal)
+            || !matches!(
+                stored.state,
+                HostRequestState::ResultReceived | HostRequestState::Terminal
+            )
             || stored.result_digest.is_none()
             || stored.result_response.is_none()
             || stored.attempt.as_ref().is_none_or(|attempt| {
@@ -436,11 +457,7 @@ impl KernelComposition {
         let durable = self
             .generation_gateway
             .ors
-            .bind_host_request_payload(
-                &durable_operation_id,
-                &envelope.envelope_sha256,
-                tool,
-            )
+            .bind_host_request_payload(&durable_operation_id, &envelope.envelope_sha256, tool)
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         if durable.payload_body.as_ref() != Some(tool) {
@@ -855,8 +872,7 @@ impl KernelComposition {
             for refs in index.values_mut() {
                 if let Some(position) = refs.iter().position(|candidate| {
                     candidate.finish_envelope.is_some()
-                        && (!candidate.finish_attempt.is_live()
-                            || candidate.finish_result_received)
+                        && (!candidate.finish_attempt.is_live() || candidate.finish_result_received)
                 }) {
                     refs.remove(position);
                     evicted = true;
@@ -957,13 +973,10 @@ impl KernelComposition {
                 }
                 let mut expected = super::requested_host_request_record(envelope)?;
                 expected.finish_replay_binding = stored.finish_replay_binding.clone();
-                if !stored.same_binding(&expected)
-                    || stored.payload_body.as_ref() != Some(tool)
-                {
+                if !stored.same_binding(&expected) || stored.payload_body.as_ref() != Some(tool) {
                     return Err(TransportError::IdentityConflict);
                 }
-                let expired =
-                    activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
+                let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
                 if expired {
                     // Expired claims are read-only reconciliation capabilities.
                     // They reuse the attempt that was durably claimed before the
@@ -999,7 +1012,8 @@ impl KernelComposition {
                         &stored,
                         &queue_attempt,
                         session,
-                    )? else {
+                    )?
+                    else {
                         continue;
                     };
                     let durable_attempt = durable.attempt.ok_or(TransportError::SessionFenced)?;
@@ -1007,7 +1021,10 @@ impl KernelComposition {
                         attempt_id: durable_attempt.attempt_id.as_str().to_owned(),
                         generation: durable_attempt.generation,
                         enqueue_salt: candidate.finish_attempt.enqueue_salt,
-                        owner_connection_id: durable_attempt.owner_connection_ref.as_str().to_owned(),
+                        owner_connection_id: durable_attempt
+                            .owner_connection_ref
+                            .as_str()
+                            .to_owned(),
                         owner_launch_nonce: durable_attempt.owner_launch_nonce.as_str().to_owned(),
                         owner_session_epoch: durable_attempt.owner_session_epoch,
                     };
@@ -1460,17 +1477,18 @@ impl KernelComposition {
             return Ok(false);
         }
         if parent.attempt.is_none()
-            && matches!(parent.state, HostRequestState::Admitted | HostRequestState::Routed)
+            && matches!(
+                parent.state,
+                HostRequestState::Admitted | HostRequestState::Routed
+            )
         {
             // Finish owner work cannot be reached until Kernel has durably
             // claimed an ORS attempt. With no attempt to reconcile, there is
             // no Finish capability that has been handed to the daemon.
             return Ok(false);
         }
-        let (envelope_before, tool_before) = self.finish_pair_for_operation(
-            parent_operation.as_str(),
-            &parent_digest,
-        )?;
+        let (envelope_before, tool_before) =
+            self.finish_pair_for_operation(parent_operation.as_str(), &parent_digest)?;
         let mut expected = super::requested_host_request_record(&envelope_before)?;
         expected.finish_replay_binding = parent.finish_replay_binding.clone();
         if !parent.same_binding(&expected) {
@@ -1704,12 +1722,18 @@ fn committed_finish_receipt_matches_owner(
     core.operation.operation_id.as_str() == operation_id.as_str()
         && core.operation.idempotency_key == envelope.identity.idempotency_key
         && core.request.state_fence == envelope.state_fence
-        && core.request.metadata.task_id.as_ref().is_some_and(|task_id| {
-            task_id.as_str() == owner.task_id.as_str()
-        })
-        && core.request.metadata.session_id.as_ref().is_some_and(|session_id| {
-            session_id.as_str() == owner.session_id.as_str()
-        })
+        && core
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .is_some_and(|task_id| task_id.as_str() == owner.task_id.as_str())
+        && core
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .is_some_and(|session_id| session_id.as_str() == owner.session_id.as_str())
         && task.task_id.as_str() == owner.task_id.as_str()
         && task.task_revision == owner.task_revision
         && task.state_fence == semantic_fence

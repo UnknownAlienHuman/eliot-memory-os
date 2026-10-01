@@ -630,9 +630,7 @@ async fn serve_user_broker_connection(
             | KernelFrameAction::Dreamer { .. }
             | KernelFrameAction::Research { .. }
             | KernelFrameAction::Backup { .. }
-            | KernelFrameAction::FinishReplay { .. } => {
-                break Err(TransportError::SessionFenced)
-            }
+            | KernelFrameAction::FinishReplay { .. } => break Err(TransportError::SessionFenced),
         }
     };
     session.fence();
