@@ -7,7 +7,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use eliot_artifact::ArtifactOwner;
+use eliot_artifact::{ArtifactError, ArtifactIdentity, ArtifactOwner, ArtifactReference};
+use eliot_contracts::{ClockReading, SourceId};
 use eliot_governor::{SourceArtifactAdmission, SourceArtifactBlobProfile};
 use eliot_git_bridge::{AsyncProcessRunner, GitSnapshotError, RepoRoot};
 use eliot_lsp_bridge::{BridgeError, LspSourceArtifactProof, SourceCandidate};
@@ -25,6 +26,16 @@ pub(crate) struct SelectedSourceArtifactInputs {
     pub(crate) runner: Arc<dyn AsyncProcessRunner>,
 }
 
+/// Original-owner snapshot staging result held across admission of the
+/// separate exact-reference Read. It cannot cross a serde boundary.
+pub(crate) struct StagedSelectedSourceSnapshot {
+    snapshot: eliot_git_bridge::SourceTreeSnapshot,
+    reference: ArtifactReference,
+    candidate: SourceCandidate,
+    root: RepoRoot,
+    runner: Arc<dyn AsyncProcessRunner>,
+}
+
 /// Failures while joining the current owner-observed source to its stored
 /// source archive and original S-04 readback.
 #[derive(Debug, Error)]
@@ -37,25 +48,28 @@ pub(crate) enum SelectedSourceArtifactInputError {
     ArtifactOwner(#[from] SourceArtifactOwnerError),
     #[error("LSP source proof rejected the owner readback: {0}")]
     Bridge(#[from] BridgeError),
+    #[error("artifact identity rejected the owner-bound snapshot: {0}")]
+    Artifact(#[from] ArtifactError),
 }
 
-/// Captures the exact current selected file in the original Git owner, then
-/// reads the caller-supplied persisted full-tree artifact through the original
-/// source Read admission and constructs the live LSP source proof.
-///
-/// `reference` must already be a real source artifact reference produced by a
-/// separately admitted owner mutation. This function deliberately cannot
-/// publish an artifact with the source Read admission.
-pub(crate) async fn capture_selected_source_artifact_proof(
+/// Captures and publishes the selected source tree under its own original
+/// ReversibleMutation admission. A later caller must obtain a distinct Read
+/// admission bound to the returned ArtifactReference before readback.
+pub(crate) async fn stage_selected_source_snapshot(
     owner: &SourceArtifactOwner,
-    read_admission: &SourceArtifactAdmission,
-    blob_profile: &SourceArtifactBlobProfile,
-    reference: eliot_artifact::ArtifactReference,
+    mutation_admission: &SourceArtifactAdmission,
+    mutation_profile: &SourceArtifactBlobProfile,
+    max_archive_bytes: u64,
+    source_id: SourceId,
+    captured_at: ClockReading,
     candidate: &SourceCandidate,
     selected: &BoundSelectedSourceObservation,
     root: RepoRoot,
     runner: Arc<dyn AsyncProcessRunner>,
-) -> Result<SelectedSourceArtifactInputs, SelectedSourceArtifactInputError> {
+) -> Result<StagedSelectedSourceSnapshot, SelectedSourceArtifactInputError> {
+    if max_archive_bytes == 0 {
+        return Err(SelectedSourceArtifactInputError::BindingMismatch);
+    }
     let selected_relative_path = selected
         .canonical_candidate
         .strip_prefix(&selected.canonical_root)
@@ -75,28 +89,62 @@ pub(crate) async fn capture_selected_source_artifact_proof(
     let snapshot = eliot_git_bridge::SourceTreeSnapshot::capture_current_async_for_selected_source(
         &root,
         runner.as_ref(),
-        reference.identity.content.size_bytes.max(1),
+        max_archive_bytes,
         selected_relative_path,
         &selected.source_bytes,
     )
     .await?;
 
-    let artifact_owner = ArtifactOwner::new(snapshot.max_archive_bytes())?;
+    let identity = ArtifactIdentity::bind_source_snapshot(
+        &mutation_admission.operation().operation_id,
+        source_id,
+        snapshot.tree_id(),
+        snapshot.archive_bytes(),
+        None,
+        captured_at,
+    )?;
+    let reference = owner.stage_source_snapshot(
+        mutation_admission,
+        mutation_profile,
+        identity,
+        snapshot.archive_bytes(),
+    )?;
+
+    Ok(StagedSelectedSourceSnapshot {
+        snapshot,
+        reference,
+        candidate: candidate.clone(),
+        root,
+        runner,
+    })
+}
+
+/// Reads the exact reference produced by `stage_selected_source_snapshot`
+/// under its independently admitted source Read and constructs the live LSP
+/// proof. The caller creates this admission only after the ready receipt ID is
+/// known; no Read authority is reused for staging.
+pub(crate) async fn readback_selected_source_snapshot(
+    owner: &SourceArtifactOwner,
+    read_admission: &SourceArtifactAdmission,
+    read_profile: &SourceArtifactBlobProfile,
+    staged: StagedSelectedSourceSnapshot,
+) -> Result<SelectedSourceArtifactInputs, SelectedSourceArtifactInputError> {
+    let artifact_owner = ArtifactOwner::new(staged.snapshot.max_archive_bytes())?;
     let (verified_artifact, read_receipt) = owner
-        .read_source_reference(read_admission, blob_profile, reference.clone())
+        .read_source_reference(read_admission, read_profile, staged.reference.clone())
         .await?;
     let source_proof = LspSourceArtifactProof::from_owner_readback(
         &artifact_owner,
-        snapshot,
-        reference,
+        staged.snapshot,
+        staged.reference,
         verified_artifact,
         read_receipt,
-        candidate,
+        &staged.candidate,
     )?;
 
     Ok(SelectedSourceArtifactInputs {
         source_proof,
-        root,
-        runner,
+        root: staged.root,
+        runner: staged.runner,
     })
 }
