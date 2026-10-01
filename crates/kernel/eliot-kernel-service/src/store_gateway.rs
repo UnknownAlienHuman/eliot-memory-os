@@ -386,6 +386,28 @@ fn user_automation_gateway_unknown(error: impl std::fmt::Display) -> UserAutomat
     ))
 }
 
+fn normalization_receipt_binding() -> UserAutomationExecutionError {
+    UserAutomationExecutionError::Contract(
+        eliot_kernel_core::user_automation::UserAutomationError::ReceiptBinding,
+    )
+}
+
+fn normalization_selector(
+    request: &UserAutomationServiceRequest,
+) -> Result<(String, String), UserAutomationExecutionError> {
+    match &request.intent.operation {
+        UserAutomationOperation::NormalizeSchedule { revision, .. }
+        | UserAutomationOperation::MigrateLegacySchedule { revision, .. } => {
+            Ok((revision.automation_id.clone(), revision.revision.clone()))
+        }
+        _ => Err(UserAutomationExecutionError::Contract(
+            eliot_kernel_core::user_automation::UserAutomationError::Invalid(
+                "operation.schedule_normalization",
+            ),
+        )),
+    }
+}
+
 #[path = "store_receipt_gateway.rs"]
 mod store_receipt_gateway;
 
@@ -2680,19 +2702,204 @@ impl KernelStoreGateway {
             .map_err(UserAutomationExecutionError::Contract)
     }
 
-    /// Performs the authenticated, read-only schedule normalization operation
-    /// used by the Kernel operator route before any Create/Edit Store call.
-    pub fn normalize_user_automation_schedule(
+    /// Performs or replays the authenticated schedule normalization operation.
+    /// A newly compiled answer is retained through the existing canonical
+    /// writer before this method returns it to the Kernel operator route.
+    pub async fn normalize_user_automation_schedule(
+        &self,
         request: &UserAutomationServiceRequest,
     ) -> Result<
-        (UserAutomationRevision, eliot_receipts::ReceiptEnvelope),
+        (
+            UserAutomationServiceRequest,
+            UserAutomationRevision,
+            eliot_receipts::ReceiptEnvelope,
+        ),
         UserAutomationExecutionError,
     > {
         request
             .validate_for_schedule_normalization()
             .map_err(UserAutomationExecutionError::Contract)?;
-        super::user_automation_store::normalize_user_automation_operation(request)
-            .map_err(UserAutomationExecutionError::Contract)
+        let (automation_id, revision_id) = normalization_selector(request)?;
+        let record = self
+            .read_user_automation_normalization_record(
+                &request.context.state_fence,
+                &automation_id,
+                &revision_id,
+            )
+            .await?;
+        if let Some(record) = record {
+            let (original, revision, envelope) =
+                super::user_automation_store::validate_normalization_record(&record)
+                    .map_err(|_| normalization_receipt_binding())?;
+            if !Self::same_normalization_intent(&original, request) {
+                return Err(normalization_receipt_binding());
+            }
+            return Ok((original, revision, envelope));
+        }
+
+        // A reused operation ID whose original result is not present under
+        // this exact selector is a known conflict. Never compile and retry it.
+        if self
+            .receipt(
+                &request.context.state_fence,
+                request.identity.operation_id.clone(),
+            )
+            .await
+            .map_err(user_automation_gateway_unknown)?
+            .is_some()
+        {
+            return Err(normalization_receipt_binding());
+        }
+
+        let (revision, envelope) =
+            super::user_automation_store::normalize_user_automation_operation(request)
+                .map_err(UserAutomationExecutionError::Contract)?;
+        self.retain_user_automation_normalization_result(request, &revision, &envelope)
+            .await
+    }
+
+    async fn read_user_automation_normalization_record(
+        &self,
+        state_fence: &StateFence,
+        automation_id: &str,
+        revision_id: &str,
+    ) -> Result<
+        Option<super::user_automation_store::UserAutomationNormalizationRecord>,
+        UserAutomationExecutionError,
+    > {
+        let named = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::normalization_read_request(
+            state_fence.clone(),
+            automation_id.to_owned(),
+            revision_id.to_owned(),
+        )
+        .map_err(user_automation_gateway_unknown)?;
+        let response = self
+            .execute_named(named.clone())
+            .await
+            .map_err(user_automation_gateway_unknown)?;
+        let record = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::project_normalization_record(automation_id, revision_id, &named, response)
+        .map_err(user_automation_gateway_unknown)?;
+        if let Some(record) = &record {
+            let receipt = self
+                .receipt(state_fence, record.operation_id.clone())
+                .await
+                .map_err(user_automation_gateway_unknown)?
+                .ok_or_else(|| {
+                    user_automation_gateway_unknown(
+                        "retained normalization has no canonical write receipt",
+                    )
+                })?;
+            CanonicalUserAutomationStore::<
+                EbpCanonicalStoreClient<NamedPipeTransport>,
+            >::validate_normalization_write_receipt(record, &receipt)
+            .map_err(user_automation_gateway_unknown)?;
+        }
+        Ok(record)
+    }
+
+    async fn retain_user_automation_normalization_result(
+        &self,
+        request: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        envelope: &eliot_receipts::ReceiptEnvelope,
+    ) -> Result<
+        (
+            UserAutomationServiceRequest,
+            UserAutomationRevision,
+            eliot_receipts::ReceiptEnvelope,
+        ),
+        UserAutomationExecutionError,
+    > {
+        let (automation_id, revision_id) = normalization_selector(request)?;
+        let original_request_json = serde_json::to_string(request)
+            .map_err(user_automation_gateway_unknown)?;
+        let store_request = crate::UserAutomationStoreRequest {
+            context: request.context.clone(),
+            authenticated_principal: request.authenticated_principal.clone(),
+            identity: request.identity.clone(),
+            intent: request.intent.clone(),
+        };
+        let (mut transition, manifest_digest) =
+            CanonicalUserAutomationStore::<BorrowedCanonicalStoreClient<'_>>::build_normalization_transition(
+                &store_request,
+                revision,
+                envelope,
+                original_request_json,
+            )
+            .map_err(user_automation_gateway_unknown)?;
+        let view = CanonicalRequestView::from_apply(
+            &store_request.context,
+            &transition,
+            &[],
+            &[],
+        );
+        let planned_hash = canonical_request_hash(&view).map_err(user_automation_gateway_unknown)?;
+        transition.identity.canonical_request_hash = planned_hash.clone();
+        let receipt = self
+            .apply(&store_request.context, transition, Vec::new(), Vec::new())
+            .await
+            .map_err(user_automation_gateway_unknown)?;
+        receipt.validate().map_err(user_automation_gateway_unknown)?;
+        if receipt.status != WriteReceiptStatus::Committed
+            || receipt.operation_id != request.identity.operation_id
+            || receipt.idempotency_key != request.identity.idempotency_key
+            || receipt.canonical_request_hash != planned_hash
+            || receipt.state_fence != request.context.state_fence
+            || receipt.operation_manifest_digest != manifest_digest
+        {
+            return Err(user_automation_gateway_unknown(
+                "normalization retention receipt does not bind the prepared transition",
+            ));
+        }
+        receipt
+            .require_reconciliation_envelope()
+            .map_err(user_automation_gateway_unknown)?;
+
+        let record = self
+            .read_user_automation_normalization_record(
+                &request.context.state_fence,
+                &automation_id,
+                &revision_id,
+            )
+            .await
+            ?
+        .ok_or_else(|| {
+            user_automation_gateway_unknown(
+                "committed normalization retention was not visible on exact readback",
+            )
+        })?;
+        let (original, retained_revision, retained_envelope) =
+            super::user_automation_store::validate_normalization_record(&record)
+                .map_err(|_| normalization_receipt_binding())?;
+        if !Self::same_normalization_intent(&original, request)
+            || retained_revision != *revision
+            || retained_envelope != *envelope
+        {
+            return Err(normalization_receipt_binding());
+        }
+        Ok((original, retained_revision, retained_envelope))
+    }
+
+    /// A retained normalization replay may arrive over a new transport
+    /// request, but its logical operation, source, principal and fence must be
+    /// identical to the original authenticated request.
+    fn same_normalization_intent(
+        original: &UserAutomationServiceRequest,
+        current: &UserAutomationServiceRequest,
+    ) -> bool {
+        original.identity.operation_id == current.identity.operation_id
+            && original.identity.idempotency_key == current.identity.idempotency_key
+            && original.authenticated_principal == current.authenticated_principal
+            && original.intent == current.intent
+            && original.context.session_id == current.context.session_id
+            && original.context.task_id == current.context.task_id
+            && original.context.product_id == current.context.product_id
+            && original.context.source_id == current.context.source_id
+            && original.context.state_fence == current.context.state_fence
     }
 
     /// Executes one authenticated `UserAutomation` operator operation as one
@@ -2748,6 +2955,12 @@ impl KernelStoreGateway {
             UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::Rejected(error))
         })?;
         Self::validate_user_automation_request(&request)?;
+        if matches!(
+            &request.intent.operation,
+            UserAutomationOperation::Create { .. } | UserAutomationOperation::Edit { .. }
+        ) {
+            self.validate_submitted_normalization_owner(&request).await?;
+        }
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         // The sealed request is the one value this frame must keep across every
         // remaining await, and it inlines the closed operator operation
@@ -2798,6 +3011,111 @@ impl KernelStoreGateway {
             .validate()
             .map_err(user_automation_gateway_unknown)?;
         Ok(transition)
+    }
+
+    /// Proves Create/Edit's revision and original envelope came from the
+    /// independently retained normalization owner before any Store mutation.
+    async fn validate_submitted_normalization_owner(
+        &self,
+        request: &UserAutomationServiceRequest,
+    ) -> Result<(), UserAutomationExecutionError> {
+        let (revision, envelope) = match &request.intent.operation {
+            UserAutomationOperation::Create {
+                revision,
+                normalization_receipt_envelope,
+            }
+            | UserAutomationOperation::Edit {
+                revision,
+                normalization_receipt_envelope,
+                ..
+            } => (revision, normalization_receipt_envelope),
+            _ => return Ok(()),
+        };
+        let fence = request.context.state_fence.clone();
+        let named = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::normalization_read_request(
+            fence.clone(),
+            revision.automation_id.clone(),
+            revision.revision.clone(),
+        )
+        .map_err(user_automation_gateway_unknown)?;
+        let response = self
+            .execute_named(named.clone())
+            .await
+            .map_err(user_automation_gateway_unknown)?;
+        let record = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::project_normalization_record(
+            &revision.automation_id,
+            &revision.revision,
+            &named,
+            response,
+        )
+        .map_err(|_| normalization_receipt_binding())?
+        .ok_or_else(normalization_receipt_binding)?;
+        let receipt = self
+            .receipt(&fence, record.operation_id.clone())
+            .await
+            .map_err(user_automation_gateway_unknown)?
+            .ok_or_else(|| {
+                user_automation_gateway_unknown(
+                    "retained normalization has no canonical write receipt",
+                )
+            })?;
+        CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::validate_normalization_write_receipt(&record, &receipt)
+        .map_err(|_| normalization_receipt_binding())?;
+        let (original, retained_revision, retained_envelope) =
+            super::user_automation_store::validate_normalization_record(&record)
+                .map_err(|_| normalization_receipt_binding())?;
+        let same_context = original.authenticated_principal == request.authenticated_principal
+            && original.context.session_id == request.context.session_id
+            && original.context.task_id == request.context.task_id
+            && original.context.product_id == request.context.product_id
+            && original.context.source_id == request.context.source_id
+            && original.context.state_fence == request.context.state_fence;
+        let migration_predecessor_matches = match (
+            &original.intent.operation,
+            &request.intent.operation,
+        ) {
+            (
+                UserAutomationOperation::MigrateLegacySchedule {
+                    previous_revision, ..
+                },
+                UserAutomationOperation::Edit {
+                    previous_revision: submitted, ..
+                },
+            ) => previous_revision == submitted,
+            (UserAutomationOperation::NormalizeSchedule { .. }, _) => true,
+            _ => false,
+        };
+        let submitted_revision_json = serde_json::to_string(revision)
+            .map_err(user_automation_gateway_unknown)?;
+        let submitted_envelope = serde_json::to_value(envelope)
+            .map_err(user_automation_gateway_unknown)?;
+        if !same_context
+            || !migration_predecessor_matches
+            || record.revision_json != submitted_revision_json
+            || record.normalization_receipt_json != submitted_envelope
+            || retained_revision != *revision
+            || retained_envelope != *envelope
+        {
+            return Err(normalization_receipt_binding());
+        }
+        let operation_kind =
+            super::user_automation_store::submitted_normalization_operation_kind(
+                &request.intent.operation,
+            )
+            .map_err(|_| normalization_receipt_binding())?;
+        super::user_automation_store::revision_with_owner_normalization_receipt(
+            revision,
+            &retained_envelope,
+            operation_kind,
+        )
+        .map_err(|_| normalization_receipt_binding())?;
+        Ok(())
     }
 
     /// Composes the one post-commit orchestration record of a parent operator
