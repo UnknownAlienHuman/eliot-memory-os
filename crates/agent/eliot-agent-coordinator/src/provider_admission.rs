@@ -39,15 +39,14 @@
 //! admitted through
 //! [`AdmittedProviderFactory::admit`](crate::admitted_provider::AdmittedProviderFactory::admit).
 //! A capability built directly through [`AdmittedProviderCapability::new`]
-//! carries no witnessed row and still aliases the presented half for those
-//! legs; only the fence leg rides owner-observed evidence (the live-fence
-//! digest) in both cases, while attempt/operation mismatch is caught
-//! receipt-side from the ORIGINAL bytes. Witnessing a genuine row for
-//! production capabilities demands the row-returning daemon seam
-//! (`DaemonKernelClient::load_provider_claim_row_async` over the Kernel
+//! carries no witnessed row and fails closed here with
+//! [`CoordinatorError::StaleProviderBinding`] before any owner check runs,
+//! so presented halves can never stand in as loaded evidence. Witnessing a
+//! genuine row for production capabilities demands the row-returning daemon
+//! seam (`DaemonKernelClient::load_provider_claim_row_async` over the Kernel
 //! claim-row read); the synchronous daemon restore builder cannot await it
-//! and stays rowless (see its residual note), so the owner digest/generation
-//! gates re-prove construction-time coherence there, not a fresh row read.
+//! and stays rowless (see its residual note), so its restore stays blocked
+//! at the construction gate and never reaches this proof.
 //!
 //! Catalogue, quota, and liveness observations (issue #265) ride only as
 //! [`ProviderSelectionHealth`]: selection/health input, never admission. The
@@ -316,9 +315,10 @@ pub struct AdmittedProviderCapability {
     /// carries equal to this row before any existing validator observed
     /// them. Every `verify` reads the loaded legs back from this retained
     /// row instead of aliasing the presented half, so one admission binds
-    /// every later proof to the same durable evidence. Direct construction
-    /// carries none: the row must be witnessed, never rebuilt from presented
-    /// halves.
+    /// every later proof to the same durable evidence; `verify` fails closed
+    /// without it, so a directly constructed capability can never verify.
+    /// Direct construction carries none: the row must be witnessed, never
+    /// rebuilt from presented halves.
     witnessed: Option<OwnerLoadedClaimRow>,
 }
 
@@ -391,9 +391,10 @@ impl AdmittedProviderCapability {
     /// Borrows the factory-witnessed durable owner row, if one was retained.
     ///
     /// Crate-internal: the sealed verifier reads the loaded legs back from
-    /// this row on every proof. `None` for directly constructed
-    /// capabilities, which alias the presented half for those legs until
-    /// their construction witnesses a genuine row.
+    /// this row on every proof and fails closed when it is absent, so the
+    /// loaded legs never alias the presented half. `None` for directly
+    /// constructed capabilities, which can never verify until their
+    /// construction witnesses a genuine row.
     pub(crate) fn witnessed_row(&self) -> Option<&OwnerLoadedClaimRow> {
         self.witnessed.as_ref()
     }
@@ -548,10 +549,11 @@ impl ProviderVerifier for KernelProviderVerifier {
         // ORIGINAL canonical bytes (typed per-kind receipt schemas, never an
         // opaque string path and never a recomputed stand-in) and carried as
         // the owner request, while the factory-witnessed row retained in the
-        // capability rides as the loaded durable row (a directly constructed
-        // capability carries no witnessed row and still aliases the
-        // presented half there). A receipt naming an attempt or operation the claim
-        // never covered fails closed through the owner as `ForeignAttempt` /
+        // capability rides as the loaded durable row; a capability without a
+        // witnessed row fails closed below before any owner check runs, so
+        // presented halves can never stand in as loaded evidence. A receipt
+        // naming an attempt or operation the claim never covered fails
+        // closed through the owner as `ForeignAttempt` /
         // `ForeignOperation` (typed `StaleProviderBinding`, the same typed
         // error a revoked or mismatched binding yields); only cancellation
         // receipts carry an operation identity, so every other kind rides the
@@ -580,38 +582,32 @@ impl ProviderVerifier for KernelProviderVerifier {
             receipt_proof_identity(kind, canonical_payload, &presented.operation_id)?;
         let fence_digest = presented.fence_digest()?;
         let live_fence_digest = currentness.live_fence_digest()?;
-        // Loaded legs come from the factory-witnessed durable row when the
-        // capability was admitted through the closed factory, so the owner
-        // re-proves presented values against retained durable evidence on
-        // every call. A directly constructed capability carries no witnessed
-        // row and still aliases the presented half here (residual: only the
-        // synchronous daemon restore builder still constructs directly);
-        // the fence leg rides the live-fence digest in both cases, never a
-        // presented echo.
-        let witnessed = self.capability.witnessed_row();
-        let loaded = match witnessed {
-            Some(row) => (
-                row.attempt_id(),
-                row.operation_id(),
-                row.binding_digest(),
-                row.executable_digest(),
-                row.worker_generation(),
-            ),
-            None => (
-                presented.attempt_id.as_str(),
-                presented.operation_id.as_str(),
-                presented.binding_digest.as_str(),
-                presented.executable_digest.as_str(),
-                presented.worker_generation,
-            ),
-        };
+        // Loaded legs come only from the factory-witnessed durable row the
+        // closed factory retained at admission, so the owner re-proves
+        // presented values against retained durable evidence on every call.
+        // A directly constructed capability carries no witnessed row and
+        // fails closed here with `StaleProviderBinding` before any owner
+        // check runs (the synchronous daemon restore builder still
+        // constructs directly, so its restore stays blocked at the
+        // construction gate and never reaches this proof); the fence leg
+        // rides the live-fence digest, never a presented echo.
+        let witnessed = self
+            .capability
+            .witnessed_row()
+            .ok_or(CoordinatorError::StaleProviderBinding)?;
         let (
             loaded_attempt_id,
             loaded_operation_id,
             loaded_binding_digest,
             loaded_executable_digest,
             loaded_worker_generation,
-        ) = loaded;
+        ) = (
+            witnessed.attempt_id(),
+            witnessed.operation_id(),
+            witnessed.binding_digest(),
+            witnessed.executable_digest(),
+            witnessed.worker_generation(),
+        );
         let request = ProviderCapabilityRequest {
             claim_id: presented.claim_id.clone(),
             attempt_id: receipt_attempt_id,
