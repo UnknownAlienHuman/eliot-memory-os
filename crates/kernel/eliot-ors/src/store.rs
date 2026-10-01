@@ -90,7 +90,8 @@ use crate::{
     OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
     BlobProcessStreamCallRecord, BlobProcessStreamCallState, BlobProcessStreamGrantRecord,
-    BlobProcessStreamGrantState,
+    BlobProcessStreamGrantState, BlobProcessStreamOwnerFactsPullRecord,
+    BlobProcessStreamOwnerFactsPullState,
     ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
     ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
@@ -162,6 +163,8 @@ const BLOB_PROCESS_STREAM_GRANTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_blob_process_stream_grants_v1");
 const BLOB_PROCESS_STREAM_CALLS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_blob_process_stream_calls_v1");
+const BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_blob_process_stream_owner_facts_pulls_v1");
 const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_authority_handoffs_v1");
 const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
@@ -5774,6 +5777,160 @@ impl RedbRecoveryStore {
                 Ok(record)
             })
             .transpose()
+    }
+
+    /// Durably publishes one exact Kernel-to-daemon owner-facts pull before
+    /// the authenticated daemon poll loop can observe it.
+    pub fn persist_blob_process_stream_owner_facts_pull(
+        &self,
+        pull: &BlobProcessStreamOwnerFactsPullRecord,
+    ) -> Result<BlobProcessStreamOwnerFactsPullRecord, OrsError> {
+        pull.validate()?;
+        if pull.state != BlobProcessStreamOwnerFactsPullState::Pending {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_pull_state",
+                reason: "new owner-facts pull must start pending",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+                .map_err(storage)?;
+            match table.get(pull.pull_ref.as_str()).map_err(storage)? {
+                Some(value) => {
+                    let existing: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+                    existing.validate()?;
+                    if !existing.same_request(pull) {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "blob_process_stream_owner_facts_pull",
+                            reason: "pull reference conflicts with a different exact request".to_owned(),
+                        });
+                    }
+                    existing
+                }
+                None => {
+                    let payload = encode(pull)?;
+                    table
+                        .insert(pull.pull_ref.as_str(), payload.as_str())
+                        .map_err(storage)?;
+                    pull.clone()
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Returns the lexicographically first pending pull for the authenticated
+    /// daemon poll route. Completed pulls are never reissued as fresh work.
+    pub fn next_blob_process_stream_owner_facts_pull(
+        &self,
+    ) -> Result<Option<BlobProcessStreamOwnerFactsPullRecord>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+            .map_err(storage)?;
+        for row in table.iter().map_err(storage)? {
+            let (key, value) = row.map_err(storage)?;
+            let record: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+            record.validate()?;
+            if key.value() != record.pull_ref {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_owner_facts_pull",
+                    reason: "pull reference does not match its table key".to_owned(),
+                });
+            }
+            if record.state == BlobProcessStreamOwnerFactsPullState::Pending {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Loads one durable pull by its opaque correlation reference.
+    pub fn load_blob_process_stream_owner_facts_pull(
+        &self,
+        pull_ref: &str,
+    ) -> Result<Option<BlobProcessStreamOwnerFactsPullRecord>, OrsError> {
+        crate::model::validate_text(pull_ref, "blob_process_stream_pull_ref")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read
+            .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+            .map_err(storage)?;
+        table
+            .get(pull_ref)
+            .map_err(storage)?
+            .map(|value| {
+                let record: BlobProcessStreamOwnerFactsPullRecord = decode(value.value())?;
+                record.validate()?;
+                if record.pull_ref != pull_ref {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_owner_facts_pull",
+                        reason: "pull reference does not match its table key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Completes one pending owner-facts pull with the exact bounded typed
+    /// response JSON. Idempotent same-response acknowledgement is safe.
+    pub fn complete_blob_process_stream_owner_facts_pull(
+        &self,
+        completed: &BlobProcessStreamOwnerFactsPullRecord,
+    ) -> Result<BlobProcessStreamOwnerFactsPullRecord, OrsError> {
+        completed.validate()?;
+        if completed.state != BlobProcessStreamOwnerFactsPullState::Completed {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_pull_state",
+                reason: "owner-facts completion requires completed state",
+            });
+        }
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut table = write
+                .open_table(BLOB_PROCESS_STREAM_OWNER_FACTS_PULLS)
+                .map_err(storage)?;
+            let existing = table
+                .get(completed.pull_ref.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<BlobProcessStreamOwnerFactsPullRecord>(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_owner_facts_pull",
+                    reason: "pull disappeared before owner completion".to_owned(),
+                })?;
+            existing.validate()?;
+            if existing.pull_ref != completed.pull_ref || !existing.same_request(completed) {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_owner_facts_pull",
+                    reason: "completion does not match the exact durable pull".to_owned(),
+                });
+            }
+            let next = match existing.state {
+                BlobProcessStreamOwnerFactsPullState::Pending => completed.clone(),
+                BlobProcessStreamOwnerFactsPullState::Completed if existing == *completed => {
+                    existing
+                }
+                BlobProcessStreamOwnerFactsPullState::Completed => {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_owner_facts_pull",
+                        reason: "completed pull response changed during replay".to_owned(),
+                    });
+                }
+            };
+            if existing != next {
+                let payload = encode(&next)?;
+                table
+                    .insert(completed.pull_ref.as_str(), payload.as_str())
+                    .map_err(storage)?;
+            }
+            next
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
     }
 
     /// Allocates and persists one one-based call token before it is exposed to

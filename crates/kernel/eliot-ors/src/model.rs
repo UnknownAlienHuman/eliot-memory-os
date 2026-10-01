@@ -1262,6 +1262,120 @@ pub enum BlobProcessStreamGrantState {
     Expired,
 }
 
+/// Durable state of one authenticated Kernel-to-daemon Blob facts pull.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamOwnerFactsPullState {
+    Pending,
+    Completed,
+}
+
+/// Correlated owner-facts pull and its bounded proof-reference response.
+///
+/// These rows persist only the closed DTO envelopes and their digests. The
+/// daemon-resolved contexts, leases, source bytes and policy material remain
+/// with their respective owners; only an opaque resolver reference crosses
+/// the pull response.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamOwnerFactsPullRecord {
+    /// ORS record revision.
+    pub contract_version: u16,
+    /// Kernel-generated lookup identity.
+    pub pull_ref: String,
+    /// Durable TestD job identity.
+    pub job_id: String,
+    /// Exact typed request JSON, bounded and digest-bound.
+    pub request_json: String,
+    /// SHA-256 of `request_json`.
+    pub request_sha256: String,
+    /// Pending/completed disposition.
+    pub state: BlobProcessStreamOwnerFactsPullState,
+    /// Exact typed response JSON, populated after daemon owner readback.
+    pub response_json: Option<String>,
+    /// SHA-256 of `response_json`.
+    pub response_sha256: Option<String>,
+}
+
+impl BlobProcessStreamOwnerFactsPullRecord {
+    /// Validates request/response canonical JSON, digest and transition shape.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != BLOB_PROCESS_STREAM_ORS_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        validate_text(&self.pull_ref, "blob_process_stream_pull_ref")?;
+        validate_text(&self.job_id, "blob_process_stream_pull_job")?;
+        validate_digest(&self.request_sha256, "blob_process_stream_pull_request")?;
+        validate_bounded_canonical_json(
+            &self.request_json,
+            MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+            "blob_process_stream_pull_request_json",
+        )?;
+        if sha256_hex(self.request_json.as_bytes()) != self.request_sha256 {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_pull_request_sha256",
+                reason: "request digest does not match exact request JSON",
+            });
+        }
+        match (&self.state, &self.response_json, &self.response_sha256) {
+            (BlobProcessStreamOwnerFactsPullState::Pending, None, None) => {}
+            (BlobProcessStreamOwnerFactsPullState::Completed, Some(response), Some(digest)) => {
+                validate_digest(digest, "blob_process_stream_pull_response")?;
+                validate_bounded_canonical_json(
+                    response,
+                    MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES,
+                    "blob_process_stream_pull_response_json",
+                )?;
+                if sha256_hex(response.as_bytes()) != digest.as_str() {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_pull_response_sha256",
+                        reason: "response digest does not match exact response JSON",
+                    });
+                }
+            }
+            _ => {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_pull_state",
+                    reason: "pending/completed state and response fields disagree",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Tests the immutable correlated request binding.
+    pub fn same_request(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.pull_ref == other.pull_ref
+            && self.job_id == other.job_id
+            && self.request_json == other.request_json
+            && self.request_sha256 == other.request_sha256
+    }
+}
+
+fn validate_bounded_canonical_json(
+    value: &str,
+    max_bytes: usize,
+    field: &'static str,
+) -> Result<(), OrsError> {
+    if value.len() > max_bytes {
+        return Err(OrsError::PayloadTooLarge);
+    }
+    let decoded: Value = serde_json::from_str(value).map_err(|_| OrsError::InvalidField {
+        field,
+        reason: "must be a bounded JSON object",
+    })?;
+    if !matches!(&decoded, Value::Object(_))
+        || serde_json::to_string(&decoded).as_bytes() != value.as_bytes()
+    {
+        return Err(OrsError::InvalidField {
+            field,
+            reason: "must be canonical JSON object bytes",
+        });
+    }
+    Ok(())
+}
+
 /// ORS state for one Kernel-issued one-use process-stream call token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1418,6 +1532,9 @@ impl BlobProcessStreamCallRecord {
 
 /// Current record revision for Kernel Blob process-stream grants and calls.
 pub const BLOB_PROCESS_STREAM_ORS_VERSION: u16 = 1;
+/// Maximum persisted request/response envelope for the small owner-facts
+/// reference exchange. No Blob bytes or resolved owner contexts are retained.
+pub const MAX_BLOB_PROCESS_STREAM_OWNER_FACTS_JSON_BYTES: usize = 64 * 1024;
 /// Maximum serialized Kernel-created Store identity retained in ORS.
 pub const MAX_BLOB_PROCESS_STREAM_IDENTITY_JSON_BYTES: usize = 16 * 1024;
 
