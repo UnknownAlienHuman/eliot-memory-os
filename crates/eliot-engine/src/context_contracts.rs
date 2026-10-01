@@ -114,9 +114,10 @@ pub struct PacketBudgetDecision {
     pub packet_mandatory_floor_tokens: usize,
     pub mandatory_floor_tokens: usize,
     pub effective_tokens: usize,
-    /// Compatibility projection of the canonical unvalidated STU planning estimate.
-    /// This is not an observed token count and never proves route fit.
-    #[serde(with = "eliot_types::cognition::legacy_unvalidated_stu_projection")]
+    /// Legacy numeric planning projection of the packet budget plus the named
+    /// supplement and return-metadata allowances. The exact whole-packet STU
+    /// measurement is retained separately in `stu_estimate`; neither value is
+    /// an observed tokenizer count or proof of route fit.
     pub estimated_tokens: usize,
     /// Exact final packet UTF-8 byte length, bound to the serializer profile
     /// and content digest below. This compiler has no route/model input, so it
@@ -173,9 +174,18 @@ impl PacketBudgetDecision {
             MAX_MEASUREMENT_BYTES,
         )?;
         let stu = stu_for_bytes(envelope.byte_len)?;
-        if self.stu_estimate.value != stu
-            || usize::try_from(stu).ok() != Some(self.estimated_tokens)
-        {
+        // Read the original owner projection from the exact validated packet
+        // bytes. Supplements and return metadata are separate planning costs,
+        // not a claim that separately rounded parts measure the whole envelope.
+        let packet: eliot_types::ContextPacketL3 = serde_json::from_slice(serialized)
+            .map_err(|_| ContextError::IdentityConflict)?;
+        let legacy_total = packet
+            .token_budget_report
+            .estimated_tokens
+            .checked_add(self.supplement_tokens)
+            .and_then(|value| value.checked_add(self.budget_metadata_tokens))
+            .ok_or(ContextError::Overflow)?;
+        if self.stu_estimate.value != stu || self.estimated_tokens != legacy_total {
             return Err(ContextError::IdentityConflict);
         }
         Ok(())
