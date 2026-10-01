@@ -52,6 +52,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eliot_cli::kernel_client::{KernelClient, KernelClientError};
+use eliot_blob_api::wire::{
+    BlobProcessStreamCallToken, BlobProcessStreamFrameRequest,
+    BlobProcessStreamKernelRequest, BlobProcessStreamKernelResponse,
+    ProcessStreamSinkCapabilityRef,
+};
 use eliot_contracts::{EpochId, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{InstrumentInvocation, InstrumentKind};
 use eliot_process::{ProcessEvidenceSink, ProcessExecutionError, ProcessExecutor, ProcessRequest};
@@ -649,6 +654,39 @@ impl KernelTestdIpcClient {
     #[must_use]
     pub fn live_epoch(&self) -> Option<&EpochId> {
         self.live_epoch.as_ref()
+    }
+
+    /// Exchanges one exact closed Blob stream operation through the
+    /// authenticated TestD→Kernel capability path. The opaque capability and
+    /// single-use token are the only authority-bearing inputs; TestD never
+    /// creates a RequestIdentity or retries an unknown transport result.
+    pub fn blob_process_stream_exchange(
+        &mut self,
+        capability: ProcessStreamSinkCapabilityRef,
+        call_token: BlobProcessStreamCallToken,
+        operation: BlobProcessStreamFrameRequest,
+        job_id: &str,
+    ) -> Result<BlobProcessStreamKernelResponse, TestdIpcError> {
+        let request = BlobProcessStreamKernelRequest::new(capability, call_token, operation)
+            .map_err(|error| TestdIpcError::Contract(error.to_string()))?;
+        let op_digest = request.operation_sha256.clone();
+        let response = self
+            .client
+            .blob_process_stream_exchange(request.clone())
+            .map_err(|error| match error {
+                KernelClientError::UnknownOutcome(_) => TestdIpcError::UnknownOutcome {
+                    job_id: job_id.to_owned(),
+                    request_digest: op_digest.clone(),
+                },
+                other => TestdIpcError::Transport(other.to_string()),
+            })?;
+        response
+            .validate_for_request(&request)
+            .map_err(|_| TestdIpcError::UnknownOutcome {
+                job_id: job_id.to_owned(),
+                request_digest: op_digest,
+            })?;
+        Ok(response)
     }
 
     /// Sends the immutable terminal receipt reference through the existing
