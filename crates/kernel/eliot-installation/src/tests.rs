@@ -1588,6 +1588,14 @@ fn installer_plan_parts(
                     static_template, ..
                 } => static_template.authority_id.clone(),
                 InstallerEffectPlan::StagePackage { staging_root, .. } => staging_root.clone(),
+                // No branch of this fixture plans the current-user supervision
+                // authority effect: the `SystemService` arm below has no
+                // `UserMode` counterpart, and no profile reaches this arm with
+                // a `UserModeSupervisionAuthorityProvisionPlan` in hand. Refuse
+                // rather than invent a `PlannedChange` target for an effect
+                // this fixture cannot plan.
+                InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } =>
+                    panic!("fixture must not plan a UserMode supervision authority effect"),
             },
             precondition_refs: vec![test_handle("evidence:installer-precondition")],
             postcondition_refs: vec![test_handle("evidence:installer-postcondition")],
@@ -2020,6 +2028,13 @@ fn system_registration_transaction() -> InstallationTransaction {
             InstallerEffectPlan::CreateRoot { .. }
             | InstallerEffectPlan::ApplyAcl { .. }
             | InstallerEffectPlan::StagePackage { .. } => {}
+            // This loop rebinds the manifest-derived Host image onto the
+            // effects that carry one, and the current-user authority plan
+            // carries none. `installer_plan_parts` never plans that effect, so
+            // meeting it here would mean the fixture changed shape underneath
+            // this loop; refuse instead of silently skipping the rebinding.
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } =>
+                panic!("Host-image rebinding must not meet a UserMode authority effect"),
         }
     }
     let mut ordered_effects = installer_effects
@@ -2362,6 +2377,13 @@ fn fully_applied_system_registration_transaction() -> InstallationTransaction {
             }
             InstallerEffectPlan::RegisterService { .. }
             | InstallerEffectPlan::StagePackage { .. } => {}
+            // This loop marks every effect `Applied` so the fixture reaches the
+            // fully-applied projection. `installer_plan_parts` never plans the
+            // current-user authority effect, so no credential receipt exists to
+            // bind here; refuse rather than leave such an effect silently
+            // un-applied if the fixture ever starts planning one.
+            InstallerEffectPlan::ProvisionUserModeSupervisionAuthority { .. } =>
+                panic!("fully-applied fixture must not meet a UserMode authority effect"),
             InstallerEffectPlan::MaterializePhaseB { .. } => {
                 let change = transaction
                     .planned_changes
@@ -3951,6 +3973,13 @@ fn service_context_binds_same_host_root_for_host_and_watchdog_argv() {
             ownership_secret: None,
             store_credential: None,
             staging_receipt: None,
+            // A `RegisterService` effect writes no current-user supervision
+            // key, and this precondition is built by `new(..)`, which carries
+            // no `user_mode_authority_snapshot`. The request validator's
+            // `(_, _, None, None)` arm is the only one this shape can take, so
+            // `None` is the admitted value rather than a stand-in for an
+            // unbuilt one.
+            user_mode_authority_receipt: None,
             action: InstallationEffectAction::Apply,
             expected_external_identity: None,
             service_bootstrap: Some(InstallationServiceBootstrap {
@@ -9557,6 +9586,11 @@ fn package_precondition_snapshot_is_required_for_post_intent_stage_package() {
         ownership_secret: None,
         store_credential: None,
         staging_receipt: None,
+        // `InstallationEffectPrecondition::from_change` carries no
+        // `user_mode_authority_snapshot`, and this request plans a
+        // `StagePackage` effect, which performs no current-user supervision key
+        // write. The validator admits exactly `(_, _, None, None)` here.
+        user_mode_authority_receipt: None,
         action: InstallationEffectAction::Apply,
         expected_external_identity: None,
         service_bootstrap: None,
@@ -9618,6 +9652,26 @@ fn package_binding_validates_candidate_and_package_digests_independently() {
         generation: transaction.candidate_manifest.generation.clone(),
         manifest: package_manifest.clone(),
         staging_root: transaction.staging_root.clone(),
+        // Production seals the candidate's selected immutable-binaries root
+        // here: the planner derives `destination_root` from
+        // `profile_resolution.roots.immutable_binaries`, and
+        // `validate_package_binding` compares it against
+        // `candidate_manifest.runtime_launch.profile_governed_roots
+        // .immutable_binaries`, which is the same value because the planner
+        // installs `profile_resolution.roots` as the candidate's `profile_governed_roots`.
+        // It is read off the fixture's own candidate rather than restated, so
+        // this stays true for every profile. `None` is not available here: the
+        // fallback branch would demand that `staging_root` joined with the
+        // package generation equals the immutable-binaries root, which this
+        // fixture's staging root does not, and the binding would be refused.
+        destination_root: Some(test_handle(
+            transaction
+                .candidate_manifest
+                .runtime_launch
+                .profile_governed_roots
+                .immutable_binaries
+                .clone(),
+        )),
         expected_file_digests: Vec::new(),
         candidate_manifest_digest: must(candidate_manifest_digest(&transaction.candidate_manifest)),
         package_manifest_digest: must(PlatformHandle::new(package_manifest.canonical_digest())),
