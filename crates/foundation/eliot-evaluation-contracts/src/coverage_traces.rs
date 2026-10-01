@@ -224,6 +224,72 @@ pub struct ObservationCoverageManifest {
     pub invalidation_dependencies: Vec<String>,
 }
 
+struct ProjectedChannelCoverage {
+    expected: Vec<String>,
+    streams: Vec<StreamCursorRange>,
+    blind_intervals: Vec<CoverageBlindInterval>,
+    missing_sources: Vec<String>,
+    material: Vec<MaterialActionCoverage>,
+}
+
+fn project_channel_coverage(
+    binding: &InstallationCoverageBinding,
+    channels: &[InstallationChannelCoverage],
+) -> ProjectedChannelCoverage {
+    let mut projected = ProjectedChannelCoverage {
+        expected: Vec::new(),
+        streams: Vec::new(),
+        blind_intervals: Vec::new(),
+        missing_sources: Vec::new(),
+        material: Vec::new(),
+    };
+    for channel in channels {
+        let stream = format!("watchdog:{}", channel.channel);
+        for class in &channel.expected_classes {
+            projected
+                .expected
+                .push(format!("watchdog:{}:{class}", channel.channel));
+        }
+        projected.streams.push(StreamCursorRange {
+            stream: stream.clone(),
+            first_expected_cursor: binding.interval_start_ms,
+            last_expected_cursor: binding.interval_end_ms,
+        });
+        let covered = channel.disposition.as_str() == "CONTINUOUS";
+        if !covered {
+            projected.blind_intervals.push(CoverageBlindInterval {
+                stream: stream.clone(),
+                first_missing_cursor: binding.interval_start_ms,
+                last_missing_cursor: binding.interval_end_ms,
+                reason: format!("{}:{}", channel.channel, channel.gap_reasons.join(";")),
+            });
+            if channel.disposition.as_str() == "BLIND" {
+                projected.missing_sources.push(format!(
+                    "{}:{}",
+                    channel.channel,
+                    channel.gap_reasons.join(";")
+                ));
+            }
+        }
+        projected.material.push(MaterialActionCoverage {
+            action_or_effect_route: stream,
+            covered,
+            detail: format!(
+                "source {}; expected [{}]; observed [{}]; disposition {}; dropped {}; sensor_map {}; interval {}..={}",
+                channel.expected_source,
+                channel.expected_classes.join(","),
+                channel.observed_classes.join(","),
+                channel.disposition,
+                channel.dropped_samples,
+                binding.sensor_map_revision,
+                binding.interval_start_ms,
+                binding.interval_end_ms,
+            ),
+        });
+    }
+    projected
+}
+
 impl ObservationCoverageManifest {
     /// Validates the denominator shape. A `COMPLETE` denominator carries no
     /// blind intervals; anything else stays `PARTIAL`, `UNKNOWN`, or
@@ -408,6 +474,398 @@ impl ObservationCoverageManifest {
         self.expected_event_sources_and_event_classes
             .iter()
             .any(|entry| entry == source_class)
+    }
+
+    /// Joins one Watchdog interval-coverage report into this manifest owner
+    /// without changing ownership (issue #1755 W6, I8.2).
+    ///
+    /// The Watchdog spool owns the per-channel interval report and the
+    /// operational cursor/high-water state, which stay where they are: the
+    /// export caller maps its record 1:1 into the owner-neutral
+    /// [`InstallationChannelCoverage`] inputs and calls this constructor, so
+    /// this crate gains no dependency edge on the Watchdog owner. Every
+    /// carried field has an explicit image below; nothing is invented:
+    ///
+    /// ```text
+    /// channel              -> stream `watchdog:<channel>`, material route
+    ///                         `watchdog:<channel>`, and the qualifier of
+    ///                         every expected-class, blind-reason and detail
+    ///                         string, so no two channels share an image;
+    /// expected source/classes -> `expected_event_sources_and_event_classes`
+    ///                         as `watchdog:<channel>:<class>`, plus the
+    ///                         material-route detail;
+    /// observed live classes  -> the material-route detail (a live sample of
+    ///                         an absent subject stays CONTINUOUS coverage of
+    ///                         a bad health result; health itself is not
+    ///                         carried here);
+    /// dropped samples       -> `sequence_faults.gaps` and the channel's
+    ///                         `SAMPLE_DROPPED` blind entry, never silence;
+    /// unclosed interval     -> `UNKNOWN` with an `INTERVAL_NOT_CLOSED`
+    ///                         blind entry on every wired channel;
+    /// gap reasons           -> one `CoverageBlindInterval` per
+    ///                         non-`CONTINUOUS` channel over that channel's
+    ///                         own declared window, plus a
+    ///                         `missing_source_reasons` entry per `BLIND`
+    ///                         channel;
+    /// sensor map revision   -> the attempt id, the sampling policy and the
+    ///                         invalidation dependencies;
+    /// installation identity -> the fingerprint product id and the
+    ///                         invalidation dependencies.
+    /// ```
+    ///
+    /// The fingerprint is installation-scoped by versioned convention, not by
+    /// inventing a session: product id is the owner-issued installation
+    /// identity, session id is [`INSTALLATION_COVERAGE_SESSION_ID`], the
+    /// attempt id pins the binding version, sensor map revision and declared
+    /// window, and the route fingerprint is [`INSTALLATION_COVERAGE_ROUTE`]
+    /// at the binding version. Cursor ranges are the declared owner-clock
+    /// window per channel stream: installation sensors have no journal
+    /// cursor, so the window itself is the declared interval and a blind
+    /// entry marks the channel window it names. Denominator completeness is
+    /// derived, never chosen: all-`CONTINUOUS` yields `COMPLETE`, an
+    /// all-`UNKNOWN` report yields `UNKNOWN`, anything else yields `PARTIAL`.
+    /// A `COMPLETE` result therefore always validates gap-free, and any gap,
+    /// drop, or unclassified channel blocks it through typed validation,
+    /// not through caller discipline.
+    ///
+    /// Export acknowledgement semantics stay with the spool/export owner:
+    /// this constructor only builds the denominator. A retained manifest is
+    /// evidence, not resolution, and losing the daemon never discards the
+    /// independently retained spool report this manifest was joined from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationContractError`] when the binding or any channel
+    /// input is malformed, when two channels share a name, when a record
+    /// contradicts itself (replayed observations without a replay adapter,
+    /// a non-continuous record naming no gap, a continuous record carrying
+    /// gaps or drops, samples outside the expected classes, or an unclosed
+    /// interval claiming a decided disposition), or when the joined
+    /// denominator does not validate.
+    pub fn for_installation_interval(
+        binding: &InstallationCoverageBinding,
+        channels: &[InstallationChannelCoverage],
+    ) -> Result<Self, EvaluationContractError> {
+        binding.validate()?;
+        if channels.is_empty() {
+            return Err(EvaluationContractError::EmptyCollection {
+                field: "installation_coverage.channels",
+            });
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for channel in channels {
+                channel.validate()?;
+                if !seen.insert(channel.channel.as_str()) {
+                    return Err(EvaluationContractError::DuplicateIdentity {
+                        field: "installation_coverage.channels",
+                    });
+                }
+            }
+        }
+        let mut continuous = 0_u64;
+        let mut unknown = 0_u64;
+        let mut dropped_total = 0_u64;
+        for channel in channels {
+            match channel.disposition.as_str() {
+                "CONTINUOUS" => continuous += 1,
+                "UNKNOWN" => unknown += 1,
+                _ => {}
+            }
+            dropped_total = dropped_total
+                .checked_add(u64::from(channel.dropped_samples))
+                .ok_or(EvaluationContractError::EvidenceState {
+                    field: "installation_coverage.dropped_samples",
+                    reason: "dropped-sample counters overflow",
+                })?;
+        }
+        let received = channels.len() as u64;
+        let completeness = if continuous == received {
+            CoverageCompleteness::Complete
+        } else if unknown == received {
+            CoverageCompleteness::Unknown
+        } else {
+            CoverageCompleteness::Partial
+        };
+        let projected = project_channel_coverage(binding, channels);
+        let manifest = Self {
+            fingerprint: RunFingerprint {
+                product_id: binding.installation_id.clone(),
+                session_id: INSTALLATION_COVERAGE_SESSION_ID.to_owned(),
+                attempt_id: format!(
+                    "v{}-sensormap{}-{}..={}",
+                    binding.binding_version,
+                    binding.sensor_map_revision,
+                    binding.interval_start_ms,
+                    binding.interval_end_ms,
+                ),
+                route_fingerprint: format!(
+                    "{}:v{}",
+                    INSTALLATION_COVERAGE_ROUTE, binding.binding_version
+                ),
+            },
+            allowed_manifest_digest: binding.allowed_manifest_digest.clone(),
+            expected_event_sources_and_event_classes: projected.expected.clone(),
+            observable_actions: projected.expected,
+            unobservable_actions: Vec::new(),
+            first_and_last_expected_cursors_by_stream: projected.streams,
+            counts: EventCounts {
+                received,
+                applied: continuous,
+                rejected: 0,
+                unknown: received - continuous,
+            },
+            sequence_faults: SequenceFaults {
+                gaps: dropped_total,
+                duplicates: 0,
+                reorders: 0,
+                payload_mutations: 0,
+            },
+            blind_intervals_and_missing_source_reasons: projected.blind_intervals,
+            missing_source_reasons: projected.missing_sources,
+            coverage_by_material_action_and_effect_route: projected.material,
+            denominator_origin_and_sampling_policy: DenominatorOrigin {
+                origin: INSTALLATION_COVERAGE_ORIGIN.to_owned(),
+                sampling_policy: format!(
+                    "one-tick-window sensor_map_revision {}",
+                    binding.sensor_map_revision
+                ),
+            },
+            completeness,
+            proof_ceiling: ProofCeiling::Observation,
+            invalidation_dependencies: vec![
+                format!("installation:{}", binding.installation_id),
+                format!("sensor-map:{}", binding.sensor_map_revision),
+                format!(
+                    "interval:{}..={}",
+                    binding.interval_start_ms, binding.interval_end_ms
+                ),
+            ],
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+}
+
+/// Version of the installation-level coverage binding declared below.
+///
+/// I8.2 Watchdog sensors observe an installation, not a product
+/// session/attempt/route: there is no session to name. This version pins the
+/// exact convention
+/// [`ObservationCoverageManifest::for_installation_interval`] uses to bind
+/// one installation window into a manifest fingerprint, so a future
+/// convention change bumps this constant instead of silently reinterpreting
+/// stored fields. Version 1 covers the four dispositions the Watchdog
+/// interval publisher can produce (`CONTINUOUS`, `PARTIAL`, `BLIND`,
+/// `UNKNOWN`); `JOURNAL_REPLAYED` needs the W3 journal-replay adapter and
+/// arrives with a binding-version bump, never as an unversioned spelling
+/// inside version 1.
+pub const INSTALLATION_COVERAGE_BINDING_VERSION: u32 = 1;
+
+/// Fixed session-scope literal for installation-level coverage.
+///
+/// The manifest fingerprint requires a nonempty session id, but an
+/// installation sensor has no session. This literal marks the fingerprint as
+/// installation-scoped instead of inventing a session; see
+/// [`INSTALLATION_COVERAGE_BINDING_VERSION`].
+pub const INSTALLATION_COVERAGE_SESSION_ID: &str = "installation";
+
+/// Fixed route literal for Watchdog interval coverage (issue #1755, I8.2).
+pub const INSTALLATION_COVERAGE_ROUTE: &str = "watchdog-interval-coverage";
+
+/// Denominator origin carried by installation-interval manifests.
+pub const INSTALLATION_COVERAGE_ORIGIN: &str = "watchdog-spool:interval-coverage";
+
+/// Installation-level binding for one Watchdog interval-coverage window.
+///
+/// The Watchdog spool owns the interval report and the operational
+/// cursor/high-water state; this struct only binds the identities the join
+/// needs: the owner-issued installation identity, the caller-resolved allowed
+/// Tool/Facet manifest digest the bound evidence must reference, the sensor
+/// map revision the dispositions were derived under, and the declared
+/// owner-clock window. `binding_version` must equal
+/// [`INSTALLATION_COVERAGE_BINDING_VERSION`].
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationCoverageBinding {
+    /// Owner-issued installation identity the sensors observed.
+    pub installation_id: String,
+    /// Caller-resolved allowed Tool/Facet manifest digest bound into the
+    /// joined denominator.
+    pub allowed_manifest_digest: String,
+    /// Sensor map revision the interval dispositions were derived under.
+    pub sensor_map_revision: u16,
+    /// Owner-clock start of the declared interval, in milliseconds.
+    pub interval_start_ms: u64,
+    /// Owner-clock end of the declared interval, in milliseconds.
+    pub interval_end_ms: u64,
+    /// Binding convention version; must be
+    /// [`INSTALLATION_COVERAGE_BINDING_VERSION`].
+    pub binding_version: u32,
+}
+
+impl InstallationCoverageBinding {
+    /// Validates the installation binding: both identities are non-blank,
+    /// the version is current, and the window is ordered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationContractError`] when an identity is blank, the
+    /// version is not the current binding version, or the window end
+    /// precedes its start.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(
+            &self.installation_id,
+            "installation_binding.installation_id",
+        )?;
+        text(
+            &self.allowed_manifest_digest,
+            "installation_binding.allowed_manifest_digest",
+        )?;
+        if self.binding_version != INSTALLATION_COVERAGE_BINDING_VERSION {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "installation_binding.binding_version",
+                reason: "installation coverage binding version is not the current version",
+            });
+        }
+        if self.interval_end_ms < self.interval_start_ms {
+            return Err(EvaluationContractError::InvalidInterval {
+                field: "installation_binding.interval_start/end_ms",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One Watchdog channel's interval coverage in owner-neutral form.
+///
+/// This mirrors the spool owner's per-channel record field for field —
+/// channel, competent source, expected classes, observed live classes,
+/// replayed count (always zero until the W3 replay adapter lands),
+/// dropped-sample count, whether the opening tick reached its close, the I8.2
+/// wire disposition, and the named gap reasons — without importing the spool
+/// owner, so the manifest owner gains no new dependency edge. The Watchdog
+/// export caller maps its record 1:1 into this struct; see
+/// [`ObservationCoverageManifest::for_installation_interval`] for the
+/// lossless image of each field.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationChannelCoverage {
+    /// I8.2 channel name as the spool owner reports it.
+    pub channel: String,
+    /// Competent source I8.2 expects to cover this channel.
+    pub expected_source: String,
+    /// Observation classes the expected source must support here.
+    pub expected_classes: Vec<String>,
+    /// Classes actually observed live in this interval.
+    pub observed_classes: Vec<String>,
+    /// Portions of the interval covered by journal replay; refused above
+    /// zero until the replay adapter exists.
+    pub observed_replayed_observations: u32,
+    /// Live samples offered for this channel and then dropped.
+    pub dropped_samples: u32,
+    /// False for a window a tick opened and did not finish: only `UNKNOWN`
+    /// may be claimed for it.
+    pub interval_closed: bool,
+    /// I8.2 wire disposition: `CONTINUOUS`, `PARTIAL`, `BLIND` or `UNKNOWN`.
+    pub disposition: String,
+    /// Named omission reasons keeping this channel short of full coverage.
+    pub gap_reasons: Vec<String>,
+}
+
+impl InstallationChannelCoverage {
+    /// Validates one channel record: identities are non-blank, the
+    /// disposition names a version-1 value, every observed class was
+    /// expected exactly once, and the record is internally consistent (no
+    /// replay claim, no gapless non-continuous record, no gapped or dropped
+    /// continuous record, no decided disposition over an unclosed window).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvaluationContractError`] when any of those checks fails.
+    /// `JOURNAL_REPLAYED` is refused typed: nothing in this binding version
+    /// can produce it.
+    pub fn validate(&self) -> Result<(), EvaluationContractError> {
+        text(&self.channel, "installation_channel.channel")?;
+        text(
+            &self.expected_source,
+            "installation_channel.expected_source",
+        )?;
+        text(&self.disposition, "installation_channel.disposition")?;
+        match self.disposition.as_str() {
+            "CONTINUOUS" | "PARTIAL" | "BLIND" | "UNKNOWN" => {}
+            _ => {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "installation_channel.disposition",
+                    reason: "unknown I8.2 disposition; version 1 binds CONTINUOUS, PARTIAL, BLIND and UNKNOWN only",
+                });
+            }
+        }
+        if self.expected_classes.is_empty() {
+            return Err(EvaluationContractError::EmptyCollection {
+                field: "installation_channel.expected_classes",
+            });
+        }
+        unique_texts(
+            &self.expected_classes,
+            "installation_channel.expected_classes",
+        )?;
+        unique_texts(
+            &self.observed_classes,
+            "installation_channel.observed_classes",
+        )?;
+        for class in &self.observed_classes {
+            text(class, "installation_channel.observed_classes")?;
+            if !self.expected_classes.contains(class) {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "installation_channel.observed_classes",
+                    reason: "observed class was not expected for this channel",
+                });
+            }
+        }
+        unique_texts(&self.gap_reasons, "installation_channel.gap_reasons")?;
+        for reason in &self.gap_reasons {
+            text(reason, "installation_channel.gap_reasons")?;
+        }
+        if self.observed_replayed_observations > 0 {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "installation_channel.observed_replayed_observations",
+                reason: "replayed observations need the journal-replay adapter",
+            });
+        }
+        let continuous = self.disposition.as_str() == "CONTINUOUS";
+        if continuous {
+            if !self.gap_reasons.is_empty() {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "installation_channel.gap_reasons",
+                    reason: "continuous channel cannot carry gap reasons",
+                });
+            }
+            if self.dropped_samples > 0 {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "installation_channel.dropped_samples",
+                    reason: "continuous channel cannot carry dropped samples",
+                });
+            }
+            if self.observed_classes.is_empty() {
+                return Err(EvaluationContractError::EvidenceState {
+                    field: "installation_channel.observed_classes",
+                    reason: "continuous channel needs an observed class",
+                });
+            }
+        } else if self.gap_reasons.is_empty() {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "installation_channel.gap_reasons",
+                reason: "non-continuous channel must name its gap",
+            });
+        }
+        if !self.interval_closed && self.disposition.as_str() != "UNKNOWN" {
+            return Err(EvaluationContractError::EvidenceState {
+                field: "installation_channel.interval_closed",
+                reason: "unclosed interval cannot carry a decided disposition",
+            });
+        }
+        Ok(())
     }
 }
 
