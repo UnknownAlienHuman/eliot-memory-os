@@ -724,6 +724,21 @@ impl KernelComposition {
             .ors
             .load_host_request(&operation_id, &envelope.envelope_sha256)
             .map_err(|_| TransportError::SessionFenced)?;
+        // An exact completed Finish invocation may be presented after its
+        // deadline solely to enter the asynchronous canonical-receipt
+        // readback path. This is a read-only exception: only the existing
+        // digest-bound terminal row qualifies, and the route below still
+        // refuses to serve its body without a current owner tuple and actual
+        // committed Store receipt.
+        let completed_finish_replay = expired
+            && envelope.kind == HostRequestKind::Invocation
+            && envelope.identity.capability == "eliot.finish"
+            && existing.as_ref().is_some_and(|record| {
+                record.state == HostRequestState::ResultReceived
+                    && record.result_digest.is_some()
+                    && record.result_response.is_some()
+                    && record.same_binding(&requested)
+            });
         // Exact replay of an admitted or terminal operation remains an
         // observation path. A fresh or still-Requested Invocation can still
         // grant authority, so reject it before service admission and before
@@ -758,7 +773,7 @@ impl KernelComposition {
         // already have produced effects stay under their owner's
         // reconciliation rules because the transition table forbids expiring
         // them blindly.
-        if expired {
+        if expired && !completed_finish_replay {
             if !stored.state.is_terminal() {
                 match self.generation_gateway.ors.advance_host_request(
                     &operation_id,
@@ -6479,6 +6494,59 @@ impl KernelComposition {
         payload: &serde_json::Value,
         protocol_version: eliot_protocol::ProtocolVersion,
     ) -> Result<KernelFrameAction, TransportError> {
+        if operation == AGENT_HOST_REQUEST_INVOKE_READ_OPERATION
+            && envelope.identity.capability == "eliot.finish"
+        {
+            let tool = match host_request_tool_from_payload(payload) {
+                Ok(tool) => tool,
+                Err(error) => {
+                    let value = self.host_request_failure_value(
+                        operation,
+                        envelope,
+                        protocol_version,
+                        error,
+                    )?;
+                    return Self::host_request_correlated_reply(
+                        session,
+                        request_id,
+                        protocol_version,
+                        value,
+                    );
+                }
+            };
+            let (admission_receipt, record) = match self.invoke_read_host_request(envelope, &tool) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    let value = self.host_request_failure_value(
+                        operation,
+                        envelope,
+                        protocol_version,
+                        error,
+                    )?;
+                    return Self::host_request_correlated_reply(
+                        session,
+                        request_id,
+                        protocol_version,
+                        value,
+                    );
+                }
+            };
+            if record.state == HostRequestState::ResultReceived {
+                if record.result_digest.is_none() || record.result_response.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return Ok(KernelFrameAction::FinishReplay {
+                    request_id,
+                    protocol_version,
+                    envelope: envelope.clone(),
+                    tool,
+                    admission_receipt,
+                    record,
+                });
+            }
+            let value = host_request_admitted_response(&admission_receipt, &record);
+            return Self::host_request_correlated_reply(session, request_id, protocol_version, value);
+        }
         let outcome = (|| -> Result<serde_json::Value, TransportError> {
             Ok(match operation {
                 AGENT_HOST_REQUEST_SUBMIT_OPERATION => {
