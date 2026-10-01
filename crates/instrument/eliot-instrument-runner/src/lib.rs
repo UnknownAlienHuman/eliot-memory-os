@@ -25,6 +25,7 @@ mod dev_fast;
 pub mod package_disposition;
 pub mod process_owner;
 pub mod profile;
+pub mod profile_replay;
 pub mod profile_run;
 pub mod provider_denominator;
 pub mod registry;
@@ -89,6 +90,9 @@ pub use profile_run::{
     StageIdentity, StageLauncher, StageOrchestrator, StagePlan, StageTargetLayout,
     TestExecutionPlaneRoute, TestdPlaneAdmission, compose_provider_dispatch,
 };
+pub use profile_replay::{
+    ProfileReplayError, ProfileReplayReceipt, replay_profile_stream,
+};
 pub use provider_denominator::{
     ADVERTISED_INSTRUMENTS, AvailabilityInputs, ConformanceCase, ConformanceCorpus,
     ConformanceError, DENOMINATOR_CONTRACT, DENOMINATOR_CONTRACT_VERSION, ProviderAvailability,
@@ -97,9 +101,10 @@ pub use provider_denominator::{
     disposition_for_parts, host_platform,
 };
 pub use registry::{
-    ATTESTED_IDENTITY_SLOTS, ExecutableIdentityCause, IdentitySlot, PROFILE_IDENTITY_SLOTS,
-    ProfileIdentities, ProfileIdentityParams, ProviderRegistry, REQUIRED_IDENTITY_SLOTS,
-    RegistryEntry, RegistryError, ResolvedExecutableIdentity, SupplyChainReceipt, SupplyChainTable,
+    ATTESTED_IDENTITY_SLOTS, ExecutableIdentityCause, IdentitySlot, InvalidationSet,
+    PROFILE_IDENTITY_SLOTS, ProfileIdentities, ProfileIdentityParams, ProviderRegistry,
+    RegistryEntry, RegistryError, RegistryFreshness, ResolvedExecutableIdentity,
+    SupplyChainReceipt, SupplyChainTable, REQUIRED_IDENTITY_SLOTS,
 };
 pub use testd_port::{
     OmissionReason, RawEvidence, TestdAdmission, TestdAdmissionPort, TestdPortError,
