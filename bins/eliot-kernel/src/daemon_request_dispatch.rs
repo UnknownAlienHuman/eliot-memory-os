@@ -3611,7 +3611,9 @@ impl KernelComposition {
                     }
                     Self::validate_activation_submitter(session, request_identity)?;
                     let decision_bytes = serde_json::to_vec(
-                        object.get("decision").ok_or(TransportError::SessionFenced)?,
+                        object
+                            .get("decision")
+                            .ok_or(TransportError::SessionFenced)?,
                     )
                     .map_err(|_| TransportError::SessionFenced)?;
                     let artifact =
