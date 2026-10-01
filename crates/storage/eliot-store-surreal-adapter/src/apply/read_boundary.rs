@@ -394,6 +394,9 @@ async fn named_read_payload(
         NamedReadOperation::GetBlackboardItem => {
             blackboard_item_payload(db, &adapter.config, query, state_fence).await
         }
+        NamedReadOperation::GetMailboxMessage => {
+            mailbox_message_payload(db, &adapter.config, query, state_fence).await
+        }
         NamedReadOperation::GetLearningRecordRange => {
             learning_record_range_payload(db, &adapter.config, query, state_fence).await
         }
@@ -444,6 +447,8 @@ async fn cognitive_authority_payload(
 }
 
 const READ_BLACKBOARD_ITEM_HEAD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $blackboard_namespace AND key = $blackboard_key LIMIT 1;";
+
+const READ_MAILBOX_MESSAGE_HEAD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $mailbox_namespace AND key = $mailbox_key LIMIT 1;";
 
 const READ_TASK_CONTRACT_ACCEPTANCE_RECORD: &str = "SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision, schema: schema, payload: payload, value_digest: value_digest } FROM recovery_owner WHERE namespace = $acceptance_namespace AND key = $acceptance_key LIMIT 1;";
 
@@ -601,6 +606,67 @@ async fn blackboard_item_payload(
     if record.task_id.to_string() != task_id
         || record.item_id != item_id
         || record.revision != head.revision
+        || record.state_fence != *state_fence
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    to_value(&record)
+}
+
+/// Reads the exact admitted mailbox message from its durable identity row.
+/// The referenced message is returned as a typed Store payload; delivery
+/// order over one recipient/task pair stays with the admitted stream head
+/// and is never recomputed here.
+///
+/// Mirrors [`blackboard_item_payload`]: the row is addressed by the W1c
+/// identity key alone (no new key design), an absent row reads as
+/// `Value::Null` so the typed decoder above the read decides refusal, and
+/// every retained agreement failure (fence, namespace/key, schema, sequence,
+/// digest, record binding) refuses with the same typed errors.
+async fn mailbox_message_payload(
+    db: &client::RpcTransport,
+    config: &SurrealAdapterConfig,
+    query: &NamedReadRequest,
+    state_fence: &StateFence,
+) -> Result<Value, AdapterError> {
+    let message_id = query
+        .parameters
+        .get("message_id")
+        .and_then(Value::as_str)
+        .ok_or(StoreError::ManifestMismatch)?;
+    let identity_key = crate::surreal_mailbox::item_identity_key(message_id)?;
+    let mut bindings = Map::new();
+    bindings.insert("mailbox_namespace".to_owned(), json!(identity_key.namespace));
+    bindings.insert("mailbox_key".to_owned(), json!(identity_key.key));
+    let mut response = client::query(
+        db,
+        config,
+        "read.mailbox_message",
+        READ_MAILBOX_MESSAGE_HEAD,
+        bindings,
+    )
+    .await?;
+    let rows = take_vec::<eliot_store_api::RecoveryRecord>(&mut response, 0)?;
+    let Some(head) = rows.first() else {
+        return Ok(Value::Null);
+    };
+    if head.state_fence != *state_fence {
+        return Err(AdapterError::Store(StoreError::FenceMismatch));
+    }
+    if head.namespace != identity_key.namespace
+        || head.key != identity_key.key
+        || head.schema != eliot_store_api::MAILBOX_ITEM_SCHEMA_V1
+        || head.revision == 0
+        || head.revision > i64::MAX as u64
+        || eliot_store_api::sha256_hex(&head.payload) != head.value_digest
+    {
+        return Err(AdapterError::Store(StoreError::InvalidReceipt));
+    }
+    let record: eliot_store_api::MailboxItemRecord = serde_json::from_slice(&head.payload)
+        .map_err(|error| AdapterError::Serialization(error.to_string()))?;
+    record.validate().map_err(AdapterError::Store)?;
+    if record.message_id != message_id
+        || record.sequence != head.revision
         || record.state_fence != *state_fence
     {
         return Err(AdapterError::Store(StoreError::InvalidReceipt));

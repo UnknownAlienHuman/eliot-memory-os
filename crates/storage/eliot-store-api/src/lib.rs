@@ -3797,6 +3797,9 @@ pub enum NamedReadOperation {
     GetAgentFeedbackRange,
     /// Exact, fenced lookup of one immutable blackboard candidate revision.
     GetBlackboardItem,
+    /// Exact, fenced lookup of one immutable admitted mailbox message
+    /// (issue #1820).
+    GetMailboxMessage,
     /// Canonical learning-record range read (issue #1868, I12.24).
     ///
     /// Durable same-scope learning rows keyed `(record_kind, handle,
