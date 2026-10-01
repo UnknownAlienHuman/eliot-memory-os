@@ -108,6 +108,7 @@ use eliot_observation::TaskSelectionEvidence;
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessRecordOwner,
     ColdStartReadinessStageOutcome, ColdStartReadinessTerminalDisposition, OrsError,
+    ScanDisclosureReadFailure,
     ScanDisclosureOrsRecord, ScanDisclosureRecordOwner, ScanDisclosureStageOutcome,
 };
 use eliot_protocol::{
@@ -348,6 +349,9 @@ enum ScanDisclosureOwnerRpcResult {
     Records {
         records: Vec<ScanDisclosureOrsRecord>,
     },
+    ReceiptReadFailure {
+        failure: ScanDisclosureReadFailure,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -402,6 +406,9 @@ enum ColdStartReadinessOwnerRpcResult {
     },
     ReadinessRecord {
         record: Option<Box<ColdStartReadinessOrsRecord>>,
+    },
+    ReceiptReadFailure {
+        failure: ScanDisclosureReadFailure,
     },
 }
 
@@ -469,21 +476,23 @@ impl KernelScanDisclosureRecordOwner {
         kernel: &super::DaemonKernelClient,
         application_connection_id: &str,
         activation_ticket_id: &str,
-    ) -> Result<eliot_governor::InstallationScanContour, String> {
+    ) -> Result<eliot_governor::InstallationScanContour, OrsError> {
         let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
             wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
             application_connection_id,
             activation_ticket_id,
             action: ScanDisclosureOwnerRpcAction::IssueContour,
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
         let value = kernel
             .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
         let response: ScanDisclosureOwnerRpcResponse =
-            serde_json::from_value(value).map_err(|error| error.to_string())?;
+            serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
         if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
-            return Err("unsupported scan-disclosure owner response version".to_owned());
+            return Err(OrsError::Contract(
+                "unsupported scan-disclosure owner response version".to_owned(),
+            ));
         }
         match response.result {
             ScanDisclosureOwnerRpcResult::Contour { contour } => {
@@ -492,9 +501,14 @@ impl KernelScanDisclosureRecordOwner {
                     contour.ors_object_ref,
                     contour.ors_generation,
                 )
-                .map_err(|error| error.to_string())
+                .map_err(|error| OrsError::Contract(error.to_string()))
             }
-            _ => Err("Kernel returned the wrong scan-disclosure owner result".to_owned()),
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
+            _ => Err(OrsError::Contract(
+                "Kernel returned the wrong scan-disclosure owner result".to_owned(),
+            )),
         }
     }
 
@@ -505,25 +519,32 @@ impl KernelScanDisclosureRecordOwner {
         kernel: &super::DaemonKernelClient,
         application_connection_id: &str,
         activation_ticket_id: &str,
-    ) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, String> {
+    ) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, OrsError> {
         let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
             wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
             application_connection_id,
             activation_ticket_id,
             action: ScanDisclosureOwnerRpcAction::IssueBinding,
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
         let value = kernel
             .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
         let response: ScanDisclosureOwnerRpcResponse =
-            serde_json::from_value(value).map_err(|error| error.to_string())?;
+            serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
         if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
-            return Err("unsupported scan-disclosure owner response version".to_owned());
+            return Err(OrsError::Contract(
+                "unsupported scan-disclosure owner response version".to_owned(),
+            ));
         }
         match response.result {
             ScanDisclosureOwnerRpcResult::Binding { binding } => Ok(binding),
-            _ => Err("Kernel returned the wrong scan-disclosure owner result".to_owned()),
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
+            _ => Err(OrsError::Contract(
+                "Kernel returned the wrong scan-disclosure owner result".to_owned(),
+            )),
         }
     }
 }
@@ -545,6 +566,9 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
                 stored: false,
                 record: Some(record),
             } => Ok(ScanDisclosureStageOutcome::AlreadyBound(Box::new(record))),
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
             _ => Err(OrsError::Contract(
                 "Kernel returned an invalid scan-disclosure stage result".to_owned(),
             )),
@@ -564,6 +588,9 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
             writer_receipt,
         })? {
             ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
             _ => Err(OrsError::Contract(
                 "Kernel returned an invalid scan-disclosure commit result".to_owned(),
             )),
@@ -579,6 +606,9 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
             operation_key,
         })? {
             ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
             _ => Err(OrsError::Contract(
                 "Kernel returned an invalid scan-disclosure load result".to_owned(),
             )),
@@ -600,6 +630,9 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
             successor_ref,
         })? {
             ScanDisclosureOwnerRpcResult::Record { record } => Ok(record),
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
             _ => Err(OrsError::Contract(
                 "Kernel returned an invalid scan-disclosure retire result".to_owned(),
             )),
@@ -621,6 +654,9 @@ impl ScanDisclosureRecordOwner for KernelScanDisclosureRecordOwner {
             limit,
         })? {
             ScanDisclosureOwnerRpcResult::Records { records } => Ok(records),
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
             _ => Err(OrsError::Contract(
                 "Kernel returned an invalid scan-disclosure list result".to_owned(),
             )),
@@ -686,6 +722,9 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
     ) -> Result<ColdStartReadinessStageOutcome, OrsError> {
         match self.request(ColdStartReadinessOwnerRpcAction::ReadinessClaim { claim })? {
             ColdStartReadinessOwnerRpcResult::ReadinessClaimed { outcome } => Ok(outcome),
+            ColdStartReadinessOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
             ColdStartReadinessOwnerRpcResult::ReadinessRecord { .. } => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness claim result".to_owned(),
             )),
@@ -712,6 +751,9 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
             ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
                 Ok(record.map(|value| *value))
             }
+            ColdStartReadinessOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
             ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness publish result".to_owned(),
             )),
@@ -725,6 +767,9 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
         match self.request(ColdStartReadinessOwnerRpcAction::ReadinessLoad { record_key })? {
             ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
                 Ok(record.map(|value| *value))
+            }
+            ColdStartReadinessOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
             }
             ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness load result".to_owned(),
@@ -742,6 +787,9 @@ impl ColdStartReadinessRecordOwner for KernelColdStartReadinessRecordOwner {
             ColdStartReadinessOwnerRpcResult::ReadinessRecord { record } => {
                 Ok(record.map(|value| *value))
             }
+            ColdStartReadinessOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
             ColdStartReadinessOwnerRpcResult::ReadinessClaimed { .. } => Err(OrsError::Contract(
                 "Kernel returned an invalid cold-start readiness binding read result".to_owned(),
             )),
@@ -755,7 +803,7 @@ pub fn request_scan_disclosure_contour(
     kernel: &super::DaemonKernelClient,
     application_connection_id: &str,
     activation_ticket_id: &str,
-) -> Result<eliot_governor::InstallationScanContour, String> {
+) -> Result<eliot_governor::InstallationScanContour, OrsError> {
     KernelScanDisclosureRecordOwner::issue_contour(
         kernel,
         application_connection_id,
@@ -769,7 +817,7 @@ pub fn request_scan_disclosure_binding(
     kernel: &super::DaemonKernelClient,
     application_connection_id: &str,
     activation_ticket_id: &str,
-) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, String> {
+) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, OrsError> {
     KernelScanDisclosureRecordOwner::issue_binding(
         kernel,
         application_connection_id,
@@ -783,22 +831,24 @@ async fn request_scan_work_scope_revision(
     activation_ticket_id: &str,
     action: ScanDisclosureOwnerRpcAction<'_>,
     expected_snapshot: &WorkScopeBindingSnapshot,
-) -> Result<(), String> {
+) -> Result<(), OrsError> {
     let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
         wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
         application_connection_id,
         activation_ticket_id,
         action,
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| OrsError::Contract(error.to_string()))?;
     let value = kernel
         .transact_async(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
     let response: ScanDisclosureOwnerRpcResponse =
-        serde_json::from_value(value).map_err(|error| error.to_string())?;
+        serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
     if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
-        return Err("Kernel scan disclosure owner returned another wire version".to_owned());
+        return Err(OrsError::Contract(
+            "Kernel scan disclosure owner returned another wire version".to_owned(),
+        ));
     }
     match response.result {
         ScanDisclosureOwnerRpcResult::WorkScopeOwnerRevision {
@@ -807,9 +857,16 @@ async fn request_scan_work_scope_revision(
         } if owner_revision == expected_snapshot.owner_revision
             && state_fence == expected_snapshot.state_fence => Ok(()),
         ScanDisclosureOwnerRpcResult::WorkScopeOwnerRevision { .. } => Err(
-            "Kernel WorkScope owner CAS acknowledged another revision or fence".to_owned(),
+            OrsError::Contract(
+                "Kernel WorkScope owner CAS acknowledged another revision or fence".to_owned(),
+            ),
         ),
-        _ => Err("Kernel scan disclosure owner returned an unexpected result".to_owned()),
+        ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+            Err(OrsError::ScanDisclosureReadFailure(failure))
+        }
+        _ => Err(OrsError::Contract(
+            "Kernel scan disclosure owner returned an unexpected result".to_owned(),
+        )),
     }
 }
 
@@ -823,7 +880,7 @@ pub async fn retain_scan_discovery_lease_owner_revision(
     expected_owner_revision: u64,
     lease: &DiscoveryReadLease,
     snapshot: &WorkScopeBindingSnapshot,
-) -> Result<(), String> {
+) -> Result<(), OrsError> {
     request_scan_work_scope_revision(
         kernel,
         application_connection_id,
@@ -850,7 +907,7 @@ pub async fn retain_scan_evidence_owner_revision(
     binding: &eliot_workscope::ScanDisclosureOwnerBinding,
     receipt_handle: &eliot_workscope::ScanReceiptHandle,
     snapshot: &WorkScopeBindingSnapshot,
-) -> Result<(), String> {
+) -> Result<(), OrsError> {
     request_scan_work_scope_revision(
         kernel,
         application_connection_id,
