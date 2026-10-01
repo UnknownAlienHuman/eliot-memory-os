@@ -1251,19 +1251,40 @@ impl KernelBackupRestore {
     /// [`BackupError::RestoreCapabilityUnsupported`] naming
     /// `owners::PURGE_LEDGER_OWNER` — see
     /// [`KernelRestoreTarget::apply_purge_ledger`] — instead of staging a
-    /// ledger whose revision no owner ever issued.
+    /// ledger whose revision no owner ever issued. An archive that carries NO
+    /// purge entry is not a way past the owner: it still DECLARES a
+    /// purge-ledger revision, so with no handle the phase reads no owner
+    /// answer and [`check_purge_revision_closure`] refuses it with
+    /// [`BackupError::FenceMismatch`] naming `purge ledger revision` — the
+    /// same refusal a carried ledger meets, reached by a different arm.
     ///
-    /// The owner route DOES exist: [`restore_with_ors_journal`](Self::restore_with_ors_journal)
-    /// supplies the composition-owned ORS handle, and
-    /// `KernelComposition::backup_restore_with_ors_journal` is the intended
-    /// production caller of it. That composition entry is recorded in
-    /// `lib.rs` as having NO caller in this repository, so the owner route is
-    /// not yet live at runtime and this entry's refusal is not currently
-    /// reachable from production. Stated rather than papered over: #963/#2569
-    /// own the front-door connection, and a guard or refusal that is only
-    /// unreachable by accident is not a guard — the purge phase's own
-    /// rehearsal and absent-owner refusals are enforced at the phase, not
-    /// here, precisely so that wiring the entry does not change them.
+    /// ## Reachability of the two public entries, measured
+    ///
+    /// The two halves are NOT equally reachable, and the asymmetry is a fact
+    /// about the call graph, not about the owner route being unwired:
+    ///
+    /// - [`restore_with_ors_journal`](Self::restore_with_ors_journal) IS
+    ///   reached from production, on every `backup.restore-test` request.
+    ///   `frame_dispatch` hands its live backup arm to
+    ///   `request_dispatch::handle_backup_restore_test`, which calls
+    ///   `KernelComposition::backup_restore_with_ors_journal`; that supplies
+    ///   the composition-owned ORS handle, so the one production route
+    ///   reaches the shared body with `ors: Some(..)`, never `None`.
+    /// - THIS entry has no production caller at all. The only call sites of
+    ///   `KernelBackupRestore::restore` in this repository are the
+    ///   integration tests in `bins/eliot-kernel/tests/backup_restore.rs`;
+    ///   the sole other `.restore(` in this crate's production sources is
+    ///   `PreStageIdentityCache::restore` in `daemon_request_dispatch`, a
+    ///   different type on the unrelated pre-stage journal path.
+    ///
+    /// So the owner route is live and exercised, and the absent-owner refusal
+    /// above is live code with no production caller of its own. Stated rather
+    /// than papered over: #963/#2569 own the front-door connection, and a
+    /// guard that is only unreachable by accident is not a guard — which is
+    /// why the purge phase enforces its refusals at the phase rather than
+    /// here. The REHEARSAL refusal in that phase is reached from production
+    /// today, because the one production route runs in rehearsal posture, so
+    /// admitting a caller to this entry neither moves nor weakens it.
     pub fn restore<J: RestoreJournalPort>(
         &self,
         bundle: &BackupBundle,
