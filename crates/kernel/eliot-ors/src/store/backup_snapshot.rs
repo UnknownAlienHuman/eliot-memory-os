@@ -4265,6 +4265,13 @@ fn observe_current_owner_validation(
 /// the receipt it lands on describe one instant. `import_page_quarantined` opens
 /// its own read the same way, for the same reason: a validation assembled from
 /// reads taken at different moments would not be an answer to any question.
+///
+/// Outcome IDENTITIES are checked BEFORE that read opens, by
+/// [`crate::backup_snapshot::check_outcome_identities`], so a duplicate outcome is
+/// a typed refusal at the boundary rather than a reason string recorded on a
+/// receipt nobody can act on. COVERAGE is deliberately left to the receipt's own
+/// gate, which re-derives it from the recorded halves and so also judges a
+/// hand-built or replayed receipt that claims coverage it does not have.
 pub(super) fn reconcile_import_receipt(
     database: &Database,
     import: &OrsBackupImportRequest,
@@ -4273,6 +4280,22 @@ pub(super) fn reconcile_import_receipt(
     import_at_ms: i64,
 ) -> Result<OrsBackupImportReceipt, OrsError> {
     let expected_members = expected_import_roster(snapshot, import)?;
+    // Outcome IDENTITIES are judged before any current-owner observation is
+    // recorded (issue #953; external audit 5868369939, step 2). A duplicate
+    // outcome id is contradictory evidence about ONE member — not a member nobody
+    // triaged — and it is a caller bug with its own operator action, so it is
+    // refused here as a typed `Err` while the caller can still see WHICH fault it
+    // was; deferring it to the receipt would flatten it into a reason string
+    // indistinguishable from every other refusal, which is the addressability the
+    // audit's duplicate clause asks for.
+    //
+    // COVERAGE (a missing or extra member) is deliberately NOT checked here. That
+    // refusal is the receipt's verdict, not a boundary failure, and the caller needs
+    // the per-member outcome vector the receipt carries to route reconciliation —
+    // turning it into an `Err` here would destroy the only artifact that says which
+    // members went untriaged. So this check is identity-only: no table read, no
+    // write, a pure comparison over values already in hand.
+    crate::backup_snapshot::check_outcome_identities(&expected_members, per_entry)?;
     let read = database.begin_read().map_err(storage)?;
     let destination_identity = {
         let meta = read.open_table(super::META).map_err(storage)?;

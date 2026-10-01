@@ -3642,17 +3642,23 @@ impl OrsBackupImportReceipt {
     ///    [`Self::new`], so it is a restatement of the facts rather than a
     ///    second claim about them.
     ///
-    /// Every refusal is [`OrsError::ReconciliationMismatch`]: I14-21 — unknown
-    /// stays reconciling, and a zero that nobody validated is unknown, not
-    /// resolved. Nothing here retries, replays or repairs; it refuses.
+    /// Every refusal is a TYPED variant, not one blanket error: a DUPLICATE
+    /// outcome or a doubled member is [`OrsError::DuplicateConflict`] (one durable
+    /// identity claimed twice — the caller triaged one member twice, and its
+    /// operator action is to re-run the triage), and every other unmet obligation is
+    /// [`OrsError::ReconciliationMismatch`] — I14-21: unknown stays reconciling, and
+    /// a zero that nobody validated is unknown, not resolved. Nothing here retries,
+    /// replays or repairs; it refuses.
     pub fn known_zero_unresolved(&self, owner: &CurrentOwnerValidation) -> Result<(), OrsError> {
         owner.validate()?;
         if owner.snapshot_digest != self.snapshot_digest {
             return Err(OrsError::ReconciliationMismatch);
         }
-        if !self.owner_validation_is_complete(owner) {
-            return Err(OrsError::ReconciliationMismatch);
-        }
+        // The coverage check REPORTS its own refusal: it returns the typed variant
+        // for the failure it found, so a duplicate outcome stays distinguishable
+        // from a member nobody triaged instead of both collapsing into one
+        // undifferentiated mismatch.
+        self.owner_validation_is_complete(owner)?;
         if !owner.unresolved_effect_identities.is_empty() {
             return Err(OrsError::ReconciliationMismatch);
         }
@@ -3689,7 +3695,8 @@ impl OrsBackupImportReceipt {
     /// compared equal and the gate could never fire.
     ///
     /// Five distinct failures, none reachable from another, each of which the
-    /// import is refused for:
+    /// import is refused for, and each of which is now REPORTED rather than
+    /// collapsed:
     ///
     /// 1. the expected roster repeats a member identity — it is not a roster;
     /// 2. two DIFFERENT expected members share one record id. The outcome
@@ -3707,36 +3714,138 @@ impl OrsBackupImportReceipt {
     ///
     /// Sets rather than lengths, because a length cannot tell a subset from a
     /// superset from a different set of the same size.
-    fn owner_validation_is_complete(&self, owner: &CurrentOwnerValidation) -> bool {
-        let mut expected: BTreeSet<(RowFamilyKind, &str)> = BTreeSet::new();
-        for (family, record_id) in &self.expected_members {
-            if !expected.insert((*family, record_id.as_str())) {
-                // Failure 1.
-                return false;
-            }
-        }
-        let expected_ids: BTreeSet<&str> =
-            expected.iter().map(|(_, record_id)| *record_id).collect();
-        if expected_ids.len() != expected.len() {
-            // Failure 2: one record id declared under two row families.
-            return false;
-        }
-        let mut provided: BTreeSet<&str> = BTreeSet::new();
-        for (record_id, _) in &self.per_entry {
-            if !provided.insert(record_id.as_str()) {
-                // Failure 3.
-                return false;
-            }
-        }
+    ///
+    /// WHY THIS RETURNS `Result` RATHER THAN `bool` (issue #953): while this was
+    /// one predicate every failure above collapsed into the same `false`, and
+    /// [`Self::known_zero_unresolved`] mapped that single `false` to one
+    /// [`OrsError::ReconciliationMismatch`]. A caller triaging the same record id
+    /// twice — which the audit names as its own discriminator, because two
+    /// contradictory outcomes for one member is a caller bug with an operator
+    /// action, not an unknown effect — was therefore indistinguishable at the error
+    /// site from a member nobody triaged at all. The rejection was real but it was
+    /// not ADDRESSABLE. Each failure now names itself; a DUPLICATE reports
+    /// [`OrsError::DuplicateConflict`], the crate's existing typed refusal for one
+    /// durable identity claimed twice and the same variant [`member_roster_refused`]
+    /// already returns for a repeated member of a page roster, while the coverage
+    /// failures keep [`OrsError::ReconciliationMismatch`] (I14-21: unknown stays
+    /// reconciling). Failures 1–3 are [`check_outcome_identities`]'s, which the store
+    /// also runs BEFORE it builds a validation, so a duplicate is refused as a typed
+    /// `Err` at the boundary instead of only as a verdict string on a receipt;
+    /// failure 4 is [`expected_member_ids`]'s and stays a verdict, so the per-member
+    /// outcome vector survives for the caller to route.
+    /// The REACHABILITY of [`KnownZeroVerdict::Satisfied`] is unchanged: a full
+    /// checked roster with exact per-member outcomes still returns `Ok(())`.
+    fn owner_validation_is_complete(
+        &self,
+        owner: &CurrentOwnerValidation,
+    ) -> Result<(), OrsError> {
+        // The expected/provided half of the coverage rule: repeats are refused by
+        // `check_outcome_identities`, and this adds the set equality in both
+        // directions, judged against the halves RECORDED on the receipt.
+        let expected_ids = expected_member_ids(&self.expected_members, &self.per_entry)?;
+        // Failure 5: the consulted roster must equal the expected roster, so the
+        // current owner was asked about every member and about nothing else.
         let mut consulted: BTreeSet<&str> = BTreeSet::new();
         for record_id in &owner.validated_record_ids {
             if !consulted.insert(record_id.as_str()) {
-                return false;
+                return Err(OrsError::DuplicateConflict);
             }
         }
-        // Failures 4 and 5.
-        provided == expected_ids && consulted == expected_ids
+        let covered = consulted.len() == expected_ids.len()
+            && expected_ids
+                .iter()
+                .all(|record_id| consulted.contains(record_id.as_str()));
+        if !covered {
+            return Err(OrsError::ReconciliationMismatch);
+        }
+        Ok(())
     }
+}
+
+/// Requires that no identity in the expected roster or the outcome vector is
+/// claimed TWICE (issue #953; external audit 5868369939, step 2).
+///
+/// This is the boundary half of the coverage rule, and it is deliberately
+/// IDENTITY-ONLY: it refuses a repeat, and nothing else. A missing or extra member
+/// is NOT refused here — that refusal is
+/// [`KnownZeroVerdict::Refused`] on a receipt the caller can read, and failing it
+/// here would destroy the per-member outcome vector that says WHICH members went
+/// untriaged, which is the artifact the caller needs to route reconciliation. So the
+/// two halves refuse different things at different places: a contradiction in the
+/// input is a typed `Err` at the boundary, while an incomplete coverage report is a
+/// verdict on the receipt.
+///
+/// Three typed refusals:
+///
+/// - the expected roster repeats one member identity — [`OrsError::DuplicateConflict`];
+/// - one record id appears under two row families — [`OrsError::ReconciliationMismatch`],
+///   because the identity was declared once per family while the outcome vocabulary is
+///   record-id keyed, so it cannot be covered by two outcomes and is half-covered by
+///   one;
+/// - the outcomes repeat one record id — [`OrsError::DuplicateConflict`], the audit's
+///   named case: two outcomes for one member are contradictory evidence about a single
+///   member, never a second member, and de-duplicating them into apparent success is
+///   the defect.
+///
+/// Pure and total: it reads no table and writes none, so it can run before any
+/// observation is made.
+pub fn check_outcome_identities(
+    expected_members: &[(RowFamilyKind, String)],
+    per_entry: &[(String, PerEntryOutcome)],
+) -> Result<(), OrsError> {
+    let mut expected: BTreeSet<(RowFamilyKind, &str)> = BTreeSet::new();
+    for (family, record_id) in expected_members {
+        if !expected.insert((*family, record_id.as_str())) {
+            return Err(OrsError::DuplicateConflict);
+        }
+    }
+    let expected_ids: BTreeSet<&str> =
+        expected.iter().map(|(_, record_id)| *record_id).collect();
+    if expected_ids.len() != expected.len() {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    let mut provided: BTreeSet<&str> = BTreeSet::new();
+    for (record_id, _) in per_entry {
+        if !provided.insert(record_id.as_str()) {
+            return Err(OrsError::DuplicateConflict);
+        }
+    }
+    Ok(())
+}
+
+/// Requires the provided outcomes to cover the expected roster EXACTLY, once each
+/// (issue #953; external audit 5868369939, step 2).
+///
+/// The coverage half, run by [`OrsBackupImportReceipt::new`]'s gate against the
+/// values RECORDED on the receipt — so it also judges a hand-assembled or replayed
+/// receipt that claims coverage it does not have, which the boundary
+/// [`check_outcome_identities`] cannot see. Its repeats are already
+/// [`check_outcome_identities`]'s job; what it adds is the set equality in both
+/// directions: a subset leaves a member nobody triaged and a superset answers a
+/// question this receipt is not. Returns the expected record-id SET (owned, so it
+/// outlives both borrowed inputs) so the caller compares the consulted roster
+/// against the same set rather than rebuilding it.
+fn expected_member_ids(
+    expected_members: &[(RowFamilyKind, String)],
+    per_entry: &[(String, PerEntryOutcome)],
+) -> Result<BTreeSet<String>, OrsError> {
+    check_outcome_identities(expected_members, per_entry)?;
+    let expected_ids: BTreeSet<String> = expected_members
+        .iter()
+        .map(|(_, record_id)| record_id.clone())
+        .collect();
+    let provided: BTreeSet<&str> = per_entry
+        .iter()
+        .map(|(record_id, _)| record_id.as_str())
+        .collect();
+    let covered = provided.len() == expected_ids.len()
+        && expected_ids
+            .iter()
+            .all(|record_id| provided.contains(record_id.as_str()));
+    if !covered {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    Ok(expected_ids)
 }
 /// Reject imports that relabel identity or arrive without bound evidence.
 pub fn validate_import_binding(
