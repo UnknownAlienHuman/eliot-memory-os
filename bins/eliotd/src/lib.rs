@@ -176,9 +176,9 @@ pub use agent_fabric::{
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
     PeerChannelPort, PeerMessage, PeerReceipt, Reservation, RouteRequirements, SwarmControlPort,
     SwarmDefinition, SwarmEntryReceipt, VerifiedProviderMaterial, WorkerAck,
-    admit_swarm_definition_candidate, begin_swarm_execution_candidate,
-    daemon_coordinator_config, launch_swarm_child_candidate, plan_candidate,
-    prepare_swarm_definition_admission_candidate, prereq_ports,
+    admit_swarm_definition_candidate, begin_swarm_execution_candidate, daemon_coordinator_config,
+    launch_swarm_child_candidate, plan_candidate, prepare_swarm_definition_admission_candidate,
+    prereq_ports,
 };
 use agent_fabric::{FabricOperation, FabricPortId, MissingPortResidual, PortBindingState};
 
