@@ -2652,7 +2652,7 @@ impl KernelStoreGateway {
             &history_request,
             history_response,
             &current_request,
-            current_after_response,
+            &current_after_response,
         )
         .map_err(|error| error.to_string())
     }
@@ -2772,7 +2772,7 @@ impl KernelStoreGateway {
         let (revision, envelope) =
             super::user_automation_store::normalize_user_automation_operation(request)
                 .map_err(UserAutomationExecutionError::Contract)?;
-        self.retain_user_automation_normalization_result(request, &revision, &envelope)
+        Box::pin(self.retain_user_automation_normalization_result(request, &revision, &envelope))
             .await
     }
 
@@ -2851,10 +2851,13 @@ impl KernelStoreGateway {
         )
         .map_err(user_automation_gateway_unknown)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
-        let receipt = store
-            .apply_normalization_transition(&store_request.context, transition, manifest_digest)
-            .await
-            .map_err(user_automation_gateway_unknown)?;
+        let receipt = Box::pin(store.apply_normalization_transition(
+            &store_request.context,
+            transition,
+            manifest_digest,
+        ))
+        .await
+        .map_err(user_automation_gateway_unknown)?;
 
         let record = self
             .read_user_automation_normalization_record(
@@ -3020,17 +3023,17 @@ impl KernelStoreGateway {
         &self,
         request: &UserAutomationServiceRequest,
     ) -> Result<(), UserAutomationExecutionError> {
-        let (revision, envelope) = match &request.intent.operation {
-            UserAutomationOperation::Create {
-                revision,
-                normalization_receipt_envelope,
-            }
-            | UserAutomationOperation::Edit {
-                revision,
-                normalization_receipt_envelope,
-                ..
-            } => (revision, normalization_receipt_envelope),
-            _ => return Ok(()),
+        let (UserAutomationOperation::Create {
+            revision,
+            normalization_receipt_envelope: envelope,
+        }
+        | UserAutomationOperation::Edit {
+            revision,
+            normalization_receipt_envelope: envelope,
+            ..
+        }) = &request.intent.operation
+        else {
+            return Ok(());
         };
         let fence = request.context.state_fence.clone();
         let named = CanonicalUserAutomationStore::<

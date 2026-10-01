@@ -478,7 +478,7 @@ impl<C> CanonicalUserAutomationStore<C> {
         history_request: &NamedReadRequest,
         history_response: NamedReadResponse,
         current_after_request: &NamedReadRequest,
-        current_after_response: NamedReadResponse,
+        current_after_response: &NamedReadResponse,
     ) -> Result<UserAutomationOwnerSnapshot, StoreError> {
         let (expected_current, expected_history) = Self::owner_read_requests(lookup)?;
         if current_request != &expected_current
@@ -489,7 +489,7 @@ impl<C> CanonicalUserAutomationStore<C> {
         }
         validate_owner_named_response(lookup, current_request, &current_response)?;
         validate_owner_named_response(lookup, history_request, &history_response)?;
-        validate_owner_named_response(lookup, current_after_request, &current_after_response)?;
+        validate_owner_named_response(lookup, current_after_request, current_after_response)?;
 
         let current_before_payload_digest = canonical_payload_digest(&current_response.payload)?;
         let current_after_payload_digest =
@@ -504,7 +504,7 @@ impl<C> CanonicalUserAutomationStore<C> {
         }
 
         let current = owner_current_row(&current_response)?;
-        let current_after = owner_current_row(&current_after_response)?;
+        let current_after = owner_current_row(current_after_response)?;
         let (current_automation_id, current_revision, current_state) =
             owner_current_fields(current)?;
         let (after_automation_id, after_revision, after_state) =
@@ -569,7 +569,7 @@ impl<C> CanonicalUserAutomationStore<C> {
                 history: owner_read_provenance(history_request, &history_response),
                 current_after: owner_read_provenance(
                     current_after_request,
-                    &current_after_response,
+                    current_after_response,
                 ),
             },
         })
@@ -2846,8 +2846,10 @@ fn validate_retained_normalization_record(
     expected_revision.schedule =
         super::user_automation_compiler::normalize_schedule(&draft.schedule, occurrence_count)
             .map_err(|_| invalid())?;
-    expected_revision.schedule.normalization_receipt =
-        revision.schedule.normalization_receipt.clone();
+    expected_revision
+        .schedule
+        .normalization_receipt
+        .clone_from(&revision.schedule.normalization_receipt);
     if expected_revision != revision
         || revision.automation_id != record.automation_id
         || revision.revision != record.revision
