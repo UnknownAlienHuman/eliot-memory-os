@@ -620,6 +620,13 @@ pub(crate) const TX_ALLOC_PROOF: &str = "LET $alloc_proof = { operation_id: $all
 /// revision conflict by the adapter.
 pub(crate) const TX_FINISH_OWNER: &str = "LET $finish_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($finish_owner_table, $finish_owner_id)); IF type::is_object($finish_existing) { LET $finish_owner_cas = (UPDATE type::record($finish_owner_table, $finish_owner_id) CONTENT $finish_owner_record WHERE state_fence = $finish_expected_state_fence AND revision = $finish_expected_revision RETURN AFTER); IF array::len($finish_owner_cas ?? []) != 1 { THROW 'finish_owner_cas_conflict'; }; } ELSE { IF $finish_expected_revision != 0 { THROW 'finish_owner_create_conflict'; }; LET $finish_owner_create = (CREATE type::record($finish_owner_table, $finish_owner_id) CONTENT $finish_owner_record RETURN AFTER); IF array::len($finish_owner_create ?? []) != 1 { THROW 'finish_owner_create_conflict'; }; };";
 
+/// Asserts Finish against the latest admitted TaskControl event for the exact
+/// task and owner scope. This reads the same committed authority bytes that
+/// `GetTaskState` reconstructs. It runs after the transaction's canonical
+/// fence CAS, so the current-task check and Finish owner write share the same
+/// serialization point as every `UpdateTaskState` commit.
+pub(crate) const TX_FINISH_TASK_OWNER_GUARD: &str = "LET $finish_task_owner_rows = (SELECT commit_sequence, payload_authority FROM write_receipt WHERE body.envelope.core.transition_class = 'task_control' AND body.envelope.core.work_scope.scope_id = $finish_task_scope AND array::len((payload_authority ?? []).filter(|$finish_task_entry| string::contains($finish_task_entry.bytes_utf8, $finish_task_id_marker))) > 0 ORDER BY commit_sequence DESC LIMIT 1); IF array::len($finish_task_owner_rows) != 1 { THROW 'finish_task_owner_missing'; }; LET $finish_task_owner_entry = $finish_task_owner_rows[0].payload_authority.filter(|$finish_task_entry| string::contains($finish_task_entry.bytes_utf8, $finish_task_id_marker))[0]; IF NOT string::contains($finish_task_owner_entry.bytes_utf8, $finish_task_revision_marker) { THROW 'finish_task_owner_stale'; };";
+
 /// Fenced upsert of the Governor-produced canonical admission owner image.
 /// The payload remains opaque to the adapter; only the fixed owner address,
 /// fence, and outer revision are provider-arbitrated.
