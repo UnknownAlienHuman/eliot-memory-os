@@ -8029,7 +8029,7 @@ impl KernelStoreGateway {
         result
     }
 
-    /// Reads the WorkScope row immediately before CAS and recognizes only an
+    /// Reads the retained work-scope owner row before CAS and recognizes only an
     /// exact same-fence replay or the exact requested current revision.
     async fn work_scope_owner_cas_replay_or_ready(
         &self,
@@ -8067,9 +8067,9 @@ impl KernelStoreGateway {
         }
     }
 
-    /// Replaces the one durable WorkScope owner row by a fenced CAS and
-    /// returns only after the exact canonical record is visible on a same-
-    /// fence named recovery read. The Store remains the owner of persistence;
+    /// Replaces the durable work-scope owner row by a fenced CAS. It returns
+    /// only after the exact canonical record is visible on a same-fence named
+    /// recovery read. The Store remains the owner of persistence;
     /// this gateway owns the active-route, source, lease, and readback checks.
     pub async fn write_work_scope_owner(
         &self,

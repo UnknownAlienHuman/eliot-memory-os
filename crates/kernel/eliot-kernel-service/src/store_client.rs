@@ -883,30 +883,53 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 response.validate_for_request(&request)?;
                 Ok(response)
             }
-            Ok(_) => Err(StoreError::InvalidReceipt),
-            Err(RequestFailure::Unknown { .. }) => {
-                // The CAS may have committed before its response was lost.
+            // A successful but mismatched response does not establish whether
+            // the admitted CAS took effect. Preserve the original write's
+            // operation identity as unknown rather than projecting a conflict.
+            Ok(_) => Err(StoreError::UnknownOutcome {
+                operation_id: request.operation_id.clone(),
+            }),
+            Err(error)
+                if matches!(&error, RequestFailure::Unknown { .. })
+                    || error.is_unknown_outcome_failure() =>
+            {
+                // The CAS may have committed before its response was lost or
+                // the Store explicitly retained its outcome as unknown.
                 // Reconcile only through a same-fence named WorkScope owner
                 // read; never submit the mutation again on an uncertain answer.
+                // If that read is unavailable or does not prove the exact row,
+                // retain the original operation's unknown disposition.
                 let snapshot = self
                     .recovery(StoreRecoveryRequest {
                         contract_version: request.contract_version,
-                        state_fence,
+                        state_fence: state_fence.clone(),
                         records: vec![RecoveryRecordKey::new("owner", "work_scope")?],
                         include_receipts: false,
                         include_jobs: false,
                     })
-                    .await?;
-                match snapshot.owner_records.as_slice() {
-                    [record]
-                        if record == &requested_record
-                            && record.revision == expected_revision.saturating_add(1) =>
-                    {
-                        Ok(StoreWorkScopeOwnerResponse {
-                            record: record.clone(),
-                        })
-                    }
-                    _ => Err(StoreError::IdentityConflict),
+                    .await;
+                match snapshot {
+                    Err(_) => Err(StoreError::UnknownOutcome {
+                        operation_id: request.operation_id.clone(),
+                    }),
+                    Ok(snapshot) if snapshot.state_fence == state_fence => {
+                        match snapshot.owner_records.as_slice() {
+                            [record]
+                                if record == &requested_record
+                                    && record.revision == expected_revision.saturating_add(1) =>
+                            {
+                                Ok(StoreWorkScopeOwnerResponse {
+                                    record: record.clone(),
+                                })
+                            }
+                            _ => Err(StoreError::UnknownOutcome {
+                                operation_id: request.operation_id.clone(),
+                            }),
+                        }
+                    },
+                    Ok(_) => Err(StoreError::UnknownOutcome {
+                        operation_id: request.operation_id.clone(),
+                    }),
                 }
             }
             Err(error) => Err(error.into_store_error()),
