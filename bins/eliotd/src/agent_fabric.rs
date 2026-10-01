@@ -926,6 +926,32 @@ pub struct ActivationEvidence {
     pub stop_boundary_admission: Option<eliot_protocol::StopBoundaryAdmissionBinding>,
 }
 
+/// Admission binding that can only be minted by a live AgentFabric owner
+/// after it joins the canonical `FabricAdmission`, member `AttemptId`, exact
+/// Governor semantic admission, durable owner revision and `WriteReceipt`.
+/// The opaque wrapper prevents composition callers from promoting an
+/// arbitrary deserialized shape into a publication input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedStopAdmissionBinding {
+    binding: eliot_protocol::StopBoundaryAdmissionBinding,
+    fabric_admission_id: AdmissionId,
+}
+
+impl VerifiedStopAdmissionBinding {
+    /// Returns the exact lower-layer binding minted by the owner join.
+    #[must_use]
+    pub fn binding(&self) -> &eliot_protocol::StopBoundaryAdmissionBinding {
+        &self.binding
+    }
+
+    /// Returns the operational admission identity independently joined by
+    /// the owner, distinct from the Governor semantic admission identity.
+    #[must_use]
+    pub fn fabric_admission_id(&self) -> &AdmissionId {
+        &self.fabric_admission_id
+    }
+}
+
 /// Provider-neutral externally dispatchable intent.
 ///
 /// Carries the exact attempt plus activated launch evidence. It names no
@@ -4279,7 +4305,10 @@ impl AgentFabric {
                 && semantic.definition_digest == admission.definition_digest
         });
         evidence.stop_boundary_admission = if has_semantic_binding {
-            Some(self.stop_boundary_admission_binding(admission_id, attempt_id)?)
+            Some(
+                self.verified_stop_admission_binding(admission_id, attempt_id)?
+                    .binding,
+            )
         } else {
             None
         };
@@ -4374,6 +4403,21 @@ impl AgentFabric {
             task_revision: definition.task_revision.clone(),
             attempt_id: attempt_id.as_str().to_owned(),
             state_fence: semantic_admission.state_fence.clone(),
+        })
+    }
+
+    /// Produces the unforgeable-for-safe-Rust publication input for one exact
+    /// activated operational attempt. This repeats the full durable semantic
+    /// owner join and pairs the result with its distinct FabricAdmission ID.
+    pub fn verified_stop_admission_binding(
+        &self,
+        fabric_admission_id: &AdmissionId,
+        attempt_id: &AttemptId,
+    ) -> Result<VerifiedStopAdmissionBinding, FabricError> {
+        let binding = self.stop_boundary_admission_binding(fabric_admission_id, attempt_id)?;
+        Ok(VerifiedStopAdmissionBinding {
+            binding,
+            fabric_admission_id: fabric_admission_id.clone(),
         })
     }
 

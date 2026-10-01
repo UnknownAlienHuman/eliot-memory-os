@@ -954,6 +954,22 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         prepare_exchange(self.canonical, identity, envelope)
     }
 
+    /// Prepares the CAS exchange that publishes a canonical owner image with
+    /// the exact stop-admission binding already verified against the live
+    /// Governor and AgentFabric records. Transport is performed by the
+    /// caller after releasing its composition borrow.
+    pub(crate) fn prepare_stop_admission_binding_exchange(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        snapshot: &CanonicalAdmissionSnapshot,
+        binding: &eliot_protocol::StopBoundaryAdmissionBinding,
+    ) -> Result<PreparedKernelExchange, FinishAttemptError> {
+        let envelope =
+            stop_admission_binding_envelope(identity, operation_id, snapshot, binding)?;
+        prepare_exchange(self.canonical, identity, envelope)
+    }
+
     /// Rehydrates the contract owner's exact `TaskContract` acceptance-item
     /// enumeration for one finish candidate (issue #1741, I7.9).
     ///
@@ -1710,6 +1726,39 @@ pub(crate) fn current_plan_envelope(
         snapshot,
         task_id.as_str(),
         &format!("current-plan:{plan_digest}"),
+    )
+}
+
+/// Builds the canonical shared-row exchange for the exact independently
+/// verified stop-admission association. `RecordFinishEvidence` is the
+/// existing single canonical snapshot CAS owner; the stop binding is one
+/// field in that complete snapshot, so this does not create a second row or
+/// revision authority.
+pub(crate) fn stop_admission_binding_envelope(
+    identity: &RequestIdentity,
+    operation_id: &OperationId,
+    snapshot: &CanonicalAdmissionSnapshot,
+    binding: &eliot_protocol::StopBoundaryAdmissionBinding,
+) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
+    if snapshot.stop_admission_binding.as_ref() != Some(binding)
+        || snapshot.state_fence != binding.state_fence
+        || identity.request.metadata.task_id.as_ref() != Some(&binding.task_id)
+    {
+        return Err(FinishAttemptError::Serialization(
+            "stop admission snapshot does not match the admitted request and owner binding"
+                .to_owned(),
+        ));
+    }
+    let binding_digest = sha256_hex(
+        &canonical_json_bytes(binding)
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?,
+    );
+    canonical_owner_snapshot_envelope(
+        identity,
+        operation_id.clone(),
+        snapshot,
+        binding.task_id.as_str(),
+        &format!("stop-admission-binding:{binding_digest}"),
     )
 }
 

@@ -170,6 +170,7 @@ use agent_fabric::build_admitted_provider_capability;
 pub use agent_fabric::{
     ActivationAuthorityPort, ActivationEvidence, AdmissionAuthorityPort, AgentFabric,
     AgentFabricDescriptor, AttemptLifecycle, AttemptResultRecord, COORDINATOR_CRATE,
+    VerifiedStopAdmissionBinding,
     CancellationLifecycle, DAEMON_CRATE, DispatchAck, DispatchEgressPort, DispatchIntent,
     FABRIC_CAPACITY_IDENTITY, FABRIC_CAPACITY_REVISION, FABRIC_PLAN_GAP_REASON, FabricAdmission,
     FabricError, FabricPorts, FabricSnapshot, LedgerEntry, ModelRegistryPort, PREREQ_PORTS,
@@ -1681,6 +1682,56 @@ impl DaemonComposition {
         }
         self.governor
             .prepare_current_plan_admission(identity, operation_id, task_id)
+    }
+
+    /// Prepares publication of the independently verified Governor
+    /// admission/AgentFabric attempt association into the canonical
+    /// activation owner. The producer must supply the exact binding returned
+    /// by the durable AgentFabric owner readback; this method rechecks the
+    /// current Governor task revision and complete StateFence before it
+    /// creates a canonical CAS exchange.
+    pub fn prepare_stop_admission_binding(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        verified: VerifiedStopAdmissionBinding,
+        now: u64,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor.prepare_stop_admission_binding_admission(
+            identity,
+            operation_id,
+            verified.binding().clone(),
+            now,
+        )
+    }
+
+    /// Accepts the exact committed canonical association exchange. The
+    /// caller must then refresh owner readback before exposing the new
+    /// activation binding to Kernel.
+    pub fn accept_prepared_stop_admission_binding(
+        &self,
+        prepared: &PreparedKernelExchange,
+    ) -> Result<(), FinishAttemptError> {
+        self.governor.accept_prepared_exchange(prepared)
+    }
+
+    /// Rehydrates the committed canonical owner image after the stop
+    /// association exchange and returns the exact live activation projection
+    /// for caller-side receipt/readback comparison.
+    pub fn refresh_stop_admission_binding_readback(
+        &mut self,
+        now: u64,
+    ) -> Result<eliot_governor::GovernorActivationSnapshot, FinishAttemptError> {
+        if self.readiness() != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        self.governor.refresh_from_kernel()?;
+        self.governor
+            .read_unique_agent_activation(now)
+            .map_err(FinishAttemptError::Composition)
     }
 
     /// Prepares the Governor-owned finish-evidence exchange without transporting it.

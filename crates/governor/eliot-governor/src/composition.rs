@@ -4021,6 +4021,51 @@ impl CanonicalAdmissionOwner {
         Ok(snapshot)
     }
 
+    /// Builds a successor canonical image carrying an independently joined
+    /// Governor admission and AgentFabric attempt association. The caller
+    /// must have re-read the live Task Controller task and AgentFabric owner
+    /// records; this method only accepts the exact current task, revision and
+    /// full fence and never derives an attempt from labels.
+    pub fn prepare_stop_admission_binding(
+        &self,
+        binding: eliot_protocol::StopBoundaryAdmissionBinding,
+    ) -> Result<Option<CanonicalAdmissionSnapshot>, CompositionError> {
+        binding
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let plan = self.read_current_plan(&binding.state_fence)?;
+        if plan.task_id != binding.task_id {
+            return Err(CompositionError::Recovery(
+                "stop admission binding task differs from the current canonical plan".to_owned(),
+            ));
+        }
+        if self.snapshot.stop_admission_binding.as_ref() == Some(&binding) {
+            return Ok(None);
+        }
+        if let Some(previous) = &self.snapshot.stop_admission_binding
+            && previous.task_id == binding.task_id
+            && previous.state_fence == binding.state_fence
+            && previous.admission_owner_revision >= binding.admission_owner_revision
+        {
+            return Err(CompositionError::Recovery(
+                "stop admission binding is not a successor to the current semantic admission".to_owned(),
+            ));
+        }
+        let owner_revision = self.snapshot.owner_revision.checked_add(1).ok_or_else(|| {
+            CompositionError::Recovery("canonical owner revision overflow".to_owned())
+        })?;
+        let snapshot = CanonicalAdmissionSnapshot {
+            state_fence: self.state_fence.clone(),
+            owner_revision,
+            current_plan: self.snapshot.current_plan.clone(),
+            verifier_execution_fact: self.snapshot.verifier_execution_fact.clone(),
+            finish_evidence: self.snapshot.finish_evidence.clone(),
+            stop_admission_binding: Some(binding),
+        };
+        snapshot.validate()?;
+        Ok(Some(snapshot))
+    }
+
     /// Builds the next canonical admission owner image after a Governor-owned
     /// finish-evidence derivation.  This is a pure owner transition payload;
     /// persistence is performed only by the Kernel transition port.
@@ -6116,6 +6161,52 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(Some(
             service.prepare_current_plan_exchange(identity, envelope)?,
         ))
+    }
+
+    /// Prepares the canonical CAS that publishes the exact current Governor
+    /// admission/AgentFabric attempt association into the activation owner.
+    /// The supplied binding must come from AgentFabric's independently
+    /// verified durable owner readback; this method re-reads current Governor
+    /// activation owners and compares task revision, task identity and full
+    /// StateFence before preparing the shared canonical snapshot transition.
+    pub fn prepare_stop_admission_binding_admission(
+        &self,
+        identity: &RequestIdentity,
+        operation_id: &OperationId,
+        binding: eliot_protocol::StopBoundaryAdmissionBinding,
+        now: u64,
+    ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(FinishAttemptError::Composition(CompositionError::NotReady));
+        }
+        identity
+            .validate()
+            .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
+        let activation = self.read_unique_agent_activation(now)?;
+        if activation.state_fence != binding.state_fence
+            || activation.task_id != binding.task_id
+            || activation.task_revision.to_string() != binding.task_revision
+            || identity.request.metadata.task_id.as_ref() != Some(&binding.task_id)
+            || identity.request.metadata.state_fence != binding.state_fence
+        {
+            return Err(FinishAttemptError::Composition(
+                CompositionError::ActivationStaleFence,
+            ));
+        }
+        let Some(snapshot) = self
+            .owners
+            .canonical
+            .prepare_stop_admission_binding(binding.clone())?
+        else {
+            return Ok(None);
+        };
+        let service = self.finish_attempt_service();
+        Ok(Some(service.prepare_stop_admission_binding_exchange(
+            identity,
+            operation_id,
+            &snapshot,
+            &binding,
+        )?))
     }
 
     /// Returns the authenticated Kernel snapshot admitted at construction.
