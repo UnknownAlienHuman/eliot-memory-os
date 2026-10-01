@@ -2719,8 +2719,7 @@ impl KernelStoreGateway {
             .validate_for_schedule_normalization()
             .map_err(UserAutomationExecutionError::Contract)?;
         if let UserAutomationOperation::MigrateLegacySchedule {
-            previous_revision,
-            ..
+            previous_revision, ..
         } = &request.intent.operation
         {
             let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
@@ -2834,29 +2833,26 @@ impl KernelStoreGateway {
         UserAutomationExecutionError,
     > {
         let (automation_id, revision_id) = normalization_selector(request)?;
-        let original_request_json = serde_json::to_string(request)
-            .map_err(user_automation_gateway_unknown)?;
+        let original_request_json =
+            serde_json::to_string(request).map_err(user_automation_gateway_unknown)?;
         let store_request = crate::UserAutomationStoreRequest {
             context: request.context.clone(),
             authenticated_principal: request.authenticated_principal.clone(),
             identity: request.identity.clone(),
             intent: request.intent.clone(),
         };
-        let (mut transition, manifest_digest) =
-            CanonicalUserAutomationStore::<BorrowedCanonicalStoreClient<'_>>::build_normalization_transition(
-                &store_request,
-                revision,
-                envelope,
-                original_request_json,
-            )
-            .map_err(user_automation_gateway_unknown)?;
+        let (mut transition, manifest_digest) = CanonicalUserAutomationStore::<
+            BorrowedCanonicalStoreClient<'_>,
+        >::build_normalization_transition(
+            &store_request,
+            revision,
+            envelope,
+            original_request_json,
+        )
+        .map_err(user_automation_gateway_unknown)?;
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         let receipt = store
-            .apply_normalization_transition(
-                &store_request.context,
-                transition,
-                manifest_digest,
-            )
+            .apply_normalization_transition(&store_request.context, transition, manifest_digest)
             .await
             .map_err(user_automation_gateway_unknown)?;
 
@@ -2866,13 +2862,12 @@ impl KernelStoreGateway {
                 &automation_id,
                 &revision_id,
             )
-            .await
-            ?
-        .ok_or_else(|| {
-            user_automation_gateway_unknown(
-                "committed normalization retention was not visible on exact readback",
-            )
-        })?;
+            .await?
+            .ok_or_else(|| {
+                user_automation_gateway_unknown(
+                    "committed normalization retention was not visible on exact readback",
+                )
+            })?;
         let (original, retained_revision, retained_envelope) =
             super::user_automation_store::validate_normalization_record(&record)
                 .map_err(user_automation_gateway_unknown)?;
@@ -2962,7 +2957,8 @@ impl KernelStoreGateway {
             &request.intent.operation,
             UserAutomationOperation::Create { .. } | UserAutomationOperation::Edit { .. }
         ) {
-            self.validate_submitted_normalization_owner(&request).await?;
+            self.validate_submitted_normalization_owner(&request)
+                .await?;
         }
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         // The sealed request is the one value this frame must keep across every
@@ -3079,25 +3075,24 @@ impl KernelStoreGateway {
             && original.context.product_id == request.context.product_id
             && original.context.source_id == request.context.source_id
             && original.context.state_fence == request.context.state_fence;
-        let migration_predecessor_matches = match (
-            &original.intent.operation,
-            &request.intent.operation,
-        ) {
-            (
-                UserAutomationOperation::MigrateLegacySchedule {
-                    previous_revision, ..
-                },
-                UserAutomationOperation::Edit {
-                    previous_revision: submitted, ..
-                },
-            ) => previous_revision == submitted,
-            (UserAutomationOperation::NormalizeSchedule { .. }, _) => true,
-            _ => false,
-        };
-        let submitted_revision_json = serde_json::to_string(revision)
-            .map_err(user_automation_gateway_unknown)?;
-        let submitted_envelope = serde_json::to_value(envelope)
-            .map_err(user_automation_gateway_unknown)?;
+        let migration_predecessor_matches =
+            match (&original.intent.operation, &request.intent.operation) {
+                (
+                    UserAutomationOperation::MigrateLegacySchedule {
+                        previous_revision, ..
+                    },
+                    UserAutomationOperation::Edit {
+                        previous_revision: submitted,
+                        ..
+                    },
+                ) => previous_revision == submitted,
+                (UserAutomationOperation::NormalizeSchedule { .. }, _) => true,
+                _ => false,
+            };
+        let submitted_revision_json =
+            serde_json::to_string(revision).map_err(user_automation_gateway_unknown)?;
+        let submitted_envelope =
+            serde_json::to_value(envelope).map_err(user_automation_gateway_unknown)?;
         if !same_context
             || !migration_predecessor_matches
             || record.revision_json != submitted_revision_json
@@ -3107,11 +3102,10 @@ impl KernelStoreGateway {
         {
             return Err(normalization_receipt_binding());
         }
-        let operation_kind =
-            super::user_automation_store::submitted_normalization_operation_kind(
-                &request.intent.operation,
-            )
-            .map_err(|_| normalization_receipt_binding())?;
+        let operation_kind = super::user_automation_store::submitted_normalization_operation_kind(
+            &request.intent.operation,
+        )
+        .map_err(|_| normalization_receipt_binding())?;
         super::user_automation_store::revision_with_owner_normalization_receipt(
             revision,
             &retained_envelope,

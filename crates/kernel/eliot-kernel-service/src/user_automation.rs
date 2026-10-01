@@ -83,10 +83,8 @@ impl UserAutomationServiceRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
-        if !operation_revisions_are_owned_by(
-            &self.intent.operation,
-            &self.authenticated_principal,
-        ) {
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
         Ok(())
@@ -123,10 +121,8 @@ impl UserAutomationServiceRequest {
                 "request.schedule_normalization.principal",
             ));
         }
-        if !operation_revisions_are_owned_by(
-            &self.intent.operation,
-            &self.authenticated_principal,
-        ) {
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
             return Err(UserAutomationError::Invalid(
                 "request.schedule_normalization.owner_principal",
             ));
@@ -170,10 +166,8 @@ impl UserAutomationStoreRequest {
         if self.intent.principal_ref != self.authenticated_principal {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
-        if !operation_revisions_are_owned_by(
-            &self.intent.operation,
-            &self.authenticated_principal,
-        ) {
+        if !operation_revisions_are_owned_by(&self.intent.operation, &self.authenticated_principal)
+        {
             return Err(UserAutomationServiceError::PrincipalMismatch);
         }
         if self.intent.state_fence != self.context.state_fence {
@@ -189,9 +183,8 @@ impl UserAutomationStoreRequest {
 /// operator request too; a caller cannot relabel another owner's automation
 /// by supplying a matching revision identifier.
 fn operation_revisions_are_owned_by(operation: &UserAutomationOperation, principal: &str) -> bool {
-    let owned_by_principal = |revision: &UserAutomationRevision| {
-        revision.owner_principal.as_str() == principal
-    };
+    let owned_by_principal =
+        |revision: &UserAutomationRevision| revision.owner_principal.as_str() == principal;
     match operation {
         UserAutomationOperation::Create { revision, .. }
         | UserAutomationOperation::NormalizeSchedule { revision, .. } => {

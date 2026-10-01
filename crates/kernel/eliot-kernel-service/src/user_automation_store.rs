@@ -328,22 +328,21 @@ impl<C> CanonicalUserAutomationStore<C> {
         };
         let record_automation_id = string("automation_id")?;
         let record_revision = string("revision")?;
-        let operation_id = eliot_store_api::OperationId::new(string("operation_id")?).map_err(
-            |_| StoreError::InvalidField {
-                field: "operation_id",
-                reason: "retained normalization operation identity is malformed",
-            },
-        )?;
-        let state_fence: StateFence = serde_json::from_value(
-            entry
-                .get("state_fence")
-                .cloned()
-                .ok_or(StoreError::InvalidField {
+        let operation_id =
+            eliot_store_api::OperationId::new(string("operation_id")?).map_err(|_| {
+                StoreError::InvalidField {
+                    field: "operation_id",
+                    reason: "retained normalization operation identity is malformed",
+                }
+            })?;
+        let state_fence: StateFence =
+            serde_json::from_value(entry.get("state_fence").cloned().ok_or(
+                StoreError::InvalidField {
                     field: "state_fence",
                     reason: "retained normalization fence is missing",
-                })?,
-        )
-        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+                },
+            )?)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
         let task_id = match entry.get("task_id") {
             Some(Value::Null) => None,
             Some(Value::String(value)) => Some(value.clone()),
@@ -354,13 +353,14 @@ impl<C> CanonicalUserAutomationStore<C> {
                 });
             }
         };
-        let normalization_receipt_json = entry
-            .get("normalization_receipt_json")
-            .cloned()
-            .ok_or(StoreError::InvalidField {
-                field: "normalization_receipt_json",
-                reason: "retained normalization envelope is missing",
-            })?;
+        let normalization_receipt_json =
+            entry
+                .get("normalization_receipt_json")
+                .cloned()
+                .ok_or(StoreError::InvalidField {
+                    field: "normalization_receipt_json",
+                    reason: "retained normalization envelope is missing",
+                })?;
         let record = UserAutomationNormalizationRecord {
             automation_id: record_automation_id,
             revision: record_revision,
@@ -1222,12 +1222,9 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             revision.to_owned(),
         )?;
         let response = self.client.execute_named(request.clone()).await?;
-        let Some(record) = Self::project_normalization_record(
-            automation_id,
-            revision,
-            &request,
-            response,
-        )? else {
+        let Some(record) =
+            Self::project_normalization_record(automation_id, revision, &request, response)?
+        else {
             return Ok(None);
         };
         let receipt = self
@@ -1664,18 +1661,17 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             });
         }
         let entry = &entries[0];
-        let document = entry
-            .get("revision_json")
-            .and_then(Value::as_str)
-            .ok_or(StoreError::InvalidField {
-                field: "automation.revision_json",
-                reason: "stored predecessor document malformed",
-            })?;
+        let document =
+            entry
+                .get("revision_json")
+                .and_then(Value::as_str)
+                .ok_or(StoreError::InvalidField {
+                    field: "automation.revision_json",
+                    reason: "stored predecessor document malformed",
+                })?;
         let parsed: UserAutomationRevision = serde_json::from_str(document)
             .map_err(|error| StoreError::Serialization(error.to_string()))?;
-        if parsed.validate().is_err()
-            && parsed.validate_legacy_for_schedule_migration().is_err()
-        {
+        if parsed.validate().is_err() && parsed.validate_legacy_for_schedule_migration().is_err() {
             return Err(StoreError::InvalidField {
                 field: "automation.revision",
                 reason: "stored predecessor is neither current nor migratable legacy",
@@ -2165,11 +2161,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         let operation_id = transition.identity.operation_id.clone();
         let idempotency_key = transition.identity.idempotency_key.clone();
         let state_fence = transition.state_fence.clone();
-        let receipt = if let Some(existing) = self
-            .client
-            .receipt(operation_id.clone())
-            .await?
-        {
+        let receipt = if let Some(existing) = self.client.receipt(operation_id.clone()).await? {
             if existing.idempotency_key != idempotency_key
                 || existing.canonical_request_hash != request_hash
             {
@@ -2808,15 +2800,21 @@ fn validate_retained_normalization_record(
         || record.scope_id != USER_AUTOMATION_SCOPE
         || record.state_fence != original.context.state_fence
         || record.task_id.as_deref()
-            != original.context.task_id.as_ref().map(ToString::to_string).as_deref()
+            != original
+                .context
+                .task_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
     {
         return Err(invalid());
     }
     let revision: UserAutomationRevision = serde_json::from_str(&record.revision_json)
         .map_err(|error| StoreError::Serialization(error.to_string()))?;
     revision.validate().map_err(|_| invalid())?;
-    let envelope: ReceiptEnvelope = serde_json::from_value(record.normalization_receipt_json.clone())
-        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let envelope: ReceiptEnvelope =
+        serde_json::from_value(record.normalization_receipt_json.clone())
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
     let (draft, occurrence_count, expected_kind, predecessor) = match &original.intent.operation {
         UserAutomationOperation::NormalizeSchedule {
             revision,
@@ -2891,8 +2889,9 @@ pub fn validate_normalization_record(
     validate_retained_normalization_record(record, &original)?;
     let revision: UserAutomationRevision = serde_json::from_str(&record.revision_json)
         .map_err(|error| StoreError::Serialization(error.to_string()))?;
-    let envelope: ReceiptEnvelope = serde_json::from_value(record.normalization_receipt_json.clone())
-        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let envelope: ReceiptEnvelope =
+        serde_json::from_value(record.normalization_receipt_json.clone())
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
     Ok((original, revision, envelope))
 }
 
@@ -3117,7 +3116,8 @@ fn automation_scope(operation: &UserAutomationOperation) -> Result<String, Store
         | UserAutomationOperation::InspectLastFailure { automation_id } => {
             Ok(automation_id.clone())
         }
-        UserAutomationOperation::GetContext | UserAutomationOperation::DecideImprovementBrief { .. } => {
+        UserAutomationOperation::GetContext
+        | UserAutomationOperation::DecideImprovementBrief { .. } => {
             Err(StoreError::UnknownOperation)
         }
     }
