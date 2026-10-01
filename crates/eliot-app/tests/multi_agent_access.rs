@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -21,21 +22,129 @@ const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DIAGNOSTIC_TAIL_BYTES: u64 = 8 * 1024;
 static DAEMON_RUNTIME_LEASE: Mutex<()> = Mutex::new(());
 
+// Fixture-root uniqueness counter. `OwnedRuntime::new` used to derive its
+// runtime path from a wall-clock nanosecond plus the process ID alone, which is
+// not collision-free: on Windows the system clock is coarse enough that two
+// tests constructing a fixture in the same instant on the same thread pool can
+// be handed the SAME path, and the first one to finish deletes the shared root
+// out from under the other (`OwnedRuntime::drop` calls `remove_dir_all`).
+// `DAEMON_RUNTIME_LEASE` used to hide this by serializing every daemon test in
+// this binary. Now that the front-door tests no longer need that lease, the
+// counter makes each fixture root genuinely unique regardless of scheduling.
+static RUNTIME_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// Canonical front-door refusal contract (retirement of the legacy route)
+// ---------------------------------------------------------------------------
+//
+// Every test below used to start a real `eliot-governor daemon run` runtime and
+// assert live Governor/MCP behaviour over it. That route no longer exists, so
+// each test now asserts the contract the product actually publishes: the
+// retired entrypoint refuses fail-closed with a stable machine-readable code
+// plus the canonical Kernel-governed route, and serves nothing.
+//
+// Owner of the refusal: `crates/eliot-app/src/front_door_cutover.rs`
+// (`LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER`, `LEGACY_ENTRYPOINT_CANONICAL_ROUTE`).
+// `assert_canonical_route_matches_source` re-reads that module so the two
+// literals below are proven against the real owner instead of assumed, and a
+// future change to the owner's text fails here rather than silently passing.
+
+/// Exact `code` field of every retired-entrypoint refusal receipt.
+const EXPECTED_CUTOVER_CODE: &str = "LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER";
+
+/// Exact `canonical_route` field of every retired-entrypoint refusal receipt,
+/// copied verbatim from `LEGACY_ENTRYPOINT_CANONICAL_ROUTE`.
+const EXPECTED_CANONICAL_ROUTE: &str = "eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)";
+
+/// Fails unless the two literals above still match the real owner module, byte
+/// for byte. This is what keeps the fixture honest: the expectation is read
+/// back from `crates/eliot-app/src/front_door_cutover.rs`, never fabricated.
+fn assert_canonical_route_matches_source() -> TestResult {
+    let source =
+        fs::read_to_string(repository_root()?.join("crates/eliot-app/src/front_door_cutover.rs"))?;
+    for declaration in [
+        format!(
+            "pub const LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER: &str = \"{EXPECTED_CUTOVER_CODE}\";"
+        ),
+        format!(
+            "pub const LEGACY_ENTRYPOINT_CANONICAL_ROUTE: &str = \"{EXPECTED_CANONICAL_ROUTE}\";"
+        ),
+    ] {
+        assert!(
+            source.contains(&declaration),
+            "crates/eliot-app/src/front_door_cutover.rs no longer declares {declaration}"
+        );
+    }
+    Ok(())
+}
+
+/// Asserts the full published refusal receipt for one retired entrypoint:
+/// fail-closed nonzero exit, stable code, exact canonical route,
+/// `completed: false`, and a detail that names both the retirement and the
+/// canonical route. Returns the parsed receipt so callers can add route-specific
+/// evidence.
+fn assert_canonical_front_door_refusal(
+    output: &std::process::Output,
+    label: &str,
+) -> TestResult<Value> {
+    assert!(
+        !output.status.success(),
+        "{label} unexpectedly served instead of refusing"
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("{label} published no refusal receipt: {error}"))?;
+    assert_canonical_front_door_receipt(&receipt, label)
+}
+
+/// Asserts the parsed refusal receipt itself, so a receipt captured to a file
+/// by a reaped child is checked exactly like one captured from `output()`.
+fn assert_canonical_front_door_receipt(receipt: &Value, label: &str) -> TestResult<Value> {
+    assert_eq!(receipt["status"], "ERROR", "{label} receipt: {receipt}");
+    assert_eq!(
+        receipt["code"], EXPECTED_CUTOVER_CODE,
+        "{label} receipt: {receipt}"
+    );
+    assert_eq!(
+        receipt["canonical_route"], EXPECTED_CANONICAL_ROUTE,
+        "{label} receipt: {receipt}"
+    );
+    assert_eq!(
+        receipt["completed"], false,
+        "{label} must stay fail-closed: {receipt}"
+    );
+    let detail = receipt["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("is retired"),
+        "{label} detail must record the retirement: {detail}"
+    );
+    assert!(
+        detail.contains(EXPECTED_CANONICAL_ROUTE),
+        "{label} detail must name the canonical route: {detail}"
+    );
+    Ok(receipt.clone())
+}
+
+// CONTRACT UPDATE (lane W4, fix/app-daemon-front-door-W4).
+//
+// Document: `docs/release/WINDOWS_X64_RELEASE.md`, "Claude Code front door
+// (issue #1719, OSP1 step 1')" paragraph. Sentence: "plus every non-stdio
+// entrypoint (`daemon run`, `service run`, `hook`, and the rest),
+// unconditionally refuse with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the
+// canonical-route receipt."
+//
+// What this test asserted before: that the facade and the daemon resolve ONE
+// runtime across two Windows spellings of the same config path (raw and
+// `canonicalize()`d), proved by one shared `runtime_id` in the publication.
+// What it asserts now: the one-runtime property survives as one-ROUTE
+// invariance. Both spellings of the same config path produce the identical
+// canonical front-door receipt, so the retired route has exactly one outcome
+// and Windows path spelling cannot fork it.
 #[test]
-fn facade_and_daemon_resolve_one_runtime_across_windows_path_spellings() -> TestResult {
-    let _runtime_lease = daemon_runtime_lease();
+fn facade_and_daemon_refuse_one_canonical_route_across_windows_path_spellings() -> TestResult {
+    assert_canonical_route_matches_source()?;
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
-
-    let mut daemon = start_daemon(&config_path)?;
-    wait_for_changed_json(
-        &mut daemon,
-        &runtime.path().join("runtime").join("publication.json"),
-        "auth_generation",
-        "",
-        DAEMON_READY_TIMEOUT,
-    )?;
 
     let canonical_config = config_path.canonicalize()?;
     assert_ne!(
@@ -44,74 +153,123 @@ fn facade_and_daemon_resolve_one_runtime_across_windows_path_spellings() -> Test
         "the red test requires Windows canonicalization to add a distinct path spelling"
     );
 
-    let mut facade = governor_command(runtime.path())
-        .arg("--config")
-        .arg(&canonical_config)
-        .args(["mcp", "stdio", "--profile", "external_auditor"])
-        .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdin = facade.stdin.take().ok_or("facade stdin unavailable")?;
-    serde_json::to_writer(
-        &mut stdin,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "multi-agent-red", "version": "0.1.0"}
-            }
-        }),
+    let raw = run_refused_daemon(runtime.path(), &config_path, "raw path spelling")?;
+    let canonical = run_refused_daemon(
+        runtime.path(),
+        &canonical_config,
+        "canonicalized path spelling",
     )?;
-    writeln!(stdin)?;
-    drop(stdin);
-    let output = facade.wait_with_output()?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "facade exited before initialize: {stderr}"
-    );
-    let response: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(
-        response
-            .pointer("/result/serverInfo/name")
-            .and_then(Value::as_str),
-        Some("eliot-governor")
+        raw["canonical_route"], canonical["canonical_route"],
+        "one canonical front door must serve both path spellings"
     );
+    assert_eq!(raw["code"], canonical["code"]);
+    assert_eq!(raw["status"], canonical["status"]);
 
-    fs::write(
-        runtime.path().join("runtime").join("stop.requested"),
-        "test\n",
-    )?;
-    daemon.wait_for_exit(Duration::from_secs(10))?;
+    // Neither spelling started a runtime, so no publication or IPC
+    // authentication artifact exists for this fixture root.
+    assert!(
+        !runtime
+            .path()
+            .join("runtime")
+            .join("publication.json")
+            .exists()
+    );
+    assert!(
+        !runtime
+            .path()
+            .join("runtime")
+            .join("ipc-auth.json")
+            .exists()
+    );
     Ok(())
 }
 
+/// Runs the retired `daemon run` arm with its receipt captured to a file and
+/// waits, bounded, for the fail-closed refusal to be published. Returns the
+/// parsed receipt. The child is always reaped, so a wedged fixture cannot hang
+/// the suite.
+///
+/// This deliberately uses a bare `Child`, not [`OwnedChild`]: the retired arm
+/// refuses in milliseconds and never spawns a process tree, so there is no
+/// tree to guard, and `ProcessTreeGuard::attach` would race the immediate exit
+/// (its `OpenProcess` can already report the exited process as not found).
+fn run_refused_daemon(fixture_root: &Path, config_path: &Path, label: &str) -> TestResult<Value> {
+    let runtime_dir = fixture_root.join("runtime");
+    fs::create_dir_all(&runtime_dir)?;
+    let receipt_path = runtime_dir.join(format!("daemon-receipt-{label}.json"));
+    let stdout = fs::File::create(&receipt_path)?;
+    let mut child = governor_command(fixture_root)
+        .arg("--config")
+        .arg(config_path)
+        .args(["daemon", "run"])
+        .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .spawn()?;
+    let status = wait_for_child_exit(&mut child, DAEMON_READY_TIMEOUT, label)?;
+    assert!(
+        !status.success(),
+        "{label} unexpectedly served instead of refusing"
+    );
+    let receipt: Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+    assert_canonical_front_door_receipt(&receipt, label)
+}
+
+/// Bounded wait for one child to exit, killing it if it overruns the deadline.
+fn wait_for_child_exit(
+    child: &mut Child,
+    timeout: Duration,
+    label: &str,
+) -> TestResult<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Err(format!("{label} did not refuse within {}s", timeout.as_secs()).into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+// CONTRACT UPDATE (lane W4, fix/app-daemon-front-door-W4).
+//
+// Document: `docs/release/WINDOWS_X64_RELEASE.md`, "Claude Code front door
+// (issue #1719, OSP1 step 1')" paragraph. Sentence: "plus every non-stdio
+// entrypoint (`daemon run`, `service run`, `hook`, and the rest),
+// unconditionally refuse with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the
+// canonical-route receipt."
+//
+// What this test asserted before: a live daemon plus a deliberately corrupted
+// `runtime/ipc-auth.json`, and both `daemon doctor` and the facade naming the
+// exact `authentication_field_mismatch` / `pipe_name` runtime mismatch.
+// What it asserts now: the discriminating property that survives retirement —
+// neither surface reaches runtime authentication at all. A mismatched
+// authentication artifact can no longer be read, because both arms refuse at
+// the entry gate first, so the mismatch can never be the reported cause.
 #[test]
-fn doctor_and_facade_name_the_exact_authentication_mismatch() -> TestResult {
-    let _runtime_lease = daemon_runtime_lease();
+fn doctor_and_facade_name_the_canonical_route_instead_of_a_runtime_mismatch() -> TestResult {
+    assert_canonical_route_matches_source()?;
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
-    let mut daemon = start_daemon(&config_path)?;
-    wait_for_changed_json(
-        &mut daemon,
-        &runtime.path().join("runtime").join("publication.json"),
-        "auth_generation",
-        "",
-        DAEMON_READY_TIMEOUT,
-    )?;
-
-    let authentication_path = runtime.path().join("runtime").join("ipc-auth.json");
-    let mut authentication: Value = serde_json::from_slice(&fs::read(&authentication_path)?)?;
-    authentication["pipe_name"] = Value::String(r"\\.\pipe\wrong-runtime".to_owned());
+    let runtime_dir = runtime.path().join("runtime");
+    fs::create_dir_all(&runtime_dir)?;
+    // The exact corrupted artifact the retired expectation depended on: a
+    // runtime authentication file whose `pipe_name` names a foreign runtime.
     fs::write(
-        &authentication_path,
-        serde_json::to_vec_pretty(&authentication)?,
+        runtime_dir.join("ipc-auth.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "runtime_id": "multi-agent-path-identity",
+            "pipe_name": r"\\.\pipe\wrong-runtime",
+            "token": "test-only-token",
+            "token_generation_id": "test-only-generation"
+        }))?,
     )?;
 
     let doctor = governor_command(runtime.path())
@@ -119,53 +277,68 @@ fn doctor_and_facade_name_the_exact_authentication_mismatch() -> TestResult {
         .arg(&config_path)
         .args(["daemon", "doctor"])
         .output()?;
-    assert!(doctor.status.success());
-    let doctor: Value = serde_json::from_slice(&doctor.stdout)?;
-    assert_eq!(doctor["status"], "not_ready");
-    assert_eq!(
-        doctor.pointer("/authentication_error/error_code"),
-        Some(&Value::String("authentication_field_mismatch".to_owned()))
-    );
-    assert!(
-        doctor["authentication_error"]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.ends_with("pipe_name"))
-    );
+    assert_canonical_front_door_refusal(&doctor, "daemon doctor")?;
 
-    let output = governor_command(runtime.path())
+    let facade = governor_command(runtime.path())
         .arg("--config")
         .arg(&config_path)
         .args(["mcp", "stdio", "--profile", "external_auditor"])
         .stdin(Stdio::null())
         .output()?;
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("runtime authentication mismatch: pipe_name")
-    );
+    assert_canonical_front_door_refusal(&facade, "mcp stdio external_auditor")?;
 
-    fs::write(
-        runtime.path().join("runtime").join("stop.requested"),
-        "test\n",
-    )?;
-    daemon.wait_for_exit(Duration::from_secs(10))?;
+    for (label, output) in [("daemon doctor", &doctor), ("mcp stdio", &facade)] {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for unreachable_diagnosis in [
+            "authentication_field_mismatch",
+            "runtime authentication mismatch",
+            "wrong-runtime",
+        ] {
+            assert!(
+                !combined.contains(unreachable_diagnosis),
+                "{label} still reports the retired runtime diagnosis {unreachable_diagnosis}: {combined}"
+            );
+        }
+    }
+    // No daemon was started for either arm, so the fixture publishes no
+    // runtime state of its own.
+    assert!(!runtime_dir.join("publication.json").exists());
     Ok(())
 }
 
+// CONTRACT UPDATE (lane W4, fix/app-daemon-front-door-W4).
+//
+// Document: `docs/release/WINDOWS_X64_RELEASE.md`, "Claude Code front door
+// (issue #1719, OSP1 step 1')" paragraph. Sentence: "plus every non-stdio
+// entrypoint (`daemon run`, `service run`, `hook`, and the rest),
+// unconditionally refuse with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the
+// canonical-route receipt."
+//
+// Document: `crates/eliot-app/src/front_door_cutover.rs`, module contract.
+// Sentence: "A delegated host at the default profile ... emits the stable code
+// plus canonical-route receipt and delegates to the approved Bridge. All other
+// host/profile values, including the Codex `codex_controller` profile whose
+// behavior home is the `eliot-mcp` track with no current-owner Bridge contour
+// (issue #18 W11), are rejected with the same stable code and receipt before
+// `mcp_stdio::run`."
+//
+// What this test asserted before: a widening `initialize` handshake carrying
+// `eliotProfile: codex_controller` over an `external_auditor` session, refused
+// with JSON-RPC -32603 "cannot widen handshake profile".
+// What it asserts now: the property that survives retirement — the widening
+// handshake is not answered at all. There is no authenticated legacy session to
+// widen, so neither the handshake nor the -32603 profile-widening refusal is
+// reachable.
 #[test]
-fn initialize_cannot_widen_the_authenticated_profile() -> TestResult {
-    let _runtime_lease = daemon_runtime_lease();
+fn initialize_cannot_widen_a_profile_because_no_legacy_session_is_served() -> TestResult {
+    assert_canonical_route_matches_source()?;
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
-    let mut daemon = start_daemon(&config_path)?;
-    wait_for_changed_json(
-        &mut daemon,
-        &runtime.path().join("runtime").join("publication.json"),
-        "auth_generation",
-        "",
-        DAEMON_READY_TIMEOUT,
-    )?;
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -178,40 +351,63 @@ fn initialize_cannot_widen_the_authenticated_profile() -> TestResult {
             "eliotProfile": "codex_controller"
         }
     });
-    let responses = run_facade_requests(&config_path, "external_auditor", &[request])?;
-    assert_eq!(
-        responses[0].pointer("/error/code").and_then(Value::as_i64),
-        Some(-32603)
-    );
-    assert!(
-        responses[0]
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .is_some_and(|message| message.contains("cannot widen handshake profile"))
-    );
+    let mut facade = governor_command(runtime.path())
+        .arg("--config")
+        .arg(&config_path)
+        .args(["mcp", "stdio", "--profile", "external_auditor"])
+        .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = facade.stdin.take().ok_or("facade stdin unavailable")?;
+    serde_json::to_writer(&mut stdin, &request)?;
+    writeln!(stdin)?;
+    drop(stdin);
+    let output = facade.wait_with_output()?;
+    assert_canonical_front_door_refusal(&output, "widening initialize")?;
 
-    fs::write(
-        runtime.path().join("runtime").join("stop.requested"),
-        "test\n",
-    )?;
-    daemon.wait_for_exit(Duration::from_secs(10))?;
+    let served = String::from_utf8_lossy(&output.stdout);
+    for unreachable in [
+        "\"jsonrpc\"",
+        "-32603",
+        "cannot widen handshake profile",
+        "eliotProfile",
+    ] {
+        assert!(
+            !served.contains(unreachable),
+            "widening handshake reached the profile server ({unreachable}): {served}"
+        );
+    }
     Ok(())
 }
 
+// CONTRACT UPDATE (lane W4, fix/app-daemon-front-door-W4).
+//
+// Document: `docs/release/WINDOWS_X64_RELEASE.md`, "Claude Code front door
+// (issue #1719, OSP1 step 1')" paragraph. Sentence that retires the old
+// expectation: "plus every non-stdio entrypoint (`daemon run`, `service run`,
+// `hook`, and the rest), unconditionally refuse with
+// `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the canonical-route receipt."
+//
+// Document: `crates/eliot-app/src/front_door_cutover.rs`, module contract.
+// Sentence: "Every one of the 57 top-level `Command` arms - including `writer
+// smoke`/`drain`, `maintenance run`, `import` execute, `daemon`/`service`
+// status and control arms, `hook` arms, and read-only surfaces such as `mcp
+// catalog` - is refused unconditionally at the `dispatch_command` entry gate."
+//
+// What this test asserted before: one live daemon plus one facade per canonical
+// access profile, publishing a bounded tool set per profile.
+// What it asserts now: the causal property that survives retirement — no
+// canonical profile can publish any tool set at all, because every profile is
+// refused at the entry gate before a daemon, store, ControlWal or writer is
+// constructed.
 #[test]
-fn canonical_profiles_publish_bounded_tool_sets() -> TestResult {
-    let _runtime_lease = daemon_runtime_lease();
+fn canonical_profiles_are_refused_and_publish_no_tool_sets() -> TestResult {
+    assert_canonical_route_matches_source()?;
     let runtime = OwnedRuntime::new()?;
     let config_path = runtime.path().join("config").join("governor.toml");
     write_test_config(runtime.path(), &config_path, free_local_port()?)?;
-    let mut daemon = start_daemon(&config_path)?;
-    wait_for_changed_json(
-        &mut daemon,
-        &runtime.path().join("runtime").join("publication.json"),
-        "auth_generation",
-        "",
-        DAEMON_READY_TIMEOUT,
-    )?;
 
     for profile in [
         "codex_controller",
@@ -222,77 +418,60 @@ fn canonical_profiles_publish_bounded_tool_sets() -> TestResult {
         "verifier",
         "human_readonly",
     ] {
-        let responses = run_facade_requests(
-            &config_path,
-            profile,
-            &[
-                initialize_request(1, profile),
-                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
-            ],
-        )?;
-        assert_eq!(
-            responses[0]
-                .pointer("/result/experimental/eliotAgentSession/access_profile")
-                .and_then(Value::as_str),
-            Some(profile)
-        );
-        let mut names = responses[1]
-            .pointer("/result/tools")
-            .and_then(Value::as_array)
-            .ok_or("profile tools missing")?
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect::<Vec<_>>();
-        if profile == "external_auditor" {
-            names.sort_unstable();
-            assert_eq!(
-                names,
-                vec![
-                    "eliot_current_state",
-                    "eliot_fetch_l2",
-                    "eliot_recall_l0",
-                    "eliot_runtime_status",
-                ],
-                "{profile}"
+        let mut facade = governor_command(runtime.path())
+            .arg("--config")
+            .arg(&config_path)
+            .args(["mcp", "stdio", "--profile", profile])
+            .env("ELIOT_DISABLE_REAL_PROVIDER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = facade.stdin.take().ok_or("facade stdin unavailable")?;
+        serde_json::to_writer(&mut stdin, &initialize_request(1, profile))?;
+        writeln!(stdin)?;
+        drop(stdin);
+        let output = facade.wait_with_output()?;
+        assert_canonical_front_door_refusal(&output, profile)?;
+        // No MCP session exists, so no profile publishes a tool set and no
+        // access profile is ever reported back to a caller.
+        let served = String::from_utf8_lossy(&output.stdout);
+        for forbidden in ["\"jsonrpc\"", "\"tools\"", "access_profile", "serverInfo"] {
+            assert!(
+                !served.contains(forbidden),
+                "{profile} served MCP content ({forbidden}): {served}"
             );
-            continue;
-        }
-        if matches!(
-            profile,
-            "codex_worker" | "claude_governed" | "dynamic_agent"
-        ) {
-            names.sort_unstable();
-            let mut expected = vec![
-                "eliot_current_state",
-                "eliot_recall_l0",
-                "eliot_fetch_l2",
-                "eliot_compile_packet_l3",
-                "eliot_agent_candidate_submit",
-                "eliot.observe",
-                "eliot_memory_influence_trace",
-                "eliot_write_cognitive_observation",
-            ];
-            expected.sort_unstable();
-            assert_eq!(names, expected, "{profile}");
-            continue;
-        }
-        assert!(names.contains(&"eliot_project_identity"));
-        assert!(names.contains(&"eliot_runtime_status"));
-        match profile {
-            "codex_controller" => assert!(names.contains(&"eliot_submit_completion_proof")),
-            "verifier" | "human_readonly" => {
-                assert!(!names.contains(&"eliot_agent_candidate_submit"));
-                assert!(!names.contains(&"eliot_submit_completion_proof"));
-            }
-            _ => unreachable!(),
         }
     }
 
-    fs::write(
-        runtime.path().join("runtime").join("stop.requested"),
-        "test\n",
-    )?;
-    daemon.wait_for_exit(Duration::from_secs(10))?;
+    // A refused profile never reaches a runtime: no publication and no IPC
+    // authentication artifact may exist for this fixture root.
+    assert!(
+        !runtime
+            .path()
+            .join("runtime")
+            .join("publication.json")
+            .exists()
+    );
+    assert!(
+        !runtime
+            .path()
+            .join("runtime")
+            .join("ipc-auth.json")
+            .exists()
+    );
+
+    // Document: `docs/release/WINDOWS_X64_RELEASE.md`, same paragraph. Sentence:
+    // "`ELIOT_CLAUDE_FRONT_DOOR` survives only as refusal evidence and never
+    // gates behavior." Setting the operator flag must therefore still refuse.
+    let flagged = governor_command(runtime.path())
+        .arg("--config")
+        .arg(&config_path)
+        .args(["mcp", "stdio", "--profile", "external_auditor"])
+        .env("ELIOT_CLAUDE_FRONT_DOOR", "agent-bridge")
+        .stdin(Stdio::null())
+        .output()?;
+    assert_canonical_front_door_refusal(&flagged, "agent-bridge flagged facade")?;
     Ok(())
 }
 
@@ -868,8 +1047,9 @@ struct OwnedRuntime(PathBuf);
 impl OwnedRuntime {
     fn new() -> TestResult<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let sequence = RUNTIME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "eliot-multi-agent-path-identity-{}-{nonce}",
+            "eliot-multi-agent-path-identity-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&path)?;

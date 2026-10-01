@@ -1,526 +1,336 @@
-use eliot_store::CanonicalStore;
-use eliot_types::{
-    CredentialProviderKind, GovernorConfig, ProjectId, TaskId, WriteId,
-    compile_packet_minimal_example,
-};
-use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use serde_json::Value;
 use std::fs;
-use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, JoinHandle};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+// ---------------------------------------------------------------------------
+// Canonical front-door refusal contract (retirement of the legacy route)
+// ---------------------------------------------------------------------------
+//
+// Every test in this file used to start a real legacy runtime — its own pinned
+// SurrealDB 3.1.4, its own `governor.toml`, its own `eliot-governor daemon run` —
+// and then spoke the UL-01 JSON-RPC contract (`INVALID_TOOL_INPUT`,
+// `ENCODING_REJECTED`, packet budget decisions) over the legacy MCP surface.
+// That route no longer exists, so each test now asserts the contract the
+// product actually publishes: the retired daemon and MCP arms refuse
+// fail-closed with a stable machine-readable code plus the canonical
+// Kernel-governed route, and no runtime report is ever published.
+//
+// Cluster-3 determination (asked for by the lane owner): this is the SAME root
+// cause as the `multi_agent_access` and `dogfood_runtime` clusters, not a
+// daemon-readiness harness defect. `start_daemon` here spawns the retired
+// `eliot-governor --config <fixture> daemon run`, which `dispatch_command`
+// refuses at the entry gate before `commands::run_daemon` can construct a
+// `DbClientSet`, `CanonicalStore`, `ControlWal` or `WriterActor`. The refusal
+// text appears verbatim in the BEFORE stderr tail for this binary. The
+// misleading "daemon runtime report did not become ready for PID <n>" message is
+// a second, independent harness defect: `wait_for_runtime_pid` polls only files
+// and never observes the child's exit, so an immediate refusal is misreported as
+// a 30-second readiness timeout.
+//
+// Owner of the refusal: `crates/eliot-app/src/front_door_cutover.rs`
+// (`LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER`, `LEGACY_ENTRYPOINT_CANONICAL_ROUTE`).
+// `assert_canonical_route_matches_source` re-reads that module so the two
+// literals below are proven against the real owner instead of assumed.
 
-#[test]
-fn t01_incomplete_frame_returns_one_32602() -> TestResult {
-    let _guard = test_guard();
-    let mut harness = Harness::start("incomplete-frame")?;
-    let schema = harness.compile_packet_schema(10)?;
-    let mut input = compile_packet_minimal_example();
-    let frame = input
-        .get_mut("material_frame")
-        .and_then(Value::as_object_mut)
-        .ok_or("minimal example has no material frame")?;
-    for field in [
-        "active_plan",
-        "completed_work",
-        "killed_paths",
-        "expected_observable",
-    ] {
-        frame.remove(field);
-    }
+/// Exact `code` field of every retired-entrypoint refusal receipt.
+const EXPECTED_CUTOVER_CODE: &str = "LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER";
 
-    let response = harness
-        .client
-        .tool_call_response(11, "eliot_compile_packet_l3", &input)?;
-    let error = response.get("error").ok_or("expected one JSON-RPC error")?;
-    assert!(response.get("result").is_none());
-    assert_eq!(error["code"], -32602);
-    assert_eq!(error["data"]["code"], "INVALID_TOOL_INPUT");
-    let missing = error["data"]["missing"]
-        .as_array()
-        .ok_or("error data missing list is absent")?
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<BTreeSet<_>>();
-    for path in [
-        "material_frame.active_plan",
-        "material_frame.completed_work",
-        "material_frame.killed_paths",
-        "material_frame.expected_observable",
+/// Exact `canonical_route` field of every retired-entrypoint refusal receipt,
+/// copied verbatim from `LEGACY_ENTRYPOINT_CANONICAL_ROUTE`.
+const EXPECTED_CANONICAL_ROUTE: &str = "eliot setup through the Kernel canonical configuration surface (Host-managed StoreLaunchConfig bound to the installation manifest; Governor operates only as outbound-only eliotd polling Kernel; typed policy resolves only through eliotd::canonical_config_precedence)";
+
+/// Fails unless the two literals above still match the real owner module, byte
+/// for byte, so the fixture can never be a fabricated pass.
+fn assert_canonical_route_matches_source() -> TestResult {
+    let source =
+        fs::read_to_string(repository_root()?.join("crates/eliot-app/src/front_door_cutover.rs"))?;
+    for declaration in [
+        format!(
+            "pub const LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER: &str = \"{EXPECTED_CUTOVER_CODE}\";"
+        ),
+        format!(
+            "pub const LEGACY_ENTRYPOINT_CANONICAL_ROUTE: &str = \"{EXPECTED_CANONICAL_ROUTE}\";"
+        ),
     ] {
         assert!(
-            missing.contains(path),
-            "missing field path {path}: {response}"
+            source.contains(&declaration),
+            "crates/eliot-app/src/front_door_cutover.rs no longer declares {declaration}"
         );
     }
-    assert_ne!(error["code"], -32603);
-    validate_schema(
-        &schema,
-        &schema,
-        &error["data"]["minimal_valid_example"],
-        "$",
-    )?;
     Ok(())
 }
 
-#[test]
-fn t01_bad_candidate_is_rejected_before_write() -> TestResult {
-    let _guard = test_guard();
-    if rerun_with_isolated_credential_backend("t01_bad_candidate_is_rejected_before_write")? {
-        return Ok(());
-    }
-    let mut harness = Harness::start("bad-candidate")?;
-    let (project_id, task_id) = harness.create_task(20)?;
-    let before = harness.current_revision(21, project_id)?;
-    let write_id = WriteId::new_v7();
-    let response = harness.client.tool_call_response(
-        22,
-        "eliot_agent_candidate_submit",
-        &candidate_arguments(
-            project_id,
-            task_id,
-            write_id,
-            "encoding",
-            "проверка ????? QUARTZ",
-        ),
-    )?;
-    assert_eq!(response["error"]["code"], -32602);
-    assert_eq!(response["error"]["data"]["code"], "ENCODING_REJECTED");
-    assert_eq!(
-        response["error"]["data"]["invalid"],
-        json!([{"field": "$.claim.statement", "reason": "qmark_run"}]),
-        "typed encoding violation differs: {response}"
+/// Asserts the full published refusal receipt: fail-closed nonzero exit, stable
+/// code, exact canonical route, `completed: false`, and a detail naming both the
+/// retirement and the canonical route.
+fn assert_canonical_front_door_refusal(output: &std::process::Output, label: &str) -> TestResult {
+    assert!(
+        !output.status.success(),
+        "{label} unexpectedly served instead of refusing"
     );
-
-    let exact = harness.client.tool_call(
-        23,
-        "eliot_fetch_l2",
-        &json!({
-            "project_id": project_id,
-            "handles": [format!("claim:{write_id}")]
-        }),
-    )?;
-    let after = harness.current_revision(24, project_id)?;
-    assert_eq!(exact["claims"].as_array().map(Vec::len), Some(0));
-    assert_eq!(exact["relations"].as_array().map(Vec::len), Some(0));
-    assert!(!harness.write_receipt_exists(write_id)?);
-    assert_eq!(before, after);
-    Ok(())
-}
-
-fn rerun_with_isolated_credential_backend(test_name: &str) -> TestResult<bool> {
-    if std::env::var("ELIOT_UL_T01_CREDENTIAL_CHILD").as_deref() == Ok(test_name) {
-        return Ok(false);
-    }
-    let credentials =
-        eliot_windows_ipc::test_support::IsolatedTestCredentialFixture::new(test_name)?;
-    let mut command = Command::new(std::env::current_exe()?);
-    credentials.configure_command(&mut command);
-    let status = command
-        .env("ELIOT_UL_T01_CREDENTIAL_CHILD", test_name)
-        .env("ELIOT_ALLOW_LEGACY_PASSWORD_FILE_MIGRATION", "1")
-        .args(["--exact", test_name, "--nocapture"])
-        .status()?;
-    if !status.success() {
-        return Err(format!("credential-gated child test failed with {status}").into());
-    }
-    Ok(true)
-}
-
-#[test]
-fn t01_packet_content_regression() -> TestResult {
-    let _guard = test_guard();
-    let mut harness = Harness::start("packet-content")?;
-    let (project_id, control_task_id) = harness.create_task(30)?;
-    let expanded_floor = harness.client.tool_call(
-        31,
-        "eliot_compile_packet_l3",
-        &json!({
-            "project_id": project_id,
-            "task_id": control_task_id,
-            "goal": "reserve the deterministic memory-free control arm",
-            "candidate_handles": [],
-            "max_tokens": 500,
-            "memory_mode": "memory_free_control"
-        }),
-    )?;
+    let receipt: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("{label} published no refusal receipt: {error}"))?;
+    assert_eq!(receipt["status"], "ERROR", "{label} receipt: {receipt}");
     assert_eq!(
-        expanded_floor["packet_budget_decision"]["preferred_tokens"],
-        500
+        receipt["code"], EXPECTED_CUTOVER_CODE,
+        "{label} receipt: {receipt}"
     );
     assert_eq!(
-        expanded_floor["packet_budget_decision"]["hard_ceiling_tokens"],
-        4_096
+        receipt["canonical_route"], EXPECTED_CANONICAL_ROUTE,
+        "{label} receipt: {receipt}"
+    );
+    assert_eq!(
+        receipt["completed"], false,
+        "{label} must stay fail-closed: {receipt}"
+    );
+    let detail = receipt["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("is retired"),
+        "{label} detail must record the retirement: {detail}"
     );
     assert!(
-        expanded_floor["packet_budget_decision"]["effective_tokens"]
-            .as_u64()
-            .is_some_and(|effective| effective >= 500),
-        "{expanded_floor}"
-    );
-    harness.client.tool_call(
-        32,
-        "eliot_compile_packet_l3",
-        &json!({
-            "project_id": project_id,
-            "task_id": control_task_id,
-            "goal": "reserve the deterministic memory-free control arm",
-            "candidate_handles": [],
-            "max_tokens": 1200,
-            "memory_mode": "memory_free_control"
-        }),
-    )?;
-    let task_id = harness.create_task_in_project(33, project_id)?;
-    let write_id = WriteId::new_v7();
-    harness.submit_candidate(
-        34,
-        project_id,
-        task_id,
-        write_id,
-        "quartz-config",
-        "QUARTZ pipeline reads config from quartz.toml",
-    )?;
-    let packet = harness.client.tool_call(
-        35,
-        "eliot_compile_packet_l3",
-        &json!({
-            "project_id": project_id,
-            "task_id": task_id,
-            "goal": "Inspect the QUARTZ pipeline",
-            "candidate_handles": [format!("claim:{write_id}")],
-            "max_tokens": 4_000,
-            "memory_mode": "include_case_candidates"
-        }),
-    )?;
-    assert!(
-        serde_json::to_string(&packet)?.contains("quartz.toml"),
-        "packet omitted candidate content: {packet}"
+        detail.contains(EXPECTED_CANONICAL_ROUTE),
+        "{label} detail must name the canonical route: {detail}"
     );
     Ok(())
 }
 
-fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-    TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-struct Harness {
+/// One retired fixture root with the legacy `governor.toml` the retired arms
+/// used to require. Constructing it proves the fixture is real; the arms below
+/// must still refuse to act on it.
+struct RetiredRouteFixture {
     runtime: OwnedRuntime,
-    port: u16,
     config_path: PathBuf,
-    client: McpClient,
-    daemon: OwnedChild,
-    surreal: OwnedChild,
-    store: CanonicalStore,
-    store_runtime: tokio::runtime::Runtime,
 }
 
-impl Harness {
-    fn start(name: &str) -> TestResult<Self> {
+impl RetiredRouteFixture {
+    fn new(name: &str) -> TestResult<Self> {
         let runtime = OwnedRuntime::new(name)?;
-        let port = test_port()?;
-        let surreal_exe = pinned_surreal_exe()?;
-        let password_file = runtime.path().join("secrets").join("surreal-root.txt");
-        fs::create_dir_all(password_file.parent().ok_or("password parent missing")?)?;
-        fs::write(&password_file, "ul-t01-test-secret")?;
         let config_path = runtime.path().join("config").join("governor.toml");
-        write_test_config(runtime.path(), &config_path, port, &surreal_exe)?;
-        let surreal = start_surreal(&surreal_exe, port)?;
-        wait_for_tcp(port, Duration::from_secs(20))?;
-        let daemon = start_daemon(&config_path)?;
-        wait_for_runtime_pid(
-            &runtime
-                .path()
-                .join("reports")
-                .join("runtime")
-                .join("latest.json"),
-            daemon.id()?,
-            Duration::from_secs(30),
-        )?;
-        let mut client = McpClient::start(&config_path)?;
-        client.initialize()?;
-        let store = CanonicalStore::new(store_config(runtime.path(), port, &surreal_exe)?);
-        let store_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        let surreal_exe = pinned_surreal_exe()?;
+        write_test_config(runtime.path(), &config_path, test_port()?, &surreal_exe)?;
         Ok(Self {
             runtime,
-            port,
             config_path,
-            client,
-            daemon,
-            surreal,
-            store,
-            store_runtime,
         })
     }
 
-    fn create_task(&mut self, request_id: u64) -> TestResult<(ProjectId, TaskId)> {
-        let project_id = ProjectId::new_v7();
-        let task_id = self.create_task_in_project(request_id, project_id)?;
-        Ok((project_id, task_id))
-    }
-
-    fn create_task_in_project(
-        &mut self,
-        request_id: u64,
-        project_id: ProjectId,
-    ) -> TestResult<TaskId> {
-        let task_id = TaskId::new_v7();
-        self.client.tool_call(
-            request_id,
-            "eliot_task_contract_create",
-            &json!({
-                "project_id": project_id,
-                "task_id": task_id,
-                "write_id": WriteId::new_v7(),
-                "title": "UL-01 contract repair",
-                "acceptance_items": [
-                    {
-                        "item_id": "behavior",
-                        "description": "requested behavior is present",
-                        "required_evidence": "observation"
-                    },
-                    {
-                        "item_id": "isolation",
-                        "description": "test uses an isolated real database",
-                        "required_evidence": "verification"
-                    }
-                ]
-            }),
-        )?;
-        Ok(task_id)
-    }
-
-    fn submit_candidate(
-        &mut self,
-        request_id: u64,
-        project_id: ProjectId,
-        task_id: TaskId,
-        write_id: WriteId,
-        topic: &str,
-        statement: &str,
-    ) -> TestResult<Value> {
-        self.client.tool_call(
-            request_id,
-            "eliot_agent_candidate_submit",
-            &candidate_arguments(project_id, task_id, write_id, topic, statement),
-        )
-    }
-
-    fn current_revision(&mut self, request_id: u64, project_id: ProjectId) -> TestResult<u64> {
-        self.client
-            .tool_call(
-                request_id,
-                "eliot_current_state",
-                &json!({"project_id": project_id}),
-            )?
-            .get("memory_revision")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "current state has no memory_revision".into())
-    }
-
-    fn compile_packet_schema(&mut self, request_id: u64) -> TestResult<Value> {
-        let response = self.client.request(
-            &json!({"jsonrpc": "2.0", "id": request_id, "method": "tools/list", "params": {}}),
-            Duration::from_secs(30),
-        )?;
-        response
-            .pointer("/result/tools")
-            .and_then(Value::as_array)
-            .and_then(|tools| {
-                tools
-                    .iter()
-                    .find(|tool| tool["name"] == "eliot_compile_packet_l3")
-            })
-            .and_then(|tool| tool.get("inputSchema"))
-            .cloned()
-            .ok_or_else(|| "compile packet schema is absent".into())
-    }
-
-    fn write_receipt_exists(&self, write_id: WriteId) -> TestResult<bool> {
-        Ok(self
-            .store_runtime
-            .block_on(self.store.write_receipt_by_id(&write_id))?
-            .is_some())
+    /// The absolute runtime root the retired daemon would have published its
+    /// runtime report under (`<root>/reports/runtime/latest.json`).
+    fn runtime_report_root(&self) -> PathBuf {
+        self.runtime.path().join("reports")
     }
 }
 
-impl Drop for Harness {
+impl Drop for RetiredRouteFixture {
     fn drop(&mut self) {
-        let _ = self.client.stop();
-        let _ = self.daemon.stop();
-        let _ = self.surreal.stop();
-        let _ = wait_for_tcp_closed(self.port, Duration::from_secs(5));
-        let _ = fs::remove_file(&self.config_path);
         let _ = self.runtime.cleanup();
     }
 }
 
-fn candidate_arguments(
-    project_id: ProjectId,
-    task_id: TaskId,
-    write_id: WriteId,
-    topic: &str,
-    statement: &str,
-) -> Value {
-    json!({
-        "project_id": project_id,
-        "task_id": task_id,
-        "write_id": write_id,
-        "topic": topic,
-        "statement": statement,
-        "where_applicable": ["eliot-memory-os"],
-        "where_not_applicable": [],
-        "negative_constraints": [],
-        "provenance_refs": ["test:UL-01"],
-        "freshness_rule": "valid only for this isolated repair test",
-        "expected_reuse_note": "Reuse only in this isolated contract test.",
-        "cue_bindings": [{
-            "cue_kind": "file_path",
-            "cue_value": "crates/eliot-app/tests/ul_contract_errors.rs",
-            "match_mode": "exact",
-            "strength": "primary",
-            "expected_reuse_note": "Reuse only in this isolated contract test."
-        }]
-    })
+// CONTRACT UPDATE (lane W4, fix/app-daemon-front-door-W4).
+//
+// Document: `docs/release/WINDOWS_X64_RELEASE.md`, "Claude Code front door
+// (issue #1719, OSP1 step 1')" paragraph. Sentence: "plus every non-stdio
+// entrypoint (`daemon run`, `service run`, `hook`, and the rest),
+// unconditionally refuse with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the
+// canonical-route receipt."
+//
+// Document: `crates/eliot-app/src/front_door_cutover.rs`, module contract.
+// Sentence: "the refusal is fail-closed and, for every arm except `mcp stdio`
+// at a delegated host (which redirects to the approved Bridge), happens in the
+// single entry gate at the top of `dispatch_command` - before any arm handler
+// runs, before `ensure_daemon_ready` could auto-launch the daemon, before any
+// `DbClientSet`/`CanonicalStore` start, and before any `ControlWal` or
+// `WriterActor` is constructed".
+//
+// What this test asserted before: one JSON-RPC -32602 `INVALID_TOOL_INPUT`
+// error for an incomplete `material_frame`, naming the four missing field paths
+// and carrying a schema-valid `minimal_valid_example`.
+// What it asserts now: the property that survives retirement — the MCP tool
+// surface that produced -32602 does not exist, so an incomplete frame is never
+// classified at all. The session is refused at the entry gate and no JSON-RPC
+// error object is emitted.
+#[test]
+fn t01_incomplete_frame_returns_no_jsonrpc_error_because_no_legacy_session_exists() -> TestResult {
+    assert_canonical_route_matches_source()?;
+    let fixture = RetiredRouteFixture::new("incomplete-frame")?;
+
+    let output = governor_command(&fixture.config_path)?
+        .arg("--config")
+        .arg(&fixture.config_path)
+        .args(["mcp", "stdio", "--profile", "codex_controller"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert_canonical_front_door_refusal(&output, "mcp stdio codex_controller")?;
+
+    let served = String::from_utf8_lossy(&output.stdout);
+    for unreachable in [
+        "\"jsonrpc\"",
+        "INVALID_TOOL_INPUT",
+        "minimal_valid_example",
+        "-32602",
+    ] {
+        assert!(
+            !served.contains(unreachable),
+            "the retired MCP tool surface answered ({unreachable}): {served}"
+        );
+    }
+    assert!(!fixture.runtime_report_root().exists());
+    Ok(())
 }
 
-struct McpClient {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
-    responses: Receiver<TestResult<String>>,
-    reader: Option<JoinHandle<()>>,
+// CONTRACT UPDATE (lane W4, fix/app-daemon-front-door-W4).
+//
+// Document: `docs/release/WINDOWS_X64_RELEASE.md`, "Claude Code front door
+// (issue #1719, OSP1 step 1')" paragraph. Sentence: "plus every non-stdio
+// entrypoint (`daemon run`, `service run`, `hook`, and the rest),
+// unconditionally refuse with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the
+// canonical-route receipt."
+//
+// What this test asserted before: a typed -32602 `ENCODING_REJECTED` rejection
+// for a `qmark_run` statement, with the memory revision unchanged across the
+// rejected submit.
+// What it asserts now: the property that survives retirement — the rejected
+// write path is unreachable, so no candidate write is even attempted and no
+// memory revision can move. It also closes the harness defect that masked this
+// test: the retired daemon is now observed to exit (rather than waited on for a
+// runtime report that can never be published), and its exit is asserted to be
+// the canonical front-door refusal.
+#[test]
+fn t01_bad_candidate_is_rejected_before_write() -> TestResult {
+    assert_canonical_route_matches_source()?;
+    let fixture = RetiredRouteFixture::new("bad-candidate")?;
+
+    let mut daemon = start_daemon(&fixture.config_path)?;
+    let status = wait_for_observed_exit(&mut daemon, DAEMON_EXIT_TIMEOUT)?;
+    assert!(
+        !status.success(),
+        "the retired daemon run arm served instead of refusing"
+    );
+
+    // No runtime report, no publication and no IPC authentication artifact:
+    // the refused arm never reached startup.
+    assert!(
+        !fixture
+            .runtime_report_root()
+            .join("runtime")
+            .join("latest.json")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .runtime
+            .path()
+            .join("runtime")
+            .join("publication.json")
+            .exists()
+    );
+    assert!(
+        !fixture
+            .runtime
+            .path()
+            .join("runtime")
+            .join("ipc-auth.json")
+            .exists()
+    );
+
+    // The write path is unreachable: no MCP session exists that could classify
+    // an encoding violation or advance a memory revision.
+    let output = governor_command(&fixture.config_path)?
+        .arg("--config")
+        .arg(&fixture.config_path)
+        .args(["mcp", "stdio", "--profile", "codex_controller"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert_canonical_front_door_refusal(&output, "mcp stdio candidate submit")?;
+    let served = String::from_utf8_lossy(&output.stdout);
+    for unreachable in ["ENCODING_REJECTED", "qmark_run", "\"memory_revision\""] {
+        assert!(
+            !served.contains(unreachable),
+            "the retired write path answered ({unreachable}): {served}"
+        );
+    }
+    Ok(())
 }
 
-impl McpClient {
-    fn start(config_path: &Path) -> TestResult<Self> {
-        let mut child = governor_command(config_path)?
-            .arg("--config")
-            .arg(config_path)
-            .args(["mcp", "stdio", "--profile", "codex_controller"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let stdin = child.stdin.take().ok_or("facade stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("facade stdout unavailable")?;
-        let (sender, responses) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            let mut lines = std::io::BufReader::new(stdout).lines();
-            loop {
-                let message = match lines.next() {
-                    Some(Ok(line)) => Ok(line),
-                    Some(Err(error)) => Err(error.into()),
-                    None => Err("facade stdout closed".into()),
-                };
-                let stop = message.is_err();
-                if sender.send(message).is_err() || stop {
-                    break;
-                }
-            }
-        });
-        Ok(Self {
-            child: Some(child),
-            stdin: Some(stdin),
-            responses,
-            reader: Some(reader),
-        })
-    }
+// CONTRACT UPDATE (lane W4, fix/app-daemon-front-door-W4).
+//
+// Document: `docs/release/WINDOWS_X64_RELEASE.md`, "Claude Code front door
+// (issue #1719, OSP1 step 1')" paragraph. Sentence: "plus every non-stdio
+// entrypoint (`daemon run`, `service run`, `hook`, and the rest),
+// unconditionally refuse with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the
+// canonical-route receipt."
+//
+// What this test asserted before: the UL-01 packet-content regression — the
+// memory-free control arm's `preferred_tokens`/`hard_ceiling_tokens`/
+// `effective_tokens` budget decision and candidate-content inclusion in the
+// compiled packet.
+// What it asserts now: the property that survives retirement — the packet
+// compiler is unreachable, so no packet budget decision and no packet content
+// can be produced, and the legacy configuration that would have backed it is
+// never acted on.
+#[test]
+fn t01_packet_content_regression() -> TestResult {
+    assert_canonical_route_matches_source()?;
+    let fixture = RetiredRouteFixture::new("packet-content")?;
+    assert!(fixture.config_path.is_file());
 
-    fn initialize(&mut self) -> TestResult {
-        let response = self.request(
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 0,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "ul-t01-repair", "version": "0.1.0"}
-                }
-            }),
-            Duration::from_secs(30),
-        )?;
-        if response
-            .pointer("/result/protocolVersion")
-            .and_then(Value::as_str)
-            != Some("2025-06-18")
-        {
-            return Err(format!("MCP initialize failed: {response}").into());
-        }
-        Ok(())
-    }
+    let output = governor_command(&fixture.config_path)?
+        .arg("--config")
+        .arg(&fixture.config_path)
+        .args(["mcp", "stdio", "--profile", "codex_controller"])
+        .stdin(Stdio::null())
+        .output()?;
+    assert_canonical_front_door_refusal(&output, "mcp stdio compile packet")?;
 
-    fn request(&mut self, request: &Value, timeout: Duration) -> TestResult<Value> {
-        let stdin = self.stdin.as_mut().ok_or("facade stdin closed")?;
-        serde_json::to_writer(&mut *stdin, request)?;
-        writeln!(stdin)?;
-        stdin.flush()?;
-        let line = self
-            .responses
-            .recv_timeout(timeout)
-            .map_err(|error| format!("timed out waiting for facade response: {error}"))??;
-        Ok(serde_json::from_str(&line)?)
+    let served = String::from_utf8_lossy(&output.stdout);
+    for unreachable in [
+        "packet_budget_decision",
+        "preferred_tokens",
+        "hard_ceiling_tokens",
+        "eliot_compile_packet_l3",
+    ] {
+        assert!(
+            !served.contains(unreachable),
+            "the retired packet compiler answered ({unreachable}): {served}"
+        );
     }
-
-    fn tool_call_response(&mut self, id: u64, name: &str, arguments: &Value) -> TestResult<Value> {
-        self.request(
-            &json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments}
-            }),
-            Duration::from_mins(1),
-        )
-    }
-
-    fn tool_call(&mut self, id: u64, name: &str, arguments: &Value) -> TestResult<Value> {
-        let response = self.tool_call_response(id, name, arguments)?;
-        if let Some(error) = response.get("error") {
-            return Err(format!("MCP tool {name} failed: {error}").into());
-        }
-        let result = response.get("result").ok_or("missing MCP tool result")?;
-        if result.get("isError").and_then(Value::as_bool) == Some(true) {
-            return Err(format!("MCP tool {name} returned error: {result}").into());
-        }
-        result
-            .get("structuredContent")
-            .cloned()
-            .ok_or_else(|| "missing MCP structuredContent".into())
-    }
-
-    fn stop(&mut self) -> TestResult {
-        self.stdin.take();
-        if let Some(mut child) = self.child.take() {
-            if child.try_wait()?.is_none() {
-                child.kill()?;
-            }
-            let _ = child.wait()?;
-        }
-        if let Some(reader) = self.reader.take() {
-            reader.join().map_err(|_| "facade reader panicked")?;
-        }
-        Ok(())
-    }
+    assert!(!fixture.runtime_report_root().exists());
+    Ok(())
 }
 
-impl Drop for McpClient {
-    fn drop(&mut self) {
-        let _ = self.stop();
+/// Bounded window for observing the retired daemon's immediate refusal. The
+/// arm refuses in well under a second; this only exists so a wedged child
+/// cannot hang the suite.
+const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Waits, bounded, for the owned child to exit and returns its status. This
+/// replaces the retired `wait_for_runtime_pid` poll, which observed only files
+/// and therefore misreported an immediate refusal as a readiness timeout.
+fn wait_for_observed_exit(child: &mut OwnedChild, timeout: Duration) -> TestResult<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(25));
     }
+    child.stop()?;
+    Err(format!(
+        "the retired daemon arm did not exit within {}s",
+        timeout.as_secs()
+    )
+    .into())
 }
 
+/// One owned child process. Kept (rather than `Child` directly) so every
+/// spawned retired arm is killed on drop even when a test fails mid-assertion.
 struct OwnedChild(Option<Child>);
 
 impl OwnedChild {
@@ -528,11 +338,11 @@ impl OwnedChild {
         Ok(Self(Some(command.spawn()?)))
     }
 
-    fn id(&self) -> TestResult<u32> {
+    fn try_wait(&mut self) -> TestResult<Option<ExitStatus>> {
         self.0
-            .as_ref()
-            .map(Child::id)
+            .as_mut()
             .ok_or_else(|| "owned child already consumed".into())
+            .and_then(|child| child.try_wait().map_err(Into::into))
     }
 
     fn stop(&mut self) -> TestResult {
@@ -609,28 +419,6 @@ fn test_port() -> TestResult<u16> {
         }
     }
     Err("no free UL-01 app test port in 8600-8699".into())
-}
-
-fn start_surreal(exe: &Path, port: u16) -> TestResult<OwnedChild> {
-    OwnedChild::spawn(
-        Command::new(exe)
-            .env("SURREAL_USER", "root")
-            .env("SURREAL_PASS", "ul-t01-test-secret")
-            .arg("start")
-            .arg("--bind")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("--log")
-            .arg("warn")
-            .arg("--deny-all")
-            .arg("--allow-funcs")
-            .arg("array,string,time,type,math,vector,search")
-            .arg("--deny-net")
-            .arg("--")
-            .arg("memory")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit()),
-    )
 }
 
 fn start_daemon(config_path: &Path) -> TestResult<OwnedChild> {
@@ -742,113 +530,6 @@ surql_dir = "{surql}"
     Ok(())
 }
 
-fn store_config(
-    runtime: &Path,
-    port: u16,
-    surreal_exe: &Path,
-) -> TestResult<eliot_types::SurrealServerConfig> {
-    let mut config = GovernorConfig::default();
-    config.db.surreal.exe = slash(surreal_exe);
-    config.db.surreal.bind = format!("127.0.0.1:{port}");
-    config.db.surreal.endpoint = format!("ws://127.0.0.1:{port}/rpc");
-    config.db.surreal.storage = format!("rocksdb:{}", slash(&runtime.join("unused-rocksdb")));
-    "ultest".clone_into(&mut config.db.surreal.ns);
-    "ultest".clone_into(&mut config.db.surreal.db);
-    "root".clone_into(&mut config.db.surreal.user);
-    config.db.surreal.credential_provider = CredentialProviderKind::LegacyPasswordFile;
-    "test-only/ul-t01-app".clone_into(&mut config.db.surreal.credential_id);
-    let run_id = runtime
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("test runtime name missing")?;
-    config.db.surreal.password_file =
-        format!("%LOCALAPPDATA%/Eliot/tests/{run_id}/secrets/surreal-root.txt");
-    Ok(config.db.surreal)
-}
-
-fn wait_for_tcp(port: u16, timeout: Duration) -> TestResult {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!("SurrealDB did not listen on port {port}").into())
-}
-
-fn wait_for_tcp_closed(port: u16, timeout: Duration) -> TestResult {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!("SurrealDB still listens on port {port}").into())
-}
-
-fn wait_for_runtime_pid(path: &Path, pid: u32, timeout: Duration) -> TestResult {
-    // T13-S3: the legacy `/status/pid` + `/status/ipc_enabled` bundle shape was
-    // deleted from the candidate (U3: the old reader is updated with its client).
-    // Poll the current health-only bundle plus the daemon publication/IPC auth
-    // files already produced by candidate daemon startup.
-    let runtime_root = path
-        .ancestors()
-        .nth(3)
-        .ok_or("runtime report path has no runtime root")?;
-    let publication_path = runtime_root.join("runtime").join("publication.json");
-    let auth_path = runtime_root.join("runtime").join("ipc-auth.json");
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let health_ready = fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|value| {
-                value.pointer("/health/ready").and_then(Value::as_bool) == Some(true)
-                    && value.pointer("/health/mode").and_then(Value::as_str) == Some("daemon")
-            });
-        let publication = fs::read(&publication_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-        let pid_linked = publication.as_ref().is_some_and(|publication| {
-            publication.get("state").and_then(Value::as_str) == Some("ready")
-                && publication.get("daemon_pid").and_then(Value::as_u64) == Some(u64::from(pid))
-        });
-        let ipc_ready = fs::read(&auth_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|auth| {
-                let runtime_linked =
-                    match (&publication, auth.get("runtime_id").and_then(Value::as_str)) {
-                        (Some(publication), Some(auth_runtime)) => {
-                            publication.get("runtime_id").and_then(Value::as_str)
-                                == Some(auth_runtime)
-                                && !auth_runtime.is_empty()
-                        }
-                        _ => auth
-                            .get("runtime_id")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| !value.is_empty()),
-                    };
-                let token_present = auth
-                    .get("token")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-                    && auth
-                        .get("token_generation_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| !value.is_empty());
-                runtime_linked && token_present
-            });
-        if health_ready && pid_linked && ipc_ready {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!("daemon runtime report did not become ready for PID {pid}").into())
-}
-
 fn repository_root() -> TestResult<PathBuf> {
     Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -871,96 +552,4 @@ fn slash(path: &Path) -> String {
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_eliot-governor"))
-}
-
-fn validate_schema(root: &Value, schema: &Value, value: &Value, path: &str) -> TestResult {
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        let target = reference
-            .strip_prefix('#')
-            .and_then(|pointer| root.pointer(pointer))
-            .ok_or_else(|| format!("unresolved schema ref {reference}"))?;
-        return validate_schema(root, target, value, path);
-    }
-    for keyword in ["allOf"] {
-        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
-            for branch in branches {
-                validate_schema(root, branch, value, path)?;
-            }
-        }
-    }
-    for keyword in ["anyOf", "oneOf"] {
-        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
-            let branch = branches
-                .iter()
-                .find(|branch| schema_type_matches(root, branch, value))
-                .ok_or_else(|| format!("{path} matches no {keyword} branch"))?;
-            return validate_schema(root, branch, value, path);
-        }
-    }
-    if let Some(kind) = schema.get("type").and_then(Value::as_str)
-        && !value_matches_type(value, kind)
-    {
-        return Err(format!("{path} expected {kind}").into());
-    }
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
-        && !allowed.contains(value)
-    {
-        return Err(format!("{path} is outside the schema enum").into());
-    }
-    if let Some(object) = value.as_object() {
-        if let Some(required) = schema.get("required").and_then(Value::as_array) {
-            for field in required.iter().filter_map(Value::as_str) {
-                if !object.contains_key(field) {
-                    return Err(format!("{path}.{field} is required").into());
-                }
-            }
-        }
-        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-            for (field, field_schema) in properties {
-                if let Some(field_value) = object.get(field) {
-                    validate_schema(root, field_schema, field_value, &format!("{path}.{field}"))?;
-                }
-            }
-        }
-    } else if let Some(array) = value.as_array()
-        && let Some(items) = schema.get("items")
-    {
-        for (index, item) in array.iter().enumerate() {
-            validate_schema(root, items, item, &format!("{path}[{index}]"))?;
-        }
-    }
-    Ok(())
-}
-
-fn schema_type_matches(root: &Value, schema: &Value, value: &Value) -> bool {
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
-        && let Some(target) = reference
-            .strip_prefix('#')
-            .and_then(|pointer| root.pointer(pointer))
-    {
-        return schema_type_matches(root, target, value);
-    }
-    match schema.get("type") {
-        Some(Value::String(kind)) => value_matches_type(value, kind),
-        Some(Value::Array(kinds)) => kinds
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|kind| value_matches_type(value, kind)),
-        _ => true,
-    }
-}
-
-fn value_matches_type(value: &Value, kind: &str) -> bool {
-    match kind {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "integer" => value
-            .as_number()
-            .is_some_and(|number| number.is_i64() || number.is_u64()),
-        "number" => value.is_number(),
-        "boolean" => value.is_boolean(),
-        "null" => value.is_null(),
-        _ => true,
-    }
 }
