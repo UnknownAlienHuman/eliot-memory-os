@@ -1549,11 +1549,11 @@ fn stdio_starvation_parent() {
     let responses =
         responses.unwrap_or_else(|error| panic!("stdio child responses unreadable: {error}"));
     assert_eq!(responses.len(), 3);
-    for (response, expected_id) in responses.iter().zip([
-        "stdio-exec-1",
-        "stdio-cancel-1",
-        "stdio-heartbeat-1",
-    ]) {
+    for (response, expected_id) in
+        responses
+            .iter()
+            .zip(["stdio-exec-1", "stdio-cancel-1", "stdio-heartbeat-1"])
+    {
         assert_eq!(response.connection_id, "connection-claim-1");
         assert_eq!(response.request_id.as_str(), expected_id);
         assert_eq!(

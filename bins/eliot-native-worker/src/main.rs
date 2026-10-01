@@ -2376,10 +2376,7 @@ mod tests {
         let response = decode_response(&writer);
         assert_eq!(response.connection_id, hello_connection);
         assert_eq!(response.request_id.as_str(), "health-kernel-drive-1");
-        assert_eq!(
-            response.trace_context["trace_id"],
-            "trace-kernel-drive-1"
-        );
+        assert_eq!(response.trace_context["trace_id"], "trace-kernel-drive-1");
         assert!(!response.response.events.is_empty());
         assert!(
             response
