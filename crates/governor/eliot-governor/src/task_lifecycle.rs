@@ -80,6 +80,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct PreparedTaskTransition {
     identity: eliot_protocol::RequestIdentity,
+    original_envelope: CanonicalWriteEnvelope,
     operation_id: OperationId,
     transition: PreparedTransition,
     expected_revision_heads: Vec<RevisionHeadExpectation>,
@@ -90,6 +91,49 @@ pub struct PreparedTaskTransition {
 }
 
 impl PreparedTaskTransition {
+    /// The unmodified Canonical envelope from which this exact transition
+    /// and its compare-and-swap/order heads were prepared.
+    #[must_use]
+    pub const fn original_envelope(&self) -> &CanonicalWriteEnvelope {
+        &self.original_envelope
+    }
+
+    /// The authenticated request identity admitted with the envelope.
+    #[must_use]
+    pub const fn request_identity(&self) -> &eliot_protocol::RequestIdentity {
+        &self.identity
+    }
+
+    /// The immutable transition derived by the canonical owner.
+    #[must_use]
+    pub const fn prepared_transition(&self) -> &PreparedTransition {
+        &self.transition
+    }
+
+    /// Exact expected revision heads carried by the original envelope.
+    #[must_use]
+    pub fn expected_revision_heads(&self) -> &[RevisionHeadExpectation] {
+        &self.expected_revision_heads
+    }
+
+    /// Exact expected ordering heads carried by the original envelope.
+    #[must_use]
+    pub fn expected_ordering_heads(&self) -> &[OrderingHeadExpectation] {
+        &self.expected_ordering_heads
+    }
+
+    /// Canonical operation identity for exchange and unknown-ack recovery.
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    /// Full state fence used to prepare the transition.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.fence
+    }
+
     /// Exchanges the exact prepared transition and reconciles an unknown
     /// acknowledgement against its original operation identity.
     pub async fn exchange<P: KernelTransitionPort + ?Sized>(
@@ -444,6 +488,7 @@ fn prepare_task_exchange(
             "admitted idempotency key does not match the Canonical envelope".to_owned(),
         )));
     }
+    let original_envelope = envelope.clone();
     let transition = canonical.prepare(&envelope)?;
     if transition.identity.idempotency_key != identity.idempotency_key
         || transition.state_fence != identity.request.metadata.state_fence
@@ -456,6 +501,7 @@ fn prepare_task_exchange(
     let failure_context = store_failure_ctx(identity, &operation_id);
     Ok(PreparedTaskTransition {
         identity: identity.clone(),
+        original_envelope,
         operation_id,
         transition,
         expected_revision_heads: envelope.expected_revision_heads,

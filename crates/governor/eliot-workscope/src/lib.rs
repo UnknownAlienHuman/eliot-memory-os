@@ -455,6 +455,46 @@ pub struct ScopeBindingGuardReceipt {
     pub source_generation: u64,
 }
 
+/// Original, owner-admitted source inputs required to compile cold-start
+/// readiness. This data is retained inside the canonical WorkScope snapshot;
+/// the policy owner remains independently owned and is named by its exact
+/// admission reference and revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColdStartOwnerInputs {
+    /// Full owner fence the original binding admission was accepted under.
+    pub state_fence: StateFence,
+    /// Exact WorkScope owner revision issued for the retained snapshot.
+    pub owner_revision: u64,
+    /// The exact descriptor admitted at the same StateFence.
+    pub descriptor: WorkScopeDescriptor,
+    /// Root identity independently observed by the Host during admission.
+    pub explicit_root_identity: String,
+    /// Authenticated principal that owned the original binding admission.
+    pub principal_ref: String,
+    /// Authenticated session that owned the original binding admission.
+    pub session_ref: String,
+    /// Exact owner-issued task selection used to admit governing sources.
+    pub task_selection: TaskSelectionEvidence,
+    /// Source admission result produced from the original request and current
+    /// owner/task/policy evidence.
+    pub source_admission: GoverningSourceAdmission,
+    /// Original exact governing source set admitted by that request.
+    pub governing_sources: GoverningSourceSet,
+    /// Original privacy boundary admitted with the descriptor and source set.
+    pub privacy: PrivacyProfile,
+    /// Current Policy owner reference used to resolve source authority.
+    pub policy_owner_ref: String,
+    /// Current Policy owner revision checked during admission.
+    pub policy_revision: u64,
+    /// Current Policy record digest checked during admission.
+    pub policy_digest: String,
+    /// The exact discovery lease bound to the observed root and caller.
+    pub discovery_lease: DiscoveryReadLease,
+    /// Expiry of the source admission request.
+    pub admission_deadline: u64,
+}
+
 /// The persisted, exact current `WorkScope` binding owned by the governor.
 ///
 /// This is a closed snapshot: it carries no task, plan, session, principal or
@@ -469,6 +509,8 @@ pub struct WorkScopeBindingSnapshot {
     pub guard_receipt: ScopeBindingGuardReceipt,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_closure: Option<(GoverningSourceSet, PrivacyProfile)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cold_start_inputs: Option<ColdStartOwnerInputs>,
 }
 
 /// The canonical owner for one current `WorkScope` binding.
@@ -3270,6 +3312,7 @@ impl WorkScopeBindingSnapshot {
             binding,
             guard_receipt,
             source_closure: None,
+            cold_start_inputs: None,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -3342,6 +3385,68 @@ impl WorkScopeBindingSnapshot {
                 return Err(WorkScopeError::BindingReceiptMismatch);
             }
         }
+        if let Some(inputs) = &self.cold_start_inputs {
+            inputs.validate_for(self)?;
+        }
+        Ok(())
+    }
+}
+
+impl ColdStartOwnerInputs {
+    fn validate_for(&self, snapshot: &WorkScopeBindingSnapshot) -> Result<(), WorkScopeError> {
+        self.state_fence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidStateFence)?;
+        counter(self.owner_revision, "cold_start.owner_revision")?;
+        self.descriptor.validate()?;
+        self.source_admission
+            .validate()
+            .map_err(|_| WorkScopeError::SourceSetMismatch)?;
+        self.discovery_lease.validate()?;
+        text(&self.explicit_root_identity, "explicit_root_identity")?;
+        text(&self.principal_ref, "principal_ref")?;
+        text(&self.session_ref, "session_ref")?;
+        self.task_selection
+            .validate()
+            .map_err(|_| WorkScopeError::BindingReceiptMismatch)?;
+        text(&self.policy_owner_ref, "policy_owner_ref")?;
+        digest(&self.policy_digest, "policy_digest")?;
+        counter(self.policy_revision, "policy_revision")?;
+        counter(self.admission_deadline, "admission_deadline")?;
+        let (sources, privacy) = snapshot
+            .source_closure
+            .as_ref()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        if self.state_fence != snapshot.state_fence
+            || self.owner_revision != snapshot.owner_revision
+            || self.descriptor.state_fence != snapshot.state_fence
+            || self.descriptor.scope_ref != snapshot.binding.scope.scope_ref
+            || self.descriptor.privacy != self.privacy
+            || self.privacy != *privacy
+            || self.governing_sources != *sources
+            || !self
+                .descriptor
+                .root_identities
+                .contains(&self.explicit_root_identity)
+            || snapshot.binding.scope.root_identity != self.explicit_root_identity
+            || self.discovery_lease.candidate_root_ref != self.explicit_root_identity
+            || self.source_admission.admitted != self.governing_sources
+            || self.source_admission.admitted.scope_ref != snapshot.binding.scope.scope_ref
+            || self.source_admission.admitted.generation
+                != snapshot.binding.governing_source_generation
+            || self.source_admission.required_owner_ref != self.policy_owner_ref
+            || self.source_admission.state_fence != snapshot.state_fence
+            || self.source_admission.expires_at != self.admission_deadline
+            || self.task_selection.work_scope_ref != snapshot.binding.scope.scope_ref
+            || self.task_selection.task_ref.is_empty()
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        if self.discovery_lease.proposer_ref != self.principal_ref
+            || self.discovery_lease.session_ref != self.session_ref
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
         Ok(())
     }
 }
@@ -3355,6 +3460,8 @@ struct WorkScopeBindingSnapshotWire {
     guard_receipt: ScopeBindingGuardReceipt,
     #[serde(default)]
     source_closure: Option<(GoverningSourceSet, PrivacyProfile)>,
+    #[serde(default)]
+    cold_start_inputs: Option<ColdStartOwnerInputs>,
 }
 
 impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
@@ -3371,6 +3478,7 @@ impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
         )
         .map_err(serde::de::Error::custom)?;
         snapshot.source_closure = wire.source_closure;
+        snapshot.cold_start_inputs = wire.cold_start_inputs;
         snapshot.validate().map_err(serde::de::Error::custom)?;
         Ok(snapshot)
     }
@@ -3417,6 +3525,17 @@ impl WorkScopeBindingOwner {
             snapshot.source_closure = Some((sources.clone(), privacy.clone()));
         }
         Self::new(snapshot)
+    }
+
+    /// Retains the exact admitted descriptor, explicit root, source admission,
+    /// policy reference and discovery lease in the same WorkScope owner row.
+    pub fn retain_cold_start_inputs(
+        mut self,
+        inputs: ColdStartOwnerInputs,
+    ) -> Result<Self, WorkScopeError> {
+        self.snapshot.cold_start_inputs = Some(inputs);
+        self.snapshot.validate()?;
+        Ok(self)
     }
 
     /// Recovers the owner through the same fail-closed validation path.
@@ -3470,6 +3589,41 @@ impl WorkScopeBindingOwner {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
         Ok((sources.clone(), privacy.clone()))
+    }
+
+    /// Reads the exact retained cold-start inputs for the current owner fence,
+    /// lease identity and admission deadline.
+    pub fn read_current_cold_start_inputs(
+        &self,
+        state_fence: &StateFence,
+        discovery_lease: &DiscoveryReadLease,
+        now: u64,
+    ) -> Result<ColdStartOwnerInputs, WorkScopeError> {
+        let snapshot = self.read_current(state_fence)?;
+        let inputs = snapshot
+            .cold_start_inputs
+            .as_ref()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        inputs.validate_for(&snapshot)?;
+        discovery_lease.validate()?;
+        if now > inputs.admission_deadline
+            || now > inputs.discovery_lease.deadline
+            || discovery_lease.lease_ref != inputs.discovery_lease.lease_ref
+            || discovery_lease.proposer_ref != inputs.discovery_lease.proposer_ref
+            || discovery_lease.session_ref != inputs.discovery_lease.session_ref
+            || discovery_lease.host_ref != inputs.discovery_lease.host_ref
+            || discovery_lease.root_filesystem_identity_ref
+                != inputs.discovery_lease.root_filesystem_identity_ref
+            || discovery_lease.candidate_root_ref != inputs.discovery_lease.candidate_root_ref
+            || discovery_lease.allowed_reads != inputs.discovery_lease.allowed_reads
+            || discovery_lease.deadline != inputs.discovery_lease.deadline
+            || discovery_lease.consumption_limit != inputs.discovery_lease.consumption_limit
+            || discovery_lease.consumed < inputs.discovery_lease.consumed
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        inputs.source_admission.require_live(now)?;
+        Ok(inputs.clone())
     }
 }
 

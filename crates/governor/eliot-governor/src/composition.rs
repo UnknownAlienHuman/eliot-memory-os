@@ -121,6 +121,7 @@ use eliot_testd_core::{
 };
 use eliot_workscope::{
     AuthorityBasis, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
+    ColdStartOwnerInputs,
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
     GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
     GoverningSourceCandidate, PrecedenceDeclaration, SourceCandidateOrigin,
@@ -4698,6 +4699,9 @@ pub struct InitialScopeBindingAdmissionRequest<'a> {
     pub retained_snapshot: Option<&'a WorkScopeBindingSnapshot>,
     pub binding: &'a ScopeBinding,
     pub observed: &'a ObservedScopeResources,
+    /// Exact Host-issued discovery lease used for the independent root
+    /// observation that produced `observed`.
+    pub discovery_lease: &'a DiscoveryReadLease,
     pub sources: &'a GoverningSourceSet,
     pub privacy: &'a PrivacyProfile,
     pub source_candidates: &'a [GoverningSourceCandidate],
@@ -7182,6 +7186,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             retained_snapshot,
             binding,
             observed,
+            discovery_lease,
             sources,
             privacy,
             source_candidates,
@@ -7192,12 +7197,18 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
+        discovery_lease
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         let fence = self.snapshot.state_fence();
         if !fences_match_exact(&fence, state_fence)
             || descriptor.state_fence != fence
             || descriptor.privacy != *privacy
             || descriptor.scope_ref != work_scope_ref
             || binding.scope.scope_ref != work_scope_ref
+            || discovery_lease.proposer_ref != authenticated_identity.0
+            || discovery_lease.session_ref != authenticated_identity.1
+            || discovery_lease.candidate_root_ref != binding.scope.root_identity
             || admission_deadline < now
         {
             return Err(CompositionError::ActivationStaleFence);
@@ -7225,6 +7236,20 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         else {
             return Err(CompositionError::ActivationStaleFence);
         };
+
+        let (task_selection, _) = self
+            .issue_task_selection_evidence_for_binding(
+                now,
+                authenticated_identity,
+                work_scope_ref,
+                state_fence,
+                (
+                    &task_ref,
+                    Some(task_revision),
+                    Some(acceptance_digest.as_str()),
+                ),
+            )
+            .await?;
 
         let policy_snapshot = self.current_initial_scope_policy_snapshot(&fence)?;
 
@@ -7392,6 +7417,29 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             privacy,
         )
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let policy_owner = self.owners.policy.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("initial WorkScope binding has no current Policy owner".to_owned())
+        })?;
+        let (principal_ref, session_ref) = authenticated_identity;
+        let admitted = admitted
+            .retain_cold_start_inputs(ColdStartOwnerInputs {
+                state_fence: fence.clone(),
+                owner_revision,
+                descriptor: descriptor.clone(),
+                explicit_root_identity: observed_instance.root_identity.clone(),
+                principal_ref: principal_ref.to_owned(),
+                session_ref: session_ref.to_owned(),
+                task_selection,
+                source_admission,
+                governing_sources: sources.clone(),
+                privacy: privacy.clone(),
+                policy_owner_ref: policy_snapshot.policy_owner.owner_ref.clone(),
+                policy_revision: policy_owner.revision(),
+                policy_digest: policy_owner.snapshot_digest().to_owned(),
+                discovery_lease: discovery_lease.clone(),
+                admission_deadline,
+            })
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         if let Some(retained) = replay_owner {
             let retained_snapshot = retained
                 .read_current(&fence)
@@ -7408,6 +7456,65 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Ok(retained);
         }
         Ok(admitted)
+    }
+
+    /// Reads the exact cold-start source inputs retained by the current
+    /// WorkScope owner and rechecks their principal/session, fence, lease and
+    /// Policy-owner evidence against the live composition.
+    pub async fn read_cold_start_owner_inputs(
+        &self,
+        principal_ref: &str,
+        session_ref: &str,
+        scope_ref: &str,
+        state_fence: &StateFence,
+        discovery_lease: &DiscoveryReadLease,
+        now: u64,
+    ) -> Result<ColdStartOwnerInputs, CompositionError> {
+        let current_fence = self.snapshot.state_fence();
+        if !fences_match_exact(&current_fence, state_fence) {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let owner = self.owners.work_scope.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("current WorkScope owner is absent".to_owned())
+        })?;
+        let inputs = owner
+            .read_current_cold_start_inputs(state_fence, discovery_lease, now)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if &inputs.principal_ref != principal_ref
+            || &inputs.session_ref != session_ref
+            || inputs.descriptor.scope_ref != scope_ref
+            || inputs.state_fence != *state_fence
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let (task_selection, _) = self
+            .issue_task_selection_evidence_for_binding(
+                now,
+                (principal_ref, session_ref),
+                scope_ref,
+                state_fence,
+                (
+                    &inputs.task_selection.task_ref,
+                    Some(inputs.task_selection.task_revision),
+                    Some(inputs.task_selection.acceptance_digest.as_str()),
+                ),
+            )
+            .await?;
+        if task_selection != inputs.task_selection {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        let policy = self.owners.policy.as_ref().ok_or_else(|| {
+            CompositionError::Recovery("current Policy owner is absent".to_owned())
+        })?;
+        let _ = self.current_initial_scope_policy_snapshot(state_fence)?;
+        if policy.state_fence() != state_fence
+            || policy.revision() != inputs.policy_revision
+            || policy.snapshot_digest() != inputs.policy_digest
+            || policy.snapshot().policy_owner.owner_ref != inputs.policy_owner_ref
+        {
+            return Err(CompositionError::ActivationStaleFence);
+        }
+        Ok(inputs)
     }
 
     fn validate_initial_scope_owner_revision(
