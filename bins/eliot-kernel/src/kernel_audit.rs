@@ -49,8 +49,11 @@
 #![forbid(unsafe_code)]
 
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use eliot_contracts::{EpochId, StateFence, canonical_json_bytes};
 use eliot_ipc::Session;
@@ -60,11 +63,58 @@ use eliot_ors::{HostRequestRecord, HostRequestState, OperationIdentity, Supervis
 use eliot_process::ProcessStartReceipt;
 use eliot_protocol::{
     HostRequestAdmissionReceipt, HostRequestEnvelope, HostRequestResultBody, LocalReadAttempt,
-    host_request_operation_id,
+    ProtocolPayload, RequestIdentity, host_request_operation_id,
 };
 use serde::{Deserialize, Serialize};
 
 use super::shutdown_drain::{DrainCommitDecision, ShutdownPublication};
+
+thread_local! {
+    static ACTIVE_AUDIT_REQUEST_IDENTITY: std::cell::RefCell<Option<RequestIdentity>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Polls one already-admitted action with its exact original Frame identity
+/// installed for Kernel audit appends made synchronously by that action.
+pub(crate) fn scope_audit_request_identity<F>(
+    identity: Option<RequestIdentity>,
+    future: F,
+) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    struct Scoped<F> {
+        identity: Option<RequestIdentity>,
+        future: Pin<Box<F>>,
+    }
+
+    impl<F: Future> Future for Scoped<F> {
+        type Output = F::Output;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.as_mut().get_mut();
+            let previous = ACTIVE_AUDIT_REQUEST_IDENTITY.with(|active| {
+                std::mem::replace(&mut *active.borrow_mut(), this.identity.clone())
+            });
+            struct Restore(Option<RequestIdentity>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    ACTIVE_AUDIT_REQUEST_IDENTITY.with(|active| {
+                        *active.borrow_mut() = self.0.take();
+                    });
+                }
+            }
+            let _restore = Restore(previous);
+            this.future.as_mut().poll(cx)
+        }
+    }
+
+    Scoped {
+        identity,
+        future: Box::pin(future),
+    }
+}
 
 /// Canonical audit record/anchor format version (I16.3 normalization version).
 pub const KERNEL_AUDIT_FORMAT_VERSION: u16 = 1;
@@ -612,6 +662,10 @@ impl AuditEventKind {
 pub struct AuditLineage {
     /// Request-scoped trace identity (`HostRequestIdentity.request_id`).
     pub trace_id: Option<String>,
+    /// Exact typed identity retained from an admitted transport frame when
+    /// the owning audit producer has that frame context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_identity: Option<RequestIdentity>,
     /// Kernel operation handle (`hostreq:<sha>`, lease, cutover, or launch).
     pub operation_id: Option<String>,
     /// Governor-owned task identity claimed by the request.
@@ -669,6 +723,7 @@ impl AuditLineage {
     pub fn empty() -> Self {
         Self {
             trace_id: None,
+            request_identity: None,
             operation_id: None,
             task_id: None,
             work_item: None,
@@ -728,6 +783,13 @@ impl AuditLineage {
             &authority_epoch_text(&envelope.state_fence.authority_epoch),
         );
         Self::fill(&mut self.controller, "kernel");
+    }
+
+    /// Retains the exact admitted frame identity on its original audit owner.
+    pub fn fill_request_identity(&mut self, identity: &RequestIdentity) {
+        if self.request_identity.is_none() {
+            self.request_identity = Some(identity.clone());
+        }
     }
 
     /// Fills durable slots from one stored ORS host-request record.
@@ -1029,6 +1091,10 @@ impl AuditEventDraft {
     ) -> Self {
         let mut lineage = AuditLineage::empty();
         lineage.fill_envelope(envelope);
+        let Some(frame_identity) = frame.request_identity.as_ref() else {
+            return unavailable;
+        };
+        lineage.fill_request_identity(frame_identity);
         lineage.fill_route_receipt_actual(&receipt.receipt_sha256);
         Self {
             kind: AuditEventKind::QUEUE_ENVELOPE_ADMITTED,
@@ -2536,6 +2602,11 @@ impl KernelAuditChain {
             reason: "audit sequence overflow".to_owned(),
         })?;
         let mut lineage = draft.lineage;
+        if lineage.request_identity.is_none() {
+            ACTIVE_AUDIT_REQUEST_IDENTITY.with(|active| {
+                lineage.request_identity = active.borrow().clone();
+            });
+        }
         lineage.finalize(seq);
         let body_bytes = canonical_json_bytes(&draft.body)
             .map_err(|error| KernelAuditError::Serialization(error.to_string()))?;
@@ -3070,19 +3141,15 @@ impl crate::KernelComposition {
             );
         }
         let base = self.crash_runtime_context(false);
-        if base.state_fence.as_ref() != Some(&envelope.state_fence) {
-            return CrashOperationContext::UnavailableWithOwnerEvidence(
-                original_owner_evidence,
-            );
-        }
+        let same_fence = base.state_fence.as_ref() == Some(&envelope.state_fence);
         let runtime_context = CrashRuntimeContext::from_observations(
             CrashRuntimeContextObservations {
                 module_generation_ref: Some(module_generation.to_owned()),
-                process_generation_ref: base.process_generation_ref,
+                process_generation_ref: same_fence.then_some(base.process_generation_ref).flatten(),
                 state_fence: Some(envelope.state_fence.clone()),
                 active_trace_ref: Some(trace_id.to_owned()),
                 work_scope_ref: Some(work_scope.to_owned()),
-                audit_head: base.audit_head,
+                audit_head: same_fence.then_some(base.audit_head).flatten(),
                 evidence_handles: Vec::new(),
                 journal_head: None,
             },
@@ -3094,6 +3161,7 @@ impl crate::KernelComposition {
         }
         CrashOperationContext::Current {
             runtime_context,
+            operation_id: Some(operation_id.to_owned()),
             original_owner_evidence,
         }
     }
@@ -3108,6 +3176,7 @@ impl crate::KernelComposition {
         &self,
         session: &Session,
         frame: &eliot_protocol::Frame,
+        action: &crate::KernelFrameAction,
     ) -> eliot_observability_runtime::CrashOperationContext {
         use eliot_observability_runtime::{
             CrashOperationContext, CrashRuntimeContext, CrashRuntimeContextObservations,
@@ -3137,85 +3206,145 @@ impl crate::KernelComposition {
         {
             return unavailable;
         }
-        let Ok(records) = self.audit_chain_records() else {
-            return unavailable;
+        let host_request_envelope = match &frame.payload {
+            ProtocolPayload::Json(payload) if payload.get("envelope").is_some() => {
+                match crate::host_request_route::host_request_envelope_from_payload(payload) {
+                    Ok(envelope) => Some(envelope),
+                    Err(_) => return unavailable,
+                }
+            }
+            _ => None,
         };
-        let Some(owner_record) = records.iter().rev().find(|record| {
-            record.lineage.trace_id.as_deref() == Some(request_id.as_str())
-                && record.lineage.state_fence.as_ref() == Some(&identity.request.state_fence)
-                && record.lineage.event_cursor.as_deref() == Some(record.seq.to_string().as_str())
-        }) else {
-            return unavailable;
-        };
-        let lineage = &owner_record.lineage;
-        let (Some(operation_id), Some(work_scope), Some(module_generation)) = (
-            lineage.operation_id.as_deref(),
-            lineage.work_scope.as_deref(),
-            lineage.module_generation.as_deref(),
-        ) else {
-            return unavailable;
-        };
-        let Some(owner_fence) = lineage.state_fence.as_ref() else {
-            return unavailable;
-        };
-        let owner_epoch = authority_epoch_text(&owner_fence.authority_epoch);
-        if owner_fence != &identity.request.state_fence
-            || lineage.authority_epoch.as_deref() != Some(owner_epoch.as_str())
-            || owner_fence != &session.module_generation.state_fence
-        {
-            return unavailable;
+        if let Some(envelope) = &host_request_envelope {
+            let request_metadata = &identity.request.metadata;
+            if envelope.connection_id != session.connection_id
+                || &envelope.identity.request_id != request_id
+                || &envelope.state_fence != &identity.request.state_fence
+                || envelope.identity.idempotency_key != identity.idempotency_key
+                || envelope.identity.cancellation_id != identity.cancellation_id
+                || envelope.identity.deadline_unix_ms != identity.deadline_unix_ms
+                || envelope.identity.task_id.as_deref()
+                    != request_metadata.task_id.as_ref().map(|value| value.as_str())
+                || envelope.identity.session_id.as_deref()
+                    != request_metadata.session_id.as_ref().map(|value| value.as_str())
+            {
+                return unavailable;
+            }
+            return self.crash_operation_context_for_host_request(session, frame, envelope);
         }
-        let manifest = crate::trace_manifest::TraceManifest::find_sealed(&records, operation_id);
-        let has_manifest_record = records.iter().any(|record| {
-            record.kind == AuditEventKind::TRACE_MANIFEST_SEALED
-                && record.lineage.operation_id.as_deref() == Some(operation_id)
+        let (action_kind, action_operation_id) = match action {
+            crate::KernelFrameAction::Process { request, .. } => {
+                ("process", request.operation_id().map(ToString::to_string))
+            }
+            crate::KernelFrameAction::Daemon { .. } => ("daemon", None),
+            crate::KernelFrameAction::Doctor { .. } => ("doctor", None),
+            crate::KernelFrameAction::Testd { .. } => ("testd", None),
+            crate::KernelFrameAction::Dreamer { .. } => ("dreamer", None),
+            crate::KernelFrameAction::Research { .. } => ("research", None),
+            crate::KernelFrameAction::Backup { .. } => ("backup", None),
+            crate::KernelFrameAction::Reply(_) | crate::KernelFrameAction::Fence(_) => {
+                return CrashOperationContext::NoActiveOperation;
+            }
+        };
+        let records = self.audit_chain_records().ok();
+        // A stored row enriches this context only when it retains the complete
+        // original typed frame identity. Same request ID/fence alone cannot
+        // select another operation from the chain.
+        let owner_record = records.as_ref().and_then(|records| {
+            records.iter().rev().find(|record| {
+                record.lineage.trace_id.as_deref() == Some(request_id.as_str())
+                    && record.lineage.state_fence.as_ref() == Some(&identity.request.state_fence)
+                    && record.lineage.event_cursor.as_deref()
+                        == Some(record.seq.to_string().as_str())
+                    && record.lineage.request_identity.as_ref() == Some(identity)
+                    && action_operation_id.as_deref().is_none_or(|expected| {
+                        record.lineage.operation_id.as_deref() == Some(expected)
+                    })
+            })
         });
-        if has_manifest_record && manifest.is_none() {
-            return unavailable;
+        let mut lineage = AuditLineage::empty();
+        lineage.trace_id = Some(request_id.to_string());
+        lineage.request_identity = Some(identity.clone());
+        lineage.state_fence = Some(identity.request.state_fence.clone());
+        lineage.module_generation = Some(
+            identity
+                .request
+                .state_fence
+                .resource_generation
+                .value()
+                .to_string(),
+        );
+        lineage.authority_epoch = Some(authority_epoch_text(
+            &identity.request.state_fence.authority_epoch,
+        ));
+        lineage.task_id = identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(ToString::to_string);
+        lineage.session_id = identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(ToString::to_string);
+        if let Some(owner_record) = owner_record {
+            let owner = &owner_record.lineage;
+            if owner.state_fence.as_ref() == Some(&identity.request.state_fence)
+                && owner.module_generation.as_deref() == lineage.module_generation.as_deref()
+                && owner.authority_epoch.as_deref() == lineage.authority_epoch.as_deref()
+                && identity
+                    .request
+                    .metadata
+                    .task_id
+                    .as_ref()
+                    .is_none_or(|task| owner.task_id.as_deref() == Some(task.as_str()))
+                && identity
+                    .request
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|session| owner.session_id.as_deref() == Some(session.as_str()))
+            {
+                lineage.operation_id = action_operation_id
+                    .clone()
+                    .or_else(|| owner.operation_id.clone());
+                lineage.work_scope = owner.work_scope.clone();
+            }
         }
-        if manifest.as_ref().is_some_and(|manifest| {
-            manifest.trace_id != request_id.as_str()
-                || manifest.operation_id != operation_id
-                || manifest.work_scope_id.as_deref() != Some(work_scope)
-                || manifest.state_fence.as_ref() != Some(owner_fence)
-                || manifest.module_generation.as_deref() != Some(module_generation)
-                || manifest.authority_epoch.as_deref() != lineage.authority_epoch.as_deref()
-        }) {
-            return unavailable;
+        if lineage.operation_id.is_none() {
+            lineage.operation_id = action_operation_id.clone();
         }
         let Ok(original_owner_evidence) = serde_json::to_string(&serde_json::json!({
-            "record_kind": &owner_record.kind,
-            "record_sequence": owner_record.seq,
-            "record_hash": &owner_record.current_hash,
-            "lineage": lineage,
-            "sealed_trace_manifest": &manifest,
+            "owner_source": "validated_admitted_frame_and_kernel_action",
+            "action_kind": action_kind,
+            "record_sequence": owner_record.map(|record| record.seq),
+            "record_hash": owner_record.map(|record| &record.current_hash),
+            "lineage": &lineage,
         })) else {
             return unavailable;
         };
         let base = self.crash_runtime_context(false);
-        // Process/module owner metadata can be retained only when its exact
-        // fence is the operation fence. A concurrent generation transition
-        // must not splice generation B into operation A's crash record.
-        if base.state_fence.as_ref() != Some(owner_fence) {
-            return unavailable;
-        }
+        let same_fence = base.state_fence.as_ref() == Some(&identity.request.state_fence);
         let runtime_context = CrashRuntimeContext::from_observations(
             CrashRuntimeContextObservations {
-                module_generation_ref: Some(module_generation.to_owned()),
-                process_generation_ref: base.process_generation_ref,
-                state_fence: Some(owner_fence.clone()),
-                active_trace_ref: lineage.trace_id.clone(),
-                work_scope_ref: Some(work_scope.to_owned()),
-                audit_head: base.audit_head,
+                module_generation_ref: lineage.module_generation.clone(),
+                process_generation_ref: same_fence.then_some(base.process_generation_ref).flatten(),
+                state_fence: Some(identity.request.state_fence.clone()),
+                active_trace_ref: Some(request_id.to_string()),
+                work_scope_ref: lineage.work_scope.clone(),
+                audit_head: same_fence.then_some(base.audit_head).flatten(),
                 evidence_handles: Vec::new(),
                 journal_head: None,
             },
         );
         if runtime_context.validate().is_err() {
-            return unavailable;
+            return CrashOperationContext::UnavailableWithOwnerEvidence(original_owner_evidence);
         }
         CrashOperationContext::Current {
             runtime_context,
+            operation_id: lineage.operation_id,
             original_owner_evidence,
         }
     }

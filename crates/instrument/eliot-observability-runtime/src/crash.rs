@@ -41,6 +41,27 @@ thread_local! {
     /// synchronous dispatch or Future poll. The guard never lives across an
     /// await, so executor migration cannot leave a context on the wrong thread.
     static ACTIVE_OPERATION_CONTEXT: RefCell<Option<CrashOperationContext>> = const { RefCell::new(None) };
+    /// Failed scope installation must not inherit a previous scope or the
+    /// process snapshot as positive context for the operation being polled.
+    static OPERATION_CONTEXT_INSTALL_FAILED: Cell<bool> = const { Cell::new(false) };
+}
+
+struct OperationContextInstallFailureGuard(bool);
+
+impl OperationContextInstallFailureGuard {
+    fn enter() -> Self {
+        let previous = OPERATION_CONTEXT_INSTALL_FAILED
+            .try_with(|failed| failed.replace(true))
+            .unwrap_or(true);
+        Self(previous)
+    }
+}
+
+impl Drop for OperationContextInstallFailureGuard {
+    fn drop(&mut self) {
+        let previous = self.0;
+        let _ = OPERATION_CONTEXT_INSTALL_FAILED.try_with(|failed| failed.set(previous));
+    }
 }
 
 /// Task-local context for the exact operation currently being dispatched.
@@ -56,6 +77,8 @@ pub enum CrashOperationContext {
     Current {
         /// Full bounded runtime identities from the same admitted owner.
         runtime_context: CrashRuntimeContext,
+        /// Original owner operation identifier when the action supplies one.
+        operation_id: Option<String>,
         /// Canonical redacted bytes projected from the original Kernel-owned
         /// AuditLineage and, when already sealed, TraceManifest owner data.
         original_owner_evidence: String,
@@ -95,11 +118,19 @@ pub fn enter_crash_operation(
 ) -> Result<CrashOperationContextGuard, CrashReportError> {
     if let CrashOperationContext::Current {
         runtime_context: snapshot,
+        operation_id,
         original_owner_evidence,
     } = &context
     {
         snapshot.validate()?;
-        validate_original_owner_evidence(original_owner_evidence)?;
+        if let Some(operation_id) = operation_id {
+            validate_identity(operation_id, "operation_id")?;
+        }
+        validate_original_owner_evidence_for_context(
+            original_owner_evidence,
+            snapshot,
+            operation_id.as_deref(),
+        )?;
     }
     if let CrashOperationContext::UnavailableWithOwnerEvidence(evidence) = &context {
         validate_original_owner_evidence(evidence)?;
@@ -135,6 +166,9 @@ pub fn with_crash_operation<R>(
     let _guard = enter_crash_operation(context)
         .or_else(|_| enter_crash_operation(fallback))
         .ok();
+    let _install_failure = _guard
+        .is_none()
+        .then(OperationContextInstallFailureGuard::enter);
     operation()
 }
 
@@ -154,11 +188,26 @@ where
     let context = match &context {
         CrashOperationContext::Current {
             runtime_context: snapshot,
+            operation_id,
             original_owner_evidence,
         } if snapshot.validate().is_err()
-            || validate_original_owner_evidence(original_owner_evidence).is_err() =>
+            || operation_id.as_deref().is_some_and(|operation_id| {
+                validate_identity(operation_id, "operation_id").is_err()
+            })
+            || validate_original_owner_evidence_for_context(
+                original_owner_evidence,
+                snapshot,
+                operation_id.as_deref(),
+            )
+            .is_err() =>
         {
-            CrashOperationContext::Unavailable
+            if validate_original_owner_evidence(original_owner_evidence).is_ok() {
+                CrashOperationContext::UnavailableWithOwnerEvidence(
+                    original_owner_evidence.clone(),
+                )
+            } else {
+                CrashOperationContext::Unavailable
+            }
         }
         CrashOperationContext::UnavailableWithOwnerEvidence(evidence)
             if validate_original_owner_evidence(evidence).is_err() =>
@@ -182,6 +231,9 @@ where
         let _guard = enter_crash_operation(context.clone())
             .or_else(|_| enter_crash_operation(fallback))
             .ok();
+        let _install_failure = _guard
+            .is_none()
+            .then(OperationContextInstallFailureGuard::enter);
         future.as_mut().poll(task_context)
     })
     .await
@@ -668,6 +720,9 @@ pub struct CrashReportMetadata {
     pub symbol_artifact: SymbolArtifact,
     /// Complete bounded runtime identity snapshot.
     pub runtime_context: CrashRuntimeContext,
+    /// Original operation identifier when the admitted action supplies one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     /// Exact redacted original owner data for an operation-scoped capture.
     /// This field is included in the report digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -699,15 +754,40 @@ impl CrashReportMetadata {
         }
         self.symbol_artifact.validate(&self.build_profile)?;
         self.runtime_context.validate()?;
-        if let Some(evidence) = &self.operation_owner_evidence {
-            validate_original_owner_evidence(evidence)?;
-        }
-        if self.operation_scope_status.as_deref().is_some_and(|status| {
-            !matches!(status, "active_operation" | "no_active_operation")
-        }) {
-            return Err(CrashReportError::InvalidMetadata(
-                "operation_scope_status",
-            ));
+        match self.operation_scope_status.as_deref() {
+            Some("active_operation") => {
+                let evidence = self.operation_owner_evidence.as_deref().ok_or(
+                    CrashReportError::InvalidMetadata(
+                        "operation_owner_evidence.active_operation_required",
+                    ),
+                )?;
+                validate_original_owner_evidence_for_context(
+                    evidence,
+                    &self.runtime_context,
+                    self.operation_id.as_deref(),
+                )?;
+            }
+            Some("no_active_operation") => {
+                if self.operation_owner_evidence.is_some() || self.operation_id.is_some() {
+                    return Err(CrashReportError::InvalidMetadata(
+                        "operation_owner_evidence.no_active_operation",
+                    ));
+                }
+            }
+            Some(_) => {
+                return Err(CrashReportError::InvalidMetadata(
+                    "operation_scope_status",
+                ));
+            }
+            None => {
+                if let Some(evidence) = &self.operation_owner_evidence {
+                    validate_original_owner_evidence_for_context(
+                        evidence,
+                        &self.runtime_context,
+                        self.operation_id.as_deref(),
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -1199,6 +1279,16 @@ impl CrashReporterState {
             );
             return;
         };
+        if OPERATION_CONTEXT_INSTALL_FAILED
+            .try_with(Cell::get)
+            .unwrap_or(true)
+        {
+            self.enqueue_gap(
+                report_id,
+                CrashTelemetryGapReason::ActiveOperationContextUnavailable,
+            );
+            return;
+        }
         let operation_context = match ACTIVE_OPERATION_CONTEXT.try_with(|current| {
             current
                 .try_borrow()
@@ -1208,7 +1298,7 @@ impl CrashReporterState {
             Ok(context) => context,
             Err(_) => Some(CrashOperationContext::Unavailable),
         };
-        let (mut context, operation_owner_evidence, operation_scope_status) = match operation_context {
+        let (mut context, operation_id, operation_owner_evidence, operation_scope_status) = match operation_context {
             Some(CrashOperationContext::Unavailable) => {
                 self.enqueue_gap(
                     report_id,
@@ -1226,9 +1316,11 @@ impl CrashReporterState {
             }
             Some(CrashOperationContext::Current {
                 runtime_context,
+                operation_id,
                 original_owner_evidence,
             }) => (
                 runtime_context,
+                operation_id,
                 Some(original_owner_evidence),
                 Some("active_operation".to_owned()),
             ),
@@ -1259,6 +1351,7 @@ impl CrashReporterState {
                 (
                     context,
                     None,
+                    None,
                     Some("no_active_operation".to_owned()),
                 )
             }
@@ -1277,6 +1370,7 @@ impl CrashReporterState {
             fault_site: "panic_hook".to_owned(),
             symbol_artifact,
             runtime_context: context,
+            operation_id,
             operation_owner_evidence,
             operation_scope_status,
         };
@@ -1408,6 +1502,145 @@ fn validate_original_owner_evidence(value: &str) -> Result<(), CrashReportError>
     serde_json::from_str::<serde_json::Value>(value)
         .map(|_| ())
         .map_err(|_| CrashReportError::InvalidMetadata("operation_owner_evidence.json"))
+}
+
+fn validate_original_owner_evidence_for_context(
+    value: &str,
+    runtime_context: &CrashRuntimeContext,
+    expected_operation_id: Option<&str>,
+) -> Result<(), CrashReportError> {
+    validate_original_owner_evidence(value)?;
+    let owner: serde_json::Value = serde_json::from_str(value)
+        .map_err(|_| CrashReportError::InvalidMetadata("operation_owner_evidence.json"))?;
+    let lineage = owner
+        .get("lineage")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.lineage",
+        ))?;
+    let trace_id = original_lineage_string(lineage, "trace_id")?;
+    let operation_id = original_lineage_optional_string(lineage, "operation_id")?;
+    let work_scope = original_lineage_optional_string(lineage, "work_scope")?;
+    let module_generation = original_lineage_optional_string(lineage, "module_generation")?;
+    let authority_epoch = original_lineage_string(lineage, "authority_epoch")?;
+    let state_fence: StateFence = serde_json::from_value(
+        lineage
+            .get("state_fence")
+            .cloned()
+            .ok_or(CrashReportError::InvalidMetadata(
+                "operation_owner_evidence.state_fence",
+            ))?,
+    )
+    .map_err(|_| CrashReportError::InvalidMetadata("operation_owner_evidence.state_fence"))?;
+    let request_identity = lineage
+        .get("request_identity")
+        .cloned()
+        .ok_or(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.request_identity",
+        ))?;
+    let request = request_identity
+        .get("request")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.request_identity",
+        ))?;
+    let metadata = request
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.request_identity",
+        ))?;
+    let identity_request_id = metadata
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.request_identity",
+        ))?;
+    let identity_fence = request
+        .get("state_fence")
+        .cloned()
+        .ok_or(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.request_identity",
+        ))?;
+    let identity_fence: StateFence = serde_json::from_value(identity_fence).map_err(|_| {
+        CrashReportError::InvalidMetadata("operation_owner_evidence.request_identity")
+    })?;
+    let metadata_fence: StateFence = serde_json::from_value(
+        metadata
+            .get("state_fence")
+            .cloned()
+            .ok_or(CrashReportError::InvalidMetadata(
+                "operation_owner_evidence.request_identity",
+            ))?,
+    )
+    .map_err(|_| CrashReportError::InvalidMetadata("operation_owner_evidence.request_identity"))?;
+    if request_identity
+        .get("idempotency_key")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+        || request_identity
+            .get("cancellation_id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        || request_identity
+            .get("deadline_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|deadline| deadline == 0)
+    {
+        return Err(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.request_identity",
+        ));
+    }
+    let expected_authority_epoch = runtime_context
+        .authority_epoch
+        .as_ref()
+        .map(|epoch| format!("{}:{}", epoch.lineage_id.as_str(), epoch.sequence))
+        .ok_or(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.authority_epoch",
+        ))?;
+    if runtime_context.active_trace_ref.as_deref() != Some(trace_id)
+        || work_scope.is_some_and(|value| runtime_context.work_scope_ref.as_deref() != Some(value))
+        || module_generation.is_some_and(|value| {
+            runtime_context.module_generation_ref.as_deref() != Some(value)
+        })
+        || runtime_context.state_fence.as_ref() != Some(&state_fence)
+        || identity_request_id != trace_id
+        || identity_fence != state_fence
+        || metadata_fence != state_fence
+        || lineage.get("task_id") != metadata.get("task_id")
+        || lineage.get("session_id") != metadata.get("session_id")
+        || authority_epoch != expected_authority_epoch
+        || operation_id != expected_operation_id
+    {
+        return Err(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.context_mismatch",
+        ));
+    }
+    if let Some(operation_id) = operation_id {
+        validate_identity(operation_id, "operation_owner_evidence.operation_id")?;
+    }
+    Ok(())
+}
+
+fn original_lineage_optional_string<'a>(
+    lineage: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<Option<&'a str>, CrashReportError> {
+    match lineage.get(field) {
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => Ok(Some(value)),
+        Some(serde_json::Value::Null) | None => Ok(None),
+        _ => Err(CrashReportError::InvalidMetadata(field)),
+    }
+}
+
+fn original_lineage_string<'a>(
+    lineage: &'a serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<&'a str, CrashReportError> {
+    lineage
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(CrashReportError::InvalidMetadata(field))
 }
 
 impl CrashReporterState {

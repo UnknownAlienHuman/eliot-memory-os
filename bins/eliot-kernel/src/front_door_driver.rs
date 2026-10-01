@@ -9,6 +9,7 @@
 //! Terminal projection (`exit_*`/`write_error`) stays in `main` and is reused
 //! here without duplication. Capability cell: 1 (front-door/IPC admission).
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use eliot_ipc::{
@@ -345,211 +346,222 @@ async fn serve_connection(
         ) {
             eliot_observability_runtime::CrashOperationContext::NoActiveOperation
         } else {
-            kernel.crash_operation_context_for_frame(&session, &frame)
+            kernel.crash_operation_context_for_frame(&session, &frame, &action)
         };
-        eliot_observability_runtime::scope_crash_operation(operation_context, async {
-        match action {
-            KernelFrameAction::Reply(reply) => {
-                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
-                    session.fence();
-                    return Err(error);
-                }
-            }
-            KernelFrameAction::Process {
-                request_id,
-                request,
-                session_binding,
-            } => {
-                use eliot_kernel::process_execution_client;
-                use eliot_kernel_service::ProcessExecutionClient;
-                // I16.6 (issue #1841): the port execution is timed from the
-                // moment the local port was handed the admitted action, and the
-                // outcome is the one the port actually produced - a rejection
-                // from admission is `Rejected`, not a failed execution. Nothing
-                // here measures the transport write, so a slow peer cannot be
-                // reported as a slow port.
-                let port_started = std::time::Instant::now();
-                let response = match process_execution_client(&kernel, &session, &session_binding) {
-                    Ok(client) => client.execute(request).await,
-                    Err(rejection) => ProcessExecutionResponse::Rejected(rejection),
-                };
-                if let Some(metrics) = eliot_kernel::execution_metrics::kernel_metrics() {
-                    metrics.record(metrics.record_local_port(
-                        ModuleIdentity::LocalHttpAdapter,
-                        WorkClass::Interactive,
-                        "kernel.local_port",
-                        local_port_outcome(&response),
-                        port_started.elapsed(),
-                    ));
-                }
-                let reply = kernel.process_response_frame(&session, request_id, &response)?;
-                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
-                    session.fence();
-                    return Err(error);
-                }
-            }
-            KernelFrameAction::Daemon {
-                request_id,
-                identity,
-                operation,
-                payload,
-            } => {
-                let reply = kernel
-                    .execute_daemon_request_with_identity(
-                        &session, request_id, identity, &operation, payload,
-                    )
-                    .await?;
-                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
-                    session.fence();
-                    return Err(error);
-                }
-            }
-            KernelFrameAction::Doctor {
-                request_id,
-                operation,
-                payload,
-                control,
-            } => {
-                // P-07 Doctor repair intake: one bounded request/response
-                // through the closed P-07 handler
-                // (`KernelComposition::execute_doctor_request`). Frames are
-                // served strictly in receive order on this connection, so a
-                // second activation can never run concurrently with the
-                // first; unknown operations never reach this arm (dispatch
-                // fences them) and any handler failure fences the session
-                // instead of silently dropping the submit.
-                let reply = kernel
-                    .execute_doctor_request_with_control(
-                        &session, request_id, &operation, payload, control, true,
-                    )
-                    .await?;
-                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
-                    session.fence();
-                    return Err(error);
-                }
-            }
-            KernelFrameAction::Testd {
-                request_id,
-                identity,
-                operation,
-                payload,
-                control,
-            } => {
-                // P-07 testd admission intake: one bounded request/response
-                // through the closed P-07 handler
-                // (`KernelComposition::execute_testd_request`). Frames are
-                // served strictly in receive order on this connection, so a
-                // second admission can never run concurrently with the
-                // first; unknown operations never reach this arm (dispatch
-                // fences them) and any handler failure fences the session
-                // instead of silently dropping the submit.
-                let reply = if operation == eliot_kernel::TESTD_TERMINAL_COMPLETION_OPERATION {
-                    kernel
-                        .execute_testd_terminal_completion(
-                            &session, request_id, &identity, &operation, payload,
-                        )
-                        .await?
-                } else if operation == eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION {
-                    kernel
-                        .execute_testd_owner_submit(
-                            &session, request_id, &identity, &operation, payload,
-                        )
-                        .await?
-                } else {
-                    kernel
-                        .execute_testd_request_with_control(
-                            &session, request_id, &operation, payload, control, true,
-                        )
-                        .await?
-                };
-                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
-                    session.fence();
-                    return Err(error);
-                }
-            }
-            KernelFrameAction::Dreamer {
-                request_id,
-                operation,
-                payload,
-            } => {
-                // T12-05 K2 Dreamer requester routing: one bounded
-                // request/response through the closed K2 handler
-                // (`KernelComposition::execute_dreamer_request`). Frames are
-                // served strictly in receive order on this connection, so a
-                // second call can never run concurrently with the first;
-                // unknown operations never reach this arm (dispatch fences
-                // them) and any handler failure fences the session instead
-                // of silently dropping the submit. No process is spawned
-                // here.
-                let reply = Box::pin(
-                    kernel.execute_dreamer_request(&session, request_id, &operation, payload),
-                )
-                .await?;
-                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
-                    session.fence();
-                    return Err(error);
-                }
-            }
-            KernelFrameAction::Research {
-                request_id,
-                operation,
-                payload,
-            } => {
-                // #24 bounded research-provider dispatch/reconcile: one
-                // request/response through the closed route handler
-                // (`KernelComposition::handle_research_provider`). Frames are
-                // served strictly in receive order on this connection, so a
-                // second dispatch can never run concurrently with the first;
-                // unknown operations never reach this arm (dispatch fences
-                // them) and any handler failure fences the session instead of
-                // silently dropping the submit. No provider process is spawned
-                // here: the admitted operation runs in `eliot-mod-research`
-                // through the shared governed process contour.
-                let reply = kernel.research_provider_reply_frame(
-                    &session,
-                    &request_id,
-                    &operation,
-                    &payload,
-                )?;
-                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
-                    session.fence();
-                    return Err(error);
-                }
-            }
-            KernelFrameAction::Backup {
-                request_id,
-                operation,
-                payload,
-            } => {
-                // #952 isolated Store restore batch: one bounded
-                // request/response through the closed route handler
-                // (`KernelComposition::execute_backup_store_restore`), which
-                // publishes the admitted archive's retained members and sends
-                // exactly one batch over the retained `KernelStoreGateway`.
-                // Frames are served strictly in receive order on this
-                // connection, so a second dispatch can never run concurrently
-                // with the first; unknown operations never reach this arm
-                // (dispatch fences them) and any handler failure fences the
-                // session instead of silently dropping the request. No second
-                // Store client, transport or credential is constructed here.
-                let reply = Box::pin(
-                    kernel.execute_backup_store_restore(&session, request_id, &operation, payload),
-                )
-                .await?;
-                if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
-                    session.fence();
-                    return Err(error);
-                }
-            }
-            KernelFrameAction::Fence(rejection) => {
-                let result = send_checked(&mut front_door, &rejection, limits).await;
-                session.fence();
-                result?;
-                return Ok(());
-            }
+        let action_future = eliot_observability_runtime::scope_crash_operation(
+                operation_context,
+                async {
+                    match action {
+                        KernelFrameAction::Reply(reply) => {
+                            if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                                session.fence();
+                                return Err(error);
+                            }
+                        }
+                        KernelFrameAction::Process {
+                            request_id,
+                            request,
+                            session_binding,
+                        } => {
+                            use eliot_kernel::process_execution_client;
+                            use eliot_kernel_service::ProcessExecutionClient;
+                            // I16.6 (issue #1841): the port execution is timed from the
+                            // moment the local port was handed the admitted action, and the
+                            // outcome is the one the port actually produced - a rejection
+                            // from admission is `Rejected`, not a failed execution. Nothing
+                            // here measures the transport write, so a slow peer cannot be
+                            // reported as a slow port.
+                            let port_started = std::time::Instant::now();
+                            let response = match process_execution_client(&kernel, &session, &session_binding) {
+                                Ok(client) => client.execute(request).await,
+                                Err(rejection) => ProcessExecutionResponse::Rejected(rejection),
+                            };
+                            if let Some(metrics) = eliot_kernel::execution_metrics::kernel_metrics() {
+                                metrics.record(metrics.record_local_port(
+                                    ModuleIdentity::LocalHttpAdapter,
+                                    WorkClass::Interactive,
+                                    "kernel.local_port",
+                                    local_port_outcome(&response),
+                                    port_started.elapsed(),
+                                ));
+                            }
+                            let reply = kernel.process_response_frame(&session, request_id, &response)?;
+                            if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                                session.fence();
+                                return Err(error);
+                            }
+                        }
+                        KernelFrameAction::Daemon {
+                            request_id,
+                            identity,
+                            operation,
+                            payload,
+                        } => {
+                            let reply = kernel
+                                .execute_daemon_request_with_identity(
+                                    &session, request_id, identity, &operation, payload,
+                                )
+                                .await?;
+                            if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                                session.fence();
+                                return Err(error);
+                            }
+                        }
+                        KernelFrameAction::Doctor {
+                            request_id,
+                            operation,
+                            payload,
+                            control,
+                        } => {
+                            // P-07 Doctor repair intake: one bounded request/response
+                            // through the closed P-07 handler
+                            // (`KernelComposition::execute_doctor_request`). Frames are
+                            // served strictly in receive order on this connection, so a
+                            // second activation can never run concurrently with the
+                            // first; unknown operations never reach this arm (dispatch
+                            // fences them) and any handler failure fences the session
+                            // instead of silently dropping the submit.
+                            let reply = kernel
+                                .execute_doctor_request_with_control(
+                                    &session, request_id, &operation, payload, control, true,
+                                )
+                                .await?;
+                            if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                                session.fence();
+                                return Err(error);
+                            }
+                        }
+                        KernelFrameAction::Testd {
+                            request_id,
+                            identity,
+                            operation,
+                            payload,
+                            control,
+                        } => {
+                            // P-07 testd admission intake: one bounded request/response
+                            // through the closed P-07 handler
+                            // (`KernelComposition::execute_testd_request`). Frames are
+                            // served strictly in receive order on this connection, so a
+                            // second admission can never run concurrently with the
+                            // first; unknown operations never reach this arm (dispatch
+                            // fences them) and any handler failure fences the session
+                            // instead of silently dropping the submit.
+                            let reply = if operation == eliot_kernel::TESTD_TERMINAL_COMPLETION_OPERATION {
+                                kernel
+                                    .execute_testd_terminal_completion(
+                                        &session, request_id, &identity, &operation, payload,
+                                    )
+                                    .await?
+                            } else if operation == eliot_testd_core::TESTD_OWNER_SUBMIT_OPERATION {
+                                kernel
+                                    .execute_testd_owner_submit(
+                                        &session, request_id, &identity, &operation, payload,
+                                    )
+                                    .await?
+                            } else {
+                                kernel
+                                    .execute_testd_request_with_control(
+                                        &session, request_id, &operation, payload, control, true,
+                                    )
+                                    .await?
+                            };
+                            if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                                session.fence();
+                                return Err(error);
+                            }
+                        }
+                        KernelFrameAction::Dreamer {
+                            request_id,
+                            operation,
+                            payload,
+                        } => {
+                            // T12-05 K2 Dreamer requester routing: one bounded
+                            // request/response through the closed K2 handler
+                            // (`KernelComposition::execute_dreamer_request`). Frames are
+                            // served strictly in receive order on this connection, so a
+                            // second call can never run concurrently with the first;
+                            // unknown operations never reach this arm (dispatch fences
+                            // them) and any handler failure fences the session instead
+                            // of silently dropping the submit. No process is spawned
+                            // here.
+                            let reply = Box::pin(
+                                kernel.execute_dreamer_request(&session, request_id, &operation, payload),
+                            )
+                            .await?;
+                            if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                                session.fence();
+                                return Err(error);
+                            }
+                        }
+                        KernelFrameAction::Research {
+                            request_id,
+                            operation,
+                            payload,
+                        } => {
+                            // #24 bounded research-provider dispatch/reconcile: one
+                            // request/response through the closed route handler
+                            // (`KernelComposition::handle_research_provider`). Frames are
+                            // served strictly in receive order on this connection, so a
+                            // second dispatch can never run concurrently with the first;
+                            // unknown operations never reach this arm (dispatch fences
+                            // them) and any handler failure fences the session instead of
+                            // silently dropping the submit. No provider process is spawned
+                            // here: the admitted operation runs in `eliot-mod-research`
+                            // through the shared governed process contour.
+                            let reply = kernel.research_provider_reply_frame(
+                                &session,
+                                &request_id,
+                                &operation,
+                                &payload,
+                            )?;
+                            if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                                session.fence();
+                                return Err(error);
+                            }
+                        }
+                        KernelFrameAction::Backup {
+                            request_id,
+                            operation,
+                            payload,
+                        } => {
+                            // #952 isolated Store restore batch: one bounded
+                            // request/response through the closed route handler
+                            // (`KernelComposition::execute_backup_store_restore`), which
+                            // publishes the admitted archive's retained members and sends
+                            // exactly one batch over the retained `KernelStoreGateway`.
+                            // Frames are served strictly in receive order on this
+                            // connection, so a second dispatch can never run concurrently
+                            // with the first; unknown operations never reach this arm
+                            // (dispatch fences them) and any handler failure fences the
+                            // session instead of silently dropping the request. No second
+                            // Store client, transport or credential is constructed here.
+                            let reply = Box::pin(
+                                kernel.execute_backup_store_restore(&session, request_id, &operation, payload),
+                            )
+                            .await?;
+                            if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
+                                session.fence();
+                                return Err(error);
+                            }
+                        }
+                        KernelFrameAction::Fence(rejection) => {
+                            let result = send_checked(&mut front_door, &rejection, limits).await;
+                            session.fence();
+                            result?;
+                            return Ok(ControlFlow::Break(()));
+                        }
+                    }
+                    Ok(ControlFlow::Continue(()))
+                },
+            );
+        let action_outcome = crate::kernel_audit::scope_audit_request_identity(
+            frame.request_identity.clone(),
+            action_future,
+        )
+        .await?;
+        if let ControlFlow::Break(()) = action_outcome {
+            return Ok(());
         }
-        Ok(())
-        }).await?;
     }
 }
 
