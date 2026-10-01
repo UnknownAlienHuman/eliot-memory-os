@@ -23,7 +23,8 @@ use eliot_process::{
     EnvironmentInheritance, EnvironmentProjection, ExitDisposition, FencingToken, Generation,
     ImageId, JobId, KernelDispatchKey, OperationId, PermitIssuance, ProcessEvidenceSink,
     ProcessExecutionError, ProcessExecutor, ProcessIntent, ProcessRequest, ProcessStartReceipt,
-    ProcessTreeId, ResourceLimits, SessionId, SuspendedProcessIdentity, ValidatedDispatch,
+    ProcessStreamSinkClient, ProcessTreeId, ResourceLimits, SessionId,
+    SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
@@ -635,6 +636,16 @@ pub fn compose_process_executor(
     authority: Arc<dyn DispatchValidationPort>,
 ) -> WindowsProcessExecutor {
     WindowsProcessExecutor::new(authority)
+}
+
+/// Composes the productive executor with the authenticated Kernel-owned
+/// process-stream sink. The sink accepts only the retained opaque capability
+/// and one-use token table; it creates no request identity or Store fence.
+pub fn compose_process_executor_with_stream_sink(
+    authority: Arc<dyn DispatchValidationPort>,
+    stream_sink: Arc<dyn ProcessStreamSinkClient>,
+) -> WindowsProcessExecutor {
+    WindowsProcessExecutor::new_with_stream_sink(authority, stream_sink)
 }
 
 // ---- Governed Git source observation (issue #1140, AC3) ----
@@ -1250,6 +1261,10 @@ pub struct TestdDerivedIntentParams {
     pub process_tree_id: String,
     /// Admitted profile name (exactly one is admitted).
     pub profile: String,
+    /// Exact command projected from the current runner stage. The worker
+    /// supplies this only for productive runner profiles; legacy probe and
+    /// slotted aliases keep their existing closed binding path.
+    pub stage_command: Option<eliot_testd_core::InstrumentStageCommand>,
     /// Validated slot suffix for the slotted list/scoped profiles; empty
     /// for the fixed-argv probe and productive profiles. The suffix is
     /// parsed through the registry slot schema before any argv is sealed.
@@ -1305,11 +1320,46 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
             reason: "testd admits only the closed cargo-test tool-probe profile",
         });
     }
-    let binding = eliot_testd_core::testd_profile_binding_with_slots(
+    let (artifact_sha256, argv, limits) = if eliot_testd_core::is_testd_executor_profile(
         &params.profile,
-        &params.executable_sha256,
-        &params.slot_suffix,
-    )?;
+    ) {
+        let command = params.stage_command.as_ref().ok_or(TestdError::Invalid {
+            field: "stage_request.stage_command",
+            reason: "productive runner execution requires its sealed command projection",
+        })?;
+        if !matches!(command.executable.as_str(), "cargo" | "cargo-nextest")
+            || command.argv.is_empty()
+            || command.argv.len() > 64
+            || command.argv.iter().any(|argument| {
+                argument.is_empty()
+                    || argument.len() > 4_096
+                    || argument.chars().any(char::is_control)
+            })
+            || command.spec_digest.len() != 64
+            || !command
+                .spec_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        (
+            params.executable_sha256.clone(),
+            command.argv.clone(),
+            eliot_testd_core::testd_productive_stage_resource_limits()?,
+        )
+    } else {
+        let binding = eliot_testd_core::testd_profile_binding_with_slots(
+            &params.profile,
+            &params.executable_sha256,
+            &params.slot_suffix,
+        )?;
+        (
+            binding.package_artifact_digest.clone(),
+            binding.fixed_argv.clone(),
+            testd_profile_resource_limits(&binding)?,
+        )
+    };
     let executable = Path::new(&params.executable_absolute);
     if !executable.is_absolute()
         || executable
@@ -1363,11 +1413,11 @@ pub fn derive_testd_intent(params: &TestdDerivedIntentParams) -> Result<ProcessI
         SessionId::new(params.session_nonce.clone()).map_err(invalid)?,
         generation,
         params.executable_absolute.clone(),
-        binding.package_artifact_digest.clone(),
-        binding.fixed_argv.clone(),
+        artifact_sha256,
+        argv,
         params.generation_root.clone(),
         environment,
-        testd_profile_resource_limits(&binding)?,
+        limits,
     )
     .map_err(invalid)?;
     Ok(intent)
@@ -1404,9 +1454,15 @@ fn derive_testd_intent_environment(
         EnvironmentProjection::new(values, Vec::new(), EnvironmentInheritance::None)
             .map_err(|error| TestdError::Contract(truncate_dispatch_detail(&error.to_string())))
     } else {
+        let selector = params
+            .stage_command
+            .as_ref()
+            .map(|command| command.executable.as_str())
+            .unwrap_or("cargo-nextest");
         validate_productive_tool_environment(
             &params.tool_environment,
             &params.executable_absolute,
+            selector,
             &params.target_root,
             &params.cache_root,
         )
@@ -1438,6 +1494,7 @@ pub struct ResolvedTestdTool {
 }
 
 const TESTD_ENV_NEXTEST_GATE: &str = "NEXTEST_EXPERIMENTAL_LIBTEST_JSON";
+const TESTD_ENV_NEXTEST: &str = "ELIOT_TESTD_NEXTEST";
 const TESTD_ENV_NEXTEST_SHA256: &str = "ELIOT_TESTD_NEXTEST_SHA256";
 const TESTD_ENV_CARGO: &str = "CARGO";
 const TESTD_ENV_RUSTC: &str = "RUSTC";
@@ -1519,6 +1576,43 @@ pub fn resolve_testd_tool_at(
     })
 }
 
+/// Resolves one current runner command selector while retaining all three
+/// owner-observed tool identities required by provider freshness.
+fn resolve_testd_executor_tool_at(
+    selector: &str,
+    source_root: &Path,
+) -> Result<ResolvedTestdTool, TestdError> {
+    if !matches!(selector, "cargo" | "cargo-nextest") {
+        return Err(TestdError::Invalid {
+            field: "stage_command.executable",
+            reason: "runner stage selected an unregistered tool selector",
+        });
+    }
+    let path_var = std::env::var_os("PATH").ok_or(TestdError::Invalid {
+        field: "program_path",
+        reason: "the platform tool locator carries no PATH",
+    })?;
+    let nextest = resolve_tool_file("cargo-nextest", &path_var)?;
+    let rustup_home = owner_home_path("RUSTUP_HOME", ".rustup")?;
+    let selected = resolve_selected_toolchain(&rustup_home, source_root)?;
+    let executable = if selector == "cargo" {
+        &selected.cargo
+    } else {
+        &nextest
+    };
+    let environment = productive_tool_environment(
+        &nextest,
+        &selected.cargo,
+        &selected.rustc,
+        &selected.toolchain,
+    )?;
+    Ok(ResolvedTestdTool {
+        executable_absolute: executable.path.clone(),
+        executable_sha256: executable.sha256.clone(),
+        environment,
+    })
+}
+
 struct ResolvedToolFile {
     path: String,
     sha256: String,
@@ -1596,6 +1690,7 @@ fn productive_tool_environment(
         .into_owned();
     Ok(vec![
         (TESTD_ENV_NEXTEST_GATE.to_owned(), "1".to_owned()),
+        (TESTD_ENV_NEXTEST.to_owned(), nextest.path.clone()),
         (TESTD_ENV_NEXTEST_SHA256.to_owned(), nextest.sha256.clone()),
         (TESTD_ENV_CARGO.to_owned(), cargo.path.clone()),
         (TESTD_ENV_RUSTC.to_owned(), rustc.path.clone()),
@@ -1821,13 +1916,15 @@ fn owner_home_path(variable: &str, suffix: &str) -> Result<String, TestdError> {
 
 fn validate_productive_tool_environment(
     environment: &[(String, String)],
-    nextest_path: &str,
+    selected_executable_path: &str,
+    selector: &str,
     target_root: &str,
     cache_root: &str,
 ) -> Result<eliot_process::EnvironmentProjection, TestdError> {
     let values: BTreeMap<_, _> = environment.iter().cloned().collect();
     let expected_keys = [
         TESTD_ENV_NEXTEST_GATE,
+        TESTD_ENV_NEXTEST,
         TESTD_ENV_NEXTEST_SHA256,
         TESTD_ENV_CARGO,
         TESTD_ENV_RUSTC,
@@ -1856,11 +1953,28 @@ fn validate_productive_tool_environment(
         })?;
         validate_owner_tool_path(path)?;
     }
+    let nextest_path = values.get(TESTD_ENV_NEXTEST).ok_or(TestdError::Invalid {
+        field: "tool_environment",
+        reason: "productive environment is missing the nextest path",
+    })?;
     let nextest = validate_owner_tool_path(nextest_path)?;
     let cargo = values.get(TESTD_ENV_CARGO).expect("checked above");
     let rustc = values.get(TESTD_ENV_RUSTC).expect("checked above");
+    let selected_path = match selector {
+        "cargo" => cargo.as_str(),
+        "cargo-nextest" => nextest_path.as_str(),
+        _ => {
+            return Err(TestdError::Invalid {
+                field: "stage_command.executable",
+                reason: "productive environment has an unregistered executable selector",
+            });
+        }
+    };
+    if selected_executable_path != selected_path {
+        return Err(TestdError::InvalidBinding);
+    }
     let expected_hashes = [
-        (TESTD_ENV_NEXTEST_SHA256, nextest_path),
+        (TESTD_ENV_NEXTEST_SHA256, nextest_path.as_str()),
         (TESTD_ENV_CARGO_SHA256, cargo),
         (TESTD_ENV_RUSTC_SHA256, rustc),
     ];
@@ -2050,8 +2164,6 @@ fn validate_job_process_stage(job: &TestJob) -> Result<(), TestdError> {
             stage.validate()?;
             if stage.execution != StageExecutionKind::Process
                 || stage.invocation != job.invocation
-                || (eliot_testd_core::is_productive_testd_profile(&job.invocation.profile)
-                    && stage.adapter != TESTD_PRODUCTIVE_ADAPTER)
             {
                 return Err(TestdError::InvalidBinding);
             }
@@ -2125,12 +2237,28 @@ fn derive_dispatch_process_intent(
     material: &crate::testd_material::ValidatedTestdMaterial,
     canonical_job_source: &Path,
 ) -> Result<ProcessIntent, TestdError> {
+    let stage_command = if eliot_testd_core::is_testd_executor_profile(&job.invocation.profile) {
+        Some(
+            job.stage_request
+                .as_ref()
+                .and_then(|stage| stage.stage_command.clone())
+                .ok_or(TestdError::InvalidBinding)?,
+        )
+    } else {
+        None
+    };
     let program_path = if job.invocation.profile == eliot_testd_core::TESTD_ADMITTED_PROFILE {
         eliot_testd_core::TESTD_PROFILE_PROGRAM
+    } else if let Some(command) = stage_command.as_ref() {
+        command.executable.as_str()
     } else {
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
     };
-    let tool = resolve_testd_tool_at(program_path, canonical_job_source)?;
+    let tool = if stage_command.is_some() {
+        resolve_testd_executor_tool_at(program_path, canonical_job_source)?
+    } else {
+        resolve_testd_tool_at(program_path, canonical_job_source)?
+    };
     let tool_environment = bind_tool_environment_to_roots(
         &job.invocation.profile,
         tool.environment,
@@ -2145,6 +2273,7 @@ fn derive_dispatch_process_intent(
         operation_id: job.process.operation_id.clone(),
         process_tree_id: job.process.process_tree_id.clone(),
         profile: job.invocation.profile.clone(),
+        stage_command,
         slot_suffix: material.sealed_slot_suffix.clone(),
         generation: material.generation,
         session_nonce: material.nonce.clone(),
@@ -2222,6 +2351,15 @@ pub async fn drive_validated_dispatch_material(
     source_root: &str,
     now_unix_ms: u64,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
+    drive_validated_dispatch_material_inner(material, source_root, now_unix_ms, None).await
+}
+
+async fn drive_validated_dispatch_material_inner(
+    material: &crate::testd_material::ValidatedTestdMaterial,
+    source_root: &str,
+    now_unix_ms: u64,
+    blob_client: Option<crate::kernel_client::KernelTestdBlobStreamClient>,
+) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
     if material.cancelled {
         return Ok(ValidatedDispatchDriveOutcome::Cancelled {
             job_id: material.job_id.clone(),
@@ -2237,7 +2375,50 @@ pub async fn drive_validated_dispatch_material(
     // request, so both launches share one Job Object contour, one permit
     // authority, and one one-shot replay fence (issue #1140, AC3).
     let authority = Arc::new(TestdDispatchAuthority::new()?);
-    let executor = Arc::new(compose_process_executor(authority.clone()));
+    let mut readback_port = None;
+    let executor = if eliot_testd_core::is_productive_testd_profile(&job.invocation.profile) {
+        let stream_material = material.blob_stream.as_ref().ok_or(TestdError::InvalidBinding)?;
+        let (durable_grant, tokens) = match store.resolve_blob_process_stream_grant(
+            &job.job_id,
+            &stream_material.capability_ref,
+            now_unix_ms,
+        )? {
+            eliot_testd_core::TestdBlobProcessStreamGrantResolution::Active(grant) => {
+                let tokens_match = grant.tokens == stream_material.tokens;
+                (grant, tokens_match)
+            }
+            eliot_testd_core::TestdBlobProcessStreamGrantResolution::NotFound
+            | eliot_testd_core::TestdBlobProcessStreamGrantResolution::Revoked => {
+                return Err(TestdError::InvalidBinding);
+            }
+        };
+        durable_grant.validate()?;
+        if !tokens
+            || durable_grant.revoked_at_ms.is_some()
+            || durable_grant.capability_ref != stream_material.capability_ref
+        {
+            return Err(TestdError::InvalidBinding);
+        }
+        let client = blob_client.ok_or(TestdError::InvalidBinding)?;
+        let calls = crate::kernel_client::KernelBlobStreamCallSequence::new(
+            client,
+            &durable_grant.capability_ref,
+            &durable_grant.tokens,
+            &job.job_id,
+            material.grant.expires_at,
+        )
+        .map_err(|error| TestdError::Contract(error.to_string()))?;
+        let sink: Arc<dyn ProcessStreamSinkClient> = Arc::new(
+            crate::kernel_client::KernelProcessStreamSinkClient::new(calls.clone()),
+        );
+        readback_port = Some(crate::blob_readback::KernelBlobReadbackPort::new(calls));
+        Arc::new(compose_process_executor_with_stream_sink(
+            authority.clone(),
+            sink,
+        ))
+    } else {
+        Arc::new(compose_process_executor(authority.clone()))
+    };
     let git = Arc::new(GovernedGitSourceObservation::new(
         executor.clone(),
         authority.clone(),
@@ -2252,17 +2433,32 @@ pub async fn drive_validated_dispatch_material(
     // one-shot nonces, so neither can be replayed, and both children are
     // owned by one Job Object contour.
     let presented = present_dispatch_admission(&job, material, &intent, &authority, now_unix_ms)?;
-    let receipt = worker::drive_admitted_one_shot_from_store(
-        &store,
-        presented,
-        &worker::GovernedContour::new(
-            executor.as_ref(),
-            Some(&*git as &dyn SourceObservationGitPort),
-        ),
-        SERVICE_NAME,
-        ADMITTED_WORKER_LEASE_MS,
-        now_unix_ms,
-    )?;
+    let receipt = if let Some(readback) = readback_port.as_ref() {
+        worker::drive_admitted_one_shot_from_store(
+            &store,
+            presented,
+            &worker::GovernedContour::with_readback_port(
+                executor.as_ref(),
+                Some(&*git as &dyn SourceObservationGitPort),
+                readback,
+            ),
+            SERVICE_NAME,
+            ADMITTED_WORKER_LEASE_MS,
+            now_unix_ms,
+        )?
+    } else {
+        worker::drive_admitted_one_shot_from_store(
+            &store,
+            presented,
+            &worker::GovernedContour::new(
+                executor.as_ref(),
+                Some(&*git as &dyn SourceObservationGitPort),
+            ),
+            SERVICE_NAME,
+            ADMITTED_WORKER_LEASE_MS,
+            now_unix_ms,
+        )?
+    };
     project_dispatch_receipt_state(&receipt)
 }
 
@@ -2276,7 +2472,13 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     now_unix_ms: u64,
     client: &mut crate::kernel_client::KernelTestdIpcClient,
 ) -> Result<ValidatedDispatchDriveOutcome, TestdError> {
-    let outcome = drive_validated_dispatch_material(material, source_root, now_unix_ms).await?;
+    let outcome = drive_validated_dispatch_material_inner(
+        material,
+        source_root,
+        now_unix_ms,
+        Some(client.blob_stream_client()),
+    )
+    .await?;
     let job_id = match &outcome {
         ValidatedDispatchDriveOutcome::Completed { job_id }
         | ValidatedDispatchDriveOutcome::Failed { job_id }
@@ -2950,6 +3152,7 @@ mod tests {
             operation_id: "testd-op-drive-1".to_owned(),
             process_tree_id: "job-testd-drive-1-tree".to_owned(),
             profile: TESTD_ADMITTED_PROFILE.to_owned(),
+            stage_command: None,
             slot_suffix: Vec::new(),
             generation: 1,
             session_nonce: "testd-drive-session-01".to_owned(),

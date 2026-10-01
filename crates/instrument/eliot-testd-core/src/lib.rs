@@ -725,6 +725,16 @@ pub fn is_testd_executor_profile(profile: &str) -> bool {
     is_productive_testd_profile(profile)
 }
 
+/// Returns the existing bounded productive limits for an admitted runner
+/// process stage. The limits are not caller-configurable and are independent
+/// of the exact sealed command carried by the stage request.
+pub fn testd_productive_stage_resource_limits() -> Result<ResourceLimits, TestdError> {
+    let (wall, cpu, memory, stdout, stderr, descendants) =
+        profile_limits(TESTD_PRODUCTIVE_PROFILE);
+    ResourceLimits::new(wall, cpu, memory, stdout, stderr, descendants)
+        .map_err(|error| TestdError::Contract(error.to_string()))
+}
+
 /// Resolves the closed binding for one admitted profile.
 ///
 /// The artifact digest is the caller's recorded SHA-256 of the installed
@@ -2509,16 +2519,14 @@ impl TestdOwnerJobSubmission {
             reason: "productive owner submission requires the runner-admitted stage",
         })?;
         stage.validate()?;
-        if self.invocation.kind != InstrumentKind::Test
-            || self.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+        if !is_testd_executor_profile(&self.invocation.profile)
             || !self.invocation.arguments.is_empty()
             || stage.invocation != self.invocation
             || stage.execution != StageExecutionKind::Process
-            || stage.adapter != TESTD_PRODUCTIVE_ADAPTER
         {
             return Err(TestdError::Invalid {
                 field: "stage_request",
-                reason: "productive submission requires the registered Nextest process stage and no caller arguments",
+                reason: "productive submission requires an admitted runner process stage and no caller arguments",
             });
         }
         Ok(())
@@ -2748,13 +2756,12 @@ impl TestdVerifierJobSubmission {
         self.invocation
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
-        if self.invocation.kind != InstrumentKind::Test
-            || self.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+        if !is_testd_executor_profile(&self.invocation.profile)
             || !self.invocation.arguments.is_empty()
         {
             return Err(TestdError::Invalid {
                 field: "invocation",
-                reason: "productive submission requires the registered TestD profile and no caller arguments",
+                reason: "productive submission requires an admitted runner profile and no caller arguments",
             });
         }
         let stage = self.stage_request.as_ref().ok_or(TestdError::Invalid {
@@ -2783,7 +2790,6 @@ impl TestdVerifierJobSubmission {
         }
         if stage.invocation != self.invocation
             || stage.execution != StageExecutionKind::Process
-            || stage.adapter != TESTD_PRODUCTIVE_ADAPTER
         {
             return Err(TestdError::InvalidBinding);
         }
@@ -3425,7 +3431,7 @@ impl VerificationReceipt {
             .map_err(|_| TestdError::InvalidBinding)?;
         if let Some(observation) = &self.tool_observation {
             observation.validate()?;
-        } else if job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+        } else if is_testd_executor_profile(&job.invocation.profile)
             && matches!(self.execution, ExecutionStatus::Succeeded)
         {
             return Err(TestdError::InvalidBinding);
@@ -3434,12 +3440,12 @@ impl VerificationReceipt {
             source.validate()?;
             if source.before.repository_root != job.target_roots.source_root
                 || source.after.repository_root != job.target_roots.source_root
-                || (job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+                || (is_testd_executor_profile(&job.invocation.profile)
                     && job.source_observation_before.as_ref() != Some(&source.before))
             {
                 return Err(TestdError::InvalidBinding);
             }
-        } else if job.invocation.profile == TESTD_PRODUCTIVE_PROFILE
+        } else if is_testd_executor_profile(&job.invocation.profile)
             && matches!(self.execution, ExecutionStatus::Succeeded)
         {
             return Err(TestdError::InvalidBinding);
@@ -4245,7 +4251,7 @@ impl TestdStore {
         ))
         .map_err(|error| TestdError::Corrupt(error.to_string()))?;
         if sha256_hex(&currentness_bytes) != grant.currentness_sha256
-            || job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            || !is_testd_executor_profile(&job.invocation.profile)
         {
             return Err(TestdError::Invalid {
                 field: "blob_stream.grant",
@@ -4663,10 +4669,10 @@ impl TestdStore {
             drop(identities);
         }
         binding.validate_for_job(&job)?;
-        if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE {
+        if !is_testd_executor_profile(&job.invocation.profile) {
             return Err(TestdError::Invalid {
                 field: "verifier_dispatch",
-                reason: "canonical verifier binding is only valid for productive nextest jobs",
+                reason: "canonical verifier binding is only valid for admitted productive process stages",
             });
         }
         if let Some(existing) = &job.verifier_dispatch {
@@ -4736,7 +4742,7 @@ impl TestdStore {
             .as_ref()
             .map(|revision| revision.value());
         if job.job_id != job_id
-            || job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            || !is_testd_executor_profile(&job.invocation.profile)
             || metadata.task_id.is_none()
             || task_revision.is_none_or(|revision| revision == 0)
             || metadata != &job.invocation.request
@@ -4835,7 +4841,7 @@ impl TestdStore {
             if job.job_id != job_id {
                 return Err(corrupt("durable job key conflicts with record"));
             }
-            if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            if !is_testd_executor_profile(&job.invocation.profile)
                 || job.state != JobState::Queued
                 || job.attempts != 0
                 || job.lease.is_some()
@@ -4885,7 +4891,7 @@ impl TestdStore {
             serde_json::from_slice::<TestJob>(value.value())
                 .map_err(|error| TestdError::Corrupt(error.to_string()))?
         };
-        if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+        if !is_testd_executor_profile(&job.invocation.profile)
             || job.verifier_dispatch.is_none()
             || job.state != JobState::Queued
             || job.attempts != 0
@@ -5417,7 +5423,7 @@ impl TestdStore {
                 .task_revision
                 .as_ref()
                 .map(|revision| revision.value());
-            if invocation.profile != TESTD_PRODUCTIVE_PROFILE
+            if !is_testd_executor_profile(&invocation.profile)
                 || identity.request.metadata.task_id.is_none()
                 || task_revision.is_none_or(|revision| revision == 0)
                 || identity.request.metadata != invocation.request
@@ -5728,7 +5734,7 @@ impl TestdStore {
         let Some(candidate) = candidates
             .into_iter()
             .filter(|candidate| {
-                candidate.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+                !is_testd_executor_profile(&candidate.invocation.profile)
                     || candidate.verifier_dispatch.is_some()
             })
             .filter(|candidate| {

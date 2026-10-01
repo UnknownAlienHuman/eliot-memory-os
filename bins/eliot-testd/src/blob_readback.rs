@@ -9,7 +9,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 use eliot_blob_api::wire::{
-    PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES, ProcessStreamSourceReadbackRequest as BlobRequest,
+    BlobProcessStreamKernelOperationRequest as KernelOperation,
+    BlobProcessStreamKernelSourceReadbackRequest as KernelSourceRequest,
+    BlobProcessStreamKernelResponse, BlobProcessStreamKernelOutcome,
+    BlobProcessStreamOperationResponse,
+    PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
     ProcessStreamSourceReadbackResponse as BlobResponse,
 };
 use eliot_contracts::{ClockReading, canonical_json_bytes};
@@ -19,17 +23,37 @@ use eliot_testd_core::{
     ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackRequest, TestdEvidenceError,
     TestdStreamDisposition, sha256_hex,
 };
+use crate::kernel_client::{KernelBlobStreamCallSequence, TestdIpcError};
 use serde::Serialize;
 
 /// Future returned by the authenticated Kernel source-readback exchange.
 pub type BlobReadbackExchangeFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<BlobResponse, TestdEvidenceError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<BlobProcessStreamKernelResponse, TestdEvidenceError>> + Send + 'a>>;
 
 /// One typed source-readback exchange over the already authenticated Kernel
 /// session. The implementation supplies owner-issued per-operation identity.
 pub trait BlobReadbackExchange: Send + Sync {
     /// Requests one bounded chunk from the exact retained source.
-    fn read_source_chunk<'a>(&'a self, request: &'a BlobRequest) -> BlobReadbackExchangeFuture<'a>;
+    fn read_source_chunk<'a>(
+        &'a self,
+        request: &'a KernelSourceRequest,
+    ) -> BlobReadbackExchangeFuture<'a>;
+}
+
+impl BlobReadbackExchange for KernelBlobStreamCallSequence {
+    fn read_source_chunk<'a>(
+        &'a self,
+        request: &'a KernelSourceRequest,
+    ) -> BlobReadbackExchangeFuture<'a> {
+        Box::pin(async move {
+            let response = self
+                .exchange(KernelOperation::SourceReadback {
+                    request: request.clone(),
+                })
+                .map_err(|error| map_ipc_error(error, request.stream))?;
+            Ok(response)
+        })
+    }
 }
 
 /// Adapts the Kernel-owned chunk exchange to Testd's verified ephemeral-byte
@@ -86,7 +110,7 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
         let mut observed_at = None;
 
         loop {
-            let wire_request = BlobRequest {
+            let wire_request = KernelSourceRequest {
                 wire_revision: 1,
                 job_id: request.job_id.clone(),
                 invocation_id: request.invocation_id.clone(),
@@ -113,16 +137,34 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 policy: policy.clone(),
                 policy_json: policy_json.clone(),
                 policy_sha256: sha256_hex(policy_json.as_bytes()),
-                fence: request.fence.clone(),
                 max_bytes: request.max_bytes,
                 offset,
                 chunk_limit: PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES,
                 deadline_ms: request.deadline_ms,
             };
-            wire_request
-                .validate()
-                .map_err(|_| invalid_stream(stream))?;
-            let response = self.exchange.read_source_chunk(&wire_request).await?;
+            wire_request.validate().map_err(|_| invalid_stream(stream))?;
+            let kernel_response = self.exchange.read_source_chunk(&wire_request).await?;
+            let response = match kernel_response.outcome {
+                BlobProcessStreamKernelOutcome::Completed { response, .. } => {
+                    match response.operation {
+                        BlobProcessStreamOperationResponse::SourceReadback { response } => response,
+                        _ => return Err(integrity_error(stream)),
+                    }
+                }
+                BlobProcessStreamKernelOutcome::Unknown { .. } => {
+                    return Err(TestdEvidenceError::SourceUnknownOutcome {
+                        stream,
+                        reason: "the Kernel could not establish the stored-source readback outcome",
+                    });
+                }
+                BlobProcessStreamKernelOutcome::NotStarted { .. }
+                | BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+                    return Err(TestdEvidenceError::SourceUnavailable {
+                        stream,
+                        reason: "the Kernel refused the stored-source readback before a result",
+                    });
+                }
+            };
             let (
                 chunk,
                 chunk_offset,
@@ -136,6 +178,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             ) = match response {
                 BlobResponse::Ready {
                     bytes,
+                    whole_source_sha256,
+                    whole_source_byte_length,
                     chunk_offset,
                     observed_sha256,
                     observed_byte_length,
@@ -146,6 +190,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                     observed_at_unix_ms,
                 } => (
                     bytes,
+                    whole_source_sha256,
+                    whole_source_byte_length,
                     chunk_offset,
                     observed_sha256,
                     observed_byte_length,
@@ -169,6 +215,8 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 }
             };
             if chunk_offset != offset
+                || whole_source_sha256 != request.expected_sha256
+                || whole_source_byte_length != request.expected_byte_length
                 || chunk.len() > PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES as usize
                 || observed_byte_length != chunk.len() as u64
                 || observed_sha256 != sha256_hex(&chunk)
@@ -186,7 +234,6 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
                 || observed_fence
                     .as_ref()
                     .is_some_and(|value: &eliot_contracts::StateFence| value != &response_fence)
-                || response_fence != request.fence
             {
                 return Err(integrity_error(stream));
             }
@@ -266,5 +313,18 @@ fn integrity_error(stream: ProcessStreamKind) -> TestdEvidenceError {
     TestdEvidenceError::SourceIntegrityBroken {
         stream,
         reason: "chunk offsets, per-chunk integrity, receipt, fence, length, or whole-source digest disagree",
+    }
+}
+
+fn map_ipc_error(error: TestdIpcError, stream: ProcessStreamKind) -> TestdEvidenceError {
+    match error {
+        TestdIpcError::UnknownOutcome { .. } => TestdEvidenceError::SourceUnknownOutcome {
+            stream,
+            reason: "the authenticated Kernel exchange outcome is unknown",
+        },
+        _ => TestdEvidenceError::SourceUnavailable {
+            stream,
+            reason: "the authenticated Kernel source-readback exchange was refused",
+        },
     }
 }

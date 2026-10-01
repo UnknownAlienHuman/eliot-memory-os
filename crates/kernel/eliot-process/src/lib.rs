@@ -1905,6 +1905,23 @@ impl ExitStatus {
     pub const fn disposition(&self) -> ExitDisposition {
         self.disposition
     }
+
+    /// Returns the observed root exit code only for a normal process exit.
+    /// Callers must retain the disposition alongside this value and may not
+    /// infer success from `Some(0)` without the relevant profile evaluator.
+    pub const fn code(&self) -> Option<i32> {
+        self.code
+    }
+
+    /// Returns the observed platform signal, when the root was signalled.
+    pub const fn signal(&self) -> Option<i32> {
+        self.signal
+    }
+
+    /// Returns the clock at which the root exit was observed.
+    pub const fn observed_at_unix_ms(&self) -> u64 {
+        self.observed_at_unix_ms
+    }
 }
 
 /// Cancellation progress independent of lifecycle.
