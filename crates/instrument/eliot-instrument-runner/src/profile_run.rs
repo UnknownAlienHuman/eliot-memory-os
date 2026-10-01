@@ -1312,10 +1312,42 @@ impl StageOrchestrator {
         ) {
             return InstrumentRun::missing(route, reason);
         }
-        if let Some(registry) = live
-            && let Err(error) = submit_admission_snapshot(registry, &planned.stage, &identity)
-        {
-            return InstrumentRun::missing(route, format!("stage admission refused: {error}"));
+        let submission = if let Some(registry) = live {
+            match submit_admission_snapshot(registry, &planned.stage, &identity) {
+                Ok(submission) => Some(submission),
+                Err(error) => {
+                    return InstrumentRun::missing(
+                        route,
+                        format!("stage admission refused: {error}"),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(submission) = submission.as_ref() {
+            // Issue #1814: invoke the Governor-owned commit entry's closed
+            // mutation request over the admitted snapshot: the exact
+            // `ApplyInstrumentRegistryState` command the canonical owner
+            // executes. Anything but the admitted closed mutation refuses
+            // here, before any child exists.
+            let request = submission.mutation_request();
+            let admitted = request.operation
+                == eliot_store_api::NamedMutationOperation::ApplyInstrumentRegistryState
+                && eliot_store_api::decode_instrument_registry_mutation(&request.parameters)
+                    .is_ok_and(|snapshot| snapshot == submission.snapshot_json());
+            if !admitted {
+                return InstrumentRun::missing(
+                    route,
+                    format!(
+                        "stage admission refused: {}",
+                        crate::profile::ProfileError::Snapshot {
+                            detail: "admission mutation is not the admitted closed registry request"
+                                .to_owned(),
+                        }
+                    ),
+                );
+            }
         }
         let mut binding = match InstrumentBinding::from_request(invocation, process_request) {
             Ok(binding) => binding,

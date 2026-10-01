@@ -670,6 +670,17 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
         // closed validator.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyInstrumentRegistryState,
+        transition_classes: &[TransitionClass::InstrumentRegistry],
+        maximum_effect: TransitionClass::InstrumentRegistry.maximum_effect(),
+        // The admitted snapshot is one owner snapshot plus its bounded
+        // supply-chain receipts, carried as a JSON string: the 2 MiB bulk
+        // parameter bound covers canonical-JSON escaping and the enclosing
+        // structure without broadening the snapshot's own closed validator,
+        // exactly as the other owner-snapshot rows above.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
 ];
 
 fn read_entry_spec(descriptor: &ActivatedReadDescriptor) -> OperationManifestSpec {
