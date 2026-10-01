@@ -83,7 +83,7 @@ fn require_exact_digest_set<K, V>(
     expected: &BTreeMap<K, V>,
 ) -> Result<(), InstallationError>
 where
-    K: Borrow<str> + AsRef<str> + Ord,
+    K: Borrow<str> + Ord,
     V: AsRef<str>,
 {
     if observed.len() != expected.len() {
@@ -116,7 +116,7 @@ where
             )));
         }
     }
-    let expected_names = expected.keys().map(|name| name.as_ref()).collect::<BTreeSet<_>>();
+    let expected_names = expected.keys().map(|name| name.borrow()).collect::<BTreeSet<_>>();
     if names.iter().copied().collect::<BTreeSet<_>>() != expected_names {
         return Err(binding_mismatch(format!(
             "{field} omits one or more required named objects"

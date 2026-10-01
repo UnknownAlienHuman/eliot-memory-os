@@ -2212,7 +2212,16 @@ impl GenerationPackagePlanner {
             native_worker_executable_path: native_worker_path,
             wasm_host_executable_path: wasm_host_path,
             user_broker_executable_path: user_broker_path,
-            opencode_adapter: None,
+            opencode_adapter: if include_opencode_adapter {
+                Some(OpenCodeAdapterArtifact {
+                    artifact_path: destination(OPENCODE_ADAPTER_ROLES[0].0)?,
+                    artifact_digest: digest_for(OPENCODE_ADAPTER_ROLES[0].0)?,
+                    descriptor_path: destination(OPENCODE_ADAPTER_ROLES[1].0)?,
+                    descriptor_digest: digest_for(OPENCODE_ADAPTER_ROLES[1].0)?,
+                })
+            } else {
+                None
+            },
             config_path,
             dependency_closure_refs: vec![
                 PlatformHandle::new(format!("evidence:phase-a-content:{phase_a_content_digest}"))
@@ -2267,6 +2276,24 @@ impl GenerationPackagePlanner {
             }
             if digest.relative_path == USER_BROKER_STAGED_ROLE {
                 if digest.sha256 != candidate.user_broker_artifact_digest {
+                    return Err(InstallationError::IdentityConflict);
+                }
+                continue;
+            }
+            if OPENCODE_ADAPTER_ROLES
+                .iter()
+                .any(|(name, _)| *name == digest.relative_path)
+            {
+                let adapter = candidate
+                    .opencode_adapter
+                    .as_ref()
+                    .ok_or(InstallationError::IdentityConflict)?;
+                let expected = if digest.relative_path == OPENCODE_ADAPTER_ROLES[0].0 {
+                    &adapter.artifact_digest
+                } else {
+                    &adapter.descriptor_digest
+                };
+                if digest.sha256 != *expected {
                     return Err(InstallationError::IdentityConflict);
                 }
                 continue;

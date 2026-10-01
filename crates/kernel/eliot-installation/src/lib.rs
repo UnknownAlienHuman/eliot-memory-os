@@ -2591,6 +2591,13 @@ impl CandidateManifest {
             "manifest.wasm_host_artifact_digest",
         )?;
         if let Some(adapter) = &self.opencode_adapter {
+            let immutable_root = lexical_windows_path(
+                &self.runtime_launch.profile_governed_roots.immutable_binaries,
+            )
+            .ok_or_else(|| InstallationError::InvalidField {
+                field: "manifest.opencode_adapter".to_owned(),
+                reason: "immutable adapter root is not a canonical Windows path".to_owned(),
+            })?;
             approved_path(&adapter.artifact_path, "manifest.opencode_adapter.artifact_path")?;
             approved_filename(
                 &adapter.artifact_path,
@@ -2608,6 +2615,27 @@ impl CandidateManifest {
             )?;
             if adapter.artifact_path == adapter.descriptor_path {
                 return Err(InstallationError::IdentityConflict);
+            }
+            let root_prefix = format!("{}\\", immutable_root.trim_end_matches('\\'));
+            for (path, field) in [
+                (&adapter.artifact_path, "manifest.opencode_adapter.artifact_path"),
+                (
+                    &adapter.descriptor_path,
+                    "manifest.opencode_adapter.descriptor_path",
+                ),
+            ] {
+                let normalized = lexical_windows_path(path.as_str()).ok_or_else(|| {
+                    InstallationError::InvalidField {
+                        field: field.to_owned(),
+                        reason: "adapter path is not a canonical Windows path".to_owned(),
+                    }
+                })?;
+                if !normalized.starts_with(&root_prefix) {
+                    return Err(InstallationError::ProfileViolation(
+                        "OpenCode adapter artifacts must be inside the candidate immutable generation"
+                            .to_owned(),
+                    ));
+                }
             }
             sha256_handle(
                 &adapter.artifact_digest,
