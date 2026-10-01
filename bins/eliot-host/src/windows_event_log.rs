@@ -12,14 +12,15 @@
 //! fakes delivery through another sink. Production delivery smoke on
 //! isolated Windows stays an honest residual for the test phase.
 //!
-//! Delivery outcomes stay five-way distinct: OS acceptance under the fixed
-//! registered-source profile, the explicitly admitted degraded Application
-//! profile (never substituted silently; unreachable without installation
-//! policy admission), source/access unavailability, OS acceptance versus
-//! registered-source proof (acceptance never proves registration or
-//! formatted-message availability), and downstream delivery uncertainty
-//! (success proves OS acceptance only, never downstream delivery). Handle
-//! acquisition is never equated with installed message resources.
+//! Delivery outcomes stay distinct: OS acceptance with registration unknown
+//! unless the platform receipt proves the fixed registered-source profile,
+//! the explicitly admitted degraded Application profile (never substituted
+//! silently; unreachable without installation policy admission), source/access
+//! unavailability, OS acceptance versus registered-source proof (acceptance
+//! never proves registration or formatted-message availability), and
+//! downstream delivery uncertainty (success proves OS acceptance only, never
+//! downstream delivery). Handle acquisition is never equated with installed
+//! message resources.
 //!
 //! The wrapper owns the finite nonblocking producer admission, queue and
 //! in-flight limits, drop reporting, and shutdown policy for the potentially
@@ -36,7 +37,8 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, TryLockError};
 use std::thread;
 
 use eliot_platform_windows::{
-    AdmittedEventLogEvent, EventLogError, is_event_log_supported, report_local_event,
+    AdmittedEventLogEvent, EventLogError, EventLogSourceAvailability, is_event_log_supported,
+    report_local_event,
 };
 
 use crate::host_diagnostics::{BoundedDetail, HostRequestEvidence};
@@ -209,17 +211,30 @@ impl EventLogRecord {
 ///
 /// Success proves OS acceptance only: not a registered source, not
 /// formatted-message availability, not downstream delivery, and not a Host
-/// semantic result. The two arms keep the registered-source profile and the
-/// explicitly admitted degraded Application profile distinct; this wrapper
-/// uses only the registered-source profile and never substitutes the
-/// degraded one silently, so the degraded arm is unreachable without
-/// installation-policy admission.
+/// semantic result. The arms keep OS acceptance, the registered-source
+/// profile, and the explicitly admitted degraded Application profile
+/// distinct; this wrapper never substitutes the degraded profile silently,
+/// so the degraded arm is unreachable without installation-policy admission.
+/// The registered-source arm is returned only when the platform receipt's
+/// source availability proves the registered-source profile. #984's current
+/// receipt always carries registration-unknown, so current successes report
+/// the registration-unknown arm and never claim the registered-source profile
+/// from handle acquisition alone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventLogDelivery {
-    /// The OS accepted the record under the fixed registered-source profile
-    /// (`EliotHost`, fixed event id and severity). Source registration and
-    /// downstream delivery stay unproven.
+    /// The OS accepted the record and the platform receipt proved the fixed
+    /// registered-source profile (`EliotHost`, fixed event id and severity).
+    /// Downstream delivery stays unproven. Unreachable while #984's receipt
+    /// carries registration-unknown; kept so a future proven-registration
+    /// receipt has a distinct arm rather than reusing the unknown one.
     RegisteredSourceAccepted {
+        /// The admitted event that was accepted, for correlation.
+        event: AdmittedEvent,
+    },
+    /// The OS accepted the record but the platform receipt leaves source
+    /// registration unknown, so no registered-source profile is claimed.
+    /// Handle acquisition is never equated with installed message resources.
+    OsAcceptedRegistrationUnknown {
         /// The admitted event that was accepted, for correlation.
         event: AdmittedEvent,
     },
@@ -239,19 +254,22 @@ impl EventLogDelivery {
     pub const fn event(&self) -> AdmittedEvent {
         match self {
             Self::RegisteredSourceAccepted { event }
+            | Self::OsAcceptedRegistrationUnknown { event }
             | Self::DegradedApplicationAccepted { event } => *event,
         }
     }
 
     /// Stable outcome name for a bounded diagnostic record.
     ///
-    /// The two arms stay named apart so a reader can never read the
-    /// registered-source acceptance as the explicitly admitted degraded
-    /// Application profile, which this wrapper never substitutes silently.
+    /// The three arms stay named apart so a reader can never read OS
+    /// acceptance with registration unknown as the registered-source profile,
+    /// nor either of those as the explicitly admitted degraded Application
+    /// profile, which this wrapper never substitutes silently.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::RegisteredSourceAccepted { .. } => "registered_source_accepted",
+            Self::OsAcceptedRegistrationUnknown { .. } => "os_accepted_registration_unknown",
             Self::DegradedApplicationAccepted { .. } => "degraded_application_accepted",
         }
     }
@@ -359,9 +377,13 @@ pub fn event_log_sink_status() -> Result<(), WindowsEventLogError> {
 ///
 /// Maps the admitted event to the fixed source, event id, and severity and
 /// submits the bounded redacted insertion string via the safe port. Success
-/// proves OS acceptance only, under the registered-source profile; source
-/// registration, formatted-message availability, and downstream delivery
-/// stay unproven. The degraded Application profile is never substituted
+/// proves OS acceptance only; source registration, formatted-message
+/// availability, and downstream delivery stay unproven unless the platform
+/// receipt's source availability proves the registered-source profile.
+/// #984's current receipt always carries registration-unknown, so current
+/// successes report [`EventLogDelivery::OsAcceptedRegistrationUnknown`] and
+/// never claim the registered-source profile from handle acquisition alone.
+/// The degraded Application profile is never substituted
 /// silently. This low-level seam is synchronous and may block inside the OS
 /// port. Production Host code uses [`try_admit_admitted_event`]; direct
 /// callers must not invoke it from Host control work. It never spawns a
@@ -380,7 +402,16 @@ pub fn report_event(record: &EventLogRecord) -> Result<EventLogDelivery, Windows
                 EVENT_LOG_SOURCE,
                 "platform receipt must carry the fixed source"
             );
-            Ok(EventLogDelivery::RegisteredSourceAccepted { event })
+            // Registration knowledge decides the arm: only a receipt whose
+            // source availability proves the registered-source profile may
+            // claim it. The match stays exhaustive with no wildcard so a
+            // future proven-registration availability cannot fall silently
+            // into the unknown arm.
+            match receipt.source_availability() {
+                EventLogSourceAvailability::Unknown => {
+                    Ok(EventLogDelivery::OsAcceptedRegistrationUnknown { event })
+                }
+            }
         }
         Err(error) => Err(map_event_log_error(error)),
     }
