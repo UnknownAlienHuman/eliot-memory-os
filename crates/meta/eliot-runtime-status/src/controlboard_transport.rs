@@ -589,8 +589,6 @@ mod tests {
             board: sent,
         };
         let payload = serde_json::to_value(&message).expect("payload");
-        // An Event frame carrying the same payload is not the agreed
-        // Response/Result handshake.
         let event = Frame {
             protocol_version: ProtocolVersion::CURRENT,
             encoding_profile: EncodingProfile::JsonV1,
@@ -602,14 +600,19 @@ mod tests {
             payload: ProtocolPayload::Json(payload.clone()),
             trace_context: BTreeMap::new(),
         };
-        let event_wire = encode_frame(&event, TransportLimits::default()).expect("event wire");
+        // An Event frame carrying the same payload is not the agreed
+        // Response/Result handshake. The emission codec now refuses this
+        // Event-kind confusion before any byte exists (#1875 durable
+        // EventEnvelope, I7.2/I7.4), so its wire cannot be minted through
+        // `encode_frame`. The handshake layer must still refuse such a
+        // frame if one ever arrives, so exercise it directly: the
+        // frame-validity refusal surfaces as `HandshakeMismatch`.
+        assert!(
+            encode_frame(&event, TransportLimits::default()).is_err(),
+            "event-kind confusion must be refused at emission"
+        );
         assert!(matches!(
-            decode_controlboard_response(
-                &event_wire,
-                &connection_id(),
-                &request_id(),
-                TransportLimits::default()
-            ),
+            open_controlboard_frame(&event, &connection_id(), &request_id()),
             Err(ControlBoardTransportError::HandshakeMismatch { .. })
         ));
         // A frame off the admitted EBP major line fails closed on both sides:

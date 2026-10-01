@@ -2838,7 +2838,7 @@ mod honest_tests {
         let report = collect(&root);
         assert_eq!(report.status, "NOT_HEALTHY");
         assert_eq!(report.contract, "eliot.runtime.live");
-        assert_eq!(report.contract_version, "1.1.0");
+        assert_eq!(report.contract_version, "1.2.0");
         assert!(
             report
                 .gaps
