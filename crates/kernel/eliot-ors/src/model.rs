@@ -9941,7 +9941,7 @@ impl ColdStartReadinessOwnerKey {
             .map_err(|error| OrsError::Contract(error.to_string()))
     }
 
-    fn base_identity_digest(&self) -> Result<String, OrsError> {
+    pub fn base_identity_digest(&self) -> Result<String, OrsError> {
         let preimage = ColdStartReadinessBaseIdentityPreimage {
             installation_id: &self.installation_id,
             lineage_candidate_ref: &self.lineage_candidate_ref,
@@ -9956,7 +9956,7 @@ impl ColdStartReadinessOwnerKey {
         Ok(sha256_hex(&bytes))
     }
 
-    fn binding_digest(&self) -> Result<String, OrsError> {
+    pub fn binding_digest(&self) -> Result<String, OrsError> {
         let base_identity_digest = self.base_identity_digest()?;
         let preimage = ColdStartReadinessBindingPreimage {
             base_identity_digest: &base_identity_digest,
@@ -10012,6 +10012,42 @@ pub struct ColdStartReadinessClaim {
 }
 
 impl ColdStartReadinessClaim {
+    /// Builds the canonical readiness lease claim for one revision allocated
+    /// by the ORS owner while holding its cold-start write transaction.
+    pub(crate) fn issued_for_revision(
+        key: ColdStartReadinessOwnerKey,
+        record_revision: u64,
+        lease_deadline: u64,
+    ) -> Result<Self, OrsError> {
+        key.validate()?;
+        if record_revision == 0 || lease_deadline == 0 {
+            return Err(OrsError::InvalidField {
+                field: "cold_start_lease_revision_or_deadline",
+                reason: "owner-issued revision and lease deadline must be non-zero",
+            });
+        }
+        let base_identity_digest = key.base_identity_digest()?;
+        let lease_ref = cold_start_readiness_record_key(&base_identity_digest, record_revision);
+        let lease = eliot_workscope::OnboardingLease {
+            lease_ref: lease_ref.clone(),
+            lineage_candidate_ref: key.lineage_candidate_ref.clone(),
+            workspace_instance_candidate_ref: key.workspace_instance_candidate_ref.clone(),
+            privacy_class: key.privacy_class,
+            governing_source_generation: key.governing_source_generation,
+            compiler_epoch: record_revision,
+            state: eliot_workscope::OnboardingLeaseState::Compiling,
+            deadline: lease_deadline,
+        };
+        lease
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let lease_bytes = canonical_json_bytes(&lease)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        let lease_bytes = String::from_utf8(lease_bytes)
+            .map_err(|error| OrsError::Encoding(error.to_string()))?;
+        Self::new(key, lease_ref, lease_deadline, lease_bytes)
+    }
+
     /// Constructs and validates a lease claim with owner-derived identity hashes.
     #[allow(
         clippy::too_many_arguments,
@@ -10094,6 +10130,14 @@ impl ColdStartReadinessClaim {
                 reason: "lease bytes must use canonical JSON encoding",
             });
         }
+        let lease: eliot_workscope::OnboardingLease =
+            serde_json::from_value(value.clone()).map_err(|_| OrsError::InvalidField {
+                field: "cold_start_lease_bytes",
+                reason: "lease bytes must be a valid OnboardingLease",
+            })?;
+        lease
+            .validate()
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
         let expected_privacy = serde_json::to_value(self.key.privacy_class)
             .map_err(|error| OrsError::Encoding(error.to_string()))?;
         if value.get("lease_ref").and_then(Value::as_str) != Some(self.lease_ref.as_str())
@@ -10113,6 +10157,21 @@ impl ColdStartReadinessClaim {
             return Err(OrsError::IntegrityProblem {
                 record_type: COLD_START_READINESS_RECORD_TYPE,
                 reason: "serialized cold-start lease disagrees with its owner key".to_owned(),
+            });
+        }
+        if lease.lease_ref != self.lease_ref
+            || lease.deadline != self.lease_deadline
+            || lease.compiler_epoch == 0
+            || self.lease_ref
+                != cold_start_readiness_record_key(
+                    &self.base_identity_digest,
+                    lease.compiler_epoch,
+                )
+        {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "cold-start lease id/epoch does not match its owner-issued revision"
+                    .to_owned(),
             });
         }
         Ok(())
@@ -10177,6 +10236,19 @@ impl ColdStartReadinessOrsRecord {
         }
         self.claim.validate()?;
         self.validate_row_identity()?;
+        let lease: eliot_workscope::OnboardingLease =
+            serde_json::from_str(&self.claim.lease_bytes)
+                .map_err(|_| OrsError::InvalidField {
+                    field: "cold_start_lease_bytes",
+                    reason: "lease bytes must be a valid OnboardingLease",
+                })?;
+        if lease.compiler_epoch != self.record_revision {
+            return Err(OrsError::IntegrityProblem {
+                record_type: COLD_START_READINESS_RECORD_TYPE,
+                reason: "OnboardingLease compiler epoch does not match the allocated ORS revision"
+                    .to_owned(),
+            });
+        }
         if let Some(terminal) = &self.terminal {
             self.validate_terminal_receipt(terminal)?;
         }
