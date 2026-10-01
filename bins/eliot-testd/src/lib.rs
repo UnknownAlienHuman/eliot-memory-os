@@ -28,7 +28,8 @@ use eliot_process::{
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
     EvidenceCollector, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
-    KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision,
+    InstrumentStageRequest, KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit,
+    RetryPolicy, SchedulingDecision, StageExecutionKind,
     SourceObservationGitPort, TargetRoots, TestJob, TestdError, TestdSourceObservation,
     TestdStore, is_admitted_testd_profile, issue_process_admission, testd_profile_binding,
     testd_profile_resource_limits, validate_running_lease, verify_envelope_layout_binding,
@@ -305,6 +306,10 @@ pub struct TestdJobRequest {
     pub job_id: String,
     pub project_id: String,
     pub invocation: InstrumentInvocation,
+    /// Closed runner-admitted profile/provider stage identity. Legacy
+    /// requests omit it and remain on the legacy Test-only admission path.
+    #[serde(default)]
+    pub stage: Option<InstrumentStageRequest>,
     pub target_contract: TargetContract,
     pub priority: i32,
     /// Governor owner binding persisted before a productive verifier can be
@@ -384,10 +389,28 @@ impl TestdComposition {
             .invocation
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if let Some(stage) = &request.stage {
+            stage.validate()?;
+            if stage.invocation != request.invocation {
+                return Err(TestdError::InvalidBinding);
+            }
+            if stage.execution == StageExecutionKind::DecoderOnly {
+                return Err(TestdError::Invalid {
+                    field: "stage.execution",
+                    reason: "decoder-only stages do not enter process admission",
+                });
+            }
+        }
         if request.invocation.arguments.len() > MAX_PROFILE_ARGUMENTS {
             return Err(TestdError::Invalid {
                 field: "invocation.arguments",
                 reason: "profile argument limit exceeded",
+            });
+        }
+        if !is_admitted_testd_profile(&request.invocation.profile) {
+            return Err(TestdError::Invalid {
+                field: "invocation.profile",
+                reason: "profile is not registered by the current Testd execution plane",
             });
         }
         if eliot_testd_core::is_productive_testd_profile(&request.invocation.profile)
@@ -410,15 +433,27 @@ impl TestdComposition {
         let roots = request
             .target_contract
             .validated_roots(permit.grant().contour_root())?;
-        let job = self.store.submit(
-            request.job_id,
-            request.project_id,
-            request.invocation,
-            permit,
-            roots,
-            request.priority,
-            unix_ms(),
-        )?;
+        let job = match request.stage {
+            Some(stage) => self.store.submit_with_stage(
+                request.job_id,
+                request.project_id,
+                request.invocation,
+                stage,
+                permit,
+                roots,
+                request.priority,
+                unix_ms(),
+            )?,
+            None => self.store.submit(
+                request.job_id,
+                request.project_id,
+                request.invocation,
+                permit,
+                roots,
+                request.priority,
+                unix_ms(),
+            )?,
+        };
         let job = match request.verifier_dispatch {
             Some(binding) => self
                 .store
@@ -469,9 +504,19 @@ impl TestdComposition {
         now: u64,
         permit: ProcessAdmissionPermit,
         executor: &E,
-        sink: &EvidenceCollector,
     ) -> Result<ProcessStartReceipt, TestdError> {
-        start_claimed_from_store(&self.store, job, lease, now, permit, executor, sink).await
+        let operation_id = permit.request().operation_id().clone();
+        let collector = EvidenceCollector::for_operation(operation_id);
+        start_claimed_from_store(
+            &self.store,
+            job,
+            lease,
+            now,
+            permit,
+            executor,
+            &collector,
+        )
+        .await
     }
 }
 
@@ -2662,6 +2707,7 @@ mod tests {
                 job_id: "job-1".to_owned(),
                 project_id: "project-1".to_owned(),
                 invocation: invocation.clone(),
+                stage: None,
                 target_contract: TargetContract {
                     target: source.clone(),
                     build_root: build.clone(),

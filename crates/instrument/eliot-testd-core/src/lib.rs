@@ -13,7 +13,8 @@ pub use eliot_build_test_graph::{
     RuntimeEnvironmentLease,
 };
 use eliot_contracts::{
-    ArtifactId, ClockReading, ContractId, EpochId, RequestId, canonical_json_bytes,
+    ArtifactId, ClockReading, ContractId, ContractVersion, EpochId, RequestId,
+    canonical_json_bytes,
 };
 pub use eliot_instrument_api::KernelProcessAdmissionRequest;
 use eliot_instrument_api::{
@@ -55,13 +56,114 @@ pub use target_layout::{
     verify_layout_binding,
 };
 pub use typed_evidence::{
-    EphemeralSourceBytes, ProcessStreamSourceReadbackObservation, ProcessStreamSourceReadbackPort,
-    ProcessStreamSourceReadbackRequest, TestdArtifactBinding, TestdEvaluationObservation,
+    AsyncProcessStreamSourceReadbackPort, EphemeralSourceBytes,
+    ProcessStreamSourceReadbackFuture, ProcessStreamSourceReadbackObservation,
+    ProcessStreamSourceReadbackPort, ProcessStreamSourceReadbackRequest, TestdArtifactBinding,
+    TestdEvaluationObservation,
     TestdEvaluationStatus, TestdEvaluatorSlot, TestdEvidenceDisposition, TestdEvidenceError,
     TestdParserSlot, TestdParsingObservation, TestdParsingStatus, TestdProcessEvidenceBundle,
     TestdReadbackContext, TestdStreamDisposition, TestdStreamEvidenceBinding,
     TestdStreamResolution, TestdStreamSlot,
 };
+
+/// The admitted execution lane for a profile stage. `DecoderOnly` names an
+/// in-process decoder over exact stored input artifacts; it never grants
+/// process execution authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageExecutionKind {
+    /// A registered adapter stage that still requires Kernel process
+    /// admission before a process can be launched.
+    Process,
+    /// A registered decoder stage that consumes its exact stored artifact
+    /// lineage without launching a process.
+    DecoderOnly,
+}
+
+/// Closed, durable identity of one profile stage admitted by the runner.
+///
+/// This carries identity and policy bindings only. In particular it contains
+/// no executable path, argv, shell text, process request, or authority
+/// evidence. Testd must resolve these identities against its current typed
+/// profile/provider registry before allocating or starting work.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentStageRequest {
+    /// The owner-admitted instrument invocation for this stage.
+    pub invocation: InstrumentInvocation,
+    /// Exact admitted profile name.
+    pub profile_name: String,
+    /// Exact durable profile revision from the admitted stage plan.
+    pub profile_revision: u64,
+    /// Immutable profile digest.
+    pub profile_digest: String,
+    /// Immutable profile DAG digest.
+    pub dag_digest: String,
+    /// Provider registry generation used for adapter selection.
+    pub registry_generation: u64,
+    /// Digest of the provider registry snapshot used for selection.
+    pub registry_digest: String,
+    /// Exact admitted stage identifier.
+    pub stage_id: String,
+    /// Registered stage specification identity.
+    pub spec: ContractId,
+    /// Exact stage specification revision.
+    pub spec_revision: ContractVersion,
+    /// Immutable stage specification digest.
+    pub spec_digest: String,
+    /// Admitted instrument kind for this stage.
+    pub kind: InstrumentKind,
+    /// Registered parser identity used for evidence replay.
+    pub parser: ContractId,
+    /// Exact parser registry generation used for admission.
+    pub parser_generation: u64,
+    /// Registered evaluator identity selected for verification.
+    pub evaluator: ContractId,
+    /// Selected registered provider adapter identity.
+    pub adapter: String,
+    /// Exact selected provider adapter version.
+    pub adapter_version: ContractVersion,
+    /// Whether the stage requires a process or is decoder-only.
+    pub execution: StageExecutionKind,
+}
+
+impl InstrumentStageRequest {
+    /// Validates identity shape without granting execution authority.
+    pub fn validate(&self) -> Result<(), TestdError> {
+        for (field, value) in [
+            ("profile_name", self.profile_name.as_str()),
+            ("stage_id", self.stage_id.as_str()),
+            ("adapter", self.adapter.as_str()),
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "must be a non-empty control-free identity",
+                });
+            }
+        }
+        for (field, value) in [
+            ("profile_digest", self.profile_digest.as_str()),
+            ("dag_digest", self.dag_digest.as_str()),
+            ("registry_digest", self.registry_digest.as_str()),
+            ("spec_digest", self.spec_digest.as_str()),
+        ] {
+            if !is_binding_digest(value) {
+                return Err(TestdError::Invalid {
+                    field,
+                    reason: "must be a lowercase SHA-256 digest",
+                });
+            }
+        }
+        self.invocation
+            .validate()
+            .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if self.profile_name != self.invocation.profile || self.kind != self.invocation.kind {
+            return Err(TestdError::InvalidBinding);
+        }
+        Ok(())
+    }
+}
 
 // ---- Closed testd profile to executable binding registry (issue #20) ----
 //
@@ -1387,6 +1489,11 @@ pub struct TestJob {
     pub project_sequence: u64,
     /// Instrument contract to execute.
     pub invocation: InstrumentInvocation,
+    /// Exact runner-admitted full-profile stage identity, when the caller
+    /// entered through the stage dispatch path. Older jobs retain `None` and
+    /// cannot be upgraded from legacy profile labels alone.
+    #[serde(default)]
+    pub stage_request: Option<InstrumentStageRequest>,
     /// Identity projection of the consuming process contract.
     pub process: ProcessAdmission,
     /// Canonical roots retained for later execution/reconciliation checks.
@@ -2987,6 +3094,32 @@ impl EvidenceCollector {
             .collect())
     }
 
+    /// Asynchronously resolves every persisted stream bundle without holding
+    /// the collector lock across provider I/O. The resolved observations are
+    /// committed back only if the bundle set is unchanged, so concurrent
+    /// process evidence cannot be overwritten by a stale replay.
+    pub async fn resolve_typed_sources_async(
+        &self,
+        port: &dyn AsyncProcessStreamSourceReadbackPort,
+        context: &TestdReadbackContext,
+    ) -> Result<Vec<Vec<TestdStreamResolution>>, TestdError> {
+        let original = self.typed_bundles();
+        let mut updated = original.clone();
+        let mut outcomes = Vec::with_capacity(updated.len());
+        for bundle in &mut updated {
+            outcomes.push(bundle.resolve_pending_async(port, context).await);
+        }
+        let mut current = self
+            .typed
+            .lock()
+            .map_err(|_| TestdError::Contract("evidence collector lock poisoned".to_owned()))?;
+        if *current != original {
+            return Err(TestdError::InvalidBinding);
+        }
+        *current = updated;
+        Ok(outcomes)
+    }
+
     /// Captures bytes before normalization; the digest is always over bytes.
     pub fn record_raw_artifact(
         &self,
@@ -3042,23 +3175,14 @@ impl EvidenceCollector {
         Ok(())
     }
 
-    /// Reports whether an admitted record already cites this handle as a
-    /// quarantined legacy reference.
-    fn cites_legacy_handle(&self, handle: &str) -> bool {
-        self.records.lock().is_ok_and(|records| {
-            records.iter().any(|record| {
-                record.stdout_ref() == Some(handle) || record.stderr_ref() == Some(handle)
-            })
-        })
-    }
-
     fn insert_raw_artifact(&self, artifact: RawArtifact) -> Result<(), TestdError> {
         let mut artifact = artifact;
-        // An operation-bound collector never upgrades a legacy reference:
-        // bytes recorded under an already-cited legacy handle would turn an
-        // unavailable import into cited raw evidence. The unbound collector
-        // keeps the legacy behavior for transition paths.
-        if self.expected_operation.is_some() && self.cites_legacy_handle(&artifact.handle) {
+        // Attempt-bound production evidence has no raw-byte write path: a
+        // caller-selected handle/byte pair cannot be associated with this
+        // process attempt, even if it happens to match a stream preview or a
+        // quarantined legacy reference. Typed source admission is the only
+        // production evidence authority.
+        if self.expected_operation.is_some() {
             return Err(TestdError::InvalidBinding);
         }
         let mut artifacts = self
@@ -4023,6 +4147,40 @@ impl TestdStore {
         )
     }
 
+    /// Submits one stage-bound job, persisting its complete profile/provider
+    /// identity in the same transaction as the job row and payload digest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_with_stage(
+        &self,
+        job_id: impl Into<String>,
+        project_id: impl Into<String>,
+        invocation: InstrumentInvocation,
+        stage_request: InstrumentStageRequest,
+        permit: ProcessAdmissionPermit,
+        target_roots: TargetRoots,
+        priority: i32,
+        at_ms: u64,
+    ) -> Result<TestJob, TestdError> {
+        stage_request.validate()?;
+        if stage_request.invocation != invocation {
+            return Err(TestdError::InvalidBinding);
+        }
+        self.submit_inner(
+            job_id.into(),
+            project_id.into(),
+            invocation,
+            permit,
+            target_roots,
+            None,
+            None,
+            priority,
+            JobSubmissionMetadata::verification(),
+            at_ms,
+            None,
+            Some(stage_request),
+        )
+    }
+
     /// Submits a job carrying its declared class and resource profile.
     #[allow(clippy::too_many_arguments)]
     pub fn submit_with_metadata(
@@ -4047,6 +4205,7 @@ impl TestdStore {
             priority,
             metadata,
             at_ms,
+            None,
             None,
         )
     }
@@ -4080,6 +4239,7 @@ impl TestdStore {
             metadata,
             at_ms,
             None,
+            None,
         )
     }
 
@@ -4100,6 +4260,7 @@ impl TestdStore {
         metadata: JobSubmissionMetadata,
         at_ms: u64,
         identity: Option<RequestIdentity>,
+        stage_request: Option<InstrumentStageRequest>,
     ) -> Result<TestJob, TestdError> {
         validate_text(&job_id, "job_id")?;
         validate_text(&project_id, "project_id")?;
@@ -4111,6 +4272,12 @@ impl TestdStore {
         invocation
             .validate()
             .map_err(|error| TestdError::Contract(error.to_string()))?;
+        if let Some(stage) = &stage_request {
+            stage.validate()?;
+            if stage.invocation != invocation {
+                return Err(TestdError::InvalidBinding);
+            }
+        }
         let (process, grant) = permit.into_parts();
         process
             .validate()
@@ -4252,6 +4419,7 @@ impl TestdStore {
             &resource_profile,
             work_envelope.as_ref(),
             fixture_namespace.as_deref(),
+            stage_request.as_ref(),
         )?;
         let process = ProcessAdmission::from_request(&process);
         let write = self.database.begin_write().map_err(database)?;
@@ -4349,6 +4517,7 @@ impl TestdStore {
             project_id,
             project_sequence: sequence,
             invocation,
+            stage_request,
             process,
             target_roots,
             target_layout,
@@ -4437,6 +4606,7 @@ impl TestdStore {
             submission.metadata,
             now,
             Some(identity),
+            None,
         )
     }
 
@@ -5301,17 +5471,34 @@ fn payload_digest(
     resource_profile: &TestResourceProfile,
     work_envelope: Option<&GovernedWorkEnvelope>,
     fixture_namespace: Option<&str>,
+    stage_request: Option<&InstrumentStageRequest>,
 ) -> Result<String, TestdError> {
-    let bytes = serde_json::to_vec(&(
-        invocation,
-        process,
-        target_roots,
-        priority,
-        job_class,
-        resource_profile,
-        work_envelope,
-        fixture_namespace,
-    ))
+    // Preserve the pre-stage digest format for legacy submissions, while
+    // binding every new stage identity into its idempotency key.
+    let bytes = if let Some(stage_request) = stage_request {
+        serde_json::to_vec(&(
+            invocation,
+            process,
+            target_roots,
+            priority,
+            job_class,
+            resource_profile,
+            work_envelope,
+            fixture_namespace,
+            stage_request,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            invocation,
+            process,
+            target_roots,
+            priority,
+            job_class,
+            resource_profile,
+            work_envelope,
+            fixture_namespace,
+        ))
+    }
     .map_err(|error| TestdError::Corrupt(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
