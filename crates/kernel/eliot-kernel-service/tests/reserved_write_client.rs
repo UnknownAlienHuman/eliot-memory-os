@@ -246,36 +246,8 @@ fn receipt_for(request: &ReservedWriteRequest) -> WriteReceipt {
 
 fn fixture_request() -> ReservedWriteRequest {
     let text = include_str!("data/reserved-write/request.json");
-    let mut request: ReservedWriteRequest = serde_json::from_str(text).unwrap();
-    // The frozen input predates the current catalogue and transition digest
-    // binders. Preserve its reservation, scope, and head evidence, then
-    // re-derive the producer-owned digests through the current Store API.
-    request.transition.admission_contract_set_digest =
-        supported_admission_contract_set_digest().unwrap();
-    request.transition.operation_manifest_digest = operation_manifest_set_digest(
-        &generated_operation_manifests().expect("operation catalogue generates"),
-    )
-    .expect("operation catalogue set digest");
-    eliot_store_api::bind_issue18_digests(&mut request.transition).unwrap();
-    let admission = &request.admission;
-    request.admission = WriteAdmissionProjection::bind(
-        &request.transition,
-        WriteAdmissionParams {
-            reservation_id: admission.reservation_id.clone(),
-            reservation_order: admission.reservation_order,
-            operation_id: admission.operation_id.clone(),
-            idempotency_key: admission.idempotency_key.clone(),
-            canonical_request_hash: admission.canonical_request_hash.clone(),
-            scopes: admission.scopes.clone(),
-            writer_epoch: admission.writer_epoch.clone(),
-            state_fence: admission.state_fence.clone(),
-            source_id: admission.source_id.clone(),
-            created_at_ms: admission.created_at_ms,
-            expires_at_ms: admission.expires_at_ms,
-            recovery_owner: admission.recovery_owner.clone(),
-        },
-    )
-    .unwrap();
+    let request: ReservedWriteRequest = serde_json::from_str(text).unwrap();
+    request.validate().unwrap();
     assert_eq!(
         request,
         valid_request(),
@@ -286,20 +258,13 @@ fn fixture_request() -> ReservedWriteRequest {
 
 fn fixture_receipt(request: &ReservedWriteRequest) -> WriteReceipt {
     let text = include_str!("data/reserved-write/receipt.json");
-    let mut receipt: WriteReceipt = serde_json::from_str(text).unwrap();
-    let rebound = receipt_for(request);
-    // The receipt fixture predates the current operation catalogue and
-    // Issue-18 transition bindings. Refresh only those producer-owned fields
-    // and the canonical envelope; keep its committed identity and outcome as
-    // the fixed response under test.
-    receipt.operation_manifest_digest = rebound.operation_manifest_digest.clone();
-    receipt.admission_digest = rebound.admission_digest.clone();
-    receipt.mutation_plan_digest = rebound.mutation_plan_digest.clone();
-    receipt.semantic_source_revisions = rebound.semantic_source_revisions.clone();
-    receipt.policy_config_schema_versions = rebound.policy_config_schema_versions.clone();
-    receipt.envelope = rebound.envelope.clone();
+    let receipt: WriteReceipt = serde_json::from_str(text).unwrap();
     receipt.validate().unwrap();
-    assert_eq!(receipt, rebound, "fixture matches the current receipt producer");
+    assert_eq!(
+        receipt,
+        receipt_for(request),
+        "fixture matches the current receipt producer"
+    );
     receipt
 }
 
