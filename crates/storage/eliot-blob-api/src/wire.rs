@@ -440,6 +440,17 @@ pub struct BlobProcessStreamOwnerFactsPullRequest {
     pub process_binding_json: String,
     /// SHA-256 of the exact process binding bytes.
     pub process_binding_sha256: String,
+    /// Canonical Kernel-issued operation-scoped AuthorityBinding JSON.
+    /// The daemon verifies these exact bytes against its authenticated
+    /// principal/fence; it never constructs or broadens this authority.
+    pub kernel_authority_binding_json: String,
+    /// SHA-256 of the exact Kernel AuthorityBinding JSON.
+    pub kernel_authority_binding_sha256: String,
+    /// Canonical Kernel-issued causal binding for this exact stage operation.
+    /// Genesis is legal only for the first durable node of the stage chain.
+    pub kernel_causal_binding_json: String,
+    /// SHA-256 of the exact Kernel causal binding JSON.
+    pub kernel_causal_binding_sha256: String,
     /// Digest of the authenticated outer Kernel request identity.
     pub outer_request_sha256: String,
     /// Product identity copied from the authenticated request metadata.
@@ -508,6 +519,16 @@ impl BlobProcessStreamOwnerFactsPullRequest {
             validate_text("task_id", task_id)?;
         }
         validate_digest("process_binding_sha256", &self.process_binding_sha256)?;
+        validate_canonical_owner_json(
+            "kernel_authority_binding",
+            &self.kernel_authority_binding_json,
+            &self.kernel_authority_binding_sha256,
+        )?;
+        validate_canonical_owner_json(
+            "kernel_causal_binding",
+            &self.kernel_causal_binding_json,
+            &self.kernel_causal_binding_sha256,
+        )?;
         validate_digest("outer_request_sha256", &self.outer_request_sha256)?;
         validate_digest("source_root_identity_sha256", &self.source_root_identity_sha256)?;
         if self.process_binding_json.len() > 16 * 1024
@@ -795,6 +816,10 @@ impl BlobProcessStreamOwnerFactsPullResponse {
                 || owner_facts.residency_sha256 != *residency_sha256
                 || owner_facts.causal_binding_sha256 != *causal_receipt_sha256
                 || owner_facts.authority_binding_sha256 != *authority_sha256
+                || owner_facts.causal_binding_json != request.kernel_causal_binding_json
+                || owner_facts.causal_binding_sha256 != request.kernel_causal_binding_sha256
+                || owner_facts.authority_binding_json != request.kernel_authority_binding_json
+                || owner_facts.authority_binding_sha256 != request.kernel_authority_binding_sha256
                 || owner_facts.currentness_sha256 != *currentness_sha256
             {
                 return Err(WireValidationError::InvalidField("owner_facts_commitment"));
