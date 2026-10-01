@@ -2216,11 +2216,31 @@ impl AgentCoordinator {
     /// #1678 admission saga's owner-issued receipt lands. Until then a drive
     /// performs one pull over an empty projection and stops.
     ///
-    /// So the per-class partition is unexercised in production today, and the
-    /// blocking join is an owner-issued [`ProviderAdmissionReceipt`] reaching
-    /// [`Self::admit`], not a missing profile. Supplying only a
-    /// `SchedulingProfile` would produce a selector that is correct and
-    /// permanently empty. See also the note on [`Self::next_ready`].
+    /// One claim here has to be narrowed, because stating it wider than the
+    /// code is the same defect class as overstating a guarantee. The per-class
+    /// partition is **not** confined to a path that "has no in-tree caller":
+    /// the production caller of this crate's selector is
+    /// `solo_agent_driver.rs::drive_fair_pull_after_release`, which resolves its
+    /// profile through `solo_agent_driver.rs::load_scheduling_profile` before
+    /// driving, from the Kernel-owned `runtime.toml` beside the
+    /// Host-approved launch config. The always-armed recovery arm
+    /// `solo_agent_driver.rs::solo_fair_pull_recovery` resolves the profile
+    /// through that same one function, so both arms compile the same policy from
+    /// the same owner. Every production pull is therefore profile-bound, and
+    /// every per-class ceiling in [`offer_class_head`] — item window, byte cap,
+    /// concurrency, deadline and WIP partition — applies on the production path
+    /// today; each refusal it raises is a typed [`CapacityDeferral`] carrying
+    /// the exact limiting dimension, observed value, limit and the profile
+    /// revision that re-opens it.
+    ///
+    /// What is unexercised is the *observable effect* of those ceilings, which
+    /// is a different statement with a different owner: no caller outside this
+    /// crate constructs the [`ProviderAdmissionReceipt`] that [`Self::admit`]
+    /// requires, so the admitted projection is empty and a production pull
+    /// selects nothing to partition. The blocking join is still the
+    /// owner-issued receipt reaching [`Self::admit`] (issue #1678) — not a
+    /// missing profile, and not a missing selector caller. See also the note on
+    /// [`Self::next_ready`].
     ///
     /// # Errors
     ///
