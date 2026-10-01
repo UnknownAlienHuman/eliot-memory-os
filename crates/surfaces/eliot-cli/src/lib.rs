@@ -19,6 +19,9 @@ use thiserror::Error;
 /// Typed backup command surface (issue #963).
 pub mod backup;
 
+/// Closed argv parser for the advertised `user-automation` command (#1779).
+pub mod user_automation_argv;
+
 /// Stable generated catalogue identity for A-11 plan-v2.
 pub const CATALOGUE_NAME: &str = "eliot.cli.commands";
 /// Catalogue revision emitted by help and schema projections.

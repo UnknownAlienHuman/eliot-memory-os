@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use eliot_bootstrap::capture::{capture_snapshot, write_snapshot_artifact};
 use eliot_cli::{
     CommandCatalogue, CommandPort, CommandPortError, CommandRequest, USER_AUTOMATION_ROUTE,
+    user_automation_argv::{UserAutomationArgv, admitted_operation},
     user_automation_route_payload,
 };
 use eliot_doctor::integration;
@@ -22,7 +23,7 @@ use eliot_installation::{
     post_bootstrap_rejection_pending_ref, require_published_source_bundle_journal,
     validate_installation_transaction_json,
 };
-use eliot_kernel_core::KernelRuntimeHealthEvidence;
+use eliot_kernel_core::{KernelRuntimeHealthEvidence, UserAutomationRevision};
 use eliot_kernel_service::ELIOTD_RESTART_POLICY_SUBJECT_ID;
 use eliot_live_canary::{
     CANARY_COMPLETION_SCHEMA, CanaryConfig, CanaryError, ProductionCanary,
@@ -189,6 +190,119 @@ enum Command {
     Version,
     /// Start or reuse the authenticated User Broker and launch Operator.
     Ui,
+    /// Submit one authenticated UserAutomation operator operation (I11.12,
+    /// #1779).
+    ///
+    /// This is the argv spelling the catalogue already advertises at
+    /// `eliot user-automation <create|list|status|history|pause|resume|edit|run-now|remove|inspect-last-failure>`.
+    /// The subcommand name and its flags are a second *spelling* of one
+    /// admitted request, never a second authority: the correlated
+    /// `RequestIdentity` still arrives from the admitted host-request path and
+    /// the dispatch still runs through `CommandCatalogue::dispatch` into
+    /// `AuthenticatedKernelPort`. This entry point never mints principal,
+    /// session, fence, clock, or idempotency identity, and it never reads or
+    /// writes the schedule.
+    #[command(name = "user-automation")]
+    UserAutomation {
+        #[command(subcommand)]
+        command: UserAutomationCommand,
+    },
+}
+
+/// The ten advertised `eliot user-automation` subcommands.
+///
+/// Each variant names exactly the members its closed Kernel operation carries
+/// and none of them is optional, so a subcommand can only be spelled from
+/// fields the operator actually supplied. Parsing, closed-vocabulary
+/// compilation and the binding to the admitted request all live in
+/// `eliot_cli::user_automation_argv`, next to the catalogue row that
+/// advertises these names.
+#[derive(Debug, Subcommand)]
+enum UserAutomationCommand {
+    /// Persist the first immutable revision from an owner-authored document.
+    Create {
+        /// Absolute path to the typed `UserAutomationRevision` JSON document.
+        #[arg(long, value_parser = absolute_path)]
+        revision: PathBuf,
+    },
+    /// Read the visible revision projection.
+    List {
+        /// Explicitly choose whether retired tombstones appear; never
+        /// defaulted, because a defaulted width would silently change what
+        /// the operator sees.
+        #[arg(long)]
+        include_retired: bool,
+    },
+    /// Read current status for one automation.
+    Status {
+        /// Stable automation identity.
+        #[arg(long)]
+        automation_id: String,
+    },
+    /// Read immutable execution/history records for one automation.
+    History {
+        /// Stable automation identity.
+        #[arg(long)]
+        automation_id: String,
+    },
+    /// Stop future admissions at one exact revision.
+    Pause {
+        /// Stable automation identity.
+        #[arg(long)]
+        automation_id: String,
+        /// Exact revision being paused.
+        #[arg(long)]
+        automation_revision: String,
+    },
+    /// Resume future admissions at the same immutable revision.
+    Resume {
+        /// Stable automation identity.
+        #[arg(long)]
+        automation_id: String,
+        /// Exact revision being resumed.
+        #[arg(long)]
+        automation_revision: String,
+    },
+    /// Create a new immutable superseding revision.
+    Edit {
+        /// Absolute path to the typed current `UserAutomationRevision` JSON
+        /// document that the new revision supersedes.
+        #[arg(long, value_parser = absolute_path)]
+        previous_revision: PathBuf,
+        /// Absolute path to the typed new `UserAutomationRevision` JSON
+        /// document.
+        #[arg(long, value_parser = absolute_path)]
+        revision: PathBuf,
+    },
+    /// Run once under an explicit manual nonce, without mutating the schedule.
+    RunNow {
+        /// Stable automation identity.
+        #[arg(long)]
+        automation_id: String,
+        /// Exact immutable revision to run.
+        #[arg(long)]
+        automation_revision: String,
+        /// Explicit Human-issued manual nonce. Required and never derived: the
+        /// CLI will not invent a nonce, and I11.12:33 binds `run-now` to one
+        /// explicit manual nonce that does not mutate the schedule.
+        #[arg(long)]
+        nonce: String,
+    },
+    /// Retire future work for one exact revision while preserving history.
+    Remove {
+        /// Stable automation identity.
+        #[arg(long)]
+        automation_id: String,
+        /// Exact revision being retired.
+        #[arg(long)]
+        automation_revision: String,
+    },
+    /// Read the last owner-issued failure for one automation.
+    InspectLastFailure {
+        /// Stable automation identity.
+        #[arg(long)]
+        automation_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1011,6 +1125,7 @@ fn run() -> Result<i32> {
         Command::Scope { command } => Ok(run_scope(command)),
         Command::Dev { command } => Ok(run_dev(command)),
         Command::Dispatch => run_dispatch(),
+        Command::UserAutomation { command } => run_user_automation(command),
         Command::Ui => run_ui(),
     }
 }
@@ -4799,6 +4914,23 @@ fn run_dispatch() -> Result<i32> {
             return Ok(INVALID_REQUEST_EXIT);
         }
     };
+    dispatch_admitted_request(&request)
+}
+
+/// Dispatches one already-admitted command request through the single
+/// authenticated Kernel front door.
+///
+/// This is the ONLY place a `CommandRequest` reaches the Kernel, and both
+/// request channels share it: the `eliot dispatch` JSON channel and the
+/// `eliot user-automation` argv spelling of the same request (#1779). The argv
+/// path is a second spelling, never a second authority, so it cannot skip
+/// `CommandCatalogue::current().dispatch` — which re-validates the catalogue
+/// and the request before the port sees them — and it cannot skip
+/// `AuthenticatedKernelPort`, which binds the correlated `RequestIdentity`
+/// through `set_request_identity` before `user_automation_route_payload`
+/// builds the route payload. Nothing here mints principal, session, fence,
+/// clock, or idempotency identity.
+fn dispatch_admitted_request(request: &CommandRequest) -> Result<i32> {
     #[cfg(windows)]
     let mut port = match AuthenticatedKernelPort::load() {
         Ok(port) => port,
@@ -4813,7 +4945,7 @@ fn run_dispatch() -> Result<i32> {
     };
     #[cfg(not(windows))]
     let mut port = ClosedKernelPort;
-    match CommandCatalogue::current().dispatch(&mut port, &request) {
+    match CommandCatalogue::current().dispatch(&mut port, request) {
         Ok(response) => {
             println!("{}", serde_json::to_string(&response)?);
             Ok(0)
@@ -4834,6 +4966,176 @@ fn write_json_error(code: &str, detail: &str) {
         "{}",
         json!({"status": "error", "code": code, "detail": detail})
     );
+}
+
+/// Maximum admitted bytes for one `user-automation` command request read from
+/// the operator front door.
+///
+/// Bounded and never truncated: an oversized stream refuses instead of
+/// delivering a partial request, because a truncated `UserAutomationRevision`
+/// would decode as a *different* revision rather than as no revision.
+const USER_AUTOMATION_REQUEST_INPUT_LIMIT: u64 = 1024 * 1024;
+
+/// Reads exactly one admitted `user-automation` command request.
+///
+/// The correlated `RequestIdentity` inside this envelope is the only
+/// correlation this process uses. A blank stream is exactly as unadmitted as a
+/// malformed one, and neither is ever repaired here: the CLI does not mint
+/// principal, session, fence, deadline, or idempotency identity, so a request
+/// that arrives without one is refused rather than completed with a fabricated
+/// one.
+fn read_admitted_user_automation_request() -> Result<CommandRequest> {
+    let mut input = Vec::new();
+    std::io::stdin()
+        .take(USER_AUTOMATION_REQUEST_INPUT_LIMIT + 1)
+        .read_to_end(&mut input)
+        .context("read the admitted user-automation command request")?;
+    if input.len() as u64 > USER_AUTOMATION_REQUEST_INPUT_LIMIT {
+        anyhow::bail!(
+            "the admitted user-automation command request exceeds the {USER_AUTOMATION_REQUEST_INPUT_LIMIT} byte limit"
+        );
+    }
+    if input.iter().all(u8::is_ascii_whitespace) {
+        anyhow::bail!(
+            "no admitted user-automation command request was supplied; the correlated request identity must arrive from the admitted host request path"
+        );
+    }
+    serde_json::from_slice::<CommandRequest>(&input)
+        .context("decode the admitted user-automation command request")
+}
+
+/// Reads one owner-authored immutable revision document for `create`/`edit`.
+///
+/// The document is the operator's own typed revision, decoded closed
+/// (`UserAutomationRevision` is `deny_unknown_fields`) and then validated by
+/// the owner's own `UserAutomationRevision::validate` through
+/// `UserAutomationOperation::validate` in the argv parser. The read is bounded
+/// and never truncated, so a partial document refuses instead of decoding as a
+/// revision with absent members.
+fn read_revision_document(path: &Path, what: &str) -> Result<Box<UserAutomationRevision>> {
+    let metadata = fs::metadata(path).with_context(|| format!("stat {what}"))?;
+    if !metadata.is_file() {
+        anyhow::bail!("{what} is not a regular file: {}", path.display());
+    }
+    if metadata.len() > USER_AUTOMATION_REQUEST_INPUT_LIMIT {
+        anyhow::bail!(
+            "{what} exceeds the {USER_AUTOMATION_REQUEST_INPUT_LIMIT} byte limit: {}",
+            path.display()
+        );
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {what}"))?;
+    serde_json::from_slice::<UserAutomationRevision>(&bytes)
+        .map(Box::new)
+        .with_context(|| format!("decode {what} as a typed UserAutomationRevision"))
+}
+
+/// Routes one advertised `user-automation` subcommand through the single
+/// authenticated Kernel front door.
+///
+/// The argv selection and the admitted request must agree exactly. The
+/// selection is compiled under the owner's closed validation, and
+/// `eliot_cli::user_automation_argv::admitted_operation` refuses unless the
+/// admitted request's typed `command` is `UserAutomation` *and* its operation
+/// is byte-for-byte the one these flags name — so `eliot user-automation
+/// run-now` can never dispatch a `create`, and a substituted payload reaches no
+/// positive verdict. On agreement the *admitted* request is dispatched, never
+/// a locally rebuilt one, so the request that reaches the Kernel is exactly the
+/// request whose identity the Kernel admits.
+fn run_user_automation(command: UserAutomationCommand) -> Result<i32> {
+    let selection = match user_automation_selection(command) {
+        Ok(selection) => selection,
+        Err(error) => {
+            write_json_error("USER_AUTOMATION_ARGUMENT_INVALID", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    let request = match read_admitted_user_automation_request() {
+        Ok(request) => request,
+        Err(error) => {
+            write_json_error("USER_AUTOMATION_REQUEST_NOT_ADMITTED", &error.to_string());
+            return Ok(INVALID_REQUEST_EXIT);
+        }
+    };
+    if let Err(error) = request.validate() {
+        write_json_error("USER_AUTOMATION_REQUEST_INVALID", &error.to_string());
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    if let Err(error) = admitted_operation(&selection, &request) {
+        write_json_error("USER_AUTOMATION_OPERATION_MISMATCH", &error.to_string());
+        return Ok(INVALID_REQUEST_EXIT);
+    }
+    dispatch_admitted_request(&request)
+}
+
+/// Builds the typed argv selection for one subcommand.
+///
+/// This is the only place the ten subcommand names become a
+/// `UserAutomationOperation`. Every field is required by clap, nothing is
+/// defaulted, and `create`/`edit` carry whole owner-authored revisions rather
+/// than assembled partials, so no revision member is ever inferred here.
+fn user_automation_selection(command: UserAutomationCommand) -> Result<UserAutomationArgv> {
+    let selection = match command {
+        UserAutomationCommand::Create { revision } => UserAutomationArgv::Create {
+            revision: read_revision_document(&revision, "the create revision document")?,
+        },
+        UserAutomationCommand::List { include_retired } => {
+            UserAutomationArgv::List { include_retired }
+        }
+        UserAutomationCommand::Status { automation_id } => {
+            UserAutomationArgv::Status { automation_id }
+        }
+        UserAutomationCommand::History { automation_id } => {
+            UserAutomationArgv::History { automation_id }
+        }
+        UserAutomationCommand::Pause {
+            automation_id,
+            automation_revision,
+        } => UserAutomationArgv::Pause {
+            automation_id,
+            automation_revision,
+        },
+        UserAutomationCommand::Resume {
+            automation_id,
+            automation_revision,
+        } => UserAutomationArgv::Resume {
+            automation_id,
+            automation_revision,
+        },
+        UserAutomationCommand::Edit {
+            previous_revision,
+            revision,
+        } => UserAutomationArgv::Edit {
+            previous_revision: read_revision_document(
+                &previous_revision,
+                "the edit previous-revision document",
+            )?,
+            revision: read_revision_document(&revision, "the edit revision document")?,
+        },
+        UserAutomationCommand::RunNow {
+            automation_id,
+            automation_revision,
+            nonce,
+        } => UserAutomationArgv::RunNow {
+            automation_id,
+            automation_revision,
+            nonce,
+        },
+        UserAutomationCommand::Remove {
+            automation_id,
+            automation_revision,
+        } => UserAutomationArgv::Remove {
+            automation_id,
+            automation_revision,
+        },
+        UserAutomationCommand::InspectLastFailure { automation_id } => {
+            UserAutomationArgv::InspectLastFailure { automation_id }
+        }
+    };
+    // Compile once here so a blank or control-character flag, and every owner
+    // admission rule the closed vocabulary applies, refuse before the request
+    // is even read from the operator front door.
+    selection.command()?;
+    Ok(selection)
 }
 
 /// Structured legacy-entrypoint cutover rejection (#1858, I19.5). Emits the
