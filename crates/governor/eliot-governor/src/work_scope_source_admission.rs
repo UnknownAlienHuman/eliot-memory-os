@@ -16,7 +16,7 @@ use eliot_protocol::RequestIdentity;
 use eliot_receipts::{AuthorityBinding, CausalBinding};
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationId, OperationManifestDigest, ScopeId, SecurityContext, TransitionClass,
+    OperationId, ScopeId, SecurityContext, TransitionClass,
     generated_operation_manifests, operation_manifest_set_digest,
     supported_admission_contract_set_digest,
 };
