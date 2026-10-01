@@ -30,19 +30,14 @@ use thiserror::Error;
 /// Exact prior owner state established by the canonical named-read path.
 ///
 /// `Absent` is valid only when the caller's exact-fence named read returned no
-/// `owner/work_scope` row. `Current` must carry the exact revision and digest
-/// from that named read. The Store adapter performs the corresponding CAS and
-/// refuses payload-only convergence for an already present row.
+/// `owner/work_scope` row. This producer is only for the first owner creation;
+/// it cannot replace or re-admit an existing row. The Store adapter performs
+/// the absent-row CAS and refuses payload-only convergence for an existing
+/// row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkScopeOwnerCasExpectation {
     /// The owner read proved that the `owner/work_scope` row is absent.
     Absent { state_fence: StateFence },
-    /// The owner read returned this exact current row revision and digest.
-    Current {
-        state_fence: StateFence,
-        owner_revision: u64,
-        value_digest: String,
-    },
 }
 
 impl WorkScopeOwnerCasExpectation {
@@ -50,17 +45,6 @@ impl WorkScopeOwnerCasExpectation {
         match self {
             Self::Absent { state_fence } if state_fence == fence => Ok((0, String::new())),
             Self::Absent { .. } => Err(WorkScopeSourceAdmissionError::FenceMismatch),
-            Self::Current {
-                state_fence,
-                owner_revision,
-                value_digest,
-            } if state_fence == fence
-                && *owner_revision > 0
-                && is_sha256(value_digest) => Ok((*owner_revision, value_digest.clone())),
-            Self::Current { state_fence, .. } if state_fence != fence => {
-                Err(WorkScopeSourceAdmissionError::FenceMismatch)
-            }
-            Self::Current { .. } => Err(WorkScopeSourceAdmissionError::InvalidOwnerCas),
         }
     }
 }
@@ -89,9 +73,6 @@ pub enum WorkScopeSourceAdmissionError {
     /// A supplied identity, authority, causal, binding, or CAS fence differed.
     #[error("WorkScope source admission inputs do not share the exact request fence")]
     FenceMismatch,
-    /// The current owner readback does not provide a usable prior CAS tuple.
-    #[error("WorkScope owner CAS expectation is invalid")]
-    InvalidOwnerCas,
     /// The owner revision overflowed while advancing the admitted snapshot.
     #[error("WorkScope owner revision overflowed")]
     OwnerRevisionOverflow,
@@ -122,9 +103,10 @@ pub enum WorkScopeSourceAdmissionError {
 /// digest join against the admitted `sources` before accepting the snapshot.
 ///
 /// `owner_cas` must come from a fresh named `owner/work_scope` read at the same
-/// fence. An absent row is represented only by `Absent`; a current row carries
-/// its exact semantic owner revision and digest. The Store operation receives
-/// those exact values and performs the CAS.
+/// fence and prove the row absent. Existing owners must use their dedicated
+/// update/admission flow; this initial-admission function cannot overwrite
+/// them. The Store operation receives the exact absence tuple and performs
+/// the CAS.
 #[allow(
     clippy::too_many_arguments,
     reason = "this one owner boundary joins every independently owned admission input without hiding authority in a generic bundle"
@@ -271,12 +253,5 @@ pub fn prepare_initial_work_scope_source_admission(
         authority_binding: authority.clone(),
         causal_binding: causal.clone(),
     })
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
