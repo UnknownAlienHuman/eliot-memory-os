@@ -23,7 +23,7 @@ use eliot_store_api::{
 };
 use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_workscope::{
-    AuthorityBasis, DiscoveryLeaseKey, DiscoveryLeaseRequest, DiscoveryRead,
+    AuthorityBasis, DiscoveryLeaseKey, DiscoveryLeaseRequest, DiscoveryRead, DiscoveryReadLease,
     GoverningSourceAdmission, GoverningSourceCandidate, GoverningSourceRole,
     GoverningSourceSet, NewSourceCandidate, ObservedScopeResources, PrivacyProfile,
     ScopeBinding, ScopeIdentity, SourceAdmissionRequest,
@@ -610,6 +610,150 @@ pub struct VerifiedGoverningSourceApproval {
     signed_snapshot_digest: String,
 }
 
+/// Non-serializable proof that the signed approval and exact request admitted
+/// one bounded source-discovery read before source observation began.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialWorkScopeSourceDiscoveryLease {
+    lease: DiscoveryReadLease,
+    authenticated_approver_principal_ref: String,
+}
+
+/// Initial-bind authority and its exact committed Policy operation parent as
+/// carried by the authenticated Kernel claim. The receipt is checked against
+/// `causal` at the WorkScope producer boundary; it is never replaced with a
+/// genesis value or an attempt-derived projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InitialWorkScopeAdmissionAuthority {
+    pub authority: AuthorityBinding,
+    pub causal: CausalBinding,
+    pub policy_receipt: eliot_store_api::WriteReceipt,
+}
+
+impl InitialWorkScopeAdmissionAuthority {
+    fn validate_for(&self, fence: &StateFence) -> Result<(), WorkScopeSourceAdmissionError> {
+        self.policy_receipt
+            .validate()
+            .map_err(|_| WorkScopeSourceAdmissionError::PolicyReceiptMismatch)?;
+        let receipt = self
+            .policy_receipt
+            .envelope
+            .as_ref()
+            .ok_or(WorkScopeSourceAdmissionError::PolicyReceiptMismatch)?;
+        let policy_causal = &receipt.core.causal;
+        let parent = &receipt.identity.receipt_id;
+        let expected_sequence = policy_causal
+            .transaction_sequence
+            .value()
+            .checked_add(1)
+            .ok_or(WorkScopeSourceAdmissionError::PolicyReceiptMismatch)?;
+        if self.policy_receipt.status != eliot_store_api::WriteReceiptStatus::Committed
+            || self.policy_receipt.state_fence != *fence
+            || policy_causal.state_fence != *fence
+            || self.causal.state_fence != *fence
+            || self.causal.transaction_sequence.value() != expected_sequence
+            || self.causal.parent_receipt_id.as_ref() != Some(parent)
+            || self.causal.predecessor_receipt_ids.as_slice() != [parent]
+            || self.authority.state_fence != *fence
+            || !fence
+                .authority_epoch
+                .is_same_authority(&self.authority.authority_epoch)
+            || !eliot_store_api::effect_is_at_most(
+                EffectClass::ReversibleMutation,
+                self.authority.allowed_effect,
+            )
+        {
+            return Err(WorkScopeSourceAdmissionError::PolicyReceiptMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Issues the exact-root, one-read discovery lease before the daemon observes
+/// the workspace or opens any governing-source bytes.
+pub fn issue_initial_work_scope_source_discovery_lease(
+    identity: &RequestIdentity,
+    approval: &VerifiedGoverningSourceApproval,
+    explicit_root_identity: &str,
+    lease_key: &DiscoveryLeaseKey,
+    now: u64,
+) -> Result<InitialWorkScopeSourceDiscoveryLease, WorkScopeSourceAdmissionError> {
+    identity
+        .validate()
+        .map_err(|_| WorkScopeSourceAdmissionError::FenceMismatch)?;
+    let fence = &identity.request.state_fence;
+    if identity.request.metadata.state_fence != *fence
+        || identity.deadline_unix_ms == 0
+        || now > identity.deadline_unix_ms
+    {
+        return Err(WorkScopeSourceAdmissionError::FenceMismatch);
+    }
+    let request_session = identity
+        .request
+        .metadata
+        .session_id
+        .as_ref()
+        .ok_or_else(|| {
+            WorkScopeSourceAdmissionError::SourceAdmission(
+                "initial source admission requires an authenticated request session".to_owned(),
+            )
+        })?;
+    lease_key
+        .validate()
+        .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+    if lease_key.proposer_ref != identity.request.metadata.request_id.as_str()
+        || lease_key.session_ref != request_session.as_str()
+        || lease_key.root_filesystem_identity_ref != explicit_root_identity
+    {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "discovery lease key differs from the authenticated request or approved root".to_owned(),
+        ));
+    }
+    let signed_approval = approval.approval();
+    signed_approval.validate_live_context(
+        explicit_root_identity,
+        &identity.request.metadata.product_id,
+        &identity.request.metadata.source_id,
+        &signed_approval.privacy,
+        signed_approval.scope_privacy_class,
+        fence,
+        &lease_key.host_ref,
+    )?;
+    let allowed_reads = vec![DiscoveryRead::GoverningSourceCandidates];
+    let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
+        WorkScopeSourceAdmissionError::SourceAdmission(
+            "source discovery lease read count is invalid".to_owned(),
+        )
+    })?;
+    let lease = issue_discovery_lease(&DiscoveryLeaseRequest {
+        proposer_ref: lease_key.proposer_ref.clone(),
+        session_ref: lease_key.session_ref.clone(),
+        host_ref: lease_key.host_ref.clone(),
+        candidate_root_ref: explicit_root_identity.to_owned(),
+        root_filesystem_identity_ref: lease_key.root_filesystem_identity_ref.clone(),
+        allowed_reads,
+        consumption_limit,
+        deadline: identity.deadline_unix_ms,
+    })
+    .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+    if !lease.key_matches(
+        &lease_key.proposer_ref,
+        &lease_key.session_ref,
+        &lease_key.host_ref,
+        &lease_key.root_filesystem_identity_ref,
+    ) {
+        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
+            "issued discovery lease does not match the authenticated request".to_owned(),
+        ));
+    }
+    lease
+        .authorize(DiscoveryRead::GoverningSourceCandidates, now)
+        .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
+    Ok(InitialWorkScopeSourceDiscoveryLease {
+        lease,
+        authenticated_approver_principal_ref: lease_key.host_ref.clone(),
+    })
+}
+
 impl VerifiedGoverningSourceApproval {
     /// Parses and joins the approval embedded in the sealed setup snapshot.
     pub fn from_verified_initial_snapshot(
@@ -716,6 +860,9 @@ pub enum WorkScopeSourceAdmissionError {
     /// The empty owner row lacks a nonzero revision or Store digest.
     #[error("empty WorkScope owner readback has an invalid revision or Store digest")]
     InvalidOwnerReadback,
+    /// The Kernel-carried authority or committed Policy causal parent differs.
+    #[error("initial WorkScope authority does not follow the exact committed Policy receipt")]
+    PolicyReceiptMismatch,
     /// The owner revision overflowed while advancing the admitted snapshot.
     #[error("WorkScope owner revision overflowed")]
     OwnerRevisionOverflow,
@@ -758,11 +905,12 @@ pub enum WorkScopeSourceAdmissionError {
 /// guard itself. It never accepts caller-created source statuses, authority
 /// bases, guard receipts, or source capture. `approval` can only be
 /// constructed from the trust-anchor-verified first-run config snapshot. The
-/// function rereads the exact observed root through the Bootstrap capture
-/// parser and joins those bytes against the signed approval before deriving
-/// the WorkScope source set. `lease_key` must come from the authenticated
-/// Kernel peer projection; this function binds its request, session, and root
-/// components to the verified `RequestIdentity` and observed root.
+/// caller must issue `lease` before observing the workspace or reading source
+/// bytes, then pass the resulting Bootstrap parser capture here. This function
+/// joins that exact capture against the signed approval before deriving the
+/// WorkScope source set. `lease_key` must come from the authenticated Kernel
+/// peer projection; this function binds its request, session, host principal,
+/// and root components to the verified `RequestIdentity` and observed root.
 /// `operation_id` is the exact admitted Store operation identity retained by
 /// the authenticated Task Controller attempt; this producer never aliases it
 /// to the transport `RequestId`.
@@ -779,20 +927,24 @@ pub enum WorkScopeSourceAdmissionError {
 pub fn prepare_initial_work_scope_source_admission(
     identity: &RequestIdentity,
     operation_id: &OperationId,
-    authority: &AuthorityBinding,
-    causal: &CausalBinding,
+    admission_authority: &InitialWorkScopeAdmissionAuthority,
     descriptor: &WorkScopeDescriptor,
     observed_resources: &ObservedScopeResources,
     governing_source_generation: u64,
     approval: &VerifiedGoverningSourceApproval,
     owner_readback: &WorkScopeOwnerSnapshotReadback,
     lease_key: &DiscoveryLeaseKey,
-    owner_clock: impl Fn() -> u64,
+    lease: &InitialWorkScopeSourceDiscoveryLease,
+    capture: &NormativePairSourceCapture,
+    now_after_source_reads: u64,
 ) -> Result<PreparedWorkScopeSourceAdmission, WorkScopeSourceAdmissionError> {
     identity
         .validate()
         .map_err(|_| WorkScopeSourceAdmissionError::FenceMismatch)?;
     let fence = &identity.request.state_fence;
+    admission_authority.validate_for(fence)?;
+    let authority = &admission_authority.authority;
+    let causal = &admission_authority.causal;
     if identity.request.metadata.state_fence != *fence
         || authority.state_fence != *fence
         || causal.state_fence != *fence
@@ -818,10 +970,9 @@ pub fn prepare_initial_work_scope_source_admission(
         approved.scope_privacy_class,
         governing_source_generation,
     )?;
-    let now_before_lease = owner_clock();
-    if now_before_lease > identity.deadline_unix_ms {
+    if now_after_source_reads > identity.deadline_unix_ms {
         return Err(WorkScopeSourceAdmissionError::SourceAdmission(
-            "request deadline has elapsed".to_owned(),
+            "request deadline elapsed while observing governing sources".to_owned(),
         ));
     }
     let request_session = identity
@@ -845,56 +996,38 @@ pub fn prepare_initial_work_scope_source_admission(
             "discovery lease key differs from the authenticated request or approved root".to_owned(),
         ));
     }
-    approved.validate_live_context(
+    approved.validate_live_binding(
+        capture,
         &binding.scope.root_identity,
         &identity.request.metadata.product_id,
         &identity.request.metadata.source_id,
         &approved.privacy,
         approved.scope_privacy_class,
         fence,
-        &approved.approver_principal_ref,
+        &lease.authenticated_approver_principal_ref,
     )?;
-    let allowed_reads = vec![DiscoveryRead::GoverningSourceCandidates];
-    let consumption_limit = u32::try_from(allowed_reads.len()).map_err(|_| {
-        WorkScopeSourceAdmissionError::SourceAdmission(
-            "source discovery lease read count is invalid".to_owned(),
-        )
-    })?;
-    let lease = issue_discovery_lease(&DiscoveryLeaseRequest {
-        proposer_ref: lease_key.proposer_ref.clone(),
-        session_ref: lease_key.session_ref.clone(),
-        host_ref: lease_key.host_ref.clone(),
-        candidate_root_ref: binding.scope.root_identity.clone(),
-        root_filesystem_identity_ref: lease_key.root_filesystem_identity_ref.clone(),
-        allowed_reads,
-        consumption_limit,
-        deadline: identity.deadline_unix_ms,
-    })
-    .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
-    if !lease.key_matches(
+    if lease.lease.deadline != identity.deadline_unix_ms
+        || lease.lease.candidate_root_ref != binding.scope.root_identity
+        || lease.lease.allowed_reads != [DiscoveryRead::GoverningSourceCandidates]
+        || lease.lease.consumption_limit != 1
+        || lease.authenticated_approver_principal_ref != lease_key.host_ref
+        || !lease.lease.key_matches(
         &lease_key.proposer_ref,
         &lease_key.session_ref,
         &lease_key.host_ref,
         &lease_key.root_filesystem_identity_ref,
     ) {
         return Err(WorkScopeSourceAdmissionError::SourceAdmission(
-            "issued discovery lease does not match the authenticated request".to_owned(),
+            "source discovery lease differs from its admitted request or read scope".to_owned(),
         ));
     }
-    // The discovery lease exists before any governed source bytes are read.
-    let capture = eliot_bootstrap::capture::capture_normative_pair_sources(Path::new(
-        &binding.scope.root_identity,
-    ))
-    .map_err(|error| WorkScopeSourceAdmissionError::SourceCapture(error.to_string()))?;
-    let now_after_capture = owner_clock();
-    if now_after_capture > identity.deadline_unix_ms {
-        return Err(WorkScopeSourceAdmissionError::SourceAdmission(
-            "request deadline elapsed while capturing governing sources".to_owned(),
-        ));
-    }
+    lease
+        .lease
+        .authorize(DiscoveryRead::GoverningSourceCandidates, now_after_source_reads)
+        .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
     let sources = approval.derive_work_scope_sources(
-        &capture,
-        &lease,
+        capture,
+        &lease.lease,
         &binding.scope.root_identity,
         &identity.request.metadata.product_id,
         &identity.request.metadata.source_id,
@@ -904,7 +1037,7 @@ pub fn prepare_initial_work_scope_source_admission(
         fence,
         &binding.scope.scope_ref,
         governing_source_generation,
-        now_after_capture,
+        now_after_source_reads,
         identity.deadline_unix_ms,
     )?;
     let (expected_revision, expected_digest) = match owner_readback {
