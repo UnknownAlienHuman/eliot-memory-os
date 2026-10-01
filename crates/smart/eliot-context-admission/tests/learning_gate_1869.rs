@@ -18,7 +18,11 @@ use std::num::NonZeroU64;
 
 use eliot_agent_contracts::AgentAttemptId;
 use eliot_context_admission::learning_gate::admit_context_with_learning;
-use eliot_context_admission::{admit_context, screen_admission_input_learning};
+use eliot_context_admission::{
+    DownstreamReservation, HeadroomAdmissionOutcome, HeadroomCheck, HeadroomContext,
+    LearningGovernance, admit_context, admit_context_governed, admit_context_traced_with_headroom,
+    screen_admission_input_learning,
+};
 use eliot_context_contracts::*;
 use eliot_contracts::{
     ArtifactId, DecisionId, EpochId, EpochLineageId, ResourceGeneration, SourceId, StateFence,
@@ -38,6 +42,9 @@ const CAMPAIGN_1869: &str = "campaign-1869-a";
 const TASK_1869: &str = "task-1869-a";
 const OVERLAY_1869: &str = "overlay-1869-live";
 const NOW_1869: u64 = 1_800_000_000;
+
+/// The reservation clock, in milliseconds, read at the point of use.
+const NOW_1869_MS: u64 = 1_800_000_000_000;
 
 fn id(value: &str) -> ArtifactId {
     ArtifactId::new(value).expect("fixture artifact id")
@@ -417,6 +424,100 @@ fn presented_1869<'a>(
     }
 }
 
+/// Owner-issued downstream reservation evidence for one compilation.
+///
+/// The bounded request, the owner's answer and the allocation ledger are built
+/// from the input's OWN binding and recipe capacity, so `check_headroom` reads
+/// this as real owner evidence rather than a pre-agreed verdict: the result
+/// cites this request's own canonical digest, and the ledger binds each purpose
+/// once, referencing the declared output and review reserves rather than adding
+/// them a second time.
+///
+/// The demand list is deliberately EMPTY. This fixture exists to prove ORDER -
+/// that both gates run before selection, whichever one refuses - and an empty
+/// demand list is never read as a grant by any assertion here. It is NOT a
+/// granted reservation: `HeadroomDemand::request` is
+/// `eliot_runtime_contracts::CapacityRequest`, a crate this package does not
+/// depend on, so a granted-dimension fixture is not constructible here.
+fn reservation_1869(
+    input: &AdmissionInput,
+) -> (
+    DownstreamHeadroomRequest,
+    DownstreamHeadroomResult,
+    HeadroomAllocationLedger,
+) {
+    let request = DownstreamHeadroomRequest {
+        schema_version: DOWNSTREAM_HEADROOM_SCHEMA_VERSION,
+        pipeline_id: id("pipeline-1869"),
+        attempt_id: id("attempt-1869"),
+        stage_id: id("stage-1869"),
+        consumer: HeadroomConsumer::Synthesis,
+        binding: input.binding.clone(),
+        route_id: "route".to_owned(),
+        serializer_id: "json-v1".to_owned(),
+        recipe_digest: input.recipe.recipe_sha256.clone(),
+        demands: Vec::new(),
+        release: HeadroomReleaseCondition {
+            completion_receipt: id("completion-1869"),
+            release_on_cancel: true,
+            expires_at_ms: NOW_1869_MS + 60_000,
+        },
+    };
+    let result = DownstreamHeadroomResult {
+        schema_version: DOWNSTREAM_HEADROOM_SCHEMA_VERSION,
+        request_digest: request.canonical_digest().expect("request digest"),
+        binding: input.binding.clone(),
+        // One decision per value of the closed denominator, and an undemanded
+        // dimension carries no reservation: a permit nobody asked for is not
+        // headroom for this pipeline.
+        decisions: HeadroomDimension::DENOMINATOR
+            .iter()
+            .map(|dimension| HeadroomDecision {
+                dimension: *dimension,
+                outcome: HeadroomOutcome::NotApplicable {
+                    basis: id("basis-1869"),
+                },
+            })
+            .collect(),
+        issued_at_ms: NOW_1869_MS,
+        expires_at_ms: NOW_1869_MS + 60_000,
+        measurement_refs: Vec::new(),
+        reconciliation_refs: vec![id("reconciliation-1869")],
+    };
+    let capacity = input.recipe.capacity;
+    let mut ledger = HeadroomAllocationLedger::new(capacity);
+    // The declared output and review reserves are REFERENCED by their own
+    // purposes, never added a second time; the remainder is context occupancy
+    // plus the decision-local tail.
+    for (purpose, share) in [
+        (HeadroomPurpose::ContextOccupancy, 70),
+        (HeadroomPurpose::Output, capacity.output_reserve),
+        (HeadroomPurpose::ReviewReasoning, capacity.review_reserve),
+        (HeadroomPurpose::DecisionTail, 0),
+        (HeadroomPurpose::ToolResult, 0),
+    ] {
+        ledger
+            .bind(purpose, share)
+            .expect("one allocation per purpose");
+    }
+    (request, result, ledger)
+}
+
+/// The caller's reservation context, its staleness clock read at the point of
+/// use rather than carried in from an earlier stage.
+fn headroom_1869<'a>(
+    request: &'a DownstreamHeadroomRequest,
+    result: &'a DownstreamHeadroomResult,
+    ledger: &'a HeadroomAllocationLedger,
+) -> HeadroomContext<'a> {
+    HeadroomContext {
+        request,
+        result,
+        ledger,
+        now_ms: NOW_1869_MS,
+    }
+}
+
 #[test]
 fn marked_atom_admitted_with_owner_issued_permit() {
     let governor = governor_1869();
@@ -602,4 +703,189 @@ fn unclosed_reusable_refused() {
         ),
         Err(ContextError::InvalidField("learning.closure_ref"))
     );
+}
+
+/// #1869: the learning gate and the bounded headroom gate compose before ONE
+/// selection, and neither entrypoint reaches the selector with only half of it.
+///
+/// This is the audit-defect pair stated as executable proof: the headroom entry
+/// must not reach selection without the ordinary learning refusal, and the
+/// learning entry must not reach it with a reservation silently ignored. Both are
+/// asserted here against a real Governor-issued carriage and real headroom
+/// evidence types, through the composed entrypoint its production caller uses.
+#[test]
+fn both_gates_pass_then_exactly_one_selection_emits() {
+    let governor = governor_1869();
+    let fence = fence_1869();
+    let permit = live_permit(&governor, &fence, Some(OVERLAY_1869), None);
+    let verified =
+        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
+    let input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 + 3600));
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
+
+    // The reservation arm is `NotReserved` because this package cannot construct
+    // a granted owner permit (see `reservation_1869`). The claim under test is
+    // still the composed one: the live carriage is VERIFIED rather than refused,
+    // the headroom half reports its stated absent state instead of reading as a
+    // grant, and the selector runs exactly once and emits.
+    match admit_context_governed(
+        &input,
+        &LearningGovernance::Presented(presented_1869(
+            &governor,
+            &verified,
+            &overlay,
+            &backlog,
+            NOW_1869,
+        )),
+        &DownstreamReservation::NotReserved,
+    )
+    .expect("both gates satisfied") {
+        HeadroomAdmissionOutcome::Admitted {
+            result,
+            traces,
+            check,
+        } => {
+            assert_eq!(check, HeadroomCheck::NotReserved);
+            // Exactly one selection: one handle-bound trace per evaluated
+            // candidate, and the marked atom surfaces in that same decision.
+            assert_eq!(traces.len(), input.candidates.candidates.len());
+            assert!(
+                traces
+                    .iter()
+                    .any(|trace| trace.atom_id == id("learning-1869"))
+            );
+            match result.outcome {
+                ContextOutcome::Complete(admitted) => assert!(
+                    admitted
+                        .records
+                        .iter()
+                        .any(|record| record.candidate.atom_id == id("learning-1869"))
+                ),
+                ContextOutcome::Incomplete(incomplete) => {
+                    panic!("covered retrieval must complete, got {incomplete:?}")
+                }
+            }
+        }
+        HeadroomAdmissionOutcome::Refused(refusal) => {
+            panic!("both gates satisfied, got refusal {refusal:?}")
+        }
+    }
+}
+
+/// #1869 REFUSAL: a reservation IS presented, no live learning carriage is, and
+/// the input carries a learning mark. The ordinary learning refusal applies and
+/// names the missing EVIDENCE (`learning.governed_path_required`) - it is not a
+/// missing function, not a headroom refusal, and not a selection.
+///
+/// This is the audit defect directly: the headroom entry must not reach the
+/// selector without the learning refusal.
+#[test]
+fn reserved_headroom_without_carriage_refuses_on_missing_evidence() {
+    let governor = governor_1869();
+    let fence = fence_1869();
+    let permit = live_permit(&governor, &fence, Some(OVERLAY_1869), None);
+    let input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 + 3600));
+    let (request, result, ledger) = reservation_1869(&input);
+    let headroom = headroom_1869(&request, &result, &ledger);
+
+    // The learning gate refuses FIRST, so the reservation evidence is never the
+    // thing that decided this.
+    assert_eq!(
+        admit_context_governed(
+            &input,
+            &LearningGovernance::Unpresented,
+            &DownstreamReservation::Reserved(&headroom),
+        ),
+        Err(ContextError::InvalidField("learning.governed_path_required"))
+    );
+    // The same guarantee on the headroom-only projection of the composed entry:
+    // a learning-marked input cannot slip through by arriving with a reservation
+    // and without the carriage.
+    assert_eq!(
+        admit_context_traced_with_headroom(&input, &headroom),
+        Err(ContextError::InvalidField("learning.governed_path_required"))
+    );
+}
+
+/// #1869 NON-DIVERGENCE: the two entrypoints run the SAME composition, so the
+/// same marked input under the same live carriage is decided by the learning arm
+/// identically whether or not a reservation is presented. A reservation changes
+/// only what the headroom arm reports.
+#[test]
+fn learning_path_and_headroom_path_do_not_diverge() {
+    let governor = governor_1869();
+    let fence = fence_1869();
+    let permit = live_permit(&governor, &fence, Some(OVERLAY_1869), None);
+    let verified =
+        verify_learning_admission(&governor, &permit, &fence).expect("live owner verifies");
+    let input = input_with_learning(TASK_1869, permit.digest(), Some(NOW_1869 + 3600));
+    let overlay = live_overlay_1869(&fence);
+    let backlog = BoundedBacklog::default();
+    let (request, result, ledger) = reservation_1869(&input);
+    let headroom = headroom_1869(&request, &result, &ledger);
+
+    // Under a live carriage the learning half VERIFIES, so the reservation arm is
+    // what decides. This reservation names no demanded dimension, so
+    // `DownstreamHeadroomRequest::validate` refuses it on its own denominator and
+    // the composed decision carries that as a TYPED headroom refusal with the
+    // attempted recipe and binding - never a selection, never a learning error.
+    let with_reservation = admit_context_governed(
+        &input,
+        &LearningGovernance::Presented(presented_1869(
+            &governor,
+            &verified,
+            &overlay,
+            &backlog,
+            NOW_1869,
+        )),
+        &DownstreamReservation::Reserved(&headroom),
+    );
+    // Same input, same carriage, no reservation stated: the admitted arm is
+    // reached, because the headroom half then has no evidence to withhold on.
+    let without_reservation = admit_context_governed(
+        &input,
+        &LearningGovernance::Presented(presented_1869(
+            &governor,
+            &verified,
+            &overlay,
+            &backlog,
+            NOW_1869,
+        )),
+        &DownstreamReservation::NotReserved,
+    );
+
+    match with_reservation {
+        Ok(HeadroomAdmissionOutcome::Refused(refusal)) => {
+            // An empty demand list is not an "unavailable dimension" refusal,
+            // so the typed reason must not claim one was withheld.
+            assert!(
+                !matches!(refusal.reason, HeadroomRefusal::Unavailable { .. }),
+                "an empty demand list withholds no dimension"
+            );
+            assert_eq!(refusal.attempted_recipe_digest, input.recipe.recipe_sha256);
+            assert_eq!(refusal.attempted_binding, input.binding);
+        }
+        Ok(HeadroomAdmissionOutcome::Admitted { .. }) => {
+            panic!("an unvalidatable reservation must not admit")
+        }
+        // A learning error here would mean the learning half diverged between
+        // the two entrypoints. It must not.
+        Err(error) => panic!("live carriage must verify on the reserved path, got {error:?}"),
+    }
+    match without_reservation.expect("learning half verifies") {
+        HeadroomAdmissionOutcome::Admitted { check, .. } => {
+            assert_eq!(check, HeadroomCheck::NotReserved);
+        }
+        HeadroomAdmissionOutcome::Refused(refusal) => {
+            panic!("no reservation stated must not withhold, got {refusal:?}")
+        }
+    }
+    // The reservation is genuinely the caller's own: bound to this compilation's
+    // recipe and binding, with its staleness clock read at the point of use.
+    assert_eq!(request.binding, input.binding);
+    assert_eq!(request.recipe_digest, input.recipe.recipe_sha256);
+    assert_eq!(headroom.now_ms, NOW_1869_MS);
+    // Silence check: the fixture must not be binding-independent.
+    assert_ne!(request.binding, binding("task-1869-other"));
 }
