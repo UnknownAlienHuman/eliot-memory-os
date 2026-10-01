@@ -1,12 +1,12 @@
 use std::{error::Error, fmt};
 
-use eliot_receipts::AuthorityBinding;
+use eliot_receipts::{AuthorityBinding, GrantClosureReceipt, GrantClosureState, ReceiptIdentity};
 use eliot_runtime_contracts::{AuthorityActivationReceipt, AuthorityRevocationReceipt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    GrantId, IntroductionId, RootTransitionActivationReceipt, RootTransitionActivationRequest,
-    SnapshotId,
+    AuthorityError, GrantId, IntroductionId, RootTransitionActivationReceipt,
+    RootTransitionActivationRequest, SnapshotId,
 };
 
 /// Typed G-01 request presented to the P-07 activation boundary.
@@ -372,4 +372,97 @@ impl P07AuthorityPort for UnavailableP07AuthorityPort {
     ) -> Result<RootTransitionActivationReceipt, P07PortError> {
         Err(P07PortError::Unavailable)
     }
+}
+
+/// Proves one already committed closure may resume ONLY its canonical second
+/// phase under the exact retained operation/request identity (issue #2100,
+/// audit 5924750035 items 2, 4 and 6).
+///
+/// This is the pure admission half of the public second-phase-only recovery
+/// entry: it accepts the already committed [`GrantClosureReceipt`], the exact
+/// re-admitted [`GrantRevocationRequest`], and the retained canonical
+/// operation identity string the canonical write must reconcile under. It
+/// performs no I/O, holds no port, builds no graph, and can never re-strike
+/// `revoke_grant`: the Kernel/ORS first phase already fenced the target, and
+/// there is nothing here that could present to P-07 again.
+///
+/// The caller validates the closure under its own receipt contract first;
+/// this predicate proves binding, not shape:
+/// - both the closure and its authority receipt are `Revoked`, otherwise the
+///   first phase did not commit this closure;
+/// - the closure's recorded operation identity equals the retained canonical
+///   operation identity, otherwise the write would reconcile under an
+///   identity the first phase never committed (item 4: the original
+///   operation/idempotency identity, never a re-derived or fresh one);
+/// - the committed target, snapshot, State Fence and authority epoch equal
+///   the re-admitted decision's own coordinates, otherwise a changed request
+///   under one identity is the conflict, never a reconciliation (item 6).
+///
+/// A diagnostic tick alone never satisfies this: only the owner's re-admitted
+/// decision together with the owner's committed bytes authorizes the second
+/// phase (item 3 caller contract for the daemon handoff).
+///
+/// # Errors
+///
+/// Returns [`AuthorityError::InvalidField`] when the closure or its authority
+/// receipt is not `Revoked`, and [`AuthorityError::IdentityConflict`] when the
+/// recorded operation identity, target, snapshot, fence or epoch disagrees
+/// with the retained identity.
+pub fn check_resume_closure_binds_request(
+    request: &GrantRevocationRequest,
+    closure: &GrantClosureReceipt,
+    canonical_operation_id: &str,
+) -> Result<(), AuthorityError> {
+    if closure.state != GrantClosureState::Revoked
+        || closure.authority_receipt.state != GrantClosureState::Revoked
+    {
+        return Err(AuthorityError::InvalidField(
+            "maintenance_resume.closure_state",
+        ));
+    }
+    if closure.operation_id != canonical_operation_id {
+        return Err(AuthorityError::IdentityConflict);
+    }
+    if closure.declaration.target_grant_id != request.grant_id.as_str()
+        || closure.authority_receipt.snapshot_id != request.snapshot_id.as_str()
+        || closure.authority.state_fence != request.binding.state_fence
+        || !closure
+            .authority_receipt
+            .authority_epoch
+            .is_same_authority(&request.binding.state_fence.authority_epoch)
+    {
+        return Err(AuthorityError::IdentityConflict);
+    }
+    Ok(())
+}
+
+/// Proves one linked second phase binds the original first-phase bytes plus
+/// the Store-issued receipt identity by content (issue #2100, audit 5924750035
+/// items 5 and 6).
+///
+/// The linked closure's operation identity and whole declaration must equal
+/// the committed closure's, and the linked receipt must equal the presented
+/// [`ReceiptIdentity`]. Existence or shape agreement is never enough: only a
+/// content-equal read-back of the immutable first-phase row plus the exact
+/// Store-issued identity completes the link. An identical replay of a
+/// completed operation passes unchanged and returns the same result; any
+/// changed closure, fence, revision or receipt under that identity refuses
+/// here instead of recording a second link.
+///
+/// # Errors
+///
+/// Returns [`AuthorityError::ReceiptMismatch`] for any content disagreement.
+pub fn check_second_phase_link_binds_closure(
+    closure: &GrantClosureReceipt,
+    receipt_identity: &ReceiptIdentity,
+    linked_closure: &GrantClosureReceipt,
+    linked_receipt: &ReceiptIdentity,
+) -> Result<(), AuthorityError> {
+    if linked_closure.operation_id != closure.operation_id
+        || linked_closure.declaration != closure.declaration
+        || linked_receipt != receipt_identity
+    {
+        return Err(AuthorityError::ReceiptMismatch);
+    }
+    Ok(())
 }
