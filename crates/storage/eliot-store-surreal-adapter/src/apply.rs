@@ -2424,6 +2424,10 @@ mod admitted_operation_gate_tests {
                 idempotency_key: "idem-gate".to_owned(),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: "intent-gate".to_owned(),
+            write_envelope_protocol_version: 1,
             state_fence: fence.clone(),
             scope_id: ScopeId::new("scope-gate").expect("scope"),
             task_id: None,
@@ -3124,6 +3128,10 @@ mod concurrent_allocation_tests {
                     idempotency_key: format!("idem-{operation}"),
                     canonical_request_hash: "a".repeat(64),
                 },
+                // The fixture's own stable intent, distinct from the per-attempt
+                // operation identity and the per-correction idempotency key.
+                write_intent_id: format!("intent-{operation}"),
+                write_envelope_protocol_version: 1,
                 state_fence: fence(),
                 scope_id: ScopeId::new(scope).expect("scope"),
                 task_id: None,

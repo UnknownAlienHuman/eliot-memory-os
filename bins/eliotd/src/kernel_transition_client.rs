@@ -510,6 +510,11 @@ mod tests {
                 idempotency_key: "idem-daemon-1".to_owned(),
                 canonical_request_hash: "c".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: "intent-daemon-1".to_owned(),
+            write_envelope_protocol_version:
+                eliot_governor::GOVERNOR_ADMISSION_WRITE_ENVELOPE_PROTOCOL_VERSION,
             state_fence: fence.clone(),
             scope_id: ScopeId::new("governor").expect("scope"),
             task_id: None,
