@@ -158,6 +158,10 @@ pub struct TestdReplayObservedInputs {
     pub environment: eliot_process::EnvironmentProjection,
     /// SHA-256 of the exact current Cargo.lock bytes at the admitted root.
     pub cargo_lock_sha256: String,
+    /// Exact bounded repository normative-pair receipt bytes. The replay
+    /// owner parses these through `eliot-bootstrap` and compares the
+    /// independently admitted pair key.
+    pub normative_pair_receipt: Vec<u8>,
     /// Original plan-required test IDs parsed from the canonical owner binding.
     pub required_test_ids: BTreeSet<String>,
     /// Exact admitted lane fingerprint digest, rederived from the durable
@@ -873,6 +877,22 @@ fn build_replay_observed_inputs(
             reason: "the admitted Cargo.lock is empty at replay time",
         });
     }
+    const MAX_NORMATIVE_PAIR_RECEIPT_BYTES: usize = 16 * 1024;
+    let normative_pair_receipt = std::fs::read(
+        Path::new(&job.target_roots.source_root).join("docs/normative-pair.toml"),
+    )
+    .map_err(|_| TestdError::Invalid {
+        field: "provider_currentness.normative_pair",
+        reason: "the exact normative-pair receipt cannot be reread before replay",
+    })?;
+    if normative_pair_receipt.is_empty()
+        || normative_pair_receipt.len() > MAX_NORMATIVE_PAIR_RECEIPT_BYTES
+    {
+        return Err(TestdError::Invalid {
+            field: "provider_currentness.normative_pair",
+            reason: "the normative-pair receipt is empty or exceeds its 16 KiB bound",
+        });
+    }
     let verifier_dispatch = job
         .verifier_dispatch
         .as_ref()
@@ -896,6 +916,7 @@ fn build_replay_observed_inputs(
         tools,
         environment,
         cargo_lock_sha256: eliot_testd_core::sha256_hex(&lock_bytes),
+        normative_pair_receipt,
         required_test_ids,
         lane_fingerprint_digest,
     })
