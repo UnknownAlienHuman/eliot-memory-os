@@ -817,24 +817,40 @@ pub const BRIDGE_INGEST_WITHHELD_PROVIDER_RESTRICTION_UNDECIDED: &str =
 /// retention leg.
 pub const BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED: &str = "retention_terms_undecided";
 
-/// Availability of one Governor-owned policy leg for a bridge-ingest verdict
+/// Decision state of one Governor-owned policy leg for a bridge-ingest verdict
 /// (issue #1934, I7.23): the provider-restriction leg (provider-forbidden
 /// hidden reasoning must be ruled out before verbatim retention) and the
 /// retention-terms leg (raw retention is admitted only within the applicable
 /// retention contract).
 ///
-/// No bridge-ingest caller presents either leg yet — `EventEnvelope` carries
-/// no provider-retention field and the retained `Session` negotiates no
-/// provider terms — so every verdict on this path records `Unavailable` and
-/// withholds raw persistence. The legs still enter the owner rule as
-/// deny-only gates over the exact decided evidence, so a future presenting
-/// caller is evaluated by the same rule: a leg can only withhold, never
-/// grant.
+/// A leg names the AVAILABILITY of the evidence its own owner presents, never
+/// the verdict itself. `Unavailable` withholds. `Decided` records that the
+/// leg's owner resolved its rule for these exact bytes and that the applicable
+/// retention/privacy contract admits raw retention on that leg — the state the
+/// cited owner text describes as a precondition for verbatim retention
+/// (I7.23: "Raw payload is used for forensic replay and parser correction
+/// **only within the applicable retention/privacy contract**").
+///
+/// Both legs enter [`resolve_bridge_ingest_disclosure`] as deny-only gates over
+/// the exact decided evidence ([`Self::withholds`]): a leg can only withhold,
+/// never grant. Clearing both withholdings admits nothing by itself — the
+/// verdict is still grant membership, so a `Decided` leg over bytes the
+/// recipient grant does not name still withholds on the source side.
+///
+/// `Unavailable` is what a caller that presents no owner evidence reaches:
+/// `EventEnvelope` carries no provider-retention field and the retained
+/// `Session` negotiates no provider terms, so every present caller records it
+/// and withholds raw persistence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BridgeIngestPolicyLeg {
     /// No owner-presented provider/retention terms reached the verdict:
     /// raw persistence stays withheld on this leg.
     Unavailable,
+    /// The leg's owner decided its rule for these exact bytes and forbade
+    /// nothing on this leg: the applicable retention/privacy contract admits
+    /// raw retention here. The verdict itself is still decided by grant
+    /// membership below.
+    Decided,
 }
 
 impl BridgeIngestPolicyLeg {
@@ -844,7 +860,32 @@ impl BridgeIngestPolicyLeg {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unavailable => "unavailable",
+            Self::Decided => "decided",
         }
+    }
+
+    /// Reads one leg out of its closed wire spelling.
+    ///
+    /// This is the owner's own vocabulary reader, so a persistence owner
+    /// validates against this table instead of repeating the spellings: an
+    /// unknown spelling is no leg at all, and the caller fails closed. It is
+    /// the exact inverse of [`Self::as_str`].
+    #[must_use]
+    pub fn from_wire(spelling: &str) -> Option<Self> {
+        match spelling {
+            x if x == Self::Unavailable.as_str() => Some(Self::Unavailable),
+            x if x == Self::Decided.as_str() => Some(Self::Decided),
+            _ => None,
+        }
+    }
+
+    /// Whether this leg withholds raw persistence on its own evidence.
+    ///
+    /// The deny-only invariant of the owner rule: a leg either removes its own
+    /// withholding or stops the query, and it never supplies an admission.
+    #[must_use]
+    pub fn withholds(self) -> bool {
+        matches!(self, Self::Unavailable)
     }
 }
 
@@ -907,9 +948,8 @@ impl BridgeIngestDisclosure {
 /// The provider-restriction and retention-terms legs enter this query as
 /// deny-only gates: either leg withholds before any grant membership can
 /// admit, and neither leg can admit what the grant membership would deny.
-/// No caller on the bridge-ingest path carries either leg yet, so events
-/// requiring them stay withheld until decided through the Governor path that
-/// presents them.
+/// A leg the owner has decided removes only its own withholding; the verdict
+/// below is still grant membership, so no leg can grant.
 ///
 /// # Errors
 ///
@@ -929,12 +969,12 @@ pub fn resolve_bridge_ingest_disclosure(
     if let Some(class) = source_class {
         text(class, "source_class")?;
     }
-    if matches!(provider_restriction, BridgeIngestPolicyLeg::Unavailable) {
+    if provider_restriction.withholds() {
         return Ok(BridgeIngestDisclosure::Withheld {
             side: BRIDGE_INGEST_WITHHELD_PROVIDER_RESTRICTION_UNDECIDED,
         });
     }
-    if matches!(retention_terms, BridgeIngestPolicyLeg::Unavailable) {
+    if retention_terms.withholds() {
         return Ok(BridgeIngestDisclosure::Withheld {
             side: BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED,
         });
@@ -4184,5 +4224,128 @@ mod tests {
         assert!(!question.trim().is_empty());
         assert_eq!(lease.consumed, 0);
         assert!(store.stored.is_empty());
+    }
+
+    /// Issue #2565: a decided policy leg makes the permit REACHABLE, and it is
+    /// earned by evidence rather than asserted by the verdict.
+    ///
+    /// Both legs `Decided` over a source class the recipient grant names is the
+    /// full evidence set the owner rule requires before it admits, so this is
+    /// the genuine admission the pre-persistence gate is built to read.
+    #[test]
+    fn decided_policy_legs_admit_a_granted_source_class() {
+        let admitted = resolve_bridge_ingest_disclosure(
+            "scope:2565",
+            Some("private"),
+            &["private".to_owned()],
+            BridgeIngestPolicyLeg::Decided,
+            BridgeIngestPolicyLeg::Decided,
+        );
+        assert_eq!(
+            admitted.expect("decided legs over a granted class resolve"),
+            BridgeIngestDisclosure::Admitted
+        );
+        assert_eq!(
+            BridgeIngestDisclosure::Admitted.verdict(),
+            BRIDGE_INGEST_VERDICT_ADMITTED
+        );
+    }
+
+    /// Issue #2565: the leg stays DENY-ONLY. Clearing a leg's own withholding
+    /// grants nothing on its own — membership in the recipient grant is still
+    /// the verdict, so a decided leg over a class the grant does not name
+    /// withholds exactly as it does with the leg unavailable.
+    #[test]
+    fn a_decided_leg_still_cannot_grant_what_the_deny_facade_forbids() {
+        let withheld = resolve_bridge_ingest_disclosure(
+            "scope:2565",
+            Some("private"),
+            &["public".to_owned()],
+            BridgeIngestPolicyLeg::Decided,
+            BridgeIngestPolicyLeg::Decided,
+        );
+        assert_eq!(
+            withheld.expect("an ungranted class still resolves"),
+            BridgeIngestDisclosure::Withheld {
+                side: BRIDGE_INGEST_WITHHELD_SOURCE_CLASS_UNADMITTED
+            }
+        );
+        let unproven = resolve_bridge_ingest_disclosure(
+            "scope:2565",
+            None,
+            &["private".to_owned()],
+            BridgeIngestPolicyLeg::Decided,
+            BridgeIngestPolicyLeg::Decided,
+        );
+        assert_eq!(
+            unproven.expect("an unproven class still resolves"),
+            BridgeIngestDisclosure::Withheld {
+                side: BRIDGE_INGEST_WITHHELD_SOURCE_CLASS_UNADMITTED
+            }
+        );
+    }
+
+    /// Issue #2565: an undecided leg withholds FIRST, ahead of grant
+    /// membership, so no evidence combination buys raw retention on a leg its
+    /// owner has not decided. This is the fail-closed direction the store
+    /// re-derives before every raw write.
+    #[test]
+    fn an_undecided_leg_withholds_before_grant_membership() {
+        let provider = resolve_bridge_ingest_disclosure(
+            "scope:2565",
+            Some("private"),
+            &["private".to_owned()],
+            BridgeIngestPolicyLeg::Unavailable,
+            BridgeIngestPolicyLeg::Decided,
+        );
+        assert_eq!(
+            provider.expect("an undecided provider leg still resolves"),
+            BridgeIngestDisclosure::Withheld {
+                side: BRIDGE_INGEST_WITHHELD_PROVIDER_RESTRICTION_UNDECIDED
+            }
+        );
+        let retention = resolve_bridge_ingest_disclosure(
+            "scope:2565",
+            Some("private"),
+            &["private".to_owned()],
+            BridgeIngestPolicyLeg::Decided,
+            BridgeIngestPolicyLeg::Unavailable,
+        );
+        assert_eq!(
+            retention.expect("an undecided retention leg still resolves"),
+            BridgeIngestDisclosure::Withheld {
+                side: BRIDGE_INGEST_WITHHELD_RETENTION_TERMS_UNDECIDED
+            }
+        );
+    }
+
+    /// Issue #2565: the wire vocabulary is closed and round-trips, so a
+    /// persistence owner validates against the owner's own table rather than
+    /// repeating the spellings. An unknown spelling is no leg at all.
+    #[test]
+    fn policy_leg_wire_vocabulary_is_closed_and_round_trips() {
+        for leg in [
+            BridgeIngestPolicyLeg::Unavailable,
+            BridgeIngestPolicyLeg::Decided,
+        ] {
+            assert_eq!(
+                BridgeIngestPolicyLeg::from_wire(leg.as_str()),
+                Some(leg),
+                "every owner leg must read back from its own wire spelling"
+            );
+        }
+        assert_eq!(
+            BridgeIngestPolicyLeg::from_wire("permitted"),
+            None,
+            "a spelling the owner does not define is not a leg"
+        );
+        assert!(
+            BridgeIngestPolicyLeg::Unavailable.withholds(),
+            "an unavailable leg withholds"
+        );
+        assert!(
+            !BridgeIngestPolicyLeg::Decided.withholds(),
+            "a decided leg removes only its own withholding"
+        );
     }
 }
