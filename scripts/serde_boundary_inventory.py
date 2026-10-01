@@ -24,20 +24,31 @@ empty success.
 
 Freshness and integrity:
 
-- The denominator separates the *scan universe* (tracked source path identity,
-  no bytes) from the *source digest*, which is derived from each row's own
-  exact per-row input digest. An unrelated tracked source file that produces no
-  row therefore cannot invalidate the inventory; a change to a row's span,
-  file, callers, profile, legacy source, rule or owner map always does.
+- The denominator separates the *scan breadth* from the *invalidation universe*.
+  Scanned breadth stays the deterministic tracked-source scan of every tracked
+  ``*.rs`` path and is recorded, but it is explicitly observational metadata
+  outside the proof ceiling: a tracked file that produces no candidate row is not
+  a dependency of any row, so it must not stale the artifact. The universe that
+  drives invalidation is exactly the set of source paths that produced at least
+  one candidate row, and ``source_digest`` is derived from each row's own exact
+  per-row input digest. A change to a row's span, file, callers, profile, legacy
+  source, rule or owner map always stales that row and the aggregate derived from
+  the rows.
 - ``aggregate_digest`` is the digest of the canonical projection of the
   rendered artifact text, and ``check`` recomputes it from the stored file
   itself. Every load-bearing row and allocation field is inside that payload,
   so a hand edit to an owner, readiness, caller, classification, allocation,
   profile/limit, fixture or invalidation field fails closed.
-- ``base_sha`` records the commit the writer stood on. It cannot equal the
-  commit that carries the artifact, so it is explicitly classified as
-  informational and outside the proof ceiling; the validated input digests are
-  the evidence. The artifact never appears in its own input universe.
+- ``base_sha`` records the commit the writer stood on. It is explicitly
+  non-authoritative, outside the proof ceiling, and never proof. It cannot equal
+  the commit that carries the artifact and it restates on every commit that
+  changes nothing this inventory observes, so it is the single field exempt from
+  the stored-versus-fresh comparison - by a closed constant, never by omission.
+  It remains inside the canonical payload, so a substituted or hand-edited value
+  is refused by the recomputed stored aggregate, and it must additionally match
+  the Git object-id grammar and its declared source. The validated per-row and
+  aggregate input digests are the actual evidence. The artifact never appears in
+  its own input universe.
 - A row ``id`` is a stable *name* for one declaration, derived only from
   ``package : path : kind : type : enclosing-function``. The declaration's
   line number is deliberately excluded: it is bound as validated fields
@@ -80,8 +91,8 @@ import tomllib
 from pathlib import Path
 
 SCHEMA = "eliot.serde-boundary-inventory.v1"
-TOOL_VERSION = "0.4.0"
-RULE_REVISION = "929.4"
+TOOL_VERSION = "0.5.0"
+RULE_REVISION = "929.5"
 ISSUE = 929
 OWNED_TOML_REL = (
     "crates/foundation/eliot-contracts/tests/data/shipped_serde_boundaries.toml"
@@ -314,12 +325,44 @@ ALLOWED_COMMANDS = (
 # derived from the rendered artifact text, so the stored and the freshly
 # generated views cannot drift apart.
 #
-# Only the fields listed in ``CANONICAL_EXCLUDED_FIELDS`` are left out, and
-# the artifact must declare that exclusion itself.
+# Only the fields in ``CANONICAL_EXCLUDED_FIELDS`` are left out, and the artifact
+# must declare that exclusion verbatim. Every owner, caller, classification,
+# readiness, allocation, span, prerequisite, profile/limit, fixture and
+# invalidation field - and the ``base_sha`` provenance - is inside the payload.
 # ---------------------------------------------------------------------------
 BASE_SHA_SOURCE = "git-rev-parse-HEAD"
 PROVENANCE_AUTHORITY = "informational-observational-outside-proof-ceiling"
-CANONICAL_EXCLUDED_FIELDS = ("base_sha", "base_sha_source")
+
+# Fields deliberately outside the canonical payload:
+#
+# - ``aggregate_digest``: the digest *of* the payload; it cannot be a member of
+#   the payload it describes.
+# - ``denominator.scan_file_count``: the observed breadth of the tracked-source
+#   scan. Adding a tracked *.rs file that produces no candidate row changes this
+#   number and nothing else; binding it would stale the artifact exactly as the
+#   audit's defect 1 describes. ``check`` therefore does not trust it: it is
+#   re-observed from the current scan and bounded by it, so a fabricated count is
+#   refused while an honestly stale one is accepted.
+#
+# Both are explicit, closed, declared by the artifact, and validated by ``check``
+# to account. Neither is proof. Every row, allocation, owner, caller,
+# classification, readiness, prerequisite, profile/limit, fixture and
+# invalidation field is inside the payload.
+CANONICAL_EXCLUDED_FIELDS = (
+    "aggregate_digest",
+    "denominator.scan_file_count",
+)
+
+# Fields that ARE inside the canonical payload - so a hand edit to them is
+# refused by the recomputed stored aggregate - but are excluded from the
+# stored-versus-fresh comparison, because they restate with the repository HEAD
+# rather than with anything this inventory observes. ``base_sha`` records the
+# commit the writer stood on; it can never equal the commit that carries the
+# artifact, and comparing it against the current HEAD would make the artifact
+# stale by construction. It is explicitly non-authoritative, outside the proof
+# ceiling, and never proof; the freshness comparison substitutes the stored value
+# rather than dropping the field, so it stays bound and tamper-evident.
+NON_FRESHNESS_BOUND_FIELDS = ("base_sha",)
 
 CANONICAL_HEADER_KEYS = (
     "schema",
@@ -327,6 +370,10 @@ CANONICAL_HEADER_KEYS = (
     "rule_revision",
     "proof_ceiling",
     "issue",
+    "base_sha",
+    "base_sha_source",
+    "provenance_authority",
+    "canonical_excludes",
     "denominator_status",
     "ambiguous_reason",
     "coverage",
@@ -347,12 +394,25 @@ CANONICAL_DENOMINATOR_KEYS = (
     "targets",
     "features",
     "universe_digest",
+    "universe_source_count",
     "source_digest",
     "rule_digest",
     "owner_map_digest",
     "profile_digest",
-    "scan_file_count",
     "rust_version",
+)
+
+# Denominator fields compared for identity against the current scan. Every one of
+# them is derived from the exact per-row input digests (or from the closed
+# rule/owner-map/profile constants), so the invalidation universe is affected-row
+# scoped: a tracked *.rs file that produces no candidate row is not an input to
+# any of them.
+FRESHNESS_DENOMINATOR_KEYS = (
+    "universe_digest",
+    "source_digest",
+    "rule_digest",
+    "owner_map_digest",
+    "profile_digest",
 )
 CANONICAL_COUNT_KEYS = ("candidate", "classified", "unknown", "unassigned")
 CANONICAL_PROFILE_KEYS = (
@@ -2255,12 +2315,18 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
     for row in rows:
         row["input_digest"] = _row_input_digest(row, profile, legacy, digest_of)
 
-    # The scan universe is the set of tracked source paths actually scanned.
-    # It is path identity only (never file content), so an unrelated byte edit
-    # inside an already-scanned file cannot restate the denominator, while
-    # adding or removing a tracked source file does. The artifact itself is not
-    # a *.rs file, so it can never appear in its own input universe.
-    universe_digest = _sha256_text("\n".join(sorted(scan_rels)))
+    # Scan breadth is observational: how many tracked *.rs paths this scan
+    # looked at. It is recorded for completeness and is NOT an invalidation
+    # input, so an unrelated tracked source file appearing in the repository
+    # cannot invalidate any row.
+    scan_breadth = len(scan_rels)
+    # The invalidation universe is exactly the set of source paths that produced
+    # at least one candidate row, i.e. the only paths any row can depend on. A
+    # tracked *.rs file that produces no row is deliberately outside it, so
+    # ordinary repository growth in unrelated crates cannot stale the artifact.
+    # The artifact itself is a .toml and can never appear in its own universe.
+    universe_rels = sorted({r["path"] for r in rows})
+    universe_digest = _sha256_text("\n".join(universe_rels))
     # Source digest is derived from the exact per-row input digests rather than
     # from every tracked Rust file in the workspace, so an unrelated tracked
     # source file that produces no row cannot invalidate the inventory.
@@ -2401,7 +2467,8 @@ def build_inventory(root: Path, scan_rels: list[str] | None = None) -> dict:
 
     denominator = dict(denominator_core)
     denominator["universe_digest"] = universe_digest
-    denominator["scan_file_count"] = len(scan_rels)
+    denominator["universe_source_count"] = len(universe_rels)
+    denominator["scan_file_count"] = scan_breadth
     denominator["rust_version"] = str(meta.get("rust_version", ""))
     header = {
         "schema": SCHEMA,
@@ -2475,9 +2542,13 @@ def _escape_toml_str(value: str) -> str:
 # field normalizes to a sentinel instead of silently defaulting, so deleting a
 # line from the artifact is a detectable change.
 #
-# ``aggregate_digest`` itself is excluded (it is the digest of this payload)
-# and ``CANONICAL_EXCLUDED_FIELDS`` are excluded because the artifact declares
-# them as observational, non-authoritative provenance metadata.
+# ``aggregate_digest`` itself is excluded: it is the digest of this payload and
+# cannot be a member of it. The observed scan breadth is excluded too, because
+# binding it would make the artifact stale on a file addition that changes
+# nothing this inventory observes; it is instead re-observed and bounded by
+# ``check``. Every other stored field - including the HEAD-derived ``base_sha``
+# provenance - is inside the payload and therefore tamper-evident; ``base_sha`` is
+# additionally exempt from the freshness comparison alone, by a closed constant.
 # ---------------------------------------------------------------------------
 ABSENT = "<absent>"
 
@@ -2583,6 +2654,7 @@ def _render_toml(inventory: dict) -> bytes:
     for key in ("universe_digest", "source_digest", "rule_digest", "owner_map_digest", "profile_digest"):
         lines.append("%s = %s" % (key, _escape_toml_str(str(denom.get(key, "")))))
     lines.append("scan_file_count = %d" % int(denom.get("scan_file_count", 0)))
+    lines.append("universe_source_count = %d" % int(denom.get("universe_source_count", 0)))
     lines.append("rust_version = %s" % _escape_toml_str(str(denom.get("rust_version", meta.get("rust_version", "")))))
     lines.append("")
     lines.append("[counts]")
@@ -2775,6 +2847,26 @@ def _fresh_canonical_payload(fresh: dict) -> dict:
     return _canonical_payload(tomllib.loads(payload.decode("utf-8")))
 
 
+def _pin_non_freshness_fields(fresh_canonical: dict, stored_canonical: dict) -> dict:
+    """Return the fresh payload with HEAD-derived fields pinned to stored values.
+
+    ``NON_FRESHNESS_BOUND_FIELDS`` (currently ``base_sha``) restates with the
+    repository HEAD rather than with anything this inventory observes. Pinning
+    the stored value keeps those fields inside the compared and aggregated
+    payload - so a hand edit to them is still refused by the stored-aggregate
+    recomputation - while not demanding that the artifact's writing commit equal
+    the commit it is being checked from.
+    """
+    pinned = {
+        key: (list(value) if isinstance(value, list) else value)
+        for key, value in fresh_canonical.items()
+    }
+    for key in NON_FRESHNESS_BOUND_FIELDS:
+        if key in pinned.get("header", {}) and key in stored_canonical.get("header", {}):
+            pinned["header"][key] = stored_canonical["header"][key]
+    return pinned
+
+
 def _first_difference(stored: dict, current: dict, keys) -> str:
     """Name the first differing canonical field, or "" when the records agree."""
     for key in keys:
@@ -2809,7 +2901,35 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
             "STALE_RULE",
             "artifact canonical_excludes %r != %r" % (doc.get("canonical_excludes"), list(CANONICAL_EXCLUDED_FIELDS)),
         )
-    for key in ("universe_digest", "source_digest", "rule_digest", "owner_map_digest", "profile_digest"):
+    # Provenance is classified, never silently presented as proof: ``base_sha``
+    # records the commit the writer stood on. It cannot equal the commit that
+    # carries the artifact, and it restates on every commit that changes nothing
+    # this inventory observes, so demanding it equal the current HEAD would
+    # reintroduce exactly the stale-by-construction artifact this repair closes.
+    #
+    # It is still bound and held to account, never ignored:
+    #
+    #   1. it is inside the canonical payload, so a substituted or hand-edited
+    #      value breaks the recomputed stored aggregate below;
+    #   2. it is excluded only from the stored-versus-fresh comparison, by the
+    #      closed ``NON_FRESHNESS_BOUND_FIELDS`` constant, which the comparison
+    #      honours by substituting the stored value rather than dropping the key;
+    #   3. the artifact must declare the canonical exclusion set verbatim, and
+    #      that set is a closed constant - it cannot be widened by a hand edit;
+    #   4. ``provenance_authority`` must be the exact observational marker and
+    #      ``base_sha_source`` the exact declared source;
+    #   5. ``base_sha`` must satisfy the Git object-id grammar below.
+    #
+    # So it never appears as proof while being silently ignored by the verifier,
+    # and the validated per-row/aggregate input digests remain the evidence.
+    base_sha = str(doc.get("base_sha", ""))
+    if base_sha != "unknown-base" and not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+        raise InventoryError(
+            "MALFORMED_PROVENANCE",
+            "artifact base_sha %r is neither a 40-hex Git object id nor the "
+            "explicit unknown-base sentinel" % base_sha,
+        )
+    for key in FRESHNESS_DENOMINATOR_KEYS:
         stored = (doc.get("denominator", {}) or {}).get(key, "")
         current = fresh["denominator"].get(key, "")
         if stored != current:
@@ -2819,6 +2939,37 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
             )
     if doc.get("denominator_digest") != fresh["header"]["denominator_digest"]:
         raise InventoryError("STALE_INPUT", "stale denominator_digest; release/source/rule/owner/profile change invalidates evidence")
+    # The observed scan breadth is outside the canonical payload, so it is not
+    # tamper-evident by digest. It is still held to account rather than trusted:
+    # it is re-observed from the current scan and bounded by it. Checked after the
+    # freshness identities so that a relevant source change is reported as the
+    # stale input it is, not as a malformed observation. The stored value must be
+    # a plausible breadth for the recorded universe - at least one source file per
+    # row-producing file, and never more than the tracked source files the current
+    # scan actually looked at. A fabricated count is refused; a genuinely stale but
+    # honest count from before an unrelated file addition is accepted, which is the
+    # point of keeping this field observational.
+    stored_breadth = (doc.get("denominator", {}) or {}).get("scan_file_count")
+    if isinstance(stored_breadth, bool) or not isinstance(stored_breadth, int):
+        raise InventoryError(
+            "MALFORMED_SCAN_BREADTH",
+            "denominator scan_file_count %r is not an integer observation" % (stored_breadth,),
+        )
+    universe_count = (doc.get("denominator", {}) or {}).get("universe_source_count")
+    if isinstance(universe_count, int) and not isinstance(universe_count, bool):
+        if stored_breadth < universe_count:
+            raise InventoryError(
+                "MALFORMED_SCAN_BREADTH",
+                "denominator scan_file_count %d is below the %d row-producing source "
+                "files it claims to have scanned" % (stored_breadth, universe_count),
+            )
+    if stored_breadth > fresh["denominator"]["scan_file_count"]:
+        raise InventoryError(
+            "MALFORMED_SCAN_BREADTH",
+            "denominator scan_file_count %d exceeds the %d tracked source files the "
+            "current scan observed"
+            % (stored_breadth, fresh["denominator"]["scan_file_count"]),
+        )
     stored_rows = _stored_rows(doc)
     seen: set[str] = set()
     for row in stored_rows:
@@ -2857,9 +3008,15 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
             "allocation content was hand-edited" % (stored_payload_digest, str(doc.get("aggregate_digest", ""))),
         )
     fresh_canonical = _fresh_canonical_payload(fresh)
+    # Stored vs fresh comparison is exact over every canonical key, in the fixed
+    # key order of each section. The only non-freshness-bound field is the
+    # HEAD-derived ``base_sha``; it is compared against itself here so it stays
+    # inside the bound payload (a hand edit is refused by the stored aggregate
+    # above) while not being demanded to equal the current HEAD.
+    pinned_fresh = _pin_non_freshness_fields(fresh_canonical, stored_canonical)
     for section in ("header", "denominator", "counts", "profile", "legacy"):
         difference = _first_difference(
-            stored_canonical[section], fresh_canonical[section],
+            stored_canonical[section], pinned_fresh[section],
             tuple(fresh_canonical[section].keys()),
         )
         if difference:
@@ -2890,8 +3047,16 @@ def validate_against_artifact(root: Path, fresh: dict, doc: dict) -> list[dict]:
             raise InventoryError(
                 "HAND_EDIT_OR_DRIFT", "row %s differs (%s); hand edits are rejected" % (rid, difference)
             )
-    if doc.get("aggregate_digest") != fresh["header"]["aggregate_digest"]:
-        raise InventoryError("HAND_EDIT_OR_DRIFT", "aggregate digest mismatch; artifact was hand-edited or inputs drifted")
+    # The repository aggregate is recomputed here from the fresh per-row and
+    # allocation records, with the HEAD-derived provenance field pinned to its
+    # stored value, so a change in any observed input restates the aggregate
+    # while an unrelated commit does not.
+    fresh_aggregate = _payload_digest(pinned_fresh)
+    if doc.get("aggregate_digest") != fresh_aggregate:
+        raise InventoryError(
+            "HAND_EDIT_OR_DRIFT",
+            "aggregate digest mismatch; artifact was hand-edited or inputs drifted",
+        )
     if fresh["header"]["denominator_status"] == "INCOMPLETE":
         raise InventoryError("AMBIGUOUS_RELEASE", fresh["header"].get("ambiguous_reason", "ambiguous release authority"))
     stored_allocs = doc.get("allocations", []) or []
