@@ -103,6 +103,10 @@ pub enum CapturedLspAdoptionError {
     /// The authenticated Kernel principal could not be represented as a holder.
     #[error("authenticated Kernel principal is invalid: {0}")]
     Holder(#[from] eliot_authority::AuthorityError),
+    /// The selected-source claim did not retain the exact original admitted
+    /// request identity and its Task/Session/WorkScope selectors.
+    #[error("selected-source claim is not bound to its original request: {0}")]
+    SelectedSourceCaptureRequest(&'static str),
     /// The Governor could not issue a read admission from its current owners.
     #[error("source-artifact read admission failed: {0}")]
     Admission(#[from] eliot_governor::SourceArtifactAdmissionError),
@@ -2297,6 +2301,75 @@ impl DaemonComposition {
     #[must_use]
     pub const fn source_artifact_owner(&self) -> &SourceArtifactOwner {
         &self.source_artifact_owner
+    }
+
+    /// Re-resolves the current Governor Task/Session/WorkScope/WorkLease to
+    /// WorkItem binding for one exact authenticated selected-source claim.
+    /// Envelope IDs are only selectors: the principal and owner evidence come
+    /// from the live Governor activation/coordination owners, and the request
+    /// identity is retained verbatim from Kernel claim.
+    #[cfg(windows)]
+    pub async fn selected_source_capture_task_selection(
+        &self,
+        envelope: &eliot_protocol::HostRequestEnvelope,
+        identity: &RequestIdentity,
+    ) -> Result<eliot_governor::TaskSelectionAdmissionBinding, CapturedLspAdoptionError> {
+        identity.validate().map_err(|_| {
+            CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "original RequestIdentity failed validation",
+            )
+        })?;
+        envelope.validate_for_admission().map_err(|_| {
+            CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "original HostRequestEnvelope failed validation",
+            )
+        })?;
+        let metadata = &identity.request.metadata;
+        let host_identity = &envelope.identity;
+        let task_id = metadata.task_id.as_ref().ok_or(
+            CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "original request omitted its selected Task",
+            ),
+        )?;
+        let session_id = metadata.session_id.as_ref().ok_or(
+            CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "original request omitted its active Session",
+            ),
+        )?;
+        let work_scope_id = host_identity.work_scope_id.as_deref().ok_or(
+            CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "selected-source claim omitted its WorkScope selector",
+            ),
+        )?;
+        if envelope.kind != eliot_protocol::HostRequestKind::SelectedSourceCapture
+            || host_identity.capability
+                != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
+            || host_identity.payload_schema_id
+                != eliot_protocol::SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID
+            || host_identity.parent_operation_id.is_some()
+            || host_identity.request_id != metadata.request_id
+            || host_identity.idempotency_key != identity.idempotency_key
+            || host_identity.cancellation_id != identity.cancellation_id
+            || host_identity.deadline_unix_ms != identity.deadline_unix_ms
+            || host_identity.task_id.as_deref() != Some(task_id.as_str())
+            || host_identity.session_id.as_deref() != Some(session_id.as_str())
+            || identity.request.state_fence != envelope.state_fence
+            || metadata.state_fence != envelope.state_fence
+        {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "HostRequest envelope changed the admitted kind, capability, identity, or fence",
+            ));
+        }
+        self.governor
+            .task_selection_evidence_for_authenticated_request(
+                || crate::try_unix_ms(SystemTime::now()).map_err(CompositionError::Clock),
+                session_id.as_str(),
+                task_id.as_str(),
+                work_scope_id,
+                &metadata.state_fence,
+            )
+            .await
+            .map_err(CapturedLspAdoptionError::TaskSelection)
     }
 
     /// Runs the internal W1 one-shot LSP capture through the original
