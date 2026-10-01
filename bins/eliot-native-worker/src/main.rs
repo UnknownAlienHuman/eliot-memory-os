@@ -2310,13 +2310,29 @@ mod tests {
         ))
         .unwrap_or_else(|error| panic!("kernel governed drive must reach Ready, got {error:?}"));
         assert_eq!(actions.len(), 4);
+        let admitted_claim = material.admission.claim();
+        let generated_authority = load(eliot_kernel::native_worker_dispatch_derivation(
+            &admitted_claim.claim_id,
+            &admitted_claim.operation_id,
+            admitted_claim.worker_generation,
+            &admitted_claim.authority_epoch,
+            &material.nonce,
+        ))
+        .authority_id;
         for (action, operation) in
             actions
                 .iter()
                 .zip(["register", "claim", "reconcile", "start_claimed"])
         {
             assert_eq!(action.operation, operation);
-            assert_eq!(action.scope_ref, "scope-kernel-drive-1");
+            assert_eq!(
+                action.scope_ref.as_str(),
+                admitted_claim.work_scope_id.as_str()
+            );
+            assert_eq!(
+                action.applicable_authority.as_str(),
+                generated_authority.as_str()
+            );
             assert!(action.verifier.starts_with("unknown:"));
             assert_eq!(
                 eliot_native_worker::governed_action::finish_for_verdict(action, true, true),
@@ -2372,6 +2388,14 @@ mod tests {
         assert!(!shutdown);
         assert_eq!(serve_actions.len(), 1);
         assert_eq!(serve_actions[0].operation, "serve_stdio");
+        assert_eq!(
+            serve_actions[0].scope_ref.as_str(),
+            admitted_claim.work_scope_id.as_str()
+        );
+        assert_eq!(
+            serve_actions[0].applicable_authority.as_str(),
+            generated_authority.as_str()
+        );
         assert!(serve_actions[0].verifier.starts_with("unknown:"));
         let response = decode_response(&writer);
         assert_eq!(response.connection_id, hello_connection);
