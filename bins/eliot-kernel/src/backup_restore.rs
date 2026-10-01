@@ -1288,17 +1288,41 @@ impl KernelBackupRestore {
     /// [`KernelRestoreTarget::apply_purge_ledger`] — instead of staging a
     /// ledger whose revision no owner ever issued.
     ///
-    /// The owner route DOES exist: [`restore_with_ors_journal`](Self::restore_with_ors_journal)
-    /// supplies the composition-owned ORS handle, and
-    /// `KernelComposition::backup_restore_with_ors_journal` is the intended
-    /// production caller of it. That composition entry is recorded in
-    /// `lib.rs` as having NO caller in this repository, so the owner route is
-    /// not yet live at runtime and this entry's refusal is not currently
-    /// reachable from production. Stated rather than papered over: #963/#2569
-    /// own the front-door connection, and a guard or refusal that is only
-    /// unreachable by accident is not a guard — the purge phase's own
-    /// rehearsal and absent-owner refusals are enforced at the phase, not
-    /// here, precisely so that wiring the entry does not change them.
+    /// The owner route DOES exist and IS live at runtime:
+    /// [`restore_with_ors_journal`](Self::restore_with_ors_journal) supplies
+    /// the composition-owned ORS handle, and
+    /// `KernelComposition::backup_restore_with_ors_journal` is that handle's
+    /// production caller, not merely its intended one.
+    /// `KernelComposition::dispatch_backup_frame` routes `backup.restore-test`
+    /// to `request_dispatch::handle_backup_restore_test`, which admits the
+    /// owner-issued journal admission and then calls that composition entry,
+    /// so every refusal living in the shared `restore_with_owner` body is
+    /// reached from the front door — including
+    /// `refuse_destination_outside_isolated_area`, which sits after only the
+    /// bundle, ports, admission, fence, key-material and blob-scope checks and
+    /// therefore runs on every restore-test request that clears them.
+    ///
+    /// What is NOT reachable from production is exactly one thing, and it is
+    /// this entry's OWN absent-owner half: it needs `ors: None`, and no
+    /// production caller passes `None` — the composition entry always supplies
+    /// the handle, the fourth selector `backup.restore-store` never reaches
+    /// this engine at all (it answers through
+    /// `KernelComposition::execute_backup_store_restore`), and the
+    /// in-repository callers of `restore` itself are the fixture proofs in
+    /// `bins/eliot-kernel/tests/backup_restore.rs`.
+    ///
+    /// The refusal NAMED above is nonetheless reachable in production, because
+    /// one typed error carries two guards. The REHEARSAL guard in
+    /// `apply_purge_entries` fires first on the restore-test route — that route
+    /// runs `RestorePorts::rehearsal = true` — so a restore-test over an
+    /// archive that carries purge entries refuses with
+    /// `BackupError::RestoreCapabilityUnsupported` naming
+    /// `owners::PURGE_LEDGER_OWNER` there, before any owner call. Only the
+    /// `ors: None` half is production-unreachable; the error, the capability
+    /// name and the guarantee they carry are not. That is why the purge phase's
+    /// rehearsal and absent-owner refusals are enforced at the phase and not
+    /// here: a guard that is unreachable only by accident is not a guard, and
+    /// enforcing them there means wiring either entry does not change them.
     pub fn restore<J: RestoreJournalPort>(
         &self,
         bundle: &BackupBundle,
