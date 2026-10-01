@@ -6742,8 +6742,6 @@ impl KernelComposition {
                     &envelope_bytes,
                     Some(&privacy_authorization),
                 );
-                let now = unix_ms();
-                let expired = activation_deadline_expired(now, deadline_unix_ms);
                 let evidence = bridge_owner_evidence(session, frame_fence)?;
                 self.stage_bridge_event_durable(
                     session,
@@ -6751,7 +6749,6 @@ impl KernelComposition {
                     &evidence,
                     &envelope_sha,
                     &privacy,
-                    expired,
                     deadline_unix_ms,
                 )
             }
@@ -6914,9 +6911,9 @@ impl KernelComposition {
         evidence: &BridgeOwnerEvidence,
         envelope_sha: &str,
         privacy: &serde_json::Value,
-        expired: bool,
         deadline_unix_ms: u64,
     ) -> Result<serde_json::Value, TransportError> {
+        let expired = activation_deadline_expired(unix_ms(), deadline_unix_ms);
         let privacy_legs = Self::bridge_event_privacy_legs(privacy)?;
         let staged = serde_json::json!({
             "stream_id": event.stream_id,
