@@ -1457,6 +1457,51 @@ pub fn handle_maintenance_trigger_replacement_pending_set(
     ledger.replacement_pending_set(continuation, mirror_recovered, now_unix_ms)
 }
 
+/// Reconciles one lost daemon generation's retained triggers for its
+/// replacement (issue #1694 W6).
+///
+/// The replacement generation arrives already authenticated: `session` is
+/// bound from live Kernel authority and is revalidated here before any
+/// ledger transition, so a replayed session can never smuggle old authority
+/// into the reconciliation. The two ledger transitions then run in the
+/// daemon-loss order:
+///
+/// 1. [`MaintenanceTriggerDeliveryLedger::revoke_consumer`] retires the lost
+///    generation's consumer authority through the Kernel owner. Pending
+///    claims are retained, never dropped: a revoked `Claimed` row returns to
+///    `Pending` under the same identity and revision for the replacement to
+///    reclaim, and a revoked `DecisionRecorded` row moves to `Reconciling`
+///    with its committed receipt preserved for receipt-lookup
+///    acknowledgement. Every later old-generation claim or ack fails against
+///    the revocation list and the current fence.
+/// 2. [`MaintenanceTriggerDeliveryLedger::replacement_pending_set`] surfaces
+///    the bounded pending set. Until the caller proves the required mirror
+///    recovery (`mirror_recovered`), this refuses with
+///    [`MaintenanceTriggerDeliveryError::MirrorRecoveryRequired`], so
+///    maintenance reconciliation can never be claimed complete before the
+///    mirrors are rebuilt and the replacement has seen the pending set.
+///
+/// The returned page carries explicit gaps and never a certified-complete
+/// signal: the caller reads members, continuation, and
+/// [`MaintenanceTriggerDeliveryLedger::recovery_counts`] instead of assuming
+/// the set is reconciled. Ordinary pending debt acquires no runtime lease
+/// here and blocks no unrelated work — this call is synchronous, holds no
+/// guard across an await, and leaves scheduling with the daemon/Kernel
+/// owners.
+pub fn reconcile_maintenance_trigger_replacement(
+    service: &KernelService,
+    session: &AuthenticatedMaintenanceTriggerSession,
+    ledger: &mut MaintenanceTriggerDeliveryLedger,
+    revocation: MaintenanceTriggerRevocation,
+    continuation: Option<&str>,
+    mirror_recovered: bool,
+    now_unix_ms: u64,
+) -> Result<MaintenanceTriggerPage, MaintenanceTriggerDeliveryError> {
+    session.service_context(service)?;
+    ledger.revoke_consumer(revocation)?;
+    ledger.replacement_pending_set(continuation, mirror_recovered, now_unix_ms)
+}
+
 /// Records terminal expiry for a past-window trigger through live authority.
 ///
 /// Re-validates the session, then delegates to
