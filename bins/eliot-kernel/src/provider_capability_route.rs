@@ -541,9 +541,9 @@ impl ProviderCapabilityContext {
                 OrsError::NativeWorkerClaimIdentityConflict { .. } => {
                     ProviderCapabilityRouteError::BindingMismatch(bounded_identity(claim_id))
                 }
-                OrsError::InvalidField { .. } => ProviderCapabilityRouteError::Session(
-                    "capability receipt bytes".to_owned(),
-                ),
+                OrsError::InvalidField { .. } => {
+                    ProviderCapabilityRouteError::Session("capability receipt bytes".to_owned())
+                }
                 _ => ProviderCapabilityRouteError::Store(
                     "durable claim record is unavailable".to_owned(),
                 ),
