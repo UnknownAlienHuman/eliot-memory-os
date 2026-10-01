@@ -1630,6 +1630,11 @@ impl TestdAdmissionPort for TestdPlaneAdmission {
         entry: &RegistryEntry,
     ) -> Result<TestdAdmission, TestdPortError> {
         Self::admit_parts(&invocation.instrument, invocation.kind, entry)?;
+        if entry.executable.is_decoder_only() {
+            return Err(TestdPortError::StageBinding {
+                detail: "decoder-only admission requires a typed stage request with artifact lineage",
+            });
+        }
         Ok(TestdAdmission::new(invocation.clone(), entry))
     }
 
