@@ -627,6 +627,12 @@ fn offer_class_head(
 /// terminally, so a scope's holder is always the only non-terminal attempt on
 /// that scope and is never a different admitted item. A second check here
 /// could not fail, so it is not written.
+///
+/// What that argument covers is the *ownership* of an exact `mutation_scope`
+/// string. It does not make the string a deliverable identity: two spellings of
+/// one deliverable are two keys and therefore two holders, so this per-class
+/// view is not where the alias/overlap half of W4 is decided. See
+/// [`DeliverableClaim`](crate::DeliverableClaim) for that boundary.
 fn item_block(
     view: &ClassPullView<'_>,
     attempt: &AttemptRecord,
@@ -775,11 +781,32 @@ fn choose_fair_head<'a, 'profile>(
 ///   [`offer_class_head`], including `max_concurrency`, so a protected class
 ///   already at its concurrency ceiling offers no head and this returns `None`.
 ///   The reserve therefore cannot be over-consumed; the ceiling refuses first.
-/// - It does not let control borrow normal capacity. The partition is decided by
-///   [`WorkClass::capacity_class`], and the Kernel enforces the same split
-///   physically in `eliot_kernel_core::ControlReserve`. This function adds no
-///   new capacity notion; it only stops the *rotation* from spending control's
+/// - It does not let control borrow normal capacity *in the rotation*. The
+///   partition is decided by [`WorkClass::capacity_class`], so the eight normal
+///   classes cannot spend a control item's turn. This function adds no new
+///   capacity notion; it only stops the *rotation* from spending control's
 ///   service opportunities.
+///
+///   Stated as a boundary rather than left implied, because the reserve is a
+///   bound on **selection** and not on admission or route capacity, and those
+///   two are shared pools whose key does not contain the partition:
+///
+///   - [`Self::validate_route_capacity`] counts every non-terminal attempt on a
+///     route against `min(max_active_per_route, capacity_limit)` with no
+///     `CapacityClass` in the key, and [`Self::active_attempt_count`] counts
+///     every non-terminal attempt against the single `max_admitted_attempts`.
+///     So a saturated normal class can still fill a route reservation, or the
+///     whole admitted budget, and a control item is then refused
+///     [`CoordinatorError::Backpressure`] at `admit` or `reassign` — I14.3's
+///     "Normal workload cannot consume it" does not hold at those two
+///     boundaries today.
+///   - Partitioning either pool here would be a second reserve scheme inside
+///     the coordinator, and the physical split is already owned elsewhere:
+///     `eliot_kernel_core::ControlReserve` charges `try_acquire_normal` and
+///     `try_acquire_protected` against disjoint counters. The owner of the
+///     route and admission budget vectors is the admission/kernel owner
+///     (issue #1678); this crate reads and re-checks their claims and must not
+///     re-partition them.
 /// - It does not starve the normal classes. Control takes at most one pull per
 ///   ready control item, and its own `max_concurrency` ceiling bounds how many
 ///   such items can be in flight, so a permanently-ready control class still
