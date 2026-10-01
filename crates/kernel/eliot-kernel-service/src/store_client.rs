@@ -883,7 +883,7 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                 response.validate_for_request(&request)?;
                 Ok(response)
             }
-            Ok(StoreResponse::WorkScopeOwner { .. }) | Ok(_) => Err(StoreError::InvalidReceipt),
+            Ok(_) => Err(StoreError::InvalidReceipt),
             Err(RequestFailure::Unknown { .. }) => {
                 // The CAS may have committed before its response was lost.
                 // Reconcile only through a same-fence named WorkScope owner
