@@ -1750,10 +1750,28 @@ impl<'a> PacketHeadroomJoin<'a> {
     /// Returns [`PacketHeadroomJoinRefusal::NotLive`] naming the exact
     /// dimension and which liveness property the owner no longer satisfies.
     pub fn revalidate(&self, now_ms: u64) -> Result<(), PacketHeadroomJoinRefusal> {
-        let live_epoch = self.owner.epoch().value();
+        // The live epoch is the whole `EpochId` tuple, read from the owner on
+        // every call. `EpochId` is `{ lineage_id, sequence }` (contract
+        // `types.EpochId`, I6.10 exact-match), so an epoch is NOT a bare scalar
+        // and there is no `value()` accessor to read one out of: a sequence
+        // number alone cannot name an epoch, because equal sequences from
+        // different lineages are unrelated authorities. Comparing tuples is
+        // therefore STRICTLY STRONGER than the sequence-only comparison this
+        // port was written against, which would have accepted a same-sequence
+        // epoch from a different lineage.
+        let live_epoch = self.owner.epoch();
         for lease in &self.leases {
-            if lease.permit.epoch().value() != live_epoch
-                || lease.binding.authority_epoch_ref.sequence.get() != live_epoch
+            // `is_same_authority` is the contract's own exact-tuple rule and is
+            // what the front door itself uses for this check
+            // (`control_reserve_front_door.rs`, request admission: a differing
+            // `lineage_id` is `StaleEpochTuple` while a differing sequence is
+            // `StaleEpoch`). Both the held permit and the owner-minted binding
+            // are checked, so neither can be honoured against an advanced epoch.
+            if !lease.permit.epoch().is_same_authority(&live_epoch)
+                || !lease
+                    .binding
+                    .authority_epoch_ref
+                    .is_same_authority(&live_epoch)
             {
                 return Err(PacketHeadroomJoinRefusal::NotLive {
                     dimension: lease.dimension,
