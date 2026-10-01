@@ -45,6 +45,7 @@ pub mod campaign_evaluation_owner;
 pub mod campaign_owner_matrix;
 pub mod campaign_packet;
 pub mod campaign_task_controller;
+pub mod opencode_model_catalogue;
 
 pub use campaign_context_owner::build_context_owner_publications;
 pub use campaign_evaluation_owner::build_product_evaluation_publications;
