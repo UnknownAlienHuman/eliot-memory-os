@@ -37,6 +37,10 @@
 
 use eliot_agent_api::{AttemptId, StateFence};
 use eliot_contracts::fences_match_exact;
+use eliot_host_state::{
+    ModelPreferenceCasOutcome, ModelPreferencePublicationReceipt, ModelPreferenceStore,
+    ModelPreferenceStoreError, PreferenceCasExpected,
+};
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -910,4 +914,96 @@ pub fn compile_bounded_monitor_candidate(
         observed_at_unix_ms: request.binding.now_unix_ms,
     };
     finalize_candidate(&request.binding, account_scope, kind)
+}
+
+/// Fail-closed production-commit errors for
+/// [`commit_replace_policy_candidate`]. Candidate
+/// ([`SwarmCommandCandidateError`]) and owner ([`ModelPreferenceStoreError`])
+/// failures map through explicit arms — never `From` bridges — so neither
+/// layer silently becomes the other.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum CommitReplacePolicyError {
+    /// The sealed candidate is structurally invalid or digest-tampered.
+    #[error("invalid swarm replace-policy candidate: {0}")]
+    Candidate(SwarmCommandCandidateError),
+    /// The sealed candidate is not a preference-replacement command.
+    #[error("swarm replace-policy commit needs a preference-replacement candidate")]
+    NotReplacePolicy,
+    /// The owner load/CAS/receipt step failed closed.
+    #[error("model preference owner step failed: {0}")]
+    Store(ModelPreferenceStoreError),
+    /// The owner committed but retains no receipt: never manufactured.
+    #[error("model preference owner retains no publication receipt after commit")]
+    MissingReceipt,
+    /// The retained receipt names a different revision than the CAS outcome.
+    #[error("model preference receipt revision disagrees with the commit outcome")]
+    ReceiptMismatch,
+}
+
+/// Committed (or idempotently replayed) preference replacement: the owner
+/// CAS outcome plus the immutable publication receipt read back from the
+/// retained committed document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedReplacePolicy {
+    /// Committed advance or identical replay; a replay wrote nothing.
+    pub outcome: ModelPreferenceCasOutcome,
+    /// Receipt reconstructed from the retained document, never from caller
+    /// fields.
+    pub receipt: ModelPreferencePublicationReceipt,
+}
+
+/// Commits a sealed preference-replacement candidate against the #485 owner
+/// publication (issue #485 R5, audit 5872395796).
+///
+/// Extracts the `ReplacePreferencePolicy` anchor triple
+/// (`expected_policy_id`, `expected_policy_revision`,
+/// `expected_policy_digest`) plus the full replacement from the sealed
+/// candidate, then runs the owner chain on a fresh read: fresh
+/// [`ModelPreferenceStore::load_model_preferences`] →
+/// [`PreferenceCasExpected::from_candidate_anchor`] →
+/// [`ModelPreferenceStore::compare_and_swap_model_preferences`] →
+/// [`ModelPreferenceStore::read_publication_receipt`].
+///
+/// The receipt is always read back from the retained committed document,
+/// never manufactured from candidate fields: a missing or mismatched
+/// retained receipt after a successful CAS fails closed. Candidate
+/// compilation stays non-mutating; the atomic predecessor recheck stays
+/// inside the owner's write transaction.
+pub fn commit_replace_policy_candidate(
+    store: &ModelPreferenceStore,
+    candidate: &SwarmCommandCandidate,
+) -> Result<CommittedReplacePolicy, CommitReplacePolicyError> {
+    candidate
+        .validate()
+        .map_err(CommitReplacePolicyError::Candidate)?;
+    let SwarmCommandKind::ReplacePreferencePolicy {
+        expected_policy_id,
+        expected_policy_revision,
+        expected_policy_digest,
+        policy,
+    } = &candidate.kind
+    else {
+        return Err(CommitReplacePolicyError::NotReplacePolicy);
+    };
+    let current = store
+        .load_model_preferences()
+        .map_err(CommitReplacePolicyError::Store)?;
+    let expected = PreferenceCasExpected::from_candidate_anchor(
+        current.as_ref(),
+        expected_policy_id,
+        expected_policy_revision,
+        expected_policy_digest,
+    )
+    .map_err(CommitReplacePolicyError::Store)?;
+    let outcome = store
+        .compare_and_swap_model_preferences(&expected, policy)
+        .map_err(CommitReplacePolicyError::Store)?;
+    let receipt = store
+        .read_publication_receipt()
+        .map_err(CommitReplacePolicyError::Store)?
+        .ok_or(CommitReplacePolicyError::MissingReceipt)?;
+    if receipt.store_revision != outcome.store_revision() {
+        return Err(CommitReplacePolicyError::ReceiptMismatch);
+    }
+    Ok(CommittedReplacePolicy { outcome, receipt })
 }

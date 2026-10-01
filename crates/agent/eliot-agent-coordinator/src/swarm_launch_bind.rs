@@ -77,6 +77,7 @@
 //! mailbox/Concilium, strict Finish, and Product Pulse remain separate.
 
 use eliot_agent_api::StateFence;
+use eliot_host_state::{ModelPreferenceStore, ModelPreferenceStoreError};
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -601,4 +602,51 @@ pub fn bind_swarm_launch(
     binding.binding_digest = binding.digest()?;
     binding.validate()?;
     Ok(binding)
+}
+
+/// Fail-closed store-bound launch-binding errors for
+/// [`bind_swarm_launch_from_store`]. Owner ([`ModelPreferenceStoreError`])
+/// and bind ([`SwarmLaunchBindError`]) failures map through explicit arms —
+/// never `From` bridges — so neither layer silently becomes the other.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum BindSwarmLaunchFromStoreError {
+    /// The owner preference-publication read failed closed.
+    #[error("model preference owner read failed: {0}")]
+    Store(ModelPreferenceStoreError),
+    /// The owner holds no validated published policy: fail closed, never a
+    /// caller-supplied read.
+    #[error("no validated published Human preference policy in the owner store")]
+    AbsentPolicy,
+    /// The bind-time recheck against the fresh owner generation failed.
+    #[error("swarm launch bind failed: {0}")]
+    Bind(SwarmLaunchBindError),
+}
+
+/// Binds the sealed launch candidate against a freshly read owner-published
+/// preference policy (issue #485 R5, audit 5872395796).
+///
+/// Fresh-reads the validated published policy via
+/// [`ModelPreferenceStore::load_model_preferences`] and delegates to
+/// [`bind_swarm_launch`], which rechecks the sealed pins against that
+/// CURRENT owner generation. Fails closed on absence: the policy comes only
+/// from the owner publication, never from caller-supplied reads. Pure and
+/// deterministic: no provider/model call, no launch, no store write.
+pub fn bind_swarm_launch_from_store(
+    store: &ModelPreferenceStore,
+    candidate: &SwarmCommandCandidate,
+    catalogue: &ModelCatalogueSnapshot,
+    now_unix_ms: u64,
+) -> Result<SwarmLaunchBinding, BindSwarmLaunchFromStoreError> {
+    let policy = store
+        .load_model_preferences()
+        .map_err(BindSwarmLaunchFromStoreError::Store)?
+        .map(|publication| publication.policy)
+        .ok_or(BindSwarmLaunchFromStoreError::AbsentPolicy)?;
+    let request = SwarmLaunchBindRequest {
+        candidate: candidate.clone(),
+        catalogue: catalogue.clone(),
+        policy,
+        now_unix_ms,
+    };
+    bind_swarm_launch(&request).map_err(BindSwarmLaunchFromStoreError::Bind)
 }
