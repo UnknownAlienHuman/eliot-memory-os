@@ -825,6 +825,31 @@ fn validate_admission_contract(input: &AdmissionInput) -> Result<(), ContextErro
 ///   `eliot_context::campaign_publication::context_safety_floor_identity` and
 ///   recorded on
 ///   `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+///   That gap code is delivered on the live route together with one code per
+///   absent leg
+///   (`AdmissionClosurePriorityPolicyUnbound`,
+///   `AdmissionClosureAdmissionRuleUnbound`,
+///   `AdmissionClosureMeasurementProfileUnbound`), so the per-identity account is
+///   readable on the wire rather than only in this note.
+///   #1724 follow-up, re-measured on `origin/main@901030c55` (2026-10-01): there
+///   is a FOURTH blocker this note previously omitted, and it is the one that
+///   makes the composition uncallable from `eliotd` rather than merely unclosed.
+///   `KernelContextReadClient::compile_context_packet` takes a
+///   `PacketHeadroomJoin<'_>` BY VALUE
+///   (`bins/eliotd/src/kernel_context_read_client.rs:2266`), and that join can
+///   only be built by `PacketHeadroomJoin::acquire`
+///   (`kernel_context_read_client.rs:1644`), which takes a live `&FrontDoor`
+///   (`kernel_context_read_client.rs:1645`). `FrontDoor` is constructed in
+///   production exactly once in the whole tree, inside the Kernel process at
+///   `crates/kernel/eliot-kernel-service/src/lifecycle.rs:483`. `eliotd` is a
+///   separate process reaching the Kernel over named-pipe IPC
+///   (`bins/eliotd/src/daemon_kernel_client.rs:70`), holds no `FrontDoor`, and
+///   the protocol publishes no capacity-permit operation it could acquire one
+///   through. So this is an ARCHITECTURAL boundary, not an unminted call: no
+///   caller inside `eliotd` can supply that argument, and supplying it from
+///   anywhere else would mean constructing a second admission core, which
+///   ARCH-SEC-02 and A12.03 forbid. That leg is reported on the live route as
+///   `CampaignPacketGapCode::AdmissionClosureHeadroomOwnerUnreachable`.
 ///   The `#40`-frozen
 ///   `eliot_context::ContextCompiler::compile_with_campaign_learning_state`
 ///   named by an earlier revision of this note has NO call site either, so it

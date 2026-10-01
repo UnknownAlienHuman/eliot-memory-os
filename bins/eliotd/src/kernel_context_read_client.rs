@@ -1928,7 +1928,12 @@ impl PacketAdmissionBundle {
     /// `AdmissionRuleIdentity` and `MeasurementCompositionProfile` still have
     /// no production construction site; the per-identity account of what each
     /// one lacks is recorded on
-    /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+    /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`,
+    /// which is delivered on the live route beside one code per absent leg
+    /// (`AdmissionClosurePriorityPolicyUnbound`,
+    /// `AdmissionClosureAdmissionRuleUnbound`,
+    /// `AdmissionClosureMeasurementProfileUnbound`) so that account is readable
+    /// at runtime and not only in this note.
     /// The remaining suppliers — priority-policy owner, admission-rule record
     /// owner, route capacity/measurement owner — call this builder with the
     /// candidate set this compilation produced and feed the resulting bundle to
@@ -2098,7 +2103,7 @@ impl KernelContextReadClient {
     /// grades exists. The production invoker is the campaign packet composition
     /// (`bins/eliotd/src/campaign_packet.rs::resolve_compile_and_bind_result`),
     /// which now holds the admitted binding, the owner recipe, and the
-    /// owner-issued `SafetyFloorIdentity` — the floor is resolved there through
+    /// owner-minted Decision Safety Floor — the floor is resolved there through
     /// `eliot_context::campaign_publication::context_safety_floor_identity` and
     /// checked by this edge's own admission join. The remaining suppliers
     /// (seven-role acquisitions, candidate policy, priority policy, admission
@@ -2106,6 +2111,24 @@ impl KernelContextReadClient {
     /// assembly policy, measurement callback) are still absent, so the packet
     /// keeps its unbound-closure gap; the per-identity account is recorded on
     /// `bins/eliotd/src/campaign_packet.rs::CampaignPacketGapCode::AdmissionClosureUnbound`.
+    ///
+    /// #1724 follow-up, re-measured on `origin/main@901030c55` (2026-10-01):
+    /// the `headroom_join` argument is a FOURTH and independently fatal blocker,
+    /// and it is architectural rather than an unminted call. This function takes
+    /// `headroom_join: PacketHeadroomJoin<'_>` BY VALUE (`:2266`), and that
+    /// value can only be built by [`PacketHeadroomJoin::acquire`] (`:1644`),
+    /// which takes a live `&FrontDoor` (`:1645`). `FrontDoor` is constructed in
+    /// production exactly once in the tree — inside the Kernel process, at
+    /// `crates/kernel/eliot-kernel-service/src/lifecycle.rs:483`. This crate is
+    /// the daemon, a separate process that reaches the Kernel over named-pipe IPC
+    /// (`daemon_kernel_client.rs:70`); it holds no `FrontDoor`, and the protocol
+    /// publishes no capacity-permit operation through which it could acquire one.
+    /// So no caller in this binary can supply that argument at all, which is why
+    /// minting the four identities alone would not make this edge callable. The
+    /// leg is reported on the live route as
+    /// `CampaignPacketGapCode::AdmissionClosureHeadroomOwnerUnreachable`, and the
+    /// remedy is a Kernel-owned capacity-permit IPC operation — never a second
+    /// admission core constructed here, which ARCH-SEC-02 and A12.03 forbid.
     ///
     /// #1869: `presented` is the owner-issued learning authority for THIS
     /// compilation, when the owner issued any. It is the Governor's live

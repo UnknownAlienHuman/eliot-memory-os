@@ -293,7 +293,70 @@ enum CampaignPacketGapCode {
     /// the refusal instead. Reporting it is what keeps the withheld rank trace
     /// from being read as support: the absence of a handle is a named, delivered
     /// gap, not a silent omission and not a claim that nothing was withheld.
+    ///
+    /// This code is the COARSE classification a consumer branches on. It is
+    /// always delivered beside the per-leg codes below, which name WHICH owner
+    /// record is absent, so one undifferentiated code never has to stand for
+    /// four independent owner absences.
     AdmissionClosureUnbound,
+    /// `PriorityPolicyIdentity` has no owner record on this route.
+    ///
+    /// `crates/smart/eliot-context-contracts/src/admission_input.rs:283` is the
+    /// definition; the record needs one `CandidatePriority` per candidate atom,
+    /// each carrying a priority CLASS and a meaningful ORDINAL
+    /// (`admission_input.rs:270-278`). The Context owner body publishes no
+    /// candidate atom set and `RecipeLayoutPolicy::role_positions`
+    /// (`crates/smart/eliot-context-contracts/src/recipe.rs:923`) is a per-ROLE
+    /// position, which is not a per-ATOM class. The record I12.13 names as the
+    /// owner of the class and the evidence-based order is
+    /// `SemanticSensitivityProfile`
+    /// (`docs/architecture/I12-13-context-compiler.md:76`), which has no
+    /// representation in this tree. An ordinal taken from the caller's own list
+    /// order would be the caller-list fabrication the contract forbids.
+    AdmissionClosurePriorityPolicyUnbound,
+    /// `AdmissionRuleIdentity` has no rule record on this route.
+    ///
+    /// `crates/smart/eliot-context-contracts/src/admission_input.rs:326` is the
+    /// definition and `rule_sha256` (`admission_input.rs:329`) is the digest of
+    /// the admission rule's OWN record. The resolved revision names that record
+    /// as an owner reference — `RecipeAdmissionPolicy::admission_rule`
+    /// (`crates/smart/eliot-context-contracts/src/recipe.rs:553`), cross-checked
+    /// against the independent requirement by
+    /// `GoverningContextRequirements::authorize` (`recipe.rs:2627`) — and
+    /// `recipe.rs:550-552` states the rule "keeps its own owner and its own
+    /// record" with that owner at `eliot-context-admission`. That crate
+    /// publishes no rule record and no rule digest, so `rule_sha256` has no
+    /// producer anywhere in the tree. Substituting the resolved policy's own
+    /// digest would put a different object under the same field.
+    AdmissionClosureAdmissionRuleUnbound,
+    /// `MeasurementCompositionProfile` has no owner record on this route.
+    ///
+    /// `crates/smart/eliot-context-contracts/src/admission_input.rs:71` is the
+    /// definition. Its identity half IS owner-issued: the serializer triple
+    /// comes from `ContextRenderSerializer`
+    /// (`crates/smart/eliot-context-contracts/src/render_serializer.rs:103`),
+    /// which has no public constructor. What has no owner is the rest of the
+    /// record — `profile_id`, `route_id`, `model_id`, the aggregation mode and
+    /// the qualification identity — so the profile still has zero production
+    /// construction sites even though its codec half is settled.
+    AdmissionClosureMeasurementProfileUnbound,
+    /// The live resource-owner join cannot be acquired from this process at
+    /// all, so no admission closure could be closed here even if every identity
+    /// above were owner-minted.
+    ///
+    /// `PacketHeadroomJoin::acquire`
+    /// (`bins/eliotd/src/kernel_context_read_client.rs:1644`) takes the live
+    /// `&FrontDoor` (`kernel_context_read_client.rs:1645`), and that type is
+    /// constructed in production exactly once in the whole tree — inside the
+    /// Kernel process, at
+    /// `crates/kernel/eliot-kernel-service/src/lifecycle.rs:483`. `eliotd` is a
+    /// separate process that reaches the Kernel over named-pipe IPC
+    /// (`bins/eliotd/src/daemon_kernel_client.rs:70`), holds no `FrontDoor`, and
+    /// the protocol publishes no capacity-permit operation it could acquire one
+    /// through. This leg is therefore an ARCHITECTURAL boundary, not an unminted
+    /// call: no caller inside `eliotd` can supply it, so the typed refusal is
+    /// what keeps the closure's silence from reading as "nothing was withheld".
+    AdmissionClosureHeadroomOwnerUnreachable,
     /// The current learning-state owner refused the view for this attempt:
     /// stale, missing, invalidated, or partial across a load-bearing slot,
     /// owner revision, State Fence, or `RetrievalPlan` history.
@@ -355,8 +418,9 @@ struct DeliveredMaterialTrace {
 /// policy, admission rule, measurement profile, per-atom measurements, quality
 /// card or assembly policy the traced join also needs — and
 /// [`CampaignPacketGapCode::AdmissionClosureUnbound`] is delivered alongside it
-/// to say so. The handle slot is present and typed precisely so an unbound
-/// handle can never be read as "nothing was withheld".
+/// to say so, now joined by the per-leg codes that name which owner record each
+/// absent piece is waiting on. The handle slot is present and typed precisely so
+/// an unbound handle can never be read as "nothing was withheld".
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ContextDeliveryMaterialAccount {
@@ -1396,10 +1460,12 @@ async fn resolve_compile_and_bind_result(
     // reported as unbound beside it rather than left silently absent.
     let material_account = account_delivered_materials(&publication.view)?;
     let mut gaps = source_gaps(&resolved.resolutions);
-    gaps.push(CampaignPacketGap {
-        code: CampaignPacketGapCode::AdmissionClosureUnbound,
-        role: None,
-    });
+    // Reaching this line already required `context_safety_floor_identity` to
+    // have returned a validated owner floor (a refusal returned the typed
+    // `ContextRecipeUnavailable` gap above), and required the admission cell's
+    // own join to have accepted that same floor. So the floor leg of the
+    // admission closure IS bound here and is not among the reported gaps.
+    gaps.extend(admission_closure_gaps());
     campaign_packet_result_body(
         envelope,
         attempt,
@@ -2260,6 +2326,54 @@ fn campaign_packet_result_body(
     body.validate()
         .map_err(|_| CampaignPacketError::OwnerReadUnavailable.to_string())?;
     Ok(body)
+}
+
+/// Reports, per admission-closure identity, which owner record this route is
+/// missing — derived from what the route actually holds, not restated.
+///
+/// #1724/#1725 reachability. The composition this packet would need,
+/// `KernelContextReadClient::compile_context_packet`, has no call site on this
+/// route, and this function is the measured account of why. It is a REPORTING
+/// function, not a substitute call: it mints no identity, admits nothing and
+/// reads no state, so it can never be mistaken for the composition it accounts
+/// for, and it grants no authority.
+///
+/// The floor leg is deliberately ABSENT from this list and is not reported as a
+/// gap: `SafetyFloorIdentity` IS owner-minted on this route. The Context owner's
+/// own publication resolved it from this attempt's exact recipe body
+/// (`eliot_context::campaign_publication::context_safety_floor_identity`, called
+/// at `resolve_compile_and_bind_result`), and the admission cell's own join
+/// re-derived and content-compared it against the binding the decision would be
+/// made under (`eliot_context_admission::check_campaign_view_for_admission`).
+/// A route that had failed to resolve that floor returned the typed
+/// `ContextRecipeUnavailable` gap before reaching here, so this function is only
+/// ever reached on the path where the floor leg is genuinely bound.
+///
+/// The legs reported below have no owner record on this route, and each names
+/// the exact owner it is missing: `CampaignPacketGapCode::
+/// AdmissionClosurePriorityPolicyUnbound`, `::AdmissionClosureAdmissionRuleUnbound`
+/// and `::AdmissionClosureMeasurementProfileUnbound`.
+///
+/// The coarse `AdmissionClosureUnbound` is delivered alongside them because the
+/// closure IS unbound on this route — three of its identities have no owner — so
+/// a consumer that branches on the coarse code keeps working unchanged, and a
+/// consumer that needs to know WHICH record is absent can now read that off the
+/// wire instead of a doc comment.
+///
+/// The fourth entry is the architectural one and is why no reshaping of this
+/// function could make the composition callable from `eliotd` at all:
+/// `::AdmissionClosureHeadroomOwnerUnreachable`.
+fn admission_closure_gaps() -> Vec<CampaignPacketGap> {
+    [
+        CampaignPacketGapCode::AdmissionClosureUnbound,
+        CampaignPacketGapCode::AdmissionClosurePriorityPolicyUnbound,
+        CampaignPacketGapCode::AdmissionClosureAdmissionRuleUnbound,
+        CampaignPacketGapCode::AdmissionClosureMeasurementProfileUnbound,
+        CampaignPacketGapCode::AdmissionClosureHeadroomOwnerUnreachable,
+    ]
+    .into_iter()
+    .map(|code| CampaignPacketGap { code, role: None })
+    .collect()
 }
 
 fn source_gaps(resolutions: &[CampaignSourceResolution]) -> Vec<CampaignPacketGap> {
