@@ -207,7 +207,7 @@ pub enum OwnerAdvanceOutcome {
     /// persist.
     LeaseGranted {
         /// The single active lease for the target.
-        lease: IntegrationOwnerLease,
+        lease: Box<IntegrationOwnerLease>,
         /// Head record transitioned to `Integrating` with its history entry.
         integrating: Box<IntegrationCandidate>,
         /// Pressure observed at advance time.
@@ -351,7 +351,7 @@ pub fn advance_integration_owner(
     };
     match acquire_integration_lease(candidates, active_leases, &lease_request) {
         Ok(lease) => Ok(OwnerAdvanceOutcome::LeaseGranted {
-            lease,
+            lease: Box::new(lease),
             integrating: Box::new(transition_to_integrating(head, request.observed_at_unix_ms)),
             pressure,
         }),
@@ -392,7 +392,7 @@ pub fn serve_integration_owner_request(
             pressure,
         } => Ok(IntegrationOwnerResponse {
             outcome: IntegrationOwnerOutcomeKind::LeaseGranted,
-            lease: Some(lease),
+            lease: Some(*lease),
             persist_candidates: vec![*integrating],
             pressure,
         }),
