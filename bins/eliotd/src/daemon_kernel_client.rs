@@ -1781,9 +1781,7 @@ impl DaemonKernelClient {
             .and_then(|object| object.remove("receipt_digest"))
             .and_then(|digest| digest.as_str().map(str::to_owned))
             .ok_or_else(|| {
-                KernelClientError::Unknown(
-                    "Kernel claim-row reply has no sealed digest".to_owned(),
-                )
+                KernelClientError::Unknown("Kernel claim-row reply has no sealed digest".to_owned())
             })?;
         let body_bytes = serde_json::to_vec(&body)
             .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
