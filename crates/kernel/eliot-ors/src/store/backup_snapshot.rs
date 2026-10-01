@@ -1224,6 +1224,20 @@ fn owner_state_exclusions() -> Vec<DispositionedTable> {
             RowDisposition::ForensicOnly,
             "committed second-phase closure links are evidence that an order was placed; no import path re-authorizes one and the owner re-derives them at its own write time",
         ),
+        // Process-stream grants and their one-use identities are live Kernel
+        // authority, bound to one admitted TestD job, current fence, and Store
+        // session. A restored row could authorize an effect in a different
+        // installation; there is deliberately no import path for these rows.
+        excluded(
+            super::BLOB_PROCESS_STREAM_GRANTS,
+            RowDisposition::ForensicOnly,
+            "process-stream grants are installation-bound Kernel authority for one admitted job and current Store session; restoring them would revive capabilities without their live issuer",
+        ),
+        excluded(
+            super::BLOB_PROCESS_STREAM_CALLS,
+            RowDisposition::ForensicOnly,
+            "process-stream call records are tied to one installation's Store request identities and owner outcomes; they are forensic evidence only and cannot authorize replay after restore",
+        ),
     ]
 }
 

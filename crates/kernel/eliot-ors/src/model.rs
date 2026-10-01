@@ -1161,6 +1161,266 @@ pub enum ProcessStartReplayState {
     Unknown,
 }
 
+/// Durable Kernel grant for the narrow authenticated process-stream exchange.
+///
+/// This row contains only opaque references and verified binding digests. It
+/// never contains stream bytes, Blob leases/contexts, or semantic policy
+/// material. The Kernel authority owner validates the facts before admitting
+/// this record; ORS preserves the exact grant identity and revocation state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamGrantRecord {
+    /// ORS record revision.
+    pub contract_version: u16,
+    /// Opaque capability reference issued to the retained TestD job.
+    pub capability_ref: String,
+    /// Durable TestD job identity.
+    pub job_id: String,
+    /// Invocation identity bound to the job.
+    pub invocation_id: String,
+    /// Digest of the exact admitted process execution binding.
+    pub process_binding_sha256: String,
+    /// Digest of the authenticated Store session identity binding.
+    pub store_session_binding_sha256: String,
+    /// Digest of the complete verified Blob owner facts retained by Kernel.
+    pub owner_facts_sha256: String,
+    /// Current Authority Epoch lineage identity.
+    pub authority_lineage_id: String,
+    /// Authority epoch sequence captured at issue time.
+    pub authority_epoch: u64,
+    /// Resource generation captured at issue time.
+    pub generation: u64,
+    /// Digest of the exact state fence.
+    pub state_fence_sha256: String,
+    /// Absolute expiry in Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+    /// Monotonic next one-based ordinal allocated by ORS.
+    pub next_ordinal: u32,
+    /// Current grant disposition.
+    pub state: BlobProcessStreamGrantState,
+}
+
+impl BlobProcessStreamGrantRecord {
+    /// Validates exact identity, fence and expiry fields.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != BLOB_PROCESS_STREAM_ORS_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        for (value, field) in [
+            (&self.capability_ref, "blob_process_stream_capability_ref"),
+            (&self.job_id, "blob_process_stream_job_id"),
+            (&self.invocation_id, "blob_process_stream_invocation_id"),
+            (&self.authority_lineage_id, "blob_process_stream_authority_lineage"),
+        ] {
+            validate_text(value, field)?;
+        }
+        for (value, field) in [
+            (&self.process_binding_sha256, "blob_process_stream_process_binding"),
+            (&self.store_session_binding_sha256, "blob_process_stream_store_session"),
+            (&self.owner_facts_sha256, "blob_process_stream_owner_facts"),
+            (&self.state_fence_sha256, "blob_process_stream_state_fence"),
+        ] {
+            validate_digest(value, field)?;
+        }
+        if self.authority_epoch == 0
+            || self.generation == 0
+            || self.expires_at_unix_ms == 0
+            || self.next_ordinal == 0
+        {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_grant_counters",
+                reason: "epoch, generation, expiry, and next ordinal must be non-zero",
+            });
+        }
+        Ok(())
+    }
+
+    /// Compares immutable admission bindings while permitting ORS-owned
+    /// ordinal/state progression.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.capability_ref == other.capability_ref
+            && self.job_id == other.job_id
+            && self.invocation_id == other.invocation_id
+            && self.process_binding_sha256 == other.process_binding_sha256
+            && self.store_session_binding_sha256 == other.store_session_binding_sha256
+            && self.owner_facts_sha256 == other.owner_facts_sha256
+            && self.authority_lineage_id == other.authority_lineage_id
+            && self.authority_epoch == other.authority_epoch
+            && self.generation == other.generation
+            && self.state_fence_sha256 == other.state_fence_sha256
+            && self.expires_at_unix_ms == other.expires_at_unix_ms
+    }
+}
+
+/// Monotonic state of a retained process-stream capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamGrantState {
+    Active,
+    Revoked,
+    Expired,
+}
+
+/// ORS state for one Kernel-issued one-use process-stream call token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BlobProcessStreamCallState {
+    Issued,
+    Reserved,
+    Dispatched,
+    Completed,
+    NotStarted,
+    Unknown,
+    Unavailable,
+}
+
+/// Durable one-use call identity and outcome projection.
+///
+/// `request_identity_json` contains only the exact Kernel-created Store
+/// `RequestIdentity`, never the Blob operation body. Large source/output bytes
+/// remain in their owner-controlled immutable storage. Once state reaches
+/// `Dispatched`, ORS will not authorize another Store effect for this token;
+/// a missing completion is `Unknown` and requires owner reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamCallRecord {
+    /// ORS record revision.
+    pub contract_version: u16,
+    /// Parent capability reference.
+    pub capability_ref: String,
+    /// Opaque one-use call reference returned to TestD.
+    pub token_ref: String,
+    /// One-based Kernel-assigned call ordinal.
+    pub ordinal: u32,
+    /// Exact typed operation digest, absent until the token is reserved.
+    pub operation_sha256: Option<String>,
+    /// Canonical exact Store RequestIdentity JSON, absent until reservation.
+    pub request_identity_json: Option<String>,
+    /// Digest of `request_identity_json`.
+    pub request_identity_sha256: Option<String>,
+    /// Call state.
+    pub state: BlobProcessStreamCallState,
+    /// Digest of the bounded exact response projection, when available.
+    pub response_sha256: Option<String>,
+    /// Immutable owner-issued reference from which a response can be reconciled.
+    pub response_ref: Option<String>,
+    /// Owner receipt reference proving a completed Store operation/readback.
+    pub owner_receipt_ref: Option<String>,
+}
+
+impl BlobProcessStreamCallRecord {
+    /// Validates one-use token identity, exact request binding, and state/result
+    /// coherence.
+    pub fn validate(&self) -> Result<(), OrsError> {
+        if self.contract_version != BLOB_PROCESS_STREAM_ORS_VERSION {
+            return Err(OrsError::UnsupportedContractVersion(self.contract_version));
+        }
+        for (value, field) in [
+            (&self.capability_ref, "blob_process_stream_call_capability"),
+            (&self.token_ref, "blob_process_stream_call_token"),
+        ] {
+            validate_text(value, field)?;
+        }
+        if self.ordinal == 0 {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_ordinal",
+                reason: "must be one-based",
+            });
+        }
+        for (value, field) in [
+            (&self.operation_sha256, "blob_process_stream_call_operation"),
+            (&self.request_identity_sha256, "blob_process_stream_call_identity"),
+            (&self.response_sha256, "blob_process_stream_call_response"),
+        ] {
+            if let Some(value) = value {
+                validate_digest(value, field)?;
+            }
+        }
+        if let Some(json) = &self.request_identity_json {
+            if json.len() > MAX_BLOB_PROCESS_STREAM_IDENTITY_JSON_BYTES
+                || !matches!(serde_json::from_str::<serde_json::Value>(json), Ok(serde_json::Value::Object(_)))
+                || serde_json::to_string(&serde_json::from_str::<serde_json::Value>(json).map_err(|_| OrsError::InvalidField {
+                    field: "blob_process_stream_call_identity_json",
+                    reason: "must be a bounded JSON object",
+                })?).as_bytes() != json.as_bytes()
+            {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_identity_json",
+                    reason: "must be a bounded canonical JSON object",
+                });
+            }
+            let digest = sha256_hex(json.as_bytes());
+            if self.request_identity_sha256.as_deref() != Some(digest.as_str()) {
+                return Err(OrsError::InvalidField {
+                    field: "blob_process_stream_call_identity_sha256",
+                    reason: "identity JSON digest mismatch",
+                });
+            }
+        } else if self.request_identity_sha256.is_some() {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_identity_json",
+                reason: "identity digest requires exact identity JSON",
+            });
+        }
+        for (value, field) in [
+            (&self.response_ref, "blob_process_stream_call_response_ref"),
+            (&self.owner_receipt_ref, "blob_process_stream_call_owner_receipt"),
+        ] {
+            if let Some(value) = value {
+                validate_text(value, field)?;
+            }
+        }
+        let reserved = self.operation_sha256.is_some()
+            && self.request_identity_json.is_some()
+            && self.request_identity_sha256.is_some();
+        let completed = self.response_sha256.is_some()
+            && self.response_ref.is_some()
+            && self.owner_receipt_ref.is_some();
+        match self.state {
+            BlobProcessStreamCallState::Issued if reserved || completed => Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "issued token cannot carry a request or result",
+            }),
+            BlobProcessStreamCallState::Reserved if !reserved || completed => Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "reserved call requires exact request and no result",
+            }),
+            BlobProcessStreamCallState::Dispatched if !reserved || completed => Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "dispatched call requires exact request and no result",
+            }),
+            BlobProcessStreamCallState::Completed if !reserved || !completed => Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "completed call requires exact request and owner result reference",
+            }),
+            BlobProcessStreamCallState::NotStarted
+            | BlobProcessStreamCallState::Unknown
+            | BlobProcessStreamCallState::Unavailable if !reserved || completed => Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "terminal refusal/unknown state requires request without result",
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Tests immutable identity for one call reference.
+    pub fn same_binding(&self, other: &Self) -> bool {
+        self.contract_version == other.contract_version
+            && self.capability_ref == other.capability_ref
+            && self.token_ref == other.token_ref
+            && self.ordinal == other.ordinal
+            && self.operation_sha256 == other.operation_sha256
+            && self.request_identity_json == other.request_identity_json
+            && self.request_identity_sha256 == other.request_identity_sha256
+    }
+}
+
+/// Current record revision for Kernel Blob process-stream grants and calls.
+pub const BLOB_PROCESS_STREAM_ORS_VERSION: u16 = 1;
+/// Maximum serialized Kernel-created Store identity retained in ORS.
+pub const MAX_BLOB_PROCESS_STREAM_IDENTITY_JSON_BYTES: usize = 16 * 1024;
+
 /// Durable one-shot authority handoff disposition.
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

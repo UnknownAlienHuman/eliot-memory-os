@@ -18,6 +18,8 @@ use super::DurableSupervisionLeaseResult;
 use super::OperationalKind;
 use super::ScopeReservationHead;
 use crate::AuthorityHandoffRecord;
+use crate::BlobProcessStreamCallRecord;
+use crate::BlobProcessStreamGrantRecord;
 use crate::CanonicalDisposition;
 use crate::CanonicalStoreRouteOwnership;
 use crate::EffectOperationLease;
@@ -485,6 +487,22 @@ impl PersistedValue for RecoveryProblem {
 
 impl PersistedValue for ProcessStartReplayRecord {
     const RECORD_TYPE: &'static str = "process_start_replay";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for BlobProcessStreamGrantRecord {
+    const RECORD_TYPE: &'static str = "blob_process_stream_grant";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate()
+    }
+}
+
+impl PersistedValue for BlobProcessStreamCallRecord {
+    const RECORD_TYPE: &'static str = "blob_process_stream_call";
 
     fn validate_persisted(&self) -> Result<(), OrsError> {
         self.validate()

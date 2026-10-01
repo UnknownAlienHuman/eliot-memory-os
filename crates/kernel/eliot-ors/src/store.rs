@@ -89,6 +89,8 @@ use crate::{
     OperationalRecordContext, OperationalRecordInput, OrsError, OrsSnapshotReceipt,
     OrsSnapshotRequest, PendingOperationPage, ProcessEvidenceReadback, ProcessEvidenceRecord,
     ProcessStartReplayAbort, ProcessStartReplayRecord, ProcessStartReplayState,
+    BlobProcessStreamCallRecord, BlobProcessStreamCallState, BlobProcessStreamGrantRecord,
+    BlobProcessStreamGrantState,
     ProcessStreamRecoveryFence, ProcessStreamRecoveryLoadError, ProcessStreamRecoveryProjection,
     ProcessStreamRecoveryRevalidation, ProcessStreamRecoveryStatusProjection,
     ProcessStreamRecoveryWriteOutcome, ProcessStreamRetirementProof, ProcessStreamSourceResolver,
@@ -156,6 +158,10 @@ const RECOVERY_INBOX_HISTORY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_recovery_inbox_history_v1");
 const PROCESS_START_REPLAY: TableDefinition<&str, &str> =
     TableDefinition::new("ors_process_start_replay_v1");
+const BLOB_PROCESS_STREAM_GRANTS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_blob_process_stream_grants_v1");
+const BLOB_PROCESS_STREAM_CALLS: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_blob_process_stream_calls_v1");
 const AUTHORITY_HANDOFFS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_authority_handoffs_v1");
 const PROCESS_EVIDENCE: TableDefinition<&str, &str> =
@@ -5698,6 +5704,291 @@ impl RedbRecoveryStore {
             ProcessStartReplayAbort::NotReleased
         };
         drop(table);
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Persists one immutable verified Kernel grant. Exact replay is
+    /// idempotent; changed authority/facts under a capability reference is a
+    /// durable conflict.
+    pub fn persist_blob_process_stream_grant(
+        &self,
+        grant: &BlobProcessStreamGrantRecord,
+    ) -> Result<BlobProcessStreamGrantRecord, OrsError> {
+        grant.validate()?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let key = grant.capability_ref.as_str();
+        let result = {
+            let mut table = write.open_table(BLOB_PROCESS_STREAM_GRANTS).map_err(storage)?;
+            match table.get(key).map_err(storage)? {
+                Some(value) => {
+                    let existing: BlobProcessStreamGrantRecord = decode(value.value())?;
+                    existing.validate()?;
+                    if !existing.same_binding(grant)
+                        || (existing.state != grant.state && existing.state != BlobProcessStreamGrantState::Active)
+                        || grant.next_ordinal < existing.next_ordinal
+                    {
+                        return Err(OrsError::IntegrityProblem {
+                            record_type: "blob_process_stream_grant",
+                            reason: "capability binding or monotonic grant state conflicts".to_owned(),
+                        });
+                    }
+                    if &existing != grant {
+                        let payload = encode(grant)?;
+                        table.insert(key, payload.as_str()).map_err(storage)?;
+                    }
+                    grant.clone()
+                }
+                None => {
+                    let payload = encode(grant)?;
+                    table.insert(key, payload.as_str()).map_err(storage)?;
+                    grant.clone()
+                }
+            }
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Loads one retained Kernel grant by its opaque capability reference.
+    pub fn load_blob_process_stream_grant(
+        &self,
+        capability_ref: &str,
+    ) -> Result<Option<BlobProcessStreamGrantRecord>, OrsError> {
+        crate::model::validate_text(capability_ref, "blob_process_stream_capability_ref")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(BLOB_PROCESS_STREAM_GRANTS).map_err(storage)?;
+        table
+            .get(capability_ref)
+            .map_err(storage)?
+            .map(|value| {
+                let record: BlobProcessStreamGrantRecord = decode(value.value())?;
+                record.validate()?;
+                if record.capability_ref != capability_ref {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_grant",
+                        reason: "grant reference does not match its table key".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Allocates and persists one one-based call token before it is exposed to
+    /// TestD. Allocation and ordinal advancement share a single ORS transaction.
+    pub fn issue_blob_process_stream_call_token(
+        &self,
+        capability_ref: &str,
+        token_ref: &str,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        crate::model::validate_text(capability_ref, "blob_process_stream_capability_ref")?;
+        crate::model::validate_text(token_ref, "blob_process_stream_token_ref")?;
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut grants = write.open_table(BLOB_PROCESS_STREAM_GRANTS).map_err(storage)?;
+            let mut calls = write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+            let mut grant: BlobProcessStreamGrantRecord = grants
+                .get(capability_ref)
+                .map_err(storage)?
+                .map(|value| decode(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_grant",
+                    reason: "call token allocation has no retained capability".to_owned(),
+                })?;
+            grant.validate()?;
+            if grant.state != BlobProcessStreamGrantState::Active
+                || calls.get(token_ref).map_err(storage)?.is_some()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "capability is inactive or token reference already exists".to_owned(),
+                });
+            }
+            let ordinal = grant.next_ordinal;
+            grant.next_ordinal = ordinal.checked_add(1).ok_or(OrsError::PayloadTooLarge)?;
+            let token = BlobProcessStreamCallRecord {
+                contract_version: crate::BLOB_PROCESS_STREAM_ORS_VERSION,
+                capability_ref: capability_ref.to_owned(),
+                token_ref: token_ref.to_owned(),
+                ordinal,
+                operation_sha256: None,
+                request_identity_json: None,
+                request_identity_sha256: None,
+                state: BlobProcessStreamCallState::Issued,
+                response_sha256: None,
+                response_ref: None,
+                owner_receipt_ref: None,
+            };
+            token.validate()?;
+            let token_payload = encode(&token)?;
+            calls.insert(token_ref, token_payload.as_str()).map_err(storage)?;
+            let grant_payload = encode(&grant)?;
+            grants.insert(capability_ref, grant_payload.as_str()).map_err(storage)?;
+            token
+        };
+        write.commit().map_err(storage)?;
+        Ok(result)
+    }
+
+    /// Loads one token and checks its full capability/ordinal binding.
+    pub fn load_blob_process_stream_call(
+        &self,
+        capability_ref: &str,
+        token_ref: &str,
+        ordinal: u32,
+    ) -> Result<Option<BlobProcessStreamCallRecord>, OrsError> {
+        crate::model::validate_text(capability_ref, "blob_process_stream_capability_ref")?;
+        crate::model::validate_text(token_ref, "blob_process_stream_token_ref")?;
+        let read = self.database.begin_read().map_err(storage)?;
+        let table = read.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+        table
+            .get(token_ref)
+            .map_err(storage)?
+            .map(|value| {
+                let record: BlobProcessStreamCallRecord = decode(value.value())?;
+                record.validate()?;
+                if record.capability_ref != capability_ref
+                    || record.token_ref != token_ref
+                    || record.ordinal != ordinal
+                {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_call",
+                        reason: "call token does not match its retained capability/ordinal".to_owned(),
+                    });
+                }
+                Ok(record)
+            })
+            .transpose()
+    }
+
+    /// Binds an issued token to one exact operation digest and Kernel-created
+    /// Store identity. It never stores the operation body or any Blob bytes.
+    pub fn reserve_blob_process_stream_call(
+        &self,
+        reserved: &BlobProcessStreamCallRecord,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        reserved.validate()?;
+        if reserved.state != BlobProcessStreamCallState::Reserved {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "reservation requires RESERVED state",
+            });
+        }
+        self.transition_blob_process_stream_call(reserved)
+    }
+
+    /// Persists the pre-transport dispatch fence. Replaying a Dispatched row
+    /// never authorizes the caller to send the Store effect again.
+    pub fn mark_blob_process_stream_call_dispatched(
+        &self,
+        dispatched: &BlobProcessStreamCallRecord,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        dispatched.validate()?;
+        if dispatched.state != BlobProcessStreamCallState::Dispatched {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "dispatch fence requires DISPATCHED state",
+            });
+        }
+        self.transition_blob_process_stream_call(dispatched)
+    }
+
+    /// Persists one owner-observed completion or explicit unknown disposition.
+    pub fn complete_blob_process_stream_call(
+        &self,
+        terminal: &BlobProcessStreamCallRecord,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        terminal.validate()?;
+        if !matches!(
+            terminal.state,
+            BlobProcessStreamCallState::Completed
+                | BlobProcessStreamCallState::NotStarted
+                | BlobProcessStreamCallState::Unknown
+                | BlobProcessStreamCallState::Unavailable
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "blob_process_stream_call_state",
+                reason: "completion requires a terminal call disposition",
+            });
+        }
+        self.transition_blob_process_stream_call(terminal)
+    }
+
+    fn transition_blob_process_stream_call(
+        &self,
+        desired: &BlobProcessStreamCallRecord,
+    ) -> Result<BlobProcessStreamCallRecord, OrsError> {
+        let write = self.database.begin_write().map_err(storage)?;
+        let result = {
+            let mut table = write.open_table(BLOB_PROCESS_STREAM_CALLS).map_err(storage)?;
+            let existing = table
+                .get(desired.token_ref.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<BlobProcessStreamCallRecord>(value.value()))
+                .transpose()?
+                .ok_or_else(|| OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "call token disappeared before state transition".to_owned(),
+                })?;
+            existing.validate()?;
+            if existing.capability_ref != desired.capability_ref
+                || existing.token_ref != desired.token_ref
+                || existing.ordinal != desired.ordinal
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "call transition token binding mismatch".to_owned(),
+                });
+            }
+            let next = if existing.state == BlobProcessStreamCallState::Issued
+                && desired.state == BlobProcessStreamCallState::Reserved
+            {
+                if desired.operation_sha256.is_none()
+                    || desired.request_identity_json.is_none()
+                    || desired.request_identity_sha256.is_none()
+                {
+                    return Err(OrsError::InvalidField {
+                        field: "blob_process_stream_call_request",
+                        reason: "reservation requires the exact operation and identity digest",
+                    });
+                }
+                desired.clone()
+            } else if existing.same_binding(desired) && existing.state == desired.state {
+                if existing == *desired {
+                    existing
+                } else {
+                    return Err(OrsError::IntegrityProblem {
+                        record_type: "blob_process_stream_call",
+                        reason: "same-state call replay changed its outcome".to_owned(),
+                    });
+                }
+            } else if existing.same_binding(desired)
+                && matches!(
+                    (existing.state, desired.state),
+                    (BlobProcessStreamCallState::Reserved, BlobProcessStreamCallState::Dispatched)
+                        | (BlobProcessStreamCallState::Dispatched, BlobProcessStreamCallState::Completed)
+                        | (BlobProcessStreamCallState::Dispatched, BlobProcessStreamCallState::Unknown)
+                        | (BlobProcessStreamCallState::Unknown, BlobProcessStreamCallState::Completed)
+                        | (BlobProcessStreamCallState::Unknown, BlobProcessStreamCallState::NotStarted)
+                        | (BlobProcessStreamCallState::Reserved, BlobProcessStreamCallState::NotStarted)
+                        | (BlobProcessStreamCallState::Reserved, BlobProcessStreamCallState::Unavailable)
+                )
+            {
+                desired.clone()
+            } else {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "blob_process_stream_call",
+                    reason: "call identity conflict or non-monotonic state transition".to_owned(),
+                });
+            };
+            if existing != next {
+                let payload = encode(&next)?;
+                table.insert(desired.token_ref.as_str(), payload.as_str()).map_err(storage)?;
+            }
+            next
+        };
         write.commit().map_err(storage)?;
         Ok(result)
     }
