@@ -317,6 +317,21 @@ pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
 /// `frame_dispatch::is_daemon_operation` lists it.
 pub(crate) const MAINTENANCE_TRIGGER_INTAKE_OPERATION: &str = "maintenance_trigger_intake";
 
+/// Authenticated daemon operation carrying one historical v1 activation
+/// decision document for explicit import inspection (issue #1115 W6/A10).
+///
+/// This operation is the one production caller of
+/// `eliot_protocol::activation_resolution_v1::decode_activation_resolution_v1_import`:
+/// the arm below decodes and validates the presented v1 bytes as an immutable
+/// artifact and projects only its exact ticket/decision identity. It never
+/// adopts the artifact as a v2 result, creates no Session or authority, and
+/// never runs on the v2 submit path; v2 material (a `result` key) fails closed
+/// here, exactly as v1 material (`decision`) fails closed on
+/// `agent_activation_submit`, so each envelope version decodes on exactly one
+/// operation. The frame reaches the arm once
+/// `frame_dispatch::is_daemon_operation` lists this marker.
+pub(crate) const AGENT_ACTIVATION_V1_IMPORT_OPERATION: &str = "agent_activation_v1_import";
+
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
     "state_fence",
@@ -640,6 +655,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_activation_claim" => "agent_activation_claim",
         "agent_activation_submit" => "agent_activation_submit",
         "agent_activation_reconcile" => "agent_activation_reconcile",
+        AGENT_ACTIVATION_V1_IMPORT_OPERATION => AGENT_ACTIVATION_V1_IMPORT_OPERATION,
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
         "semantic_observe_claim" => "semantic_observe_claim",
@@ -3561,6 +3577,51 @@ impl KernelComposition {
                         Some(identity),
                     )
                     .map(|ack| Self::reconciled_activation_daemon_response(&ack))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            AGENT_ACTIVATION_V1_IMPORT_OPERATION => {
+                #[cfg(windows)]
+                {
+                    // Issue #1115 W6/A10: the explicit v1 import boundary and
+                    // the one production caller of the closed v1 import
+                    // decoder. The operation carries exactly one historical v1
+                    // decision document under `decision`; the decoder validates
+                    // the original bytes and digest, and the arm projects only
+                    // the exact ticket/decision identity. Nothing is adopted:
+                    // no Session, no authority, no v2 result write, and no
+                    // fallback into the submit path. A `result` key (v2
+                    // material) fails closed here, mirroring the `decision`
+                    // rejection on `agent_activation_submit`, so each envelope
+                    // version decodes on exactly one operation.
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.contains_key("result") {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    if object.len() != 2
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some(AGENT_ACTIVATION_V1_IMPORT_OPERATION)
+                        || !object.contains_key("decision")
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let decision_bytes = serde_json::to_vec(
+                        object
+                            .get("decision")
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    let artifact =
+                        eliot_protocol::activation_resolution_v1::decode_activation_resolution_v1_import(
+                            &decision_bytes,
+                        )
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Ok(Self::v1_import_observed_daemon_response(&artifact))
                 }
                 #[cfg(not(windows))]
                 {
@@ -8693,6 +8754,28 @@ impl KernelComposition {
         serde_json::json!({
             "status": "known",
             "value": { "ack": ack },
+            "recovery": null,
+        })
+    }
+
+    /// Typed projection of one validated historical v1 import (issue #1115
+    /// W6/A10): the artifact decoded under the closed v1 shape and is observed
+    /// only. `accepted` is false because nothing is adopted as an activation
+    /// result; `import_observed` carries the completed validation, and the two
+    /// identities name the exact historical record so migration tooling can
+    /// cite it without parsing diagnostics. No Session, authority, capability,
+    /// or result state is created.
+    fn v1_import_observed_daemon_response(
+        artifact: &eliot_protocol::activation_resolution_v1::AgentActivationResolutionDecision,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": false,
+                "import_observed": true,
+                "ticket_id": artifact.ticket_id,
+                "decision_sha256": artifact.decision_sha256,
+            },
             "recovery": null,
         })
     }
