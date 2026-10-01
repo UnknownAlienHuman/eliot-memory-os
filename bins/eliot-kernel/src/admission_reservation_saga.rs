@@ -755,6 +755,10 @@ impl KernelComposition {
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
         request.validate().map_err(|_| TransportError::SessionFenced)?;
+        if session.module_generation.module_id.as_str() != super::ACTIVE_DAEMON_CALLER {
+            return Err(TransportError::SessionFenced);
+        }
+        self.require_current_daemon_session(session)?;
         let parent_identity = outer_identity.ok_or(TransportError::SessionFenced)?;
         parent_identity
             .validate()
@@ -932,6 +936,10 @@ impl KernelComposition {
             serde_json::from_value(without_daemon_routing_key(payload)?)
                 .map_err(|_| TransportError::SessionFenced)?;
         request.validate().map_err(|_| TransportError::SessionFenced)?;
+        if session.module_generation.module_id.as_str() != super::ACTIVE_DAEMON_CALLER {
+            return Err(TransportError::SessionFenced);
+        }
+        self.require_current_daemon_session(session)?;
         let parent_identity = outer_identity.ok_or(TransportError::SessionFenced)?;
         parent_identity
             .validate()
