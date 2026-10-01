@@ -39,6 +39,8 @@ mod campaign_task_sources;
 mod canonical_projections;
 mod capability_evidence;
 mod capability_evidence_commit;
+mod cold_start_surface;
+mod cold_start_trigger;
 mod composition;
 mod context_inputs;
 mod cue_composition;
@@ -59,6 +61,8 @@ pub use attention_evaluation_commit::{
     produce_and_commit_attention_evaluation, resolve_attention_lost_acknowledgement,
     validate_attention_evaluation_request, verify_attention_evaluation_readback,
 };
+pub use cold_start_surface::ColdStartHumanBoardView;
+pub use cold_start_trigger::ColdStartTriggerCompilation;
 pub use context_inputs::{
     ContextInputsError, ContextReconstructionRequest, GovernorContextInputs, ROLE_AFFORDANCES,
     ROLE_ATTENTION_CONFLICT, ROLE_CUE_ACTIVATION, ROLE_EPISTEMIC_POSITION, ROLE_EVIDENCE_ASSURANCE,
