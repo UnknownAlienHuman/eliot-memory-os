@@ -2216,6 +2216,8 @@ mod tests {
                     "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
                     "principal_sid": principal_sid,
                     "access_mask": eliot_platform_windows::ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK,
+                    "security_descriptor_owner": eliot_platform_windows::SERVICE_EXPECTED_OWNER_SID,
+                    "security_descriptor_group": eliot_platform_windows::SERVICE_EXPECTED_GROUP_SID,
                     "security_descriptor_digest": security_descriptor_digest,
                 })
             }
@@ -2232,6 +2234,8 @@ mod tests {
                     "principal_service": eliot_platform_windows::ELIOT_HOST_SERVICE_NAME,
                     "principal_sid": principal_sid,
                     "access_mask": eliot_platform_windows::ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
+                    "security_descriptor_owner": eliot_platform_windows::SERVICE_EXPECTED_OWNER_SID,
+                    "security_descriptor_group": eliot_platform_windows::SERVICE_EXPECTED_GROUP_SID,
                     "security_descriptor_digest": security_descriptor_digest,
                 })
             }
