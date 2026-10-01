@@ -45,10 +45,12 @@ pub use config::{
 };
 pub use crash::{
     CrashDigestAlgorithm, CrashExecutableRole, CrashOwnerHead, CrashOwnerHeadKind, CrashReport,
-    CrashReportError, CrashReportMetadata, CrashReporterConfig, CrashReporterHandle,
+    CrashOperationContext, CrashOperationContextGuard, CrashReportError, CrashReportMetadata,
+    CrashReporterConfig, CrashReporterHandle,
     CrashRuntimeContext, CrashRuntimeContextObservations, CrashTelemetryGapReason,
     CrashTelemetryOutcome, MissingCrashContextField,
-    RedactedEvidenceHandle, SymbolArtifact, install_crash_reporter,
+    RedactedEvidenceHandle, SymbolArtifact, enter_crash_operation, install_crash_reporter,
+    scope_crash_operation, with_crash_operation,
 };
 pub use critical_path::{
     CriticalEventError, CriticalEventRecord, CriticalEventSinks, CriticalEventSinksEntry,

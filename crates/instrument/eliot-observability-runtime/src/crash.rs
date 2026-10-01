@@ -2,16 +2,21 @@
 //!
 //! Crash capture is deliberately separate from lifecycle and recovery. The
 //! installed hook takes a bounded snapshot with nonblocking operations and
-//! hands it to one bounded writer queue. It records identities and evidence
-//! handles only; panic payloads, stacks, environment, argv, and dumps never
-//! enter this schema (I15.4).
+//! hands it to one bounded writer queue. It records identities, bounded
+//! original owner data, and evidence handles only; panic payloads, stacks,
+//! environment, argv, and dumps never enter this schema (I15.4).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
@@ -24,6 +29,7 @@ use crate::rolling_log::{RollingLogAppendError, RollingLogAppendOutcome, Rolling
 const MAX_IDENTITY_CHARS: usize = 128;
 const MAX_EVIDENCE_HANDLES: usize = 8;
 const MAX_EVIDENCE_REFERENCE_CHARS: usize = 256;
+const MAX_OPERATION_OWNER_EVIDENCE_BYTES: usize = 64 * 1024;
 const MAX_GAP_RECORD_BYTES: usize = 4096;
 const PANIC_WRITER_QUEUE_CAPACITY: usize = 1;
 const ROLLING_APPEND_ACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,6 +37,154 @@ const ROLLING_APPEND_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 thread_local! {
     /// Prevents a panic inside capture from recursively re-entering capture.
     static PANIC_CAPTURE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// Original admitted operation context, installed only for the current
+    /// synchronous dispatch or Future poll. The guard never lives across an
+    /// await, so executor migration cannot leave a context on the wrong thread.
+    static ACTIVE_OPERATION_CONTEXT: RefCell<Option<CrashOperationContext>> = const { RefCell::new(None) };
+}
+
+/// Task-local context for the exact operation currently being dispatched.
+///
+/// `Unavailable` means an admitted operation is active but its original owner
+/// data could not be joined. A panic under that scope must emit a context gap;
+/// it must never fall back to the process snapshot and appear operation-bound.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CrashOperationContext {
+    /// The scoped caller observed that no admitted operation was active.
+    NoActiveOperation,
+    /// Full bounded owner snapshot joined to the current admitted operation.
+    Current {
+        /// Full bounded runtime identities from the same admitted owner.
+        runtime_context: CrashRuntimeContext,
+        /// Canonical redacted bytes projected from the original Kernel-owned
+        /// AuditLineage and, when already sealed, TraceManifest owner data.
+        original_owner_evidence: String,
+    },
+    /// The operation is admitted, but its exact context producer/readback is
+    /// unavailable or inconsistent.
+    Unavailable,
+    /// The process context cannot be safely joined, but the original owner
+    /// evidence remains available for the typed crash gap record.
+    UnavailableWithOwnerEvidence(String),
+}
+
+/// Restores the previous operation scope when a synchronous dispatch returns
+/// or unwinds. Nested scopes therefore preserve their caller's exact context.
+pub struct CrashOperationContextGuard {
+    previous: Option<CrashOperationContext>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Drop for CrashOperationContextGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = ACTIVE_OPERATION_CONTEXT.try_with(|current| {
+            if let Ok(mut current) = current.try_borrow_mut() {
+                *current = previous;
+            }
+        });
+    }
+}
+
+/// Enters one validated operation context for a synchronous owner call.
+///
+/// The returned RAII guard is intentionally not `Send`; callers must not keep
+/// it across an await. Use [`scope_crash_operation`] for a Future.
+pub fn enter_crash_operation(
+    context: CrashOperationContext,
+) -> Result<CrashOperationContextGuard, CrashReportError> {
+    if let CrashOperationContext::Current {
+        runtime_context: snapshot,
+        original_owner_evidence,
+    } = &context
+    {
+        snapshot.validate()?;
+        validate_original_owner_evidence(original_owner_evidence)?;
+    }
+    if let CrashOperationContext::UnavailableWithOwnerEvidence(evidence) = &context {
+        validate_original_owner_evidence(evidence)?;
+    }
+    ACTIVE_OPERATION_CONTEXT
+        .try_with(|current| {
+            let mut current = current
+                .try_borrow_mut()
+                .map_err(|_| CrashReportError::InvalidMetadata("operation_context.borrowed"))?;
+            let previous = std::mem::replace(&mut *current, Some(context));
+            Ok(CrashOperationContextGuard {
+                previous,
+                _not_send: PhantomData,
+            })
+        })
+        .map_err(|_| CrashReportError::InvalidMetadata("operation_context.unavailable"))?
+}
+
+/// Runs one synchronous owner call under its exact admitted-operation context.
+pub fn with_crash_operation<R>(
+    context: CrashOperationContext,
+    operation: impl FnOnce() -> R,
+) -> R {
+    // Observability setup never changes whether an already admitted action
+    // runs. If a Current context cannot be installed, retain an explicit gap
+    // scope and still execute the operation.
+    let fallback = match &context {
+        CrashOperationContext::UnavailableWithOwnerEvidence(evidence) => {
+            CrashOperationContext::UnavailableWithOwnerEvidence(evidence.clone())
+        }
+        _ => CrashOperationContext::Unavailable,
+    };
+    let _guard = enter_crash_operation(context)
+        .or_else(|_| enter_crash_operation(fallback))
+        .ok();
+    operation()
+}
+
+/// Scopes a Future by installing the context for each `poll` only.
+///
+/// The current executor thread is always the thread polling the operation, so
+/// this follows task migration and restores the previous nested context after
+/// every `Pending`, `Ready`, or unwind without holding a thread-local guard
+/// across an await.
+pub async fn scope_crash_operation<F>(
+    context: CrashOperationContext,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    let context = match &context {
+        CrashOperationContext::Current {
+            runtime_context: snapshot,
+            original_owner_evidence,
+        } if snapshot.validate().is_err()
+            || validate_original_owner_evidence(original_owner_evidence).is_err() =>
+        {
+            CrashOperationContext::Unavailable
+        }
+        CrashOperationContext::UnavailableWithOwnerEvidence(evidence)
+            if validate_original_owner_evidence(evidence).is_err() =>
+        {
+            CrashOperationContext::Unavailable
+        }
+        _ => context,
+    };
+    let mut future = Box::pin(future);
+    std::future::poll_fn(move |task_context| {
+        // A failed scope install must remain an explicit active-operation
+        // gap. Poll the work either way so observability cannot change its
+        // delivery semantics, but never let a panic fall through to the
+        // unrelated process snapshot.
+        let fallback = match &context {
+            CrashOperationContext::UnavailableWithOwnerEvidence(evidence) => {
+                CrashOperationContext::UnavailableWithOwnerEvidence(evidence.clone())
+            }
+            _ => CrashOperationContext::Unavailable,
+        };
+        let _guard = enter_crash_operation(context.clone())
+            .or_else(|_| enter_crash_operation(fallback))
+            .ok();
+        future.as_mut().poll(task_context)
+    })
+    .await
 }
 
 /// Typed crash-report failure.
@@ -514,6 +668,14 @@ pub struct CrashReportMetadata {
     pub symbol_artifact: SymbolArtifact,
     /// Complete bounded runtime identity snapshot.
     pub runtime_context: CrashRuntimeContext,
+    /// Exact redacted original owner data for an operation-scoped capture.
+    /// This field is included in the report digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_owner_evidence: Option<String>,
+    /// Whether panic capture observed a scoped operation or an explicit
+    /// no-active-operation state. `None` is retained for older reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_scope_status: Option<String>,
 }
 
 impl CrashReportMetadata {
@@ -536,7 +698,18 @@ impl CrashReportMetadata {
             return Err(CrashReportError::InvalidMetadata("fault_class_or_site"));
         }
         self.symbol_artifact.validate(&self.build_profile)?;
-        self.runtime_context.validate()
+        self.runtime_context.validate()?;
+        if let Some(evidence) = &self.operation_owner_evidence {
+            validate_original_owner_evidence(evidence)?;
+        }
+        if self.operation_scope_status.as_deref().is_some_and(|status| {
+            !matches!(status, "active_operation" | "no_active_operation")
+        }) {
+            return Err(CrashReportError::InvalidMetadata(
+                "operation_scope_status",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -649,6 +822,9 @@ pub enum CrashTelemetryGapReason {
     RuntimeProfileUnavailable,
     /// The context snapshot was contended or poisoned at panic time.
     RuntimeContextUnavailable,
+    /// An admitted operation was active, but its exact owner context was
+    /// absent, inconsistent, or unavailable for this panic snapshot.
+    ActiveOperationContextUnavailable,
     /// The bounded writer queue was full.
     QueueSaturated,
     /// The writer thread could not be started or has exited.
@@ -671,6 +847,8 @@ struct CrashTelemetryGapRecord<'a> {
     report_id: &'a str,
     process: &'a str,
     reason: CrashTelemetryGapReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation_owner_evidence: Option<&'a str>,
 }
 
 enum CrashCapture {
@@ -679,6 +857,7 @@ enum CrashCapture {
         report_id: String,
         process: String,
         reason: CrashTelemetryGapReason,
+        operation_owner_evidence: Option<String>,
     },
 }
 
@@ -1020,30 +1199,70 @@ impl CrashReporterState {
             );
             return;
         };
-        if self.context_gap.load(Ordering::Acquire) {
-            self.enqueue_gap(
-                report_id,
-                CrashTelemetryGapReason::RuntimeContextUnavailable,
-            );
-            return;
-        }
-        let context = if let Ok(context) = self.context.try_read() {
-            context.clone()
-        } else {
-            self.enqueue_gap(
-                report_id,
-                CrashTelemetryGapReason::RuntimeContextUnavailable,
-            );
-            return;
+        let operation_context = match ACTIVE_OPERATION_CONTEXT.try_with(|current| {
+            current
+                .try_borrow()
+                .map(|value| value.clone())
+                .unwrap_or(Some(CrashOperationContext::Unavailable))
+        }) {
+            Ok(context) => context,
+            Err(_) => Some(CrashOperationContext::Unavailable),
         };
-        if self.context_gap.load(Ordering::Acquire) {
-            self.enqueue_gap(
-                report_id,
-                CrashTelemetryGapReason::RuntimeContextUnavailable,
-            );
-            return;
-        }
-        let mut context = context;
+        let (mut context, operation_owner_evidence, operation_scope_status) = match operation_context {
+            Some(CrashOperationContext::Unavailable) => {
+                self.enqueue_gap(
+                    report_id,
+                    CrashTelemetryGapReason::ActiveOperationContextUnavailable,
+                );
+                return;
+            }
+            Some(CrashOperationContext::UnavailableWithOwnerEvidence(evidence)) => {
+                self.enqueue_gap_with_owner_evidence(
+                    report_id,
+                    CrashTelemetryGapReason::ActiveOperationContextUnavailable,
+                    evidence,
+                );
+                return;
+            }
+            Some(CrashOperationContext::Current {
+                runtime_context,
+                original_owner_evidence,
+            }) => (
+                runtime_context,
+                Some(original_owner_evidence),
+                Some("active_operation".to_owned()),
+            ),
+            None | Some(CrashOperationContext::NoActiveOperation) => {
+                if self.context_gap.load(Ordering::Acquire) {
+                    self.enqueue_gap(
+                        report_id,
+                        CrashTelemetryGapReason::RuntimeContextUnavailable,
+                    );
+                    return;
+                }
+                let context = if let Ok(context) = self.context.try_read() {
+                    context.clone()
+                } else {
+                    self.enqueue_gap(
+                        report_id,
+                        CrashTelemetryGapReason::RuntimeContextUnavailable,
+                    );
+                    return;
+                };
+                if self.context_gap.load(Ordering::Acquire) {
+                    self.enqueue_gap(
+                        report_id,
+                        CrashTelemetryGapReason::RuntimeContextUnavailable,
+                    );
+                    return;
+                }
+                (
+                    context,
+                    None,
+                    Some("no_active_operation".to_owned()),
+                )
+            }
+        };
         if self.journal_head_gap.load(Ordering::Acquire) {
             context.journal_head = None;
             context.journal_head_gap = true;
@@ -1058,6 +1277,8 @@ impl CrashReporterState {
             fault_site: "panic_hook".to_owned(),
             symbol_artifact,
             runtime_context: context,
+            operation_owner_evidence,
+            operation_scope_status,
         };
         let capture = match CrashReport::new(&report_id, metadata) {
             Ok(report) => CrashCapture::Report(Box::new(report)),
@@ -1065,6 +1286,7 @@ impl CrashReporterState {
                 report_id,
                 process: self.process.clone(),
                 reason: report_error_reason(&error),
+                operation_owner_evidence: None,
             },
         };
         self.enqueue(capture);
@@ -1079,6 +1301,21 @@ impl CrashReporterState {
             report_id,
             process: self.process.clone(),
             reason,
+            operation_owner_evidence: None,
+        })
+    }
+
+    fn enqueue_gap_with_owner_evidence(
+        &self,
+        report_id: String,
+        reason: CrashTelemetryGapReason,
+        operation_owner_evidence: String,
+    ) -> CrashTelemetryOutcome {
+        self.enqueue(CrashCapture::Gap {
+            report_id,
+            process: self.process.clone(),
+            reason,
+            operation_owner_evidence: Some(operation_owner_evidence),
         })
     }
 
@@ -1133,7 +1370,13 @@ fn crash_writer_loop(receiver: &mpsc::Receiver<CrashCapture>, state: &CrashRepor
                 report_id,
                 process,
                 reason,
-            } => state.write_gap_for(&report_id, &process, reason),
+                operation_owner_evidence,
+            } => state.write_gap_for(
+                &report_id,
+                &process,
+                reason,
+                operation_owner_evidence.as_deref(),
+            ),
         }
         if state.overflow_gap.swap(false, Ordering::AcqRel) {
             let report_id = state.next_report_id();
@@ -1141,6 +1384,7 @@ fn crash_writer_loop(receiver: &mpsc::Receiver<CrashCapture>, state: &CrashRepor
                 &report_id,
                 &state.process,
                 CrashTelemetryGapReason::QueueSaturated,
+                None,
             );
         }
     }
@@ -1153,6 +1397,17 @@ fn report_error_reason(error: &CrashReportError) -> CrashTelemetryGapReason {
         }
         CrashReportError::Io(_) => CrashTelemetryGapReason::ReportWriteFailed,
     }
+}
+
+fn validate_original_owner_evidence(value: &str) -> Result<(), CrashReportError> {
+    if value.is_empty() || value.len() > MAX_OPERATION_OWNER_EVIDENCE_BYTES {
+        return Err(CrashReportError::InvalidMetadata(
+            "operation_owner_evidence.bound",
+        ));
+    }
+    serde_json::from_str::<serde_json::Value>(value)
+        .map(|_| ())
+        .map_err(|_| CrashReportError::InvalidMetadata("operation_owner_evidence.json"))
 }
 
 impl CrashReporterState {
@@ -1187,15 +1442,22 @@ impl CrashReporterState {
     }
 
     fn write_gap(&self, report_id: &str, reason: CrashTelemetryGapReason) {
-        self.write_gap_for(report_id, &self.process, reason);
+        self.write_gap_for(report_id, &self.process, reason, None);
     }
 
-    fn write_gap_for(&self, report_id: &str, process: &str, reason: CrashTelemetryGapReason) {
+    fn write_gap_for(
+        &self,
+        report_id: &str,
+        process: &str,
+        reason: CrashTelemetryGapReason,
+        operation_owner_evidence: Option<&str>,
+    ) {
         let record = CrashTelemetryGapRecord {
             record_type: "crash_telemetry_gap",
             report_id,
             process,
             reason,
+            operation_owner_evidence,
         };
         let Ok(text) = serde_json::to_string(&record) else {
             self.outcome.store(

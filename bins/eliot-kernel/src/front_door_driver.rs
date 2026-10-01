@@ -339,6 +339,15 @@ async fn serve_connection(
                 return Err(error);
             }
         };
+        let operation_context = if matches!(
+            &action,
+            KernelFrameAction::Reply(_) | KernelFrameAction::Fence(_)
+        ) {
+            eliot_observability_runtime::CrashOperationContext::NoActiveOperation
+        } else {
+            kernel.crash_operation_context_for_frame(&session, &frame)
+        };
+        eliot_observability_runtime::scope_crash_operation(operation_context, async {
         match action {
             KernelFrameAction::Reply(reply) => {
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
@@ -539,6 +548,8 @@ async fn serve_connection(
                 return Ok(());
             }
         }
+        Ok(())
+        }).await?;
     }
 }
 

@@ -6841,14 +6841,18 @@ impl KernelComposition {
         if frame.request_id.as_ref() != Some(&envelope.identity.request_id) {
             return Err(TransportError::SessionFenced);
         }
-        self.dispatch_host_request_operation(
-            session,
-            request_id,
-            operation,
-            &envelope,
-            &payload,
-            frame.protocol_version,
-        )
+        let crash_context =
+            self.crash_operation_context_for_host_request(session, frame, &envelope);
+        eliot_observability_runtime::with_crash_operation(crash_context, || {
+            self.dispatch_host_request_operation(
+                session,
+                request_id,
+                operation,
+                &envelope,
+                &payload,
+                frame.protocol_version,
+            )
+        })
     }
 
     fn dispatch_host_request_operation(

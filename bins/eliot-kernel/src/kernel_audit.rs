@@ -3006,6 +3006,220 @@ fn append_missing_result_leg(
 }
 
 impl crate::KernelComposition {
+    /// Builds operation context directly from the original validated host
+    /// request envelope before its admitted dispatch/effect leg begins.
+    pub(crate) fn crash_operation_context_for_host_request(
+        &self,
+        session: &Session,
+        frame: &eliot_protocol::Frame,
+        envelope: &HostRequestEnvelope,
+    ) -> eliot_observability_runtime::CrashOperationContext {
+        use eliot_observability_runtime::{
+            CrashOperationContext, CrashRuntimeContext, CrashRuntimeContextObservations,
+        };
+
+        let unavailable = CrashOperationContext::Unavailable;
+        if envelope.validate().is_err()
+            || frame.validate().is_err()
+            || session.peer.validate().is_err()
+            || frame.connection_id != session.connection_id
+            || envelope.connection_id != session.connection_id
+            || frame.request_id.as_ref() != Some(&envelope.identity.request_id)
+            || frame
+                .request_identity
+                .as_ref()
+                .is_none_or(|identity| {
+                    identity.validate().is_err()
+                        || identity.request.metadata.request_id != envelope.identity.request_id
+                        || identity.request.state_fence != envelope.state_fence
+                })
+            || !session
+                .module_generation
+                .state_fence
+                .is_compatible_with(&envelope.state_fence)
+        {
+            return unavailable;
+        }
+        let mut lineage = AuditLineage::empty();
+        lineage.fill_envelope(envelope);
+        if lineage.state_fence.as_ref() != Some(&envelope.state_fence)
+            || lineage.trace_id.as_deref() != Some(envelope.identity.request_id.as_str())
+        {
+            return unavailable;
+        }
+        let Ok(original_owner_evidence) = serde_json::to_string(&serde_json::json!({
+            "owner_source": "validated_host_request_envelope",
+            "envelope_sha256": &envelope.envelope_sha256,
+            "lineage": &lineage,
+        })) else {
+            return unavailable;
+        };
+        let (Some(trace_id), Some(operation_id), Some(work_scope), Some(module_generation)) = (
+            lineage.trace_id.as_deref(),
+            lineage.operation_id.as_deref(),
+            lineage.work_scope.as_deref(),
+            lineage.module_generation.as_deref(),
+        ) else {
+            return CrashOperationContext::UnavailableWithOwnerEvidence(
+                original_owner_evidence,
+            );
+        };
+        if operation_id.trim().is_empty() {
+            return CrashOperationContext::UnavailableWithOwnerEvidence(
+                original_owner_evidence,
+            );
+        }
+        let base = self.crash_runtime_context(false);
+        if base.state_fence.as_ref() != Some(&envelope.state_fence) {
+            return CrashOperationContext::UnavailableWithOwnerEvidence(
+                original_owner_evidence,
+            );
+        }
+        let runtime_context = CrashRuntimeContext::from_observations(
+            CrashRuntimeContextObservations {
+                module_generation_ref: Some(module_generation.to_owned()),
+                process_generation_ref: base.process_generation_ref,
+                state_fence: Some(envelope.state_fence.clone()),
+                active_trace_ref: Some(trace_id.to_owned()),
+                work_scope_ref: Some(work_scope.to_owned()),
+                audit_head: base.audit_head,
+                evidence_handles: Vec::new(),
+                journal_head: None,
+            },
+        );
+        if runtime_context.validate().is_err() {
+            return CrashOperationContext::UnavailableWithOwnerEvidence(
+                original_owner_evidence,
+            );
+        }
+        CrashOperationContext::Current {
+            runtime_context,
+            original_owner_evidence,
+        }
+    }
+
+    /// Builds the scoped crash observation for an already admitted frame.
+    ///
+    /// Admission remains owned by `dispatch_frame`; this readback joins that
+    /// exact typed frame/session to the verified Kernel audit chain before the
+    /// transport invokes its action. Missing or mixed owner facts stay an
+    /// explicit active-operation gap.
+    pub fn crash_operation_context_for_frame(
+        &self,
+        session: &Session,
+        frame: &eliot_protocol::Frame,
+    ) -> eliot_observability_runtime::CrashOperationContext {
+        use eliot_observability_runtime::{
+            CrashOperationContext, CrashRuntimeContext, CrashRuntimeContextObservations,
+        };
+
+        let unavailable = CrashOperationContext::Unavailable;
+        if frame.validate().is_err()
+            || session.peer.validate().is_err()
+            || session.connection_id.trim().is_empty()
+            || frame.connection_id != session.connection_id
+            || session.module_generation.state_fence.validate().is_err()
+        {
+            return unavailable;
+        }
+        let (Some(request_id), Some(identity)) =
+            (frame.request_id.as_ref(), frame.request_identity.as_ref())
+        else {
+            return unavailable;
+        };
+        if identity.validate().is_err()
+            || &identity.request.metadata.request_id != request_id
+            || identity.request.state_fence != identity.request.metadata.state_fence
+            || !session
+                .module_generation
+                .state_fence
+                .is_compatible_with(&identity.request.state_fence)
+        {
+            return unavailable;
+        }
+        let Ok(records) = self.audit_chain_records() else {
+            return unavailable;
+        };
+        let Some(owner_record) = records.iter().rev().find(|record| {
+            record.lineage.trace_id.as_deref() == Some(request_id.as_str())
+                && record.lineage.state_fence.as_ref() == Some(&identity.request.state_fence)
+                && record.lineage.event_cursor.as_deref() == Some(record.seq.to_string().as_str())
+        }) else {
+            return unavailable;
+        };
+        let lineage = &owner_record.lineage;
+        let (Some(operation_id), Some(work_scope), Some(module_generation)) = (
+            lineage.operation_id.as_deref(),
+            lineage.work_scope.as_deref(),
+            lineage.module_generation.as_deref(),
+        ) else {
+            return unavailable;
+        };
+        let Some(owner_fence) = lineage.state_fence.as_ref() else {
+            return unavailable;
+        };
+        let owner_epoch = authority_epoch_text(&owner_fence.authority_epoch);
+        if owner_fence != &identity.request.state_fence
+            || lineage.authority_epoch.as_deref() != Some(owner_epoch.as_str())
+            || owner_fence != &session.module_generation.state_fence
+        {
+            return unavailable;
+        }
+        let manifest = crate::trace_manifest::TraceManifest::find_sealed(&records, operation_id);
+        let has_manifest_record = records.iter().any(|record| {
+            record.kind == AuditEventKind::TRACE_MANIFEST_SEALED
+                && record.lineage.operation_id.as_deref() == Some(operation_id)
+        });
+        if has_manifest_record && manifest.is_none() {
+            return unavailable;
+        }
+        if manifest.as_ref().is_some_and(|manifest| {
+            manifest.trace_id != request_id.as_str()
+                || manifest.operation_id != operation_id
+                || manifest.work_scope_id.as_deref() != Some(work_scope)
+                || manifest.state_fence.as_ref() != Some(owner_fence)
+                || manifest.module_generation.as_deref() != Some(module_generation)
+                || manifest.authority_epoch.as_deref() != lineage.authority_epoch.as_deref()
+        }) {
+            return unavailable;
+        }
+        let Ok(original_owner_evidence) = serde_json::to_string(&serde_json::json!({
+            "record_kind": &owner_record.kind,
+            "record_sequence": owner_record.seq,
+            "record_hash": &owner_record.current_hash,
+            "lineage": lineage,
+            "sealed_trace_manifest": &manifest,
+        })) else {
+            return unavailable;
+        };
+        let base = self.crash_runtime_context(false);
+        // Process/module owner metadata can be retained only when its exact
+        // fence is the operation fence. A concurrent generation transition
+        // must not splice generation B into operation A's crash record.
+        if base.state_fence.as_ref() != Some(owner_fence) {
+            return unavailable;
+        }
+        let runtime_context = CrashRuntimeContext::from_observations(
+            CrashRuntimeContextObservations {
+                module_generation_ref: Some(module_generation.to_owned()),
+                process_generation_ref: base.process_generation_ref,
+                state_fence: Some(owner_fence.clone()),
+                active_trace_ref: lineage.trace_id.clone(),
+                work_scope_ref: Some(work_scope.to_owned()),
+                audit_head: base.audit_head,
+                evidence_handles: Vec::new(),
+                journal_head: None,
+            },
+        );
+        if runtime_context.validate().is_err() {
+            return unavailable;
+        }
+        CrashOperationContext::Current {
+            runtime_context,
+            original_owner_evidence,
+        }
+    }
+
     /// Returns the Kernel's currently admitted authority fence, if readable.
     ///
     /// Best-effort like every observation: `None` on a poisoned policy lock.
