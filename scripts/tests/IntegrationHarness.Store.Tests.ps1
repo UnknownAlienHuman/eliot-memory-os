@@ -733,7 +733,7 @@ function Test-StoreCase7 {
     }
     catch { $forgedRefusal = [string]$_.Exception.Message }
     Assert-StoreTrue $Failures (-not $forgedLaunched) '7-forged-identity-refused'
-    Assert-StoreTrue $Failures ($forgedRefusal -match 'STORE-RESERVATION-') ('7-forged-identity-typed: ' + $forgedRefusal)
+    Assert-StoreTrue $Failures ($forgedRefusal -match '^STORE-RESERVATION-FOREIGN:') ('7-forged-identity-typed: ' + $forgedRefusal)
 }
 
 # ---------------------------------------------------------------------------
@@ -898,10 +898,61 @@ function Test-StoreCase14 {
     Assert-StoreTrue $Failures ([bool]$receipt['schemaReady']) '14-schema-ready'
     Assert-StoreTrue $Failures (-not [bool]$receipt['fixtureReady']) '14-fixture-false'
     Assert-StoreTrue $Failures ([bool]$receipt['ready']) '14-ready-despite-fixture'
+    # The handshake was ready ONLY because it carried the receipt's own declared
+    # expected schema identity: the receipt reports that exact digest back and
+    # no other one flips schemaReady. The mismatch arm reuses the matching
+    # process identity, endpoint, authentication and this allocation's own names,
+    # so schemaReady is the single field that differs.
+    Assert-StoreTrue $Failures ([string]$receipt['schemaDigest'] -ceq $schema) '14-schema-echoes-receipt-identity'
+    $wrongSchema = 'ff' + $schema.Substring(2)
+    if ($wrongSchema -ceq $schema) { $wrongSchema = 'ee' + $schema.Substring(2) }
+    Assert-StoreTrue $Failures ($wrongSchema -cne $schema) '14-wrong-schema-is-distinct'
+    $wrongSchemaClient = { param($ctx) return @{ authenticated = $true; namespace = $ns; database = $db; schemaDigest = $wrongSchema; fixtureReady = $false; endpoint = $ctx['endpoint'] } }.GetNewClosure()
+    $wrongSchemaReceipt = Invoke-StoreObserveReadiness -Binding $binding -StartReceipt $start -ProcessObserver $proc -PortObserver $port -StoreClient $wrongSchemaClient
+    Assert-StoreTrue $Failures ([bool]$wrongSchemaReceipt['authenticated']) '14-wrong-schema-still-authenticated'
+    Assert-StoreTrue $Failures (-not [bool]$wrongSchemaReceipt['schemaReady']) '14-wrong-schema-not-schema-ready'
+    Assert-StoreTrue $Failures (-not [bool]$wrongSchemaReceipt['ready']) '14-wrong-schema-not-ready'
+    Assert-StoreTrue $Failures ([string]$wrongSchemaReceipt['failureClass'] -ceq 'schema-mismatch') '14-wrong-schema-failure-class'
+    # What the handshake is compared against is the RECEIPT's own declaration,
+    # not a digest this test invented and not one recomputed here: a receipt that
+    # declares a different expected identity makes that one -- and only that one --
+    # the schema-ready canary, on the same authenticated process/endpoint/names.
+    $declaredSchema = ('ab' * 32)
+    $declaredStart = @{}
+    foreach ($key in $start.Keys) { $declaredStart[$key] = $start[$key] }
+    $declaredRequested = @{}
+    foreach ($key in $start['requested'].Keys) { $declaredRequested[$key] = $start['requested'][$key] }
+    $declaredRequested['schemaDigest'] = $declaredSchema
+    $declaredStart['requested'] = $declaredRequested
+    $declaredClient = { param($ctx) return @{ authenticated = $true; namespace = $ns; database = $db; schemaDigest = $declaredSchema; fixtureReady = $false; endpoint = $ctx['endpoint'] } }.GetNewClosure()
+    $declaredReceipt = Invoke-StoreObserveReadiness -Binding $binding -StartReceipt $declaredStart -ProcessObserver $proc -PortObserver $port -StoreClient $declaredClient
+    Assert-StoreTrue $Failures ([bool]$declaredReceipt['schemaReady']) '14-declared-identity-is-the-canary'
+    Assert-StoreTrue $Failures ([bool]$declaredReceipt['ready']) '14-declared-identity-ready'
+    Assert-StoreTrue $Failures ([string]$declaredReceipt['schemaDigest'] -ceq $declaredSchema) '14-declared-identity-reported'
+    # ...and under that receipt the ORIGINAL pinned identity is no longer ready:
+    # the comparison follows the receipt, so it cannot be a hard-coded value.
+    $pinnedUnderDeclared = { param($ctx) return @{ authenticated = $true; namespace = $ns; database = $db; schemaDigest = $schema; fixtureReady = $false; endpoint = $ctx['endpoint'] } }.GetNewClosure()
+    $pinnedDeclaredReceipt = Invoke-StoreObserveReadiness -Binding $binding -StartReceipt $declaredStart -ProcessObserver $proc -PortObserver $port -StoreClient $pinnedUnderDeclared
+    Assert-StoreTrue $Failures (-not [bool]$pinnedDeclaredReceipt['schemaReady']) '14-pinned-not-ready-under-other-declaration'
+    Assert-StoreTrue $Failures ([string]$pinnedDeclaredReceipt['failureClass'] -ceq 'schema-mismatch') '14-pinned-failure-class-under-other-declaration'
+    # A receipt with no declared expected schema identity at all is refused, so the
+    # readiness comparison always has something of its OWN to compare against.
+    $noSchemaStart = @{}
+    foreach ($key in $start.Keys) { $noSchemaStart[$key] = $start[$key] }
+    $noSchemaRequested = @{}
+    foreach ($key in $start['requested'].Keys) { $noSchemaRequested[$key] = $start['requested'][$key] }
+    $noSchemaRequested.Remove('schemaDigest')
+    $noSchemaStart['requested'] = $noSchemaRequested
+    $noSchemaRefusal = ''
+    try { [void](Invoke-StoreObserveReadiness -Binding $binding -StartReceipt $noSchemaStart -ProcessObserver $proc -PortObserver $port -StoreClient $authNoFixture) }
+    catch { $noSchemaRefusal = [string]$_.Exception.Message }
+    Assert-StoreTrue $Failures (-not [string]::IsNullOrWhiteSpace($noSchemaRefusal)) '14-no-declared-schema-refused'
+    Assert-StoreTrue $Failures ($noSchemaRefusal -match '^STORE-RECEIPT-STALE:') ('14-no-declared-schema-typed: ' + $noSchemaRefusal)
     $authWithFixture = { param($ctx) return @{ authenticated = $true; namespace = $ns; database = $db; schemaDigest = $schema; fixtureReady = $true; endpoint = $ctx['endpoint'] } }.GetNewClosure()
     $receipt2 = Invoke-StoreObserveReadiness -Binding $binding -StartReceipt $start -ProcessObserver $proc -PortObserver $port -StoreClient $authWithFixture
     Assert-StoreTrue $Failures ([bool]$receipt2['fixtureReady']) '14-fixture-true-separate'
     Assert-StoreTrue $Failures ($receipt['schemaDigest'] -ceq $receipt2['schemaDigest']) '14-schema-stable'
+    Assert-StoreTrue $Failures ($receipt2['schemaDigest'] -ceq $schema) '14-fixture-receipt-same-declared-identity'
 }
 
 # ---------------------------------------------------------------------------
@@ -1075,7 +1126,10 @@ function Test-StoreCase19 {
     $incompleteController = { param($ctx) if ($ctx['phase'] -ceq 'graceful') { return @{ exited = $false; pid = $ctx['pid'] } } else { $incompleteCalls['count']++; return @{ exited = $true; pid = $ctx['pid'] } } }.GetNewClosure()
     $incomplete = Invoke-StoreStop -Binding $binding -StartReceipt $start -ProcessController $incompleteController -ProcessObserver $incompleteObserver
     Assert-StoreTrue $Failures ($incomplete['stopState'] -ceq 'ReconciliationRequired') '19-incomplete-closure-reconciles'
-    Assert-StoreTrue $Failures ([string]$incomplete['failure'] -match 'STORE-DESCENDANT-CLOSURE-INCOMPLETE') ('19-incomplete-closure-typed: ' + [string]$incomplete['failure'])
+    # The stop receipt keeps its typed refusal verbatim behind the
+    # stop-ownership-unproven prefix, so the refusal is asserted as the code it
+    # actually carries rather than by prose.
+    Assert-StoreTrue $Failures ([string]$incomplete['failure'] -match '^stop-ownership-unproven:STORE-DESCENDANT-CLOSURE-INCOMPLETE:') ('19-incomplete-closure-typed: ' + [string]$incomplete['failure'])
     Assert-StoreTrue $Failures ([int]$incomplete['ownedPid'] -eq $ownedPid) '19-incomplete-closure-keeps-owner'
     Assert-StoreTrue $Failures ($incompleteCalls['count'] -eq 0) '19-incomplete-closure-no-forced-kill'
 }
