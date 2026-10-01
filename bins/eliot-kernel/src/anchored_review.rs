@@ -965,10 +965,7 @@ fn resolve_tier_match(
 }
 
 /// Collects Tier 4 content-plus-structural fingerprint matches.
-fn fingerprint_matches(
-    candidates: &[ReviewCandidate],
-    original: &ReviewAnchor,
-) -> Vec<usize> {
+fn fingerprint_matches(candidates: &[ReviewCandidate], original: &ReviewAnchor) -> Vec<usize> {
     candidates
         .iter()
         .enumerate()
