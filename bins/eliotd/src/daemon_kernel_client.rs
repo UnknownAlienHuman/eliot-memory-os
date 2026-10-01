@@ -84,7 +84,7 @@ pub(super) use handshake::{is_pre_admission_pending_rejection, validate_server_h
 
 use super::{
     KERNEL_OPERATION_TIMEOUT, KernelLaunchBinding, PRE_ADMISSION_RETRY_DELAY, SERVICE_NAME,
-    unix_ms, unix_ms_i64,
+    governor_observe_serve::OBSERVE_CAPABILITY, unix_ms, unix_ms_i64,
 };
 
 const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
@@ -421,8 +421,16 @@ pub enum LocalReadSubmitOutcome {
 pub struct TaskControllerClaimedInvocation {
     pub invocation: TaskControllerInvocation,
     pub envelope: HostRequestEnvelope,
+    /// Kernel-retained authenticated application principal for this claim.
+    /// This is distinct from the daemon's authenticated transport principal
+    /// and is required to join the request to the Governor's active owner
+    /// selection without deriving authority from caller-controlled labels.
+    pub authenticated_principal: String,
     pub tool: serde_json::Value,
-    pub request_identity: RequestIdentity,
+    /// Owner-derived request metadata used by ordinary Task Controller
+    /// transitions. `BIND_SCOPE` does not invent Product/Source metadata from
+    /// a learning recipe it is forbidden to carry, so it may be absent.
+    pub request_identity: Option<RequestIdentity>,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
 }
@@ -589,15 +597,28 @@ pub fn parse_task_controller_claimed_pair(
     envelope
         .validate()
         .map_err(|error| format!("Kernel Task Controller envelope is invalid: {error}"))?;
+    let authenticated_principal = decode("authenticated_principal")?
+        .as_str()
+        .filter(|principal| !principal.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Kernel Task Controller claim has no authenticated principal".to_owned())?;
     let tool = decode("tool")?;
-    let request_identity: RequestIdentity = match pair.get("identity") {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?,
-        None => derive_task_controller_request_identity(&invocation, &envelope)?,
-    };
-    request_identity
-        .validate()
-        .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
+    let request_identity: Option<RequestIdentity> =
+        if invocation.action == eliot_protocol::TaskControllerAction::BindScope {
+            None
+        } else {
+            Some(match pair.get("identity") {
+                Some(value) => serde_json::from_value(value.clone()).map_err(|error| {
+                    format!("Kernel Task Controller identity does not decode: {error}")
+                })?,
+                None => derive_task_controller_request_identity(&invocation, &envelope)?,
+            })
+        };
+    if let Some(identity) = request_identity.as_ref() {
+        identity
+            .validate()
+            .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
+    }
     let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
         .map_err(|error| format!("Kernel Task Controller operation id does not decode: {error}"))?;
     let attempt: TaskControllerAttempt = serde_json::from_value(decode("attempt")?)
@@ -624,9 +645,11 @@ pub fn parse_task_controller_claimed_pair(
                 .work_scope_id
                 .as_deref()
                 .unwrap_or_default()
-        || request_identity.request.state_fence != envelope.state_fence
-        || request_identity.request.metadata.state_fence != envelope.state_fence
-        || request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
+        || request_identity.as_ref().is_some_and(|identity| {
+            identity.request.state_fence != envelope.state_fence
+                || identity.request.metadata.state_fence != envelope.state_fence
+                || identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
+        })
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
         || attempt.task_id != invocation.task_id
@@ -640,6 +663,7 @@ pub fn parse_task_controller_claimed_pair(
     Ok(Some(TaskControllerClaimedInvocation {
         invocation,
         envelope,
+        authenticated_principal,
         tool,
         request_identity,
         operation_id,
@@ -890,7 +914,7 @@ pub fn parse_finish_claimed_pair(
         || tool_name != Some("eliot.finish")
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
-        || attempt.session_id != envelope.identity.session_id.as_deref().unwrap_or_default()
+        || Some(attempt.session_id.as_str()) != envelope.identity.session_id.as_deref()
         || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
         || attempt.authority_epoch != envelope.state_fence.authority_epoch
     {
@@ -1040,12 +1064,17 @@ pub fn parse_local_read_submit_outcome(
 }
 
 /// Typed outcome of one `semantic_observe_result` submit (issue #2565).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObserveSubmitOutcome {
     /// Kernel persisted the body through the ORS result path. An exact replay
     /// of an already-resulted operation reports here too — idempotent, even
     /// across deadline expiry.
     Accepted,
+    /// Kernel durably retained the complete original operation as a staged
+    /// write. This is a nonterminal handoff; the caller must retain its
+    /// original claim and prepared capture and poll the same operation for a
+    /// committed receipt.
+    Staged(Box<eliot_store_api::WriteSubmission>),
     /// The absolute deadline elapsed before the body could persist. This is
     /// the expected claim/submit race, projected as a known outcome — never
     /// as a transport error.
@@ -1062,19 +1091,10 @@ pub enum ObserveSubmitOutcome {
 /// Typed outcome of one `semantic_observe_deferred` deferral (issue #2565).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObserveDeferOutcome {
-    /// Kernel retired the queue pair and advanced the durable record
-    /// `Admitted -> Routed`: the pending handle stays live with its exact
-    /// resume condition. No effect was produced and none was claimed.
-    Deferred,
-    /// The durable record already closed the operation: consult it through
-    /// the waiter path instead of deferring.
-    Settled,
-    /// The absolute deadline elapsed before the deferral could record. This
-    /// is the expected claim/defer race, projected as a known outcome.
-    Expired,
-    /// The presented attempt is not the current fencing generation. The
-    /// waiter never observes the stale deferral; the poller idles.
-    StaleAttempt,
+    /// The protected Observe pair was already published to the daemon. A
+    /// later no-op/defer request is reconciled as Unknown, never as a safe
+    /// no-effect deferral or an invitation to reschedule.
+    ReconciliationRequired,
 }
 
 /// Parses one unwrapped `semantic_observe_claim` answer value into the
@@ -1082,68 +1102,364 @@ pub enum ObserveDeferOutcome {
 ///
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_claim`)
-/// answers the single-`operation`-key poll with `{"pair": {"envelope",
-/// "tool", "attempt"}}` or `{"pair": null}`. `None` is the empty-queue
-/// backoff signal, not an error — exactly like the local-read claim. The
+/// answers the single-`operation`-key poll with a pair containing the
+/// `envelope`, `tool`, `attempt`, `record` and `durable_attempt` fields, or
+/// `{"pair": null}`. `None` is the empty-queue backoff signal, not an error —
+/// exactly like the local-read claim. The
 /// claimed envelope must already decode as admitted shape, name the
 /// `eliot.observe` capability, and bind the attempt; their closed linkage
 /// and fence binding are re-proved inside the observe flight before any
-/// submit or defer touches them. A pair without an attempt fails closed:
-/// absent authority is never invented.
+/// submit or defer touches them. The daemon also validates the exact durable
+/// ORS row, executable-input commitment and retained `Claimed`
+/// attempt; a partial pair
+/// fails closed instead of rebuilding missing authority.
+#[derive(Clone, Debug)]
+pub struct ObserveClaimedPair {
+    /// Original admitted host request envelope.
+    pub envelope: HostRequestEnvelope,
+    /// Original Governor request identity retained from the admitted Host
+    /// Request Frame, distinct from the flat `HostRequestIdentity` above.
+    pub source_request_identity: RequestIdentity,
+    /// Exact original peer admission receipt retained by the ORS executable
+    /// row, never reconstructed from the current daemon connection.
+    pub peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    /// Exact activation ticket retained beside the peer receipt in ORS.
+    pub source_activation_ticket: eliot_protocol::AgentActivationResolutionTicket,
+    /// Exact immutable activation result that admitted the retained policy
+    /// projection for this Host origin.
+    pub source_activation_result: eliot_protocol::AgentActivationResolutionResult,
+    /// Exact decoded original `ToolRequest` value retained by Kernel.
+    pub tool: serde_json::Value,
+    /// Current Kernel-issued daemon claim capability.
+    pub attempt: LocalReadAttempt,
+    /// Exact durable ORS row read back by Kernel for this claim.
+    pub record: eliot_ors::HostRequestRecord,
+    /// Exact durable ORS attempt read back with the row.
+    pub durable_attempt: eliot_ors::HostRequestAttempt,
+}
+
 pub fn parse_observe_claimed_pair(
     value: &serde_json::Value,
-) -> Result<Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>, String> {
+) -> Result<Option<ObserveClaimedPair>, String> {
     let pair = value
         .get("pair")
         .ok_or_else(|| "Kernel semantic_observe_claim answer omits the pair".to_owned())?;
     match pair {
         serde_json::Value::Null => Ok(None),
-        serde_json::Value::Object(_) => {
-            let envelope_value = pair.get("envelope").cloned().ok_or_else(|| {
-                "Kernel semantic_observe_claim pair omits the envelope".to_owned()
-            })?;
-            let tool = pair
-                .get("tool")
-                .cloned()
-                .ok_or_else(|| "Kernel semantic_observe_claim pair omits the tool".to_owned())?;
-            let attempt_value = pair
-                .get("attempt")
-                .cloned()
-                .ok_or_else(|| "Kernel semantic_observe_claim pair omits the attempt".to_owned())?;
-            let envelope: HostRequestEnvelope =
-                serde_json::from_value(envelope_value).map_err(|error| {
-                    format!("Kernel semantic_observe_claim pair envelope does not decode: {error}")
-                })?;
-            envelope.validate().map_err(|error| {
-                format!(
-                    "Kernel semantic_observe_claim pair envelope is not admitted shape: {error}"
-                )
-            })?;
-            if envelope.identity.capability != "eliot.observe" {
-                return Err(
-                    "Kernel semantic_observe_claim pair is not the admitted observe capability"
-                        .to_owned(),
-                );
-            }
-            let attempt: LocalReadAttempt =
-                serde_json::from_value(attempt_value).map_err(|error| {
-                    format!("Kernel semantic_observe_claim pair attempt does not decode: {error}")
-                })?;
-            attempt.validate().map_err(|error| {
-                format!("Kernel semantic_observe_claim pair attempt is not bound shape: {error}")
-            })?;
-            if attempt.operation_id != host_request_operation_id(&envelope) {
-                return Err(
-                    "Kernel semantic_observe_claim pair attempt does not bind the envelope"
-                        .to_owned(),
-                );
-            }
-            Ok(Some((envelope, tool, attempt)))
-        }
+        serde_json::Value::Object(_) => decode_observe_claimed_pair(pair).map(Some),
         _ => Err(
             "Kernel semantic_observe_claim pair is neither an admitted pair nor null".to_owned(),
         ),
     }
+}
+
+struct ObserveClaimParts {
+    envelope: HostRequestEnvelope,
+    tool: serde_json::Value,
+    attempt: LocalReadAttempt,
+    record: eliot_ors::HostRequestRecord,
+    durable_attempt: eliot_ors::HostRequestAttempt,
+}
+
+struct ObserveRetainedSources {
+    source_request_identity: RequestIdentity,
+    peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    source_activation_ticket: eliot_protocol::AgentActivationResolutionTicket,
+    source_activation_result: eliot_protocol::AgentActivationResolutionResult,
+}
+
+fn decode_observe_claimed_pair(pair: &serde_json::Value) -> Result<ObserveClaimedPair, String> {
+    let parts = decode_observe_claim_parts(pair)?;
+    let executable_input = parts.record.executable_input.as_ref().ok_or_else(|| {
+        "Kernel semantic_observe_claim ORS record omits retained executable input".to_owned()
+    })?;
+    executable_input
+        .validate_for(&parts.record)
+        .map_err(|error| format!("Kernel retained executable input is invalid: {error}"))?;
+    let sources = decode_observe_retained_sources(executable_input)?;
+    validate_observe_claim_lineage(&parts, executable_input, &sources)?;
+    validate_observe_tool_commitment(&parts.tool, executable_input)?;
+    Ok(ObserveClaimedPair {
+        envelope: parts.envelope,
+        source_request_identity: sources.source_request_identity,
+        peer_admission_receipt: sources.peer_admission_receipt,
+        source_activation_ticket: sources.source_activation_ticket,
+        source_activation_result: sources.source_activation_result,
+        tool: parts.tool,
+        attempt: parts.attempt,
+        record: parts.record,
+        durable_attempt: parts.durable_attempt,
+    })
+}
+
+fn decode_observe_claim_parts(value: &serde_json::Value) -> Result<ObserveClaimParts, String> {
+    let envelope_value = required_observe_pair_field(value, "envelope")?;
+    let tool = required_observe_pair_field(value, "tool")?;
+    let attempt_value = required_observe_pair_field(value, "attempt")?;
+    let record_value = required_observe_pair_field(value, "record")?;
+    let durable_attempt_value = required_observe_pair_field(value, "durable_attempt")?;
+    let envelope: HostRequestEnvelope =
+        serde_json::from_value(envelope_value).map_err(|error| {
+            format!("Kernel semantic_observe_claim envelope does not decode: {error}")
+        })?;
+    envelope.validate().map_err(|error| {
+        format!("Kernel semantic_observe_claim envelope is not admitted shape: {error}")
+    })?;
+    if envelope.identity.capability != "eliot.observe" {
+        return Err(
+            "Kernel semantic_observe_claim pair is not the admitted observe capability".to_owned(),
+        );
+    }
+    let attempt: LocalReadAttempt = serde_json::from_value(attempt_value).map_err(|error| {
+        format!("Kernel semantic_observe_claim attempt does not decode: {error}")
+    })?;
+    attempt.validate().map_err(|error| {
+        format!("Kernel semantic_observe_claim attempt is not bound shape: {error}")
+    })?;
+    if attempt.operation_id != host_request_operation_id(&envelope) {
+        return Err("Kernel semantic_observe_claim attempt does not bind the envelope".to_owned());
+    }
+    let record: eliot_ors::HostRequestRecord =
+        serde_json::from_value(record_value).map_err(|error| {
+            format!("Kernel semantic_observe_claim ORS record does not decode: {error}")
+        })?;
+    record
+        .validate()
+        .map_err(|error| format!("Kernel semantic_observe_claim ORS record is invalid: {error}"))?;
+    let durable_attempt: eliot_ors::HostRequestAttempt =
+        serde_json::from_value(durable_attempt_value).map_err(|error| {
+            format!("Kernel semantic_observe_claim ORS attempt does not decode: {error}")
+        })?;
+    Ok(ObserveClaimParts {
+        envelope,
+        tool,
+        attempt,
+        record,
+        durable_attempt,
+    })
+}
+
+fn required_observe_pair_field(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<serde_json::Value, String> {
+    value
+        .get(field)
+        .cloned()
+        .ok_or_else(|| format!("Kernel semantic_observe_claim pair omits {field}"))
+}
+
+fn decode_observe_retained_sources(
+    executable_input: &eliot_ors::HostRequestExecutableInput,
+) -> Result<ObserveRetainedSources, String> {
+    let binding = &executable_input.application_binding;
+    let source_request_identity: RequestIdentity =
+        serde_json::from_value(binding.source_request_identity.clone()).map_err(|error| {
+            format!("Kernel original request identity does not decode: {error}")
+        })?;
+    source_request_identity
+        .validate()
+        .map_err(|error| format!("Kernel original request identity is invalid: {error}"))?;
+    if serde_json::to_value(&source_request_identity)
+        .map_err(|error| format!("Kernel original request identity cannot encode: {error}"))?
+        != binding.source_request_identity
+    {
+        return Err(
+            "Kernel original RequestIdentity differs from the retained ORS source".to_owned(),
+        );
+    }
+    let peer_admission_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt =
+        serde_json::from_value(binding.host_peer_admission_receipt.clone())
+            .map_err(|error| format!("retained Host peer receipt does not decode: {error}"))?;
+    peer_admission_receipt
+        .validate()
+        .map_err(|error| format!("retained Host peer receipt is invalid: {error}"))?;
+    let source_activation_ticket: eliot_protocol::AgentActivationResolutionTicket =
+        serde_json::from_value(binding.source_activation_ticket.clone()).map_err(|error| {
+            format!("retained source activation ticket does not decode: {error}")
+        })?;
+    source_activation_ticket
+        .validate()
+        .map_err(|error| format!("retained source activation ticket is invalid: {error}"))?;
+    let source_activation_result: eliot_protocol::AgentActivationResolutionResult =
+        serde_json::from_value(binding.source_activation_result.clone()).map_err(|error| {
+            format!("retained source activation result does not decode: {error}")
+        })?;
+    source_activation_result
+        .validate_against(&source_activation_ticket)
+        .map_err(|error| format!("retained source activation result is invalid: {error}"))?;
+    Ok(ObserveRetainedSources {
+        source_request_identity,
+        peer_admission_receipt,
+        source_activation_ticket,
+        source_activation_result,
+    })
+}
+
+fn validate_observe_claim_lineage(
+    parts: &ObserveClaimParts,
+    executable_input: &eliot_ors::HostRequestExecutableInput,
+    sources: &ObserveRetainedSources,
+) -> Result<(), String> {
+    let envelope = &parts.envelope;
+    let attempt = &parts.attempt;
+    let record = &parts.record;
+    let durable_attempt = &parts.durable_attempt;
+    let binding = &executable_input.application_binding;
+    let observation_origin = binding
+        .observation_policy_binding
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "retained observation owner origin is missing".to_owned())?;
+    let attempt_matches_owner = match observation_origin {
+        "HOST_PEER" => {
+            attempt.wire_version == eliot_protocol::LOCAL_READ_ATTEMPT_HOST_ORIGIN_CONTRACT_VERSION
+                && attempt.session_id.is_none()
+                && record
+                    .scope_ref
+                    .as_ref()
+                    .map(eliot_ors::OpaqueLabel::as_str)
+                    == Some(attempt.scope_id.as_str())
+        }
+        "APPLICATION_SESSION" => {
+            attempt.wire_version == LocalReadAttempt::CONTRACT_VERSION
+                && attempt.session_id.as_deref()
+                    == binding
+                        .session_ref
+                        .as_ref()
+                        .map(eliot_ors::OpaqueLabel::as_str)
+                && record
+                    .scope_ref
+                    .as_ref()
+                    .map(eliot_ors::OpaqueLabel::as_str)
+                    == Some(attempt.scope_id.as_str())
+        }
+        _ => false,
+    };
+    if record.operation_id.as_str() != attempt.operation_id
+        || record.request_digest != envelope.envelope_sha256
+        || record.payload_digest != envelope.identity.payload_sha256
+        || record.state != eliot_ors::HostRequestState::Submitted
+        || record.result_digest.is_some()
+        || record.attempt.as_ref() != Some(durable_attempt)
+        || durable_attempt.attempt_id.as_str() != attempt.attempt_id
+        || durable_attempt.generation != attempt.fencing_generation
+        || durable_attempt.input_commitment_sha256.as_deref()
+            != Some(executable_input.commitment_sha256.as_str())
+        || executable_input.payload_sha256 != envelope.identity.payload_sha256
+        || !attempt_matches_owner
+        || durable_attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
+        || attempt.authority_epoch != envelope.state_fence.authority_epoch
+        || attempt.facet_method != OBSERVE_CAPABILITY
+        || envelope.state_fence != binding.state_fence
+    {
+        return Err(
+            "Kernel semantic_observe_claim ORS row is not the exact admitted pair".to_owned(),
+        );
+    }
+    validate_observe_activation_lineage(envelope, executable_input, sources).and_then(|()| {
+        validate_observe_source_identity(envelope, binding, &sources.source_request_identity)
+    })
+}
+
+fn validate_observe_activation_lineage(
+    envelope: &HostRequestEnvelope,
+    executable_input: &eliot_ors::HostRequestExecutableInput,
+    sources: &ObserveRetainedSources,
+) -> Result<(), String> {
+    let binding = &executable_input.application_binding;
+    let peer = &sources.peer_admission_receipt;
+    let ticket = &sources.source_activation_ticket;
+    let result = &sources.source_activation_result;
+    let retained_peer_receipt = serde_json::to_value(peer)
+        .map_err(|error| format!("retained Host peer receipt cannot encode: {error}"))?;
+    if envelope.connection_id != peer.connection_id
+        || envelope.peer_admission_receipt_sha256 != peer.receipt_sha256
+        || executable_input.peer_admission_receipt_sha256 != peer.receipt_sha256
+        || binding.host_peer_admission_receipt != retained_peer_receipt
+        || ticket.peer_admission_receipt.as_ref() != Some(peer)
+        || ticket.peer_admission_receipt_sha256 != peer.receipt_sha256
+        || ticket.connection_id != envelope.connection_id
+        || ticket.state_fence != envelope.state_fence
+        || result.ticket_id != ticket.ticket_id
+        || result.ticket_state_fence != ticket.state_fence
+        || !envelope
+            .activation_binding
+            .as_ref()
+            .is_some_and(|activation| {
+                activation.ticket_id == ticket.ticket_id
+                    && activation.ticket_sha256 == ticket.ticket_sha256
+                    && activation.resolution_result_sha256 == result.result_sha256
+            })
+    {
+        return Err(
+            "Kernel semantic_observe_claim ORS activation is not the exact admitted pair"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_observe_source_identity(
+    envelope: &HostRequestEnvelope,
+    binding: &eliot_ors::HostRequestApplicationBinding,
+    source: &RequestIdentity,
+) -> Result<(), String> {
+    let original_request_identity = serde_json::to_value(&envelope.identity)
+        .map_err(|error| format!("original observe identity cannot encode: {error}"))?;
+    if binding.request_identity != original_request_identity
+        || source.request.metadata.request_id != envelope.identity.request_id
+        || source.idempotency_key != envelope.identity.idempotency_key
+        || source.cancellation_id != envelope.identity.cancellation_id
+        || source.deadline_unix_ms != envelope.identity.deadline_unix_ms
+        || !neutral_source_fence_matches_owner(&source.request.state_fence, &binding.state_fence)
+        || !neutral_source_fence_matches_owner(
+            &source.request.metadata.state_fence,
+            &binding.state_fence,
+        )
+        || source.request.metadata.session_id.is_some()
+        || source.request.metadata.task_id.is_some()
+    {
+        return Err(
+            "Kernel original RequestIdentity differs from the admitted Host request".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_observe_tool_commitment(
+    tool: &serde_json::Value,
+    executable_input: &eliot_ors::HostRequestExecutableInput,
+) -> Result<(), String> {
+    let tool_bytes = canonical_json_bytes(tool)
+        .map_err(|error| format!("original observe tool cannot canonicalize: {error}"))?;
+    let tool_length = u64::try_from(tool_bytes.len())
+        .map_err(|_| "original observe tool length exceeds the ORS contract".to_owned())?;
+    if tool_length != executable_input.payload_length
+        || sha256_hex(&tool_bytes) != executable_input.payload_sha256
+    {
+        return Err(
+            "Kernel retained executable input does not bind the decoded original tool".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// The Bridge Frame identity retains transport attribution and its neutral
+/// epoch/generation fence. The admitted Host row separately retains the full
+/// semantic owner fence; only the non-semantic fence coordinates may join.
+fn neutral_source_fence_matches_owner(
+    source: &eliot_contracts::StateFence,
+    semantic: &eliot_contracts::StateFence,
+) -> bool {
+    source
+        .authority_epoch
+        .is_same_authority(&semantic.authority_epoch)
+        && source.resource_generation == semantic.resource_generation
+        && source.task_revision.is_none()
+        && source.policy_revision.is_none()
+        && source.integration_revision.is_none()
 }
 
 /// Parses one unwrapped `semantic_observe_result` answer value into the
@@ -1152,6 +1468,8 @@ pub fn parse_observe_claimed_pair(
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_result`)
 /// answers `{"accepted": true}` on persist (exact replays included),
+/// `ACCEPTED_PENDING` with the exact typed `WriteSubmission` on a durable
+/// stage (no receipt or terminal claim),
 /// `{"accepted": false, "expired": true}` when the absolute deadline elapsed
 /// first, and `{"accepted": false, "stale": true, ...}` when the presented
 /// attempt is not the current fencing generation. Anything else is a contract
@@ -1162,6 +1480,45 @@ pub fn parse_observe_submit_outcome(
     // #740: submit-outcome span. Accepted/expired/stale stay distinct;
     // anything else is a contract violation, never a silent accept.
     let _span = tracing::info_span!("eliotd.observe_submit").entered();
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("accepted_pending") {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "Kernel staged Observe answer is not an object".to_owned())?;
+        if object.len() != 3
+            || !object.contains_key("status")
+            || !object.contains_key("value")
+            || object.get("recovery") != Some(&serde_json::Value::Null)
+        {
+            return Err("Kernel staged Observe answer has an open or invalid envelope".to_owned());
+        }
+        let typed = object
+            .get("value")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "Kernel staged Observe answer has no typed value".to_owned())?;
+        if typed.len() != 2
+            || typed.get("kind").and_then(serde_json::Value::as_str) != Some("write_submission")
+        {
+            return Err("Kernel staged Observe answer is not a closed write_submission".to_owned());
+        }
+        let submission: eliot_store_api::WriteSubmission = serde_json::from_value(
+            typed
+                .get("value")
+                .cloned()
+                .ok_or_else(|| "Kernel staged Observe answer omits its submission".to_owned())?,
+        )
+        .map_err(|error| format!("Kernel staged Observe submission cannot decode: {error}"))?;
+        submission
+            .validate()
+            .map_err(|error| format!("Kernel staged Observe submission is invalid: {error}"))?;
+        if submission.state != eliot_store_api::WriteSubmissionState::Staged
+            || submission.canonical_receipt_ref.is_some()
+        {
+            return Err(
+                "Kernel staged Observe answer is not a nonterminal staged submission".to_owned(),
+            );
+        }
+        return Ok(ObserveSubmitOutcome::Staged(Box::new(submission)));
+    }
     let accepted = value
         .get("accepted")
         .and_then(serde_json::Value::as_bool)
@@ -1356,58 +1713,31 @@ pub fn watchdog_export_result_for_acknowledgement(
 ///
 /// The Kernel arm
 /// (`bins/eliot-kernel/src/daemon_request_dispatch.rs::semantic_observe_deferred`)
-/// answers `{"accepted": true, "deferred": true, ...}` when the pair retired
-/// and the durable record advanced to `Routed`,
-/// `{"accepted": true, "settled": true, ...}` when the record already
-/// closed, `{"accepted": false, "expired": true}` on the deadline race, and
-/// `{"accepted": false, "stale": true, ...}` on a superseded attempt.
-/// Anything else is a contract violation, never a silent accept.
+/// must return the exact Unknown/reconciliation disposition for a pair already
+/// published as Submitted. Every other status would falsely imply no effect or
+/// permit rescheduling and is rejected.
 pub fn parse_observe_defer_outcome(
     value: &serde_json::Value,
 ) -> Result<ObserveDeferOutcome, String> {
     let _span = tracing::info_span!("eliotd.observe_defer").entered();
-    let accepted = value
-        .get("accepted")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| {
-            "Kernel semantic_observe_deferred answer omits the accepted outcome".to_owned()
-        })?;
-    if accepted {
-        if value
-            .get("deferred")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(ObserveDeferOutcome::Deferred);
-        }
-        if value
-            .get("settled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            return Ok(ObserveDeferOutcome::Settled);
-        }
-        return Err(
-            "Kernel semantic_observe_deferred answer is accepted but neither deferred nor settled"
-                .to_owned(),
-        );
-    }
-    if value
-        .get("expired")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("unknown")
+        && value
+            .pointer("/value/outcome")
+            .and_then(serde_json::Value::as_str)
+            == Some("unknown_outcome")
+        && value
+            .pointer("/recovery/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("unknown_outcome")
+        && value
+            .pointer("/recovery/reason")
+            .and_then(serde_json::Value::as_str)
+            == Some("published_observe_pair_requires_reconciliation")
     {
-        return Ok(ObserveDeferOutcome::Expired);
-    }
-    if value
-        .get("stale")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Ok(ObserveDeferOutcome::StaleAttempt);
+        return Ok(ObserveDeferOutcome::ReconciliationRequired);
     }
     Err(
-        "Kernel semantic_observe_deferred answer is neither deferred, settled, expired, nor stale"
+        "Kernel semantic_observe_deferred answer is not the exact published-pair Unknown disposition"
             .to_owned(),
     )
 }
@@ -2004,6 +2334,12 @@ impl DaemonKernelClient {
         self.snapshot.state_fence()
     }
 
+    /// Returns the digest of the authenticated immutable Kernel snapshot for
+    /// exact owner recovery/write requests.
+    pub(super) fn protected_snapshot_digest(&self) -> &str {
+        self.snapshot.protected_snapshot_digest.as_str()
+    }
+
     /// Mints the transport operation binding for one startup evidence
     /// publish. The identity is minted by the authenticated channel owner
     /// for this exact publish (same contour as `daemon_ready`) and
@@ -2286,6 +2622,35 @@ impl DaemonKernelClient {
         payload: serde_json::Value,
         identity: RequestIdentity,
     ) -> Result<serde_json::Value, KernelClientError> {
+        match self
+            .transact_async_with_identity_outcome(operation, payload, identity)
+            .await?
+        {
+            WireOutcome::Known { value, recovery } => {
+                let _ = recovery;
+                Ok(value)
+            }
+            WireOutcome::Error { code, reason, .. } => {
+                Err(KernelClientError::Contract(format!("{code}: {reason}")))
+            }
+            WireOutcome::Partial { reason, value } => {
+                let _ = value;
+                Err(KernelClientError::Unknown(reason))
+            }
+            WireOutcome::Unknown { reason } => Err(KernelClientError::Unknown(reason)),
+            WireOutcome::AcceptedPending { .. } => Err(KernelClientError::Unknown(
+                "Kernel returned ACCEPTED_PENDING to a receipt-only caller".to_owned(),
+            )),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn transact_async_with_identity_outcome(
+        &self,
+        operation: &str,
+        payload: serde_json::Value,
+        identity: RequestIdentity,
+    ) -> Result<WireOutcome, KernelClientError> {
         let (mut transport, limits) = self.connect_transport().await?;
         let request_id = identity.request.metadata.request_id.clone();
         let frame = Frame {
@@ -2329,22 +2694,8 @@ impl DaemonKernelClient {
                 "Kernel response is not JSON".to_owned(),
             ));
         };
-        match serde_json::from_value::<WireOutcome>(value)
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))?
-        {
-            WireOutcome::Known { value, recovery } => {
-                let _ = recovery;
-                Ok(value)
-            }
-            WireOutcome::Error { code, reason } => {
-                Err(KernelClientError::Contract(format!("{code}: {reason}")))
-            }
-            WireOutcome::Partial { reason, value } => {
-                let _ = value;
-                Err(KernelClientError::Unknown(reason))
-            }
-            WireOutcome::Unknown { reason } => Err(KernelClientError::Unknown(reason)),
-        }
+        serde_json::from_value::<WireOutcome>(value)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
 
     #[cfg(not(windows))]
@@ -2363,6 +2714,16 @@ impl DaemonKernelClient {
         _payload: serde_json::Value,
         _identity: RequestIdentity,
     ) -> Result<serde_json::Value, KernelClientError> {
+        Err(KernelClientError::Unsupported)
+    }
+
+    #[cfg(not(windows))]
+    pub(super) async fn transact_async_with_identity_outcome(
+        &self,
+        _operation: &str,
+        _payload: serde_json::Value,
+        _identity: RequestIdentity,
+    ) -> Result<WireOutcome, KernelClientError> {
         Err(KernelClientError::Unsupported)
     }
 
@@ -2786,10 +3147,7 @@ impl DaemonKernelClient {
     #[cfg(windows)]
     pub async fn claim_observe_pair_async(
         &self,
-    ) -> Result<
-        Option<(HostRequestEnvelope, serde_json::Value, LocalReadAttempt)>,
-        super::DaemonError,
-    > {
+    ) -> Result<Option<ObserveClaimedPair>, super::DaemonError> {
         let value = self
             .transact_async(
                 "semantic_observe_claim",
@@ -2798,10 +3156,10 @@ impl DaemonKernelClient {
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
         let pair = parse_observe_claimed_pair(&value).map_err(super::DaemonError::Kernel)?;
-        if let Some((envelope, _, attempt)) = pair.as_ref() {
+        if let Some(pair) = pair.as_ref() {
             let _ = crate::diagnostics::RequestReceipt::of(
-                envelope.identity.request_id.as_str(),
-                &attempt.operation_id,
+                pair.envelope.identity.request_id.as_str(),
+                &pair.attempt.operation_id,
             )
             .emit();
         }
@@ -2868,9 +3226,10 @@ impl DaemonKernelClient {
     /// The body travels as the single-`result`-key
     /// `"semantic_observe_result"` payload and is validated before any
     /// transport is touched. Kernel persists through the ORS result path: an
-    /// exact replay stays idempotent (even across deadline expiry); an
-    /// elapsed absolute deadline is the expected race and projects as
-    /// [`ObserveSubmitOutcome::Expired`], never as a transport error.
+    /// exact replay stays idempotent (even across deadline expiry); a durable
+    /// stage projects its exact `WriteSubmission` as
+    /// [`ObserveSubmitOutcome::Staged`] without implying commit; an elapsed
+    /// absolute deadline projects as [`ObserveSubmitOutcome::Expired`].
     #[cfg(windows)]
     pub async fn submit_observe_result_async(
         &self,
@@ -2878,24 +3237,60 @@ impl DaemonKernelClient {
     ) -> Result<ObserveSubmitOutcome, super::DaemonError> {
         body.validate()
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
-        let value = self
-            .transact_async(
-                "semantic_observe_result",
-                serde_json::json!({ "result": body }),
-            )
-            .await
+        let operation = "semantic_observe_result";
+        let payload = serde_json::json!({ "result": body });
+        let identity = self
+            .next_identity(&CanonicalKernelRequest {
+                operation,
+                scope: &self.connection_id,
+                request: &payload,
+            })
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        let value = match self
+            .transact_async_with_identity_outcome(operation, payload, identity)
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?
+        {
+            WireOutcome::Known {
+                value,
+                recovery: None,
+            } => value,
+            WireOutcome::AcceptedPending {
+                value,
+                recovery: None,
+            } => serde_json::json!({
+                "status": "accepted_pending",
+                "value": value,
+                "recovery": null,
+            }),
+            WireOutcome::Known { .. } => {
+                return Err(super::DaemonError::Kernel(
+                    "Kernel Observe result known response unexpectedly carries recovery".to_owned(),
+                ));
+            }
+            WireOutcome::AcceptedPending { .. } => {
+                return Err(super::DaemonError::Kernel(
+                    "Kernel staged Observe response unexpectedly carries recovery".to_owned(),
+                ));
+            }
+            WireOutcome::Error { code, reason, .. } => {
+                return Err(super::DaemonError::Kernel(format!("{code}: {reason}")));
+            }
+            WireOutcome::Partial { reason, .. } | WireOutcome::Unknown { reason } => {
+                return Err(super::DaemonError::Kernel(reason));
+            }
+        };
         parse_observe_submit_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
     /// Defers one claimed observe pair the daemon flight cannot execute yet
     /// (issue #2565).
     ///
-    /// The presenting attempt must be the live Kernel-minted triple the claim
-    /// returned. Kernel retires the queue pair and advances the durable
-    /// record `Admitted -> Routed`, so the pending handle stays live with its
-    /// exact resume condition while no queue entry spins. No effect is
-    /// produced and none is claimed by this leg.
+    /// The presenting attempt must be the exact Kernel-minted attempt returned
+    /// with the claimed pair. The pair was already durably published as
+    /// `Submitted`; therefore this leg marks that attempt `Unknown` and
+    /// requires reconciliation. It never reports a no-effect deferral or
+    /// requeues the pair.
     #[cfg(windows)]
     pub async fn defer_observe_claim_async(
         &self,
@@ -2906,6 +3301,11 @@ impl DaemonKernelClient {
         attempt
             .validate()
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if attempt.operation_id != operation_id {
+            return Err(super::DaemonError::Kernel(
+                "Observe defer operation does not match the exact claimed attempt".to_owned(),
+            ));
+        }
         let value = self
             .transact_async(
                 "semantic_observe_deferred",
@@ -2917,6 +3317,15 @@ impl DaemonKernelClient {
             )
             .await
             .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        if value
+            .pointer("/value/operation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(operation_id)
+        {
+            return Err(super::DaemonError::Kernel(
+                "Observe Unknown reconciliation response names another operation".to_owned(),
+            ));
+        }
         parse_observe_defer_outcome(&value).map_err(super::DaemonError::Kernel)
     }
 
@@ -3662,7 +4071,7 @@ mod tests {
             operation_id: operation_id.clone(),
             attempt_id: format!("{operation_id}:attempt:test-boot:7:{generation}"),
             fencing_generation: generation,
-            session_id: "kernel-session-1".to_owned(),
+            session_id: Some("kernel-session-1".to_owned()),
             authority_epoch: envelope.state_fence.authority_epoch.clone(),
             scope_id: "kernel-session-1".to_owned(),
             facet_method: "eliot.query".to_owned(),
