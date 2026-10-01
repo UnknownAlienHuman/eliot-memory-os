@@ -77,9 +77,9 @@ use eliot_store_api::{
     BackupOperationReconciliation, CanonicalRestoreBatch, IsolatedDestination,
     IsolatedDestinationReceipt, OperationId, OperationIdentity, RequestMeta,
     RestoreValidationReceipt, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt,
-    SnapshotHandle, SnapshotPage, StoreBackupOperation, StoreBackupRequest, StoreBackupResponse,
-    StoreBackupStatus, StoreError, StoreFailure, StoreRequest, StoreResponse, canonical_json_bytes,
-    reconcile_same_operation, sha256_hex,
+    SnapshotHandle, SnapshotMember, SnapshotPage, SnapshotSourceIdentity, StoreBackupOperation,
+    StoreBackupRequest, StoreBackupResponse, StoreBackupStatus, StoreError, StoreFailure,
+    StoreRequest, StoreResponse, canonical_json_bytes, reconcile_same_operation, sha256_hex,
 };
 use thiserror::Error;
 
@@ -128,6 +128,29 @@ fn backup_derived_envelope_identity(
         idempotency_key: idempotency_key.to_owned(),
         canonical_request_hash: sha256_hex(&bytes),
     })
+}
+
+/// Reports whether a receipt names exactly the members that were requested.
+///
+/// Comparison is by the existing domain-qualified
+/// [`SnapshotMember::logical_identity`] and is order-sensitive, because the
+/// admitted batch states its members in admitted order and equal bytes under
+/// different residency domains are distinct logical objects that must never be
+/// merged on content digest alone. The lengths are compared too, so a receipt
+/// that drops a member is refused even though the shorter prefix agrees.
+///
+/// Both sides are caller-held values: the request's admitted batch and the
+/// receipt the Store returned. This is never a self-consistency check inside
+/// the response, and it never lets `denominator_members` stand in for the
+/// members themselves.
+fn names_same_members(receipt: &[SnapshotMember], admitted: &[SnapshotMember]) -> bool {
+    receipt.len() == admitted.len()
+        && receipt
+            .iter()
+            .zip(admitted)
+            .all(|(receipt_member, admitted_member)| {
+                receipt_member.logical_identity() == admitted_member.logical_identity()
+            })
 }
 
 impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
@@ -520,8 +543,12 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// Idempotency key: the admitted batch identity
     /// (`batch.operation.idempotency_key`). A validate/status answer can
     /// never satisfy this call: only the closed `Restored` outcome bound to
-    /// the exact batch identity, archive digest, destination and member-count
-    /// denominator is accepted.
+    /// the exact batch identity, source identity, archive digest, destination,
+    /// per-member logical identities and member-count denominator is accepted.
+    /// The per-member and source bindings are what turn a wrong member or a
+    /// wrong source into the same typed [`StoreError::IdentityConflict`] a
+    /// wrong digest or destination already produced, instead of a
+    /// well-formed receipt for a batch that was never requested.
     pub(super) async fn backup_restore_batch_inner(
         &self,
         ctx: &RequestMeta,
@@ -538,6 +565,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let admitted_archive_digest = batch.archive_member_digest.clone();
         let admitted_destination = batch.destination.clone();
         let admitted_member_count = batch.member_count;
+        let admitted_source = batch.source.clone();
+        let admitted_members = batch.members.clone();
         // Coherence rule: `RestoreBatch` requires the envelope identity to
         // equal the payload's admitted `OperationIdentity` — copied verbatim.
         let identity = admitted_operation.clone();
@@ -569,6 +598,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                     &admitted_archive_digest,
                     &admitted_destination,
                     admitted_member_count,
+                    &admitted_source,
+                    &admitted_members,
                     &response,
                 )
                 .map_err(Into::into)
@@ -589,8 +620,11 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// unblock effects. Idempotency key: the admitted batch identity
     /// (`batch.operation.idempotency_key`). Only the closed wire `Validation`
     /// outcome (`RestoreValidationReceipt`) bound to the exact admitted
-    /// batch operation, archive digest, destination and member-count
-    /// denominator is accepted.
+    /// batch operation, source identity, archive digest, destination, per-member
+    /// logical identities and member-count denominator is accepted. Validation
+    /// binds the same requested batch a restore does, so a receipt that
+    /// validates a different batch's members or source is refused with the
+    /// same typed [`StoreError::IdentityConflict`].
     pub(super) async fn backup_validate_inner(
         &self,
         ctx: &RequestMeta,
@@ -606,6 +640,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         let admitted_archive_digest = batch.archive_member_digest.clone();
         let admitted_destination = batch.destination.clone();
         let admitted_member_count = batch.member_count;
+        let admitted_source = batch.source.clone();
+        let admitted_members = batch.members.clone();
         // Coherence rule: `Validate` requires the envelope identity to equal
         // the payload's admitted `OperationIdentity` — copied verbatim.
         let identity = admitted_operation.clone();
@@ -630,6 +666,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 &admitted_archive_digest,
                 &admitted_destination,
                 admitted_member_count,
+                &admitted_source,
+                &admitted_members,
                 &response,
             )
             .map_err(Into::into),
@@ -643,6 +681,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         admitted_archive_digest: &str,
         admitted_destination: &IsolatedDestination,
         admitted_member_count: u64,
+        admitted_source: &SnapshotSourceIdentity,
+        admitted_members: &[SnapshotMember],
         response: &StoreBackupResponse,
     ) -> Result<RestoreValidationReceipt, StoreError> {
         let StoreBackupResponse::Restored { receipt } = response else {
@@ -653,6 +693,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             || receipt.archive_member_digest != admitted_archive_digest
             || &receipt.destination != admitted_destination
             || receipt.denominator_members != admitted_member_count
+            || &receipt.source != admitted_source
+            || !names_same_members(&receipt.members, admitted_members)
         {
             return Err(StoreError::IdentityConflict);
         }
@@ -664,6 +706,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         admitted_archive_digest: &str,
         admitted_destination: &IsolatedDestination,
         admitted_member_count: u64,
+        admitted_source: &SnapshotSourceIdentity,
+        admitted_members: &[SnapshotMember],
         response: &StoreBackupResponse,
     ) -> Result<RestoreValidationReceipt, StoreError> {
         let StoreBackupResponse::Validation { receipt } = response else {
@@ -674,6 +718,8 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             || receipt.archive_member_digest != admitted_archive_digest
             || &receipt.destination != admitted_destination
             || receipt.denominator_members != admitted_member_count
+            || &receipt.source != admitted_source
+            || !names_same_members(&receipt.members, admitted_members)
         {
             return Err(StoreError::IdentityConflict);
         }

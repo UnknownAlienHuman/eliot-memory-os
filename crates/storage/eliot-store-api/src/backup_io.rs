@@ -1310,14 +1310,37 @@ impl SnapshotValidationReceipt {
 ///
 /// Structural only; same success contour as [`SnapshotValidationReceipt`]:
 /// unknown or possible-mutation dispositions never validate as success.
+///
+/// [`Self::source`] and [`Self::members`] restate the *admitted* batch identity
+/// so this answer can be bound to what was actually asked for. A receipt that
+/// carried only a member count and an archive digest could agree with a
+/// different batch of the same size, and I5.13 is explicit that equal bytes
+/// under different obligations remain distinct logical objects and are never
+/// merged on content digest alone — so the binding vocabulary is the existing
+/// domain-qualified [`SnapshotMember::logical_identity`], never a bare digest.
+/// Both fields are recorded identity only: no archive content is ever carried
+/// here, exactly as in the batch. [`Self::denominator_members`] stays a bare
+/// count and deliberately gains no per-member meaning; the per-member binding
+/// is [`Self::members`] compared against the requested batch, never a count
+/// cross-check inside the response.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreValidationReceipt {
     pub operation: OperationIdentity,
+    /// The source the restore read, as admitted on the request.
+    pub source: SnapshotSourceIdentity,
     pub destination: IsolatedDestination,
     pub archive_member_digest: String,
+    /// The exact canonical records this answer covers, in admitted order.
+    ///
+    /// Bounded by the same ceiling as the batch's own member list. Only
+    /// identity is restated: a member's digest names content, never carries
+    /// it.
+    pub members: Vec<SnapshotMember>,
     pub resolved_members: u64,
     pub unresolved_members: u64,
+    /// Bare member count. It says how many members the answer resolved, never
+    /// which ones; [`Self::members`] names those.
     pub denominator_members: u64,
     pub completeness: SnapshotCompleteness,
     pub disposition: StoreMutationDisposition,
@@ -1336,10 +1359,24 @@ impl RestoreValidationReceipt {
     }
 
     /// Validates count closure and the known-zero completeness rule.
+    ///
+    /// [`Self::source`] and [`Self::members`] are validated as *recorded*: each
+    /// is checked for shape in its own right, never re-derived and compared
+    /// against itself. Agreement with the requested batch is a separate,
+    /// stronger question that only the caller holding both sides can ask, and a
+    /// receipt that is internally well-formed but answers a different batch
+    /// still has to be refused there.
     pub fn validate(&self) -> Result<(), StoreError> {
         self.operation.validate()?;
+        self.source.validate()?;
         self.destination.validate()?;
         validate_digest(&self.archive_member_digest, "restore.archive_member_digest")?;
+        if self.members.len() > MAX_RESTORE_MEMBERS {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        for member in &self.members {
+            member.validate()?;
+        }
         if self
             .resolved_members
             .saturating_add(self.unresolved_members)
