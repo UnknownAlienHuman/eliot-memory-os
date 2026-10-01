@@ -3553,6 +3553,15 @@ impl GrantActivationPort {
             grant_revocations,
             introduction_fences,
         };
+        // The Governor enumeration carries the graph head used to derive this
+        // complete closure. Advance the durable watermark before ORS validates
+        // the closure commit against that exact owner revision; otherwise a
+        // valid later owner revision is rejected as if the graph were stale.
+        check_closure_watermark(
+            boundary,
+            &request.authority_root_ref,
+            request.grant_graph_revision,
+        )?;
         let durable = boundary
             .store
             .commit_grant_closure_fence(fence_request)
@@ -7317,26 +7326,34 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             map_thin_error(&KernelError::Expired { expires_at_ms: 1 }),
-            P07PortError::NotAdmitted
+            P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::AuthorityReceiptExpired
+            }
         ));
         assert!(matches!(
             map_thin_error(&KernelError::InvalidField {
                 field: "binding.authority_owner",
                 reason: "must be non-blank",
             }),
-            P07PortError::InvalidBinding
+            P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::InvalidOwnerField
+            }
         ));
         assert!(matches!(
             map_thin_error(&KernelError::IdempotencyConflict),
-            P07PortError::InvalidBinding
+            P07PortError::IdentityConflict
         ));
         assert!(matches!(
             map_thin_error(&KernelError::DependencyUnavailable("ors".to_owned())),
-            P07PortError::Unavailable
+            P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::DependencyUnavailable
+            }
         ));
         assert!(matches!(
             map_thin_error(&KernelError::RecoveryUnavailable("view".to_owned())),
-            P07PortError::Unavailable
+            P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::RecoveryUnavailable
+            }
         ));
     }
 
@@ -7399,11 +7416,13 @@ pub(crate) mod tests {
         };
         assert!(matches!(
             P07AuthorityPort::activate_grant(&port, &blank_request),
-            Err(P07PortError::InvalidBinding)
+            Err(P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::InvalidOwnerField
+            })
         ));
 
-        // Valid binding but no hydration owner: activation stays Unavailable,
-        // unknown revocation stays Unavailable (no lineage is fabricated).
+        // Valid binding but no hydration owner stays unavailable and never
+        // fabricates grant lineage.
         let activation = GrantActivationRequest {
             grant_id: grant_id("grant-new")?,
             snapshot_id: snapshot_id("snap-1")?,
@@ -7922,7 +7941,9 @@ pub(crate) mod tests {
 
         assert!(matches!(
             P07AuthorityPort::revoke_grant(&port, &revoke),
-            Err(P07PortError::Unavailable | P07PortError::InvalidBinding)
+            Err(P07PortError::Refused {
+                cause: eliot_authority::P07RefusalCause::RecoveryUnavailable
+            })
         ));
         assert!(!port.grant_revoked("grant-root"));
         assert!(port.disposition(&revoke_operation_id).is_none());
@@ -8253,10 +8274,30 @@ pub(crate) mod tests {
 
     struct TestClosureHydration {
         enumeration: Mutex<GrantClosureEnumeration>,
+        members: Mutex<BTreeMap<String, GrantClosureMember>>,
     }
 
     impl TestClosureHydration {
+        fn new(enumeration: GrantClosureEnumeration) -> Self {
+            let members = enumeration
+                .members
+                .iter()
+                .map(|member| (member.intent.grant_id.clone(), member.clone()))
+                .collect();
+            Self {
+                enumeration: Mutex::new(enumeration),
+                members: Mutex::new(members),
+            }
+        }
+
         fn replace(&self, enumeration: GrantClosureEnumeration) {
+            let mut members = self
+                .members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for member in &enumeration.members {
+                members.insert(member.intent.grant_id.clone(), member.clone());
+            }
             *self
                 .enumeration
                 .lock()
@@ -8292,6 +8333,19 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone())
+        }
+
+        fn hydrate_grant_member(&self, grant_id: &str) -> Result<GrantClosureMember, KernelError> {
+            self.members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(grant_id)
+                .cloned()
+                .ok_or_else(|| {
+                    KernelError::RecoveryUnavailable(
+                        "fixture owner admits no hydration for the requested grant".to_owned(),
+                    )
+                })
         }
     }
 
@@ -8358,6 +8412,47 @@ pub(crate) mod tests {
         Ok(GrantClosureMember {
             intent,
             durable_record,
+            observed_at_ms: 1_000,
+        })
+    }
+
+    fn introduction_hydration_fixture(
+        intent: IntroductionActivationIntent,
+        epoch: &EpochId,
+    ) -> Result<IntroductionHydration, KernelError> {
+        let authority_epoch = eliot_ors::EpochLineage {
+            current: eliot_ors::EpochIdentity {
+                lineage_id: eliot_ors::OpaqueLabel::new(
+                    intent.binding.authority_epoch.lineage_id.as_str(),
+                )?,
+                epoch: intent.binding.authority_epoch.sequence.get(),
+            },
+            predecessor: None,
+        };
+        let state_fence = eliot_ors::StateFenceSnapshot::capture(
+            &intent.binding.state_fence,
+            epoch.sequence.get(),
+        )?;
+        let record = eliot_ors::OperationalRecordInput::encrypted(
+            eliot_ors::OperationalRecordContext {
+                record_id: eliot_ors::OperationIdentity::new(&intent.operation_id)?,
+                subject_id: eliot_ors::OperationIdentity::new(&intent.introduction_id)?,
+                authority_epoch,
+                state_fence,
+                created_at_ms: intent.issued_at_ms,
+                cleanup_after_ms: None,
+            },
+            eliot_platform::SecretReference::new("test-provider", "closure-intro-key").map_err(
+                |_error| KernelError::InvalidField {
+                    field: "test_secret_reference",
+                    reason: "fixture reference must validate",
+                },
+            )?,
+            format!("opaque-closure-introduction-{}", intent.introduction_id).into_bytes(),
+        )?;
+        Ok(IntroductionHydration {
+            intent,
+            durable_record: CapabilityIntroductionActivation::new(record)?,
             observed_at_ms: 1_000,
         })
     }
@@ -8491,9 +8586,7 @@ pub(crate) mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(enumeration),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(enumeration));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
 
@@ -8742,9 +8835,7 @@ pub(crate) mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(valid.clone()),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(valid.clone()));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
 
@@ -8881,9 +8972,7 @@ pub(crate) mod tests {
             5,
         )?;
         full.members.insert(2, side);
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(full.clone()),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(full.clone()));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
         let activated = port.activate_grant_closure(
@@ -9015,9 +9104,7 @@ pub(crate) mod tests {
             5,
         )?;
         full.members.insert(2, side);
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(full.clone()),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(full.clone()));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
         port.activate_grant_closure(
@@ -9132,9 +9219,7 @@ pub(crate) mod tests {
             5,
         )?;
         full.members.insert(2, side);
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(full.clone()),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(full.clone()));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
         port.activate_grant_closure(
@@ -9220,9 +9305,12 @@ pub(crate) mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(chain_enumeration(&epoch, &binding, 5, Vec::new())?),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(chain_enumeration(
+            &epoch,
+            &binding,
+            5,
+            Vec::new(),
+        )?));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
         let chain_root_label = eliot_ors::OpaqueLabel::new("root-chain")?;
@@ -9403,9 +9491,12 @@ pub(crate) mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let store = Arc::new(eliot_ors::RedbRecoveryStore::open(&path)?);
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(chain_enumeration(&epoch, &binding, 5, Vec::new())?),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(chain_enumeration(
+            &epoch,
+            &binding,
+            5,
+            Vec::new(),
+        )?));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
 
@@ -9490,9 +9581,7 @@ pub(crate) mod tests {
             members: vec![root_member],
             preserved: Vec::new(),
         };
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(root_enum.clone()),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(root_enum.clone()));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
         let root_receipts = port.activate_grant_closure(
@@ -9617,9 +9706,7 @@ pub(crate) mod tests {
             members: vec![root_member, mid_member],
             preserved: Vec::new(),
         };
-        let hydration_source = Arc::new(TestClosureHydration {
-            enumeration: Mutex::new(enumeration.clone()),
-        });
+        let hydration_source = Arc::new(TestClosureHydration::new(enumeration.clone()));
         let port =
             GrantActivationPort::with_durable_root_grant(hydration_source.clone(), store.clone());
         let activated = port.activate_grant_closure(
@@ -9650,8 +9737,16 @@ pub(crate) mod tests {
             expires_at_ms: None,
             receipt_obligations: Vec::new(),
         };
-        port.activate_introduction(&introduction, epoch.clone(), 1_000)?;
+        // #2100 requires the dependent introduction to have its exact durable
+        // owner projection before closure fencing can claim it in the receipt.
+        let introduction_hydration = introduction_hydration_fixture(introduction.clone(), &epoch)?;
+        port.activate_introduction_durable(&introduction_hydration, &epoch, 1_000)?;
         assert!(!port.introduction_revoked("intro-ci-1"));
+        let intro_subject = eliot_ors::OperationIdentity::new("intro-ci-1")?;
+        let active_intro = store
+            .load_capability_introduction(&intro_subject)?
+            .ok_or("active introduction projection missing")?;
+        assert_eq!(active_intro.phase(), OperationalPhase::Active);
 
         // Revocation fences the dependent introduction and records it in the
         // durable closure row.
@@ -9694,6 +9789,10 @@ pub(crate) mod tests {
             Some(vec!["intro-ci-1".to_owned()])
         );
         assert!(port.introduction_revoked("intro-ci-1"));
+        let fenced_intro = store
+            .load_capability_introduction(&intro_subject)?
+            .ok_or("fenced introduction projection missing")?;
+        assert_eq!(fenced_intro.phase(), OperationalPhase::Fenced);
         let revoke_key = eliot_ors::OperationIdentity::new("op-ci-revoke")?;
         let stored_row = store
             .load_grant_closure(&revoke_key)?
@@ -9732,7 +9831,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ledger_only_closure_revoke_fences_live_descendants() -> Result<(), Box<dyn std::error::Error>>
+    fn ledger_only_closure_revoke_refuses_without_durable_owner_boundary(
+    ) -> Result<(), Box<dyn std::error::Error>>
     {
         let epoch = canonical_epoch("550e8400-e29b-41d4-a716-446655440000", 7)?;
         let binding = restart_test_binding(&epoch)?;
@@ -9788,43 +9888,30 @@ pub(crate) mod tests {
             unknown_outcome_operations: Vec::new(),
             receipt_obligations: Vec::new(),
         };
-        let receipt = port.revoke_grant_closure(&revocation, &epoch)?;
-        assert_eq!(
-            receipt.declaration.affected_grants(),
-            vec![
-                "grant-local-leaf".to_owned(),
-                "grant-local-mid".to_owned(),
-                "grant-local-root".to_owned(),
-            ]
-        );
-        assert!(receipt.declaration.preserved.is_empty());
-        assert!(matches!(receipt.state, GrantClosureState::Revoked));
-        assert!(port.grant_revoked("grant-local-leaf"));
+        // #2100 negative acceptance: process-memory lineage cannot substitute
+        // for the durable owner enumeration and ORS closure receipt.
+        assert!(matches!(
+            port.revoke_grant_closure(&revocation, &epoch),
+            Err(KernelError::RecoveryUnavailable(_))
+        ));
+        assert_eq!(port.grant_graph_revision("root-local"), Some(2));
+        assert!(!port.grant_revoked("grant-local-root"));
+        assert!(!port.grant_revoked("grant-local-mid"));
+        assert!(!port.grant_revoked("grant-local-leaf"));
+        assert!(port.disposition("op-local-revoke").is_none());
         assert_eq!(
             port.revocation_closure("op-local-revoke"),
-            Some(receipt.declaration.affected_grants())
+            None
         );
-        assert_eq!(
-            port.closure_receipt("op-local-revoke"),
-            Some(receipt.clone())
-        );
-
-        // Unknown ledger-only target records a reconciling intent.
-        let mut unknown = revocation.clone();
-        unknown.operation_id = "op-local-unknown".to_owned();
-        unknown.grant_id = "grant-local-ghost".to_owned();
-        assert!(matches!(
-            port.revoke_grant_closure(&unknown, &epoch),
-            Err(KernelError::InvalidField { .. })
-        ));
-        assert!(
-            port.reconciling_operations()
-                .contains(&"op-local-unknown".to_owned())
-        );
-        assert_eq!(
-            port.revocation_closure("op-local-unknown"),
-            Some(Vec::new())
-        );
+        assert!(port.closure_receipt("op-local-revoke").is_none());
+        assert!(port.reconciling_operations().is_empty());
+        let ledger = port.lock_ledger();
+        for grant_id in ["grant-local-root", "grant-local-mid", "grant-local-leaf"] {
+            assert!(matches!(
+                ledger.grants.get(grant_id).map(|grant| &grant.status),
+                Some(LiveStatus::Active)
+            ));
+        }
         Ok(())
     }
 }
