@@ -225,6 +225,27 @@ mod windows_durable_owner {
         assert_eq!(stdout_open.bytes, b"");
         assert_eq!(stderr_open.bytes, b"");
 
+        // Cancellation before a future is polled has no owner effect. A
+        // skipped sequence is likewise refused without advancing the durable
+        // prefix, so a caller cannot silently omit bytes from the stream.
+        let cancelled_before_poll = store.append_process_stream_stage(append(&stdout, 0, 0, b"x"));
+        drop(cancelled_before_poll);
+        assert_eq!(
+            block_on(store.resume_process_stream_stage(BlobProcessStreamStageResumeRequest {
+                session_id: stdout.session_id.clone(),
+                source_id: stdout.source_id.clone(),
+                terminal_id: stdout.terminal_id.clone(),
+                open_request_sha256: stdout.open_request_sha256.clone(),
+            }))
+            .expect("prefix after pre-poll cancellation")
+            .bytes,
+            b""
+        );
+        assert!(matches!(
+            block_on(store.append_process_stream_stage(append(&stdout, 1, 0, b"omitted"))),
+            Err(BlobError::InvalidContract(_))
+        ));
+
         // A zero-byte chunk is an actual committed sequence and can be replayed
         // only with the same sequence, offset, and bytes.
         let empty = append(&stdout, 0, 0, b"");
@@ -325,7 +346,26 @@ mod windows_durable_owner {
         .expect("recover stderr after restart");
         assert_eq!(stderr_readback.bytes, b"err");
         let after_restart = append(&stdout, 2, 3, b"put");
-        block_on(store.append_process_stream_stage(after_restart)).expect("append after restart");
+        // Model a process crash after the durable commit and before the caller
+        // observes its acknowledgement: discard the first result, restart the
+        // service, then retry the original operation and require the same
+        // committed receipt without duplicating bytes.
+        let lost_ack_result = block_on(store.append_process_stream_stage(after_restart.clone()))
+            .expect("append commits before simulated lost acknowledgement");
+        drop(lost_ack_result);
+        drop(store);
+        drop(owner);
+        let owner = BlobRootOwner::claim(
+            root.to_string_lossy().into_owned(),
+            "process-stream-owner",
+            std::process::id(),
+        )
+        .expect("reclaim after lost append acknowledgement");
+        let store = service(&root, &owner, &stdout);
+        let replayed_receipt = block_on(store.append_process_stream_stage(after_restart))
+            .expect("exact retry resolves the committed append after restart");
+        assert_eq!(replayed_receipt.sequence, 2);
+        assert_eq!(replayed_receipt.next_offset, 6);
         let after_append = block_on(store.resume_process_stream_stage(
             BlobProcessStreamStageResumeRequest {
                 session_id: stdout.session_id.clone(),
