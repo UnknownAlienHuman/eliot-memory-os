@@ -497,7 +497,11 @@ impl WasmtimeComponentEngine {
                     .build(),
                 peak_memory_bytes: None,
                 pending_memory_bytes: None,
-                table_elements: None,
+                // This newly-created, exclusively-owned Store contains no tables.
+                // The limiter is installed before instantiation; every later table
+                // creation/growth updates this observation through its callbacks.
+                // This is an owned empty baseline, not a default for unknown reports.
+                table_elements: Some(0),
                 pending_table_elements: None,
                 limit_hit: None,
             },
@@ -892,6 +896,106 @@ mod tests {
         assert_eq!(report.usage.enforced_stack_limit_bytes, Some(8 * 1024));
         assert_eq!(report.usage.effective_epoch_policy, limits.epoch);
         assert!(report.usage.stack_bytes.is_none());
+        Ok(())
+    }
+
+    /// Executes the same real component ABI with a bounded optional table.
+    fn fresh_store_table_report(
+        initial: Option<u32>,
+        grow_by: Option<u32>,
+        max_elements: u32,
+    ) -> Result<(InvocationLimits, EngineReport), String> {
+        let mut source = include_str!("../tests/fixtures/guest.wat").to_owned();
+        if let Some(initial) = initial {
+            source = source.replacen(
+                "    (memory (export \"memory\") 1)",
+                &format!(
+                    "    (table $tracked {initial} funcref)\n    (memory (export \"memory\") 1)"
+                ),
+                1,
+            );
+        }
+        if let Some(grow_by) = grow_by {
+            source = source.replacen(
+                "    (func $run (type $run)",
+                &format!("    (func $run (type $run)\n      (drop (table.grow $tracked (ref.null func) (i32.const {grow_by})))"),
+                1,
+            );
+        }
+        let artifact = wat::parse_str(&source).map_err(|error| error.to_string())?;
+        let digest = Sha256Digest::of_bytes(&artifact);
+        let engine = WasmtimeComponentEngine::new(
+            binding(),
+            digest.clone(),
+            &artifact,
+            COMPONENT_CONFIGURATION,
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        let mut limits = test_limits(digest);
+        limits.max_table_elements = max_elements;
+        let report = engine
+            .invoke_component(
+                &Sha256Digest::of_bytes(b"fresh-store-table-metering"),
+                &limits,
+                b"metered",
+                true,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok((limits, report))
+    }
+
+    #[test]
+    fn fresh_store_table_free_reports_measured_zero() -> Result<(), String> {
+        let (limits, report) = fresh_store_table_report(None, None, 1)?;
+        assert_eq!(report.termination, EngineTermination::Completed);
+        assert_eq!(report.output, b"metered");
+        assert_eq!(report.usage.table_elements, Some(0));
+        assert_eq!(report.usage.peak_memory_bytes, Some(65_536));
+        assert!(report.usage.fuel_consumed > 0);
+        assert!(report.usage.fuel_consumed <= limits.max_fuel);
+        eliot_wasm_runtime::lifecycle::enforce_guest_no_effect(&limits, &report)
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_store_table_creation_and_growth_are_measured() -> Result<(), String> {
+        let (_, created) = fresh_store_table_report(Some(1), None, 2)?;
+        assert_eq!(created.termination, EngineTermination::Completed);
+        assert_eq!(created.usage.table_elements, Some(1));
+        let (limits, grown) = fresh_store_table_report(Some(1), Some(1), 2)?;
+        assert_eq!(grown.termination, EngineTermination::Completed);
+        assert_eq!(grown.usage.table_elements, Some(2));
+        eliot_wasm_runtime::lifecycle::enforce_guest_no_effect(&limits, &grown)
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_store_table_denied_growth_keeps_current_count() -> Result<(), String> {
+        let (_, report) = fresh_store_table_report(Some(1), Some(1), 1)?;
+        assert_eq!(report.termination, EngineTermination::TableLimit);
+        assert_eq!(report.usage.table_elements, Some(1));
+        assert!(report.output.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_store_table_missing_external_measurement_stays_refused() -> Result<(), String> {
+        let (limits, mut report) = fresh_store_table_report(None, None, 1)?;
+        assert_eq!(report.termination, EngineTermination::Completed);
+        assert!(eliot_wasm_runtime::lifecycle::enforce_guest_no_effect(&limits, &report).is_ok());
+        // Only the external report's table observation is removed. Consumers
+        // still reject unknown evidence; they never manufacture a zero value.
+        report.usage.table_elements = None;
+        assert_eq!(
+            eliot_wasm_runtime::lifecycle::enforce_guest_no_effect(&limits, &report),
+            Err(
+                eliot_wasm_runtime::lifecycle::GuestNoEffectError::MemoryEnvelope {
+                    field: "table-elements",
+                }
+            ),
+        );
         Ok(())
     }
 
