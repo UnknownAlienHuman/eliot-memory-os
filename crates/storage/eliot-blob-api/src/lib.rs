@@ -1231,6 +1231,253 @@ impl BlobProcessStreamSourceBinding {
     }
 }
 
+/// Durable per-process-stream staging identity. The source binding and
+/// operation contexts are captured at the authenticated Open boundary and
+/// remain immutable for the lifetime of the staging session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamStageOpenRequest {
+    pub session_id: String,
+    pub source_id: String,
+    pub terminal_id: String,
+    pub open_request_sha256: String,
+    pub stage_context: BlobReceiptContext,
+    pub read_context: BlobReceiptContext,
+    pub root_lease: BlobRootLease,
+    pub policy: BlobPolicyBinding,
+    pub residency: ObjectResidencyKey,
+    pub process_source_binding: BlobProcessStreamSourceBinding,
+    pub max_bytes: u64,
+    pub max_chunk_bytes: u64,
+    pub max_chunks: u64,
+}
+
+impl BlobProcessStreamStageOpenRequest {
+    pub fn validate(&self) -> Result<(), BlobError> {
+        valid_text(&self.session_id, "session_id")?;
+        valid_text(&self.source_id, "source_id")?;
+        valid_text(&self.terminal_id, "terminal_id")?;
+        canonical_sha256(&self.open_request_sha256, "open_request_sha256")?;
+        self.stage_context
+            .validate_for(EffectClass::ReversibleMutation)?;
+        self.read_context.validate_for(EffectClass::Read)?;
+        self.root_lease.validate_context(&self.stage_context)?;
+        self.root_lease.validate_context(&self.read_context)?;
+        self.policy.validate_for_residency(&self.residency)?;
+        self.process_source_binding.validate()?;
+        if self.stage_context.work_scope != self.read_context.work_scope
+            || self.stage_context.task != self.read_context.task
+            || self.stage_context.session != self.read_context.session
+            || self.stage_context.authority.authority_id != self.read_context.authority.authority_id
+            || self.stage_context.authority.authority_owner != self.read_context.authority.authority_owner
+            || self.stage_context.authority.authority_epoch != self.read_context.authority.authority_epoch
+            || self.stage_context.authority.state_fence != self.read_context.authority.state_fence
+            || self.max_bytes == 0
+            || self.max_bytes > BLOB_MAX_PLAINTEXT_BYTES
+            || self.max_chunk_bytes == 0
+            || self.max_chunk_bytes > self.max_bytes
+            || self.max_chunks == 0
+        {
+            return Err(BlobError::InvalidContract(
+                "process stream staging identity is not one bounded owner session".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stable owner key for exactly this stream session and Open identity.
+    pub fn session_key_sha256(&self) -> Result<String, BlobError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(&(
+            &self.session_id,
+            &self.source_id,
+            &self.terminal_id,
+            &self.open_request_sha256,
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        Ok(hex_sha256(&bytes))
+    }
+}
+
+/// One exact append to a durable process-stream staging session.
+///
+/// The append identity is the original stream session plus sequence and the
+/// canonical request commitment computed by this contract. Retrying the same
+/// sequence with different bytes is an identity conflict; an unknown durable
+/// write never authorizes a new identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamStageAppendRequest {
+    pub session_id: String,
+    pub source_id: String,
+    pub terminal_id: String,
+    pub open_request_sha256: String,
+    pub sequence: u64,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub chunk_sha256: String,
+}
+
+impl BlobProcessStreamStageAppendRequest {
+    pub fn validate(&self) -> Result<(), BlobError> {
+        valid_text(&self.session_id, "session_id")?;
+        valid_text(&self.source_id, "source_id")?;
+        valid_text(&self.terminal_id, "terminal_id")?;
+        canonical_sha256(&self.open_request_sha256, "open_request_sha256")?;
+        canonical_sha256(&self.chunk_sha256, "chunk_sha256")?;
+        if self.bytes.len() as u64 > BLOB_MAX_PLAINTEXT_BYTES
+            || hex_sha256(&self.bytes) != self.chunk_sha256
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(())
+    }
+
+    /// SHA-256 of the exact canonical append identity and bytes.
+    pub fn request_commitment_sha256(&self) -> Result<String, BlobError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(&(
+            &self.session_id,
+            &self.source_id,
+            &self.terminal_id,
+            &self.open_request_sha256,
+            self.sequence,
+            self.offset,
+            &self.chunk_sha256,
+            &self.bytes,
+        ))
+        .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        Ok(hex_sha256(&bytes))
+    }
+}
+
+/// Owner-authored durable disposition of one exact append.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamStageAppendReceipt {
+    pub session_key_sha256: String,
+    pub request_commitment_sha256: String,
+    pub sequence: u64,
+    pub offset: u64,
+    pub byte_length: u64,
+    pub chunk_sha256: String,
+    pub next_sequence: u64,
+    pub next_offset: u64,
+}
+
+impl BlobProcessStreamStageAppendReceipt {
+    pub fn validate_for(
+        &self,
+        session: &BlobProcessStreamStageOpenRequest,
+        request: &BlobProcessStreamStageAppendRequest,
+    ) -> Result<(), BlobError> {
+        let commitment = request.request_commitment_sha256()?;
+        if self.session_key_sha256 != session.session_key_sha256()?
+            || self.request_commitment_sha256 != commitment
+            || self.sequence != request.sequence
+            || self.offset != request.offset
+            || self.byte_length != request.bytes.len() as u64
+            || self.chunk_sha256 != request.chunk_sha256
+            || self.next_sequence != request.sequence.saturating_add(1)
+            || self.next_offset != request.offset.saturating_add(self.byte_length)
+            || self.next_offset > session.max_bytes
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Exact resume lookup for one already-opened stream staging session.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamStageResumeRequest {
+    pub session_id: String,
+    pub source_id: String,
+    pub terminal_id: String,
+    pub open_request_sha256: String,
+}
+
+/// Exact process sink terminal retained by the Blob owner after a terminal
+/// transition. Terminal bytes are canonical typed process JSON; a complete
+/// source also carries the original Blob-ready receipt returned by this owner.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamStageTerminal {
+    pub terminal_json: String,
+    pub terminal_json_sha256: String,
+    pub ready_receipt: Option<BlobReadyReceipt>,
+}
+
+impl BlobProcessStreamStageTerminal {
+    pub fn validate(&self) -> Result<(), BlobError> {
+        canonical_sha256(&self.terminal_json_sha256, "terminal_json_sha256")?;
+        let value: serde_json::Value = serde_json::from_str(&self.terminal_json)
+            .map_err(|_| BlobError::InvalidContract("terminal is not JSON".to_owned()))?;
+        let canonical = eliot_contracts::canonical_json_bytes(&value)
+            .map_err(|error| BlobError::InvalidContract(error.to_string()))?;
+        if !value.is_object()
+            || canonical != self.terminal_json.as_bytes()
+            || hex_sha256(self.terminal_json.as_bytes()) != self.terminal_json_sha256
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        if let Some(ready) = &self.ready_receipt {
+            ready.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Durable ordered staging snapshot. `bytes` is reconstructed only from the
+/// owner-authenticated append records; callers cannot supply a replacement
+/// prefix or advance the sequence from this readback.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobProcessStreamStageSnapshot {
+    pub session: BlobProcessStreamStageOpenRequest,
+    pub append_receipts: Vec<BlobProcessStreamStageAppendReceipt>,
+    pub bytes: Vec<u8>,
+    pub sha256: String,
+    pub next_sequence: u64,
+    pub next_offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<BlobProcessStreamStageTerminal>,
+}
+
+impl BlobProcessStreamStageSnapshot {
+    pub fn validate(&self) -> Result<(), BlobError> {
+        self.session.validate()?;
+        canonical_sha256(&self.sha256, "staged_sha256")?;
+        if self.bytes.len() as u64 != self.next_offset
+            || self.next_offset > self.session.max_bytes
+            || hex_sha256(&self.bytes) != self.sha256
+            || self.append_receipts.len() as u64 != self.next_sequence
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        let mut offset = 0_u64;
+        for (index, receipt) in self.append_receipts.iter().enumerate() {
+            if receipt.sequence != index as u64 || receipt.offset != offset {
+                return Err(BlobError::IntegrityMismatch);
+            }
+            offset = offset
+                .checked_add(receipt.byte_length)
+                .ok_or(BlobError::IntegrityMismatch)?;
+            if receipt.next_sequence != index as u64 + 1 || receipt.next_offset != offset {
+                return Err(BlobError::IntegrityMismatch);
+            }
+        }
+        if offset != self.next_offset {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        if let Some(terminal) = &self.terminal {
+            terminal.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Semantic readback lookup for a process source previously persisted by the
 /// Blob owner. It deliberately contains no Blob lease, receipt context, or
 /// storage path; the owner loads those from its retained stage intent.
@@ -3562,6 +3809,14 @@ pub enum BlobError {
         operation_id: String,
         state: PublishState,
     },
+    #[error(
+        "unknown outcome after process-stream append {sequence} for session {session_id}"
+    )]
+    UnknownStreamAppendOutcome {
+        session_id: String,
+        sequence: u64,
+        request_commitment_sha256: String,
+    },
     #[error("unknown outcome after durable GC effect for operation {operation_id} at {state:?}")]
     UnknownGcOutcome {
         operation_id: String,
@@ -3858,6 +4113,58 @@ pub type BlobFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BlobError>> +
 /// caller.
 pub trait BlobStoreClient: Send + Sync {
     fn stage(&self, request: BlobStageRequest) -> BlobFuture<'_, BlobReadyReceipt>;
+    /// Durably opens one process-stream append session under the original
+    /// stream operation and root owner. The provider must make an exact replay
+    /// converge and reject a changed Open identity for the same session.
+    fn open_process_stream_stage(
+        &self,
+        _request: BlobProcessStreamStageOpenRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageSnapshot> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose durable process-stream staging".to_owned(),
+            ))
+        })
+    }
+    /// Persists one ordered append before acknowledging it. `Unknown` is a
+    /// terminal disposition for a possibly attempted append until its exact
+    /// request commitment is resolved by `resume_process_stream_stage`.
+    fn append_process_stream_stage(
+        &self,
+        _request: BlobProcessStreamStageAppendRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageAppendReceipt> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose durable process-stream append".to_owned(),
+            ))
+        })
+    }
+    /// Resolves the exact durable session after restart. The result is `NotFound`
+    /// only when the owner positively observes no session record; an unreadable
+    /// or malformed record remains an error and never means an empty stream.
+    fn resume_process_stream_stage(
+        &self,
+        _request: BlobProcessStreamStageResumeRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageSnapshot> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose durable process-stream resume".to_owned(),
+            ))
+        })
+    }
+    /// Persists the exact terminal under the already-opened stream session.
+    /// Same terminal bytes replay; changed terminal or ready receipt conflicts.
+    fn record_process_stream_stage_terminal(
+        &self,
+        _session: BlobProcessStreamStageResumeRequest,
+        _terminal: BlobProcessStreamStageTerminal,
+    ) -> BlobFuture<'_, ()> {
+        Box::pin(async {
+            Err(BlobError::PlanGap(
+                "Blob owner does not expose durable process-stream terminal lookup".to_owned(),
+            ))
+        })
+    }
     /// Resolves only owner-persisted evidence for the original stage
     /// identity. A missing commit or unsettled journal is `Unknown`; callers
     /// must not turn that result into a fresh stage attempt.
@@ -3960,6 +4267,34 @@ where
         request: BlobStageRecoveryRequest,
     ) -> BlobFuture<'_, BlobStageRecovery> {
         (**self).recover_stage(request)
+    }
+
+    fn open_process_stream_stage(
+        &self,
+        request: BlobProcessStreamStageOpenRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageSnapshot> {
+        (**self).open_process_stream_stage(request)
+    }
+
+    fn append_process_stream_stage(
+        &self,
+        request: BlobProcessStreamStageAppendRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageAppendReceipt> {
+        (**self).append_process_stream_stage(request)
+    }
+
+    fn resume_process_stream_stage(
+        &self,
+        request: BlobProcessStreamStageResumeRequest,
+    ) -> BlobFuture<'_, BlobProcessStreamStageSnapshot> {
+        (**self).resume_process_stream_stage(request)
+    }
+    fn record_process_stream_stage_terminal(
+        &self,
+        session: BlobProcessStreamStageResumeRequest,
+        terminal: BlobProcessStreamStageTerminal,
+    ) -> BlobFuture<'_, ()> {
+        (**self).record_process_stream_stage_terminal(session, terminal)
     }
 
     fn read_process_stream_source(
