@@ -527,8 +527,7 @@ pub fn bind_swarm_launch(
     }
     let (current_policy_id, current_policy_revision, current_policy_digest) =
         current_preference_identity(&request.policy)?;
-    if *preference_policy_id != current_policy_id
-        || *preference_revision != current_policy_revision
+    if *preference_policy_id != current_policy_id || *preference_revision != current_policy_revision
     {
         return Err(SwarmLaunchBindError::StalePolicy);
     }
