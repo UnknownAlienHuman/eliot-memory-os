@@ -264,6 +264,37 @@ pub struct ColdStartDiscoveryInput {
     pub discovery: BootstrapDiscoveryInputs,
 }
 
+/// The exact installation-owned scan result retained across the accepted
+/// attach trigger. The receipt handle and full scan evidence stay paired with
+/// the original lease/binding so readiness compilation can validate the same
+/// durable operation instead of reconstructing it from a disclosure summary.
+pub struct ColdStartScanOwnerReceipt {
+    pub trigger: eliot_workscope::ColdStartTrigger,
+    pub discovery: ColdStartDiscoveryInput,
+    pub contour: eliot_governor::InstallationScanContour,
+    pub binding: eliot_workscope::ScanDisclosureOwnerBinding,
+    pub scan_evidence: BootstrapScanEvidence,
+    pub disclosure_receipt: eliot_workscope::ScanDisclosureReceipt,
+    pub receipt_handle: eliot_workscope::ScanReceiptHandle,
+    pub store: eliot_governor::InstallationScanDisclosureStore,
+}
+
+/// Why a durable scan receipt did not advance to compiled cold-start
+/// readiness. A successful scan is not a readiness receipt: profile and
+/// projection provenance must come from their own current owners.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColdStartReadinessRefusal {
+    CompilerProfileOwnerUnavailable,
+}
+
+pub enum ColdStartTriggerResult {
+    Question(eliot_workscope::BootstrapScanOutcome),
+    Persisted {
+        scan: ColdStartScanOwnerReceipt,
+        readiness_refusal: ColdStartReadinessRefusal,
+    },
+}
+
 const SCAN_DISCLOSURE_OWNER_OPERATION: &str = "scan_disclosure_owner";
 const SCAN_DISCLOSURE_OWNER_WIRE_VERSION: u16 = 1;
 
