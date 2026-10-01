@@ -160,9 +160,9 @@ pub(super) fn load_durable_runtime_restarts(
                     "runtime restart store contains a non-text filename".to_owned(),
                 )
             })?;
-        // Budget file is owned by load_restart_budget; never adopted here.
         if file_name == RESTART_BUDGET_FILE_NAME {
-            host_restart_observe("host.restart budget not adopted observed"); continue;
+            host_restart_observe("host.restart budget not adopted observed");
+            continue;
         }
         let pending_digest = file_name
             .strip_suffix(".pending.json")
