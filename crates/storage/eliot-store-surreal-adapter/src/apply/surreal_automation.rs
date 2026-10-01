@@ -1413,22 +1413,8 @@ impl PrepareContext<'_> {
         decoded: DecodedAutomationMutation,
     ) -> Result<(), AdapterError> {
         match decoded {
-            DecodedAutomationMutation::RetainNormalization {
-                automation_id,
-                revision,
-                revision_json,
-                normalization_receipt_json,
-                normalization_request_json,
-            } => {
-                self.apply_retain_normalization(
-                    writes,
-                    automation_id,
-                    revision,
-                    revision_json,
-                    normalization_receipt_json,
-                    normalization_request_json,
-                )
-                .await
+            leg @ DecodedAutomationMutation::RetainNormalization { .. } => {
+                self.apply_retain_normalization(writes, leg).await
             }
             DecodedAutomationMutation::Create {
                 automation_id,
@@ -1520,12 +1506,21 @@ impl PrepareContext<'_> {
     async fn apply_retain_normalization(
         &self,
         writes: &mut AutomationWrites,
-        automation_id: String,
-        revision: String,
-        revision_json: String,
-        normalization_receipt_json: Value,
-        normalization_request_json: String,
+        leg: DecodedAutomationMutation,
     ) -> Result<(), AdapterError> {
+        let DecodedAutomationMutation::RetainNormalization {
+            automation_id,
+            revision,
+            revision_json,
+            normalization_receipt_json,
+            normalization_request_json,
+        } = leg
+        else {
+            return Err(AdapterError::Store(StoreError::InvalidField {
+                field: "automation.operation",
+                reason: "normalization retention requires its decoded owner leg",
+            }));
+        };
         let normalization_receipt_json =
             validate_automation_normalization_envelope(Some(normalization_receipt_json))?
                 .ok_or(AdapterError::Store(StoreError::InvalidReceipt))?;
