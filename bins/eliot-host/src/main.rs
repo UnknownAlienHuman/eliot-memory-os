@@ -56,8 +56,22 @@ fn install_host_crash_reporter() {
         retention_policy: None,
         initial_context: crash_context::unavailable_context(),
     };
-    if let Ok(reporter) = eliot_observability_runtime::install_crash_reporter(config) {
-        let _ = CRASH_REPORTER.set(reporter);
+    match eliot_observability_runtime::install_crash_reporter(config) {
+        Ok(reporter) => {
+            reporter.invalidate_runtime_context();
+            if CRASH_REPORTER.set(reporter).is_err() {
+                tracing::warn!(
+                    target: "eliot::crash_reporter",
+                    event = "host_reporter_handle_unavailable",
+                    "Host crash reporter handle could not be retained"
+                );
+            }
+        }
+        Err(_) => tracing::warn!(
+            target: "eliot::crash_reporter",
+            event = "host_reporter_install_failed",
+            "Host crash reporter could not be installed; crash capture is unavailable"
+        ),
     }
 }
 
@@ -65,7 +79,13 @@ fn attach_current_host_crash_reporter(
     host: &mut HostComposition,
 ) {
     if let Some(reporter) = CRASH_REPORTER.get() {
-        crash_context::attach_reporter(host, reporter);
+        if crash_context::attach_reporter(host, reporter).is_err() {
+            tracing::warn!(
+                target: "eliot::crash_reporter",
+                event = "host_reporter_attachment_incomplete",
+                "Host crash reporter attachment is incomplete; later capture will record gaps"
+            );
+        }
     }
 }
 

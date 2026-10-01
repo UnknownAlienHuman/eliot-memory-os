@@ -3032,26 +3032,39 @@ impl crate::KernelComposition {
         handle: eliot_observability_runtime::CrashReporterHandle,
         kernel_process_generation: Option<String>,
     ) -> Result<(), eliot_observability_runtime::CrashReportError> {
-        let attached = self.crash_reporter.lock().map_err(|_| {
-            eliot_observability_runtime::CrashReportError::InvalidMetadata(
-                "crash_reporter.binding_poisoned",
-            )
-        })?.is_some();
+        let attached = match self.crash_reporter.lock() {
+            Ok(binding) => binding.is_some(),
+            Err(_) => {
+                handle.invalidate_runtime_context();
+                return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                    "crash_reporter.binding_poisoned",
+                ));
+            }
+        };
         if attached {
+            handle.invalidate_runtime_context();
             return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
                 "crash_reporter.already_attached",
             ));
         }
-        handle.update_context(self.crash_runtime_context(
+        if let Err(error) = handle.update_context(self.crash_runtime_context(
             kernel_process_generation.as_deref(),
             false,
-        ))?;
-        let mut binding = self.crash_reporter.lock().map_err(|_| {
-            eliot_observability_runtime::CrashReportError::InvalidMetadata(
-                "crash_reporter.binding_poisoned",
-            )
-        })?;
+        )) {
+            handle.invalidate_runtime_context();
+            return Err(error);
+        }
+        let mut binding = match self.crash_reporter.lock() {
+            Ok(binding) => binding,
+            Err(_) => {
+                handle.invalidate_runtime_context();
+                return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
+                    "crash_reporter.binding_poisoned",
+                ));
+            }
+        };
         if binding.is_some() {
+            handle.invalidate_runtime_context();
             return Err(eliot_observability_runtime::CrashReportError::InvalidMetadata(
                 "crash_reporter.already_attached",
             ));
@@ -3133,10 +3146,19 @@ impl crate::KernelComposition {
             })
         });
         if let Some((handle, kernel_process_generation)) = binding {
-            let _ = handle.update_context(self.crash_runtime_context(
-                kernel_process_generation.as_deref(),
-                true,
-            ));
+            if handle
+                .update_context(self.crash_runtime_context(
+                    kernel_process_generation.as_deref(),
+                    true,
+                ))
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "eliot::crash_reporter",
+                    event = "kernel_context_update_failed",
+                    "Kernel crash context is unavailable; a later panic will emit an explicit gap"
+                );
+            }
         }
     }
 
