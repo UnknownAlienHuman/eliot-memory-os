@@ -373,6 +373,7 @@ pub(super) async fn write_transaction(
         transition,
         plan,
         receipt,
+        causal,
         initial_state,
         expected_commit_sequence,
         expected_outbox_sequence,
