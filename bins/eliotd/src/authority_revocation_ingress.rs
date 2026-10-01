@@ -63,19 +63,26 @@
 //!    any target outside that set
 //!    (`bins/eliot-kernel/src/daemon_request_dispatch.rs`). The second-phase
 //!    resume the pass below tenders therefore needs a public second-phase-only
-//!    entry in `eliot-governor`, which does not exist:
+//!    entry in `eliot-governor`: that entry is
+//!    `GovernorComposition::resume_pending_second_phase`, and this module
+//!    drives it through [`drive_admitted_pending_second_phase`], which the
+//!    production owner-feed pass calls once it can supply the durable link
+//!    port and the admitted canonical identities.
 //!    `GovernorComposition::reconcile_canonical_revocation` and
-//!    `GovernorComposition::link_closure_second_phase` are both private. The
+//!    `GovernorComposition::link_closure_second_phase` stay private. The
 //!    admitted value this pass tenders is typed and documented for that entry
 //!    alone; presenting it to the fresh Kernel-first saga is forbidden.
 //!
-//! The exact remaining gap is named in
-//! [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]: `eliot-governor` must expose the
-//! public second-phase-only resume accepting the owner-admitted value. The
+//! The exact remaining production gap is named in
+//! [`AUTHORITY_REVOCATION_RESUME_BLOCKED`]: `eliot-governor` now exposes the
+//! public second-phase-only resume
+//! (`GovernorComposition::resume_pending_second_phase`), and this module
+//! drives it through [`drive_admitted_pending_second_phase`]. The
 //! maintenance-request half of that contract — the owner that re-admits the
-//! exact operation — now exists in
+//! exact operation — exists in
 //! [`crate::maintenance_trigger_evaluator::AdmittedMaintenanceRevocation`];
-//! only the Governor drive is still missing.
+//! what is still missing is the production caller that supplies the durable
+//! link port and the canonical identities from admitted ingress.
 //!
 //! Forbidden boundary: no ORS access (the Kernel owns ORS in its own
 //! process), no second grant graph, no fabricated request, identity or
@@ -85,9 +92,13 @@
 
 use std::sync::Arc;
 
-use eliot_authority::GrantStatus;
-use eliot_contracts::StateFence;
-use eliot_governor::{CompositionError, KernelGenerationSnapshotProvider};
+use eliot_authority::{GrantStatus, RevocationOperationIdentity};
+use eliot_contracts::{OperationId, StateFence};
+use eliot_governor::{
+    CompositionError, GovernorComposition, GrantClosureCanonicalLinkPort, KernelGenerationPort,
+    KernelGenerationSnapshotProvider, ResumedClosureSecondPhase,
+};
+use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, GrantClosureState};
 use eliot_store_api::REVOCATION_HISTORY_MAX_RECORDS;
 
@@ -316,6 +327,74 @@ impl AuthorityRevocationIngressReport {
             .filter(|row| !row.admission.is_admitted())
             .count()
     }
+}
+
+/// Drives one owner-admitted pending second phase through the Governor
+/// second-phase-only resume entry (issue #2100, audit 5924750035 items 2, 3).
+///
+/// This is the call-site that wires the handoff's admitted path to the entry:
+/// it accepts exactly what the handoff tenders — one [`PendingRevocationAdmission`]
+/// row — and hands an admitted row to the Governor second-phase-only resume
+/// entry
+/// ([`GovernorComposition::resume_pending_second_phase`](eliot_governor::GovernorComposition::resume_pending_second_phase)).
+/// It never calls `revoke_grant`, never presents to a fresh Kernel-first
+/// saga, opens no second graph or ledger, and touches no ORS or Store client:
+/// the durable link travels as the existing transport-neutral
+/// [`GrantClosureCanonicalLinkPort`](eliot_governor::GrantClosureCanonicalLinkPort)
+/// the caller supplies.
+///
+/// Exact-name agreement (one scheme: the entry consumes exactly what the
+/// handoff tenders, proven by the call below):
+/// - `request`: the handoff's `AdmittedMaintenanceRevocation::request()` is
+///   the entry's `request`;
+/// - `closure`: the owner's committed [`GrantClosureReceipt`] bytes, re-read
+///   verbatim over the authenticated closure-receipt read, are the entry's
+///   `closure`;
+/// - `closure_operation_id`: the handoff's `closure_operation_id` text,
+///   typed by the caller to [`OperationId`] verbatim from the committed bytes
+///   (validation only, never a fresh identity), is the entry's
+///   `closure_operation_id`;
+/// - `canonical_request_identity`, `operation` and `durable_link` travel
+///   under the entry's names and are composed together by the caller from
+///   admitted ingress, never derived from the durable closure.
+///
+/// A [`PendingRevocationAdmission::Refused`] row never drives: it fails this
+/// call closed under its exact refusal and stays pending/recovery-required.
+/// The committed closure this drive reconciles must be the same bytes the
+/// owner admitted; presenting mismatched bytes refuses inside the entry's
+/// binding predicate instead of recording a second result.
+pub async fn drive_admitted_pending_second_phase<P, L>(
+    governor: &mut GovernorComposition<P>,
+    durable_link: &L,
+    admission: &PendingRevocationAdmission,
+    closure: &GrantClosureReceipt,
+    closure_operation_id: &OperationId,
+    canonical_request_identity: &RequestIdentity,
+    operation: &RevocationOperationIdentity,
+) -> Result<ResumedClosureSecondPhase, CompositionError>
+where
+    P: KernelGenerationPort + ?Sized,
+    L: GrantClosureCanonicalLinkPort + ?Sized,
+{
+    let admitted = match admission {
+        PendingRevocationAdmission::Admitted(admitted) => admitted,
+        PendingRevocationAdmission::Refused { reason } => {
+            return Err(CompositionError::Recovery(format!(
+                "pending canonical second phase is owner-refused ({reason}); \
+                 it stays pending and never drives a resume"
+            )));
+        }
+    };
+    governor
+        .resume_pending_second_phase(
+            admitted.request(),
+            closure,
+            closure_operation_id,
+            canonical_request_identity,
+            operation,
+            durable_link,
+        )
+        .await
 }
 
 /// Captures the exact admitted authority state one ingress pass reads from.

@@ -27,7 +27,8 @@ pub use root_transition::{
 pub use activation::{
     GrantActivationRequest, GrantRevocationRequest, IntroductionActivationRequest,
     IntroductionRevocationRequest, P07AuthorityPort, P07PortError, P07RefusalCause,
-    P07RefusalDirective, UnavailableP07AuthorityPort,
+    P07RefusalDirective, UnavailableP07AuthorityPort, check_resume_closure_binds_request,
+    check_second_phase_link_binds_closure,
 };
 pub use break_glass::{
     BreakGlassAuthorization, BreakGlassAuthorizationId, BreakGlassPermit, BreakGlassState,

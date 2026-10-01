@@ -48,11 +48,12 @@ use crate::{
     QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
 };
 use eliot_authority::{
-    CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
-    GrantStatus, IntroductionActivationRequest, IntroductionId, IntroductionRevocationRequest,
-    IntroductionStatus, P07AuthorityPort, P07PortError, RevocationOperationIdentity,
-    RevocationOrigin, RevocationTransitionDisposition, RevocationTransitionRequest,
-    RootTransitionActivationReceipt, RootTransitionActivationRequest,
+    AuthorityError, CrossRootQuarantineEvidence, GrantActivationRequest, GrantId,
+    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest, IntroductionId,
+    IntroductionRevocationRequest, IntroductionStatus, P07AuthorityPort, P07PortError,
+    RevocationOperationIdentity, RevocationOrigin, RevocationTransitionDisposition,
+    RevocationTransitionRequest, RootTransitionActivationReceipt, RootTransitionActivationRequest,
+    check_resume_closure_binds_request, check_second_phase_link_binds_closure,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
@@ -5247,6 +5248,30 @@ pub struct AuthorityRevocationReconciliation {
     pub closure_projection: GrantClosureSecondPhaseLink,
 }
 
+/// The proved canonical second phase of one already committed grant closure,
+/// resumed without re-striking the Kernel/ORS first phase (issue #2100, audit
+/// 5924750035 item 2).
+///
+/// Unlike [`AuthorityRevocationReconciliation`], this carries no Kernel-issued
+/// first-phase receipt: the resume entry never calls
+/// [`GovernorComposition::revoke_grant`], so it mints no first-phase evidence and re-admits no fenced grant. The
+/// committed [`GrantClosureReceipt`] the caller presents already binds the
+/// Kernel-issued authority receipt reference, and the two values below are
+/// the only evidence the resumed second phase produces. An exact replay of
+/// the same operation returns the same two values through store/ORS
+/// idempotency; changed material under the same identity conflicts there
+/// instead of recording a second result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumedClosureSecondPhase {
+    /// Canonical write receipt proving the second phase committed under the
+    /// ORIGINAL operation/idempotency identity.
+    pub canonical_receipt: WriteReceipt,
+    /// Proved canonical second phase: the ORIGINAL committed first-phase
+    /// closure together with the exact Store-issued receipt durably linked to
+    /// it, as the neutral [`GrantClosureSecondPhaseLink`] carries it.
+    pub closure_projection: GrantClosureSecondPhaseLink,
+}
+
 /// Agent- and Human-facing projection of one retained terminal cold-start
 /// receipt (issue #1790, cold-start surface production type).
 ///
@@ -9863,6 +9888,243 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
     }
 
+    /// Resumes ONLY the canonical second phase of one already committed
+    /// grant-closure revocation (issue #2100, audit 5924750035 items 2, 4, 6).
+    ///
+    /// This is the executing caller of the pure sibling predicate
+    /// [`check_resume_closure_binds_request`](eliot_authority::check_resume_closure_binds_request):
+    /// it accepts the already committed [`GrantClosureReceipt`] together with
+    /// the exact re-admitted [`GrantRevocationRequest`] and the retained
+    /// canonical operation/request identity, proves the binding BEFORE any
+    /// canonical write, and never calls [`Self::revoke_grant`] — the
+    /// Kernel/ORS first phase already fenced the target, and re-striking it
+    /// against an intentionally no-longer-admitted grant is refused by
+    /// construction because there is no call here that could present to P-07.
+    ///
+    /// The `closure_operation_id` parameter is the handoff's own name for this
+    /// value: the daemon's admitted maintenance revocation tenders exactly
+    /// the immutable first-phase closure operation identity the canonical
+    /// write reconciles under (its `closure_operation_id`), and this entry
+    /// consumes it under that same name (one scheme, issue #2100
+    /// integration).
+    ///
+    /// Fail-closed order, all of it ahead of any transport:
+    /// - The composition must be `Ready`; the presented binding State Fence
+    ///   and the admitted canonical request identity must both equal the live
+    ///   composition State Fence. An operation compiled against a superseded
+    ///   generation refuses here instead of reconciling under a different
+    ///   owner snapshot.
+    /// - A retained presentation for the same grant must carry the exact same
+    ///   bytes, and a pending stricter canonical revocation for the same grant
+    ///   must name the same snapshot. Changed content under a retained
+    ///   operation identity returns `IdentityConflict` and performs no
+    ///   transition; the retained record is never cleared by a refusal.
+    /// - The committed closure must validate and must bind the re-admitted
+    ///   decision under the retained canonical operation identity
+    ///   ([`check_resume_closure_binds_request`](eliot_authority::check_resume_closure_binds_request)).
+    ///   A diagnostic tick alone never satisfies this: only the owner's
+    ///   re-admitted decision together with the owner's committed bytes
+    ///   authorizes the second phase.
+    ///
+    /// Everything past admission is the existing second-phase machinery,
+    /// unchanged: the authority graph's own origin-bound re-derivation is
+    /// proven to bind the durable declaration, the canonical envelope is
+    /// compiled from that closure and committed under the ORIGINAL
+    /// operation/idempotency identity, and the Store-issued receipt identity
+    /// is linked to the immutable first-phase row and read back by content.
+    /// `Committed + Success` may link; unknown, partial or non-commit stays
+    /// pending or refused under its exact disposition, and the mechanical
+    /// fence — which already took effect — keeps the grant reporting as
+    /// revoked while the record is retained.
+    ///
+    /// An exact replay of the same operation returns the same second-phase
+    /// result through store/ORS idempotency; changed request, closure, fence,
+    /// graph revision or receipt under the same identity conflicts there
+    /// instead of recording a second result.
+    ///
+    /// Its one production ingress is the daemon's pending-second-phase pass,
+    /// which hands the obligation to this owner only after re-admitting the
+    /// exact operation (a diagnostic tick alone remains non-authoritative).
+    /// No second graph, ledger, authority machine or Store client is
+    /// introduced here.
+    pub async fn resume_pending_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        closure: &GrantClosureReceipt,
+        closure_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
+        durable_link: &L,
+    ) -> Result<ResumedClosureSecondPhase, CompositionError> {
+        self.require_ready_for_authority()?;
+        let live_fence = self.snapshot.state_fence();
+        if request.binding.state_fence != live_fence {
+            return Err(CompositionError::Recovery(
+                "admitted grant revocation resume is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        if canonical_request_identity.request.metadata.state_fence != live_fence {
+            return Err(CompositionError::Provider(
+                "admitted canonical request identity is not bound to the live composition State Fence"
+                    .to_owned(),
+            ));
+        }
+        let presented = PresentedAuthorityRequest::GrantRevocation(request.clone());
+        let ledger_key = presented.ledger_key();
+        if let Some(retained) = self.authority_presentations.get(ledger_key.as_str())
+            && retained.request() != &presented
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        if let Some(pending) = self
+            .pending_canonical_revocations
+            .get(request.grant_id.as_str())
+            && pending.snapshot_id != request.snapshot_id.as_str()
+        {
+            return Err(CompositionError::Authority(P07PortError::IdentityConflict));
+        }
+        // The admitted canonical identity travels as one indivisible bundle —
+        // composed together by the caller from admitted ingress, never derived
+        // from the durable closure — so the prepare step cannot be handed a
+        // mixture of two different operations.
+        let commit = CanonicalRevocationCommit {
+            canonical_operation_id: closure_operation_id,
+            canonical_request_identity,
+            operation,
+        };
+        let resumed = self
+            .resume_committed_closure_second_phase(request, closure, &commit, durable_link)
+            .await;
+        match resumed {
+            Ok(resumed) => {
+                self.pending_canonical_revocations
+                    .remove(request.grant_id.as_str());
+                Ok(resumed)
+            }
+            Err(pending) => {
+                self.pending_canonical_revocations.insert(
+                    request.grant_id.as_str().to_owned(),
+                    PendingCanonicalRevocation {
+                        grant_id: request.grant_id.as_str().to_owned(),
+                        snapshot_id: request.snapshot_id.as_str().to_owned(),
+                        revocation_id: closure.authority_receipt.receipt_id.clone(),
+                        phase: pending.phase,
+                    },
+                );
+                Err(pending.error)
+            }
+        }
+    }
+
+    /// Runs only the canonical second phase for one already committed closure
+    /// and reports which phase refused, so the caller retains a pending
+    /// stricter revocation against the exact Kernel-issued identity.
+    ///
+    /// This method is reached only for a closure whose Kernel/ORS first phase
+    /// already committed, so every refusal here is a refusal to finish a
+    /// handoff whose mechanical fence already took effect. It performs no
+    /// revocation, builds no graph, and holds no closure-source port: the
+    /// closure it reconciles is the owner's committed bytes, proven binding
+    /// before the first canonical write.
+    async fn resume_committed_closure_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        closure: &GrantClosureReceipt,
+        commit: &CanonicalRevocationCommit<'_>,
+        durable_link: &L,
+    ) -> Result<ResumedClosureSecondPhase, PendingCanonicalHandoff> {
+        closure
+            .validate()
+            .map_err(|error| PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::ClosureReadback,
+                error: CompositionError::Owner(error.to_string()),
+            })?;
+        // The binding proof runs BEFORE any canonical write: a closure that is
+        // not Revoked, or that names a different operation identity, target,
+        // snapshot, fence or epoch than the re-admitted decision, never
+        // reaches the store. Identity conflicts stay typed.
+        check_resume_closure_binds_request(
+            request,
+            closure,
+            commit.canonical_operation_id.as_str(),
+        )
+        .map_err(|error| PendingCanonicalHandoff {
+            phase: CanonicalRevocationPhase::ClosureReadback,
+            error: match error {
+                AuthorityError::IdentityConflict => {
+                    CompositionError::Authority(P07PortError::IdentityConflict)
+                }
+                AuthorityError::InvalidField(field) => CompositionError::Recovery(format!(
+                    "committed grant closure does not bind the exact resume request: {field}"
+                )),
+                other => CompositionError::Owner(other.to_string()),
+            },
+        })?;
+        if commit
+            .canonical_request_identity
+            .request
+            .metadata
+            .state_fence
+            != closure.authority.state_fence
+        {
+            return Err(PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::ClosureReadback,
+                error: CompositionError::Recovery(
+                    "committed grant closure fence disagrees with the canonical resume request"
+                        .to_owned(),
+                ),
+            });
+        }
+        // The authority graph's own origin-bound re-derivation at the CURRENT
+        // graph revision must bind the durable declaration this resume is
+        // about to commit; a declaration this graph cannot reproduce refuses
+        // here rather than being written.
+        self.prepare_revocation_transition_for_commit(request, closure, commit)
+            .map_err(|error| PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::ClosureReadback,
+                error,
+            })?;
+        let envelope = authority_revocation_envelope_from_closure(
+            commit.canonical_request_identity,
+            commit.canonical_operation_id,
+            closure,
+        )
+        .map_err(|error| PendingCanonicalHandoff {
+            phase: CanonicalRevocationPhase::CanonicalCommit,
+            error,
+        })?;
+        // Reconciled by the ORIGINAL operation/idempotency identity: the
+        // envelope carries the admitted identities, never re-derived ones, so
+        // an exact replay resolves to the same receipt while changed material
+        // under the same identity conflicts at the store.
+        let canonical_receipt = self
+            .commit_canonical(commit.canonical_request_identity, envelope)
+            .await
+            .map_err(|error| PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::CanonicalCommit,
+                error,
+            })?;
+        // Only a Committed write whose receipt core reports Success may link;
+        // a possible, partial or unknown commit never becomes the recorded
+        // revocation and stays pending under its exact disposition.
+        let receipt_identity = canonical_receipt_identity(&canonical_receipt).map_err(|error| {
+            PendingCanonicalHandoff {
+                phase: CanonicalRevocationPhase::SecondPhaseLink,
+                error,
+            }
+        })?;
+        // The ORIGINAL recorded first-phase operation identity, not a
+        // re-derived or freshly minted one; the read-back is proven by content
+        // through the pure sibling predicate inside.
+        let closure_projection =
+            Self::link_closure_second_phase(durable_link, closure, &receipt_identity)?;
+        Ok(ResumedClosureSecondPhase {
+            canonical_receipt,
+            closure_projection,
+        })
+    }
+
     /// Runs only the canonical second phase of the grant-revocation saga and
     /// reports which phase refused, so the caller can retain a pending
     /// stricter revocation against the exact Kernel-issued identity.
@@ -9998,8 +10260,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// read-back is compared by CONTENT on the owner's committed bytes, never
     /// by existence and never by shape: the linked operation identity, the
     /// whole declared closure membership, and the exact linked canonical
-    /// receipt. A disagreement is the second-phase refusal the saga retains a
-    /// pending stricter revocation for.
+    /// receipt. That comparison is the pure sibling predicate
+    /// [`check_second_phase_link_binds_closure`](eliot_authority::check_second_phase_link_binds_closure),
+    /// so both the fresh saga and the second-phase-only resume prove the same
+    /// content binding. A disagreement is the second-phase refusal the saga
+    /// retains a pending stricter revocation for.
     fn link_closure_second_phase<L: GrantClosureCanonicalLinkPort + ?Sized>(
         durable_link: &L,
         closure: &GrantClosureReceipt,
@@ -10011,18 +10276,19 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 phase: CanonicalRevocationPhase::SecondPhaseLink,
                 error: CompositionError::Owner(error.to_string()),
             })?;
-        if closure_projection.closure().operation_id != closure.operation_id
-            || closure_projection.closure().declaration != closure.declaration
-            || closure_projection.canonical_receipt() != receipt_identity
-        {
-            return Err(PendingCanonicalHandoff {
-                phase: CanonicalRevocationPhase::SecondPhaseLink,
-                error: CompositionError::Recovery(
-                    "durable second-phase readback does not bind the canonical closure receipt"
-                        .to_owned(),
-                ),
-            });
-        }
+        check_second_phase_link_binds_closure(
+            closure,
+            receipt_identity,
+            closure_projection.closure(),
+            closure_projection.canonical_receipt(),
+        )
+        .map_err(|_| PendingCanonicalHandoff {
+            phase: CanonicalRevocationPhase::SecondPhaseLink,
+            error: CompositionError::Recovery(
+                "durable second-phase readback does not bind the canonical closure receipt"
+                    .to_owned(),
+            ),
+        })?;
         Ok(closure_projection)
     }
 
