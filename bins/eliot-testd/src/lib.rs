@@ -45,6 +45,7 @@ pub use eliot_testd_core::{
 };
 
 pub mod kernel_client;
+pub mod blob_readback;
 pub mod testd_material;
 pub mod worker;
 pub use kernel_client::{
