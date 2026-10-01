@@ -114,7 +114,13 @@ fn fixture_schema_identity(label: &str) -> eliot_contracts::ContractIdentity {
 }
 
 fn fence() -> StateFence {
-    StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
+    // I3.6 requires staffing and route mix to follow current policy. This fixture
+    // uses the explicit genesis policy revision; it does not stand in for live
+    // policy evidence (`docs/architecture/I03-06-model-route-and-portfolio-policy.md`).
+    StateFence {
+        policy_revision: Some(PolicyRevision::genesis()),
+        ..StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
+    }
 }
 
 fn full_fence() -> StateFence {
@@ -163,10 +169,13 @@ fn coordinator(
     AgentCoordinator::with_provider(cfg, Box::new(verifier(proofs, 0)))
 }
 
-fn admitted_capability(minimum_sequence: u64) -> TestResult<AdmittedProviderCapability> {
+fn admitted_capability(tag: &str, minimum_sequence: u64) -> TestResult<AdmittedProviderCapability> {
     admitted_capability_for(
         provider_identity(),
         false,
+        &format!("claim-{tag}"),
+        &format!("attempt-{tag}-0"),
+        &format!("op-{tag}"),
         "route-rev-7",
         "capacity-rev-3",
         "route-rev-7",
@@ -178,10 +187,12 @@ fn admitted_capability(minimum_sequence: u64) -> TestResult<AdmittedProviderCapa
 }
 
 /// Builds daemon-supplied Kernel admission from exact owner records through the
-/// owner-witnessed factory: the loaded row repeats the presented identities
-/// and digests exactly as the daemon's ORS read projection would return them.
-/// Every digest is recomputed here with the same `sha256_hex` validator the
-/// verifier uses; no canned pass value is hardcoded.
+/// owner-witnessed factory: the loaded row repeats the presented identities,
+/// material digests, generation, and full fence digest for this fixture's
+/// exact claim/attempt/operation tuple, as the daemon's ORS read projection
+/// must. The material digests are computed from the controlled owner fixture
+/// inputs; currentness still comes from the separately supplied expectation
+/// and live-fence values.
 #[allow(
     clippy::too_many_arguments,
     reason = "the test fixture mirrors the admitted capability's flat owner tuple one-to-one"
@@ -189,6 +200,9 @@ fn admitted_capability(minimum_sequence: u64) -> TestResult<AdmittedProviderCapa
 fn admitted_capability_for(
     identity: ProviderIdentity,
     revoked: bool,
+    claim_id: &str,
+    attempt_id: &str,
+    operation_id: &str,
     route_revision: &str,
     capacity_revision: &str,
     current_route_revision: &str,
@@ -197,14 +211,29 @@ fn admitted_capability_for(
     live_sequence: u64,
     minimum_sequence: u64,
 ) -> TestResult<AdmittedProviderCapability> {
-    let _ = live_sequence;
     let presented_fence = fence();
+    let binding_material = canonical_json_bytes(&serde_json::json!({
+        "claim_id": claim_id,
+        "attempt_id": attempt_id,
+        "operation_id": operation_id,
+        "owner_material": "fixture-binding"
+    }))
+    .map_err(|error| format!("fixture binding material must serialize: {error}"))?;
+    let executable_material = canonical_json_bytes(&serde_json::json!({
+        "claim_id": claim_id,
+        "attempt_id": attempt_id,
+        "operation_id": operation_id,
+        "owner_material": "fixture-executable"
+    }))
+    .map_err(|error| format!("fixture executable material must serialize: {error}"))?;
+    let binding_digest = sha256_hex(&binding_material);
+    let executable_digest = sha256_hex(&executable_material);
     let loaded = OwnerLoadedClaimRow::new(
-        "claim-t9-05-1".to_owned(),
-        "attempt-t9-05-1".to_owned(),
-        "op-t9-05-1".to_owned(),
-        sha256_hex(b"claim-binding-material-t9-05-1"),
-        sha256_hex(b"executable-material-t9-05-1"),
+        claim_id.to_owned(),
+        attempt_id.to_owned(),
+        operation_id.to_owned(),
+        binding_digest.clone(),
+        executable_digest.clone(),
         1,
         sha256_hex(
             &canonical_json_bytes(&presented_fence)
@@ -212,13 +241,15 @@ fn admitted_capability_for(
         ),
     )?;
     let factory = AdmittedProviderFactory::new(loaded);
+    let mut live_fence = fence();
+    live_fence.authority_epoch = test_epoch(TEST_LINEAGE_A, live_sequence);
     Ok(factory.admit(
         identity,
-        "claim-t9-05-1".to_owned(),
-        "attempt-t9-05-1".to_owned(),
-        "op-t9-05-1".to_owned(),
-        sha256_hex(b"claim-binding-material-t9-05-1"),
-        sha256_hex(b"executable-material-t9-05-1"),
+        claim_id.to_owned(),
+        attempt_id.to_owned(),
+        operation_id.to_owned(),
+        binding_digest,
+        executable_digest,
         route_revision.to_owned(),
         capacity_revision.to_owned(),
         1,
@@ -229,16 +260,16 @@ fn admitted_capability_for(
             live_authority_epoch: test_epoch(TEST_LINEAGE_A, expectation_sequence),
             revoked,
         },
-        fence(),
+        live_fence,
         None,
         minimum_sequence,
     )?)
 }
 
-fn production_coordinator(cfg: CoordinatorConfig) -> TestResult<AgentCoordinator> {
+fn production_coordinator(cfg: CoordinatorConfig, tag: &str) -> TestResult<AgentCoordinator> {
     Ok(AgentCoordinator::new_with_admitted_provider(
         cfg,
-        admitted_capability(0)?,
+        admitted_capability(tag, 0)?,
     )?)
 }
 
@@ -598,6 +629,12 @@ fn zero_digest() -> TestResult<LowercaseSha256> {
     ))?)
 }
 
+fn start_request_digest(binding: &ProviderExecutionBinding) -> TestResult<LowercaseSha256> {
+    Ok(serde_json::from_value(serde_json::json!(
+        binding.start_request_sha256.clone()
+    ))?)
+}
+
 fn stored_admission_digest(lane: &AdmittedLaneReceipt) -> TestResult<LowercaseSha256> {
     // S5 linkage: the observation must reference the stored admission's
     // self_digest. Legacy lanes without stored admission fall back to the
@@ -633,7 +670,7 @@ fn matched_observation(
         route_state: RouteObservationState::Matched,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::Observed,
-        request_digest: zero_digest()?,
+        request_digest: start_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -682,7 +719,7 @@ fn unknown_observation(
         route_state: RouteObservationState::Matched,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::UnknownOutcome,
-        request_digest: zero_digest()?,
+        request_digest: start_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -873,6 +910,7 @@ fn unknown_outcome_retains_writer_until_authenticated_reconciliation() -> TestRe
         config(3, 3),
         &[
             "proof-admission-unknown",
+            "proof-bind-unknown",
             "proof-result-unknown",
             "proof-unknown-unknown",
             "proof-admission-after",
@@ -894,7 +932,9 @@ fn unknown_outcome_retains_writer_until_authenticated_reconciliation() -> TestRe
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let result = result_submission("unknown", &lane, ResultDisposition::UnknownOutcome)?;
+    let stored = bind_result_fixture(&mut coordinator, &context, &lane, "unknown")?;
+    let mut result = result_submission("unknown", &lane, ResultDisposition::UnknownOutcome)?;
+    use_result_binding(&mut result, &stored)?;
     let submission_id = result.submission_id.clone();
     coordinator.submit_result(context.clone(), result)?;
     assert_eq!(
@@ -1301,6 +1341,8 @@ fn descendant_closure_matches_runtime_before_parent_complete_candidate() -> Test
     let proofs = [
         "proof-admission-parent",
         "proof-admission-child",
+        "proof-bind-parent",
+        "proof-bind-child",
         "proof-result-child",
         "proof-result-parent",
     ];
@@ -1337,15 +1379,20 @@ fn descendant_closure_matches_runtime_before_parent_complete_candidate() -> Test
     let child_context = ExecutionContext::from(&child);
     let child_lane = child.admitted_lanes[0].clone();
     coordinator.start_attempt(child_context.clone(), child_lane.attempt_id.clone())?;
-    coordinator.submit_result(
-        child_context,
-        result_submission("child", &child_lane, ResultDisposition::CandidateSucceeded)?,
-    )?;
-    let parent_result = result_submission(
+    let child_binding =
+        bind_result_fixture(&mut coordinator, &child_context, &child_lane, "child")?;
+    let mut child_result =
+        result_submission("child", &child_lane, ResultDisposition::CandidateSucceeded)?;
+    use_result_binding(&mut child_result, &child_binding)?;
+    coordinator.submit_result(child_context, child_result)?;
+    let parent_binding =
+        bind_result_fixture(&mut coordinator, &parent_context, &parent_lane, "parent")?;
+    let mut parent_result = result_submission(
         "parent",
         &parent_lane,
         ResultDisposition::CandidateSucceeded,
     )?;
+    use_result_binding(&mut parent_result, &parent_binding)?;
     assert_eq!(
         coordinator.submit_result(parent_context.clone(), parent_result.clone()),
         Err(CoordinatorError::IncompleteDescendantClosure)
@@ -1731,7 +1778,11 @@ fn coordinator_case_16_snapshot_v3_and_v4_legacy_fence_reject_before_replay() ->
 fn coordinator_case_17_candidate_disposition_is_candidate_only_and_capped() -> TestResult {
     let mut coordinator = coordinator(
         config(2, 2),
-        &["proof-admission-case-17", "proof-result-case-17"],
+        &[
+            "proof-admission-case-17",
+            "proof-bind-case-17",
+            "proof-result-case-17",
+        ],
     )?;
     let admitted = plan_and_admit(
         &mut coordinator,
@@ -1749,7 +1800,9 @@ fn coordinator_case_17_candidate_disposition_is_candidate_only_and_capped() -> T
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let result = result_submission("case-17", &lane, ResultDisposition::CandidateSucceeded)?;
+    let stored = bind_result_fixture(&mut coordinator, &context, &lane, "case-17")?;
+    let mut result = result_submission("case-17", &lane, ResultDisposition::CandidateSucceeded)?;
+    use_result_binding(&mut result, &stored)?;
     let receipt = coordinator.submit_result(context, result)?;
     assert_eq!(
         receipt.proof_ceiling(),
@@ -1767,10 +1820,11 @@ fn coordinator_case_17_candidate_disposition_is_candidate_only_and_capped() -> T
     // Serialized receipt is candidate-only.
     let wire = serde_json::to_value(&receipt)?;
     assert_eq!(wire["provider_disposition"], "CANDIDATE_SUCCEEDED");
-    // No conversion path exists to FinishDecisionOutcome::VerifiedComplete.
-    let source = include_str!("core.rs");
-    assert!(!source.contains("FinishDecision"));
-    assert!(!source.contains("VerifiedComplete"));
+    // Issue #370 S5 and the Coordinator candidate-only contract fix this
+    // receipt's ceiling at CandidateArtifact; assert the serialized contract
+    // directly instead of inspecting unrelated source identifiers.
+    assert_eq!(wire["proof_ceiling"], "CANDIDATE_ARTIFACT");
+    assert!(wire.get("finish_decision").is_none());
     Ok(())
 }
 
@@ -1838,7 +1892,11 @@ fn coordinator_case_18_legacy_verified_complete_and_effect_receipts_rejected() -
 
 #[test]
 fn coordinator_case_19_replay_conflict_and_snapshot_forgery_fail_closed() -> TestResult {
-    let proofs = ["proof-admission-case-19", "proof-result-case-19"];
+    let proofs = [
+        "proof-admission-case-19",
+        "proof-bind-case-19",
+        "proof-result-case-19",
+    ];
     let mut coordinator = coordinator(config(2, 2), &proofs)?;
     let admitted = plan_and_admit(
         &mut coordinator,
@@ -1856,7 +1914,9 @@ fn coordinator_case_19_replay_conflict_and_snapshot_forgery_fail_closed() -> Tes
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let first = result_submission("case-19", &lane, ResultDisposition::CandidateSucceeded)?;
+    let stored = bind_result_fixture(&mut coordinator, &context, &lane, "case-19")?;
+    let mut first = result_submission("case-19", &lane, ResultDisposition::CandidateSucceeded)?;
+    use_result_binding(&mut first, &stored)?;
     let first_id = first.submission_id.clone();
     let first_route = first.result.actual_route.clone();
     coordinator.submit_result(context.clone(), first)?;
@@ -1869,6 +1929,7 @@ fn coordinator_case_19_replay_conflict_and_snapshot_forgery_fail_closed() -> Tes
     // Same identity with different bytes (different disposition) is a conflict.
     let mut conflict = result_submission("case-19", &lane, ResultDisposition::Partial)?;
     conflict.submission_id = first_id.clone();
+    use_result_binding(&mut conflict, &stored)?;
     assert_eq!(
         coordinator.submit_result(context.clone(), conflict).err(),
         Some(CoordinatorError::IdempotencyConflict)
@@ -1901,6 +1962,8 @@ fn coordinator_case_20_parent_closure_is_candidate_only_and_requires_descendant_
     let proofs = [
         "proof-admission-parent-20",
         "proof-admission-child-20",
+        "proof-bind-parent-20",
+        "proof-bind-child-20",
         "proof-result-child-20",
         "proof-result-parent-20",
     ];
@@ -1937,20 +2000,24 @@ fn coordinator_case_20_parent_closure_is_candidate_only_and_requires_descendant_
     let child_context = ExecutionContext::from(&child);
     let child_lane = child.admitted_lanes[0].clone();
     coordinator.start_attempt(child_context.clone(), child_lane.attempt_id.clone())?;
-    coordinator.submit_result(
-        child_context,
-        result_submission(
-            "child-20",
-            &child_lane,
-            ResultDisposition::CandidateSucceeded,
-        )?,
+    let child_binding =
+        bind_result_fixture(&mut coordinator, &child_context, &child_lane, "child-20")?;
+    let mut child_result = result_submission(
+        "child-20",
+        &child_lane,
+        ResultDisposition::CandidateSucceeded,
     )?;
+    use_result_binding(&mut child_result, &child_binding)?;
+    coordinator.submit_result(child_context, child_result)?;
     // Parent candidate success without descendant closure must fail.
-    let parent_result = result_submission(
+    let parent_binding =
+        bind_result_fixture(&mut coordinator, &parent_context, &parent_lane, "parent-20")?;
+    let mut parent_result = result_submission(
         "parent-20",
         &parent_lane,
         ResultDisposition::CandidateSucceeded,
     )?;
+    use_result_binding(&mut parent_result, &parent_binding)?;
     assert_eq!(
         coordinator
             .submit_result(parent_context.clone(), parent_result.clone())
@@ -2142,6 +2209,42 @@ fn binding_submission(
         provider_identity: provider_identity(),
         provider_start_receipt_ref: format!("proof-bind-{tag}"),
     })
+}
+
+/// Test-only owner binding for result-intake scenarios. Each fixture persists
+/// a distinct execution unit through `bind_provider_execution` before it
+/// submits a result; this mirrors the production intake requirement that the
+/// exact stored binding, not the caller-presented observation, anchors result
+/// identity (`core.rs::validate_result_intake_binding`).
+fn bind_result_fixture(
+    coordinator: &mut AgentCoordinator,
+    context: &ExecutionContext,
+    lane: &AdmittedLaneReceipt,
+    tag: &str,
+) -> TestResult<ProviderExecutionBinding> {
+    let mut binding = observation_binding(lane)?;
+    binding.provider_scope_ref = format!("scope:{tag}");
+    binding.execution_unit = ExecutionUnit::new("test-provider", format!("unit-{tag}"))?;
+    binding.start_request_id = RequestId::new(format!("req-{tag}"))?;
+    binding.start_request_sha256 = sha256_hex(format!("request-{tag}").as_bytes());
+    Ok(coordinator.bind_provider_execution(
+        context.clone(),
+        ProviderExecutionBindingSubmission {
+            binding,
+            provider_identity: provider_identity(),
+            provider_start_receipt_ref: format!("proof-bind-{tag}"),
+        },
+    )?)
+}
+
+fn use_result_binding(
+    submission: &mut ResultSubmission,
+    binding: &ProviderExecutionBinding,
+) -> TestResult<()> {
+    submission.result.actual_route.binding = binding.clone();
+    submission.result.actual_route.request_digest = start_request_digest(binding)?;
+    submission.result.actual_route.self_digest = submission.result.actual_route.compute_digest()?;
+    Ok(())
 }
 
 fn bind_lane_spec<'a>(work: &'a str, role: &'a str, route: &'a str) -> LaneSpec<'a> {
@@ -2413,7 +2516,7 @@ fn diverged_observation(
         route_state: RouteObservationState::Diverged,
         diverged_fields: diverged,
         execution_outcome: ExecutionOutcome::Observed,
-        request_digest: zero.clone(),
+        request_digest: start_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -2464,7 +2567,7 @@ fn unobserved_observation(
         route_state: RouteObservationState::Unobserved,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::UnknownOutcome,
-        request_digest: zero.clone(),
+        request_digest: start_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -2496,7 +2599,11 @@ fn unobserved_observation(
 fn diverged_observation_is_retained_with_capped_ceiling() -> TestResult {
     let mut coordinator = coordinator(
         config(2, 2),
-        &["proof-admission-diverged", "proof-result-diverged"],
+        &[
+            "proof-admission-diverged",
+            "proof-bind-diverged",
+            "proof-result-diverged",
+        ],
     )?;
     let admitted = plan_and_admit(
         &mut coordinator,
@@ -2514,7 +2621,7 @@ fn diverged_observation_is_retained_with_capped_ceiling() -> TestResult {
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let binding = observation_binding(&lane)?;
+    let binding = bind_result_fixture(&mut coordinator, &context, &lane, "diverged")?;
     let observed = route("b");
     let mut submission = result_submission("diverged", &lane, ResultDisposition::Partial)?;
     submission.provider_result_receipt_ref = "proof-result-diverged".to_owned();
@@ -2539,7 +2646,11 @@ fn diverged_observation_is_retained_with_capped_ceiling() -> TestResult {
 fn unobserved_observation_is_retained_with_capped_ceiling() -> TestResult {
     let mut coordinator = coordinator(
         config(2, 2),
-        &["proof-admission-unobserved", "proof-result-unobserved"],
+        &[
+            "proof-admission-unobserved",
+            "proof-bind-unobserved",
+            "proof-result-unobserved",
+        ],
     )?;
     let admitted = plan_and_admit(
         &mut coordinator,
@@ -2557,10 +2668,11 @@ fn unobserved_observation_is_retained_with_capped_ceiling() -> TestResult {
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let binding = observation_binding(&lane)?;
+    let binding = bind_result_fixture(&mut coordinator, &context, &lane, "unobserved")?;
     let mut submission = result_submission("unobserved", &lane, ResultDisposition::UnknownOutcome)?;
     submission.provider_result_receipt_ref = "proof-result-unobserved".to_owned();
     submission.result.actual_route = unobserved_observation(&lane, &binding)?;
+    use_result_binding(&mut submission, &binding)?;
     submission.result.unknown_reason = Some("provider outcome unresolved".to_owned());
     let receipt = coordinator.submit_result(context, submission)?;
     assert_eq!(
@@ -2620,7 +2732,11 @@ fn mismatched_requested_route_rejects_as_invalid_candidate() -> TestResult {
 fn forged_binding_rejects_at_intake() -> TestResult {
     let mut coordinator = coordinator(
         config(2, 2),
-        &["proof-admission-forged", "proof-result-forged"],
+        &[
+            "proof-admission-forged",
+            "proof-bind-forged",
+            "proof-result-forged",
+        ],
     )?;
     let admitted = plan_and_admit(
         &mut coordinator,
@@ -2638,15 +2754,33 @@ fn forged_binding_rejects_at_intake() -> TestResult {
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let stored = bind_result_fixture(&mut coordinator, &context, &lane, "forged")?;
+    // A correct full binding does not allow a presentation to substitute a
+    // different request commitment. Result intake must use the digest retained
+    // on the owner-issued start binding, not a receipt or fixture-local hash.
+    let mut wrong_request = result_submission("forged", &lane, ResultDisposition::Partial)?;
+    wrong_request.provider_result_receipt_ref = "proof-result-forged".to_owned();
+    use_result_binding(&mut wrong_request, &stored)?;
+    wrong_request.result.actual_route.request_digest = zero_digest()?;
+    wrong_request.result.actual_route.self_digest =
+        wrong_request.result.actual_route.compute_digest()?;
+    let events_before_wrong_request = coordinator.events().len();
+    assert_eq!(
+        coordinator
+            .submit_result(context.clone(), wrong_request)
+            .err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    assert_eq!(coordinator.events().len(), events_before_wrong_request);
     // Forge the lease: the presented binding no longer agrees with the
     // admitted attempt on the exact typed lease, so intake fails closed.
-    let mut binding = observation_binding(&lane)?;
+    let mut binding = stored;
     binding.lease_id = serde_json::from_value::<WorkLeaseId>(
         serde_json::json!({"namespace": "eliot.governor.work-lease", "revision": "v1", "value": "lease-forged"}),
     )?;
     let mut submission = result_submission("forged", &lane, ResultDisposition::Partial)?;
     submission.provider_result_receipt_ref = "proof-result-forged".to_owned();
-    let mut observation = matched_observation(&lane, &observation_binding(&lane)?)?;
+    let mut observation = matched_observation(&lane, &binding)?;
     observation.binding = binding;
     observation.self_digest = observation.compute_digest()?;
     submission.result.actual_route = observation;
@@ -2688,6 +2822,8 @@ fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult 
     // and a forged admitted_route_digest fails closed.
     let proofs = [
         "proof-admission-s5a",
+        "proof-bind-s5a-0",
+        "proof-bind-s5a-1",
         "proof-result-s5a-0",
         "proof-result-s5a-1-forged",
     ];
@@ -2730,6 +2866,8 @@ fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult 
     let second = admitted.admitted_lanes[1].clone();
     coordinator.start_attempt(context.clone(), first.attempt_id.clone())?;
     coordinator.start_attempt(context.clone(), second.attempt_id.clone())?;
+    let first_binding = bind_result_fixture(&mut coordinator, &context, &first, "s5a-0")?;
+    let second_binding = bind_result_fixture(&mut coordinator, &context, &second, "s5a-1")?;
     // Snapshot round-trip preserves the stored decision; restore-then-submit
     // still closes.
     let snapshot = coordinator.snapshot()?;
@@ -2745,7 +2883,8 @@ fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult 
             .admitted_route,
         first.admitted_route
     );
-    let happy = result_submission("s5a-0", &first, ResultDisposition::Partial)?;
+    let mut happy = result_submission("s5a-0", &first, ResultDisposition::Partial)?;
+    use_result_binding(&mut happy, &first_binding)?;
     let receipt = restored.submit_result(context.clone(), happy)?;
     assert_eq!(
         receipt.proof_ceiling(),
@@ -2755,6 +2894,7 @@ fn s5_stored_admission_closes_binding_and_forged_digest_rejects() -> TestResult 
     // the stored self_digest. Shape still validates (recomputed self_digest)
     // so only the admission linkage can fail.
     let mut forged = result_submission("s5a-1-forged", &second, ResultDisposition::Partial)?;
+    use_result_binding(&mut forged, &second_binding)?;
     forged.result.actual_route.admitted_route_digest = zero_digest()?;
     forged.result.actual_route.self_digest = forged.result.actual_route.compute_digest()?;
     assert_eq!(
@@ -2771,6 +2911,8 @@ fn s5_foreign_turn_binding_admission_triple_mismatch_rejects() -> TestResult {
     // rejected as mismatch).
     let proofs = [
         "proof-admission-s5b",
+        "proof-bind-s5b-0",
+        "proof-bind-s5b-1",
         "proof-result-s5b-foreign-bind",
         "proof-result-s5b-foreign-digest",
     ];
@@ -2803,14 +2945,13 @@ fn s5_foreign_turn_binding_admission_triple_mismatch_rejects() -> TestResult {
     let lane_b = admitted.admitted_lanes[1].clone();
     coordinator.start_attempt(context.clone(), lane_a.attempt_id.clone())?;
     coordinator.start_attempt(context.clone(), lane_b.attempt_id.clone())?;
+    let binding_a = bind_result_fixture(&mut coordinator, &context, &lane_a, "s5b-0")?;
+    let binding_b = bind_result_fixture(&mut coordinator, &context, &lane_b, "s5b-1")?;
     // Foreign turn: result names attempt A but the embedded binding is B's
     // unit (different attempt/lease). Intake fails closed.
-    let binding_b = observation_binding(&lane_b)?;
     let mut foreign_bind =
         result_submission("s5b-foreign-bind", &lane_a, ResultDisposition::Partial)?;
-    foreign_bind.result.actual_route.binding = binding_b;
-    foreign_bind.result.actual_route.self_digest =
-        foreign_bind.result.actual_route.compute_digest()?;
+    use_result_binding(&mut foreign_bind, &binding_b)?;
     assert_eq!(
         coordinator
             .submit_result(context.clone(), foreign_bind)
@@ -2827,6 +2968,7 @@ fn s5_foreign_turn_binding_admission_triple_mismatch_rejects() -> TestResult {
         .clone();
     let mut foreign_digest_sub =
         result_submission("s5b-foreign-digest", &lane_a, ResultDisposition::Partial)?;
+    use_result_binding(&mut foreign_digest_sub, &binding_a)?;
     foreign_digest_sub.result.actual_route.admitted_route_digest = foreign_digest;
     foreign_digest_sub.result.actual_route.self_digest =
         foreign_digest_sub.result.actual_route.compute_digest()?;
@@ -2841,7 +2983,10 @@ fn s5_foreign_turn_binding_admission_triple_mismatch_rejects() -> TestResult {
 fn s5_per_effect_attempt_mismatch_rejects() -> TestResult {
     // Reachable via submit_result: the effect itself satisfies the ceiling
     // so only the S5 per-effect attempt linkage can fail.
-    let mut coordinator = coordinator(config(2, 2), &["proof-admission-s5c", "proof-result-s5c"])?;
+    let mut coordinator = coordinator(
+        config(2, 2),
+        &["proof-admission-s5c", "proof-bind-s5c", "proof-result-s5c"],
+    )?;
     let admitted = plan_and_admit(
         &mut coordinator,
         "s5c",
@@ -2858,7 +3003,9 @@ fn s5_per_effect_attempt_mismatch_rejects() -> TestResult {
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
+    let stored = bind_result_fixture(&mut coordinator, &context, &lane, "s5c")?;
     let mut submission = result_submission("s5c", &lane, ResultDisposition::Partial)?;
+    use_result_binding(&mut submission, &stored)?;
     let foreign_effect = ProposedEffect {
         effect_id: "effect-s5c-1".to_owned(),
         attempt_id: AttemptId::new("attempt-s5c-foreign")?,
@@ -2882,7 +3029,10 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
     // Legacy `None` (pre-S5 wire) and reassigned attempts (new identity
     // awaiting a new external decision) both fail closed at intake with the
     // admission owner named, never silently upgraded.
-    let mut legacy = coordinator(config(2, 2), &["proof-admission-s5d", "proof-result-s5d"])?;
+    let mut legacy = coordinator(
+        config(2, 2),
+        &["proof-admission-s5d", "proof-bind-s5d", "proof-result-s5d"],
+    )?;
     let candidate = legacy.plan(request(
         "s5d",
         &[LaneSpec {
@@ -2908,7 +3058,9 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
         None
     );
     legacy.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let submission = result_submission("s5d", &lane, ResultDisposition::Partial)?;
+    let stored = bind_result_fixture(&mut legacy, &context, &lane, "s5d")?;
+    let mut submission = result_submission("s5d", &lane, ResultDisposition::Partial)?;
+    use_result_binding(&mut submission, &stored)?;
     assert_eq!(
         legacy.submit_result(context, submission).err(),
         Some(CoordinatorError::IdentityConflict("admitted_route"))
@@ -2917,6 +3069,7 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
     // Reassigned attempt: new identity starts unresolved.
     let proofs = [
         "proof-admission-s5e",
+        "proof-bind-s5e-new",
         "proof-fence-s5e",
         "proof-reassign-s5e",
         "proof-result-s5e-new",
@@ -2986,8 +3139,10 @@ fn s5_missing_stored_admission_and_reassigned_stays_unresolved() -> TestResult {
         mutation_scope: reassigned.mutation_scope.clone(),
         admitted_route: None,
     };
+    let stored = bind_result_fixture(&mut coordinator, &context, &fake_lane, "s5e-new")?;
     let mut submission = result_submission("s5e-new", &fake_lane, ResultDisposition::Partial)?;
     submission.provider_result_receipt_ref = "proof-result-s5e-new".to_owned();
+    use_result_binding(&mut submission, &stored)?;
     assert_eq!(
         coordinator.submit_result(context, submission).err(),
         Some(CoordinatorError::IdentityConflict("admitted_route"))
@@ -3599,7 +3754,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     // snapshot only; the installed durable commit remains controller track
     // and no `Store` commit is invented here.
     let cfg = config(4, 4);
-    let mut coordinator = production_coordinator(cfg.clone())?;
+    let mut coordinator = production_coordinator(cfg.clone(), "e2e-observe")?;
     let admitted = plan_and_admit(
         &mut coordinator,
         "e2e-observe",
@@ -3642,7 +3797,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     let mut coordinator = AgentCoordinator::restore_with_admitted_provider(
         pre_snapshot.clone(),
         cfg.clone(),
-        admitted_capability(pre_snapshot.event_sequence)?,
+        admitted_capability("e2e-observe", pre_snapshot.event_sequence)?,
     )?;
     assert_eq!(coordinator.events().len(), event_count_before);
     // Replay once: accepted exactly once, never duplicated.
@@ -3656,7 +3811,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     let mut restored = AgentCoordinator::restore_with_admitted_provider(
         durable.clone(),
         cfg.clone(),
-        admitted_capability(durable.event_sequence)?,
+        admitted_capability("e2e-observe", durable.event_sequence)?,
     )?;
     assert_eq!(restored.events(), coordinator.events());
     restored.observe_provider_event(context.clone(), envelope.clone(), receipt.clone())?;
@@ -3699,7 +3854,14 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     // The replays synthesized no usage/result: exact intake still closes
     // exactly once, and a second intake is a duplicate.
     let mut submission = result_submission("e2e-observe", &lane, ResultDisposition::Partial)?;
-    submission.result.actual_route = matched_observation(&lane, &stored)?;
+    let mut actual = matched_observation(&lane, &stored)?;
+    // Issue #369 A31/W34 requires result intake to extend the accepted host
+    // event boundary and retain its cursor: sequence 2 follows event 1.
+    actual.event_sequence = 2;
+    actual.event_cursor = EventCursor::new("cursor-e2e-1")?;
+    actual.self_digest = actual.compute_digest()?;
+    actual.validate()?;
+    submission.result.actual_route = actual;
     let intake = restored.submit_result(context.clone(), submission)?;
     assert_eq!(
         intake.proof_ceiling(),
@@ -3716,7 +3878,7 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
 
 #[test]
 fn production_verifier_admits_binds_and_accepts_result() -> TestResult {
-    let mut coordinator = production_coordinator(config(4, 4))?;
+    let mut coordinator = production_coordinator(config(4, 4), "prod-abr")?;
     let admitted = plan_and_admit(
         &mut coordinator,
         "prod-abr",
@@ -3750,7 +3912,7 @@ fn production_verifier_admits_binds_and_accepts_result() -> TestResult {
 
 #[test]
 fn production_verifier_reconciles_cancellation() -> TestResult {
-    let mut coordinator = production_coordinator(config(2, 2))?;
+    let mut coordinator = production_coordinator(config(2, 2), "prod-cancel")?;
     let admitted = plan_and_admit(
         &mut coordinator,
         "prod-cancel",
@@ -3764,7 +3926,7 @@ fn production_verifier_reconciles_cancellation() -> TestResult {
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let operation_id = OperationId::new("operation-prod-cancel")?;
+    let operation_id = OperationId::new("op-prod-cancel")?;
     coordinator.request_cancellation(
         context.clone(),
         CancelCommand {
@@ -3797,7 +3959,7 @@ fn production_verifier_reconciles_cancellation() -> TestResult {
 
 #[test]
 fn production_verifier_fences_and_reassigns() -> TestResult {
-    let mut coordinator = production_coordinator(config(4, 4))?;
+    let mut coordinator = production_coordinator(config(4, 4), "prod-fence")?;
     let admitted = plan_and_admit(
         &mut coordinator,
         "prod-fence",
@@ -3835,7 +3997,7 @@ fn production_verifier_fences_and_reassigns() -> TestResult {
 
 #[test]
 fn production_verifier_reconciles_unknown_outcome() -> TestResult {
-    let mut coordinator = production_coordinator(config(2, 2))?;
+    let mut coordinator = production_coordinator(config(2, 2), "prod-unknown")?;
     let admitted = plan_and_admit(
         &mut coordinator,
         "prod-unknown",
@@ -3849,7 +4011,18 @@ fn production_verifier_reconciles_unknown_outcome() -> TestResult {
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let submission = result_submission("prod-unknown", &lane, ResultDisposition::UnknownOutcome)?;
+    let binding = coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission(
+            "prod-unknown",
+            &lane,
+            "unit-prod-unknown",
+            "scope-prod-unknown",
+        )?,
+    )?;
+    let mut submission =
+        result_submission("prod-unknown", &lane, ResultDisposition::UnknownOutcome)?;
+    use_result_binding(&mut submission, &binding)?;
     let submission_id = submission.submission_id.clone();
     coordinator.submit_result(context.clone(), submission)?;
     let final_receipt = coordinator.reconcile_unknown_outcome(
@@ -3874,7 +4047,7 @@ fn production_verifier_reconciles_unknown_outcome() -> TestResult {
 
 #[test]
 fn production_replay_is_idempotent_and_conflict_fails_closed() -> TestResult {
-    let mut coordinator = production_coordinator(config(2, 2))?;
+    let mut coordinator = production_coordinator(config(2, 2), "prod-replay")?;
     let candidate = coordinator.plan(request(
         "prod-replay",
         &[bind_lane_spec(
@@ -3906,6 +4079,9 @@ fn production_revoked_capability_fails_closed_without_mutation() -> TestResult {
     let revoked = admitted_capability_for(
         provider_identity(),
         true,
+        "claim-prod-revoked",
+        "attempt-prod-revoked-0",
+        "op-prod-revoked",
         "route-rev-7",
         "capacity-rev-3",
         "route-rev-7",
@@ -3940,6 +4116,9 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
     let stale_capacity = admitted_capability_for(
         provider_identity(),
         false,
+        "claim-prod-stale-cap",
+        "attempt-prod-stale-cap-0",
+        "op-prod-stale-cap",
         "route-rev-7",
         "capacity-rev-stale",
         "route-rev-7",
@@ -3971,6 +4150,9 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
     let stale_route = admitted_capability_for(
         provider_identity(),
         false,
+        "claim-prod-stale-route",
+        "attempt-prod-stale-route-0",
+        "op-prod-stale-route",
         "route-rev-stale",
         "capacity-rev-3",
         "route-rev-7",
@@ -3999,6 +4181,9 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
     let stale_epoch = admitted_capability_for(
         provider_identity(),
         false,
+        "claim-prod-stale-epoch",
+        "attempt-prod-stale-epoch-0",
+        "op-prod-stale-epoch",
         "route-rev-7",
         "capacity-rev-3",
         "route-rev-7",
@@ -4028,7 +4213,7 @@ fn production_stale_route_capacity_epoch_fail_closed() -> TestResult {
 
 #[test]
 fn production_foreign_identity_fails_closed() -> TestResult {
-    let mut coordinator = production_coordinator(config(2, 2))?;
+    let mut coordinator = production_coordinator(config(2, 2), "prod-foreign")?;
     let candidate = coordinator.plan(request(
         "prod-foreign",
         &[bind_lane_spec(
@@ -4066,7 +4251,7 @@ fn plan_only_constructor_still_refuses_effects() -> TestResult {
         gap_coordinator.admit(receipt.clone()),
         Err(CoordinatorError::PlanGap(_))
     ));
-    let mut production = production_coordinator(cfg)?;
+    let mut production = production_coordinator(cfg, "prod-split")?;
     production.plan(request(
         "prod-split",
         &[bind_lane_spec("work-prod-split", "reader-prod-split", "a")],
@@ -4079,7 +4264,7 @@ fn plan_only_constructor_still_refuses_effects() -> TestResult {
 #[test]
 fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
     let cfg = config(4, 4);
-    let mut coordinator = production_coordinator(cfg.clone())?;
+    let mut coordinator = production_coordinator(cfg.clone(), "prod-restore")?;
     let admitted = plan_and_admit(
         &mut coordinator,
         "prod-restore",
@@ -4098,7 +4283,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
     let restored = AgentCoordinator::restore_with_admitted_provider(
         snapshot.clone(),
         cfg.clone(),
-        admitted_capability(snapshot.event_sequence)?,
+        admitted_capability("prod-restore", snapshot.event_sequence)?,
     )?;
     assert_eq!(restored.events(), coordinator.events());
     assert_eq!(
@@ -4108,6 +4293,9 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
             admitted_capability_for(
                 provider_identity(),
                 true,
+                "claim-prod-restore",
+                "attempt-prod-restore-0",
+                "op-prod-restore",
                 "route-rev-7",
                 "capacity-rev-3",
                 "route-rev-7",
@@ -4124,7 +4312,7 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
         AgentCoordinator::restore_with_admitted_provider(
             snapshot.clone(),
             cfg.clone(),
-            admitted_capability(snapshot.event_sequence + 1)?,
+            admitted_capability("prod-restore", snapshot.event_sequence + 1)?,
         )
         .err(),
         Some(CoordinatorError::SnapshotRollback)
@@ -4140,6 +4328,9 @@ fn production_restore_reverifies_against_fresh_kernel_evidence() -> TestResult {
             admitted_capability_for(
                 foreign_identity,
                 false,
+                "claim-prod-restore",
+                "attempt-prod-restore-0",
+                "op-prod-restore",
                 "route-rev-7",
                 "capacity-rev-3",
                 "route-rev-7",

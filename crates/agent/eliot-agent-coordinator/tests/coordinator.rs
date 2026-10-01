@@ -16,7 +16,7 @@ use eliot_agent_coordinator::{
     RoleProfileManifest, RouteCandidateEvidence, StaffingLaneRequest, StaffingPlanCandidate,
     StaffingPlanRequest, WorkerId,
 };
-use eliot_contracts::{EpochLineageId, canonical_json_bytes, sha256_hex};
+use eliot_contracts::{EpochLineageId, PolicyRevision, canonical_json_bytes, sha256_hex};
 use eliot_evaluation_contracts::BudgetEvidence;
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_receipts::ProofCeiling;
@@ -67,7 +67,13 @@ fn fixture_schema_identity(
 }
 
 fn fence() -> StateFence {
-    StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
+    // I3.6 requires staffing and route mix to follow current policy. This fixture
+    // uses the explicit genesis policy revision; it does not stand in for live
+    // policy evidence (`docs/architecture/I03-06-model-route-and-portfolio-policy.md`).
+    StateFence {
+        policy_revision: Some(PolicyRevision::genesis()),
+        ..StateFence::new(test_epoch(TEST_LINEAGE_A, 1), ResourceGeneration::genesis())
+    }
 }
 
 fn route(name: &str) -> RouteFingerprint {
