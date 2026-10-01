@@ -2657,12 +2657,20 @@ async fn publish_maintenance_source_results(
             // The summary states only what coverage is, never what utility is: a
             // fully covered set means every declared result observation is
             // admitted, not that the maintained subsystem improved.
+            //
+            // The two counts are deliberately not the same unit and are labelled
+            // apart: `declared_jobs` is how many identities the owner's records
+            // declared, while `observed_results`/`outstanding_results` count
+            // source results. One declared job can owe several observations — a
+            // failure, an unknown outcome, a reconciliation and a completion are
+            // each one — so the result counts may exceed the job count, and
+            // reporting the job count beside them would understate what is owed.
             tracing::info!(
                 target: "eliotd::diagnostics",
                 event = "eliotd.maintenance_outcome_observation_coverage",
-                declared = expected.len(),
-                observed = coverage.observed.len(),
-                outstanding = coverage.outstanding.len(),
+                declared_jobs = expected.len(),
+                observed_results = coverage.observed.len(),
+                outstanding_results = coverage.outstanding.len(),
                 complete = coverage.is_complete(),
             );
             for outstanding in coverage.outstanding {

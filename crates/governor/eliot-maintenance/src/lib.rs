@@ -37,7 +37,7 @@ pub use outcome_observation::{
     OBSERVATION_GAP_PROFILE, OBSERVATION_GAP_REASON, OUTCOME_OBSERVATION_OWNER,
     OUTCOME_OBSERVATION_RESOLUTION, ObservedOutcomeObservation, OutcomeObservationCoverage,
     OutstandingOutcome, OutstandingOutcomeObligation, RefusedReceiptStatus,
-    admit_observation_delivery, outcome_observation_coverage, outcome_observation_disposition,
+    admit_observation_delivery, outcome_observation_coverage, outcome_observation_dispositions,
     record_observation_gap,
 };
 
