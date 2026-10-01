@@ -173,9 +173,8 @@ fn bounded_client_set_limits(write_limit: usize) -> Result<ClientSetLimits, Stri
     let write_sessions = u8::try_from(write_limit).map_err(|_| {
         "configured Store writer lanes exceed the bounded client-set profile".to_owned()
     })?;
-    let read_sessions = u8::try_from(DEFAULT_READ_CLIENTS).map_err(|_| {
-        "Store read client bound exceeds the bounded client-set profile".to_owned()
-    })?;
+    let read_sessions = u8::try_from(DEFAULT_READ_CLIENTS)
+        .map_err(|_| "Store read client bound exceeds the bounded client-set profile".to_owned())?;
     let health_sessions = u8::try_from(DEFAULT_HEALTH_CLIENTS).map_err(|_| {
         "Store health client bound exceeds the bounded client-set profile".to_owned()
     })?;
