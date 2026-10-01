@@ -1442,8 +1442,7 @@ impl HostComposition {
         let control = self
             .jobs
             .begin_fresh_supervision_control_context(&generation)?;
-        let readiness_contour =
-            self.persist_fresh_authenticated_readiness(&generation, control)?;
+        let readiness_contour = self.persist_fresh_authenticated_readiness(&generation, control)?;
         let readiness_observation = self
             .journal
             .snapshot()?
