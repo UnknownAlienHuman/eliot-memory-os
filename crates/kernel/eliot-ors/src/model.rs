@@ -41,6 +41,10 @@ pub const HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION: u16 = 1;
 /// This issue allows one original send attempt plus one proven-not-sent retry.
 pub const MAX_HOST_REQUEST_SEND_ATTEMPTS: usize = 2;
 
+/// Maximum encoded size of the full Governor-issued executable binding on
+/// the existing native-worker claim row.
+pub const MAX_NATIVE_WORKER_EXECUTABLE_BINDING_RECORD_BYTES: usize = 128 * 1024;
+
 /// Maximum active claim lifetime for one authenticated `UserAutomation` send.
 /// This follows the Host Control Endpoint's existing 30-second queue-response
 /// timeout; expiry moves an uncertain claim to reconciliation and never frees
@@ -8699,20 +8703,16 @@ pub struct NativeWorkerClaimRecord {
     pub binding_digest: String,
     /// Canonical digest over the presenting request envelope.
     pub request_digest: String,
-    /// Owner-verified executable-binding digest retained at stage.
-    ///
-    /// Copied from the Kernel-gated v2 executable join
-    /// (`NativeWorkerExecutableBinding.executable_binding_digest`) when the
-    /// claim stages, never recomputed here: ORS compares it byte-wise and
-    /// never interprets it. A changed executable binding under one claim
-    /// identity is rejected as
-    /// [`OrsError::NativeWorkerClaimIdentityConflict`] and never overwrites
-    /// the durable binding.
-    ///
-    /// Absent (empty) in rows staged before this column and in joinless
-    /// claims; decodes as empty and never verifies.
+    /// Governor-issued executable-binding digest retained on the claim row.
+    /// Bound only with the full owner record below; a worker presentation
+    /// alone never populates either field.
     #[serde(default)]
     pub executable_binding_digest: String,
+    /// Canonical JSON for the complete Governor-issued executable binding.
+    /// The Kernel validates its original digest and joins its fields to this
+    /// same claim row before admission or readback. No second registry exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_binding_record_json: Option<String>,
     /// Supported execution-unit schema version.
     pub execution_unit_schema_version: u16,
     /// Predecessor revision this claim continues from; opaque to ORS.
@@ -8771,6 +8771,7 @@ impl NativeWorkerClaimRecord {
             && self.binding_digest == other.binding_digest
             && self.request_digest == other.request_digest
             && self.executable_binding_digest == other.executable_binding_digest
+            && self.executable_binding_record_json == other.executable_binding_record_json
             && self.execution_unit_schema_version == other.execution_unit_schema_version
             && self.predecessor_revision == other.predecessor_revision
             && self.resource_envelope_digest == other.resource_envelope_digest
@@ -8819,6 +8820,36 @@ impl NativeWorkerClaimRecord {
                 &self.executable_binding_digest,
                 "native_worker_claim_executable_binding_digest",
             )?;
+        }
+        if let Some(record_json) = &self.executable_binding_record_json {
+            if record_json.len() > MAX_NATIVE_WORKER_EXECUTABLE_BINDING_RECORD_BYTES {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_executable_binding_record",
+                    reason: "owner binding record exceeds its byte bound",
+                });
+            }
+            let value = serde_json::from_str::<Value>(record_json).map_err(|_| {
+                OrsError::InvalidField {
+                    field: "native_worker_claim_executable_binding_record",
+                    reason: "owner binding record is not JSON",
+                }
+            })?;
+            if self.executable_binding_digest.is_empty() || !value.is_object() {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_executable_binding_record",
+                    reason: "owner record requires a digest and JSON object",
+                });
+            }
+            let canonical = canonical_json_bytes(&value).map_err(|_| OrsError::InvalidField {
+                field: "native_worker_claim_executable_binding_record",
+                reason: "owner binding record cannot be canonicalized",
+            })?;
+            if canonical.as_slice() != record_json.as_bytes() {
+                return Err(OrsError::InvalidField {
+                    field: "native_worker_claim_executable_binding_record",
+                    reason: "owner binding record is not canonical JSON",
+                });
+            }
         }
         match (&self.capability_cell, &self.capability_cell_registry_digest) {
             (Some(cell), Some(registry_digest)) => {
@@ -8912,6 +8943,11 @@ impl NativeWorkerClaimRecord {
             &self.executable_binding_digest,
             "native_worker_claim_executable_binding_digest",
         )?;
+        if self.executable_binding_record_json.is_none() {
+            return Err(OrsError::NativeWorkerClaimIdentityConflict {
+                claim_id: self.claim_id.as_str().to_owned(),
+            });
+        }
         if self.executable_binding_digest != presented_digest {
             return Err(OrsError::NativeWorkerClaimIdentityConflict {
                 claim_id: self.claim_id.as_str().to_owned(),

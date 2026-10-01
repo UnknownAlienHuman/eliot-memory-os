@@ -13,8 +13,9 @@
 //! `authority_epoch`, `budget`, `cancellation_policy_id`, `claim_id`,
 //! `deadline_unix_ms`, `decision_id`, `expected_result_schema`,
 //! `expected_result_schema_version`, `operation_id`, `parent_job_id`,
-//! `predecessor_revision`, `registration_id`, `route_class`, `state_fence`,
-//! `task_id`, `work_scope_id`, `worker_generation`, plus one nested
+//! `predecessor_revision`, `privacy_class`, `registration_id`,
+//! `route_class`, `state_fence`, `swarm_id`, `task_id`, `visibility`,
+//! `work_scope_id`, `worker_generation`, plus one nested
 //! `executable_binding` object carrying the T9-02 executable join. The nested
 //! object is JSON `null` for wire-v1 claims (which predate the join) and
 //! otherwise covers exactly the keys `adapter_id`, `adapter_revision`,
@@ -44,6 +45,8 @@
 use eliot_contracts::{
     CapabilityCellId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_store_api::EffectClass;
+use eliot_security_contracts::PrivacyClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -376,6 +379,291 @@ impl NativeWorkerExecutableBinding {
     }
 }
 
+/// Closed Kernel mirror of the full Governor-issued executable binding.
+///
+/// The Kernel retains this exact owner record on the existing ORS claim row.
+/// It is deliberately broader than the worker-presented T9-02 join: identity,
+/// route, grant, manifest, process, and revision provenance stay bound to the
+/// original Governor digest instead of being rebuilt from the presentation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkerExecutableBindingPublication {
+    pub claim_id: String,
+    pub registration_id: String,
+    pub task_id: String,
+    pub work_unit_id: String,
+    pub work_scope_id: String,
+    pub attempt: u32,
+    pub lease_id: String,
+    pub operation_id: String,
+    pub canonical_request_hash: String,
+    pub installation_id: String,
+    pub principal_id: String,
+    pub session_id: String,
+    pub worker_generation: u64,
+    pub process_tree_id: String,
+    pub job_object_lineage_ref: String,
+    pub process_generation: u64,
+    pub process_fence: String,
+    pub route_ref: String,
+    pub adapter_id: String,
+    pub adapter_revision: u64,
+    pub artifact_digest: String,
+    pub config_digest: String,
+    pub protocol_digest: String,
+    pub command_ref: String,
+    pub facet_manifest_ref: String,
+    pub capability_cell: CapabilityCellId,
+    pub introduction_refs: Vec<String>,
+    pub supporting_grant_refs: Vec<String>,
+    pub grant_graph_revision: u64,
+    pub module_catalog_revision: u64,
+    pub capability_cell_registry_digest: String,
+    pub kernel_execution_manifest_digest: String,
+    pub resource_limits_digest: String,
+    pub cancellation_policy_ref: String,
+    pub checkpoint_policy_digest: String,
+    pub drain_policy_ref: String,
+    pub restart_policy_digest: String,
+    pub effective_ceiling: EffectClass,
+    pub credential_refs: Vec<String>,
+    pub resource_refs: Vec<String>,
+    pub replay_stream_id: String,
+    pub launch_nonce: String,
+    pub process_invocation_digest: String,
+    pub state_fence: StateFence,
+    pub authority_epoch: EpochId,
+    pub generation: ResourceGeneration,
+    pub deadline_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub plan_id: String,
+    pub plan_revision: String,
+    pub task_revision: u64,
+    pub config_snapshot_digest: String,
+    pub admission_revision_ref: String,
+    pub wire_id: String,
+    pub wire_version: u16,
+    pub binding_digest: String,
+}
+
+impl NativeWorkerExecutableBindingPublication {
+    /// Governor-owned wire identity for the original full binding record.
+    pub const WIRE_ID: &'static str = "eliot.governor.native-worker-executable-binding";
+    /// Current Governor-owned binding record version.
+    pub const WIRE_VERSION: u16 = 2;
+
+    /// Validates the complete record and its original Governor digest.
+    pub fn validate_original_binding(&self) -> Result<(), KernelServiceError> {
+        if self.wire_id != Self::WIRE_ID || self.wire_version != Self::WIRE_VERSION {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.wire",
+                reason: "unsupported Governor binding wire",
+            });
+        }
+        for (value, field) in [
+            (&self.claim_id, "claim_id"),
+            (&self.registration_id, "registration_id"),
+            (&self.task_id, "task_id"),
+            (&self.work_unit_id, "work_unit_id"),
+            (&self.work_scope_id, "work_scope_id"),
+            (&self.lease_id, "lease_id"),
+            (&self.operation_id, "operation_id"),
+            (&self.installation_id, "installation_id"),
+            (&self.principal_id, "principal_id"),
+            (&self.session_id, "session_id"),
+            (&self.process_tree_id, "process_tree_id"),
+            (&self.job_object_lineage_ref, "job_object_lineage_ref"),
+            (&self.process_fence, "process_fence"),
+            (&self.route_ref, "route_ref"),
+            (&self.adapter_id, "adapter_id"),
+            (&self.command_ref, "command_ref"),
+            (&self.facet_manifest_ref, "facet_manifest_ref"),
+            (&self.cancellation_policy_ref, "cancellation_policy_ref"),
+            (&self.drain_policy_ref, "drain_policy_ref"),
+            (&self.replay_stream_id, "replay_stream_id"),
+            (&self.plan_id, "plan_id"),
+            (&self.plan_revision, "plan_revision"),
+            (&self.admission_revision_ref, "admission_revision_ref"),
+        ] {
+            validate_wire_text(value, "native_worker_executable_binding_publication.text")
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "native_worker_executable_binding_publication.text",
+                    reason: field,
+                })?;
+        }
+        for (value, field) in [
+            (&self.canonical_request_hash, "canonical_request_hash"),
+            (&self.artifact_digest, "artifact_digest"),
+            (&self.config_digest, "config_digest"),
+            (&self.protocol_digest, "protocol_digest"),
+            (&self.capability_cell_registry_digest, "capability_cell_registry_digest"),
+            (
+                &self.kernel_execution_manifest_digest,
+                "kernel_execution_manifest_digest",
+            ),
+            (&self.resource_limits_digest, "resource_limits_digest"),
+            (&self.checkpoint_policy_digest, "checkpoint_policy_digest"),
+            (&self.restart_policy_digest, "restart_policy_digest"),
+            (&self.process_invocation_digest, "process_invocation_digest"),
+            (&self.config_snapshot_digest, "config_snapshot_digest"),
+            (&self.binding_digest, "binding_digest"),
+        ] {
+            validate_wire_digest(value, "native_worker_executable_binding_publication.digest")
+                .map_err(|_| KernelServiceError::InvalidField {
+                    field: "native_worker_executable_binding_publication.digest",
+                    reason: field,
+                })?;
+        }
+        validate_wire_text(
+            &self.launch_nonce,
+            "native_worker_executable_binding_publication.launch_nonce",
+        )?;
+        if !(16..=256).contains(&self.launch_nonce.len()) {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.launch_nonce",
+                reason: "launch nonce must be 16..=256 characters",
+            });
+        }
+        for values in [
+            &self.introduction_refs,
+            &self.supporting_grant_refs,
+            &self.credential_refs,
+            &self.resource_refs,
+        ] {
+            if values.len() > 64 {
+                return Err(KernelServiceError::InvalidField {
+                    field: "native_worker_executable_binding_publication.references",
+                    reason: "reference list exceeds bound",
+                });
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for value in values {
+                validate_wire_text(
+                    value,
+                    "native_worker_executable_binding_publication.reference",
+                )?;
+                if !seen.insert(value) {
+                    return Err(KernelServiceError::InvalidField {
+                        field: "native_worker_executable_binding_publication.references",
+                        reason: "reference list contains duplicates",
+                    });
+                }
+            }
+        }
+        if self.worker_generation == 0
+            || self.process_generation == 0
+            || self.adapter_revision == 0
+            || self.grant_graph_revision == 0
+            || self.module_catalog_revision == 0
+            || self.task_revision == 0
+            || self.deadline_unix_ms == 0
+            || self.expires_at_unix_ms <= self.deadline_unix_ms
+        {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.bounds",
+                reason: "revisions, generation, and deadline window are invalid",
+            });
+        }
+        self.state_fence
+            .validate()
+            .map_err(|_| KernelServiceError::HandshakeMismatch {
+                field: "native_worker_executable_binding_publication.state_fence",
+            })?;
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+            || self.generation != self.state_fence.resource_generation
+        {
+            return Err(KernelServiceError::HandshakeMismatch {
+                field: "native_worker_executable_binding_publication.fence_binding",
+            });
+        }
+        if self.compute_original_binding_digest()? != self.binding_digest {
+            return Err(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication.binding_digest",
+                reason: "original Governor binding digest mismatch",
+            });
+        }
+        Ok(())
+    }
+
+    /// Recomputes the Governor digest preimage, excluding its digest field.
+    pub fn compute_original_binding_digest(&self) -> Result<String, KernelServiceError> {
+        let mut value = serde_json::to_value(self).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication",
+                reason: "record cannot be encoded",
+            }
+        })?;
+        value
+            .as_object_mut()
+            .ok_or(KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication",
+                reason: "record must encode as an object",
+            })?
+            .remove("binding_digest");
+        let bytes = canonical_json_bytes(&value).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication",
+                reason: "record cannot be canonicalized",
+            }
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Returns the exact canonical JSON persisted on the ORS claim row.
+    pub fn canonical_record_json(&self) -> Result<String, KernelServiceError> {
+        let value = serde_json::to_value(self).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication",
+                reason: "record cannot be encoded",
+            }
+        })?;
+        let bytes = canonical_json_bytes(&value).map_err(|_| {
+            KernelServiceError::InvalidField {
+                field: "native_worker_executable_binding_publication",
+                reason: "record cannot be canonicalized",
+            }
+        })?;
+        String::from_utf8(bytes).map_err(|_| KernelServiceError::InvalidField {
+            field: "native_worker_executable_binding_publication",
+            reason: "canonical record is not UTF-8",
+        })
+    }
+
+    /// Projects the full record into the existing Kernel executable join.
+    pub fn to_kernel_binding(&self) -> NativeWorkerExecutableBinding {
+        NativeWorkerExecutableBinding {
+            route_ref: self.route_ref.clone(),
+            adapter_id: self.adapter_id.clone(),
+            adapter_revision: self.adapter_revision,
+            config_digest: self.config_digest.clone(),
+            facet_manifest_ref: self.facet_manifest_ref.clone(),
+            capability_cell: self.capability_cell.clone(),
+            grant_graph_revision: self.grant_graph_revision,
+            module_catalog_revision: self.module_catalog_revision,
+            capability_cell_registry_digest: self.capability_cell_registry_digest.clone(),
+            kernel_execution_manifest_digest: self.kernel_execution_manifest_digest.clone(),
+            job_object_lineage_ref: self.job_object_lineage_ref.clone(),
+            resource_limits_digest: self.resource_limits_digest.clone(),
+            cancellation_policy_ref: self.cancellation_policy_ref.clone(),
+            checkpoint_policy_digest: self.checkpoint_policy_digest.clone(),
+            drain_policy_ref: self.drain_policy_ref.clone(),
+            restart_policy_digest: self.restart_policy_digest.clone(),
+            replay_stream_id: self.replay_stream_id.clone(),
+            launch_nonce: self.launch_nonce.clone(),
+            process_invocation_digest: self.process_invocation_digest.clone(),
+            authority_epoch: self.authority_epoch.clone(),
+            generation: self.generation,
+            state_fence: self.state_fence.clone(),
+            deadline_unix_ms: self.deadline_unix_ms,
+            expires_at_unix_ms: self.expires_at_unix_ms,
+            executable_wire_version: self.wire_version,
+            executable_binding_digest: self.binding_digest.clone(),
+        }
+    }
+}
+
 /// Current owner-produced executable authority one claim is checked against.
 ///
 /// The route builds this from the live registration, admission, activation,
@@ -456,6 +744,15 @@ pub struct NativeWorkerClaimRequest {
     /// never carry executable authority; required on wire v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable_binding: Option<NativeWorkerExecutableBinding>,
+    /// Harness-bound visibility label. None until the owner publishes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// Canonical privacy class. None until the owner publishes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_class: Option<PrivacyClass>,
+    /// Swarm identity attributed to this unit. None until the owner publishes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_id: Option<String>,
     /// Canonical digest over every bound work field.
     pub binding_digest: String,
     /// Canonical digest over this request envelope.
@@ -488,10 +785,13 @@ impl NativeWorkerClaimRequest {
             "operation_id": self.operation_id,
             "parent_job_id": self.parent_job_id,
             "predecessor_revision": self.predecessor_revision,
+            "privacy_class": self.privacy_class,
             "registration_id": self.registration_id,
             "route_class": self.route_class,
             "state_fence": self.state_fence,
+            "swarm_id": self.swarm_id,
             "task_id": self.task_id,
+            "visibility": self.visibility,
             "work_scope_id": self.work_scope_id,
             "worker_generation": self.worker_generation,
         });
@@ -533,6 +833,9 @@ impl NativeWorkerClaimRequest {
             authority_epoch: EpochId,
             state_fence: &'a StateFence,
             executable_binding: Option<&'a NativeWorkerExecutableBinding>,
+            visibility: Option<&'a str>,
+            privacy_class: Option<PrivacyClass>,
+            swarm_id: Option<&'a str>,
             binding_digest: &'a str,
         }
         let canonical = Canonical {
@@ -562,6 +865,9 @@ impl NativeWorkerClaimRequest {
             authority_epoch: self.authority_epoch.clone(),
             state_fence: &self.state_fence,
             executable_binding: self.executable_binding.as_ref(),
+            visibility: self.visibility.as_deref(),
+            privacy_class: self.privacy_class,
+            swarm_id: self.swarm_id.as_deref(),
             binding_digest: &self.binding_digest,
         };
         canonical_json_bytes(&canonical)
@@ -666,6 +972,7 @@ impl NativeWorkerClaimRequest {
             });
         }
         self.budget.validate()?;
+        self.validate_optional_owner_legs()?;
         self.state_fence
             .validate()
             .map_err(|_| KernelServiceError::HandshakeMismatch {
@@ -690,6 +997,19 @@ impl NativeWorkerClaimRequest {
             return Err(KernelServiceError::HandshakeMismatch {
                 field: "native_worker_claim.binding_digest",
             });
+        }
+        Ok(())
+    }
+
+    /// Validates the optional owner-published legs.
+    fn validate_optional_owner_legs(&self) -> Result<(), KernelServiceError> {
+        for (leg, field) in [
+            (self.visibility.as_deref(), "native_worker_claim.visibility"),
+            (self.swarm_id.as_deref(), "native_worker_claim.swarm_id"),
+        ] {
+            if let Some(text) = leg {
+                validate_wire_text(text, field)?;
+            }
         }
         Ok(())
     }
@@ -1390,6 +1710,9 @@ mod executable_binding_tests {
             authority_epoch: test_epoch(1),
             state_fence: live_fence(),
             executable_binding: Some(join.clone()),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
             binding_digest: String::new(),
             request_digest: String::new(),
         };

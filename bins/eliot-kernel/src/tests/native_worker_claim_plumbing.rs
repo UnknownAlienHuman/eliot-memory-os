@@ -271,19 +271,16 @@ fn test_executable_join() -> NativeWorkerExecutableBinding {
 /// presented v2 join, currentness anchors from the live registration fence,
 /// the registration's worker-configuration identity, and the live epoch.
 fn route_expectation(request: &NativeWorkerClaimRequest) -> NativeWorkerExecutableExpectation {
-    let registration = serde_json::json!({
-        "worker_config_digest": "b".repeat(64),
-        "module_catalog_revision": 7,
-        "capability_cell": eliot_contracts::CapabilityCellId::new("native-worker-core")
-            .expect("cell id"),
-    });
-    KernelComposition::build_executable_expectation(
-        request.executable_binding.as_ref(),
-        &registration,
-        &live_fence(),
-        &test_epoch(1),
-    )
-    .expect("route expectation builds")
+    // This fixture exercises the service's pure join comparator only. The
+    // route-level proof that production currentness comes from an independently
+    // retained Governor record lives in `native_worker_lifecycle_route`.
+    NativeWorkerExecutableExpectation {
+        current: request
+            .executable_binding
+            .clone()
+            .expect("v2 service primitive fixture has a join"),
+        revoked: false,
+    }
 }
 
 /// Recomputes both claim digests after a presented-field mutation so the
@@ -368,6 +365,9 @@ fn test_claim_request(
         authority_epoch: test_epoch(1),
         state_fence: fence,
         executable_binding: Some(test_executable_join()),
+        visibility: None,
+        privacy_class: None,
+        swarm_id: None,
         binding_digest: String::new(),
         request_digest: String::new(),
     };
@@ -580,6 +580,7 @@ fn stage_persists_requested_row_with_real_store() {
             .as_ref()
             .map(|join| join.executable_binding_digest.clone())
             .unwrap_or_default(),
+        executable_binding_record_json: None,
         execution_unit_schema_version: request.execution_unit_schema_version,
         predecessor_revision: eliot_ors::OpaqueLabel::new(request.predecessor_revision.as_str())
             .expect("pred"),
@@ -1320,7 +1321,7 @@ fn claim_route_gates_executable_binding_after_admit_before_seal() {
         );
     }
     let admit = route_src
-        .find("admit_native_worker_claim(self.generation_gateway")
+        .find("admit_native_worker_claim_with_expectation(")
         .expect("admission call");
     let gate = route_src
         .find("enforce_claim_executable_binding(&request, &expectation, now)")
