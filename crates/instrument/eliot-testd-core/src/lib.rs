@@ -1732,10 +1732,10 @@ impl TestdBlobProcessStreamGrant {
         }
         for (index, token) in self.tokens.iter().enumerate() {
             validate_text(&token.reference, "blob_stream.token.reference")?;
-            if token.ordinal as usize != index {
+            if token.ordinal as usize != index + 1 {
                 return Err(TestdError::Invalid {
                     field: "blob_stream.tokens",
-                    reason: "token ordinals must be contiguous from zero",
+                    reason: "token ordinals must be contiguous from one",
                 });
             }
             if self.tokens[..index]
@@ -4218,7 +4218,7 @@ impl TestdStore {
                 }
             }
         }
-        if ordinal != highest.map_or(0, |value| value.saturating_add(1)) {
+        if ordinal != highest.map_or(1, |value| value.saturating_add(1)) {
             return Err(TestdError::InvalidBinding);
         }
         let record = TestdBlobProcessStreamCallRecord {
