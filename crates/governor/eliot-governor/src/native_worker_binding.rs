@@ -50,6 +50,7 @@
 use eliot_contracts::{
     CapabilityCellId, EpochId, ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
+use eliot_ors::{NativeWorkerClaimRecord, NativeWorkerClaimState};
 use eliot_store_api::EffectClass;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,159 @@ pub const NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID: &str =
     "eliot.governor.native-worker-executable-binding";
 /// Current wire revision of the Governor-owned executable binding.
 pub const NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION: u16 = 2;
+
+/// Why an authenticated native-worker publication no longer admits reuse.
+///
+/// These are owner observations, not caller labels. In particular,
+/// `GovernorOwnerRevisionChanged` means a current Governor owner was read and
+/// disagreed with the revision retained in the executable binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWorkerBindingRevocationReason {
+    /// ORS has durably closed the exact claim as terminal.
+    TerminalClaim,
+    /// The stored claim tuple or executable-binding digest differs from the
+    /// owner-persisted binding supplied by the authenticated Kernel read.
+    ClaimBindingMismatch,
+    /// The owner-persisted binding is malformed or its digest is invalid.
+    InvalidOwnerBinding,
+    /// The binding's execution deadline or expiry has passed.
+    BindingExpired,
+    /// The retained Governor state fence changed.
+    StateFenceChanged,
+    /// The protected configuration snapshot changed.
+    ConfigSnapshotChanged,
+    /// The canonical plan identity or revision changed.
+    CanonicalPlanChanged,
+    /// The task revision or state fence changed.
+    TaskRevisionChanged,
+    /// The session route, authority epoch, or state fence changed.
+    SessionRouteChanged,
+    /// The current WorkScope identity no longer matches the binding.
+    WorkScopeChanged,
+    /// The live Module Catalog revision changed.
+    ModuleCatalogChanged,
+    /// The grant graph revision changed after this binding was issued.
+    GrantGraphChanged,
+    /// A supporting grant is no longer admitted in the current graph.
+    SupportingGrantRevoked,
+}
+
+/// Why an authenticated read cannot establish a current native-worker
+/// binding. These outcomes preserve the original claim identity for
+/// reconciliation and never authorize a retry under a new identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWorkerBindingUnknownReason {
+    /// ORS reports an unknown or reconciling durable outcome.
+    ClaimOutcomeUnknown,
+    /// A non-pending claim has no owner-persisted executable binding.
+    OwnerBindingMissing,
+    /// Governor is not ready to make a currentness observation.
+    GovernorNotReady,
+    /// A current owner read required to establish binding currentness failed.
+    GovernorOwnerReadUnavailable,
+    /// The binding relies on supporting grants but the restored owner has no
+    /// current revocation-history source revision.
+    RevocationHistoryUnavailable,
+}
+
+/// Non-effecting result of joining one authenticated ORS claim readback with
+/// the owner-persisted Governor binding and current Governor owner state.
+///
+/// The record is retained in every result so a caller cannot collapse a
+/// known pending or uncertain outcome into a new claim. A Governor-current
+/// result is still not an admitted provider capability: the caller must join
+/// the independent provider route/account revisions and Kernel process
+/// lifecycle owners before use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeWorkerBindingObservation {
+    /// The exact claim is still REQUESTED; admission has not completed.
+    Pending {
+        /// Authenticated ORS claim row read by Kernel.
+        claim: NativeWorkerClaimRecord,
+        /// Binding, if publication has committed while the claim remains
+        /// REQUESTED. It remains non-effecting in this state.
+        binding: Option<NativeWorkerExecutableBinding>,
+        /// Kernel owner time at the readback operation.
+        observed_at_unix_ms: u64,
+    },
+    /// The exact claim or binding is known to be closed or stale.
+    Revoked {
+        /// Authenticated ORS claim row read by Kernel.
+        claim: NativeWorkerClaimRecord,
+        /// Full owner-persisted binding, when the Kernel read returned one.
+        binding: Option<NativeWorkerExecutableBinding>,
+        /// Current owner evidence that closed reuse.
+        reason: NativeWorkerBindingRevocationReason,
+        /// Kernel owner time at the readback operation.
+        observed_at_unix_ms: u64,
+    },
+    /// The exact claim remains under reconciliation because its outcome or a
+    /// required owner read is unknown.
+    UnknownOutcome {
+        /// Authenticated ORS claim row read by Kernel.
+        claim: NativeWorkerClaimRecord,
+        /// Full owner-persisted binding, when the Kernel read returned one.
+        binding: Option<NativeWorkerExecutableBinding>,
+        /// Why currentness could not be established.
+        reason: NativeWorkerBindingUnknownReason,
+        /// Kernel owner time at the readback operation.
+        observed_at_unix_ms: u64,
+    },
+    /// The exact owner-persisted binding is current under Governor owners,
+    /// but provider route/account revisions remain a separate required gate.
+    GovernorCurrentButProviderRevisionsUnavailable {
+        /// Authenticated ORS claim row read by Kernel.
+        claim: NativeWorkerClaimRecord,
+        /// Full owner-persisted binding read from Kernel/ORS.
+        binding: NativeWorkerExecutableBinding,
+        /// Kernel owner time at the readback operation.
+        observed_at_unix_ms: u64,
+    },
+}
+
+/// Closed classification of an ORS claim state at the native-worker use
+/// boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWorkerBindingClaimDisposition {
+    /// Admission has not occurred yet.
+    Requested,
+    /// The claim is terminal and permanently closed.
+    Terminal,
+    /// The outcome is uncertain and must remain under reconciliation.
+    UnknownOutcome,
+    /// Governor currentness is required before any provider use.
+    GovernorCurrentnessRequired,
+}
+
+impl NativeWorkerBindingObservation {
+    /// Classifies a typed ORS state; no unknown string can be mapped to an
+    /// effectable state.
+    pub fn classify_claim_state(
+        state: NativeWorkerClaimState,
+    ) -> NativeWorkerBindingClaimDisposition {
+        use NativeWorkerClaimState as State;
+
+        match state {
+            State::Requested => NativeWorkerBindingClaimDisposition::Requested,
+            State::Terminal => NativeWorkerBindingClaimDisposition::Terminal,
+            State::Unknown | State::Reconciling => {
+                NativeWorkerBindingClaimDisposition::UnknownOutcome
+            }
+            State::Admitted | State::Ready | State::Active | State::Cancelling | State::Submitted => {
+                NativeWorkerBindingClaimDisposition::GovernorCurrentnessRequired
+            }
+        }
+    }
+}
+
+/// Internal classification returned by independent Governor owner checks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeWorkerBindingCurrentnessError {
+    /// A current owner disproved one or more retained binding commitments.
+    Revoked(NativeWorkerBindingRevocationReason),
+    /// Owner evidence was unavailable or incomplete at this readback.
+    Unknown(NativeWorkerBindingUnknownReason),
+}
 
 /// Maximum bounded text length, matching the Kernel claim `validate_text`.
 const MAX_TEXT_LEN: usize = 1024;

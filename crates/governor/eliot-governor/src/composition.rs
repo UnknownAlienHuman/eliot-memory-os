@@ -98,7 +98,7 @@ use eliot_observation::{ObservationJournal, ObservationJournalEntry};
 use eliot_ors::{
     ColdStartReadinessClaim, ColdStartReadinessOrsRecord, ColdStartReadinessOwnerKey,
     ColdStartReadinessRecordOwner, ColdStartReadinessStageOutcome,
-    ColdStartReadinessTerminalDisposition, ScanDisclosureRecordOwner,
+    ColdStartReadinessTerminalDisposition, NativeWorkerClaimRecord, ScanDisclosureRecordOwner,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{GrantClosureReceipt, ReceiptIdentity};
@@ -164,8 +164,28 @@ pub use genesis_owner_packet::{
 mod native_worker_binding;
 pub use native_worker_binding::{
     NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_ID, NATIVE_WORKER_EXECUTABLE_BINDING_WIRE_VERSION,
+    NativeWorkerBindingClaimDisposition, NativeWorkerBindingObservation,
+    NativeWorkerBindingRevocationReason, NativeWorkerBindingUnknownReason,
     NativeWorkerExecutableBinding, NativeWorkerLifecycleBinding, process_invocation_digest_for,
 };
+
+fn native_worker_claim_matches_binding(
+    claim: &NativeWorkerClaimRecord,
+    binding: &NativeWorkerExecutableBinding,
+) -> bool {
+    claim.claim_id.as_str() == binding.claim_id
+        && claim.registration_id.as_str() == binding.registration_id
+        && claim.worker_generation == binding.worker_generation
+        && claim.task_id.as_str() == binding.task_id
+        && claim.work_scope_id.as_str() == binding.work_scope_id
+        && claim.operation_id.as_str() == binding.operation_id
+        && claim.authority_epoch == binding.authority_epoch.sequence.get()
+        && claim.executable_binding_digest == binding.binding_digest
+        && claim.capability_cell.as_ref().map(|cell| cell.as_str())
+            == Some(binding.capability_cell.as_str())
+        && claim.capability_cell_registry_digest.as_deref()
+            == Some(binding.capability_cell_registry_digest.as_str())
+}
 
 /// Canonical write result kept together with the negative-memory decision
 /// that admitted that exact request.
@@ -9041,6 +9061,265 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
         Ok(canonical_facet_ref)
+    }
+
+    fn native_binding_grants_current(
+        &self,
+        binding: &NativeWorkerExecutableBinding,
+    ) -> Result<(), native_worker_binding::NativeWorkerBindingCurrentnessError> {
+        use native_worker_binding::{
+            NativeWorkerBindingCurrentnessError as CurrentnessError,
+            NativeWorkerBindingRevocationReason as Revocation,
+            NativeWorkerBindingUnknownReason as Unknown,
+        };
+
+        let authority = &self.owners.authority;
+        if authority.grants.revision() != binding.grant_graph_revision {
+            return Err(CurrentnessError::Revoked(Revocation::GrantGraphChanged));
+        }
+        let applicability = authority.authority_applicability();
+        if !binding.supporting_grant_refs.is_empty()
+            && applicability.revocation_source_revision.is_none()
+        {
+            return Err(CurrentnessError::Unknown(
+                Unknown::RevocationHistoryUnavailable,
+            ));
+        }
+        for grant_ref in &binding.supporting_grant_refs {
+            let grant_id = GrantId::new(grant_ref.clone()).map_err(|_| {
+                CurrentnessError::Revoked(Revocation::InvalidOwnerBinding)
+            })?;
+            if !authority.grants.grant_is_admitted(&grant_id) {
+                return Err(CurrentnessError::Revoked(
+                    Revocation::SupportingGrantRevoked,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn native_binding_currentness(
+        &self,
+        binding: &NativeWorkerExecutableBinding,
+        now_unix_ms: u64,
+    ) -> Result<(), native_worker_binding::NativeWorkerBindingCurrentnessError> {
+        use native_worker_binding::{
+            NativeWorkerBindingCurrentnessError as CurrentnessError,
+            NativeWorkerBindingRevocationReason as Revocation,
+            NativeWorkerBindingUnknownReason as Unknown,
+        };
+
+        if self.readiness != CompositionReadiness::Ready {
+            return Err(CurrentnessError::Unknown(Unknown::GovernorNotReady));
+        }
+        binding
+            .validate()
+            .map_err(|_| CurrentnessError::Revoked(Revocation::InvalidOwnerBinding))?;
+        if now_unix_ms == 0 {
+            return Err(CurrentnessError::Unknown(
+                Unknown::GovernorOwnerReadUnavailable,
+            ));
+        }
+        if now_unix_ms >= binding.deadline_unix_ms
+            || now_unix_ms >= binding.expires_at_unix_ms
+        {
+            return Err(CurrentnessError::Revoked(Revocation::BindingExpired));
+        }
+
+        let fence = self.snapshot.state_fence();
+        if binding.state_fence != fence {
+            return Err(CurrentnessError::Revoked(Revocation::StateFenceChanged));
+        }
+        if binding.config_snapshot_digest != self.snapshot.protected_snapshot_digest
+            || binding.config_snapshot_digest != self.owners.config.snapshot_digest()
+        {
+            return Err(CurrentnessError::Revoked(
+                Revocation::ConfigSnapshotChanged,
+            ));
+        }
+
+        let plan = self
+            .owners
+            .canonical
+            .read_current_plan(fence)
+            .map_err(|_| CurrentnessError::Unknown(Unknown::GovernorOwnerReadUnavailable))?;
+        if plan.plan_id != binding.plan_id
+            || plan.plan_revision != binding.plan_revision
+            || plan.task_id.as_str() != binding.task_id
+            || plan.work_scope_id != binding.work_scope_id
+        {
+            return Err(CurrentnessError::Revoked(Revocation::CanonicalPlanChanged));
+        }
+
+        let task_id = TaskId::new(binding.task_id.clone())
+            .map_err(|_| CurrentnessError::Revoked(Revocation::InvalidOwnerBinding))?;
+        let task = self
+            .owners
+            .task
+            .task(&task_id)
+            .ok_or(CurrentnessError::Unknown(
+                Unknown::GovernorOwnerReadUnavailable,
+            ))?;
+        if task.revision != binding.task_revision || task.state_fence != *fence {
+            return Err(CurrentnessError::Revoked(Revocation::TaskRevisionChanged));
+        }
+
+        let session_id = SessionId::new(binding.session_id.clone())
+            .map_err(|_| CurrentnessError::Revoked(Revocation::InvalidOwnerBinding))?;
+        let session = self
+            .owners
+            .session
+            .session(&session_id)
+            .ok_or(CurrentnessError::Unknown(
+                Unknown::GovernorOwnerReadUnavailable,
+            ))?;
+        if session.state_fence != *fence
+            || session.authority_epoch != fence.authority_epoch
+            || session.model_route != binding.route_ref
+        {
+            return Err(CurrentnessError::Revoked(Revocation::SessionRouteChanged));
+        }
+
+        let scope = require_fresh_matched_binding(
+            self.owners.work_scope.as_ref(),
+            fence,
+            "native binding WorkScope currentness is unavailable",
+        )
+        .map_err(|_| CurrentnessError::Unknown(Unknown::GovernorOwnerReadUnavailable))?;
+        if scope.binding.scope.scope_ref != binding.work_scope_id {
+            return Err(CurrentnessError::Revoked(Revocation::WorkScopeChanged));
+        }
+
+        if binding.module_catalog_revision != self.owners.module_registry.revision() {
+            return Err(CurrentnessError::Revoked(Revocation::ModuleCatalogChanged));
+        }
+        self.native_binding_grants_current(binding)?;
+        Ok(())
+    }
+
+    /// Rechecks an owner-persisted native-worker binding at the use boundary.
+    ///
+    /// This compares the original Governor commitments against current plan,
+    /// task, session, WorkScope, config, catalog and grant owners. The
+    /// Kernel's process lifecycle and provider route/account owners remain
+    /// separate required joins; success here proves only Governor currentness.
+    pub fn validate_native_worker_binding_current(
+        &self,
+        binding: &NativeWorkerExecutableBinding,
+        now_unix_ms: u64,
+    ) -> Result<(), CompositionError> {
+        match self.native_binding_currentness(binding, now_unix_ms) {
+            Ok(()) => Ok(()),
+            Err(native_worker_binding::NativeWorkerBindingCurrentnessError::Revoked(reason)) => {
+                Err(CompositionError::Recovery(format!(
+                    "native worker binding is no longer current: {reason:?}"
+                )))
+            }
+            Err(native_worker_binding::NativeWorkerBindingCurrentnessError::Unknown(reason)) => {
+                Err(CompositionError::Recovery(format!(
+                    "native worker binding currentness is unavailable: {reason:?}"
+                )))
+            }
+        }
+    }
+
+    /// Joins one authenticated ORS claim readback with its full
+    /// owner-persisted Governor binding, then independently checks current
+    /// Governor owners. Kernel must perform its own process-lifecycle check
+    /// and the daemon must still check provider route/account revisions.
+    pub fn observe_native_worker_binding_claim(
+        &self,
+        claim: &NativeWorkerClaimRecord,
+        binding: Option<&NativeWorkerExecutableBinding>,
+        observed_at_unix_ms: u64,
+    ) -> Result<NativeWorkerBindingObservation, CompositionError> {
+        use native_worker_binding::{
+            NativeWorkerBindingClaimDisposition as Disposition,
+            NativeWorkerBindingCurrentnessError as CurrentnessError,
+            NativeWorkerBindingObservation as Observation,
+            NativeWorkerBindingRevocationReason as Revocation,
+            NativeWorkerBindingUnknownReason as Unknown,
+        };
+
+        claim
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if observed_at_unix_ms == 0 {
+            return Err(CompositionError::Recovery(
+                "native worker claim readback has no valid owner time".to_owned(),
+            ));
+        }
+        let retained_binding = binding.cloned();
+        match Observation::classify_claim_state(claim.state) {
+            Disposition::Requested => {
+                if let Some(binding) = binding
+                    && !native_worker_claim_matches_binding(claim, binding)
+                {
+                    return Ok(Observation::Revoked {
+                        claim: claim.clone(),
+                        binding: retained_binding,
+                        reason: Revocation::ClaimBindingMismatch,
+                        observed_at_unix_ms,
+                    });
+                }
+                Ok(Observation::Pending {
+                    claim: claim.clone(),
+                    binding: retained_binding,
+                    observed_at_unix_ms,
+                })
+            }
+            Disposition::Terminal => Ok(Observation::Revoked {
+                claim: claim.clone(),
+                binding: retained_binding,
+                reason: Revocation::TerminalClaim,
+                observed_at_unix_ms,
+            }),
+            Disposition::UnknownOutcome => Ok(Observation::UnknownOutcome {
+                claim: claim.clone(),
+                binding: retained_binding,
+                reason: Unknown::ClaimOutcomeUnknown,
+                observed_at_unix_ms,
+            }),
+            Disposition::GovernorCurrentnessRequired => {
+                let Some(binding) = binding else {
+                    return Ok(Observation::UnknownOutcome {
+                        claim: claim.clone(),
+                        binding: None,
+                        reason: Unknown::OwnerBindingMissing,
+                        observed_at_unix_ms,
+                    });
+                };
+                if !native_worker_claim_matches_binding(claim, binding) {
+                    return Ok(Observation::Revoked {
+                        claim: claim.clone(),
+                        binding: retained_binding,
+                        reason: Revocation::ClaimBindingMismatch,
+                        observed_at_unix_ms,
+                    });
+                }
+                match self.native_binding_currentness(binding, observed_at_unix_ms) {
+                    Ok(()) => Ok(Observation::GovernorCurrentButProviderRevisionsUnavailable {
+                        claim: claim.clone(),
+                        binding: binding.clone(),
+                        observed_at_unix_ms,
+                    }),
+                    Err(CurrentnessError::Revoked(reason)) => Ok(Observation::Revoked {
+                        claim: claim.clone(),
+                        binding: retained_binding,
+                        reason,
+                        observed_at_unix_ms,
+                    }),
+                    Err(CurrentnessError::Unknown(reason)) => {
+                        Ok(Observation::UnknownOutcome {
+                            claim: claim.clone(),
+                            binding: retained_binding,
+                            reason,
+                            observed_at_unix_ms,
+                        })
+                    }
+                }
+            }
+        }
     }
 
     /// Publishes one versioned Governor-owned executable binding projection
