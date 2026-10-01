@@ -1503,8 +1503,14 @@ pub enum AcpResultOutcome {
     Completed,
     /// The operation was cancelled.
     Cancelled,
-    /// The provider reported a failure.
-    Failed { reason: String },
+    /// The provider reported a failure. `reason` is untrusted provider prose
+    /// (sanitized at the adapter boundary); `code` is the distinct typed
+    /// [`AcpRpcError::code`] when the failure arrived as a wire error, `None`
+    /// when the assembler has no wire code. The code travels typed through
+    /// assembly and is rendered alongside — never through — the redacted
+    /// display text, so default-deny keeps distinct codes distinct instead of
+    /// merging them into one generic result.
+    Failed { reason: String, code: Option<i64> },
     /// The outcome could not be established.
     Unknown { reason: String },
 }
@@ -1544,7 +1550,10 @@ impl AcpResultEnvelope {
         match outcome {
             AcpResultOutcome::Completed => (ResultDisposition::DegradedNoProof, None),
             AcpResultOutcome::Cancelled => (ResultDisposition::CancelledObserved, None),
-            AcpResultOutcome::Failed { reason } => {
+            AcpResultOutcome::Failed { reason, .. } => {
+                // Disposition keys on the failure kind, never on the wire
+                // code: distinct codes stay distinct in the display text
+                // below, they never fork dispositions.
                 (ResultDisposition::FailedVerification, Some(reason))
             }
             AcpResultOutcome::Unknown { reason } => {
@@ -1591,6 +1600,19 @@ impl AcpResultEnvelope {
         }
     }
 
+    /// Renders a typed wire failure code alongside sanitized display text
+    /// (issue #2641 AUD6): the code is formatted from the typed `i64` after
+    /// sanitization, never parsed from untrusted prose, so redaction cannot
+    /// destroy it and provider text cannot forge it. The sanitized base is
+    /// shortened only by suffix removal to respect the public-field bound,
+    /// which cannot introduce markers, controls, or blank content.
+    fn acp_failure_display_with_code(base: &str, code: i64) -> String {
+        let suffix = format!(" [rpc-code:{code}]");
+        let keep = eliot_agent_api::MAX_SAFE_ERROR_CHARS.saturating_sub(suffix.chars().count());
+        let truncated: String = base.chars().take(keep).collect();
+        format!("{truncated}{suffix}")
+    }
+
     pub fn into_agent_result(
         self,
         route: RouteFingerprint,
@@ -1613,17 +1635,35 @@ impl AcpResultEnvelope {
             return Err(AcpAdapterError::InvalidInput("operation_id"));
         }
         Self::check_acp_result_binding(&route, binding, self.session_id.as_ref())?;
+        // The typed wire code travels beside the outcome, not inside the
+        // untrusted prose: it is captured here and rendered only after the
+        // sanitizer below has run, so default-deny redaction keeps distinct
+        // codes distinct instead of merging them into one generic result.
+        let error_code = match &outcome {
+            AcpResultOutcome::Failed { code, .. } => *code,
+            _ => None,
+        };
         let (disposition, unknown_reason) = Self::acp_result_disposition(outcome);
         // Adapter-boundary sanitization (issues #369 and #2641): provider
         // prose is untrusted even when it byte-matches a fixed ELIOT reason.
         // Only the real ACP terminal assembly site supplies caller provenance
         // for its fixed non-terminal reason; generic/wire bytes never supply
         // caller provenance and cannot qualify through exact text equality.
+        // A typed wire code, when present, is appended after sanitization so
+        // redaction never destroys it; both public fields below inherit it.
         let unknown_reason = unknown_reason.map(|reason| {
-            let trusted_diagnostic = diagnostic_caller.and_then(|caller| {
-                eliot_agent_api::route_receipts::resolve_trusted_adapter_diagnostic(caller, &reason)
-            });
-            sanitize_adapter_error(trusted_diagnostic.unwrap_or(""))
+            let sanitized = {
+                let trusted_diagnostic = diagnostic_caller.and_then(|caller| {
+                    eliot_agent_api::route_receipts::resolve_trusted_adapter_diagnostic(
+                        caller, &reason,
+                    )
+                });
+                sanitize_adapter_error(trusted_diagnostic.unwrap_or(""))
+            };
+            match error_code {
+                Some(code) => Self::acp_failure_display_with_code(&sanitized, code),
+                None => sanitized,
+            }
         });
         let usage = UsageReceipt {
             input_tokens: None,
@@ -1794,7 +1834,8 @@ pub struct AcpWireResultIds {
 ///   output still maps to candidate-only `DegradedNoProof`);
 /// - `Response` with `error` keeps the error payload and drains through
 ///   [`AcpResultEnvelope::into_agent_result`] with an explicit
-///   [`AcpResultOutcome::Failed`] reason (sanitized at the adapter boundary);
+///   [`AcpResultOutcome::Failed`] reason (sanitized at the adapter boundary)
+///   carrying the distinct typed wire code alongside the redacted text;
 /// - `Notification` is non-terminal provider output and drains through
 ///   `assemble_candidate_result` to `UnknownOutcome` with its recovery handle;
 /// - `Request` is an inbound call and never a result: rejected.
@@ -1852,6 +1893,9 @@ pub fn drain_wire_result(
                     admission,
                     AcpResultOutcome::Failed {
                         reason: error.message.clone(),
+                        // Distinct typed wire code carried alongside the
+                        // sanitized message (issue #2641 AUD6).
+                        code: Some(error.code),
                     },
                 )
             } else if let Some(result) = &response.result {
@@ -2650,6 +2694,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let failed = project_result(AcpResultOutcome::Failed {
             reason: "provider rejected request".into(),
+            code: None,
         })?;
         assert_eq!(failed.disposition, ResultDisposition::FailedVerification);
         assert_eq!(
