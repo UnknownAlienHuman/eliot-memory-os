@@ -1526,7 +1526,22 @@ impl KernelComposition {
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
-        let (receipt, record) = self.admit_host_request_envelope_under_transition(envelope)?;
+        let task_relative_tool = check_task_controller_admission(envelope, tool)
+            .ok()
+            .and_then(|()| {
+                serde_json::from_value::<eliot_protocol::TaskControllerInvocation>(
+                    tool.get("arguments")?.clone(),
+                )
+                .ok()
+            })
+            .map(|invocation| {
+                invocation.action != eliot_protocol::TaskControllerAction::BindScope
+            });
+        let (receipt, record) = self
+            .admit_host_request_envelope_with_tool_binding_under_transition(
+                envelope,
+                task_relative_tool,
+            )?;
         // Queue each admitted shape in its Kernel-owned lane. Query and Skill
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
@@ -3201,7 +3216,7 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         pending: &super::AgentActivationPendingState,
-        task_relative_tool: bool,
+        task_relative_tool: Option<bool>,
     ) -> Result<bool, TransportError> {
         let retained = {
             let connections = self
@@ -3213,8 +3228,9 @@ impl KernelComposition {
                 .and_then(|state| state.activated_binding.clone())
         };
         let task_relative = envelope.kind == HostRequestKind::Invocation
-            && (task_relative_tool
-                || host_request_capability_is_task_relative(envelope.identity.capability.as_str()));
+            && task_relative_tool.unwrap_or_else(|| {
+                host_request_capability_is_task_relative(envelope.identity.capability.as_str())
+            });
         let session_id = if let Some(retained) = retained.as_ref() {
             if !self.activation_result_still_retained(pending, retained, &envelope.connection_id) {
                 return Ok(false);
@@ -3357,7 +3373,7 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
-                if !self.application_binding_live_for_claim(envelope, &admission_owner, false)? {
+                if !self.application_binding_live_for_claim(envelope, &admission_owner, None)? {
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
@@ -3543,7 +3559,7 @@ impl KernelComposition {
         let Some(envelope) = candidate.local_read_envelope.as_ref() else {
             return Ok(None);
         };
-        if !self.application_binding_live_for_claim(envelope, pending, false)? {
+        if !self.application_binding_live_for_claim(envelope, pending, None)? {
             return Ok(None);
         }
         let attempt = candidate.local_read_attempt.clone();
@@ -5117,7 +5133,7 @@ impl KernelComposition {
                 if !self.application_binding_live_for_claim(
                     envelope,
                     &admission_owner,
-                    task_relative_tool,
+                    Some(task_relative_tool),
                 )? {
                     position += 1;
                     continue;
