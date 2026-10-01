@@ -220,6 +220,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::{fs, path::Component};
 use std::sync::Arc;
 
 use eliot_bootstrap::capture::{
@@ -231,7 +232,7 @@ use eliot_contracts::{RequestMetadata, StateFence, TaskId};
 use eliot_governor::{
     CanonicalWriteEnvelope, ColdStartSurfaceView, GoverningSourceSet, PrivacyProfile, ScopeBinding,
     SourceArtifactAdmission, TaskSelectionAdmissionBinding, WorkScopeDescriptor,
-    derive_observed_resources,
+    derive_observed_resources, observed_scope_binding,
 };
 use eliot_integration_coverage::{GovernanceProfile, IntegrationCoverageProfile};
 use eliot_observation::TaskSelectionEvidence;
@@ -3797,6 +3798,162 @@ pub fn observe_explicit_workspace(
     fence: &StateFence,
 ) -> Result<ObservedScopeResources, TaskBindingError> {
     observe_explicit_workspace_facts(workspace_root, fence).map(|(_, observed)| observed)
+}
+
+/// Owner-observed source bytes for one selected path beneath the current
+/// retained WorkScope root. The canonical path is a locator result only; the
+/// caller must keep the `WorkScopeBindingSnapshot` and its original matched
+/// guard receipt beside this value through admission and process invocation.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundSelectedSourceObservation {
+    pub(crate) facts: WorkspaceInstanceFacts,
+    pub(crate) canonical_root: PathBuf,
+    pub(crate) canonical_candidate: PathBuf,
+    pub(crate) source_bytes: Vec<u8>,
+    pub(crate) source_sha256: String,
+}
+
+/// Re-observes the physical workspace named by the current original WorkScope
+/// and reads one normalized relative source candidate. A stored root identity
+/// is used only to locate the path to observe: the fresh filesystem/Git facts,
+/// complete derived binding, state fence, and original matched guard receipt
+/// must all agree before any candidate bytes are returned.
+pub(crate) fn observe_bound_selected_source(
+    work_scope: &eliot_workscope::WorkScopeBindingSnapshot,
+    state_fence: &StateFence,
+    selected_relative_path: &str,
+) -> Result<BoundSelectedSourceObservation, TaskBindingError> {
+    work_scope.validate().map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "selected-source WorkScope snapshot is invalid: {error}"
+        ))
+    })?;
+    if work_scope.state_fence != *state_fence
+        || work_scope.binding.scope.generation != state_fence.resource_generation.value()
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "selected-source WorkScope snapshot is not current at the request fence".to_owned(),
+        ));
+    }
+    let receipt = &work_scope.guard_receipt;
+    let binding = &work_scope.binding;
+    if receipt.disposition != eliot_workscope::ScopeBindingDisposition::Matched
+        || receipt.expected_scope_ref != binding.scope.scope_ref
+        || receipt.observed_scope_ref != binding.scope.scope_ref
+        || receipt.expected_lineage_ref != binding.scope.lineage_ref
+        || receipt.observed_lineage_ref != binding.scope.lineage_ref
+        || receipt.expected_instance_ref != binding.scope.instance_ref
+        || receipt.observed_instance_ref != binding.scope.instance_ref
+        || receipt.source_generation != binding.governing_source_generation
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "selected-source request lacks the exact original matched WorkScope receipt".to_owned(),
+        ));
+    }
+
+    let root_hint = Path::new(&binding.scope.root_identity);
+    if !root_hint.is_absolute()
+        || selected_relative_path.trim().is_empty()
+        || selected_relative_path.contains('\\')
+        || Path::new(selected_relative_path).components().any(|component| {
+            !matches!(component, Component::Normal(_))
+        })
+    {
+        return Err(TaskBindingError::scope_incompatible(
+            "selected-source locator is not an absolute retained root plus normalized relative path".to_owned(),
+        ));
+    }
+
+    let facts = observe_workspace_instance(root_hint).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "selected-source physical WorkScope observation failed: {error}"
+        ))
+    })?;
+    let observed = derive_observed_resources(
+        &facts,
+        state_fence.resource_generation,
+        None,
+    )
+    .map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "selected-source physical WorkScope facts were refused: {error}"
+        ))
+    })?;
+    let observed_binding = observed_scope_binding(
+        binding,
+        &observed,
+        binding.privacy_class,
+        binding.governing_source_generation,
+    )
+    .map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "selected-source physical WorkScope binding was refused: {error}"
+        ))
+    })?;
+    if observed_binding != *binding {
+        return Err(TaskBindingError::scope_incompatible(
+            "selected-source physical root or full WorkScope identity changed".to_owned(),
+        ));
+    }
+
+    let canonical_root = fs::canonicalize(root_hint).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "selected-source WorkScope root could not be canonicalized: {error}"
+        ))
+    })?;
+    let requested_candidate = canonical_root.join(selected_relative_path);
+    let mut cursor = canonical_root.clone();
+    for component in Path::new(selected_relative_path).components() {
+        let Component::Normal(part) = component else {
+            return Err(TaskBindingError::scope_incompatible(
+                "selected-source candidate contains a non-normal path component".to_owned(),
+            ));
+        };
+        cursor.push(part);
+        let metadata = fs::symlink_metadata(&cursor).map_err(|error| {
+            TaskBindingError::scope_incompatible(format!(
+                "selected-source candidate path is unavailable: {error}"
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(TaskBindingError::scope_incompatible(
+                "selected-source candidate traverses a symbolic link".to_owned(),
+            ));
+        }
+    }
+    let candidate_metadata = fs::metadata(&requested_candidate).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "selected-source candidate could not be observed: {error}"
+        ))
+    })?;
+    if !candidate_metadata.is_file() {
+        return Err(TaskBindingError::scope_incompatible(
+            "selected-source candidate is not a regular file".to_owned(),
+        ));
+    }
+    let canonical_candidate = fs::canonicalize(&requested_candidate).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "selected-source candidate could not be canonicalized: {error}"
+        ))
+    })?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(TaskBindingError::scope_incompatible(
+            "selected-source candidate escaped the retained WorkScope root".to_owned(),
+        ));
+    }
+    let source_bytes = fs::read(&canonical_candidate).map_err(|error| {
+        TaskBindingError::scope_incompatible(format!(
+            "selected-source candidate could not be read: {error}"
+        ))
+    })?;
+    let source_sha256 = sha256_hex(&source_bytes);
+    Ok(BoundSelectedSourceObservation {
+        facts,
+        canonical_root,
+        canonical_candidate,
+        source_bytes,
+        source_sha256,
+    })
 }
 
 fn observe_explicit_workspace_facts(
