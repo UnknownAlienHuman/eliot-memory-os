@@ -4319,7 +4319,7 @@ impl TestdStore {
         if let Some(existing) = &job.blob_process_stream_grant {
             if existing == &grant {
                 let head_key = blob_process_stream_token_head_key(job_id, &grant.capability_ref)?;
-                let heads = write
+                let mut heads = write
                     .open_table(BLOB_PROCESS_STREAM_TOKEN_HEADS)
                     .map_err(database)?;
                 if heads.get(head_key.as_str()).map_err(database)?.is_none() {
