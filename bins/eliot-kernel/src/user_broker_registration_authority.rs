@@ -137,9 +137,9 @@ pub(crate) struct UserBrokerFenceReplay {
     pub(crate) spent: Vec<SpentUserBrokerOperationIdentity>,
 }
 
-/// I1.6 WorkScope execution identity bound to one broker registration.
+/// I1.6 `WorkScope` execution identity bound to one broker registration.
 ///
-/// A broker registration is inherently user-session-bound: the only WorkScope
+/// A broker registration is inherently user-session-bound: the only `WorkScope`
 /// it can ever authorize is `interactive_user:<sid>` for the exact SID it was
 /// admitted for. `service` and `remote` scopes are never derived from a broker
 /// registration here; they are admitted (or refused) on their own owner
@@ -150,7 +150,7 @@ pub(crate) enum BrokerWorkScope {
 }
 
 impl BrokerWorkScope {
-    /// Derives the single WorkScope identity one registration authorizes.
+    /// Derives the single `WorkScope` identity one registration authorizes.
     pub(crate) fn for_registration(registration: &RegistrationRequest) -> Self {
         Self::InteractiveUser {
             sid: registration.windows_sid.clone(),
@@ -168,7 +168,7 @@ impl BrokerWorkScope {
 /// Admits one `interactive_user:<sid>` scoped execution against the exact
 /// live registration that authorizes it (issue #1889 AC1).
 ///
-/// The claimed scope must equal the WorkScope identity derived from the live
+/// The claimed scope must equal the `WorkScope` identity derived from the live
 /// registration, the presenting receipt must still name that same
 /// SID/session tuple with an Active status, and both the receipt and the
 /// registration lease must be unexpired at `now`. Anything else fails closed
