@@ -45,70 +45,123 @@
 //!   makes a changed receipt an I5.27 conflict; it is not evidence, and it is
 //!   not a ceiling.
 //!
-//! # THE HONEST ANSWER ON THIS TREE (I3)
+//! # WHO THE RETAINED-ARCHIVE OWNER IS, AND WHAT IS ACTUALLY MISSING (I3)
 //!
-//! There is NO admitted owner that can resolve a
-//! [`BackupArtifactHandle`] for a backup archive, and this file does not invent
-//! one. Measured on this base:
+//! An earlier version of this file said there is "NO admitted owner" at all.
+//! That was wrong in a way that pointed the next owner at the wrong work, so it
+//! is corrected here rather than left standing.
 //!
-//! 1. `BackupArtifactHandle` requires an `eliot_contracts::ArtifactId`, and the
-//!    ECXF manifest (`eliot_backup::EcxfManifest`) carries no artifact identity
-//!    at all — only `backup_id`, `source_adapter` and `export_fence_sha256`.
-//!    There is no value anywhere in the repository that could be that
-//!    `artifact_id` for a whole archive.
-//! 2. `backup_capture_ports::PublicationPort` — the admitted
-//!    artifact/publication seam — DOES have a production implementation, and it
-//!    is stated here precisely because an earlier version of this file claimed
-//!    otherwise and was wrong: `eliot_blob::BlobArchivePublicationOwner`
+//! **The documented retained-archive owner is `eliot-artifact` (I-01), and the
+//! Kernel already depends on it.** `bins/eliot-kernel/Cargo.toml` declares
+//! `eliot-artifact.workspace = true` as a live edge, and that crate owns exactly
+//! what a retained archive handle is:
+//!
+//! - `eliot_artifact::ArtifactIdentity`
+//!   (`crates/instrument/eliot-artifact/src/identity.rs`) binds
+//!   `artifact_id: ArtifactId`, `content: ContentAddress { digest_hex,
+//!   size_bytes }`, `schema: Option<SchemaBinding>`, `source:
+//!   Option<SourceBinding>` and `created_at` — i.e. the artifact id, the content
+//!   digest and the exact byte length that [`BackupArtifactHandle`] requires,
+//!   derived from bytes rather than caller-asserted;
+//! - `eliot_artifact::PublishedArtifact::receipt()`
+//!   (`crates/instrument/eliot-artifact/src/publication.rs`) is the retained
+//!   PUBLICATION receipt for one published identity, and
+//!   `ArtifactOwner::stage`/`publish` are its only production entry;
+//! - `eliot_artifact::ArtifactOwner::read`
+//!   (`crates/instrument/eliot-artifact/src/blob.rs`) is the ONE owner-issued
+//!   bytes read in the product: it returns a `VerifiedArtifact` whose bytes
+//!   passed the S-04 chunk integrity check and a second I-01
+//!   `ArtifactIdentity::verify_content`, plus a non-mintable
+//!   `ArtifactReadReceipt`.
+//!
+//! Two independent blockers stand between that owner and this route, and they
+//! need different work:
+//!
+//! 1. **The S-04 reader adapter does not exist.**
+//!    `ArtifactOwner::read` takes an injected
+//!    `ArtifactBlobReader` (`crates/instrument/eliot-artifact/src/blob.rs`),
+//!    whose own contract says the composition layer supplies it "around the one
+//!    `eliot_blob_api::BlobStoreClient` owner". Measured on this base that trait
+//!    has **zero implementations in the repository** — the only occurrences of
+//!    the name are the declaration, its one use, the crate re-export, and a
+//!    comment in `bins/eliot-kernel/src/coordination_mailbox.rs`. Supplying it
+//!    means a `BlobStoreClient`, which means a constructed
+//!    `eliot_blob::BlobStoreService`, and every construction of that type
+//!    (`BlobStoreService::new`, `BlobStoreService::new_with_owner`) sits inside
+//!    the `#[cfg(test)] mod tests` that opens at
+//!    `crates/storage/eliot-blob/src/lib.rs:5173`. `bins/eliot-kernel` may not
+//!    take the `eliot-blob` edge at all: four live assertions in
+//!    `scripts/tests/test_backup_dependency_link.py` forbid it (reverted in
+//!    9c7dede47). So this leg is the single Blob root/platform owner — BK2's
+//!    lane CS3 agreement (#1969) — and no Kernel-side code can substitute for it.
+//!
+//! 2. **The closed protocol handle carries none of the S-04 addressing terms
+//!    its owner needs, and no blob agreement closes that.** `ArtifactOwner::read`
+//!    is driven by an `ArtifactReference`
+//!    (`crates/instrument/eliot-artifact/src/blob.rs`), which is
+//!    `identity` PLUS `locator: BlobLocator` PLUS `expected_metadata_sha256`
+//!    PLUS `expected_ready_receipt_id` — and the locator alone is a residency
+//!    identity with `root_generation` and `path_generation`
+//!    (`crates/storage/eliot-blob-api/src/lib.rs`). [`BackupArtifactHandle`]
+//!    (`crates/foundation/eliot-protocol/src/backup.rs`) has none of those
+//!    fields, and `ArtifactManifest` (`.../eliot-artifact/src/manifest.rs`) does
+//!    not retain a locator either, so the I-01 owner cannot be asked to resolve a
+//!    bare handle on its own. Closing this is a decision about the closed
+//!    `BackupArtifactHandle` wire — either that contract grows the addressing
+//!    terms, or a second handle type appears, which this file and the issue
+//!    both forbid. It is not a Kernel decision.
+//!
+//! Two more measured facts belong to the same section:
+//!
+//! 3. `backup_capture_ports::PublicationPort` — the capture-side seam — DOES
+//!    have a production implementation, stated here precisely because an earlier
+//!    version of this file claimed otherwise and was wrong:
+//!    `eliot_blob::BlobArchivePublicationOwner`
 //!    (`crates/storage/eliot-blob/src/publication_owner.rs`,
-//!    `impl PublicationPort for BlobArchivePublicationOwner`).
-//!    But that implementation cannot resolve an ARCHIVE HANDLE, and the reason is
-//!    the trait's own shape, not a missing file: `PublicationPort` has exactly
-//!    two methods, `publish_once(operation_id, idempotency_key, bytes)` and
-//!    `reconcile(operation_id)`. Both are WRITE-SIDE or BY-OPERATION queries.
-//!    Neither accepts a `BackupArtifactHandle`, neither returns bytes, and
-//!    neither returns an `ArtifactId`: the only thing either can hand back is a
-//!    `PublicationReceipt { operation_id, archive_sha256, durable }`. So there is
-//!    no argument this route could pass a handle to and no value it could read
-//!    bytes out of. Binding it is a second, independent blocker — it needs an
-//!    `eliot_blob::BlobStoreService`, and every construction of that type in the
-//!    repository (`BlobStoreService::new`, `BlobStoreService::new_with_owner` in
-//!    `crates/storage/eliot-blob/src/lib.rs`) sits inside the `#[cfg(test)] mod
-//!    tests` that begins at line 5173 of that file, so no production code
-//!    constructs one — but the trait shape alone already decides it.
-//! 3. `eliot-blob-api::backup_io` DOES own real retained-artifact evidence
+//!    `impl PublicationPort for BlobArchivePublicationOwner`). It cannot resolve
+//!    an archive handle, and the reason is the trait's own shape rather than a
+//!    missing file: `PublicationPort` has exactly two methods,
+//!    `publish_once(operation_id, idempotency_key, bytes)` and
+//!    `reconcile(operation_id)`, both WRITE-SIDE or BY-OPERATION, and the only
+//!    thing either can return is a `PublicationReceipt { operation_id,
+//!    archive_sha256, durable }`. It is the owner of the PUBLICATION receipt on
+//!    the capture leg — `KernelBackupCapture::capture` already binds it, and
+//!    binds it through its own `validate()` on the durable record — and it is not
+//!    an archive-RETENTION owner.
+//! 4. `eliot-blob-api::backup_io` owns real retained-artifact evidence
 //!    (`BlobBackupFence`, `SealedBlobCaptureRecord`, `BlobBackupScope`,
-//!    `BlobBackupCompletionReceipt`, `SealedBlobRead`), and its one read path,
-//!    `BlobReadRequest` → `read_sealed` → `SealedBlobRead`, is a genuine
-//!    owner-issued-bytes read. But that owner retains PER-MEMBER SEALED BLOB
-//!    ENVELOPES under a destination residency scope, not a backup archive, and
-//!    none of its receipts carries an `ArtifactId`, a `ContractIdentity` or a
-//!    class. Its own read request is addressed by `BlobLocator` plus
-//!    `expected_metadata_sha256` and `expected_ready_receipt_id` — a locator, not
-//!    a `BackupArtifactHandle`. It is therefore not a backup-archive retention
-//!    owner and is not bound here.
-//! 4. `bins/eliot-kernel/src/backup_owner_clients.rs` binds the two real owner
-//!    CHANNELS, and its Watchdog accepted table carries `VerifyArchive`
-//!    (`WATCHDOG_SUPPORTED_OPS`), but that is a RECOGNITION set and the
-//!    executable set is narrower: `WATCHDOG_EXECUTABLE_CONTOURS` is
-//!    `[ReadSnapshotPage, ReconcileRestore]`, so `VerifyArchive` is registered
-//!    precisely so an absent owner method answers with an explicit typed
-//!    refusal instead of vanishing. The Watchdog's own endpoint says the same
-//!    thing about itself in `bins/eliot-watchdog/src/backup_control.rs`: it
-//!    "holds no archive verifier and never interprets archive bytes". Separately,
-//!    `BackupRole::Verifier` — the only role whose
-//!    `BackupArchiveValidityAttestation::validate_against` accepts
-//!    (`eliot-protocol/src/backup.rs`) — is bound to no channel: the closed
-//!    `OwnerRole` enum carries only `InstallationAuthority` (Host) and
-//!    `CaptureOwner`/`SpoolOwner` (Watchdog), and `Verifier` appears in no
-//!    `protocol_roles()` table. So no channel on this product can issue a
-//!    validity attestation at all. The Watchdog DOES hold
-//!    `BackupRole::CaptureOwner`, so a capture receipt is role-plausible on its
-//!    own; it is still unreachable, for two independent reasons:
-//!    `RequestCapture` is outside that owner's registered operation table, and
-//!    the verify route contacts no owner client at all.
+//!    `BlobBackupCompletionReceipt`, `SealedBlobRead`), but it retains PER-MEMBER
+//!    SEALED BLOB ENVELOPES under a destination residency scope, not a backup
+//!    archive, and none of its receipts carries an `ArtifactId`, a
+//!    `ContractIdentity` or a class. It is not bound here.
 //!
-//! Consequently the production answer is
+//! # THE VERIFIER ATTESTATION IS A SEPARATE, OWNER-DECIDED BLOCKER
+//!
+//! `bins/eliot-kernel/src/backup_owner_clients.rs` binds the two real owner
+//! CHANNELS, and its Watchdog accepted table carries `VerifyArchive`
+//! (`WATCHDOG_SUPPORTED_OPS`), but that is a RECOGNITION set and the executable
+//! set is narrower: `WATCHDOG_EXECUTABLE_CONTOURS` is `[ReadSnapshotPage,
+//! ReconcileRestore]`, so `VerifyArchive` is registered precisely so an absent
+//! owner method answers with an explicit typed refusal instead of vanishing. The
+//! Watchdog's own endpoint says the same thing about itself in
+//! `bins/eliot-watchdog/src/backup_control.rs`: it "holds no archive verifier and
+//! never interprets archive bytes". Separately, `BackupRole::Verifier` — the only
+//! role whose `BackupArchiveValidityAttestation::validate_against` accepts — is
+//! bound to no channel: the closed role tables carry only
+//! `InstallationAuthority` (Host) and `CaptureOwner`/`SpoolOwner` (Watchdog), so
+//! `Verifier` appears in no `protocol_roles()` table and no channel on this
+//! product can issue a validity attestation at all. Widening either closed table
+//! is a deliberate owner statement about which owner interprets archive bytes,
+//! and it is not this route's to make.
+//!
+//! The Watchdog DOES hold `BackupRole::CaptureOwner`, so a capture receipt is
+//! role-plausible on its own; it is still unreachable for two further measured
+//! reasons: `RequestCapture` is outside that owner's registered operation table,
+//! and `BackupCaptureReceipt::validate_against` needs a `BackupRequestIdentity`,
+//! whose `admission: BackupAdmissionRef` carries an owner-issued
+//! `admission_receipt: ReceiptId` that no owner on this product issues.
+//!
+//! Consequently the production answer remains
 //! [`OwnerProvenanceEvidence::unissued`]: the three #2862 identity fields stay
 //! `None`, no receipt is validated because none exists, and no attestation is
 //! produced because no verifier session issues one. `None` there is the OWNER'S
@@ -141,6 +194,16 @@
 //! `missing_owner` and `reason`), so the refusal uses the vocabulary that
 //! already exists instead of inventing one.
 //!
+//! ONE CORRECTION TO THAT TOKEN, because it is what the next owner will be
+//! pointed at: `backup-retained-archive-owner (#2862)` names an owner that does
+//! exist — `eliot-artifact` (I-01), already a `bins/eliot-kernel` dependency.
+//! What is absent is its S-04 read adapter (the single Blob root/platform owner,
+//! BK2's lane CS3 agreement) and, separately, a way for the closed
+//! `BackupArtifactHandle` wire to carry the addressing terms that owner needs.
+//! The token itself is left byte-identical here because `request_dispatch.rs` is
+//! another writer's span in this batch; the correction is recorded where the
+//! measurement belongs and travels with this file's return.
+//!
 //! # WHAT IS DELIBERATELY NOT HERE
 //!
 //! - No `BackupArchiveVerification` is CONSTRUCTED here or anywhere else. This
@@ -165,10 +228,9 @@
 //!   an owner channel, and the frame holds none: which is why
 //!   `OwnerProvenanceEvidence::unissued` is the production answer below and why
 //!   the retained-archive arm fails closed today rather than assuming a role.
-//!   This file's measured reasons for that absence are unchanged; what changed is
-//!   that the receipt and attestation validators are now genuinely CALLED on the
-//!   path where an owner does supply them, instead of a hand-written subset of
-//!   their relations being spelled out beside them.
+//!   This file's measured reasons for that absence are re-derived in the module
+//!   docs above; what is new there is only WHICH owner is missing, not the fact
+//!   that one is.
 //! - `successor_of` is untouched in meaning. It stays caller-presented, stays a
 //!   POINTER that only selects which durable row is read, and stays at its
 //!   current fail-closed / lower-ceiling behaviour. Only its owning TYPE moved
@@ -488,17 +550,16 @@ impl OwnerProvenanceEvidence {
     ///
     /// This is a TYPED REFUSAL, not an empty default and not a stand-in. On
     /// this tree it is also the production answer, and the measured reasons are
-    /// enumerated in the module docs: a `BackupArtifactHandle` needs an
-    /// `ArtifactId` that no backup-archive owner issues; the production
-    /// `PublicationPort` impl #959 added
-    /// (`eliot_blob::BlobArchivePublicationOwner`) has NO METHOD THAT ACCEPTS A
-    /// HANDLE AND NO METHOD THAT RETURNS BYTES — its `reconcile` returns only a
-    /// `PublicationReceipt { operation_id, archive_sha256, durable }` — and it
-    /// additionally could not be bound without a production
-    /// `eliot_blob::BlobStoreService`, which does not exist;
-    /// `eliot-blob-api::backup_io` retains per-member sealed blob envelopes
-    /// addressed by `BlobLocator` rather than a backup archive; and
-    /// `BackupRole::Verifier` is bound to no owner channel.
+    /// enumerated in the module docs. In short: the retained-archive OWNER is
+    /// `eliot-artifact` (I-01), which `bins/eliot-kernel` already depends on,
+    /// but the two things it needs to resolve a handle into bytes are both
+    /// absent — the S-04 `ArtifactBlobReader` adapter has zero implementations
+    /// anywhere in the repository and depends on the single Blob
+    /// root/platform owner (BK2, lane CS3 #1969); and the closed
+    /// `BackupArtifactHandle` wire carries none of the S-04 addressing terms
+    /// `ArtifactOwner::read` requires, which is a contract decision rather than
+    /// an implementation gap. Separately, `BackupRole::Verifier` is bound to no
+    /// owner channel.
     ///
     /// What it means concretely: the presented archive is caller-presented
     /// inline bytes and nothing more. The route therefore records all three
@@ -879,12 +940,11 @@ fn check_protocol_archive_binding(
 /// - handle → owner: the handle's owner `ContractId` equals the capture/owner
 ///   contract the archive DECLARES about itself in its producing
 ///   `source_adapter`.
-///   ASSUMPTION: a retained-archive owner records its contract name in the same
-///   text the archive declares as its `source_adapter`. Nothing in the
-///   repository proves that today, because no such owner exists; if a future
-///   owner records a different spelling, this comparison fails closed for every
-///   receipt, which is the safe direction, and this line is the single place
-///   that binding is stated.
+///   ASSUMPTION, and now a MEASURED defect rather than an open one: this is the
+///   same vocabulary mismatch every other owner comparison in this file carries,
+///   and it is stated once, in full and with its owner's own definition, in
+///   "ONE MEASURED DEFECT IN EVERY OWNER-CONTRACT COMPARISON" above. This line is
+///   a pointer to that statement, not a second, weaker copy of it.
 /// - receipt → capture operation → archive: `validate_against` compares the
 ///   receipt's `archive_id`, `snapshot_digest`, `member_digest`, class, fence
 ///   and currency against the capture request identity; the joins below then
@@ -894,6 +954,33 @@ fn check_protocol_archive_binding(
 ///   fence this archive was exported under. A receipt for another archive,
 ///   another snapshot, another membership, another class, another fence or
 ///   another source refuses here, before any verdict.
+///
+/// # ONE MEASURED DEFECT IN EVERY OWNER-CONTRACT COMPARISON BELOW, STATED
+/// ONCE INSTEAD OF FIVE TIMES
+///
+/// Every "→ owner" comparison in this file joins a CONTRACT IDENTITY name —
+/// `handle.contract.name`, `identity.archive_contract.name`,
+/// `identity.owner_contract.name` — against `CaptureReport::owner_contract`,
+/// and the two `attesting_owner` comparisons join against it too. That report
+/// field is read from the decoded ECXF manifest's producing `source_adapter`
+/// (`bins/eliot-kernel/src/backup_capture.rs`), and `source_adapter` is, by its
+/// own owner's recorded definition, "this adapter's identity"
+/// (`crates/storage/eliot-store-surreal-adapter/src/schema.rs`) — the STORE
+/// ADAPTER that produced the export, not a `ContractIdentity` of a retention or
+/// capture owner.
+///
+/// The two vocabularies are therefore not two spellings of one fact. As
+/// written, a handle, receipt or attestation whose contract is CORRECT can still
+/// be refused here, and such a refusal does not mean the evidence was wrong. The
+/// direction is fail-closed and is kept deliberately: this file does not remove
+/// the comparison, because removing it would drop a binding rather than repair
+/// one, and it does not coerce the adapter name into a contract identity,
+/// because that would invent the relation the issue forbids inventing. What the
+/// next owner of this arm needs is an OWNER-HELD contract identity to compare
+/// against — the route holds no such value today, which is the same absence the
+/// module docs enumerate. Repair it at that end; do not "repair" it here by
+/// matching text.
+///
 /// - receipt → owner: the receipt's `attesting_owner` equals the owner contract
 ///   the archive declares. A receipt issued by another owner refuses, and so
 ///   does one whose channel never authenticated as the capture owner.
