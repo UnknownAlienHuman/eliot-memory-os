@@ -291,7 +291,14 @@ pub(super) fn supervision_publication_identity(
         })?,
     };
     // WORK_UNIT_CASE: 979/4 — publication identity projected with exact digests.
-    watchdog_publication_observe("watchdog.publication identity projected");
+    // I7.20 same-operation identity: the phase detail carries the same
+    // owner-built nonsecret handles (never record bytes); the facade bounds.
+    watchdog_publication_observe(&format!(
+        "watchdog.publication identity projected lease_id={} ors_receipt={} publication={}",
+        super::host_diagnostics::bound_field(identity.lease_id.as_str()).text(),
+        super::host_diagnostics::bound_field(identity.ors_receipt_digest.as_str()).text(),
+        super::host_diagnostics::bound_field(identity.publication_digest.as_str()).text(),
+    ));
     Ok(identity)
 }
 

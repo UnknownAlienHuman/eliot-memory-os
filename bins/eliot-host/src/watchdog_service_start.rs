@@ -125,7 +125,12 @@ fn bind_watchdog_process(
         *bound = Some(observed.clone());
     }
     // WORK_UNIT_CASE: 979/4 — exact process identity bound (pid/start/image match).
-    watchdog_start_observe("watchdog.start process identity bound");
+    // I7.20 same-operation identity: pid/start already held; image path never
+    // rendered (I15.4); the facade bounds.
+    watchdog_start_observe(&format!(
+        "watchdog.start process identity bound pid={} start={}",
+        observed.process_id, observed.start_time_100ns,
+    ));
     Ok(())
 }
 

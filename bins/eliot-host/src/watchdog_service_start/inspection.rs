@@ -346,12 +346,25 @@ pub fn verify_watchdog_scm_running(
         ));
     }
     // WORK_UNIT_CASE: 979/5 — SCM liveness verified; never supervision evidence.
-    watchdog_inspection_observe("watchdog.inspection SCM running verified");
-    Ok(VerifiedWatchdogScmRunning {
+    // I7.20 same-operation identity: pid/start/generation already held; image
+    // path never rendered (I15.4); a missing generation stays an explicit
+    // unavailable field; the facade bounds.
+    let verified = VerifiedWatchdogScmRunning {
         process: observed.clone(),
         wait_hint_ms,
         approved_plan_generation: registration
             .bootstrap()
             .map(ServiceBootstrapArguments::transaction_plan_generation),
-    })
+    };
+    let generation = verified
+        .approved_plan_generation
+        .map_or_else(|| "unavailable".to_owned(), |value| value.to_string());
+    watchdog_inspection_observe(&format!(
+        "watchdog.inspection SCM running verified pid={} start={} generation={} wait_hint_ms={}",
+        verified.process.process_id,
+        verified.process.start_time_100ns,
+        generation,
+        verified.wait_hint_ms,
+    ));
+    Ok(verified)
 }

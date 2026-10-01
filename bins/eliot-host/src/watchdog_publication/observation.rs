@@ -235,7 +235,14 @@ pub fn verify_exact_current_watchdog_publication(
         ));
     }
     // WORK_UNIT_CASE: 979/2 — publication verified as the exact authoritative ORS head.
-    watchdog_observation_observe("watchdog.publication exact current verified");
+    // I7.20 same-operation identity: bind the already-held snapshot revision,
+    // record, and receipt digest (never lease bytes); the facade bounds.
+    watchdog_observation_observe(&format!(
+        "watchdog.publication exact current verified revision={} record={} ors_receipt={}",
+        current.record.revision,
+        super::super::host_diagnostics::bound_field(current.record.record_id.as_str()).text(),
+        super::super::host_diagnostics::bound_field(&current.receipt.receipt_sha256).text(),
+    ));
     Ok(())
 }
 
