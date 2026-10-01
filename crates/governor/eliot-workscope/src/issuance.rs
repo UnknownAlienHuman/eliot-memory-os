@@ -162,5 +162,5 @@ pub fn admit_initial_binding(
     }
     let snapshot =
         WorkScopeBindingSnapshot::new(fence.clone(), owner_revision, observed.clone(), receipt)?;
-    WorkScopeBindingOwner::new(snapshot)
+    WorkScopeBindingOwner::new_with_source_closure(snapshot, sources, privacy)
 }

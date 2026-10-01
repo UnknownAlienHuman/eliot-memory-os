@@ -474,6 +474,8 @@ pub struct WorkScopeBindingSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct WorkScopeBindingOwner {
     snapshot: WorkScopeBindingSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_closure: Option<(GoverningSourceSet, PrivacyProfile)>,
 }
 
 /// Validation errors for the bounded core.
@@ -502,6 +504,8 @@ pub enum WorkScopeError {
     SourceIdentityMismatch,
     #[error("source set is not admitted for this scope generation")]
     SourceSetMismatch,
+    #[error("the retained WorkScope owner has no admitted governing-source closure")]
+    SourceClosureUnavailable,
     #[error("governing sources are conflicted with no admitted winner")]
     UnresolvedSourceConflict,
     #[error("task promotion requires the decision owner or a delegated binding")]
@@ -3446,7 +3450,43 @@ impl WorkScopeBindingOwner {
     /// Creates the canonical owner after validating the persisted snapshot.
     pub fn new(snapshot: WorkScopeBindingSnapshot) -> Result<Self, WorkScopeError> {
         snapshot.validate()?;
-        Ok(Self { snapshot })
+        Ok(Self {
+            snapshot,
+            source_closure: None,
+        })
+    }
+
+    /// Creates an owner that retains the exact source/privacy values used by
+    /// the successful binding admission.
+    ///
+    /// The supplied closure is revalidated against the admitted snapshot
+    /// before it is retained. The closure remains in-process owner state and
+    /// is not added to the legacy snapshot wire shape.
+    pub fn new_with_source_closure(
+        snapshot: WorkScopeBindingSnapshot,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+    ) -> Result<Self, WorkScopeError> {
+        snapshot.validate()?;
+        if sources.generation != snapshot.binding.governing_source_generation {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
+        let receipt = ScopeBindingGuard.check(
+            &snapshot.binding,
+            &snapshot.binding,
+            sources,
+            privacy,
+        );
+        if receipt.disposition != ScopeBindingDisposition::Matched {
+            return Err(WorkScopeError::BindingReceiptNotMatched);
+        }
+        if receipt != snapshot.guard_receipt {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        Ok(Self {
+            snapshot,
+            source_closure: Some((sources.clone(), privacy.clone())),
+        })
     }
 
     /// Recovers the owner through the same fail-closed validation path.
@@ -3467,6 +3507,38 @@ impl WorkScopeBindingOwner {
             return Err(WorkScopeError::StateFenceMismatch);
         }
         Ok(self.snapshot.clone())
+    }
+
+    /// Reads the exact admitted source/privacy closure at its current fence.
+    ///
+    /// Legacy owners reconstructed from snapshots remain readable through
+    /// [`Self::read_current`], but cannot authorize a source-dependent write
+    /// because their original closure values were not retained.
+    pub fn read_current_source_closure(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<(GoverningSourceSet, PrivacyProfile), WorkScopeError> {
+        self.read_current(state_fence)?;
+        let (sources, privacy) = self
+            .source_closure
+            .as_ref()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        if sources.generation != self.snapshot.binding.governing_source_generation {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
+        let receipt = ScopeBindingGuard.check(
+            &self.snapshot.binding,
+            &self.snapshot.binding,
+            sources,
+            privacy,
+        );
+        if receipt.disposition != ScopeBindingDisposition::Matched {
+            return Err(WorkScopeError::BindingReceiptNotMatched);
+        }
+        if receipt != self.snapshot.guard_receipt {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        Ok((sources.clone(), privacy.clone()))
     }
 }
 
