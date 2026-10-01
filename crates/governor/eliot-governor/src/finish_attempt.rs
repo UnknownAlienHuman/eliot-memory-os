@@ -277,12 +277,11 @@ fn recovery_refusal(detail: String) -> FinishAttemptError {
 pub fn parse_kernel_change_transfer(
     json: &str,
 ) -> Result<KernelObservationTransfer, FinishAttemptError> {
-    let document: KernelObservationTransfer =
-        serde_json::from_str(json).map_err(|error| {
-            recovery_refusal(format!(
-                "kernel change transfer is not a v1 observation document: {error}"
-            ))
-        })?;
+    let document: KernelObservationTransfer = serde_json::from_str(json).map_err(|error| {
+        recovery_refusal(format!(
+            "kernel change transfer is not a v1 observation document: {error}"
+        ))
+    })?;
     if document.format_version != KERNEL_CHANGE_TRANSFER_FORMAT_VERSION {
         return Err(recovery_refusal(format!(
             "kernel change transfer format version {document.format_version} is not ingestible (expected {KERNEL_CHANGE_TRANSFER_FORMAT_VERSION})"
@@ -482,16 +481,17 @@ fn governed_transfer_observation(
             structural_digest: None,
         }
     });
-    let after = original.after_revision.as_ref().map(|revision| {
-        ResourceSnapshot {
+    let after = original
+        .after_revision
+        .as_ref()
+        .map(|revision| ResourceSnapshot {
             resource_ref: original.resource.clone(),
             revision: revision.clone(),
             path: Some(original.path.clone()),
             symbol: None,
             content_digest: original.after_digest.clone(),
             structural_digest: None,
-        }
-    });
+        });
     let kind = match (&before, &after) {
         (None, None) => {
             return Err(recovery_refusal(format!(
