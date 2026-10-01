@@ -195,7 +195,7 @@ impl RpcSession {
     /// `Some`, each received frame is charged against it *before* the binary arm
     /// copies the frame and before either arm converts it to text, so a
     /// provider response larger than the admitted ceiling is refused with
-    /// [`StoreError::PayloadTooLarge`](eliot_store_api::StoreError::PayloadTooLarge)
+    /// `StoreError::PayloadTooLarge`
     /// rather than being materialized and refused afterwards. When it is
     /// `None` the previous unbounded read is unchanged: the ceiling is a
     /// property of an admitted capture budget, and no other named operation
