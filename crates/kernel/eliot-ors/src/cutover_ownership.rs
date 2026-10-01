@@ -721,6 +721,127 @@ impl DaemonCutoverOwnership {
     }
 }
 
+/// Durable proof emitted only from a committed daemon-cutover record (I14.15).
+///
+/// Every member is copied out of the committed row, so a receipt cannot assert a
+/// daemon generation, authority epoch, proposal fence, staged-operation
+/// identity, in-flight disposition or unresolved effect scope that the ORS
+/// linearization point did not record. `from_committed` refuses a staged
+/// candidate, so a receipt can never precede the durable commit — the same rule
+/// [`GenerationCutoverOwnershipReceipt::from_committed`] applies to a module
+/// cutover.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonCutoverOwnershipReceipt {
+    /// The exact daemon-cutover identity.
+    pub cutover_id: String,
+    /// Daemon generation being replaced, if any.
+    pub prior_daemon_generation: Option<ResourceGeneration>,
+    /// Daemon generation that becomes authoritative.
+    pub candidate_daemon_generation: ResourceGeneration,
+    /// Authority epoch issued by the cutover.
+    pub new_epoch: AuthorityEpoch,
+    /// Fence after which unstaged prior-daemon proposals are stale.
+    pub old_proposal_fence: OldDaemonProposalFence,
+    /// Exact staged-operation identities Kernel already owned at commit.
+    pub staged_operation_ids: Vec<OperationIdentity>,
+    /// In-flight disposition set fixed at the linearization point.
+    pub in_flight: Vec<InFlightDisposition>,
+    /// Effect scopes left unresolved for reconciliation.
+    pub unresolved_scopes: Vec<String>,
+    /// ORS linearization identity, never absent on a receipt.
+    pub linearization_record_id: String,
+}
+
+impl DaemonCutoverOwnershipReceipt {
+    /// Derives the receipt from one committed record.
+    ///
+    /// The record is revalidated on its OWN recorded values first, and the
+    /// absence of a linearization identity is refused as an invalid transition
+    /// rather than defaulted: a staged candidate carries no proof, so this can
+    /// never mint one.
+    pub fn from_committed(record: &DaemonCutoverOwnership) -> Result<Self, OrsError> {
+        record.validate()?;
+        let Some(linearization_record_id) = record.linearization_record_id.clone() else {
+            return Err(OrsError::InvalidTransition);
+        };
+        Ok(Self {
+            cutover_id: record.cutover_id.clone(),
+            prior_daemon_generation: record.prior_daemon_generation,
+            candidate_daemon_generation: record.candidate_daemon_generation,
+            new_epoch: record.new_epoch,
+            old_proposal_fence: record.old_proposal_fence,
+            staged_operation_ids: record.staged_operation_ids.clone(),
+            in_flight: record.in_flight.clone(),
+            unresolved_scopes: record.unresolved_scopes.clone(),
+            linearization_record_id,
+        })
+    }
+}
+
+/// Validates the committed daemon-cutover lineage read back from ORS.
+///
+/// A daemon replacement is a chain, not a set: each committed cutover names the
+/// daemon generation the previous one installed, and each raises the authority
+/// epoch. This is the read-back half of the commit's own rule — the commit binds
+/// against the ORIGINAL RECORDED committed row, and this refuses a stored set
+/// that does not form the same chain, so a restart cannot adopt a daemon
+/// authority whose own history is incoherent. It takes only the recorded rows and
+/// derives nothing, so it cannot grant authority or revive a superseded epoch.
+pub fn validate_daemon_cutover_lineage(
+    committed: &[DaemonCutoverOwnership],
+) -> Result<(), OrsError> {
+    let mut prior: Option<&DaemonCutoverOwnership> = None;
+    for record in committed {
+        record.validate()?;
+        if record.linearization_record_id.is_none() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "daemon_cutover_ownership",
+                reason: "a staged daemon cutover is not a committed lineage row".to_owned(),
+            });
+        }
+        if let Some(previous) = prior {
+            if record.prior_daemon_generation != Some(previous.candidate_daemon_generation)
+                || record.new_epoch.value() <= previous.new_epoch.value()
+            {
+                return Err(OrsError::IntegrityProblem {
+                    record_type: "daemon_cutover_ownership",
+                    reason: "committed daemon cutovers do not form one advancing lineage"
+                        .to_owned(),
+                });
+            }
+        } else if record.prior_daemon_generation.is_some() {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "daemon_cutover_ownership",
+                reason: "the first committed daemon cutover cannot replace a daemon generation"
+                    .to_owned(),
+            });
+        }
+        prior = Some(record);
+    }
+    Ok(())
+}
+
+/// Durable stored form of one daemon-cutover record with its ORS order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredDaemonCutoverOwnership {
+    pub(crate) operation_order: u64,
+    pub(crate) record: DaemonCutoverOwnership,
+}
+
+impl StoredDaemonCutoverOwnership {
+    pub(crate) fn validate_persisted(&self) -> Result<(), OrsError> {
+        if self.operation_order == 0 {
+            return Err(OrsError::IntegrityProblem {
+                record_type: "daemon_cutover_ownership",
+                reason: "stored daemon cutover has no operation order".to_owned(),
+            });
+        }
+        self.record.validate()
+    }
+}
+
 /// Durable stored form of one ownership record with its ORS order.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
