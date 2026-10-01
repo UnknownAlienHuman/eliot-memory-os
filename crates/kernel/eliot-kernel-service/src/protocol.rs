@@ -1470,7 +1470,7 @@ impl KernelControlRequest {
 }
 
 /// Typed outcome for matched Host supervision revocation.
-#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HostSupervisionRevocationDisposition {
     /// The exact current heartbeat observation was withdrawn.
