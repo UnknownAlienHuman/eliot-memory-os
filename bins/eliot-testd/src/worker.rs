@@ -59,6 +59,7 @@
 //! decision when the admitted drive goes live.
 
 use std::future::Future;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -72,7 +73,8 @@ use eliot_process::{
 use eliot_testd_core::{
     EvidenceCollector, JobState, KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider,
     AsyncProcessStreamSourceReadbackPort, EphemeralSourceBytes, Lease, SourceObservationGitPort,
-    TestJob, TestdError, TestdReadbackContext, TestdStreamEvidenceBinding,
+    TestJob, TestdError, TestdReadbackContext, TestdSourceObservationRange,
+    TestdStreamEvidenceBinding, TestdToolObservation,
     TestdSourceObservation, TestdSourceObservationRange, TestdStore, TestdToolObservation,
     evaluate_testd_verification, issue_process_admission,
 };
@@ -135,10 +137,32 @@ pub trait VerifiedStreamReplayPort: Send + Sync {
         stage: &eliot_testd_core::InstrumentStageRequest,
         source: &TestdStreamEvidenceBinding,
         bytes: &EphemeralSourceBytes,
+        observations: &TestdReplayObservedInputs,
         terminal: Option<&ExitStatus>,
         started_at: ClockReading,
         finished_at: ClockReading,
     ) -> Result<eliot_instrument_runner::ProfileReplayReceipt, String>;
+}
+
+/// Actual replay-time observations supplied by the productive TestD worker.
+/// Registry/profile freshness values are intentionally absent; the replay
+/// owner combines these measured inputs with its authenticated catalog and
+/// normative-pair readback.
+#[derive(Clone, Debug)]
+pub struct TestdReplayObservedInputs {
+    /// Source before/after observation from the same governed Git executor.
+    pub source: TestdSourceObservationRange,
+    /// Tool files and selected toolchain remeasured at the finish boundary.
+    pub tools: TestdToolObservation,
+    /// Exact secret-safe environment projection retained from Kernel submit.
+    pub environment: eliot_process::EnvironmentProjection,
+    /// SHA-256 of the exact current Cargo.lock bytes at the admitted root.
+    pub cargo_lock_sha256: String,
+    /// Original plan-required test IDs parsed from the canonical owner binding.
+    pub required_test_ids: BTreeSet<String>,
+    /// Exact admitted lane fingerprint digest, rederived from the durable
+    /// work envelope and paired with the fresh before/after Git observation.
+    pub lane_fingerprint_digest: String,
 }
 
 impl<'a, E: ?Sized> GovernedContour<'a, E> {
@@ -513,6 +537,11 @@ fn observe_tool_identity(
             return Err(TestdError::InvalidBinding);
         }
     }
+    reobserve_tool_files(&observation)?;
+    Ok(observation)
+}
+
+fn reobserve_tool_files(observation: &TestdToolObservation) -> Result<(), TestdError> {
     for (path, expected) in [
         (
             observation.nextest_path.as_str(),
@@ -538,7 +567,7 @@ fn observe_tool_identity(
             });
         }
     }
-    Ok(observation)
+    Ok(())
 }
 
 /// Supervises the started operation to a bounded terminal observation and
@@ -807,6 +836,71 @@ fn observe_terminal_source<E: ProcessExecutor + 'static>(
     }
 }
 
+fn build_replay_observed_inputs(
+    job: &TestJob,
+    source: &TestdSourceObservationRange,
+) -> Result<TestdReplayObservedInputs, TestdError> {
+    source.validate()?;
+    if source.before.repository_root != job.target_roots.source_root
+        || source.after.repository_root != job.target_roots.source_root
+    {
+        return Err(TestdError::InvalidBinding);
+    }
+    let tools = job
+        .provider_tool_observation
+        .clone()
+        .ok_or(TestdError::InvalidBinding)?;
+    tools.validate()?;
+    reobserve_tool_files(&tools)?;
+    let environment = job
+        .provider_environment_projection
+        .clone()
+        .ok_or(TestdError::InvalidBinding)?;
+    eliot_process::EnvironmentProjection::new(
+        environment.non_secret().clone(),
+        environment.secret_refs().to_vec(),
+        environment.inheritance(),
+    )
+    .map_err(|error| TestdError::Contract(error.to_string()))?;
+    let lock_path = Path::new(&job.target_roots.source_root).join("Cargo.lock");
+    let lock_bytes = std::fs::read(lock_path).map_err(|_| TestdError::Invalid {
+        field: "provider_currentness.lock",
+        reason: "the exact admitted Cargo.lock cannot be reread before replay",
+    })?;
+    if lock_bytes.is_empty() {
+        return Err(TestdError::Invalid {
+            field: "provider_currentness.lock",
+            reason: "the admitted Cargo.lock is empty at replay time",
+        });
+    }
+    let verifier_dispatch = job
+        .verifier_dispatch
+        .as_ref()
+        .ok_or(TestdError::InvalidBinding)?;
+    let required_test_ids = verifier_dispatch
+        .required_test_ids_for_job(job)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if required_test_ids.is_empty() {
+        return Err(TestdError::InvalidBinding);
+    }
+    let lane_fingerprint_digest = job
+        .work_envelope
+        .as_ref()
+        .ok_or(TestdError::InvalidBinding)?
+        .fingerprint
+        .digest()
+        .map_err(|_| TestdError::InvalidBinding)?;
+    Ok(TestdReplayObservedInputs {
+        source: source.clone(),
+        tools,
+        environment,
+        cargo_lock_sha256: eliot_testd_core::sha256_hex(&lock_bytes),
+        required_test_ids,
+        lane_fingerprint_digest,
+    })
+}
+
 /// Captures terminal evidence and finishes the already-revalidated attempt.
 ///
 /// The terminal source observation is taken through `contour`'s physical Git
@@ -855,6 +949,17 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
     if let Some(message) = observation_fault {
         reason = message;
     }
+    let replay_observed_inputs = match source_observation.as_ref() {
+        Some(source) => match build_replay_observed_inputs(claimed, source) {
+            Ok(inputs) => Some(inputs),
+            Err(error) => {
+                execution = ExecutionStatus::Unknown;
+                reason = format!("replay-time source/tool currentness observation failed: {error}");
+                None
+            }
+        },
+        None => None,
+    };
     if let Some(port) = contour.readback() {
         let context = TestdReadbackContext {
             job_id: claimed.job_id.clone(),
@@ -894,10 +999,17 @@ fn finish_observed_attempt<E: ProcessExecutor + 'static>(
                                 });
                                 continue;
                             };
+                            let Some(observations) = replay_observed_inputs.as_ref() else {
+                                replay_fault.get_or_insert_with(|| {
+                                    "replay-time source/tool currentness observations are unavailable".to_owned()
+                                });
+                                continue;
+                            };
                             let replayed = match replay_context.replay_stream(
                                 stage,
                                 &source,
                                 &bytes,
+                                observations,
                                 exit_status.as_ref(),
                                 started_at,
                                 finished_at,
