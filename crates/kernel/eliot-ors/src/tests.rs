@@ -682,7 +682,12 @@ fn receipt(token: &WriterReservationToken, disposition: &Value) -> TestResult<Re
         "operation": {
             "operation_id": token.operation_id.as_str(),
             "request_id": request_id,
-            "idempotency_key": token.reservation_id.as_str(),
+            "idempotency_key": token
+                .write_binding
+                .as_ref()
+                .ok_or("reservation token must retain the admitted write identity")?
+                .idempotency_key
+                .as_str(),
             "operation_kind": "canonical-write",
             "effect": "REVERSIBLE_MUTATION",
             "state_fence": state_fence
@@ -786,6 +791,12 @@ fn envelope_validation_rejects_tamper_version_and_bad_fence() -> TestResult {
 
     let mut wrong_fence = original.envelope;
     wrong_fence.state_fence.observed_authority_epoch = 8;
+    wrong_fence
+        .write_binding
+        .as_mut()
+        .ok_or("canonical write envelope must retain its binding")?
+        .state_fence
+        .observed_authority_epoch = 8;
     assert!(matches!(
         wrong_fence.validate(),
         Err(OrsError::FenceMismatch)
@@ -3900,26 +3911,59 @@ fn appendix_p4_operational_surface_projects_rollover_and_retains_snapshot() -> T
         "opaque-ack",
     )?)?)?;
 
-    store.stage_admission_reservation(AdmissionReservation::new(operational_input(
-        "admission-stage-1",
-        "admission-1",
-        old.clone(),
-        "opaque-admission",
-    )?)?)?;
-    store.activate_admission_reservation(AdmissionReservationActivation::new(
-        operational_input(
-            "admission-active-1",
-            "admission-1",
-            old.clone(),
-            "opaque-admission-active",
-        )?,
-    )?)?;
-    store.release_admission_reservation(AdmissionReservationRelease::new(operational_input(
-        "admission-release-1",
-        "admission-1",
-        old.clone(),
-        "opaque-admission-release",
-    )?)?)?;
+    let admission_claims = AdmissionReservationClaims {
+        resources: AdmissionReservationClaimRef {
+            reference: label("admission-resource-claim-1")?,
+            sha256: "a1".repeat(32),
+        },
+        lane: AdmissionReservationClaimRef {
+            reference: label("admission-lane-claim-1")?,
+            sha256: "a2".repeat(32),
+        },
+        environment: AdmissionReservationClaimRef {
+            reference: label("admission-environment-claim-1")?,
+            sha256: "a3".repeat(32),
+        },
+        effects: AdmissionReservationClaimRef {
+            reference: label("admission-effect-claim-1")?,
+            sha256: "a4".repeat(32),
+        },
+        quota_view: AdmissionReservationClaimRef {
+            reference: label("admission-quota-claim-1")?,
+            sha256: "a5".repeat(32),
+        },
+    };
+    let admission_work_item = label("admission-work-item-1")?;
+    let admission_fence = fence(&old)?;
+    let mut admission_identity = AdmissionReservationIdentityInput {
+        work_item_id: admission_work_item.clone(),
+        proposed_attempt_id: label("admission-attempt-seed-1")?,
+        semantic_admission_revision: "admission-revision-1".to_owned(),
+        claims: admission_claims.clone(),
+        state_fence: admission_fence.clone(),
+        authority_epoch: old.clone(),
+    };
+    admission_identity.proposed_attempt_id = proposed_attempt_identity(&admission_identity)?;
+    let admission_reservation_id = admission_reservation_identity(&admission_identity)?;
+    let staged_admission = stage_admission_reservation_inactive(
+        store,
+        &AdmissionReservationStageRequest {
+            reservation_id: admission_reservation_id.clone(),
+            work_item_id: admission_work_item,
+            proposed_attempt_id: admission_identity.proposed_attempt_id.clone(),
+            operation_id: stage_operation_identity(&admission_reservation_id)?,
+            claims: admission_claims.clone(),
+            authority_epoch: old.clone(),
+            state_fence: admission_fence,
+            expires_at_ms: 10_000,
+            now_unix_ms: 100,
+        },
+    )?;
+    assert_eq!(
+        staged_admission.snapshot.record().state,
+        AdmissionReservationState::StagedInactive
+    );
+    assert_eq!(staged_admission.snapshot.record().claims, admission_claims);
 
     store.apply_generation_transition(GenerationTransition::new(operational_input(
         "generation-transition-1",
