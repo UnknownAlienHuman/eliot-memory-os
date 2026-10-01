@@ -1343,13 +1343,13 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
         // `RestoreJournalRequired` rather than an admission carrying a
         // placeholder, because an unbound store proves nothing about which
         // installation its rows belong to.
-        let installed = self
-            .store
-            .installed_store_identity()
-            .map_err(|error| match ors_to_backup(error) {
-                BackupError::IntegrityMismatch { .. } => BackupError::RestoreJournalRequired,
-                other => other,
-            })?;
+        let installed =
+            self.store
+                .installed_store_identity()
+                .map_err(|error| match ors_to_backup(error) {
+                    BackupError::IntegrityMismatch { .. } => BackupError::RestoreJournalRequired,
+                    other => other,
+                })?;
         let installation = installed.installation_id();
         if installation != self.binding.installation_ref() {
             return Err(BackupError::RestoreJournalMismatch);
