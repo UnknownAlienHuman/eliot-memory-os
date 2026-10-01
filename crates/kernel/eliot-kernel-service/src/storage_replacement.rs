@@ -1785,6 +1785,17 @@ fn ors_refusal(error: &OrsError) -> KernelServiceError {
         OrsError::WorkerReplayStaleStream { .. } => mismatch("worker_replay_stream"),
         OrsError::WorkerReplayAckMismatch { .. } => mismatch("worker_replay_ack"),
         OrsError::RecoverySnapshotMoved { .. } => mismatch("recovery_inventory_revision"),
+        // A `backup.verify` succession refused because its commit outcome is not
+        // the one I14.21 lets a grant stand in for, and because the owner that
+        // would record an evidence-backed decision publishes no such owner for
+        // this route. It is a presented-state mismatch like every other arm here:
+        // the caller presented a reconciliation the store will not authorize.
+        // The refusal text names the missing owner in the ORS value itself; this
+        // arm reports the class without echoing it, so the wire sentence stays
+        // one static string.
+        OrsError::BackupVerifySuccessionIneligible { .. } => {
+            mismatch("backup_verify_succession_eligibility")
+        }
         // An ORS field rejection already has this crate's exact refusal shape.
         OrsError::InvalidField { field, reason } => {
             KernelServiceError::InvalidField { field, reason }

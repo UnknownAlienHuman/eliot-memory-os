@@ -1088,9 +1088,7 @@ impl KernelBackupCapture {
     ) -> Result<BackupVerifySuccessionGrantDisposition, KernelCaptureError> {
         eligibility
             .require_succession_eligibility()
-            .map_err(|error| {
-                KernelCaptureError::OwnerEvidenceInvalid(error.to_string())
-            })?;
+            .map_err(|error| KernelCaptureError::OwnerEvidenceInvalid(error.to_string()))?;
         let predecessor_namespace_digest = identity.namespace_digest().map_err(|error| {
             KernelCaptureError::OwnerEvidenceInvalid(format!(
                 "succession grant cannot name the predecessor operation: {error}"

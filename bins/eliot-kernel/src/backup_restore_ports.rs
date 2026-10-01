@@ -2168,6 +2168,17 @@ impl OrsRestoreJournal {
 pub fn ors_to_backup(error: OrsError) -> BackupError {
     match error {
         OrsError::InvalidField { field, reason } => BackupError::InvalidField { field, reason },
+        // A `backup.verify` succession refused because its commit outcome is not
+        // the one I14.21 lets an owner-issued grant stand in for, or because the
+        // owner that would record an evidence-backed decision publishes none for
+        // this route. The restore protocol has no such arm of its own, so it maps
+        // onto the bounded-field refusal every unrecognised ORS class lands in
+        // here, keeping the wire sentence static and concealing nothing about the
+        // named owner.
+        OrsError::BackupVerifySuccessionIneligible { .. } => BackupError::InvalidField {
+            field: "backup_verify.succession_eligibility",
+            reason: "the presented reconciliation is not an authorized succession",
+        },
         OrsError::FenceMismatch => BackupError::FenceMismatch {
             subject: "restore journal writer fence".to_owned(),
         },
