@@ -48,12 +48,11 @@ use crate::{
     QueueLimits, STARTUP_ORDER, ServiceId, ServiceObservation,
 };
 use eliot_authority::{
-    CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRevocationRequest,
-    GrantRecoveryRecord, GrantStatus, IntroductionActivationRequest, IntroductionId,
+    CrossRootQuarantineEvidence, GrantActivationRequest, GrantId, GrantRecoveryRecord,
+    GrantRevocationRequest, GrantStatus, IntroductionActivationRequest, IntroductionId,
     IntroductionRevocationRequest, IntroductionStatus, P07AuthorityPort, P07PortError,
-    RevocationOperationIdentity,
-    RevocationOrigin, RevocationTransitionDisposition, RevocationTransitionRequest,
-    RootTransitionActivationReceipt, RootTransitionActivationRequest,
+    RevocationOperationIdentity, RevocationOrigin, RevocationTransitionDisposition,
+    RevocationTransitionRequest, RootTransitionActivationReceipt, RootTransitionActivationRequest,
 };
 use eliot_budget::{BudgetLedger, BudgetLedgerRecoverySnapshot};
 use eliot_canonical::{
@@ -7945,8 +7944,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     ) -> Result<WorkScopeBindingOwner, CompositionError> {
         if !request.privacy.admits(request.binding.privacy_class) {
             return Err(CompositionError::Recovery(
-                "WorkScope privacy boundary does not admit the binding's source class"
-                    .to_owned(),
+                "WorkScope privacy boundary does not admit the binding's source class".to_owned(),
             ));
         }
         let observed_binding = observed_scope_binding(
@@ -8158,8 +8156,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             )
             .filter_map(|basis| match basis {
                 AuthorityBasis::ProjectContract { contract_ref } => Some(contract_ref),
-                AuthorityBasis::HumanOwner { .. }
-                | AuthorityBasis::DelegatedTaskBinding { .. } => None,
+                AuthorityBasis::HumanOwner { .. } | AuthorityBasis::DelegatedTaskBinding { .. } => {
+                    None
+                }
             })
         {
             if proven_contract_refs.insert(contract_ref.clone()) {
@@ -8384,9 +8383,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         };
         for class in &privacy.admitted_classes {
             let label = class_label(*class);
-            let covered = matching_leaves.iter().any(|leaf| {
-                self.initial_scope_grant_path_covers_class(leaf, &validation, label)
-            });
+            let covered = matching_leaves
+                .iter()
+                .any(|leaf| self.initial_scope_grant_path_covers_class(leaf, &validation, label));
             if !covered {
                 return Err(CompositionError::Recovery(format!(
                     "delegated WorkScope privacy class {label} is outside the current holder grant path"
@@ -8406,7 +8405,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let mut seen = BTreeSet::new();
         while let Some(intent) = current {
             if !seen.insert(intent.grant_id.as_str())
-                || intent.mechanical_subset.verify_recorded_commitment().is_err()
+                || intent
+                    .mechanical_subset
+                    .verify_recorded_commitment()
+                    .is_err()
                 || intent.mechanical_subset.binding.state_fence != *validation.fence
                 || intent.mechanical_subset.holder_principal != intent.holder_principal
                 || intent.mechanical_subset.session_id != intent.session_id

@@ -8060,9 +8060,7 @@ impl KernelStoreGateway {
                 }))
             }
             [record] if record.revision == request.expected_owner_revision => Ok(None),
-            [record]
-                if record.revision == next_revision && record != expected_record =>
-            {
+            [record] if record.revision == next_revision && record != expected_record => {
                 Err(NamedReadGatewayError::Store(StoreError::IdentityConflict))
             }
             _ => Err(NamedReadGatewayError::Store(StoreError::RevisionConflict)),
