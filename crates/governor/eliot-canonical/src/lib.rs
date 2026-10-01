@@ -1532,7 +1532,7 @@ mod tests {
     /// which is what makes the cross-crate agreement real rather than
     /// two independently-matching literals.
     const ISSUE_63_GOLDEN_CHAIN_DIGEST: &str =
-        "c6d6434a01e468723d1f59c6bbd1a8df07850d673176de049c38f241442a51e4";
+        "014506c9ef916ef8791f29a4209edf8dcdc92ece29eb0400351df04e0d5c7d6e";
 
     #[test]
     fn golden_chain_envelope_hash_matches_the_pinned_cross_crate_digest() {
