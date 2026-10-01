@@ -342,6 +342,10 @@ mod idempotency_tests {
                 idempotency_key: "idem-key".to_owned(),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: "intent-idem".to_owned(),
+            write_envelope_protocol_version: 1,
             state_fence: fence,
             scope_id: ScopeId::new("scope-idem").expect("scope"),
             task_id: None,

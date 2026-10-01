@@ -221,6 +221,10 @@ fn transition_with(
             idempotency_key: format!("idem-automation-live-{tag}"),
             canonical_request_hash: "0".repeat(64),
         },
+        // The fixture's own stable intent, distinct from the per-attempt
+        // operation identity and the per-correction idempotency key.
+        write_intent_id: format!("intent-automation-live-{tag}"),
+        write_envelope_protocol_version: 1,
         state_fence: fence(),
         scope_id: ScopeId::new(SCOPE).expect("scope"),
         task_id: None,

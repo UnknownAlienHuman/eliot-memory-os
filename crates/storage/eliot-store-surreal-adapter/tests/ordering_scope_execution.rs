@@ -96,6 +96,10 @@ fn transition(op: &str, scopes: &[&str]) -> PreparedTransition {
             idempotency_key: format!("idem-{op}"),
             canonical_request_hash: "a".repeat(64),
         },
+        // The fixture's own stable intent, distinct from the per-attempt
+        // operation identity and the per-correction idempotency key.
+        write_intent_id: format!("intent-{op}"),
+        write_envelope_protocol_version: 1,
         state_fence: fence(),
         scope_id: ScopeId::new(scopes[0]).unwrap(),
         task_id: None,

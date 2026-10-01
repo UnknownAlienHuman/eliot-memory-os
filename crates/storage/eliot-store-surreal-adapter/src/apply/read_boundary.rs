@@ -3781,6 +3781,10 @@ mod admitted_read_tests {
                 idempotency_key: format!("idem-{operation_id}"),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{operation_id}"),
+            write_envelope_protocol_version: 1,
             state_fence: fence,
             scope_id: ScopeId::new("scope-1").expect("scope"),
             task_id: None,
@@ -4308,6 +4312,10 @@ mod admitted_read_tests {
                 idempotency_key: format!("idem-{operation_id}"),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{operation_id}"),
+            write_envelope_protocol_version: 1,
             state_fence: fence,
             scope_id: ScopeId::new("scope-1").expect("scope"),
             task_id: None,
@@ -4367,6 +4375,10 @@ mod admitted_read_tests {
                 idempotency_key: format!("idem-{operation_id}"),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{operation_id}"),
+            write_envelope_protocol_version: 1,
             state_fence: fence,
             scope_id: ScopeId::new("scope-1").expect("scope"),
             task_id: None,
@@ -4431,6 +4443,10 @@ mod admitted_read_tests {
                 idempotency_key: format!("idem-{operation_id}"),
                 canonical_request_hash: "a".repeat(64),
             },
+            // The fixture's own stable intent, distinct from the per-attempt
+            // operation identity and the per-correction idempotency key.
+            write_intent_id: format!("intent-{operation_id}"),
+            write_envelope_protocol_version: 1,
             state_fence: fence,
             scope_id: ScopeId::new("scope-1").expect("scope"),
             task_id: None,
