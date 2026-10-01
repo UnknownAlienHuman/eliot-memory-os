@@ -12,6 +12,15 @@
 //! normal Store write, named read, agent or maintenance admission cannot reach
 //! protected ORS capacity by relabelling its priority or class.
 //!
+//! W4 ORS wave: every [`OrsPermit`] is owner-issued non-clone evidence bound
+//! to capacity class, bottleneck/unit/granted amount, typed operation,
+//! operation identity, owner and the typed [`AuthorityEpoch`] observed at
+//! acquisition, mirroring the front-door [`ControlPermit`] evidence grade.
+//! Every denial names the exact bottleneck, shed work and observed epoch. A
+//! stale epoch, changed operation or changed owner fails before consumption
+//! because the evidence no longer matches the current owner state; there is
+//! no epoch-blind permit to replay.
+//!
 //! Exhausted normal durable bytes render as a versioned
 //! [`I14BackpressureResponseV1`] with disposition `STORAGE_BACKPRESSURE`
 //! naming exactly [`ORS_DURABLE_BYTES_BOTTLENECK`] in its byte unit; exhausted
@@ -24,9 +33,15 @@
 //! the request, so pressure evidence is never manufactured.
 //!
 //! This module has no production caller yet (STITCH): it publishes the owner
-//! evidence the Kernel profile composition will join. There is no emergency
+//! evidence the Kernel profile composition joins via
+//! [`OrsReserve::publish_owner_rows`] and the kernel-core
+//! `join_ors_owner_evidence` composition step. There is no emergency
 //! partition here; recording reserve loss stays with the front-door
 //! last-resort slot until a later wave wires ORS-side loss reporting.
+//! Restart reconciliation (W5) stays with the ORS recovery-journal owner:
+//! permits carry the operation identity, owner and epoch the reconciler
+//! needs, but this module holds no durable permit ledger and never
+//! reconstitutes capacity from a reset counter.
 //! DISCLOSED LIMIT: `profile_revision` on the responses is caller-supplied
 //! metadata echoed into the directive; the `Current` currentness claim refers
 //! to the live-observed saturation at call time, not to a re-read of the
@@ -36,15 +51,16 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use eliot_contracts::{ArtifactId, OperationId};
+use eliot_contracts::{ArtifactId, AuthorityEpoch, OperationId};
 use eliot_runtime_contracts::{
     AffectedOperationClass, BackpressureDisposition, BottleneckAvailability,
-    BottleneckCoverageState, BottleneckObservationV1, CapacityBottleneck, CapacityClass,
-    ControlOperationClass, EarliestRecoveryCondition, EvidenceCoverageState,
-    HumanActionRequirement, I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause,
-    I14BackpressureResponseV1, I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction,
-    I14RecoveryAction, I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState,
-    I14WorkOutcome, NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus,
+    BottleneckCapacityProfile, BottleneckCoverageState, BottleneckObservationV1,
+    CapacityBottleneck, CapacityClass, CapacityEnforcement, CapacityLimit, ControlOperationClass,
+    EarliestRecoveryCondition, EvidenceCoverageState, HumanActionRequirement,
+    I14_BACKPRESSURE_RESPONSE_VERSION, I14BackpressureCause, I14BackpressureResponseV1,
+    I14CurrentnessState, I14EscalationCondition, I14ForbiddenAction, I14RecoveryAction,
+    I14RecoveryDirectiveV1, I14RequiredAuthority, I14ResolutionState, I14WorkOutcome,
+    NormalWorkClass, RecoveryCommitStatus, StatePreservationStatus, frozen_bottleneck_owner_map,
 };
 use thiserror::Error;
 
@@ -74,7 +90,7 @@ pub enum OrsReserveError {
     /// The normal partition cannot satisfy the request; the protected
     /// partition is untouched.
     #[error(
-        "ORS normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner}"
+        "ORS normal capacity exhausted for {bottleneck:?}: work {work_class:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     NormalCapacityExhausted {
         /// Bottleneck whose normal partition is saturated.
@@ -85,10 +101,12 @@ pub enum OrsReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
     /// The protected partition cannot satisfy the request.
     #[error(
-        "ORS protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner}"
+        "ORS protected reserve exhausted for {bottleneck:?}: control operation {operation:?} operation {operation_id} owned by {owner} epoch {epoch:?}"
     )]
     ProtectedReserveExhausted {
         /// Bottleneck whose protected partition is saturated.
@@ -99,6 +117,8 @@ pub enum OrsReserveError {
         operation_id: String,
         /// Requesting owner.
         owner: String,
+        /// Authority epoch observed at denial.
+        epoch: AuthorityEpoch,
     },
 }
 
@@ -120,6 +140,33 @@ impl OrsDimension {
             Self::DurableQueueBytes => ORS_DURABLE_BYTES_BOTTLENECK,
         }
     }
+}
+
+/// Composition-resolved reference strings the ORS owner binds into its
+/// published capacity rows but cannot observe itself.
+///
+/// The owner supplies every quantity in the row from the live reserve: the
+/// frozen bottleneck and unit, the disjoint normal/protected partition limits
+/// and their physical total, and the [`CapacityEnforcement::PhysicalPartition`]
+/// mechanism those partitions are held under. The composition supplies the
+/// references that identify the observation: its own owner-generation
+/// reference for the ORS owner, the independent proof-profile reference, and
+/// the current evidence and invalidation references. Both halves are required:
+/// [`OrsReserve::publish_owner_rows`] fails closed through the existing
+/// [`BottleneckCapacityProfile::validate`] when any reference is missing or
+/// non-canonical, so the composition must resolve canonical (strictly
+/// ascending, duplicate-free) reference sets rather than have them defaulted
+/// or sorted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrsOwnerEvidenceContext {
+    /// Owner generation/revision reference for the Kernel ORS owner.
+    pub owner_generation_ref: String,
+    /// Independent proof-profile reference produced for the ORS dimensions.
+    pub proof_profile_ref: String,
+    /// Current owner evidence references supporting the published rows.
+    pub evidence_refs: Vec<String>,
+    /// Exact invalidation set of the published rows.
+    pub invalidation_set: Vec<String>,
 }
 
 /// Typed operation identity carried by every [`OrsPermit`].
@@ -172,9 +219,9 @@ pub struct OrsReserve {
     inner: Arc<OrsReserveInner>,
 }
 
-/// One held ORS capacity permit, bound to dimension, class, operation and
-/// owner. Releasing is automatic on drop and returns exactly the consumed
-/// partition and amount.
+/// One held ORS capacity permit, bound to dimension, class, operation, owner
+/// and Authority Epoch. Releasing is automatic on drop and returns exactly
+/// the consumed partition and amount.
 ///
 /// Permits are deliberately not [`Clone`]: duplicating a permit handle must
 /// never duplicate the underlying capacity.
@@ -187,6 +234,7 @@ pub struct OrsPermit {
     operation: OrsPermitOperation,
     operation_id: String,
     owner: String,
+    epoch: AuthorityEpoch,
 }
 
 impl OrsPermit {
@@ -230,6 +278,12 @@ impl OrsPermit {
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Returns the Authority Epoch bound at acquisition.
+    #[must_use]
+    pub const fn epoch(&self) -> AuthorityEpoch {
+        self.epoch
     }
 }
 
@@ -382,19 +436,23 @@ impl OrsReserve {
     /// Attempts to acquire one normal transaction slot without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
-    /// capacity is unreachable through this path by construction.
+    /// capacity is unreachable through this path by construction. The granted
+    /// permit binds `epoch`; a caller presenting it under a different epoch
+    /// holds evidence that no longer matches the current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`OrsReserveError::NormalCapacityExhausted`] naming the
-    /// transaction bottleneck and shed work when the normal partition is
-    /// saturated. The protected partition is untouched in every case.
+    /// transaction bottleneck, shed work and observed epoch when the normal
+    /// partition is saturated. The protected partition is untouched in every
+    /// case.
     pub fn try_acquire_normal_transaction(
         &self,
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<OrsPermit, OrsReserveError> {
         validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
             field: "ors_permit.owner",
@@ -416,6 +474,7 @@ impl OrsReserve {
                 work_class: work,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(OrsPermit {
@@ -426,27 +485,31 @@ impl OrsReserve {
             operation: OrsPermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
     /// Attempts to acquire `bytes` normal durable bytes without blocking.
     ///
     /// Only [`NormalWorkClass`] operations typecheck here, so protected ORS
-    /// durable capacity is unreachable through this path by construction.
+    /// durable capacity is unreachable through this path by construction. The
+    /// granted permit binds `epoch`; a caller presenting it under a different
+    /// epoch holds evidence that no longer matches the current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`OrsReserveError::NormalCapacityExhausted`] naming the
-    /// durable-byte bottleneck and shed work when the normal partition cannot
-    /// satisfy the request. The protected partition is untouched in every
-    /// case.
+    /// durable-byte bottleneck, shed work and observed epoch when the normal
+    /// partition cannot satisfy the request. The protected partition is
+    /// untouched in every case.
     pub fn try_acquire_normal_durable_bytes(
         &self,
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
         bytes: NonZeroU64,
+        epoch: AuthorityEpoch,
     ) -> Result<OrsPermit, OrsReserveError> {
         validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
             field: "ors_permit.owner",
@@ -468,6 +531,7 @@ impl OrsReserve {
                 work_class: work,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(OrsPermit {
@@ -478,6 +542,7 @@ impl OrsReserve {
             operation: OrsPermitOperation::Normal(work),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -487,19 +552,22 @@ impl OrsReserve {
     /// Store write, named read, agent admission or module job cannot name a
     /// protected operation and therefore cannot acquire this partition. This
     /// is the path an admitted cancellation/recovery record keeps while
-    /// normal transaction work is saturated.
+    /// normal transaction work is saturated. The granted permit binds `epoch`
+    /// so the recovery record proves it was admitted under the current owner
+    /// state.
     ///
     /// # Errors
     ///
     /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`OrsReserveError::ProtectedReserveExhausted`] naming the
-    /// transaction bottleneck, operation, owner and request when the
-    /// protected partition is saturated.
+    /// transaction bottleneck, operation, owner, request and observed epoch
+    /// when the protected partition is saturated.
     pub fn try_acquire_protected_transaction(
         &self,
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
+        epoch: AuthorityEpoch,
     ) -> Result<OrsPermit, OrsReserveError> {
         validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
             field: "ors_permit.owner",
@@ -521,6 +589,7 @@ impl OrsReserve {
                 operation,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(OrsPermit {
@@ -531,6 +600,7 @@ impl OrsReserve {
             operation: OrsPermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -538,20 +608,23 @@ impl OrsReserve {
     ///
     /// Only [`ControlOperationClass`] operations typecheck here. This is the
     /// path an admitted cancellation/recovery record keeps while normal
-    /// durable-byte work reports `STORAGE_BACKPRESSURE`.
+    /// durable-byte work reports `STORAGE_BACKPRESSURE`. The granted permit
+    /// binds `epoch` so the recovery record proves it was admitted under the
+    /// current owner state.
     ///
     /// # Errors
     ///
     /// Returns [`OrsReserveError::InvalidField`] for a blank owner/operation
     /// identity, or [`OrsReserveError::ProtectedReserveExhausted`] naming the
-    /// durable-byte bottleneck, operation, owner and request when the
-    /// protected partition cannot satisfy the request.
+    /// durable-byte bottleneck, operation, owner, request and observed epoch
+    /// when the protected partition cannot satisfy the request.
     pub fn try_acquire_protected_durable_bytes(
         &self,
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
         bytes: NonZeroU64,
+        epoch: AuthorityEpoch,
     ) -> Result<OrsPermit, OrsReserveError> {
         validate_text(owner, "ors_permit.owner").map_err(|_| OrsReserveError::InvalidField {
             field: "ors_permit.owner",
@@ -573,6 +646,7 @@ impl OrsReserve {
                 operation,
                 operation_id: operation_id.to_owned(),
                 owner: owner.to_owned(),
+                epoch,
             });
         }
         Ok(OrsPermit {
@@ -583,6 +657,7 @@ impl OrsReserve {
             operation: OrsPermitOperation::Protected(operation),
             operation_id: operation_id.to_owned(),
             owner: owner.to_owned(),
+            epoch,
         })
     }
 
@@ -692,6 +767,123 @@ impl OrsReserve {
             RecoveryCommitStatus::None,
         )
     }
+
+    /// Publishes the two owner-produced capacity rows for the frozen ORS
+    /// dimensions: transaction slots and durable queue bytes.
+    ///
+    /// Every quantity is read from this reserve: the frozen bottleneck and
+    /// unit, the configured disjoint normal/protected partition limits and
+    /// their physical total, and the [`CapacityEnforcement::PhysicalPartition`]
+    /// mechanism those partitions are held under. The published limits are the
+    /// configured partition capacities, not the currently available remainder:
+    /// availability moves as permits are acquired and released, while the
+    /// guarantee the profile records is the partition itself. No emergency
+    /// partition is claimed here because the ORS owner holds none; the
+    /// preallocated last-resort slot stays with the Kernel front-door owner.
+    /// The composition-resolved references come from `ctx` unchanged.
+    ///
+    /// Each row is checked by the existing
+    /// [`BottleneckCapacityProfile::validate`] before it is returned, so a
+    /// missing owner, generation, physical total, protected partition,
+    /// enforcement, proof, evidence or invalidation reference fails here
+    /// rather than publishing a row the Kernel composition would have to
+    /// lower to `UNKNOWN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OrsReserveError::Contract`] when the frozen owner map binds
+    /// no owner to an ORS dimension, when the configured partition capacities
+    /// cannot form a positive physical total, or when either assembled row
+    /// fails the existing contract validation.
+    pub fn publish_owner_rows(
+        &self,
+        ctx: &OrsOwnerEvidenceContext,
+    ) -> Result<[BottleneckCapacityProfile; 2], OrsReserveError> {
+        let transaction = owner_capacity_row(
+            ORS_TRANSACTION_BOTTLENECK,
+            self.inner.transaction_normal_capacity,
+            self.inner.transaction_protected_capacity,
+            ctx,
+        )?;
+        let durable = owner_capacity_row(
+            ORS_DURABLE_BYTES_BOTTLENECK,
+            self.inner.durable_normal_capacity_bytes,
+            self.inner.durable_protected_capacity_bytes,
+            ctx,
+        )?;
+        Ok([transaction, durable])
+    }
+}
+
+/// Builds one claimed owner row for an ORS dimension from the reserve's
+/// configured partition capacities and the composition-resolved references.
+///
+/// The owner reference is read from the frozen owner map, never restated here;
+/// the unit is the bottleneck's own declared unit. The physical total is
+/// exactly the sum of the two disjoint partitions, so the existing partition
+/// accounting check always bounds them. A zero partition capacity or a missing
+/// frozen owner fails closed: the reserve constructor already refuses zero
+/// partitions, and a dimension without a frozen owner has no claim to publish.
+fn owner_capacity_row(
+    bottleneck: CapacityBottleneck,
+    normal_capacity: u64,
+    protected_capacity: u64,
+    ctx: &OrsOwnerEvidenceContext,
+) -> Result<BottleneckCapacityProfile, OrsReserveError> {
+    let owner = frozen_bottleneck_owner_map()
+        .into_iter()
+        .find(|bound| bound.bottleneck == bottleneck)
+        .map(|bound| bound.owner)
+        .ok_or_else(|| {
+            OrsReserveError::Contract(format!(
+                "frozen owner map binds no owner to {bottleneck:?}; no ORS row to publish"
+            ))
+        })?;
+    let unit = bottleneck.unit();
+    let limit = |field: &'static str, amount: u64| {
+        NonZeroU64::new(amount)
+            .map(|quantity| CapacityLimit { unit, quantity })
+            .ok_or(OrsReserveError::InvalidField {
+                field,
+                reason: "partition capacity must be greater than zero",
+            })
+    };
+    let normal_limit = limit("ors_reserve.normal_limit", normal_capacity)?;
+    let protected_limit = limit("ors_reserve.protected_limit", protected_capacity)?;
+    let physical_total =
+        normal_capacity
+            .checked_add(protected_capacity)
+            .ok_or(OrsReserveError::InvalidField {
+                field: "ors_reserve.physical_total_limit",
+                reason: "disjoint partition capacities overflow the physical total",
+            })?;
+    let physical_total_limit =
+        NonZeroU64::new(physical_total).ok_or(OrsReserveError::InvalidField {
+            field: "ors_reserve.physical_total_limit",
+            reason: "physical total must be greater than zero",
+        })?;
+    let row = BottleneckCapacityProfile {
+        bottleneck,
+        coverage_state: BottleneckCoverageState::Claimed,
+        owner_ref: owner.to_owned(),
+        owner_generation_ref: ctx.owner_generation_ref.clone(),
+        unit,
+        physical_total_limit: Some(CapacityLimit {
+            unit,
+            quantity: physical_total_limit,
+        }),
+        normal_work_applicable: true,
+        normal_limit: Some(normal_limit),
+        protected_limit: Some(protected_limit),
+        emergency_limit: None,
+        enforcement: Some(CapacityEnforcement::PhysicalPartition),
+        proof_profile_ref: ctx.proof_profile_ref.clone(),
+        evidence_refs: ctx.evidence_refs.clone(),
+        invalidation_set: ctx.invalidation_set.clone(),
+    };
+    row.validate()
+        .map_err(|error| OrsReserveError::Contract(error.to_string()))?;
+    Ok(row)
 }
 
 /// Exact parts of one ORS rejection directive shared by every constructor.

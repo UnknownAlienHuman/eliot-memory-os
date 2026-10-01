@@ -34,6 +34,12 @@
 //! 96..128 operation_digest   32 bytes, all zero exactly when not bound
 //! ```
 //!
+//! NUL padding is load-bearing, not cosmetic: every byte inside `site_len` and
+//! `detail_len` is non-zero and every padding byte to the fixed field end is
+//! zero. The readback validator enforces this completion rule, so a torn or
+//! partially overwritten record that keeps a valid magic, version and length
+//! still stays unresolved rather than validating as a completed cleanup.
+//!
 //! Only bounded non-secret identities and the exact `u32` OS error are
 //! present. No path, token, ACL, principal value, or secret value is
 //! representable.
@@ -155,6 +161,22 @@ impl std::fmt::Display for TerminalContainmentError {
 impl std::error::Error for TerminalContainmentError {}
 
 /// The exact bounded result of one terminal submission attempt.
+///
+/// A submission attempt is not durable evidence. No variant here — not even
+/// [`TerminalSubmission::Recorded`] — is a restoration receipt, and this module
+/// mints none: a successful write is OS acceptance of 128 bytes, never proof
+/// that restoration happened. Only the independent supervisor's readback
+/// decision ([`TerminalContainmentReadback`], [`TerminalRestartGate`])
+/// establishes evidence, and only the guard owner establishes that
+/// continuation-safe OS state was reached. If submission fails in any way, the
+/// fail-stop fallback still runs and the supervisor retains
+/// non-success/unknown state; no receipt is synthesized and ordinary work is
+/// never resumed under unsafe security state.
+///
+/// Exactly one bounded write is attempted per call. There is no retry loop on
+/// the emergency path: a second attempt would need a second bounded resource
+/// it does not own, and unbounded retry could delay the fail-stop the unsafe
+/// state requires.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalSubmission {
     /// The complete fixed record was accepted by the approved sink.
@@ -220,6 +242,37 @@ pub enum TerminalContainmentReadback {
     Unresolved(TerminalContainmentUnresolved),
 }
 
+/// Restart decision for one retained terminal-containment record.
+///
+/// The restart owner reads retained composite/terminal evidence before
+/// adopting or overwriting the affected object and keeps it blocked until
+/// exact owner reconciliation. A [`TerminalRestartGate::Blocked`] decision
+/// names the exact unresolved reason; it is never a completed cleanup and it
+/// never authorizes adoption or overwrite. A
+/// [`TerminalRestartGate::Reconciled`] decision carries the validated record
+/// bound to the exact expected operation generation; the owner still performs
+/// the reconciliation itself — this value only reports that the retained
+/// evidence is complete, current, and exactly bound, so the owner has
+/// something unambiguous to reconcile against.
+///
+/// The gate creates no journal, no receipt, and no second derivation: the
+/// expected identity is computed by [`terminal_containment_operation_digest`],
+/// the one rule the writer used. Unknown, missing, short, torn, foreign, or
+/// differently-bound records stay blocked; restart never adopts ambiguous
+/// state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalRestartGate {
+    /// The affected object stays blocked. `reason` is the exact unresolved
+    /// cause; the owner must reconcile before any adoption or overwrite.
+    Blocked {
+        reason: TerminalContainmentUnresolved,
+    },
+    /// The retained record is complete, current, and bound to the exact
+    /// expected operation generation. The owner may now reconcile; this value
+    /// alone adopts nothing.
+    Reconciled { record: TerminalContainmentRecord },
+}
+
 /// The installed bounded evidence resource.
 ///
 /// Exactly one preparation is admitted per process. The value is owned here for
@@ -270,6 +323,46 @@ static TERMINAL_REENTRY: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 // the emergency restore failure as separate slots; a successful emergency
 // restoration must not erase the explicit failure that preceded it. Both
 // attempts stay separately recorded.
+//
+// #860 per-guard wiring — same three entry points, no second mechanism.
+//
+// `ScopedRestorePrivilege` (token privilege, `installer_root.rs`) and
+// `ImpersonationGuard` (thread impersonation, `named_pipe_peer_auth.rs`) each
+// wire identically:
+//
+// 1. `enter`/`begin`: call [`prepare_terminal_containment`] once with the same
+//    validated `RequestMetadata` the composite's `parent_operation` carries,
+//    before any impersonation or elevation. A returned error refuses the
+//    mutation; the guard must not arm.
+// 2. Fail-stop sites keep their exact `site`/`detail`/`code` triple and route
+//    it to [`fail_stop_with_terminal_containment`]:
+//    `installer-root/scoped-restore-drop`, `installer-root/dual-failure`, and
+//    `peer-auth/impersonation-drop`, each with its stage-name detail and the
+//    exact `u32` captured immediately after the failed call. The in-crate
+//    forwarder `installer_root::emit_abort_boundary_evidence` already delegates
+//    to that owner and stays the only forwarder; #860 adds no other emitter,
+//    logger, journal, or per-guard writer.
+// 3. Restart/startup reads each retained record through
+//    [`gate_terminal_restart_for`] with the expected digest from
+//    [`terminal_containment_operation_digest`]. `Blocked` keeps the affected
+//    object fenced until exact owner reconciliation; `Reconciled` is what the
+//    owner reconciles against.
+//
+// Ownership, lifetime, and error rules for every guard body:
+//
+// - Ownership: the prepared resource, the record encoding, the sink, and the
+//   reentry guard are owned here for the process life. Guards own only their
+//   `site`/`detail` identities and their immediately-captured `code`; they
+//   never own the sink, a handle, or a receipt.
+// - Lifetime: `site` and `detail` are `&'static str` — static call-site names
+//   and stage names only. No borrowed runtime string may cross into the
+//   terminal path, which cannot validate or retain heap state; in particular
+//   Drop-time calls must not borrow guard fields that may be mid-unwind.
+// - Errors: every terminal entry reports through [`TerminalSubmission`] or
+//   diverges via fail-stop; a terminal failure never becomes a `Result` the
+//   guard could match on and continue from. Every readback entry reports
+//   through [`TerminalContainmentReadback`] or [`TerminalRestartGate`]; an
+//   unresolved record never becomes success.
 
 /// Acquires the bounded terminal-containment evidence resource **before** a
 /// guarded mutation, and fixes every terminal-path decision while normal
@@ -391,6 +484,12 @@ pub fn submit_terminal_containment(
 /// [`TerminalContainmentUnresolved`] and is never a completed cleanup. When the
 /// record validates, its operation identity is bound to the exact preparation
 /// that produced it; an unbound record is reported explicitly.
+///
+/// Beyond version, length, and binding, the validator enforces the field-image
+/// completion rule: every identity byte inside the declared length is non-zero
+/// and every NUL-padding byte to the fixed field end is zero. A torn or
+/// partially overwritten record can keep a valid header while carrying a
+/// corrupted identity image; such a record is malformed, not evidence.
 pub fn validate_terminal_containment_readback(bytes: &[u8]) -> TerminalContainmentReadback {
     use TerminalContainmentUnresolved::{
         ForeignRecord, MalformedField, Missing, ShortRecord, UnsupportedVersion,
@@ -418,6 +517,11 @@ pub fn validate_terminal_containment_readback(bytes: &[u8]) -> TerminalContainme
     if bytes[OFFSET_RESERVED] != 0
         || usize::from(site_len) > TERMINAL_CONTAINMENT_SITE_MAX_BYTES
         || usize::from(detail_len) > TERMINAL_CONTAINMENT_DETAIL_MAX_BYTES
+    {
+        return TerminalContainmentReadback::Unresolved(MalformedField);
+    }
+    if !field_image_is_intact(bytes, OFFSET_SITE, site_len, OFFSET_DETAIL)
+        || !field_image_is_intact(bytes, OFFSET_DETAIL, detail_len, OFFSET_OPERATION_DIGEST)
     {
         return TerminalContainmentReadback::Unresolved(MalformedField);
     }
@@ -471,8 +575,68 @@ pub fn validate_terminal_containment_readback_for(
     }
 }
 
+/// Gates restart of the affected object on one retained record and the exact
+/// expected operation generation.
+///
+/// This is the restart owner's entry point. It runs the same fixed-encoding
+/// validator the terminal path uses, bound to the expected identity by
+/// content, and projects the outcome onto the one restart decision: anything
+/// unresolved — missing, short, torn, foreign, stale-version, malformed, or
+/// bound to another operation — stays [`TerminalRestartGate::Blocked`], and
+/// the affected object must not be adopted or overwritten until the exact
+/// owner reconciles it. Only a complete, current record bound to the exact
+/// expected generation becomes [`TerminalRestartGate::Reconciled`].
+///
+/// Ownership: the caller owns `bytes` and the expected digest; this function
+/// borrows both, copies out at most one fixed record, and retains nothing.
+/// Lifetime: no state escapes except the returned `Copy` decision. Errors:
+/// there is no failure return — every non-evidence input is a `Blocked`
+/// reason, never success and never a synthesized receipt.
+///
+/// The expected digest must come from [`terminal_containment_operation_digest`]
+/// over the same validated operation context the writer prepared with. A
+/// caller-supplied second derivation is a second journal by another name and
+/// is not accepted here.
+pub fn gate_terminal_restart_for(
+    bytes: &[u8],
+    expected_operation_digest: [u8; TERMINAL_CONTAINMENT_OPERATION_DIGEST_BYTES],
+) -> TerminalRestartGate {
+    match validate_terminal_containment_readback_for(bytes, expected_operation_digest) {
+        TerminalContainmentReadback::Unresolved(reason) => TerminalRestartGate::Blocked { reason },
+        TerminalContainmentReadback::Complete(record) => TerminalRestartGate::Reconciled { record },
+    }
+}
+
 fn is_bounded_identity(value: &str, max_bytes: usize) -> bool {
     value.len() <= max_bytes && PlatformHandle::new(value).is_ok()
+}
+
+/// Checks one fixed-width identity field image: every byte inside the declared
+/// length is non-zero and every padding byte to the fixed field end is zero.
+///
+/// All indices derive from the fixed layout and the already range-checked
+/// length, so no slice access can panic. This runs on the normal/restart path,
+/// never on the terminal path; it still allocates nothing, formats nothing,
+/// and cannot panic.
+fn field_image_is_intact(bytes: &[u8], field_start: usize, len: u8, field_end: usize) -> bool {
+    let len = usize::from(len);
+    let width = field_end.saturating_sub(field_start);
+    if len > width || bytes.len() < field_end {
+        return false;
+    }
+    let mut index = 0;
+    while index < width {
+        let byte = bytes[field_start + index];
+        if index < len {
+            if byte == 0 {
+                return false;
+            }
+        } else if byte != 0 {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 fn fixed_record_length_field() -> u32 {

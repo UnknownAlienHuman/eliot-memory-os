@@ -262,6 +262,49 @@ def expand_selectors(selectors: Iterable[str], handles: dict[str, dict[str, Any]
     return sorted(values, key=handle_key)
 
 
+# A normative fragment is titled `<handle>. <prose title>` (or
+# `<handle> <prose title>`). The handle token itself never participates in
+# topic matching: routing is chosen by the prose title the writer described the
+# work with, never by the identifier they happened to grep for.
+FRAGMENT_TITLE_PREFIX_RE = re.compile(r"^(?:APPENDIX-[A-Z]|[AI]\d+(?:\.\d+)*)[.]?[ \t]+")
+
+
+def fragment_title_tokens(title: str) -> list[str]:
+    """Tokenize a fragment's prose title, dropping its leading handle token."""
+    return topic_tokens(FRAGMENT_TITLE_PREFIX_RE.sub("", title, count=1))
+
+
+def governing_handles(
+    handles: dict[str, dict[str, Any]], topic: str
+) -> list[str]:
+    """Handles whose prose title the causal property names directly.
+
+    A writer states the causal property in prose ("oracle ownership and test
+    change governance"). When that prose names a fragment's own title, that
+    fragment governs the work regardless of which path globs or route keywords
+    happen to match, so it is a required read. Only a full contiguous coverage
+    of the fragment's complete title qualifies, which keeps the result small
+    and evidence-bearing rather than a fuzzy keyword expansion.
+    """
+    wanted = topic_tokens(topic)
+    if not wanted:
+        return []
+    selected: list[str] = []
+    for handle in sorted(handles):
+        title = str(handles[handle].get("title", ""))
+        if not title:
+            continue
+        title_wanted = fragment_title_tokens(title)
+        if not title_wanted or len(title_wanted) > len(wanted):
+            continue
+        if any(
+            list(wanted[offset:offset + len(title_wanted)]) == title_wanted
+            for offset in range(len(wanted) - len(title_wanted) + 1)
+        ):
+            selected.append(handle)
+    return sorted(selected, key=handle_key)
+
+
 def path_matches(path: str, pattern: str) -> bool:
     path = normalize_repo_path(path)
     pattern = normalize_repo_path(pattern)
@@ -425,7 +468,15 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
             limits.append(route.max_required_bytes)
     required_files.extend(ancestor_agent_files(root, normalized_paths))
 
-    required_handles = expand_selectors(required_selectors, handles)
+    # The causal property names its own governing fragment; a route table gap
+    # must not silently demote it to one-hop optional material (#929, #958,
+    # #1730, #2970). Resolved from the prose title, so it names the governing
+    # fragment without widening any glob, keyword, or required byte ceiling.
+    governing = governing_handles(handles, topic)
+    required_handles = sorted(
+        set(expand_selectors(required_selectors, handles)) | set(governing),
+        key=handle_key,
+    )
     optional_handles = [
         handle for handle in expand_selectors(optional_selectors, handles)
         if handle not in set(required_handles)
@@ -456,6 +507,7 @@ def route_payload(root: Path, config: Config, paths: Sequence[str], topic: str) 
         "paths": normalized_paths,
         "topic": topic.strip(),
         "matched_routes": [route.route_id for route in routes],
+        "governing_handles": governing,
         "required": required_items,
         "optional": optional_items,
         "required_bytes": required_bytes,

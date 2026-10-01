@@ -2524,8 +2524,10 @@ impl HostIdleDrainSupervisor {
                 // A cancellation ends the drain attempt and changes the
                 // obligation set, so the cached census is no longer authority
                 // for the next decision. The same trigger then drives the
-                // I1.5 return to ACTIVE: the tick reconcile cannot, because
-                // its Healthy proof requires the Active state being restored.
+                // I1.5 return to ACTIVE: the tick reconcile serves
+                // pre-commit cancelled drains too (same authenticated proof
+                // through the admitted fence). The trigger-driven resume
+                // below runs as well, independently.
                 match host.resume_cancelled_drain_on_observable_use() {
                     Ok(true) => {
                         self.idle_since = Some(std::time::Instant::now());

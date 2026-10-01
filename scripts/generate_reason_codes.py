@@ -18,8 +18,15 @@ validated on every run: the legacy name must resolve through the exact
 ``AgentBridgeActivationDenialCode::as_str`` transport vocabulary owned by
 ``crates/foundation/eliot-protocol/src/lib.rs`` (read-only input; full
 coverage, no more and no less), and the canonical target must be a member
-of the parsed I7.20 set. Bridge/Kernel consumption of the emitted tables
-is a separate consumer slice; this generator only ships the projection.
+of the parsed I7.20 set. The seven bridge-denial projection rows extend the
+same pins with the closed I7.20 disposition and the typed directive wire
+value, so the catalogue projection owns a disposition callable instead of
+leaving Bridge/Kernel on hand-maintained matches: each disposition must be a
+member of the parsed catalogue disposition vocabulary and each directive
+must resolve through the exact ``AgentActivationDirectiveKind::as_str``
+vocabulary owned by the same transport file. Bridge/Kernel consumption of
+the emitted tables is a separate consumer slice; this generator only ships
+the projection.
 
 Usage:
 
@@ -51,7 +58,7 @@ MD_ARTIFACT = ROOT / "docs/generated/reason-codes.md"
 
 #: Generator logic revision. Bump when this file's parsing or rendering
 #: rules change so a regenerated artefact records what produced it.
-GENERATOR_REVISION = 1
+GENERATOR_REVISION = 2
 
 #: Explicit #204 product mapping: (transport const name, canonical reason).
 #: The legacy wire spelling is read from the owner transport declaration,
@@ -67,11 +74,30 @@ BRIDGE_ALIASES: tuple[tuple[str, str], ...] = (
     ("AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE", "UNKNOWN_OUTCOME"),
 )
 
+#: Explicit #204 product mapping: (transport const name, closed I7.20
+#: disposition, directive variant name). The disposition must be a member of
+#: the parsed catalogue disposition vocabulary; the directive variant must
+#: resolve through the exact ``AgentActivationDirectiveKind::as_str``
+#: vocabulary owned by the transport file. The Kernel-owned no-result row
+#: (``SEMANTIC_RESOLUTION_UNAVAILABLE``) keeps the retry directive, never
+#: the failure capsule, so it stays distinct from ``FAILED_INTERNAL`` by
+#: (reason, directive) even where the closed disposition is shared.
+BRIDGE_DENIAL_PROJECTION: tuple[tuple[str, str, str], ...] = (
+    ("AGENT_BRIDGE_TASK_SELECTION_REQUIRED", "INVALID_REQUEST", "CandidateRecoveryNoAutoSelection"),
+    ("AGENT_BRIDGE_SCOPE_SELECTION_REQUIRED", "INVALID_REQUEST", "CandidateRecoveryNoAutoSelection"),
+    ("AGENT_BRIDGE_SCOPE_AMBIGUOUS", "STALE_OR_CONFLICT", "CandidateRecoveryNoAutoSelection"),
+    ("AGENT_BRIDGE_NOT_READY", "UNAVAILABLE_OR_CAPACITY", "RetryRequiresNewTicket"),
+    ("AGENT_BRIDGE_STALE_FENCE", "STALE_OR_CONFLICT", "StaleFenceFailClosed"),
+    ("AGENT_BRIDGE_FAILED_INTERNAL", "FAILED", "FailureCapsule"),
+    ("AGENT_BRIDGE_SEMANTIC_RESOLUTION_UNAVAILABLE", "FAILED", "RetryRequiresNewTicket"),
+)
+
 NORMATIVE_GROUP = re.compile(r"^([a-z]+(?:/[a-z]+)?)\s*—\s*(.*)$")
 CANONICAL_CODE = re.compile(r"\b[A-Z][A-Z0-9_]*\b")
 DISPOSITION_CODE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 TRANSPORT_CONST = re.compile(r'^pub const (AGENT_BRIDGE_[A-Z0-9_]+): &str = "([^"]*)";$')
 TRANSPORT_ARM = re.compile(r"^\s*Self::([A-Za-z0-9_]+) => (AGENT_BRIDGE_[A-Z0-9_]+),\s*$")
+DIRECTIVE_ARM = re.compile(r'^\s*Self::([A-Za-z0-9_]+) => "([a-z0-9-]+)",\s*$')
 
 
 class Refused(Exception):
@@ -208,6 +234,37 @@ def parse_transport_wires(lines: list[str]) -> dict[str, str]:
     return wires
 
 
+def parse_directives(lines: list[str]) -> dict[str, str]:
+    """Resolve every directive wire value from its owner declaration."""
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if "impl AgentActivationDirectiveKind" in line
+        ),
+        None,
+    )
+    if start is None:
+        raise Refused("AgentActivationDirectiveKind owner block is absent")
+    depth = 0
+    opened = False
+    wires: dict[str, str] = {}
+    for line in lines[start:]:
+        depth += line.count("{") - line.count("}")
+        opened |= "{" in line
+        match = DIRECTIVE_ARM.match(line)
+        if match is not None:
+            variant, wire = match.groups()
+            if variant in wires:
+                raise Refused(f"directive vocabulary variant {variant!r} is mapped twice")
+            wires[variant] = wire
+        if opened and depth == 0:
+            break
+    if not wires:
+        raise Refused("AgentActivationDirectiveKind vocabulary is empty")
+    return wires
+
+
 def resolve_aliases(
     catalogue: list[tuple[str, str]], transport_wires: dict[str, str]
 ) -> list[tuple[str, str]]:
@@ -234,9 +291,51 @@ def resolve_aliases(
     return resolved
 
 
+def resolve_denial_projection(
+    aliases: list[tuple[str, str]],
+    dispositions: list[str],
+    transport_wires: dict[str, str],
+    directives: dict[str, str],
+) -> list[tuple[str, str, str, str]]:
+    """Validate the pinned denial projection against every owner source."""
+    const_wires: dict[str, str] = {}
+    for line in source_lines(PROTOCOL_LIB):
+        match = TRANSPORT_CONST.match(line)
+        if match is not None:
+            const_wires[match.group(1)] = match.group(2)
+    canonical_by_legacy = dict(aliases)
+    seen_legacy: set[str] = set()
+    rows: list[tuple[str, str, str, str]] = []
+    for const, disposition, directive_variant in BRIDGE_DENIAL_PROJECTION:
+        if const not in const_wires:
+            raise Refused(f"denial projection legacy {const!r} has no transport declaration")
+        if disposition not in dispositions:
+            raise Refused(
+                f"denial projection disposition {disposition!r} is absent from the I7.20 set"
+            )
+        if directive_variant not in directives:
+            raise Refused(
+                f"denial projection directive {directive_variant!r} is absent from the owner vocabulary"
+            )
+        legacy = const_wires[const]
+        if legacy in seen_legacy:
+            raise Refused(f"denial projection legacy wire {legacy!r} is pinned twice")
+        if legacy not in canonical_by_legacy:
+            raise Refused(f"denial projection legacy wire {legacy!r} has no bridge alias pin")
+        seen_legacy.add(legacy)
+        rows.append((legacy, canonical_by_legacy[legacy], disposition, directives[directive_variant]))
+    if seen_legacy != set(transport_wires.values()):
+        raise Refused("denial projection pins do not cover the exact transport vocabulary")
+    canonicals = [canonical for _, canonical, _, _ in rows]
+    if len(canonicals) != len(set(canonicals)):
+        raise Refused("denial projection canonical targets are not unique")
+    return rows
+
+
 def render_rs(
     catalogue: list[tuple[str, str]],
     aliases: list[tuple[str, str]],
+    projection: list[tuple[str, str, str, str]],
     catalogue_digest: str,
     transport_digest: str,
     dispositions: list[str],
@@ -304,6 +403,61 @@ def render_rs(
             "    AGENT_REASON_CODES.iter().find(|entry| entry.code == code)",
             "}",
             "",
+            "/// One generated bridge denial projection row: a legacy transport",
+            "/// wire plus its exact I7.20 catalogue projection (canonical",
+            "/// reason, closed disposition, typed directive wire value).",
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq)]",
+            "pub struct BridgeDenialProjection {",
+            "    /// Legacy Kernel↔bridge transport wire name.",
+            "    pub legacy: &'static str,",
+            "    /// Exact canonical I7.20 catalogue reason code.",
+            "    pub canonical: &'static str,",
+            "    /// Closed I7.20 disposition vocabulary member.",
+            "    pub disposition: &'static str,",
+            "    /// Typed directive wire value (`AgentActivationDirectiveKind::as_str`).",
+            "    pub directive: &'static str,",
+            "}",
+            "",
+            "/// Bridge denial projection for every legacy transport wire,",
+            "/// generated from the I7.20 catalogue disposition vocabulary plus",
+            "/// the explicit #204 product pins. The Kernel-owned no-result row",
+            "/// keeps the retry directive, never the failure capsule.",
+            "pub const BRIDGE_DENIAL_PROJECTION: &[BridgeDenialProjection] = &[",
+        ]
+    )
+    for legacy, canonical, disposition, directive in projection:
+        lines.extend(
+            [
+                "    BridgeDenialProjection {",
+                f'        legacy: "{legacy}",',
+                f'        canonical: "{canonical}",',
+                f'        disposition: "{disposition}",',
+                f'        directive: "{directive}",',
+                "    },",
+            ]
+        )
+    lines.extend(
+        [
+            "];",
+            "",
+            "/// Projects a legacy transport wire through the generated denial table.",
+            "#[must_use]",
+            "pub fn bridge_denial_projection(legacy_code: &str) -> Option<&'static BridgeDenialProjection> {",
+            "    BRIDGE_DENIAL_PROJECTION",
+            "        .iter()",
+            "        .find(|entry| entry.legacy == legacy_code)",
+            "}",
+            "",
+            "/// Projects a canonical catalogue reason to its bridge denial row.",
+            "#[must_use]",
+            "pub fn canonical_denial_projection(",
+            "    canonical_code: &str,",
+            ") -> Option<&'static BridgeDenialProjection> {",
+            "    BRIDGE_DENIAL_PROJECTION",
+            "        .iter()",
+            "        .find(|entry| entry.canonical == canonical_code)",
+            "}",
+            "",
         ]
     )
     return "\n".join(lines)
@@ -312,6 +466,7 @@ def render_rs(
 def render_md(
     catalogue: list[tuple[str, str]],
     aliases: list[tuple[str, str]],
+    projection: list[tuple[str, str, str, str]],
     dispositions: list[str],
 ) -> str:
     groups: dict[str, list[str]] = {}
@@ -350,12 +505,19 @@ def render_md(
             "",
             "This transport column is interpreted only at the bridge compatibility boundary.",
             "An identity mapping retains the same canonical spelling and does not create a second registry entry.",
+            "The disposition and directive columns are the generated #204 denial",
+            "projection: the closed I7.20 disposition plus the typed directive",
+            "wire value for each legacy transport name. The Kernel-owned",
+            "no-result row keeps the retry directive, never the failure capsule.",
             "",
-            "| Legacy transport name | Canonical reason code |",
-            "| --- | --- |",
+            "| Legacy transport name | Canonical reason code | Disposition | Directive |",
+            "| --- | --- | --- | --- |",
         ]
     )
-    lines.extend(f"| `{legacy}` | `{canonical}` |" for legacy, canonical in aliases)
+    projection_by_legacy = {legacy: (disposition, directive) for legacy, _, disposition, directive in projection}
+    for legacy, canonical in aliases:
+        disposition, directive = projection_by_legacy[legacy]
+        lines.append(f"| `{legacy}` | `{canonical}` | `{disposition}` | `{directive}` |")
     lines.extend([""])
     return "\n".join(lines)
 
@@ -367,12 +529,20 @@ def render_all() -> tuple[str, str]:
     codes = [code for _, code in catalogue]
     if len(codes) != len(set(codes)):
         raise Refused("I7.20 canonical reason-code set contains a duplicate code")
-    transport_wires = parse_transport_wires(source_lines(PROTOCOL_LIB))
+    protocol_lines = source_lines(PROTOCOL_LIB)
+    transport_wires = parse_transport_wires(protocol_lines)
+    directives = parse_directives(protocol_lines)
     aliases = resolve_aliases(catalogue, transport_wires)
+    projection = resolve_denial_projection(aliases, dispositions, transport_wires, directives)
     expected_rs = render_rs(
-        catalogue, aliases, source_digest(I720_CATALOGUE), source_digest(PROTOCOL_LIB), dispositions
+        catalogue,
+        aliases,
+        projection,
+        source_digest(I720_CATALOGUE),
+        source_digest(PROTOCOL_LIB),
+        dispositions,
     )
-    return expected_rs, render_md(catalogue, aliases, dispositions)
+    return expected_rs, render_md(catalogue, aliases, projection, dispositions)
 
 
 def main() -> int:

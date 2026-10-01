@@ -2403,8 +2403,13 @@ fn handle_stop(runner: &BridgeRunner) -> Response {
 /// Pre-activation reports `not-attached`. An attached row marks the retained
 /// binding current only after the live Heartbeat/Health exchange succeeds;
 /// failure remains an explicit unknown Kernel status while preserving the
-/// local attach facts for recovery. Exact-pair rehydration remains a separate
-/// open port-composition contour; a replacement connection always requires a
+/// local attach facts for recovery. The event/gap forwarder is additionally
+/// reported ready only after an exact real host operation settles through
+/// the host-request client (an admitted invoke/cancel reply, an
+/// owner-resolved durable winner, or an exact reconcile-probe success): the
+/// Health exchange alone creates no operation identity and never advertises
+/// forwarding readiness. Exact-pair rehydration remains a separate open
+/// port-composition contour; a replacement connection always requires a
 /// new admission.
 fn status_response(
     profile: Profile,
@@ -2432,6 +2437,15 @@ fn status_response(
             resources: None,
         },
         Some(view) => {
+            // Forwarding readiness observes probe history, never the Health
+            // exchange alone: the Health probe creates no operation identity,
+            // so `true` here means an exact real host operation has settled
+            // (issue #77 W8). Read before the binding probe so the mutable
+            // client borrow below stays sequential.
+            let operation_probe_settled = match client.as_ref() {
+                Some(client) => client.has_settled_host_operation(),
+                None => false,
+            };
             let probe = match client {
                 Some(client) => client.check_kernel_binding(),
                 None => Err(PortFailure::TransportBindingRejected {
@@ -2447,11 +2461,17 @@ fn status_response(
                 Ok(()) => (
                     "kernel-binding-current: live Kernel Health probe succeeded; session-bound dispatch joins the admitted Kernel session",
                     None,
-                    "live Kernel binding confirmed; reconnect with the current connection, session, generation, epoch, and fence nonce; stale targets fail closed; a replacement connection requires a new admission".to_owned(),
+                    if operation_probe_settled {
+                        "live Kernel binding confirmed; reconnect with the current connection, session, generation, epoch, and fence nonce; stale targets fail closed; a replacement connection requires a new admission".to_owned()
+                    } else {
+                        "live Kernel binding confirmed; forwarding readiness is not advertised until one exact host invoke/cancel operation settles; dispatch one host operation, then re-read Status; stale targets fail closed; a replacement connection requires a new admission".to_owned()
+                    },
                     if view.reconciliation_required() {
                         "reconciliation-required: ordinary event and gap forwarding remains gated until recovery completes"
-                    } else {
+                    } else if operation_probe_settled {
                         "admitted: live Kernel binding and composed event/gap forwarder are ready; acceptance does not claim Governor normalization or application"
+                    } else {
+                        "not-probed: live Kernel binding is current but no exact real host operation has settled yet; forwarding readiness is not advertised until one exact invoke/cancel probe succeeds"
                     },
                 ),
                 Err(error) => (
@@ -3102,6 +3122,7 @@ fn run_mcp_front_door(
                 if let Err(error) = eliot_agent_bridge::mcp_correlation::observe_mcp_emission(
                     runner,
                     &request,
+                    &response,
                     request.get("method").and_then(Value::as_str).unwrap_or(""),
                     None,
                     observed,

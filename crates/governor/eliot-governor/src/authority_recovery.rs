@@ -626,19 +626,59 @@ pub struct AuthorityRestoreOutcome {
 }
 
 impl AuthorityOwner {
+    /// Restores the authority owner on the SYNCHRONOUS Kernel recovery
+    /// composition route, which carries no CURRENT revocation-history
+    /// evidence.
+    ///
+    /// This route can prove neither a grant's current disposition nor a
+    /// dependent effect's current contest state, so it restores authority
+    /// ONLY where there is nothing to prove: an owner that grants nothing
+    /// and admits no effect. The genesis authority owner restores exactly
+    /// as before.
+    ///
+    /// Any durable payload carrying grant lineage, a recorded revoked set,
+    /// admitted root transitions, inert cross-root quarantine, or a restored
+    /// effect-authorization ledger REFUSES. The refusal is the security
+    /// property, not a limitation of this constructor: a snapshot's own
+    /// `revoked` list is the backup's list, so restoring it without
+    /// CURRENT durable history would reinstate exactly the grants a later
+    /// revocation removed, and `EffectAuthorizer`'s restore deliberately
+    /// resets contest state to empty (I12.20: revocation is re-propagated
+    /// from the live revoked set, never resurrected from backup), so every
+    /// restored authorization would read back `Admissible` regardless.
+    /// "Could not check" is not "nothing was revoked."
+    ///
+    /// The one constructor that may install a non-empty authority owner is
+    /// [`Self::from_snapshot_with_revocation_history`], reached from the
+    /// live-history read in `owner_closure_feed::synchronize_owner_feed`
+    /// and from `OwnerClosureProvider::restore_with_*`.
     pub(super) fn from_snapshot(
         snapshot: &AuthorityOwnerSnapshot,
         expected_fence: &StateFence,
     ) -> Result<Self, CompositionError> {
         let snapshot = AuthorityOwnerSnapshot::canonical_durable_snapshot(snapshot)?;
         snapshot.validate_against(expected_fence)?;
+        let graph = &snapshot.grant_graph;
+        let effects = &snapshot.effect_authorizer.records;
+        if !graph.grants.is_empty()
+            || !graph.revoked.is_empty()
+            || !graph.admitted_root_transitions.is_empty()
+            || !graph.quarantined_cross_root.is_empty()
+            || !effects.is_empty()
+        {
+            return Err(CompositionError::Recovery(
+                "authority owner recovery carries grant lineage or effect authorizations but no \
+                 CURRENT revocation history; unavailable history is not absence of revocation"
+                    .to_owned(),
+            ));
+        }
         let grants = GrantGraph::from_recovery_snapshot(&snapshot.grant_graph)
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
-        let effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
+        let restored_effects = EffectAuthorizer::from_snapshot(snapshot.effect_authorizer.clone())
             .map_err(|error| CompositionError::Recovery(error.to_string()))?;
         Ok(Self {
             state_fence: snapshot.state_fence.clone(),
-            effects,
+            effects: restored_effects,
             grants,
             owner_hydrations: snapshot.owner_hydrations.clone(),
             effect_obligations: BTreeMap::new(),

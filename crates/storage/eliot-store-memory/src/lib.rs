@@ -6849,7 +6849,7 @@ mod tests {
     fn exact_replay_binds_recomputed_digest_and_is_byte_identical() -> Result<(), StoreError> {
         // Proves cross-crate stability: the store recompute uses the same
         // shared helper as Slice A (golden vector
-        // `55e62e405f35c7f137fe9fcdf177c66a1cba54a5b75fb547deaa11f001a89ec1`
+        // `21b8b2be1415dae7f905e202725e0eb02c953d06afef64a946db7d2a19bd601c`
         // is produced by `canonical_request_hash` in `eliot-store-api`).
         // Here the memory path binds its own recomputed digest and replays
         // byte-identically.

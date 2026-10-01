@@ -161,6 +161,15 @@ pub struct KernelHostRequestClient {
 pub(super) struct ReplayCacheEntry {
     pub(super) payload_digest: String,
     pub(super) envelope: HostRequestEnvelope,
+    /// Whether the Kernel has settled the exact operation for this
+    /// correlation (issue #77 W8).
+    ///
+    /// Set only where the Kernel proves it staged the exact operation — an
+    /// admitted reply, an owner-resolved durable winner, or an exact
+    /// reconcile-probe success. Heartbeat/Health, preview, and resolve-miss
+    /// exchanges never set it. Status gates forwarding-readiness
+    /// advertisement on the existence of one such entry.
+    pub(super) owner_settled: bool,
 }
 
 /// Kernel-issued facts snapshotted from the shared owner for one call.
@@ -691,6 +700,57 @@ impl KernelHostRequestClient {
             .exchange_host_request_frame(frame)
     }
 
+    /// Records that the Kernel settled one exact host operation through this
+    /// client (issue #77 W8).
+    ///
+    /// Marks the replay-cache entry for `correlation` when one exists. A
+    /// missing entry (owner-resolved recovery without local bytes, or a
+    /// cancellation whose parent was built by another connection) stays
+    /// unmarked, which only under-reports readiness — fail-closed, never
+    /// advertised. A failed borrow is likewise skipped: the next successful
+    /// operation re-marks. Takes `&self`: mutation runs through the shared
+    /// owner's interior mutability, so marking composes with the `&self`
+    /// probe/disposition calls at every outcome site.
+    fn note_owner_settled(&self, correlation: &str) {
+        let Ok(mut owner) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        if let Some(entry) = owner.replay_cache.get_mut(correlation) {
+            entry.owner_settled = true;
+        }
+    }
+
+    /// Records settlement only for a successful exact-operation outcome and
+    /// returns it unchanged (issue #77 W8).
+    ///
+    /// Only owner-confirmed settlement marks: admission, response, applied
+    /// cancellation, or an observed terminal state. Unknown-outcome and
+    /// delivery failures never mark, so readiness is never inferred from an
+    /// error.
+    fn record_settled<T, E>(&self, correlation: &str, outcome: Result<T, E>) -> Result<T, E> {
+        if outcome.is_ok() {
+            self.note_owner_settled(correlation);
+        }
+        outcome
+    }
+
+    /// Reports whether an exact real host operation has settled through this
+    /// client (issue #77 W8).
+    ///
+    /// Status gates forwarding-readiness advertisement on this: it is true
+    /// only after an admitted invoke/cancel reply, an owner-resolved durable
+    /// winner, or an exact reconcile-probe success proves the Kernel staged
+    /// the exact operation. Each probe itself remains per-operation
+    /// settlement — never a readiness label — while this observes the history
+    /// fact that such a probe succeeded. A failed borrow reports false so
+    /// readiness is never advertised on unknown state.
+    pub fn has_settled_host_operation(&self) -> bool {
+        let Ok(owner) = self.shared.try_borrow() else {
+            return false;
+        };
+        owner.replay_cache.values().any(|entry| entry.owner_settled)
+    }
+
     /// Captures owner-verified source-result and attach facts for a resource
     /// created from this exact responded operation. The returned digest is a
     /// local comparison commitment only; reads must call
@@ -955,6 +1015,7 @@ impl KernelHostRequestClient {
                         ReplayCacheEntry {
                             payload_digest: payload_digest.to_owned(),
                             envelope: envelope.clone(),
+                            owner_settled: false,
                         },
                     );
                 Ok(InvocationPreparation::Submit(Box::new(envelope)))
@@ -3483,11 +3544,47 @@ fn map_parent_cancellation_disposition(
     }
 }
 
+/// Builds the dispatch frame for one prepared invoke envelope.
+///
+/// Extracted verbatim from `invoke` (issue #77 W8): the settled-marking wraps
+/// added lines to an already-long dispatch entry, so the frame match lives
+/// here to keep the entry under the length lint. Behavior unchanged: every
+/// arm returns the same frame or the same typed failure.
+fn invoke_request_frame(
+    request: &HostInvocationRequest,
+    envelope: &HostRequestEnvelope,
+    facts: &TransportFacts,
+) -> Result<Frame, PortFailure> {
+    Ok(match canonical_dispatch_entry(&request.tool) {
+        CanonicalDispatchEntry::InvokeRead => {
+            host_request_invoke_read_frame(request, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitAdmitOnly { .. } => {
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitActGated { .. } => {
+            revalidate_act_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
+            revalidate_coordinate_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitStateGated { .. } => {
+            revalidate_state_dispatch(request, envelope, facts)?;
+            host_request_frame_for_envelope(AGENT_HOST_REQUEST_SUBMIT_OPERATION, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitCarryingBytes => {
+            host_request_user_automation_frame(request, envelope, facts)?
+        }
+        CanonicalDispatchEntry::SubmitObservePair => {
+            revalidate_observe_dispatch(request, envelope, facts)?;
+            host_request_observe_submit_frame(request, envelope, facts)?
+        }
+    })
+}
+
 impl KernelHostRequestPort for KernelHostRequestClient {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the eight canonical entries must dispatch serially on the same carrier (issue #1739 W5); splitting the match would scatter the single dispatch order"
-    )]
     fn invoke(
         &mut self,
         request: &HostInvocationRequest,
@@ -3523,11 +3620,14 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                     .request_id
                     .clone()
                     .unwrap_or_else(|| correlation.clone());
-                return submit_outcome_for_resolved(
-                    &record,
-                    occurrence.as_str(),
-                    request.tool.canonical_name(),
-                    logical_key.as_str(),
+                return self.record_settled(
+                    correlation.as_str(),
+                    submit_outcome_for_resolved(
+                        &record,
+                        occurrence.as_str(),
+                        request.tool.canonical_name(),
+                        logical_key.as_str(),
+                    ),
                 );
             }
             InvocationPreparation::Submit(envelope) => envelope,
@@ -3541,53 +3641,17 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // unknown-outcome error is returned unchanged and MUST NOT be
             // rewritten into DeadlineExceeded. Only the Kernel-owned Expired
             // record state maps to an owner timeout.
-            return self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+            let outcome = self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+            return self.record_settled(correlation.as_str(), outcome);
         }
-        let frame = match canonical_dispatch_entry(&request.tool) {
-            CanonicalDispatchEntry::InvokeRead => {
-                host_request_invoke_read_frame(request, &envelope, &facts)?
-            }
-            CanonicalDispatchEntry::SubmitAdmitOnly { .. } => host_request_frame_for_envelope(
-                AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                &envelope,
-                &facts,
-            )?,
-            CanonicalDispatchEntry::SubmitActGated { .. } => {
-                revalidate_act_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitCoordinateGated { .. } => {
-                revalidate_coordinate_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitStateGated { .. } => {
-                revalidate_state_dispatch(request, &envelope, &facts)?;
-                host_request_frame_for_envelope(
-                    AGENT_HOST_REQUEST_SUBMIT_OPERATION,
-                    &envelope,
-                    &facts,
-                )?
-            }
-            CanonicalDispatchEntry::SubmitCarryingBytes => {
-                host_request_user_automation_frame(request, &envelope, &facts)?
-            }
-            CanonicalDispatchEntry::SubmitObservePair => {
-                revalidate_observe_dispatch(request, &envelope, &facts)?;
-                host_request_observe_submit_frame(request, &envelope, &facts)?
-            }
-        };
+        let frame = invoke_request_frame(request, &envelope, &facts)?;
         let reply = match self.exchange(&frame) {
             Ok(reply) => reply,
             Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
-            Err(_) => return self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+            Err(_) => {
+                let outcome = self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+                return self.record_settled(correlation.as_str(), outcome);
+            }
         };
         if is_legacy_correlation_unresolved_reply(&reply, &envelope) {
             return Err(PortFailure::LegacyCorrelationUnresolved);
@@ -3595,28 +3659,31 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         if is_idempotency_conflict_reply(&reply, &envelope) {
             return Err(PortFailure::IdempotencyConflict);
         }
-        match decode_admitted_reply(&reply, &envelope) {
-            Some((receipt, record)) => {
-                // Unresolved durable states are re-read from the Kernel-owned
-                // record instead of assumed: the admitted pair is presented
-                // unchanged to the rehydrate entry and the refreshed state is
-                // mapped. A failed re-read keeps the admitted record the owner
-                // already returned; its handle stays the typed reconcile path.
-                let record = match record.state {
-                    HostRequestRecordState::PossiblyEffected
-                    | HostRequestRecordState::Unknown
-                    | HostRequestRecordState::Reconciling => {
-                        match self.rehydrate_operation(&envelope, &receipt) {
-                            Ok(refreshed) => refreshed,
-                            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
-                            Err(_) => record,
-                        }
+        if let Some((receipt, record)) = decode_admitted_reply(&reply, &envelope) {
+            // Unresolved durable states are re-read from the Kernel-owned
+            // record instead of assumed: the admitted pair is presented
+            // unchanged to the rehydrate entry and the refreshed state is
+            // mapped. A failed re-read keeps the admitted record the owner
+            // already returned; its handle stays the typed reconcile path.
+            let record = match record.state {
+                HostRequestRecordState::PossiblyEffected
+                | HostRequestRecordState::Unknown
+                | HostRequestRecordState::Reconciling => {
+                    match self.rehydrate_operation(&envelope, &receipt) {
+                        Ok(refreshed) => refreshed,
+                        Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
+                        Err(_) => record,
                     }
-                    _ => record,
-                };
-                submit_outcome(&receipt, &record, request, &envelope)
-            }
-            None => self.probe_settles_invocation(&facts, &session, &envelope, now_ms),
+                }
+                _ => record,
+            };
+            self.record_settled(
+                correlation.as_str(),
+                submit_outcome(&receipt, &record, request, &envelope),
+            )
+        } else {
+            let outcome = self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+            self.record_settled(correlation.as_str(), outcome)
         }
     }
 
@@ -3658,7 +3725,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
             // Unknown delivery: resolve the retained cancellation identity
             // before any probe, without generating another cancellation.
             Err(_) => {
-                return self.resolve_retained_cancellation(
+                let outcome = self.resolve_retained_cancellation(
                     &parent,
                     cancel_correlation.as_str(),
                     &envelope,
@@ -3666,6 +3733,7 @@ impl KernelHostRequestPort for KernelHostRequestClient {
                     &session,
                     now_ms,
                 );
+                return self.record_settled(parent.request_base.as_str(), outcome);
             }
         };
         if is_legacy_correlation_unresolved_reply(&reply, &envelope) {
@@ -3674,18 +3742,19 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         if is_idempotency_conflict_reply(&reply, &envelope) {
             return Err(PortFailure::IdempotencyConflict);
         }
-        match decode_admitted_reply(&reply, &envelope) {
-            Some((_, _intent_record)) => {
-                self.resolve_cancellation_parent_disposition(&parent, &facts, &session)
-            }
-            None => self.resolve_retained_cancellation(
+        if let Some((_, _intent_record)) = decode_admitted_reply(&reply, &envelope) {
+            let outcome = self.resolve_cancellation_parent_disposition(&parent, &facts, &session);
+            self.record_settled(parent.request_base.as_str(), outcome)
+        } else {
+            let outcome = self.resolve_retained_cancellation(
                 &parent,
                 cancel_correlation.as_str(),
                 &envelope,
                 &facts,
                 &session,
                 now_ms,
-            ),
+            );
+            self.record_settled(parent.request_base.as_str(), outcome)
         }
     }
 

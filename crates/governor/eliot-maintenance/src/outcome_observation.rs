@@ -34,6 +34,14 @@
 //!   the durable trigger and decision records; it is never rebuilt from the
 //!   obligations a coverage pass happens to be walking. A job in that set with
 //!   no retained revision is unavailable, not observed.
+//! * **Every owed result is enumerated, not only the newest.** A job's
+//!   obligation chain is append-only, so one job can hold a failure, an unknown
+//!   outcome, a reconciliation and a completion. Each is a distinct source
+//!   result that owed its own observation when it was recorded, and each is
+//!   reported on its own. Reporting only the newest would let a later
+//!   admission erase an earlier unadmitted result from the census — the same
+//!   history rewrite this crate refuses everywhere else, arriving from the
+//!   coverage side.
 //! * **A refused writeback is recorded, not retried silently.** When the store
 //!   returns a terminal non-committed receipt for an exact publication
 //!   identity, the owner settles that obligation's delivery into
@@ -199,11 +207,13 @@ pub struct OutstandingOutcomeObligation {
     pub coverage_gap_ref: Option<String>,
 }
 
-/// What is durably known about the observation one maintenance job owes.
+/// What is durably known about the observation one owed maintenance result has.
 ///
 /// The arms are separate facts. Collapsing any two of them is the defect this
 /// type exists to prevent: work performed is not an admitted observation, and
-/// neither one is evidence that the maintained subsystem improved.
+/// neither one is evidence that the maintained subsystem improved. The unit is
+/// one owed result, not one job, so a job holding several results yields one of
+/// these per result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MaintenanceOutcomeDisposition {
     /// The job has reached no result-bearing lifecycle state, so it owes no
@@ -236,6 +246,10 @@ pub enum MaintenanceOutcomeDisposition {
 /// trigger and decision records, never rebuilt from the obligations a coverage
 /// pass happens to be walking. A completeness claim measured against the list
 /// it is iterating proves nothing.
+///
+/// A declared job may owe several observations — a failure, an unknown outcome,
+/// a reconciliation and a completion are each a distinct source result — so one
+/// declared identity legitimately contributes several entries to the census.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpectedOutcomeObservation {
     /// The durable job identity that owes an outcome observation.
@@ -253,7 +267,7 @@ pub struct ObservedOutcomeObservation {
     pub observation_receipt_ref: String,
 }
 
-/// One declared job that is not fully observed.
+/// One owed result of one declared job that is not fully observed.
 ///
 /// Each arm is outstanding on the observation path, and none of them is a
 /// reconciled result. One is an explicit obligation over work that really
@@ -263,6 +277,11 @@ pub struct ObservedOutcomeObservation {
 /// owner already recorded a coverage gap for is still the first arm: a gap says
 /// the observation could not be written back, never that it was written, and
 /// [`OutcomeObservationCoverage::is_complete`] stays false either way.
+///
+/// Every unadmitted result of a declared job appears, not only its newest: an
+/// earlier result that was never observed stays outstanding beside a later one
+/// that was, because a later admission is added evidence and never a rewrite of
+/// what came before it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OutstandingOutcome {
     /// The job performed work and no observation was admitted for it.
@@ -284,19 +303,22 @@ pub enum OutstandingOutcome {
 /// Outcome-observation completeness for one independently declared set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutcomeObservationCoverage {
-    /// Declared jobs whose owed result observation is admitted, each with the
-    /// exact receipt that proves it.
+    /// Admitted observations, one per declared job's owed result that has one,
+    /// each with the exact receipt that proves it.
     pub observed: Vec<ObservedOutcomeObservation>,
-    /// Every declared job that is not fully observed, in declaration order.
+    /// Every owed result of every declared job that is not observed, in
+    /// declaration order and, within a job, in retention order.
     pub outstanding: Vec<OutstandingOutcome>,
 }
 
 impl OutcomeObservationCoverage {
-    /// Whether every declared job's owed observation is admitted.
+    /// Whether every owed observation of every declared job is admitted.
     ///
     /// A coverage claim is true only when nothing is outstanding. An
     /// unreadable revision keeps it false, so an unavailable read cannot be
-    /// reported as complete coverage.
+    /// reported as complete coverage, and an unadmitted earlier result keeps it
+    /// false even when a later result of the same job was admitted, so a
+    /// reconciliation cannot make an incomplete history look complete.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.outstanding.is_empty()
@@ -317,37 +339,106 @@ fn recorded_coverage_gap(delivery: &MaintenanceDeliveryState) -> Option<String> 
     None
 }
 
-/// The result this job's own current state owes an observation for, as the
-/// publication identity that owes it and the work that was performed.
+/// One result a job still owes an observation for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwedResult {
+    /// The exact publication identity that owes an admitted observation.
+    publication_id: String,
+    /// The work that was actually performed. Preserved so the owed observation
+    /// never reads as though the work itself is in doubt.
+    work_performed: MaintenanceExecutionOutcome,
+    /// The durable coverage gap already recorded for this writeback, when the
+    /// canonical route returned a terminal non-committed receipt for it.
+    coverage_gap_ref: Option<String>,
+}
+
+/// Every result this job's own retained state owes an observation for, in
+/// retention order.
 ///
-/// Read from the job's retained obligation history when it recorded one, and
-/// otherwise derived from the exact lifecycle state and attempt ordinal. A
-/// result-bearing state whose obligation was never recorded still owes one,
-/// and that is exactly the case this derivation exists to keep visible: a
-/// completed job with no obligation is not a job with nothing to observe.
-fn owed_result(
-    job: &MaintenanceJob,
-) -> Option<(String, MaintenanceExecutionOutcome, Option<String>)> {
-    if let Some(latest) = job.result_obligations.last() {
-        return Some((
-            latest.publication_id.clone(),
-            latest.execution_outcome,
-            recorded_coverage_gap(&latest.delivery),
-        ));
+/// The whole retained obligation history is enumerated, not just its last entry.
+/// A job that failed, went unknown, was reconciled and then completed holds
+/// several results, and each one is a distinct source result that owed its own
+/// observation when it was recorded. Reading only the newest entry would let a
+/// later admission erase an earlier unadmitted result from the census, which is
+/// precisely the reconciliation-overwrites-history collapse the append-only
+/// obligation chain exists to prevent: the uncertainty must stay visible beside
+/// its resolution rather than disappear behind it.
+///
+/// The chain is walked oldest-first so a still-owed result is reported in the
+/// order it actually became owed. When the job retained no obligation at all,
+/// the single owed result is derived from the exact lifecycle state and attempt
+/// ordinal: a result-bearing state whose obligation was never recorded still
+/// owes one, and that is exactly the case this derivation exists to keep
+/// visible, because a completed job with no obligation is not a job with nothing
+/// to observe.
+fn owed_results(job: &MaintenanceJob) -> Vec<OwedResult> {
+    if !job.result_obligations.is_empty() {
+        return job
+            .result_obligations
+            .iter()
+            .map(|obligation| OwedResult {
+                publication_id: obligation.publication_id.clone(),
+                work_performed: obligation.execution_outcome,
+                coverage_gap_ref: recorded_coverage_gap(&obligation.delivery),
+            })
+            .collect();
     }
     // A result-bearing state whose obligation was never recorded still owes one
     // and has no settled delivery, so it carries no gap: nothing refused it.
-    result_outcome(job.state).map(|outcome| {
-        (
-            publication_id_for(&job.job_id, job.state, job.attempts),
-            outcome,
-            None,
-        )
-    })
+    result_outcome(job.state)
+        .map(|outcome| OwedResult {
+            publication_id: publication_id_for(&job.job_id, job.state, job.attempts),
+            work_performed: outcome,
+            coverage_gap_ref: None,
+        })
+        .into_iter()
+        .collect()
 }
 
-/// Decides what the observation path actually holds for one job that owes an
-/// outcome.
+/// Decides one owed result against the admitted set.
+///
+/// The admission test is an entry in the receipt set whose publication identity
+/// is exactly the identity this result owes. A receipt for any other identity
+/// settles nothing, and the job's own outcome reference settles nothing.
+///
+/// An unadmitted result that already carries a recorded coverage gap is still
+/// [`MaintenanceOutcomeDisposition::ObservationOwed`] — the gap is a fact about
+/// the writeback's availability, not an admission, so it never turns an owed
+/// observation into an observed one. It is reported on the obligation so the
+/// caller states the writeback as unavailable rather than as unstarted.
+fn result_observation_disposition(
+    job_id: &str,
+    owed: &OwedResult,
+    admitted: &[AdmittedObservationReceipt],
+) -> MaintenanceOutcomeDisposition {
+    match admitted
+        .iter()
+        .find(|receipt| receipt.publication_id == owed.publication_id.as_str())
+    {
+        Some(receipt) => MaintenanceOutcomeDisposition::ResultObserved {
+            publication_id: owed.publication_id.clone(),
+            observation_receipt_ref: receipt.observation_receipt_ref.clone(),
+        },
+        None => MaintenanceOutcomeDisposition::ObservationOwed(OutstandingOutcomeObligation {
+            job_ref: job_id.to_owned(),
+            publication_id: owed.publication_id.clone(),
+            work_performed: owed.work_performed,
+            obligation_owner: OUTCOME_OBSERVATION_OWNER.to_owned(),
+            resolution_condition: OUTCOME_OBSERVATION_RESOLUTION.to_owned(),
+            coverage_gap_ref: owed.coverage_gap_ref.clone(),
+        }),
+    }
+}
+
+/// Decides what the observation path actually holds for every result one job
+/// owes.
+///
+/// One disposition is returned per owed result, in retention order, so a job
+/// with several results reports each of them separately instead of collapsing
+/// onto its newest one. A job that owes no result at all yields exactly one
+/// [`MaintenanceOutcomeDisposition::NoResultDeclared`], which keeps the arm
+/// meaningful: an empty census is not the same fact as a job whose results were
+/// all observed.
 ///
 /// `admitted` is the independent admitted set: it is filled only from store
 /// receipts the canonical route returned, never from the obligation list this
@@ -355,51 +446,26 @@ fn owed_result(
 /// it is a reference the transition recorded, and a dangling reference is a
 /// broken link rather than evidence that an observation exists.
 ///
-/// An unadmitted result that already carries a recorded coverage gap is still
-/// [`MaintenanceOutcomeDisposition::ObservationOwed`] — the gap is a fact about
-/// the writeback's availability, not an admission, so it never turns an owed
-/// observation into an observed one. It is reported on the obligation so the
-/// caller states the writeback as unavailable rather than as unstarted, and the
-/// coverage result stays incomplete either way.
-///
 /// # Errors
 ///
 /// Returns [`MaintenanceError`] when the retained job revision fails its own
 /// validation, or when an admitted receipt does not name one observation.
-pub fn outcome_observation_disposition(
+pub fn outcome_observation_dispositions(
     job: &MaintenanceJob,
     admitted: &[AdmittedObservationReceipt],
-) -> Result<MaintenanceOutcomeDisposition, MaintenanceError> {
+) -> Result<Vec<MaintenanceOutcomeDisposition>, MaintenanceError> {
     job.validate()?;
     for receipt in admitted {
         receipt.validate()?;
     }
-    let Some((publication_id, work_performed, coverage_gap_ref)) = owed_result(job) else {
-        return Ok(MaintenanceOutcomeDisposition::NoResultDeclared);
-    };
-    // The admission test: an entry in the receipt set whose publication
-    // identity is exactly the identity this job owes. A receipt for any other
-    // identity settles nothing, and the job's own outcome reference settles
-    // nothing.
-    match admitted
-        .iter()
-        .find(|receipt| receipt.publication_id == publication_id.as_str())
-    {
-        Some(receipt) => Ok(MaintenanceOutcomeDisposition::ResultObserved {
-            publication_id,
-            observation_receipt_ref: receipt.observation_receipt_ref.clone(),
-        }),
-        None => Ok(MaintenanceOutcomeDisposition::ObservationOwed(
-            OutstandingOutcomeObligation {
-                job_ref: job.job_id.clone(),
-                publication_id,
-                work_performed,
-                obligation_owner: OUTCOME_OBSERVATION_OWNER.to_owned(),
-                resolution_condition: OUTCOME_OBSERVATION_RESOLUTION.to_owned(),
-                coverage_gap_ref,
-            },
-        )),
+    let owed = owed_results(job);
+    if owed.is_empty() {
+        return Ok(vec![MaintenanceOutcomeDisposition::NoResultDeclared]);
     }
+    Ok(owed
+        .iter()
+        .map(|result| result_observation_disposition(&job.job_id, result, admitted))
+        .collect())
 }
 
 /// Measures outcome-observation completeness against an independent expected
@@ -417,7 +483,7 @@ pub fn outcome_observation_disposition(
 /// Returns [`MaintenanceError::InvalidField`] when a declared job identity is
 /// empty or carries a control character, [`MaintenanceError::IdentityConflict`]
 /// when the expected set names one job twice, and every
-/// [`MaintenanceError`] from [`outcome_observation_disposition`].
+/// [`MaintenanceError`] from [`outcome_observation_dispositions`].
 pub fn outcome_observation_coverage(
     expected: &[ExpectedOutcomeObservation],
     jobs: &[MaintenanceJob],
@@ -441,28 +507,37 @@ pub fn outcome_observation_coverage(
                 .push(OutstandingOutcome::RevisionUnavailable {
                     job_ref: entry.job_id.clone(),
                 }),
-            Some(job) => match outcome_observation_disposition(job, admitted)? {
-                MaintenanceOutcomeDisposition::NoResultDeclared => {
-                    coverage
-                        .outstanding
-                        .push(OutstandingOutcome::NoResultDeclared {
-                            job_ref: entry.job_id.clone(),
-                        });
+            Some(job) => {
+                // One entry per owed result, so a job that failed, went unknown,
+                // was reconciled and then completed contributes each of those
+                // results to the census. Reporting only the newest would let a
+                // later admission hide an earlier unadmitted result and turn an
+                // incomplete census into a complete one.
+                for disposition in outcome_observation_dispositions(job, admitted)? {
+                    match disposition {
+                        MaintenanceOutcomeDisposition::NoResultDeclared => {
+                            coverage
+                                .outstanding
+                                .push(OutstandingOutcome::NoResultDeclared {
+                                    job_ref: entry.job_id.clone(),
+                                });
+                        }
+                        MaintenanceOutcomeDisposition::ResultObserved {
+                            publication_id,
+                            observation_receipt_ref,
+                        } => coverage.observed.push(ObservedOutcomeObservation {
+                            job_id: entry.job_id.clone(),
+                            publication_id,
+                            observation_receipt_ref,
+                        }),
+                        MaintenanceOutcomeDisposition::ObservationOwed(obligation) => {
+                            coverage
+                                .outstanding
+                                .push(OutstandingOutcome::ObservationOwed(obligation));
+                        }
+                    }
                 }
-                MaintenanceOutcomeDisposition::ResultObserved {
-                    publication_id,
-                    observation_receipt_ref,
-                } => coverage.observed.push(ObservedOutcomeObservation {
-                    job_id: entry.job_id.clone(),
-                    publication_id,
-                    observation_receipt_ref,
-                }),
-                MaintenanceOutcomeDisposition::ObservationOwed(obligation) => {
-                    coverage
-                        .outstanding
-                        .push(OutstandingOutcome::ObservationOwed(obligation));
-                }
-            },
+            }
         }
     }
     Ok(coverage)

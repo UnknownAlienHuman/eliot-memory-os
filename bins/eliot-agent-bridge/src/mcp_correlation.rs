@@ -286,21 +286,91 @@ impl StdioEmissionOutcome {
     }
 }
 
+/// The canonical write owner this route does not reach, so canonical commit
+/// evidence cannot be produced here.
+///
+/// This is a closed set of one and it is the whole point of the type: adding a
+/// variant is the change that adds an owner, and the compiler then refuses to
+/// build until that owner's arm is written and answers what evidence the owner
+/// can actually supply. Nothing on the MCP route reaches a canonical write.
+/// Canonical `WriteSubmission`/`WriteReceipt` production belongs to the store
+/// write-admission owner behind the daemon dispatch; every frame this process
+/// renders is instead an accepted status (status, operation handle, correlation
+/// id, recovery), an admitted `McpResponse` plus its handle, or a typed
+/// refusal. None of those is a canonical receipt, and the only owner resolve
+/// available here answers an operation handle — never a receipt — so there is
+/// no exact readback of a committed record to compare against.
+///
+/// [`CommitEvidence::is_committed`] therefore has no receiver on this path and
+/// [`CanonicalDisposition::CommittedWithReadback`] is unreachable rather than
+/// reachable by assertion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbsentCanonicalWriteOwner {
+    /// The store write-admission owner is not reached from the MCP route.
+    StoreWriteAdmissionNotReached,
+}
+
+impl AbsentCanonicalWriteOwner {
+    /// The only commit evidence this route can hold while that owner is absent.
+    ///
+    /// The match is exhaustive over the closed set, so there is no expression
+    /// reachable from this function that supplies a canonical receipt or a
+    /// readback verdict, and therefore none that makes
+    /// [`CommitEvidence::is_committed`] true. The disposition derived from this
+    /// stops at `ReadOnly`/`Unknown`, and `Unknown` is the conservative end of
+    /// that range: it still requires read-only reconciliation before any replay.
+    #[must_use]
+    pub const fn commit_evidence(self) -> CommitEvidence {
+        match self {
+            Self::StoreWriteAdmissionNotReached => CommitEvidence {
+                canonical_receipt_write_id: None,
+                exact_readback_match: None,
+            },
+        }
+    }
+}
+
+/// Reads the typed handler outcome off the exact frame this process rendered.
+///
+/// The envelope shape on this route is closed: `render_result` emits `result`
+/// and `render_error`/`render_rejection` emit `error` carrying an integer
+/// `code`. Only the emitted frame is an input — never the request, a caller
+/// hint, a flag, or an environment value — so the recorded outcome cannot be
+/// widened past what the bytes say. An `error` member whose `code` cannot be
+/// read as an integer is reported as an untyped internal failure rather than as
+/// a success.
+fn observed_handler_outcome(frame: &Value) -> HandlerOutcome {
+    match frame.get("error") {
+        Some(error) => match error.get("code").and_then(Value::as_i64) {
+            Some(code) => HandlerOutcome::JsonRpcError { code },
+            None => HandlerOutcome::InternalFailure,
+        },
+        None => HandlerOutcome::CompletedOk,
+    }
+}
+
 /// Integrates one MCP stdio emission and submits it to the owner.
 ///
 /// This is the ELIOT-side producer on the live path. It observes only what
 /// this process can measure for itself: the JSON-RPC request identity, the
-/// method and tool, and the exact byte and flush receipt. It then freezes those
-/// facts into the owner's immutable observation and submits them through the
-/// owner's admitted route, so a later host event has something durable to join
-/// against.
+/// rendered response envelope, the method and tool, and the exact byte and
+/// flush receipt. It then freezes those facts into the owner's immutable
+/// observation and submits them through the owner's admitted route, so a later
+/// host event has something durable to join against.
 ///
 /// It declares no host terminal state. A successful emission yields a pending
 /// record with an explicit `PartialUnknown` denominator, and only a later
 /// admitted host event can resolve the correlation.
+///
+/// `response` is the exact frame about to be placed on stdout, so the handler
+/// outcome recorded here is the one the handler actually produced. An oversize
+/// frame is refused and replaced downstream by a transport refusal; that
+/// substitution is a transport fact, carried by the byte/flush receipt, and
+/// this field keeps naming the handler's own envelope.
 pub fn observe_mcp_emission(
     runner: &mut BridgeRunner,
     request: &Value,
+    response: &Value,
     method: &str,
     tool_name: Option<&str>,
     outcome: StdioEmissionOutcome,
@@ -347,17 +417,24 @@ pub fn observe_mcp_emission(
     let emission = EliotEmissionObservation::observe(
         identity,
         stage,
-        HandlerOutcome::CompletedOk,
+        observed_handler_outcome(response),
         Some(outcome.bytes),
         Some(receipt),
     );
+    // Contour #6 (issue #7 W2): the canonical write owner is not reached from
+    // this route, so no canonical receipt and no exact readback exist here and
+    // `CommitEvidence` is built only as the typed absence that says so. A
+    // disposition cannot be moved to `CommittedWithReadback` from here, because
+    // nothing reachable from here can satisfy `is_committed`. `false` for
+    // `failed_before_handler` is the conservative value and is left standing: it
+    // yields `Unknown` rather than `FailedBeforeStage`, so the disposition still
+    // demands read-only reconciliation before any replay. Distinguishing a
+    // pre-handler refusal from a post-handler failure needs the dispatcher's own
+    // arm, which the frame alone does not carry.
     let canonical = CanonicalDisposition::from_facade_evidence(
         method,
         false,
-        &CommitEvidence {
-            canonical_receipt_write_id: None,
-            exact_readback_match: None,
-        },
+        &AbsentCanonicalWriteOwner::StoreWriteAdmissionNotReached.commit_evidence(),
     );
     // The caller-supplied hints are diagnostic only and are never allowed to
     // authorize resubmission: no operation binding is passed, so the owner's
@@ -370,6 +447,10 @@ pub fn observe_mcp_emission(
         operation_hint_present = !operation.is_empty(),
         idempotency_key_present = operation.idempotency_key.is_some(),
         owner_operation_bound = false,
+        handler_outcome = emission.handler_outcome.as_str(),
+        canonical_disposition = canonical.as_str(),
+        canonical_write_owner = "absent",
+        exact_readback_observed = false,
         stage = stage.as_str(),
         response_bytes = outcome.bytes,
         emitted_exactly_once = emission.emitted_exactly_once(),

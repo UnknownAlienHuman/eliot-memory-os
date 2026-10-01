@@ -20,9 +20,12 @@
 //! admitted set it is about to render. Every one of them re-derives the
 //! State-Fence, task/scope identity and load-bearing Context recipe owner
 //! revision joins itself, and every one of them compares the recipe revision
-//! against `context_recipe_body_digest`, which the Context owner re-derived
-//! from the exact recipe body its own publication validator accepted. No cell
-//! inherits another's verdict. The `#40`-frozen
+//! against `context_recipe_record_digest`, the Context owner ROW digest this
+//! route re-derived through the owner's own publication from the exact recipe
+//! body its publication validator accepted. That is the object the immutable
+//! view records for its `ContextRecipe` row; the recipe-body digest is a
+//! different object and is used only for the stored document body comparison.
+//! No cell inherits another's verdict. The `#40`-frozen
 //! `eliot_context::ContextCompiler` is deliberately not called here: the
 //! frozen donor surface takes no new caller, and no legacy-only helper may
 //! accept a view the current owner cells refused.
@@ -584,9 +587,10 @@ pub fn validate_campaign_packet_pair(
 /// `eliot_context_candidates::check_campaign_learning_state_view`. That cell
 /// owns the State Fence, task/scope/request identity and load-bearing Context
 /// recipe owner-revision joins; it compares the view's recorded binding
-/// against this request and the view's recorded Context recipe content digest
-/// against `context_recipe_body_digest`, which the Context owner re-derived
-/// from the exact body its own publication validator accepted. A stale,
+/// against this request and the view's recorded Context recipe owner-row
+/// content digest against `context_recipe_record_digest`, which the Context
+/// owner re-derived through its own publication from the exact body its
+/// publication validator accepted. A stale,
 /// missing, blocked or invalidated view is refused here through a current
 /// owner and takes the typed `CampaignViewNotCurrent` gap; the learning-state
 /// owner has already refused a load-bearing-partial view before this point, and
@@ -612,7 +616,7 @@ fn candidate_request_for_packet(
     recipe: &ContextRecipe,
     binding: &CampaignPacketBinding,
     view: &CampaignLearningStateView,
-    context_recipe_body_digest: &str,
+    context_recipe_record_digest: &str,
 ) -> Result<CandidateRequest, CampaignPacketError> {
     recipe
         .validate()
@@ -632,7 +636,7 @@ fn candidate_request_for_packet(
     request
         .validate()
         .map_err(|_| CampaignPacketError::InvalidInvocation)?;
-    check_campaign_learning_state_view(&request, recipe, view, context_recipe_body_digest)
+    check_campaign_learning_state_view(&request, recipe, view, context_recipe_record_digest)
         .map_err(|error| match error {
             ContextError::MissingField(
                 "campaign_view.context_recipe" | "campaign_view.context_reference",
@@ -1153,6 +1157,31 @@ async fn resolve_compile_and_bind_result(
             );
         }
     };
+    // #1862: the value the three Context cells compare is the Context owner ROW
+    // digest, in the same domain the immutable view records for its
+    // `ContextRecipe` source resolution. `context_recipe_digest` above digests
+    // the recipe body alone and stays the right value for the stored-document
+    // body comparison just below; handing it to the cells instead would compare
+    // a row digest with a body digest and refuse every view, current or not.
+    let context_recipe_record_digest =
+        match crate::campaign_context_owner::derive_context_recipe_record_digest(
+            &context_recipe_body,
+        ) {
+            Ok(digest) => digest,
+            Err(_) => {
+                return campaign_packet_result_body(
+                    envelope,
+                    attempt,
+                    context_blocked_response(
+                        publication,
+                        CampaignPacketGapCode::ContextRecipeUnavailable,
+                        Some(CampaignSourceRole::ContextRecipe),
+                        &resolved.resolutions,
+                        prior.is_some() && !prior_is_current,
+                    ),
+                );
+            }
+        };
     let context_body_digests_match = canonical_body_digest(&context_recipe_record.document.body)
         .ok()
         .is_some_and(|stored| stored == context_recipe_digest)
@@ -1218,7 +1247,7 @@ async fn resolve_compile_and_bind_result(
         &context_recipe_body.recipe,
         &binding,
         &publication.view,
-        &context_recipe_digest,
+        &context_recipe_record_digest,
     ) {
         let (gap, role) = match refusal {
             CampaignPacketError::CampaignViewNotCurrent => {
@@ -1251,8 +1280,11 @@ async fn resolve_compile_and_bind_result(
     // binding, its recipe binding and its floor binding, so it is the
     // admission cell's fact and not a value forwarded from the candidate stage.
     // The load-bearing Context recipe revision is compared against
-    // `context_recipe_digest`, which the Context owner re-derived from the exact
-    // recipe body its own publication validator accepted.
+    // `context_recipe_record_digest`, the Context owner ROW digest this route
+    // re-derived through the owner's own publication from the exact recipe body
+    // its publication validator accepted. That is the same object the immutable
+    // view records for its `ContextRecipe` row; the recipe-body digest is a
+    // different object and is used only for the stored document body comparison.
     //
     // The protected floor this decision is made under is resolved here, from the
     // same authenticated Context owner row, through the Context owner's own
@@ -1300,7 +1332,7 @@ async fn resolve_compile_and_bind_result(
     if let Err(refusal) = check_campaign_view_for_admission(
         &context_recipe_body.recipe.binding,
         &publication.view,
-        &context_recipe_digest,
+        &context_recipe_record_digest,
         &admission_floor,
         &context_recipe_body.recipe,
     ) {

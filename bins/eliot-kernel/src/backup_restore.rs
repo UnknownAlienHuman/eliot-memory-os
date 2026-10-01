@@ -1323,27 +1323,63 @@ impl KernelBackupRestore {
                 capability: owners::BLOB_SCOPE_BINDING,
             });
         }
-        if let Some(evidence) = ports.manifest_evidence.as_ref() {
-            evidence.validate()?;
-            let own_root = std::fs::canonicalize(&self.work_root)
-                .map_err(|error| KernelRestoreError::DestinationInvalid(error.to_string()))?;
-            let admitted_root = std::fs::canonicalize(&evidence.kernel_work_root)
-                .map_err(|error| KernelRestoreError::DestinationInvalid(error.to_string()))?;
-            if own_root != admitted_root {
-                return Err(KernelRestoreError::DestinationInvalid(
-                    "admitted work root does not match the Kernel work root".to_owned(),
-                ));
-            }
-            if let Some(config) = bundle
-                .artifacts
-                .iter()
-                .find(|artifact| artifact.kind == "config")
-                && config.sha256 != evidence.manifest_digest
-            {
-                return Err(KernelRestoreError::FenceMismatch(
-                    "destination manifest".to_owned(),
-                ));
-            }
+        // A11's POSITIVE direction, which the containment gate beside
+        // `refuse_destination_outside_isolated_area` cannot supply: the recovery
+        // import may target ONLY the installation an EXTERNAL owner admitted.
+        //
+        // `ports.manifest_evidence` IS that record — the projection of the
+        // Host-side active manifest binding, issued by the owner's own producer
+        // `DestinationManifestEvidence::issue_from_owner_manifest` and admitted by
+        // `RestorePorts::with_owner_destination_evidence` (both in
+        // `backup_restore_ports.rs`, #958/#962). The Kernel cannot mint, recompute
+        // or default it: nothing on this side observes the Host's manifest
+        // binding.
+        //
+        // Absent it there is nothing to import INTO that anyone admitted.
+        // `KernelIsolatedDestination::open` CONSTRUCTS
+        // `<work_root>/.eliot/restore-isolated/<label>` from a label the request
+        // chose, so a root that exists is not evidence that an owner admitted
+        // it, and a path this operation constructed for itself is not admission.
+        // Reading this field optionally — as it was — made the entire
+        // destination-admission set of checks vacuous on exactly the unadmitted
+        // shape: a predictable directory name passed every check because there
+        // was nothing to compare it against, and the import then staged events,
+        // receipts, projections, blobs and the final evidence into an
+        // installation no external owner ever named. The record is therefore
+        // required rather than inspected when present, and the refusal is this
+        // crate's own `KernelRestoreError::DestinationNotAdmitted` — not a
+        // string, a boolean, or an error invented for this path.
+        //
+        // It is raised before `compile_plan` and before
+        // `KernelIsolatedDestination::open` creates the root, so no destination
+        // byte exists yet. Everything below is the EXISTING owner/validator
+        // work, unchanged and in the same order: the record is validated with
+        // its own `validate()` against the ORIGINAL recorded value, the admitted
+        // work root is compared RESOLVED against this owner's own `self.work_root`
+        // rather than caller text, and a `config` artifact must carry the
+        // admitted `manifest_digest`.
+        let Some(evidence) = ports.manifest_evidence.as_ref() else {
+            return Err(KernelRestoreError::DestinationNotAdmitted);
+        };
+        evidence.validate()?;
+        let own_root = std::fs::canonicalize(&self.work_root)
+            .map_err(|error| KernelRestoreError::DestinationInvalid(error.to_string()))?;
+        let admitted_root = std::fs::canonicalize(&evidence.kernel_work_root)
+            .map_err(|error| KernelRestoreError::DestinationInvalid(error.to_string()))?;
+        if own_root != admitted_root {
+            return Err(KernelRestoreError::DestinationInvalid(
+                "admitted work root does not match the Kernel work root".to_owned(),
+            ));
+        }
+        if let Some(config) = bundle
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "config")
+            && config.sha256 != evidence.manifest_digest
+        {
+            return Err(KernelRestoreError::FenceMismatch(
+                "destination manifest".to_owned(),
+            ));
         }
         let plan = Self::compile_plan(bundle, target.clone())?;
         let transaction = plan
@@ -3822,9 +3858,16 @@ impl RestoreTarget for KernelRestoreTarget<'_> {
 /// restore runs on is the journal admission — and that one field is the value
 /// the durable owner issued for this exact plan. Nothing is defaulted and no
 /// field is dropped: an absent key manifest, blob scope or destination evidence
-/// stays absent, because "rehearsal without Host admission" is a supported
-/// production shape and inventing an empty stand-in for one would change the
-/// gate.
+/// stays absent, and inventing an empty stand-in for one would change the
+/// gate. That is now the whole of the destination field's role here: this
+/// function moves the owner's value or the absence, and never supplies one.
+///
+/// The destination evidence stays optional on the bundle because its field is
+/// the owner's to admit or withhold. The import no longer treats its absence
+/// as permission: `KernelBackupRestore::restore_with_owner` refuses
+/// [`KernelRestoreError::DestinationNotAdmitted`] before it constructs a
+/// destination root, so a bundle that reaches the execution body without Host
+/// admission stops here rather than importing into a root nothing admitted.
 fn admitted_restore_ports<'a>(
     ports: &'a RestorePorts<'_>,
     admission: &'a RestoreJournalAdmission,
