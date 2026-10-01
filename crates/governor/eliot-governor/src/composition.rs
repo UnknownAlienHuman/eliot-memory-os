@@ -9700,56 +9700,34 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         })
     }
 
-    pub async fn resume_committed_closure_second_phase<LinkFn, LinkFut>(
+    /// Commits the resumed canonical write and links it through the
+    /// authenticated Kernel/ORS owner (issue #2100, audit 5924750035
+    /// items 4, 5).
+    ///
+    /// The envelope is compiled from the committed closure and committed
+    /// under the ORIGINAL operation/idempotency identity; only `Committed`
+    /// plus `Success` may link, and the link travels over the caller-supplied
+    /// transport closure with the ORIGINAL first-phase operation identity.
+    /// Every refusal retains the pending record via
+    /// [`Self::retain_pending_second_phase`] and returns the typed error.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the commit/link seam carries the admitted request, committed closure, retained commit bundle, pending coordinates and the transport link as one indivisible resume; splitting them would let a caller commit one resume and link another"
+    )]
+    async fn commit_resume_link<LinkFn, LinkFut>(
         &mut self,
         request: &GrantRevocationRequest,
         closure: &GrantClosureReceipt,
-        canonical_operation_id: &OperationId,
-        canonical_request_identity: &RequestIdentity,
-        operation: &RevocationOperationIdentity,
+        commit: &CanonicalRevocationCommit<'_>,
+        pending_snapshot: String,
+        pending_revocation: String,
         link: LinkFn,
-    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
+    ) -> Result<(WriteReceipt, ReceiptIdentity, GrantClosureSecondPhaseLink), CompositionError>
     where
         LinkFn: FnOnce(String, ReceiptIdentity) -> LinkFut,
         LinkFut: Future<Output = Result<GrantClosureSecondPhaseLink, KernelPortError>>,
     {
-        self.check_resume_second_phase_admission(request, closure, canonical_request_identity)?;
-        // The committed closure validated above is the proof the mechanical
-        // fence already took effect, so every refusal from here retains the
-        // pending stricter revocation instead of clearing it.
-        let pending_snapshot = closure.authority_receipt.snapshot_id.clone();
-        let pending_revocation = closure.authority_receipt.receipt_id.clone();
         let grant_id = request.grant_id.as_str();
-        let commit = CanonicalRevocationCommit {
-            canonical_operation_id,
-            canonical_request_identity,
-            operation,
-        };
-        if let Err(error) = self.prepare_revocation_transition_for_commit(request, closure, &commit)
-        {
-            return Err(self.retain_pending_second_phase(
-                grant_id,
-                pending_snapshot.clone(),
-                pending_revocation.clone(),
-                CanonicalRevocationPhase::ClosureReadback,
-                error,
-            ));
-        }
-        if let Err(error) = self
-            .owners
-            .authority
-            .grants
-            .revoke_declared_closure(&request.grant_id, &closure.declaration.affected_grants())
-        {
-            return Err(self.retain_pending_second_phase(
-                grant_id,
-                pending_snapshot.clone(),
-                pending_revocation.clone(),
-                CanonicalRevocationPhase::ClosureReadback,
-                CompositionError::Owner(error.to_string()),
-            ));
-        }
-        self.owners.authority.invalidate_owner_hydrations();
         let envelope = match authority_revocation_envelope_from_closure(
             commit.canonical_request_identity,
             commit.canonical_operation_id,
@@ -9801,13 +9779,76 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 Err(error) => {
                     return Err(self.retain_pending_second_phase(
                         grant_id,
-                        pending_snapshot.clone(),
-                        pending_revocation.clone(),
+                        pending_snapshot,
+                        pending_revocation,
                         CanonicalRevocationPhase::SecondPhaseLink,
                         CompositionError::Owner(error.to_string()),
                     ));
                 }
             };
+        Ok((canonical_receipt, receipt_identity, closure_projection))
+    }
+
+    pub async fn resume_committed_closure_second_phase<LinkFn, LinkFut>(
+        &mut self,
+        request: &GrantRevocationRequest,
+        closure: &GrantClosureReceipt,
+        canonical_operation_id: &OperationId,
+        canonical_request_identity: &RequestIdentity,
+        operation: &RevocationOperationIdentity,
+        link: LinkFn,
+    ) -> Result<AuthorityRevocationReconciliation, CompositionError>
+    where
+        LinkFn: FnOnce(String, ReceiptIdentity) -> LinkFut,
+        LinkFut: Future<Output = Result<GrantClosureSecondPhaseLink, KernelPortError>>,
+    {
+        self.check_resume_second_phase_admission(request, closure, canonical_request_identity)?;
+        // The committed closure validated above is the proof the mechanical
+        // fence already took effect, so every refusal from here retains the
+        // pending stricter revocation instead of clearing it.
+        let pending_snapshot = closure.authority_receipt.snapshot_id.clone();
+        let pending_revocation = closure.authority_receipt.receipt_id.clone();
+        let grant_id = request.grant_id.as_str();
+        let commit = CanonicalRevocationCommit {
+            canonical_operation_id,
+            canonical_request_identity,
+            operation,
+        };
+        if let Err(error) = self.prepare_revocation_transition_for_commit(request, closure, &commit)
+        {
+            return Err(self.retain_pending_second_phase(
+                grant_id,
+                pending_snapshot.clone(),
+                pending_revocation.clone(),
+                CanonicalRevocationPhase::ClosureReadback,
+                error,
+            ));
+        }
+        if let Err(error) = self
+            .owners
+            .authority
+            .grants
+            .revoke_declared_closure(&request.grant_id, &closure.declaration.affected_grants())
+        {
+            return Err(self.retain_pending_second_phase(
+                grant_id,
+                pending_snapshot.clone(),
+                pending_revocation.clone(),
+                CanonicalRevocationPhase::ClosureReadback,
+                CompositionError::Owner(error.to_string()),
+            ));
+        }
+        self.owners.authority.invalidate_owner_hydrations();
+        let (canonical_receipt, receipt_identity, closure_projection) = self
+            .commit_resume_link(
+                request,
+                closure,
+                &commit,
+                pending_snapshot,
+                pending_revocation,
+                link,
+            )
+            .await?;
         self.finish_resume_second_phase(
             closure,
             &canonical_receipt,
