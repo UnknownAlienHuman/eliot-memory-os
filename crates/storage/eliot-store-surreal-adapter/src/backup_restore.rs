@@ -89,18 +89,32 @@ use std::sync::{Mutex, OnceLock};
 
 use eliot_store_api::{
     BACKUP_IO_CAPABILITY_ISOLATED_RESTORE, BACKUP_IO_RESTORE_SCHEMA_V1,
-    BackupOperationReconciliation, BlobResidencyDomain, CanonicalRestoreBatch, IsolatedDestination,
-    IsolatedDestinationReceipt, IsolatedRestorePort, IsolationEvidence, MAX_RESTORE_MEMBERS,
-    OperationId, OperationIdentity, OrderingHeadExpectation, ReconciliationOutcome, RecoveryRecord,
-    RequestMeta, RestoreValidationReceipt, RetainedArchiveMember, RevisionHeadExpectation,
-    SnapshotCompleteness, SnapshotMember, SnapshotMemberType, SnapshotSourceIdentity, StateFence,
-    StoreBackupRequest, StoreError, StoreMutationDisposition, canonical_json_bytes,
+    BackupOperationReconciliation, BlobResidencyDomain, CanonicalRestoreBatch, ExactJsonBytes,
+    HISTORICAL_TRUNCATION_SIGNATURE, HistoricalRecordDisposition, HistoricalRecordProvenance,
+    IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort, IsolationEvidence,
+    MAX_RESTORE_MEMBERS, OperationId, OperationIdentity, OrderingHeadExpectation,
+    ReconciliationOutcome, RecoveryRecord, RequestMeta, RestoreValidationReceipt,
+    RetainedArchiveMember, RevisionHeadExpectation, SnapshotCompleteness, SnapshotMember,
+    SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreBackupRequest, StoreError,
+    StoreMutationDisposition, canonical_json_bytes, dispose_historical_record,
     reconcile_same_operation, sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::client::RpcTransport;
 use crate::{SurrealStoreAdapter, config::SurrealAdapterConfig, error::AdapterError};
+
+/// Schema generation whose rows were written through the binding codec (issue #10).
+///
+/// The record-shaped coercion was closed in `client/json_codec.rs`
+/// (`encode_bindings`), and the fragment envelope closed the ten remaining
+/// free-text envelope leaves in `apply_write_envelope.surql`. Neither introduced
+/// DDL, so both shipped on the same admitted generation; [`crate::schema`] stays
+/// the single owner of that constant and this reference adds no second
+/// generation identity. A restore whose source is on an *earlier* generation was
+/// captured before both fixes and its records are the only ones the historical
+/// corruption predicate applies to.
+const POST_RECORD_COERCION_FIX_GENERATION: &str = crate::schema::GENERATION_V2;
 
 /// Versioned schema tag accepted for isolated-restore documents.
 pub const RESTORE_SCHEMA_V1: &str = BACKUP_IO_RESTORE_SCHEMA_V1;
@@ -208,6 +222,244 @@ struct RestoreMemberRecord {
     /// without a `Restored` disposition never carries one, so it cannot claim an
     /// import it has no expectation for.
     imported_digest: Option<String>,
+    /// Historical-corruption disposition of this member's own logical payload
+    /// (issue #10, items 7 and A5).
+    ///
+    /// `None` for a member whose payload this port does not interpret: a
+    /// reference edge carries no payload of its own, and a member whose
+    /// payload never resolved has nothing to dispose of. It is present for
+    /// every resolved import, and it is the *durable* place the
+    /// reconstructable/unreconstructable verdict is recorded, so a corrupt
+    /// record is marked with its provenance rather than only refused.
+    ///
+    /// The value is the store-neutral
+    /// [`eliot_store_api::HistoricalRecordDisposition`] rendered by its closed
+    /// wire labels; the classification itself is never re-derived here, and no
+    /// second disposition vocabulary exists. A
+    /// [`HistoricalRecordDisposition::CorruptedStaleUnreconstructable`] member
+    /// is never imported at all, so a stored `CorruptedStale`/`Unverified`
+    /// label is by construction a member this operation refused before the
+    /// commit, and the readback re-derives that refusal instead of reporting a
+    /// successful import.
+#[serde(default)]
+    history: Option<MemberHistoryDisposition>,
+}
+
+/// Closed durable rendering of one
+/// [`eliot_store_api::HistoricalRecordDisposition`].
+///
+/// The three observable outcomes are exactly the three dispositions the
+/// store-neutral contract can answer for one archived member. Both refusals
+/// are kept distinct on purpose, because they are different facts: one is
+/// proven corruption with an evidence-backed signature, the other is an
+/// unproven value that merely is not a match.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MemberHistoryDisposition {
+    /// Reconstructed from the archive owner's exact canonical source bytes.
+    /// The stored pre-fix bytes are never trusted for this member.
+    ReplayFromExactSource,
+    /// The stored bytes were proven intact by the post-fix write path, which
+    /// carries the binding codec as positive preservation evidence.
+    PreservedIntact,
+    /// Pre-fix stored bytes with no exact source that match the evidence-backed
+    /// truncation signature: corrupted/stale, unreconstructable. The dropped
+    /// suffix is unknowable and is never guessed.
+    CorruptedStaleUnreconstructable,
+    /// Pre-fix stored bytes with no exact source that do not match the
+    /// truncation signature: integrity unproven, so quarantined rather than
+    /// replayed as intact authority.
+    UnverifiedPreFix,
+}
+
+impl MemberHistoryDisposition {
+    /// Projects the store-neutral disposition onto its durable label.
+    ///
+    /// Exhaustive over the contract enum, so a new disposition upstream cannot
+    /// be silently dropped by this owner.
+    const fn label(disposition: HistoricalRecordDisposition) -> Self {
+        match disposition {
+            HistoricalRecordDisposition::ReplayFromExactSource => Self::ReplayFromExactSource,
+            HistoricalRecordDisposition::PreservedIntact => Self::PreservedIntact,
+            HistoricalRecordDisposition::UnverifiedPreFix => Self::UnverifiedPreFix,
+            HistoricalRecordDisposition::CorruptedStaleUnreconstructable { .. } => {
+                Self::CorruptedStaleUnreconstructable
+            }
+        }
+    }
+
+    /// Reports whether this label is a refusal: the member must never be
+    /// imported into a destination.
+    const fn is_quarantine(self) -> bool {
+        matches!(
+            self,
+            Self::CorruptedStaleUnreconstructable | Self::UnverifiedPreFix
+        )
+    }
+
+    /// Folds two positions of one value tree into the strongest verdict.
+    ///
+    /// Order of evidence, strongest first: proven corruption outranks an
+    /// unproven value, and an unproven value outranks a proven-intact tree. A
+    /// single quarantined string anywhere in a record therefore decides the
+    /// record, which is the conservative direction: it can only ever refuse an
+    /// import, never enable one.
+    const fn worse(self, other: Self) -> Self {
+        rank(self).max(rank(other))
+    }
+
+    /// Severity rank of this label; a higher rank is the stronger claim.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::PreservedIntact => 0,
+            Self::ReplayFromExactSource => 1,
+            Self::UnverifiedPreFix => 2,
+            Self::CorruptedStaleUnreconstructable => 3,
+        }
+    }
+}
+
+/// One member's historical-corruption verdict, with the provenance that produced
+/// it (issue #10, item 7).
+///
+/// The provenance travels with the verdict so the two cannot drift: the same
+/// two facts that produced the label are the ones the record-level inventory
+/// re-derives its counts under.
+#[derive(Clone, Copy, Debug)]
+struct MemberHistoryOutcome {
+    /// The durable per-member label.
+    disposition: MemberHistoryDisposition,
+    /// The provenance this port supplied to
+    /// [`eliot_store_api::dispose_historical_record`].
+    provenance: HistoricalRecordProvenance,
+}
+
+/// Durable historical-corruption inventory of one committed restore record
+/// (issue #10, items 7 and A5).
+///
+/// This is a projection over the existing per-member `history` labels, kept in
+/// one closed place so a reader can answer the inventory question from the
+/// record alone. It adds no second disposition vocabulary: the
+/// reconstructable/unreconstructable verdict lives in
+/// [`RestoreMemberRecord::history`], and these counters only count it.
+///
+/// `Default` is the "nothing was inventoried" reading used when a record row
+/// predates this field; it is never the reading of a freshly committed record,
+/// because [`Self::from_members`] always produces a stated verdict.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreHistoryInventory {
+    /// Whether the source rows of this batch were written before the
+    /// record-coercion fix. This is the provenance fact every per-member
+    /// verdict below was decided under.
+    written_before_record_coercion_fix: bool,
+    /// Schema generation string of the source snapshot, recorded so the
+    /// provenance claim above is re-checkable against the archive rather than
+    /// taken on trust.
+    source_schema_generation: String,
+    /// Members reconstructed from the archive owner's exact canonical bytes.
+    replayed_from_exact_source: u64,
+    /// Members whose stored bytes carry positive post-fix preservation evidence.
+    preserved_intact: u64,
+    /// Members proven corrupted/stale by the evidence-backed truncation
+    /// signature with no exact source. Never imported and never guessed.
+    corrupted_stale_unreconstructable: u64,
+    /// Pre-fix members with no exact source that carry no positive preservation
+    /// evidence. Quarantined rather than replayed as intact authority.
+    unverified_pre_fix: u64,
+    /// Evidence-backed truncation signature that classified the corrupted
+    /// members, or the empty string when none were found. It travels with the
+    /// count so the verdict names the predicate that produced it.
+    corrupted_stale_signature: String,
+}
+
+impl RestoreHistoryInventory {
+    /// Builds the inventory from the per-member records it summarizes.
+    ///
+    /// The counts are derived, never supplied: a caller cannot declare a batch
+    /// clean. `written_before_record_coercion_fix` and the source schema are the
+    /// provenance the members were classified under, recorded once for the
+    /// whole batch.
+    fn from_members(
+        members: &[RestoreMemberRecord],
+        provenance: HistoricalRecordProvenance,
+        source_schema_generation: &str,
+    ) -> Self {
+        let mut replayed_from_exact_source = 0_u64;
+        let mut preserved_intact = 0_u64;
+        let mut corrupted_stale_unreconstructable = 0_u64;
+        let mut unverified_pre_fix = 0_u64;
+        let mut corrupted_stale_signature = String::new();
+        for member in members {
+            match member.history {
+                Some(MemberHistoryDisposition::ReplayFromExactSource) => {
+                    replayed_from_exact_source = replayed_from_exact_source.saturating_add(1);
+                }
+                Some(MemberHistoryDisposition::PreservedIntact) => {
+                    preserved_intact = preserved_intact.saturating_add(1);
+                }
+                Some(MemberHistoryDisposition::CorruptedStaleUnreconstructable) => {
+                    corrupted_stale_unreconstructable =
+                        corrupted_stale_unreconstructable.saturating_add(1);
+                    if corrupted_stale_signature.is_empty() {
+                        corrupted_stale_signature =
+                            eliot_store_api::HISTORICAL_TRUNCATION_SIGNATURE.to_owned();
+                    }
+                }
+                Some(MemberHistoryDisposition::UnverifiedPreFix) => {
+                    unverified_pre_fix = unverified_pre_fix.saturating_add(1);
+                }
+                None => {}
+            }
+        }
+        Self {
+            written_before_record_coercion_fix: provenance.written_before_record_coercion_fix,
+            source_schema_generation: source_schema_generation.to_owned(),
+            replayed_from_exact_source,
+            preserved_intact,
+            corrupted_stale_unreconstructable,
+            unverified_pre_fix,
+            corrupted_stale_signature,
+        }
+    }
+
+    /// Re-derives the counts from the members this record actually carries and
+    /// fails closed on any disagreement.
+    ///
+    /// The stored scalars are an audit surface, never the authority: the same
+    /// discipline [`observed_outcome`] applies to the restore denominator. A
+    /// record whose inventory claims fewer corrupted members than its own member
+    /// rows name is refused rather than reported, and the signature is required
+    /// to be present exactly when at least one member is marked corrupted/stale.
+    fn validate_against(&self, members: &[RestoreMemberRecord]) -> Result<(), StoreError> {
+        let derived = Self::from_members(
+            members,
+            HistoricalRecordProvenance {
+                written_before_record_coercion_fix: self.written_before_record_coercion_fix,
+                exact_source_bytes_available: false,
+            },
+            self.source_schema_generation.as_str(),
+        );
+        if derived.replayed_from_exact_source != self.replayed_from_exact_source
+            || derived.preserved_intact != self.preserved_intact
+            || derived.corrupted_stale_unreconstructable != self.corrupted_stale_unreconstructable
+            || derived.unverified_pre_fix != self.unverified_pre_fix
+            || derived.corrupted_stale_signature != self.corrupted_stale_signature
+        {
+            return Err(StoreError::InvalidReceipt);
+        }
+        if self.corrupted_stale_unreconstructable > 0
+            && self.corrupted_stale_signature
+                != eliot_store_api::HISTORICAL_TRUNCATION_SIGNATURE
+        {
+            return Err(StoreError::InvalidReceipt);
+        }
+        if self.corrupted_stale_unreconstructable == 0 && !self.corrupted_stale_signature.is_empty()
+        {
+            return Err(StoreError::InvalidReceipt);
+        }
+        Ok(())
+    }
 }
 
 /// The canonical class one resolved archive member restores into.
@@ -418,6 +670,14 @@ struct ResolvedArchiveMember {
     /// post-commit readback must reproduce before the member may be reported
     /// `Restored`.
     payload_digest: String,
+    /// Historical-corruption disposition and provenance for this member
+    /// (issue #10, item 7).
+    ///
+    /// Set at resolution by the evidence-backed predicate, before any member is
+    /// given a disposition, so a quarantined record is refused at the same step
+    /// that would otherwise have imported it. It is the source the durable
+    /// per-member label in [`RestoreMemberRecord::history`] is written from.
+    history: MemberHistoryOutcome,
 }
 
 /// Closed lifecycle state of one current purge-ledger obligation.
@@ -697,6 +957,22 @@ struct RestoreRecordDocument {
     denominator: RestoreDenominator,
     /// Per-member durable dispositions, in member order.
     members: Vec<RestoreMemberRecord>,
+    /// Per-record historical-corruption inventory for this batch (issue #10,
+    /// item 7).
+    ///
+    /// This is the durable answer to "which of these restored records came
+    /// from the pre-fix store generation, and how was each one disposed of".
+    /// It is present on every record this path commits, including the all-
+    /// post-fix batch whose inventory is an all-clear, so a later audit reads
+    /// a stated verdict rather than an absent field.
+    ///
+    /// Defaults on decode so a record row this bridge committed before the
+    /// inventory existed still reads back for reconciliation: absent decodes as
+    /// "nothing was inventoried", and `validate_against` must then reproduce
+    /// that from the member rows, which carry no label either. An older row is
+    /// therefore reported as un-inventoried, never as a clean batch.
+    #[serde(default)]
+    history: RestoreHistoryInventory,
     /// Closed phase label this record was committed in.
     phase: String,
     /// Completeness observed for this record.
@@ -2703,8 +2979,14 @@ fn carrier_answers_for(
 /// member, not a member with empty content. A carrier whose own attested digest
 /// or declared length disagrees with the payload it actually holds is refused
 /// outright — the recorded value is validated, never replaced by a fresh
-/// checksum over whatever happened to arrive. The resolved payloads are private
-/// to this execution path and never become part of a caller-visible receipt.
+/// checksum over whatever happened to arrive.
+///
+/// Every member whose payload resolves is inventoried by the evidence-backed
+/// historical predicate before it can be imported (issue #10, item 7): the
+/// disposition lives on [`ResolvedArchiveMember::history`], so a pre-fix member
+/// without exact source bytes is refused as corrupted/stale or unverified here
+/// and never reaches a destination row. The resolved payloads are private to
+/// this execution path and never become part of a caller-visible receipt.
 async fn resolve_archive_members(
     transport: &RpcTransport,
     config: &SurrealAdapterConfig,
@@ -2748,9 +3030,167 @@ async fn resolve_archive_members(
             record_id: carrier.record_id,
             payload: carrier.payload,
             payload_digest,
+            history: dispose_resolved_member_history(batch, &payload_bytes, &payload_digest)?,
         }));
     }
     Ok(resolved)
+}
+
+/// Inventories one resolved member by the evidence-backed historical predicate
+/// (issue #10, items 7 and A5).
+///
+/// The source bytes *are* available here: the archive/artifact owner retained
+/// the canonical logical payload and its own attested digest and declared length
+/// were proved against exactly those bytes above, which is precisely the
+/// "exact canonical/external source bytes" the item requires. That is why
+/// [`HistoricalRecordProvenance::exact_source_bytes_available`] is derived from
+/// the presence of a resolved member rather than from a caller claim: a member
+/// that resolved has exact source bytes, and a member that did not resolve never
+/// reaches this function at all.
+///
+/// Whether those bytes were *written before the record-coercion fix* is the one
+/// fact this owner can establish about the source rows, and it derives it from
+/// the admitted source schema generation the capture bound: the binding codec
+/// and the fragment envelope both landed on
+/// [`POST_RECORD_COERCION_FIX_GENERATION`], so a batch captured on an earlier
+/// generation carries pre-fix rows and a batch captured on or after it carries
+/// rows that went through the fix. A source generation this owner cannot place is
+/// not silently treated as post-fix: it is the pre-fix arm, which is the arm
+/// that refuses without exact-source proof and never guesses a suffix.
+///
+/// [`ExactJsonBytes::replay_historical_record`] is the single authority for the
+/// verdict, so the evidence-backed predicate, the provenance gating and the
+/// never-guess-the-suffix rule stay in one place. This function only supplies
+/// the provenance and reports the resulting refusal; the classification itself is
+/// never re-derived here.
+///
+/// A quarantined member aborts the whole resolution step, which is the strictest
+/// reading available here: this port restores a bounded batch into one isolated
+/// destination under one operation, and a refusal has to be attributable to a
+/// named member rather than to an anonymous partial receipt.
+fn dispose_resolved_member_history(
+    batch: &CanonicalRestoreBatch,
+    source_bytes: &[u8],
+    source_digest: &str,
+) -> Result<MemberHistoryOutcome, StoreError> {
+    let provenance = HistoricalRecordProvenance {
+        written_before_record_coercion_fix: written_before_record_coercion_fix(
+            &batch.source.schema,
+        ),
+        exact_source_bytes_available: true,
+    };
+    // The store-neutral predicate is asked about this member's own value tree, so
+    // a record-like string nested in an object or an array is classified at its
+    // own position rather than only at the root.
+    let verdict = strongest_history_verdict(&source_bytes_value(source_bytes)?, provenance);
+    // Quarantined members are never replayed into an authority, and their
+    // dropped suffix is never guessed: the pre-fix verdict is the refusal.
+    if verdict.is_quarantine() {
+        return Err(StoreError::InvalidField {
+            field: "restore.member_history",
+            reason: quarantine_reason(verdict),
+        });
+    }
+    // Reconstruction is from the owner's exact canonical bytes only. The
+    // stored/pre-fix bytes are never the replay input, and `None` for the
+    // optional third argument is deliberate: with
+    // `exact_source_bytes_available == true` the entry binds these bytes as the
+    // source, and passing a second copy would claim two sources for one record.
+    let authority = ExactJsonBytes::replay_historical_record(source_bytes, provenance, None)?;
+    // The replayed authority is the archive owner's bytes, not a locally derived
+    // re-encoding, so its digest must reproduce the owner's own attested value
+    // and its provenance must be the migration-replay label. A mismatch means
+    // the bytes the owner attested are not the bytes the replay bound, and no
+    // authority may be derived from them.
+    if authority.digest_hex() != source_digest
+        || authority.source != eliot_store_api::PayloadSource::MigrationReplay
+    {
+        return Err(StoreError::InvalidField {
+            field: "restore.member_history",
+            reason: "historical replay authority does not bind the owner-attested source digest",
+        });
+    }
+    // The replayed authority is validated, not discarded: binding the owner's
+    // attested digest back to the reconstructed authority is what makes the
+    // reconstruction provable rather than assumed.
+    authority.validate()?;
+    Ok(MemberHistoryOutcome {
+        disposition: verdict,
+        provenance,
+    })
+}
+
+/// Reports whether one captured source generation predates the record-coercion
+/// fix.
+///
+/// Closed over the generations the single owner publishes, so this can only
+/// answer from a known denominator. An unrecognized generation is not treated
+/// as post-fix: the pre-fix arm is the arm that demands positive preservation
+/// evidence, and treating an unknown generation as proven-intact would assert
+/// exactly the `PreservedIntact` claim the item forbids without that evidence.
+fn written_before_record_coercion_fix(source_schema: &str) -> bool {
+    source_schema != POST_RECORD_COERCION_FIX_GENERATION
+}
+
+/// Parses one exact source byte string into the value tree the historical
+/// predicate walks.
+fn source_bytes_value(source_bytes: &[u8]) -> Result<serde_json::Value, StoreError> {
+    serde_json::from_slice(source_bytes).map_err(|error| {
+        StoreError::Serialization(redact_serialization(&error.to_string()))
+    })
+}
+
+/// Reports the strongest historical verdict present anywhere in one value tree.
+///
+/// Every string position is classified by the store-neutral predicate, exactly
+/// as the historical run corrupted them recursively. The arms are folded from
+/// the weakest claim to the strongest, so a single quarantined string anywhere
+/// in a record decides the whole record. That is the conservative direction: it
+/// can only ever refuse an import, never enable one.
+fn strongest_history_verdict(
+    value: &serde_json::Value,
+    provenance: HistoricalRecordProvenance,
+) -> MemberHistoryDisposition {
+    match value {
+        serde_json::Value::String(text) => {
+            MemberHistoryDisposition::label(dispose_historical_record(text, provenance))
+        }
+        serde_json::Value::Array(items) => items.iter().fold(
+            MemberHistoryDisposition::ReplayFromExactSource,
+            |worst, item| worst.worse(strongest_history_verdict(item, provenance)),
+        ),
+        serde_json::Value::Object(fields) => fields.values().fold(
+            MemberHistoryDisposition::ReplayFromExactSource,
+            |worst, field| worst.worse(strongest_history_verdict(field, provenance)),
+        ),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            // No string position at all, so nothing in this subtree can carry
+            // the truncation signature. A non-string subtree contributes no
+            // evidence, which is exactly the absence the item refuses to read
+            // as preservation.
+            MemberHistoryDisposition::ReplayFromExactSource
+        }
+    }
+}
+
+/// The bounded refusal reason for one quarantined historical member.
+///
+/// Static text per disposition: the predicate's own evidence travels in the
+/// durable inventory beside the count, so no caller text and no record prose
+/// crosses the error boundary.
+const fn quarantine_reason(disposition: MemberHistoryDisposition) -> &'static str {
+    match disposition {
+        MemberHistoryDisposition::CorruptedStaleUnreconstructable => {
+            "archived member matches the pre-fix record-truncation signature; marked corrupted/stale with provenance, suffix never guessed"
+        }
+        MemberHistoryDisposition::UnverifiedPreFix => {
+            "archived pre-fix member holds values outside the evidence-backed truncation signature; marked unverified, never replayed as intact authority"
+        }
+        MemberHistoryDisposition::ReplayFromExactSource
+        | MemberHistoryDisposition::PreservedIntact => {
+            "archived member was not quarantined by the historical predicate"
+        }
+    }
 }
 
 /// Reads one canonical row of the destination through its own read path.
@@ -3200,6 +3640,13 @@ fn check_record_binding(
 /// readback produced. Without that, a metadata-only batch could still present a
 /// complete committed receipt, which is exactly the failure this re-derivation
 /// exists to prevent.
+///
+/// The historical-corruption inventory (issue #10, item 7) is re-derived here
+/// too, from the per-member labels rather than from the stored counters, and a
+/// quarantined member is never allowed to be `Restored`: the disposition surface
+/// is the record's own durable evidence, so a reader of this receipt learns how
+/// many members were rejected as corrupted/stale or unverified rather than
+/// having to re-open the archive.
 fn observed_outcome(
     document: &RestoreRecordDocument,
     denominator: &RestoreDenominator,
@@ -3209,6 +3656,12 @@ fn observed_outcome(
     let mut suppressed = 0_u64;
     let mut unresolved = 0_u64;
     for member in &document.members {
+        // A member marked corrupted/stale or unverified is quarantined by
+        // construction: this path never imports one. A record that claims
+        // otherwise is refused rather than reported ready.
+        if member.history.is_some_and(MemberHistoryDisposition::is_quarantine) {
+            return Err(StoreError::InvalidReceipt);
+        }
         match member.disposition {
             MemberDisposition::Restored => {
                 restored = restored.saturating_add(1);
@@ -3291,6 +3744,10 @@ fn receipt_from_document(
     if document.members.len() as u64 != batch.member_count {
         return Err(StoreError::InvalidReceipt);
     }
+    // The durable inventory must reproduce itself from the member rows it
+    // summarizes, so a record cannot claim a clean batch over members it marks
+    // corrupted/stale.
+    document.history.validate_against(&document.members)?;
     let (completeness, disposition) = observed_outcome(document, &denominator)?;
     if document.completeness != completeness || document.disposition != disposition {
         return Err(StoreError::InvalidReceipt);
@@ -3364,14 +3821,24 @@ fn check_destination_fence(
 /// purge-suppressed member is `Suppressed` even while the rest imported. The
 /// import evidence fields are populated only from a member's own readback, so a
 /// `Restored` row can never exist without the canonical import it claims.
+///
+/// The historical label is carried over from the member's own resolution
+/// (issue #10, item 7): a resolved member that was inventoried keeps its
+/// verdict, and a member with no resolved payload keeps none. A quarantined
+/// member never reaches this function, so no imported row can claim a
+/// corrupted/stale or unverified label.
 fn member_records(
     batch: &CanonicalRestoreBatch,
     domains: &RestoreDomains,
     dispositions: &[MemberDisposition],
     imports: &[Option<ImportedMemberEvidence>],
     purge_revision: u64,
+    histories: &[Option<MemberHistoryDisposition>],
 ) -> Result<Vec<RestoreMemberRecord>, StoreError> {
     if dispositions.len() != batch.members.len() || imports.len() != batch.members.len() {
+        return Err(StoreError::InvalidReceipt);
+    }
+    if !histories.is_empty() && histories.len() != batch.members.len() {
         return Err(StoreError::InvalidReceipt);
     }
     batch
@@ -3381,10 +3848,19 @@ fn member_records(
         .map(|(index, member)| {
             let disposition = dispositions[index];
             let evidence = imports[index].as_ref();
+            let history = histories.get(index).copied().flatten();
             // Import evidence is exactly the readback of a committed canonical
             // write: it is present for a `Restored` member and absent otherwise,
             // so a suppressed or unresolved member can never carry one.
             if (disposition == MemberDisposition::Restored) != evidence.is_some() {
+                return Err(StoreError::InvalidReceipt);
+            }
+            // A quarantined historical label and a committed import are
+            // contradictory: this path refuses the member before the commit, so
+            // a record carrying both is refused here rather than reported.
+            if history.is_some_and(MemberHistoryDisposition::is_quarantine)
+                && disposition == MemberDisposition::Restored
+            {
                 return Err(StoreError::InvalidReceipt);
             }
             Ok(RestoreMemberRecord {
@@ -3401,6 +3877,7 @@ fn member_records(
                 imported_record_id: evidence.map(|evidence| evidence.record_id.clone()),
                 imported_class: evidence.map(|evidence| evidence.class_token.to_owned()),
                 imported_digest: evidence.map(|evidence| evidence.digest.clone()),
+                history,
             })
         })
         .collect()
@@ -4188,13 +4665,34 @@ impl SurrealStoreAdapter {
         // reported restored — so a record written without a matching import is
         // re-read as unresolved rather than certified.
         let planned = planned_evidence(batch, &imports);
+        // The durable historical label of each member, taken from that member's
+        // own resolution. It is positional here for the same reason the
+        // dispositions are: both are planned over the batch's admitted member
+        // order, and the post-commit readback re-derives each one from the
+        // member's own durable row.
+        let planned_histories = planned_history_labels(&resolved);
         let members = member_records(
             batch,
             &source.domains,
             &dispositions,
             &planned,
             fence.document.purge_policy_revision,
+            &planned_histories,
         )?;
+        // The record-level inventory is derived from the member rows it
+        // summarizes, never supplied, and is bound under the same provenance the
+        // per-member verdicts were decided with.
+        let history = RestoreHistoryInventory::from_members(
+            &members,
+            HistoricalRecordProvenance {
+                written_before_record_coercion_fix: written_before_record_coercion_fix(
+                    &batch.source.schema,
+                ),
+                exact_source_bytes_available: true,
+            },
+            batch.source.schema.as_str(),
+        );
+        history.validate_against(&members)?;
         let (revision_digests, ordering_digests) = expected_head_digests(batch)?;
         let document = RestoreRecordDocument {
             operation: batch.operation.clone(),
@@ -4211,6 +4709,7 @@ impl SurrealStoreAdapter {
             expected_ordering_head_digests: ordering_digests,
             denominator,
             members,
+            history,
             phase: RESTORE_PHASE_APPLIED.to_owned(),
             completeness,
             disposition: mutation,
@@ -4369,6 +4868,7 @@ impl SurrealStoreAdapter {
         let mut dispositions = Vec::with_capacity(recorded.len());
         let mut dispositions_by_member: BTreeMap<String, MemberDisposition> = BTreeMap::new();
         let mut evidence = Vec::with_capacity(recorded.len());
+        let mut histories = Vec::with_capacity(recorded.len());
         for row in &recorded {
             // Only a claim that names a closed class, a record address *and* the
             // content digest this operation committed can be looked up in the
@@ -4419,6 +4919,11 @@ impl SurrealStoreAdapter {
             // never be examined against another member's reference edge.
             dispositions_by_member.insert(row.member_ref.clone(), disposition);
             evidence.push(observed);
+            // The historical label is read from this member's own durable row,
+            // never from the resolution that is being re-proved: the readback
+            // reports what was committed, and a row that names a quarantine
+            // label is refused by `member_records` rather than re-cleared here.
+            histories.push(row.history);
         }
         validate_reference_closure_against(batch, &dispositions_by_member)?;
         let denominator = denominator_of(&dispositions);
@@ -4429,10 +4934,22 @@ impl SurrealStoreAdapter {
             &dispositions,
             &evidence,
             document.current_purge_revision,
+            &histories,
         )?;
+        let history = RestoreHistoryInventory::from_members(
+            &members,
+            HistoricalRecordProvenance {
+                written_before_record_coercion_fix: document.history
+                    .written_before_record_coercion_fix,
+                exact_source_bytes_available: true,
+            },
+            document.history.source_schema_generation.as_str(),
+        );
+        history.validate_against(&members)?;
         let observed_document = RestoreRecordDocument {
             denominator,
             members,
+            history,
             completeness: SnapshotCompleteness::Partial,
             disposition: StoreMutationDisposition::Partial,
             ..document.clone()
@@ -4531,6 +5048,28 @@ fn planned_outcome(
         SnapshotCompleteness::Complete,
         StoreMutationDisposition::ProvenNotApplied,
     )
+}
+
+/// Binds the historical-corruption label of each member this commit will
+/// record (issue #10, item 7).
+///
+/// Read from each resolved member's own inventory entry, indexed by that
+/// member's own index, exactly as [`planned_evidence`] does. A member that did
+/// not resolve carries no label: there is no payload to dispose of, and an
+/// unresolved member is already visible in the denominator.
+///
+/// The authority each entry carries is deliberately not persisted here: the
+/// member's own canonical import is bound and re-read through the destination's
+/// read path, so a second copy of the bytes in the bookkeeping row would be a
+/// second payload source. The label plus the record-level inventory is the
+/// durable disposition surface this path owns.
+fn planned_history_labels(
+    resolved: &[Option<ResolvedArchiveMember>],
+) -> Vec<Option<MemberHistoryDisposition>> {
+    resolved
+        .iter()
+        .map(|member| member.as_ref().map(|member| member.history.disposition))
+        .collect()
 }
 
 /// Binds the class, the address and the content digest of each member this
