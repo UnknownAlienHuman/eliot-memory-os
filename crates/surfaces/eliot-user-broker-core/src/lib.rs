@@ -5050,6 +5050,19 @@ pub const OPENCODE_BRIDGE_ENV_URL: &str = "ELIOT_OPENCODE_BRIDGE_URL";
 /// Exact child environment name carrying the protected bootstrap channel.
 /// Consumed by the one-shot bootstrap transport; never a secret value.
 pub const OPENCODE_BRIDGE_ENV_BOOTSTRAP: &str = "ELIOT_OPENCODE_BRIDGE_BOOTSTRAP";
+/// Exact child environment name carrying the installation-pinned server
+/// identity used for the first-contact challenge/response proof
+/// (issue #2898, step 4).
+///
+/// This is the introduction's own `server_identity`, materialized only into the
+/// exact approved `OpenCode` process alongside
+/// [`OPENCODE_BRIDGE_ENV_URL`]. The `OpenCode` plugin uses it to recompute the
+/// bridge's first-contact identity proof before it discloses the request
+/// credential, which is what makes "plain loopback location is not identity"
+/// true on the wire: a process that merely bound the pinned port holds a
+/// challenge, never this value, so it can neither mint a proof nor receive the
+/// credential.
+pub const OPENCODE_BRIDGE_ENV_SERVER_IDENTITY: &str = "ELIOT_OPENCODE_BRIDGE_SERVER_IDENTITY";
 /// Protected named-pipe channel served by the `OpenCode` one-shot bootstrap
 /// authority (issue #2898, step 4). An introduction selects this transport by
 /// carrying exactly this channel; `None` selects the exclusively pre-bound
@@ -5473,13 +5486,15 @@ impl OpenCodeBridgeIntroduction {
     }
 
     /// Projects the exact child environment for the bound `OpenCode` process
-    /// (issue #2898, step 3).
+    /// (issue #2898, steps 3 and 4).
     ///
     /// The introduction is first revalidated at `now_ms` (version, shape,
     /// window, digest binding): an expired or tampered introduction never
     /// reaches a child map. The non-secret map carries only the pinned
-    /// endpoint URL and, when the introduction selects pipe bootstrap, the
-    /// protected channel name; the credential travels solely as the opaque
+    /// endpoint URL, the installation-pinned server identity the plugin needs
+    /// to authenticate the bridge before it discloses the credential, and,
+    /// when the introduction selects pipe bootstrap, the protected channel
+    /// name; the credential travels solely as the opaque
     /// [`SecretRef`] in `secret_refs`. [`EnvironmentProjection::new`]
     /// refuses secret-like names or values in the plain map, so the request
     /// credential (notably `ELIOT_OPENCODE_BRIDGE_TOKEN`) cannot be
@@ -5494,6 +5509,10 @@ impl OpenCodeBridgeIntroduction {
         self.validate(now_ms)?;
         let mut non_secret = BTreeMap::new();
         non_secret.insert(OPENCODE_BRIDGE_ENV_URL.to_owned(), self.endpoint.clone());
+        non_secret.insert(
+            OPENCODE_BRIDGE_ENV_SERVER_IDENTITY.to_owned(),
+            self.server_identity.clone(),
+        );
         if let Some(channel) = self.bootstrap_channel.as_deref() {
             non_secret.insert(OPENCODE_BRIDGE_ENV_BOOTSTRAP.to_owned(), channel.to_owned());
         }
