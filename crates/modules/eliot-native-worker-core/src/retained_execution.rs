@@ -8,7 +8,7 @@
 //! request before using it.
 
 use eliot_contracts::{EpochId, StateFence, sha256_hex};
-use eliot_protocol::native_worker_material::{
+use eliot_protocol::{
     NativeWorkerProviderProcessIdentityV1, NativeWorkerRetainedProviderMaterialRefV1,
 };
 use schemars::JsonSchema;
@@ -39,8 +39,6 @@ pub struct NativeWorkerRetainedOperationIdentity {
     pub route_ref: String,
     /// Worker generation from the persisted dispatch.
     pub worker_generation: u64,
-    /// Original owner-issued claim binding digest, preserved verbatim.
-    pub binding_digest: String,
     /// Original owner-issued executable digest, preserved verbatim.
     pub executable_digest: String,
     /// Expected result schema from the persisted dispatch.

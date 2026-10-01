@@ -7,6 +7,7 @@ use eliot_native_worker::{
     AdmittedLifecycle, BoundedEvidenceSink, KERNEL_ADMISSION_REQUIRED, KernelCheckpointPort,
     KernelNativeWorkerClient, NativeWorker, NativeWorkerDispatchAuthority, NativeWorkerError,
     PresentationEchoAdmission, SharedKernelTransport,
+    AuthenticatedRetainedProviderExecutePort,
     admitted_material::{ValidatedAdmittedMaterial, read_admitted_material},
     derive_admitted_intent, dispatch_now_unix_ms, select_factory_for_admitted,
 };
@@ -180,7 +181,7 @@ fn run() -> i32 {
         Ok(replay) => replay,
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
-    let checkpoint = match KernelCheckpointPort::new(shared.clone(), claim) {
+    let checkpoint = match KernelCheckpointPort::new(shared.clone(), claim.clone()) {
         Ok(checkpoint) => checkpoint,
         Err(error) => return deny_invalid_material(&error.to_string()),
     };
@@ -190,13 +191,17 @@ fn run() -> i32 {
     // granted epoch/fence/lease/revision the core sealed its live grant from
     // instead of a re-derived guess.
     let admission = PresentationEchoAdmission::new();
+    let execute_port = Arc::new(AuthenticatedRetainedProviderExecutePort::new(
+        shared.clone(),
+        claim,
+    ));
     let mut worker = NativeWorker::new(WorkerCore::new(
         Some(executor),
         Some(admission.clone()),
         Some(replay),
         Some(checkpoint),
         Some(Arc::new(BoundedEvidenceSink::new())),
-    ));
+    ).with_execute_port(execute_port));
     drive_admitted_material(&mut lifecycle, &mut worker, &material, process, &admission)
 }
 

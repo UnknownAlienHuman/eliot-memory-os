@@ -37,6 +37,9 @@ pub mod adapter_registry;
 /// Retained per-attempt Claude execution behind owner-issued provider input.
 pub mod retained_claude;
 
+/// Authenticated retained-provider owner reads at the live Execute boundary.
+pub mod provider_execute_port;
+
 /// Governed action envelope for declared external-adapter operations
 /// (issue #1911, A10.1/A10.2/A10.3/A10.8). Added here so the `tests/`
 /// contract proof addresses the identical gate the contour drives.
@@ -64,6 +67,7 @@ pub use kernel_admission_client::{
     NATIVE_WORKER_RESULT_SUBMIT_OPERATION, ReconcileRetainedReceipt, ReconcileSubmission,
     SharedKernelTransport,
 };
+pub use provider_execute_port::AuthenticatedRetainedProviderExecutePort;
 
 const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 pub const KERNEL_ADMISSION_REQUIRED: &str = "KERNEL_ADMISSION_REQUIRED";

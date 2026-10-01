@@ -46,6 +46,19 @@ use eliot_native_worker_core::{
     NativeWorkerClaim, NativeWorkerReadiness, NativeWorkerRegistration, ProviderFailure,
     ReadinessSubmission, WorkerEventDraft, WorkerEventEnvelope,
 };
+use eliot_protocol::{
+    NativeWorkerProviderProcessIdentityV1, NativeWorkerProviderProcessReadRequestV1,
+    NativeWorkerProviderProcessReadResponseV1,
+    NativeWorkerRetainedProviderMaterialReadRequestV1,
+    NativeWorkerRetainedProviderMaterialReadResponseV1,
+    NativeWorkerRetainedProviderMaterialRefV1,
+    NativeWorkerRetainedProviderMaterialResolveRequestV1,
+    NativeWorkerRetainedProviderMaterialResolveResponseV1,
+    NativeWorkerProviderProcessReadbackV1, NativeWorkerRetainedProviderMaterialReadbackV1,
+    NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION,
+    NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION,
+    NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION,
+};
 use serde::{Deserialize, Serialize};
 
 use super::NativeWorkerError;
@@ -667,6 +680,204 @@ impl KernelNativeWorkerClient {
         Ok(reply)
     }
 
+    /// Resolves the immutable provider-material reference from the current
+    /// Kernel claim row. The request is built only from the exact retained
+    /// claim and Ready binding; it never reads a reference from an EBP payload
+    /// or dispatch file. A missing route, pending owner row, or unknown
+    /// currentness remains a refusal under this same claim.
+    pub fn resolve_retained_provider_material(
+        &mut self,
+    ) -> Result<
+        (
+            NativeWorkerRetainedProviderMaterialRefV1,
+            NativeWorkerProviderProcessIdentityV1,
+        ),
+        NativeWorkerError,
+    > {
+        let ready = self.require_ready_unit()?;
+        let claim = self.claim.as_ref().ok_or_else(|| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "no exact claimed native-worker execution unit".to_owned(),
+            )
+        })?;
+        claim.validate().map_err(NativeWorkerError::from)?;
+        let request = NativeWorkerRetainedProviderMaterialResolveRequestV1 {
+            claim_id: claim.claim_id.as_str().to_owned(),
+            dispatch_operation_id: claim.operation_id.as_str().to_owned(),
+            attempt_id: claim.attempt_id.as_str().to_owned(),
+            binding_digest: claim.binding_digest.clone(),
+            worker_generation: claim.worker_generation,
+            state_fence: claim.state_fence.clone(),
+            authority_epoch: claim.authority_epoch.clone(),
+        };
+        request.validate().map_err(|error| {
+            NativeWorkerError::KernelAdmissionRequired(format!(
+                "retained provider material lookup request is invalid: {error}"
+            ))
+        })?;
+        require_ready_claim_fence(&ready, claim)?;
+        bind_request_identity(
+            &mut self.client,
+            serde_json::to_value(&claim.state_fence)?,
+            claim.operation_id.as_str(),
+        )?;
+        let payload = serde_json::to_value(&request)?;
+        let value = self.transact(
+            NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_RESOLVE_OPERATION,
+            payload,
+        )?;
+        let response: NativeWorkerRetainedProviderMaterialResolveResponseV1 =
+            serde_json::from_value(value).map_err(|error| {
+                NativeWorkerError::KernelAdmissionRequired(format!(
+                    "Kernel retained provider material resolve response is malformed: {error}"
+                ))
+            })?;
+        match response {
+            NativeWorkerRetainedProviderMaterialResolveResponseV1::Found {
+                reference,
+                provider_process,
+            } => {
+                validate_retained_provider_identity(claim, &reference, &provider_process)?;
+                Ok((reference, provider_process))
+            }
+            NativeWorkerRetainedProviderMaterialResolveResponseV1::Pending { reason } => {
+                Err(NativeWorkerError::KernelAdmissionRequired(format!(
+                    "provider material is not yet owner-issued for this claim: {}",
+                    bounded_owner_reason(&reason)
+                )))
+            }
+            NativeWorkerRetainedProviderMaterialResolveResponseV1::Unknown { reason } => {
+                Err(NativeWorkerError::KernelAdmissionRequired(format!(
+                    "provider material currentness is unknown for this claim: {}",
+                    bounded_owner_reason(&reason)
+                )))
+            }
+        }
+    }
+
+    /// Reads the exact canonical material bytes named by a prior authenticated
+    /// Kernel resolve. Kernel rechecks current claim ownership on this second
+    /// read; local validation compares every returned byte and identity to the
+    /// original reference without recomputing or replacing its digest.
+    pub fn read_retained_provider_material(
+        &mut self,
+        reference: &NativeWorkerRetainedProviderMaterialRefV1,
+        provider_process: &NativeWorkerProviderProcessIdentityV1,
+    ) -> Result<NativeWorkerRetainedProviderMaterialReadbackV1, NativeWorkerError> {
+        let ready = self.require_ready_unit()?;
+        let claim = self.claim.as_ref().ok_or_else(|| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "no exact claimed native-worker execution unit".to_owned(),
+            )
+        })?;
+        require_ready_claim_fence(&ready, claim)?;
+        validate_retained_provider_identity(claim, reference, provider_process)?;
+        let request = NativeWorkerRetainedProviderMaterialReadRequestV1 {
+            reference: reference.clone(),
+        };
+        bind_request_identity(
+            &mut self.client,
+            serde_json::to_value(&claim.state_fence)?,
+            claim.operation_id.as_str(),
+        )?;
+        let value = self.transact(
+            NATIVE_WORKER_RETAINED_PROVIDER_MATERIAL_READ_OPERATION,
+            serde_json::to_value(&request)?,
+        )?;
+        let response: NativeWorkerRetainedProviderMaterialReadResponseV1 =
+            serde_json::from_value(value).map_err(|error| {
+                NativeWorkerError::KernelAdmissionRequired(format!(
+                    "Kernel retained provider material read response is malformed: {error}"
+                ))
+            })?;
+        match response {
+            NativeWorkerRetainedProviderMaterialReadResponseV1::Found { readback } => {
+                readback
+                    .validate_for(reference, provider_process)
+                    .map_err(|error| {
+                        NativeWorkerError::KernelAdmissionRequired(format!(
+                            "Kernel retained provider material does not match its original owner reference: {error}"
+                        ))
+                    })?;
+                Ok(readback)
+            }
+            NativeWorkerRetainedProviderMaterialReadResponseV1::Pending { reason } => {
+                Err(NativeWorkerError::KernelAdmissionRequired(format!(
+                    "provider material read is pending for this claim: {}",
+                    bounded_owner_reason(&reason)
+                )))
+            }
+            NativeWorkerRetainedProviderMaterialReadResponseV1::Unknown { reason } => {
+                Err(NativeWorkerError::KernelAdmissionRequired(format!(
+                    "provider material read could not establish currentness: {}",
+                    bounded_owner_reason(&reason)
+                )))
+            }
+        }
+    }
+
+    /// Reads the independently sealed provider-process admission and its
+    /// separate grant under the same claim-scoped material reference. The
+    /// response is inert owner data; this method never deserializes a
+    /// `ProcessRequest` or turns the projection into launch authority.
+    pub fn read_provider_process_admission(
+        &mut self,
+        reference: &NativeWorkerRetainedProviderMaterialRefV1,
+        provider_process: &NativeWorkerProviderProcessIdentityV1,
+    ) -> Result<NativeWorkerProviderProcessReadbackV1, NativeWorkerError> {
+        let ready = self.require_ready_unit()?;
+        let claim = self.claim.as_ref().ok_or_else(|| {
+            NativeWorkerError::KernelAdmissionRequired(
+                "no exact claimed native-worker execution unit".to_owned(),
+            )
+        })?;
+        require_ready_claim_fence(&ready, claim)?;
+        validate_retained_provider_identity(claim, reference, provider_process)?;
+        let request = NativeWorkerProviderProcessReadRequestV1 {
+            reference: reference.clone(),
+            provider_process: provider_process.clone(),
+        };
+        bind_request_identity(
+            &mut self.client,
+            serde_json::to_value(&claim.state_fence)?,
+            claim.operation_id.as_str(),
+        )?;
+        let value = self.transact(
+            NATIVE_WORKER_PROVIDER_PROCESS_READ_OPERATION,
+            serde_json::to_value(&request)?,
+        )?;
+        let response: NativeWorkerProviderProcessReadResponseV1 =
+            serde_json::from_value(value).map_err(|error| {
+                NativeWorkerError::KernelAdmissionRequired(format!(
+                    "Kernel provider-process read response is malformed: {error}"
+                ))
+            })?;
+        match response {
+            NativeWorkerProviderProcessReadResponseV1::Found { readback } => {
+                readback
+                    .validate_for(provider_process)
+                    .map_err(|error| {
+                        NativeWorkerError::KernelAdmissionRequired(format!(
+                            "Kernel provider-process admission does not match its owner identity: {error}"
+                        ))
+                    })?;
+                Ok(readback)
+            }
+            NativeWorkerProviderProcessReadResponseV1::Pending { reason } => {
+                Err(NativeWorkerError::KernelAdmissionRequired(format!(
+                    "provider-process admission is pending for this claim: {}",
+                    bounded_owner_reason(&reason)
+                )))
+            }
+            NativeWorkerProviderProcessReadResponseV1::Unknown { reason } => {
+                Err(NativeWorkerError::KernelAdmissionRequired(format!(
+                    "provider-process admission currentness is unknown: {}",
+                    bounded_owner_reason(&reason)
+                )))
+            }
+        }
+    }
+
     /// Sends one typed payload; transport failures stay transport failures.
     fn transact(
         &mut self,
@@ -727,6 +938,64 @@ impl KernelNativeWorkerClient {
             ));
         }
         Ok(ready.clone())
+    }
+}
+
+fn require_ready_claim_fence(
+    ready: &NativeReadyReport,
+    claim: &NativeWorkerClaim,
+) -> Result<(), NativeWorkerError> {
+    let now = unix_ms()?;
+    ready
+        .validate_for_claim(claim, now)
+        .map_err(NativeWorkerError::from)?;
+    if ready.state_fence != claim.state_fence
+        || ready.authority_epoch != claim.authority_epoch
+        || ready.claim_binding_digest != claim.binding_digest
+    {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "retained provider read is not bound to the exact current Ready claim".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retained_provider_identity(
+    claim: &NativeWorkerClaim,
+    reference: &NativeWorkerRetainedProviderMaterialRefV1,
+    provider_process: &NativeWorkerProviderProcessIdentityV1,
+) -> Result<(), NativeWorkerError> {
+    claim.validate().map_err(NativeWorkerError::from)?;
+    reference.validate().map_err(|error| {
+        NativeWorkerError::KernelAdmissionRequired(format!(
+            "Kernel retained provider material reference is malformed: {error}"
+        ))
+    })?;
+    provider_process.validate().map_err(|error| {
+        NativeWorkerError::KernelAdmissionRequired(format!(
+            "Kernel provider process identity is malformed: {error}"
+        ))
+    })?;
+    let binding_digest = claim.compute_binding_digest().map_err(NativeWorkerError::from)?;
+    if reference.claim_id != claim.claim_id.as_str()
+        || reference.dispatch_operation_id != claim.operation_id.as_str()
+        || reference.attempt_id != claim.attempt_id.as_str()
+        || reference.binding_digest != claim.binding_digest
+        || reference.binding_digest != binding_digest
+        || provider_process.provider_operation_id == claim.operation_id.as_str()
+    {
+        return Err(NativeWorkerError::KernelAdmissionRequired(
+            "Kernel retained provider identity differs from the exact claim or reuses its dispatch operation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_owner_reason(reason: &str) -> &'static str {
+    if reason.trim().is_empty() {
+        "owner omitted its diagnostic"
+    } else {
+        "owner refusal detail redacted"
     }
 }
 
@@ -1423,6 +1692,42 @@ impl SharedKernelTransport {
         self.inner.lock().map_err(|_| {
             NativeWorkerError::KernelAdmissionRequired("Kernel transport lock poisoned".to_owned())
         })
+    }
+
+    /// Resolves exact retained provider material from the shared authenticated
+    /// Kernel session after the worker is Ready.
+    pub fn resolve_retained_provider_material(
+        &self,
+    ) -> Result<
+        (
+            NativeWorkerRetainedProviderMaterialRefV1,
+            NativeWorkerProviderProcessIdentityV1,
+        ),
+        NativeWorkerError,
+    > {
+        self.lock()?.resolve_retained_provider_material()
+    }
+
+    /// Reads immutable canonical provider material through the same session
+    /// and rechecks it against the exact Kernel-issued reference.
+    pub fn read_retained_provider_material(
+        &self,
+        reference: &NativeWorkerRetainedProviderMaterialRefV1,
+        provider_process: &NativeWorkerProviderProcessIdentityV1,
+    ) -> Result<NativeWorkerRetainedProviderMaterialReadbackV1, NativeWorkerError> {
+        self.lock()?
+            .read_retained_provider_material(reference, provider_process)
+    }
+
+    /// Reads the separately retained inert provider-process admission and
+    /// grant through the same authenticated Kernel session.
+    pub fn read_provider_process_admission(
+        &self,
+        reference: &NativeWorkerRetainedProviderMaterialRefV1,
+        provider_process: &NativeWorkerProviderProcessIdentityV1,
+    ) -> Result<NativeWorkerProviderProcessReadbackV1, NativeWorkerError> {
+        self.lock()?
+            .read_provider_process_admission(reference, provider_process)
     }
 }
 
@@ -2142,5 +2447,96 @@ mod tests {
             credential_refs: Vec::new(),
             ready_at_unix_ms: now,
         })
+    }
+
+    /// #22 Work/Acceptance positive: an owner-resolved material reference and
+    /// separate child operation are accepted only for the exact recomputed
+    /// active claim tuple.
+    #[test]
+    fn retained_material_resolution_accepts_exact_claim_and_distinct_child() -> Result<(), String> {
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .map_err(|error| error.to_string())?,
+            NonZeroU64::new(3).ok_or_else(|| "test epoch sequence is zero".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let fence = eliot_contracts::StateFence::new(
+            epoch.clone(),
+            ResourceGeneration::new(1).map_err(|error| error.to_string())?,
+        );
+        let now = unix_ms().map_err(|error| error.to_string())?;
+        let registration = live_registration(
+            &epoch,
+            &fence,
+            now,
+            &"a".repeat(64),
+            &"b".repeat(64),
+        )
+        .map_err(|error| error.to_string())?;
+        let claim = live_claim(&epoch, &fence, now, &registration, &epoch)
+            .map_err(|error| error.to_string())?;
+        let reference = NativeWorkerRetainedProviderMaterialRefV1 {
+            claim_id: claim.claim_id.as_str().to_owned(),
+            dispatch_operation_id: claim.operation_id.as_str().to_owned(),
+            attempt_id: claim.attempt_id.as_str().to_owned(),
+            binding_digest: claim.binding_digest.clone(),
+            material_ref: "retained:material-live-1".to_owned(),
+            material_sha256: "c".repeat(64),
+        };
+        let process = NativeWorkerProviderProcessIdentityV1 {
+            provider_operation_id: "provider-op-live-1".to_owned(),
+            provider_process_invocation_digest: "d".repeat(64),
+            provider_executable_digest: "e".repeat(64),
+            process_ref: "retained:provider-process-live-1".to_owned(),
+        };
+
+        validate_retained_provider_identity(&claim, &reference, &process)
+            .map_err(|error| error.to_string())
+    }
+
+    /// #22 Work/Acceptance refusal: a foreign owner binding digest cannot be
+    /// substituted into a resolved reference for the otherwise exact claim.
+    #[test]
+    fn retained_material_resolution_refuses_foreign_binding_digest() -> Result<(), String> {
+        let epoch = EpochId::new(
+            EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                .map_err(|error| error.to_string())?,
+            NonZeroU64::new(3).ok_or_else(|| "test epoch sequence is zero".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let fence = eliot_contracts::StateFence::new(
+            epoch.clone(),
+            ResourceGeneration::new(1).map_err(|error| error.to_string())?,
+        );
+        let now = unix_ms().map_err(|error| error.to_string())?;
+        let registration = live_registration(
+            &epoch,
+            &fence,
+            now,
+            &"a".repeat(64),
+            &"b".repeat(64),
+        )
+        .map_err(|error| error.to_string())?;
+        let claim = live_claim(&epoch, &fence, now, &registration, &epoch)
+            .map_err(|error| error.to_string())?;
+        let reference = NativeWorkerRetainedProviderMaterialRefV1 {
+            claim_id: claim.claim_id.as_str().to_owned(),
+            dispatch_operation_id: claim.operation_id.as_str().to_owned(),
+            attempt_id: claim.attempt_id.as_str().to_owned(),
+            binding_digest: "f".repeat(64),
+            material_ref: "retained:material-live-1".to_owned(),
+            material_sha256: "c".repeat(64),
+        };
+        let process = NativeWorkerProviderProcessIdentityV1 {
+            provider_operation_id: "provider-op-live-1".to_owned(),
+            provider_process_invocation_digest: "d".repeat(64),
+            provider_executable_digest: "e".repeat(64),
+            process_ref: "retained:provider-process-live-1".to_owned(),
+        };
+
+        if validate_retained_provider_identity(&claim, &reference, &process).is_ok() {
+            return Err("foreign binding digest was accepted".to_owned());
+        }
+        Ok(())
     }
 }
