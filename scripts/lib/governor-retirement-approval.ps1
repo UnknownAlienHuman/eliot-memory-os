@@ -46,19 +46,21 @@
     #    (idempotency_namespace, operation_id) key with a different request
     #    hash is APPROVAL_IDENTITY_CONFLICT and performs no transition.
 
-    The issuer. Current `main` has no production release-retirement approval
-    issuer, and the release retirement role is a semantic owner decision that
-    this issue is not authorized to invent. The seam below therefore exposes
-    exactly three issuer states and only one of them is actionable:
-    `ISSUER_AVAILABLE` (an admitted issuer identity is configured and the owner
-    adopts the recomputed closure), `ISSUER_UNAVAILABLE` (no issuer is
-    configured - the documented fail-closed state), and a rejected approval.
-    Neither the Authenticode Code Signing EKU nor any binary-signing signer is
-    admitted for the semantic `retirement-approval` role by this module.
-    Issuance itself is implemented below by `New-GovernorRetirementApproval`:
-    the owner observes C first, and the function constructs, self-verifies and
-    emits the detached R(C) outside C - refusing while no issuer is admitted
-    or the closure is incomplete.
+    The issuer. The production retirement-approval issuer is the owner release
+    controller. Its identity and certificate are admitted by the owner release
+    policy published on the protected owner ref
+    (`refs/heads/eliot/owner/release-policy`), never by a file the candidate
+    carries; `Resolve-GovernorRetirementOwnerReleasePolicy` resolves that
+    policy, refuses a candidate that ships its own copy of it, and refuses a
+    candidate that does not descend from the owner policy commit. The controller
+    observes candidate C first, then `New-GovernorRetirementApproval` signs one
+    detached owner receipt over the exact owner decision with the pinned
+    certificate and writes it outside C. Neither the Authenticode Code Signing
+    EKU nor any binary-signing signer is admitted for the semantic
+    `retirement-approval` role by this module. While the owner has not
+    published its policy on that ref, `Resolve-GovernorRetirementIssuer` refuses
+    and every retirement stays blocked: that is fail-closed on absent owner
+    material, not on an absent authority path.
 
     Control-flow contract for callers: this file defines only closed constants
     and pure functions, and its dot-source guard sits at the BOTTOM, exactly
@@ -91,8 +93,29 @@ $script:GovernorRetirementFreezeKind = 'detached-approval-pointer'
 $script:GovernorRetirementForbiddenSelfReceiptPath = 'crates/eliot-app/retirement-receipt.json'
 $script:GovernorRetirementBundleTrustFile = 'GOVERNOR_RETIREMENT_APPROVAL_TRUST.json'
 $script:GovernorRetirementBundleApprovalFile = 'GOVERNOR_RETIREMENT_APPROVAL.json'
+# The retired bundle carries the exact detached owner evidence the owner
+# produced outside C, so the finalizer re-verifies the same issuer signature
+# and the same issuer readback offline, with no network and no candidate-tree
+# lookup. It is evidence, not install payload, and SHA256SUMS.json binds it.
+$script:GovernorRetirementBundleOwnerEvidenceFile = 'GOVERNOR_RETIREMENT_OWNER_EVIDENCE.json'
 $script:GovernorRetirementTrustPolicyPath = 'scripts/lib/governor-retirement-approval-trust.json'
+# AUD-5918050095-1: the trust root and the closure rule set may no longer be
+# resolved from the candidate commit being approved. They are read from one
+# protected owner release-policy ref whose identity is fixed outside C, and
+# then applied to C.
+$script:GovernorRetirementOwnerPolicyRef = 'refs/heads/eliot/owner/release-policy'
+$script:GovernorRetirementOwnerPolicyPath = 'config/owner-release-policy.json'
 $script:GovernorRetirementApprovalRole = 'retirement-approval'
+# AUD-5918050095-2/-3: the production issuer is the owner release controller. It
+# signs one detached owner receipt with its own certificate and publishes that
+# certificate beside the receipt; verification resolves the issuer certificate
+# through `issuer_readback_ref` and validates the detached CMS signature, so
+# `issuer_readback_ref` is an executed verification path rather than a label.
+$script:GovernorRetirementIssuerController = 'owner-release-controller'
+$script:GovernorRetirementIssuerReceiptKind = 'detached-signed-owner-receipt-bundle'
+$script:GovernorRetirementOwnerReceiptSchema = 'eliot-owner-retirement-receipt-v1'
+$script:GovernorRetirementOwnerReceiptDomain = 'eliot-owner-retirement-receipt-preimage-v1'
+$script:GovernorRetirementIssuerSignatureAlgorithm = 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256'
 $script:GovernorRetirementClosureRuleSetV1 = 'tracked-legacy-reference-closure-v1'
 $script:GovernorRetirementClosureRuleSetV2 = 'tracked-legacy-reference-closure-v2'
 $script:GovernorRetirementClosureRuleSet = $script:GovernorRetirementClosureRuleSetV2
@@ -118,6 +141,8 @@ $script:GovernorRetirementNonAdmissionReasons = @(
     'APPROVAL_IDENTITY_CONFLICT'
     'APPROVAL_CANDIDATE_MISMATCH'
     'APPROVAL_TRUST_UNAVAILABLE'
+    'APPROVAL_OWNER_POLICY_UNAVAILABLE'
+    'APPROVAL_OWNER_EVIDENCE_UNVERIFIED'
     'APPROVAL_ISSUER_UNAVAILABLE'
     'APPROVAL_CLOSURE_MISMATCH'
     'APPROVAL_CLOSURE_INCOMPLETE'
@@ -1196,6 +1221,15 @@ function Test-GovernorRetirementApprovalShape(
         if ($issuerEvidence -is [bool] -or [string]$issuerEvidence -notmatch '^[0-9a-f]{64}$') {
             return (& $rejected "APPROVAL_OWNER_EVIDENCE_MISSING (issuer_evidence_sha256 must be a 64-hex content digest of the detached owner receipt)")
         }
+        # AUD-5918050095-3: the readback reference must be an executed absolute
+        # path to the signed owner evidence the digest above names, not a
+        # caller-chosen label. Its resolved bytes and its executed verification
+        # are enforced by Resolve-GovernorRetirementOwnerEvidence, which the
+        # binding requires before the approval is admitted.
+        $readbackRef = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'issuer_readback_ref')
+        if (-not [System.IO.Path]::IsPathRooted($readbackRef)) {
+            return (& $rejected "APPROVAL_OWNER_READBACK_REF_NOT_EXECUTABLE (issuer_readback_ref must be the explicit absolute path of the signed owner receipt, found '$readbackRef')")
+        }
         if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'revocation_state')) -cne 'not-revoked') {
             return (& $rejected "APPROVAL_REVOKED (state=$(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'revocation_state')))")
         }
@@ -1441,12 +1475,21 @@ function Resolve-GovernorRetirementBundleTrustMaterial(
 }
 
 
-function Resolve-GovernorRetirementIssuer([object]$TrustPolicy) {
-    # The narrow issuer seam. `ISSUER_UNAVAILABLE` is the documented fail-closed
-    # state for every current tree; the state is only actionable when a
-    # root-owned trust policy admits one issuer identity for the semantic
-    # retirement-approval role. Authenticode Code Signing signers and any
-    # binary-signing identity are never admitted for this role by this module.
+function Resolve-GovernorRetirementIssuer([object]$TrustPolicy, [object]$OwnerPolicy = $null) {
+    # AUD-5918050095-2. The production issuer is the owner release controller.
+    # It exists in code and config: this function names it, the owner-pinned
+    # release policy on the protected owner ref admits it by name and pins its
+    # certificate, and `New-GovernorRetirementApproval` signs its owner receipt
+    # with that certificate. What is unavailable is the owner material itself
+    # (an unpopulated owner ref, or an owner who has not published the policy),
+    # and that fails closed as ISSUER_UNAVAILABLE without making the authority
+    # path a test-only seam.
+    #
+    # The identity and certificate that admit an issuer come from the
+    # owner-pinned policy, never from the candidate-resolved trust material, so
+    # a candidate that edits its own trust JSON cannot admit its own issuer.
+    # Authenticode Code Signing signers and any binary-signing identity are
+    # never admitted for this role by this module.
     $issuers = @(Read-GovernorApprovalField $TrustPolicy 'admitted_issuers')
     if ($issuers.Count -eq 0) {
         return [pscustomobject]@{
@@ -1454,6 +1497,12 @@ function Resolve-GovernorRetirementIssuer([object]$TrustPolicy) {
             reason = 'no owner-admitted retirement-approval issuer is configured in the root-owned trust policy'
             issuer_identity = $null
             policy_digest = $null
+            certificate_sha256 = $null
+            receipt_kind = $null
+            owner_ref = $null
+            owner_commit = $null
+            owner_policy_sha256 = $null
+            owner_policy_blob = $null
         }
     }
     $matching = @($issuers | Where-Object {
@@ -1466,6 +1515,12 @@ function Resolve-GovernorRetirementIssuer([object]$TrustPolicy) {
             reason = "the root-owned trust policy must admit exactly one issuer for the $($script:GovernorRetirementApprovalRole) role; found $($matching.Count)"
             issuer_identity = $null
             policy_digest = $null
+            certificate_sha256 = $null
+            receipt_kind = $null
+            owner_ref = $null
+            owner_commit = $null
+            owner_policy_sha256 = $null
+            owner_policy_blob = $null
         }
     }
     $admitted = $matching[0]
@@ -1475,13 +1530,42 @@ function Resolve-GovernorRetirementIssuer([object]$TrustPolicy) {
             reason = 'an Authenticode Code Signing signer is not a semantic retirement-approval issuer; the trust policy claim is refused'
             issuer_identity = $null
             policy_digest = $null
+            certificate_sha256 = $null
+            receipt_kind = $null
+            owner_ref = $null
+            owner_commit = $null
+            owner_policy_sha256 = $null
+            owner_policy_blob = $null
+        }
+    }
+    $identity = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $admitted 'issuer')
+    $receiptKind = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $admitted 'receipt_kind')
+    if ($identity -cne [string]$script:GovernorRetirementIssuerController -or
+        $receiptKind -cne [string]$script:GovernorRetirementIssuerReceiptKind) {
+        return [pscustomobject]@{
+            state = 'ISSUER_UNAVAILABLE'
+            reason = "the only production retirement-approval issuer is $($script:GovernorRetirementIssuerController) publishing $($script:GovernorRetirementIssuerReceiptKind); the trust material names '$identity'/'$receiptKind'"
+            issuer_identity = $null
+            policy_digest = $null
+            certificate_sha256 = $null
+            receipt_kind = $null
+            owner_ref = $null
+            owner_commit = $null
+            owner_policy_sha256 = $null
+            owner_policy_blob = $null
         }
     }
     [pscustomobject]@{
         state = 'ISSUER_AVAILABLE'
         reason = $null
-        issuer_identity = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $admitted 'issuer'))
+        issuer_identity = $identity
         policy_digest = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'content_sha256'))
+        certificate_sha256 = if ($OwnerPolicy) { [string]$OwnerPolicy.owner_certificate_sha256 } else { $null }
+        receipt_kind = $receiptKind
+        owner_ref = if ($OwnerPolicy) { [string]$OwnerPolicy.owner_ref } else { $null }
+        owner_commit = if ($OwnerPolicy) { [string]$OwnerPolicy.owner_commit } else { $null }
+        owner_policy_sha256 = if ($OwnerPolicy) { [string]$OwnerPolicy.owner_policy_sha256 } else { $null }
+        owner_policy_blob = if ($OwnerPolicy) { [string]$OwnerPolicy.owner_policy_blob } else { $null }
     }
 }
 
@@ -1567,6 +1651,410 @@ function Test-GovernorRetirementCandidateTransition(
         }
     }
     [pscustomobject]@{ admitted = $true; reason = $null }
+}
+
+function Get-GovernorRetirementOwnerPolicyBlobBytes(
+    [string]$Repo,
+    [string]$SourceCommit,
+    [string]$RelativePath) {
+    # Reads one pinned blob's exact bytes out of the candidate's own object
+    # store. The object store is content-addressed, so the bytes are the bytes
+    # of that object id and cannot be substituted by editing a working tree.
+    $oid = (& git -C $Repo rev-parse "$SourceCommit`:$RelativePath" 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $oid -cnotmatch '^[0-9a-f]{40,64}$') {
+        return $null
+    }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'git'
+    $psi.Arguments = "-C `"$Repo`" cat-file blob $oid"
+    $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $memory = [System.IO.MemoryStream]::new()
+    try {
+        $process.StandardOutput.BaseStream.CopyTo($memory)
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "failed to read the pinned owner policy blob $oid at $SourceCommit"
+        }
+        $bytes = $memory.ToArray()
+    }
+    finally {
+        $process.StandardOutput.Close()
+        $memory.Dispose()
+        $process.Dispose()
+    }
+    return [pscustomobject]@{ blob = [string]$oid; bytes = [byte[]]$bytes }
+}
+
+function Resolve-GovernorRetirementOwnerReleasePolicy(
+    [string]$Repo,
+    [string]$SourceCommit,
+    [string]$OwnerPolicyRef = '') {
+    # AUD-5918050095-1. The trust root and the closure rule set are no longer
+    # bytes of the candidate commit being approved. They are read from one
+    # protected owner release-policy ref whose identity is fixed outside C, and
+    # then applied to C: the verified (issuer_entry, issuer_receipt_kind,
+    # owner_certificate_sha256) of this resolver is recorded in the approval,
+    # and `Resolve-GovernorRetirementApprovalBinding` recomputes it from the
+    # same ref for the same release candidate. Both results must be identical
+    # or the approval is rejected.
+    # Three independent refusals, in order:
+    #   * the owner policy must not be carried by C itself, otherwise the
+    #     candidate could swap the trust root together with the approval;
+    #   * the approved candidate must descend from the owner policy commit O,
+    #     otherwise the policy does not govern this candidate;
+    #   * C and D must resolve the same owner policy blob at the same owner
+    #     ref, otherwise the verified admission does not bind this release.
+    $ref = if ([string]::IsNullOrWhiteSpace($OwnerPolicyRef)) { [string]$script:GovernorRetirementOwnerPolicyRef } else { $OwnerPolicyRef }
+    if ($ref -cne [string]$script:GovernorRetirementOwnerPolicyRef) {
+        throw "the retirement owner release policy is read only from the protected owner ref $($script:GovernorRetirementOwnerPolicyRef), never from $($ref) and never from the candidate commit"
+    }
+    if ([string]::IsNullOrWhiteSpace($SourceCommit) -or $SourceCommit -cnotmatch '^[0-9a-f]{40}$') {
+        throw 'the retirement owner release policy requires the exact 40-hex candidate commit it governs'
+    }
+    # Refusal 1: the candidate must not carry the owner policy itself.
+    $candidateBlob = Get-GovernorRetirementTrackedPathDigest $Repo $SourceCommit $script:GovernorRetirementOwnerPolicyPath
+    if ($candidateBlob) {
+        throw "the retirement owner release policy must not be carried by candidate ${SourceCommit}: $($script:GovernorRetirementOwnerPolicyPath) is a protected-ref-owned artifact, and a candidate that ships its own trust root could swap it together with the approval"
+    }
+    $ownerCommit = (& git -C $Repo rev-parse "$ref^{commit}" 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $ownerCommit -cnotmatch '^[0-9a-f]{40}$') {
+        return [pscustomobject]@{
+            available = $false
+            reason = "the protected owner release-policy ref is not resolvable in this checkout: $ref (the retirement trust root cannot be resolved from the candidate commit, so retirement fails closed until the owner publishes its policy on the protected ref)"
+            owner_ref = $ref
+            owner_commit = $null
+            owner_policy_path = $script:GovernorRetirementOwnerPolicyPath
+            owner_policy_blob = $null
+            owner_policy_sha256 = $null
+            body = $null
+            bytes = $null
+        }
+    }
+    # Refusal 2: the approved candidate must descend from the owner policy commit.
+    $mergeBase = (& git -C $Repo merge-base $SourceCommit $ownerCommit 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $mergeBase -cne $ownerCommit) {
+        throw "candidate ${SourceCommit} does not descend from the owner release-policy commit $ownerCommit at $ref; the owner policy that admits a retirement-approval issuer does not govern this candidate"
+    }
+    $ownerBlob = Get-GovernorRetirementOwnerPolicyBlobBytes $Repo $ownerCommit $script:GovernorRetirementOwnerPolicyPath
+    if (-not $ownerBlob) {
+        throw "the owner release-policy commit $ownerCommit carries no $($script:GovernorRetirementOwnerPolicyPath)"
+    }
+    $text = [System.Text.Encoding]::UTF8.GetString([byte[]]$ownerBlob.bytes).TrimStart([char]0xFEFF)
+    $policy = $null
+    try {
+        $policy = $text | ConvertFrom-Json
+    }
+    catch {
+        throw "the owner release policy at $($script:GovernorRetirementOwnerPolicyPath)@$ref is not well-formed JSON: $([string]$_.Exception.Message)"
+    }
+    if (-not $policy) {
+        throw "the owner release policy at $($script:GovernorRetirementOwnerPolicyPath)@$ref decoded to no object"
+    }
+    [void](Test-GovernorRetirementOwnerReleasePolicyShape $policy)
+    $admitted = @(@(Read-GovernorApprovalField $policy 'admitted_issuers') | Where-Object {
+            (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $_ 'role')) -ceq $script:GovernorRetirementApprovalRole -and
+            (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $_ 'issuer')) -ceq [string]$script:GovernorRetirementIssuerController
+        })
+    if ($admitted.Count -ne 1) {
+        throw "the owner release policy at $ref must admit exactly one $($script:GovernorRetirementApprovalRole) issuer named $($script:GovernorRetirementIssuerController); found $($admitted.Count)"
+    }
+    $receiptKind = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $admitted[0] 'receipt_kind')
+    if ($receiptKind -cne [string]$script:GovernorRetirementIssuerReceiptKind) {
+        throw "the admitted retirement-approval issuer must publish its evidence as $($script:GovernorRetirementIssuerReceiptKind); found $receiptKind"
+    }
+    $certificateDigest = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $admitted[0] 'owner_certificate_sha256')
+    if ($certificateDigest -cnotmatch '^[0-9a-f]{64}$') {
+        throw 'the admitted retirement-approval issuer entry names no owner_certificate_sha256 to pin the issuer certificate identity'
+    }
+    [pscustomobject]@{
+        available = $true
+        reason = $null
+        owner_ref = $ref
+        owner_commit = $ownerCommit
+        owner_policy_path = $script:GovernorRetirementOwnerPolicyPath
+        owner_policy_blob = [string]$ownerBlob.blob
+        owner_policy_sha256 = Get-GovernorApprovalSha256Bytes ([byte[]]$ownerBlob.bytes)
+        issuer_identity = [string]$script:GovernorRetirementIssuerController
+        issuer_receipt_kind = $receiptKind
+        owner_certificate_sha256 = $certificateDigest.ToLowerInvariant()
+        body = $policy
+        bytes = [byte[]]$ownerBlob.bytes
+    }
+}
+
+function Test-GovernorRetirementOwnerReleasePolicyShape([object]$Policy) {
+    # A closed shape gate for the owner release policy. It proves that the
+    # artifact read from the protected ref is the retirement-approval admission
+    # this verifier understands; it grants nothing by itself.
+    if (-not $Policy) {
+        throw 'the retirement owner release policy is missing'
+    }
+    $schema = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Policy 'schema')
+    if ($schema -cne 'eliot-owner-release-policy-v1') {
+        throw "retirement owner release policy schema is not supported: $schema"
+    }
+    $supportedFields = @(
+        'schema', 'release_policy', 'release_product', 'release_policy_revision',
+        'closure_rule_sets', 'revocation_source', 'admitted_issuers', 'content_sha256'
+    )
+    foreach ($property in $Policy.PSObject.Properties) {
+        if ($supportedFields -cnotcontains [string]$property.Name) {
+            throw "retirement owner release policy field is not in the closed contract: $([string]$property.Name)"
+        }
+    }
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Policy 'release_policy')) -cne $script:GovernorRetirementLegacyRepository -or
+        (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Policy 'release_product')) -cne $script:GovernorRetirementProduct) {
+        throw 'the retirement owner release policy is not bound to this repository/product release'
+    }
+    $declaredRuleSets = @(Read-GovernorApprovalField $Policy 'closure_rule_sets')
+    if ($declaredRuleSets.Count -ne $script:GovernorRetirementClosureRuleSets.Count) {
+        throw 'the retirement owner release policy must declare exactly the closure rule sets this verifier implements'
+    }
+    for ($i = 0; $i -lt $declaredRuleSets.Count; $i++) {
+        if ((ConvertTo-GovernorApprovalString $declaredRuleSets[$i]) -cne ([string]$script:GovernorRetirementClosureRuleSets[$i])) {
+            throw "the retirement owner release policy declares unsupported closure rule set ${i}: $(ConvertTo-GovernorApprovalString $declaredRuleSets[$i])"
+        }
+    }
+    foreach ($field in @('release_policy_revision', 'content_sha256')) {
+        if ([string]::IsNullOrWhiteSpace((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Policy $field)))) {
+            throw "the retirement owner release policy is missing its $field"
+        }
+    }
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Policy 'content_sha256')) -cne (Get-GovernorApprovalSha256 (Get-GovernorRetirementOwnerPolicyPreimage $Policy))) {
+        throw 'the retirement owner release policy canonical digest mismatch'
+    }
+    return $true
+}
+
+function Get-GovernorRetirementOwnerPolicyPreimage([object]$Policy) {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($field in @('schema', 'release_policy', 'release_product', 'release_policy_revision', 'revocation_source')) {
+        [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine $field (Read-GovernorApprovalField $Policy $field)))
+    }
+    foreach ($ruleSet in @(Read-GovernorApprovalField $Policy 'closure_rule_sets')) {
+        [void]$lines.Add("closure_rule_set=$([string]$ruleSet)")
+    }
+    foreach ($issuer in @(Read-GovernorApprovalField $Policy 'admitted_issuers')) {
+        [void]$lines.Add("issuer=$([string](Read-GovernorApprovalField $issuer 'issuer'))|role=$([string](Read-GovernorApprovalField $issuer 'role'))|authority=$([string](Read-GovernorApprovalField $issuer 'authority'))|receipt_kind=$([string](Read-GovernorApprovalField $issuer 'receipt_kind'))|owner_certificate_sha256=$(([string](Read-GovernorApprovalField $issuer 'owner_certificate_sha256')).ToLowerInvariant())")
+    }
+    return (@($lines) -join "`n")
+}
+
+function Get-GovernorApprovalSha256Bytes([byte[]]$Bytes) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Test-GovernorRetirementOwnerReleasePolicyShapeAppliedTo(
+    [object]$OwnerPolicy,
+    [object]$TrustPolicy) {
+    # The owner-pinned identity and the admitted v2 policy body must describe
+    # the same release-policy revision and the same closure rule selection.
+    # Without this, a detached approval could name one owner's issuer policy
+    # while the trust material admits another.
+    $ownerRevision = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $OwnerPolicy 'release_policy_revision')
+    $trustRevision = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'release_policy_revision')
+    if ([string]::IsNullOrWhiteSpace($ownerRevision) -or $ownerRevision -cne $trustRevision) {
+        throw "the owner-pinned release policy revision '$ownerRevision' differs from the admitted trust material revision '$trustRevision'"
+    }
+    $ownerRuleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $TrustPolicy 'closure_rule_set')
+    $ownerPinnedRuleSets = @(Read-GovernorApprovalField $OwnerPolicy 'closure_rule_sets')
+    if ($ownerPinnedRuleSets -cnotcontains $ownerRuleSet) {
+        throw "the admitted trust material selects closure rule set '$ownerRuleSet', which the owner release policy at $((Read-GovernorApprovalField $OwnerPolicy 'content_sha256')) does not pin"
+    }
+    return $true
+}
+
+function Test-GovernorRetirementOwnerReceiptSignature(
+    [byte[]]$ReceiptBytes,
+    [byte[]]$ContentBytes,
+    [string]$ExpectedCertificateSha256,
+    [string]$Purpose) {
+    # The one cryptographic primitive this feature borrows is the detached CMS
+    # signature, and it is only a primitive: the semantic retirement-approval
+    # authority is the owner release policy above, never this signature.
+    # The signature is verified over the exact owner evidence content bytes with
+    # the issuer certificate carried by the same evidence, which is itself
+    # authenticated by the owner-pinned certificate digest. A valid signature
+    # over different content, or from a certificate that is not the admitted
+    # issuer, refuses.
+    if ($null -eq $ReceiptBytes -or $ReceiptBytes.Length -eq 0) {
+        throw "$Purpose carries no detached owner receipt signature bytes"
+    }
+    $expected = ([string]$ExpectedCertificateSha256).Replace(' ', '').ToLowerInvariant()
+    $certificate = $null
+    try {
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([byte[]]$ContentBytes)
+    }
+    catch {
+        throw "$Purpose carries no decodable issuer certificate: $([string]$_.Exception.Message)"
+    }
+    $actual = Get-GovernorApprovalSha256Bytes ([byte[]][System.Convert]::FromBase64String($certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)))
+    if ($actual -cne $expected) {
+        throw "$Purpose issuer certificate digest $actual is not the owner-pinned issuer certificate digest $expected"
+    }
+    Add-Type -AssemblyName System.Security.Cryptography.Pkcs -ErrorAction SilentlyContinue
+    $cms = [System.Security.Cryptography.Pkcs.SignedCms]::new()
+    try {
+        $cms.Decode([byte[]]$ReceiptBytes)
+    }
+    catch {
+        throw "$Purpose owner receipt is not a well-formed detached CMS signature: $([string]$_.Exception.Message)"
+    }
+    if ($cms.SignerInfos.Count -ne 1) {
+        throw "$Purpose owner receipt must carry exactly one signer, found $($cms.SignerInfos.Count)"
+    }
+    if (-not $cms.CheckSignature($true)) {
+        throw "$Purpose owner receipt signature does not verify over its detached owner evidence content"
+    }
+    $signer = $cms.SignerInfos[0]
+    if ($signer.Certificate -eq $null) {
+        throw "$Purpose owner receipt carries no signer certificate"
+    }
+    $signerDigest = Get-GovernorApprovalSha256Bytes ([byte[]][System.Convert]::FromBase64String($signer.Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)))
+    if ($signerDigest -cne $expected) {
+        throw "$Purpose owner receipt was signed by certificate $signerDigest, which is not the owner-pinned issuer certificate $expected"
+    }
+    return $true
+}
+
+function Get-GovernorRetirementOwnerEvidenceText([object]$Evidence) {
+    # The exact bytes the issuer signed: a deterministic, versioned, ordered
+    # rendering of the owner evidence content object. The same rendering is
+    # produced at issuance and at verification, so the signature is verified
+    # over bytes that are recomputed here, never over bytes read back from the
+    # signature envelope.
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($field in @('schema', 'domain', 'repository', 'product', 'release_policy_revision',
+            'owner_policy_ref', 'owner_policy_commit', 'owner_policy_blob', 'owner_policy_sha256',
+            'owner_certificate_sha256', 'issuer', 'issuer_receipt_kind', 'issuer_role',
+            'issuer_readback_ref', 'operation_id', 'idempotency_namespace', 'approver_principal',
+            'approver_role', 'repository_candidate_commit', 'repository_candidate_tree',
+            'approval_canonical_request_hash', 'issued_at_utc', 'expires_at_utc',
+            'revocation_state', 'reopen_condition', 'rollback_condition', 'proof_ceiling')) {
+        [void]$lines.Add((Get-GovernorApprovalDomainSeparatedLine $field (Read-GovernorApprovalField $Evidence $field)))
+    }
+    foreach ($consumer in @(Sort-GovernorApprovalConsumers (Read-GovernorApprovalField $Evidence 'consumers'))) {
+        [void]$lines.Add("consumer=$([string]$consumer.consumer)|proof=$([string]$consumer.proof_path)|reference=$([string]$consumer.live_reference)|disposition=$([string]$consumer.disposition)|replacement_owner=$([string]$consumer.replacement_owner)|product_contract=$([string]$consumer.product_contract)|removal_decision=$([string]$consumer.removal_decision)|expiry=$([string]$consumer.expiry)")
+    }
+    return (@($lines) -join "`n")
+}
+
+function Resolve-GovernorRetirementOwnerEvidence(
+    [object]$ReceiptInput,
+    [string]$Repo,
+    [object]$Issuer,
+    [object]$OwnerPolicy,
+    [object]$Approval) {
+    # AUD-5918050095-3. `issuer_readback_ref` stops being a nonblank label: it
+    # is executed here. The named reference is resolved through the same
+    # explicit detached-artifact reader the approval itself uses, the bytes read
+    # back must be exactly the bytes whose SHA-256 the approval carries as
+    # issuer_evidence_sha256, and the decoded owner receipt must agree with the
+    # approval on schema, issuer, role, operation, candidate, currentness and
+    # revocation. A nonblank label that resolves to nothing, or resolves to
+    # different bytes, refuses.
+    if (-not $ReceiptInput) {
+        throw 'the detached owner receipt was not supplied; an approval cannot claim owner evidence it never read back'
+    }
+    if (-not [bool]$ReceiptInput.supplied) {
+        throw 'the detached owner receipt readback is absent; issuer_readback_ref must resolve through the release safe path/handle reader'
+    }
+    $readbackRef = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'issuer_readback_ref')
+    if (-not [System.IO.Path]::IsPathRooted($readbackRef)) {
+        throw 'the detached approval carries no executable issuer_readback_ref'
+    }
+    # The readback is executed: these bytes were read through the release safe
+    # path/handle reader from the named reference (or from the retired bundle's
+    # byte-identical copy of it, for offline finalization), and they must hash to
+    # the issuer_evidence_sha256 the approval carries. A reference that resolves
+    # to nothing, or to different bytes, fails here.
+    $declaredEvidence = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'issuer_evidence_sha256')).ToLowerInvariant()
+    if ($declaredEvidence -cne ([string]$ReceiptInput.sha256).ToLowerInvariant()) {
+        throw "the owner receipt readback digest $([string]$ReceiptInput.sha256) is not the issuer_evidence_sha256 '$declaredEvidence' the detached approval carries"
+    }
+    $envelope = Read-GovernorRetirementJsonFile ([string]$ReceiptInput.path) 'detached owner retirement receipt'
+    $receipt = Read-GovernorApprovalField $envelope 'receipt'
+    if (-not $receipt) {
+        throw 'the detached owner retirement receipt carries no receipt object'
+    }
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $envelope 'schema')) -cne [string]$script:GovernorRetirementOwnerReceiptSchema) {
+        throw "the detached owner retirement receipt schema is not supported: $(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $envelope 'schema'))"
+    }
+    # The signed content is recomputed from the receipt body here, not read back
+    # out of the signature envelope, so the signature is verified over bytes
+    # this verifier re-derives.
+    $contentText = Get-GovernorRetirementOwnerEvidenceText $receipt
+    $contentBytes = [System.Text.Encoding]::UTF8.GetBytes($contentText)
+    $contentDigest = Get-GovernorApprovalSha256 $contentText
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $envelope 'content_sha256')) -cne $contentDigest) {
+        throw "the detached owner receipt canonical digest mismatch (declared=$(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $envelope 'content_sha256')) recomputed=$contentDigest)"
+    }
+    $contentB64 = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $envelope 'content_base64')
+    if ([string]::IsNullOrWhiteSpace($contentB64)) {
+        throw 'the detached owner retirement receipt carries no signed content'
+    }
+    $declaredBytes = [System.Text.Encoding]::UTF8.GetBytes([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($contentB64)))
+    if ((Get-GovernorApprovalSha256Bytes $declaredBytes) -cne $contentDigest) {
+        throw 'the detached owner receipt signed content does not match its declared canonical digest'
+    }
+    $certificateSha256 = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $envelope 'issuer_certificate_sha256')).ToLowerInvariant()
+    if ([string]$Issuer.certificate_sha256 -cne $certificateSha256) {
+        throw "the detached owner receipt names issuer certificate $certificateSha256 but the owner-pinned policy admits $([string]$Issuer.certificate_sha256)"
+    }
+    $signatureB64 = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $envelope 'signature_base64')
+    [void](Test-GovernorRetirementOwnerReceiptSignature `
+            ([System.Convert]::FromBase64String($signatureB64)) `
+            $declaredBytes `
+            $certificateSha256 `
+            'the detached owner retirement receipt')
+    # Semantic readback: the owner decision the issuer signed must be the same
+    # decision the approval claims, for this candidate and this operation.
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt 'repository_candidate_commit')).ToLowerInvariant() -cne
+        (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'candidate_commit')).ToLowerInvariant()) {
+        throw 'the owner receipt names a different repository candidate commit than the detached approval'
+    }
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt 'repository_candidate_tree')).ToLowerInvariant() -cne
+        (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'candidate_tree')).ToLowerInvariant()) {
+        throw 'the owner receipt names a different candidate tree than the detached approval'
+    }
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt 'operation_id')) -cne
+        (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'operation_id'))) {
+        throw 'the owner receipt names a different approval operation than the detached approval'
+    }
+    foreach ($field in @('issuer', 'issuer_receipt_kind', 'approver_principal', 'approver_role',
+            'issuer_readback_ref', 'issued_at_utc', 'expires_at_utc', 'revocation_state')) {
+        if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt $field)) -cne
+            (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval $field))) {
+            throw "the owner receipt $field differs from the detached approval ($((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt $field))) vs $(ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval $field)))"
+        }
+    }
+    # The owner-pinned policy identity the issuer signed must equal the identity
+    # this verifier independently re-resolved from the protected ref.
+    if ((ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt 'owner_policy_commit')) -cne [string]$OwnerPolicy.owner_commit -or
+        (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt 'owner_policy_sha256')).ToLowerInvariant() -cne [string]$OwnerPolicy.owner_policy_sha256) {
+        throw 'the owner receipt was issued under a different owner release policy than this verifier resolved from the protected ref'
+    }
+    $repositoryCandidateTree = Get-GovernorRetirementCandidateTree $Repo (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt 'repository_candidate_commit'))
+    if ($repositoryCandidateTree -cne (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $receipt 'repository_candidate_tree')).ToLowerInvariant()) {
+        throw 'the owner receipt repository candidate tree does not read back its own candidate commit'
+    }
+    return [pscustomobject]@{
+        readback_ref = $readbackRef
+        path = [string]$ReceiptInput.path
+        sha256 = [string]$ReceiptInput.sha256
+        content_sha256 = $contentDigest
+        receipt = $receipt
+        envelope = $envelope
+    }
 }
 
 function Test-GovernorRetirementTrustPolicyShape([object]$TrustPolicy) {
@@ -1740,9 +2228,8 @@ function New-GovernorRetirementCandidateFreeze(
 function New-GovernorRetirementApproval(
     [string]$Repo,
     [string]$SourceCommit,
-    [string]$OwnerReceiptPath,
+    [string]$IssuerCertificatePath,
     [string]$ApproverPrincipal,
-    [string]$IssuerReadbackRef,
     [string]$OperationId,
     [string]$IdempotencyNamespace,
     [string]$IdempotencyRetentionHours,
@@ -1758,25 +2245,35 @@ function New-GovernorRetirementApproval(
     [string]$ReopenCondition,
     [string]$RollbackCondition,
     [string]$ExpectedFreezeClosureDigest = '',
+    [string]$OwnerReceiptPath = '',
     [string]$OutputPath) {
-    # Owner-side issuance of the detached GovernorRetirementApprovalV1 artifact
-    # R(C) (issue #2968 Required design B, two-time workflow step 4). The issuer
-    # observes the frozen candidate C first and issues afterwards; the approval
-    # body and the owner receipt remain outside C. Every candidate-bound value
-    # (commit, tree, closure, declaration, normative pair, policy revision,
-    # issuer identity) is recomputed from the repository and the pinned
-    # root-owned trust policy - never taken from a caller string - while the
-    # owner decision itself (principal, operation, validity window, refs,
-    # dispositions, conditions) arrives only through these explicit parameters:
-    # no environment selection, no repository default, no directory search.
-    # Issuance refuses, fail closed, while no issuer is admitted, while the
-    # independent closure is incomplete, or while the constructed body does not
-    # verify through the same shape gate the builder enforces; nothing
-    # unverifiable is ever emitted. The emitted artifact is consumed through
-    # the builder's explicit -GovernorRetirementApproval input. No new PKI is
-    # introduced: the owner receipt is owner-produced bytes bound here by
-    # content digest, and the trust anchor is the root-owned policy admitting
-    # exactly one issuer identity for the retirement-approval role.
+    # AUD-5918050095-2/-3: owner-side issuance of the detached
+    # GovernorRetirementApprovalV1 artifact R(C) (issue #2968 Required design B,
+    # two-time workflow step 4). The issuer observes the frozen candidate C
+    # first and issues afterwards; the approval body and the signed owner
+    # receipt remain outside C. Every candidate-bound value (commit, tree,
+    # closure, declaration, normative pair, policy revision, issuer identity,
+    # owner-policy identity) is recomputed from the repository, from the
+    # owner-pinned release policy on the protected owner ref, and from the
+    # pinned trust material - never taken from a caller string - while the owner
+    # decision itself (principal, operation, validity window, refs, dispositions,
+    # conditions) arrives only through these explicit parameters: no environment
+    # selection, no repository default, no directory search.
+    #
+    # The production issuer is the owner release controller. It signs one
+    # detached owner receipt over the exact owner decision with the certificate
+    # the owner-pinned policy pins, and that receipt is written outside C with a
+    # self-verifying readback. Issuance refuses, fail closed, while the owner
+    # policy is unavailable, while no issuer is admitted, while the independent
+    # closure is incomplete, while the issuer certificate is not the pinned one,
+    # or while the constructed body does not verify through the same shape gate
+    # the builder enforces; nothing unverifiable is ever emitted. The emitted
+    # artifact is consumed through the builder's explicit
+    # -GovernorRetirementApproval input. No new PKI is introduced: the CMS
+    # signature is the one existing cryptographic primitive, and it is only a
+    # primitive - the semantic retirement-approval authority is the owner-pinned
+    # release policy that admits this one issuer for the retirement-approval
+    # role.
     if ([string]::IsNullOrWhiteSpace($Repo) -or -not (Test-Path -LiteralPath $Repo -PathType Container)) {
         throw 'retirement approval issuance requires the repository root of candidate C'
     }
@@ -1791,8 +2288,14 @@ function New-GovernorRetirementApproval(
         -not (Get-Command Read-VerifiedResidentFile -CommandType Function -ErrorAction SilentlyContinue)) {
         throw 'retirement approval issuance requires the release safe path/handle rules; dot-source scripts/build-eliot-windows-x64-release.ps1 (which loads this contract) before issuing'
     }
-    $trustPolicy = Resolve-GovernorRetirementTrustPolicy $Repo $SourceCommit
-    $issuer = Resolve-GovernorRetirementIssuer $trustPolicy.body
+    # The trust root and the closure rule identity come from the protected owner
+    # release-policy ref, never from the candidate commit being approved.
+    $ownerPolicy = Resolve-GovernorRetirementOwnerReleasePolicy $Repo $SourceCommit
+    if (-not [bool]$ownerPolicy.available) {
+        throw "retirement approval issuance is unavailable: $([string]$ownerPolicy.reason)"
+    }
+    $trustPolicy = Resolve-GovernorRetirementTrustPolicy $Repo $SourceCommit $ownerPolicy
+    $issuer = Resolve-GovernorRetirementIssuer $trustPolicy.body $ownerPolicy
     if ([string]$issuer.state -cne 'ISSUER_AVAILABLE') {
         throw "retirement approval issuance is unavailable for candidate ${SourceCommit}: $([string]$issuer.reason)"
     }
@@ -1801,11 +2304,11 @@ function New-GovernorRetirementApproval(
             (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $_ 'issuer')) -ceq [string]$issuer.issuer_identity
         })
     if ($admitted.Count -ne 1) {
-        throw 'the root-owned trust policy admits no single retirement-approval issuer entry for this issuance'
+        throw 'the trust policy admits no single retirement-approval issuer entry for this issuance'
     }
     $issuerReceiptKind = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $admitted[0] 'receipt_kind')
-    if ([string]::IsNullOrWhiteSpace($issuerReceiptKind)) {
-        throw 'the admitted retirement-approval issuer entry names no receipt_kind'
+    if ($issuerReceiptKind -cne [string]$script:GovernorRetirementIssuerReceiptKind) {
+        throw "the admitted retirement-approval issuer must publish its evidence as $($script:GovernorRetirementIssuerReceiptKind): $issuerReceiptKind"
     }
     $closureRuleSet = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $trustPolicy.body 'closure_rule_set')
     $releasePolicyRevision = Get-GovernorRetirementClosurePolicyRevision $trustPolicy.body $closureRuleSet
@@ -1824,18 +2327,50 @@ function New-GovernorRetirementApproval(
         throw "the closure declaration inventory is not tracked at candidate ${SourceCommit}: $($script:GovernorRetirementDispositionInventoryPath)"
     }
     $repoFull = (Resolve-Path -LiteralPath $Repo).Path.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-    if ([string]::IsNullOrWhiteSpace($OwnerReceiptPath) -or -not [System.IO.Path]::IsPathRooted($OwnerReceiptPath)) {
-        throw 'retirement approval issuance requires the owner receipt as an explicit absolute path outside the candidate tree'
+    # The issuer's private key never travels: issuance runs as the owner
+    # release controller on the owner host and reaches the pinned certificate
+    # through the platform key store. Only the certificate is named here, and
+    # its digest must equal the owner-pinned identity.
+    if ([string]::IsNullOrWhiteSpace($IssuerCertificatePath)) {
+        throw 'retirement approval issuance requires the admitted owner release controller certificate as an explicit thumbprint or absolute certificate path'
     }
-    $receiptFull = [System.IO.Path]::GetFullPath($OwnerReceiptPath)
-    if ($receiptFull.StartsWith("$repoFull$([System.IO.Path]::DirectorySeparatorChar)", [System.StringComparison]::OrdinalIgnoreCase) -or
-        [string]::Equals($receiptFull, $repoFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw 'the owner receipt must remain outside the candidate tree C'
+    $issuerCertificate = $null
+    if ($IssuerCertificatePath -cmatch '^[0-9a-fA-F]{40}$') {
+        foreach ($store in @('Cert:\CurrentUser\My', 'Cert:\LocalMachine\My')) {
+            $found = Get-ChildItem -LiteralPath $store -ErrorAction SilentlyContinue |
+                Where-Object { ([string]$_.Thumbprint).Replace(' ', '').ToLowerInvariant() -ceq $IssuerCertificatePath.ToLowerInvariant() }
+            if ($found) {
+                $issuerCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($found[0])
+                break
+            }
+        }
+        if (-not $issuerCertificate) {
+            throw "no certificate with thumbprint $IssuerCertificatePath was found for the owner release controller"
+        }
     }
-    $receipt = Read-VerifiedResidentFile $OwnerReceiptPath 'detached owner retirement receipt'
+    else {
+        if (-not [System.IO.Path]::IsPathRooted($IssuerCertificatePath)) {
+            throw 'the owner release controller certificate must be an explicit thumbprint or an explicit absolute path'
+        }
+        $certificateEvidence = Read-VerifiedResidentFile $IssuerCertificatePath 'owner release controller certificate'
+        $issuerCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new([byte[]]$certificateEvidence.bytes)
+    }
+    $issuerCertificateSha256 = Get-GovernorApprovalSha256Bytes ([byte[]][System.Convert]::FromBase64String($issuerCertificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)))
+    if ($issuerCertificateSha256 -cne [string]$ownerPolicy.owner_certificate_sha256) {
+        throw "the owner release controller certificate digest $issuerCertificateSha256 is not the owner-pinned issuer certificate digest $([string]$ownerPolicy.owner_certificate_sha256)"
+    }
+    if ($OwnerReceiptPath) {
+        if (-not [System.IO.Path]::IsPathRooted($OwnerReceiptPath)) {
+            throw 'the signed owner receipt output path must be an explicit absolute path'
+        }
+        $ownerReceiptFull = [System.IO.Path]::GetFullPath($OwnerReceiptPath)
+        if ($ownerReceiptFull.StartsWith("$repoFull$([System.IO.Path]::DirectorySeparatorChar)", [System.StringComparison]::OrdinalIgnoreCase) -or
+            [string]::Equals($ownerReceiptFull, $repoFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'the signed owner receipt must remain outside the candidate tree C'
+        }
+    }
     $ownerScalars = [ordered]@{
         ApproverPrincipal = $ApproverPrincipal
-        IssuerReadbackRef = $IssuerReadbackRef
         OperationId = $OperationId
         IdempotencyNamespace = $IdempotencyNamespace
         ConfigPolicyRevision = $ConfigPolicyRevision
@@ -1952,8 +2487,8 @@ function New-GovernorRetirementApproval(
         approver_role = $script:GovernorRetirementApprovalRole
         issuer = [string]$issuer.issuer_identity
         issuer_receipt_kind = $issuerReceiptKind
-        issuer_evidence_sha256 = [string]$receipt.sha256
-        issuer_readback_ref = $IssuerReadbackRef
+        issuer_evidence_sha256 = ''
+        issuer_readback_ref = ''
         issued_at_utc = $IssuedAtUtc
         expires_at_utc = $ExpiresAtUtc
         revocation_state = 'not-revoked'
@@ -1964,8 +2499,100 @@ function New-GovernorRetirementApproval(
         content_sha256 = $null
     }
     $body = [pscustomobject]$approval
+    # The canonical request hash deliberately excludes owner evidence, so the
+    # owner decision can sign a receipt over it before the receipt digest is
+    # known: one deterministic pass, no fixed point.
     $requestHash = Get-GovernorApprovalRequestDigest $body
     $body.canonical_request_hash = $requestHash
+    # The owner evidence content the issuer signs. It names the issuer identity,
+    # its role, the operation, the exact candidate commit/tree, the owner-pinned
+    # policy identity, the currentness window and the revocation state, and it
+    # is the same content the verifier re-derives from the decoded receipt.
+    $ownerReceipt = [ordered]@{
+        schema = $script:GovernorRetirementOwnerReceiptSchema
+        domain = $script:GovernorRetirementOwnerReceiptDomain
+        repository = $script:GovernorRetirementLegacyRepository
+        product = $script:GovernorRetirementProduct
+        release_policy_revision = $releasePolicyRevision
+        owner_policy_ref = [string]$ownerPolicy.owner_ref
+        owner_policy_commit = [string]$ownerPolicy.owner_commit
+        owner_policy_blob = [string]$ownerPolicy.owner_policy_blob
+        owner_policy_sha256 = [string]$ownerPolicy.owner_policy_sha256
+        owner_certificate_sha256 = [string]$ownerPolicy.owner_certificate_sha256
+        issuer = [string]$issuer.issuer_identity
+        issuer_receipt_kind = $issuerReceiptKind
+        issuer_role = $script:GovernorRetirementApprovalRole
+        issuer_readback_ref = $ownerReceiptFull
+        operation_id = $OperationId
+        idempotency_namespace = $IdempotencyNamespace
+        approver_principal = $ApproverPrincipal
+        approver_role = $script:GovernorRetirementApprovalRole
+        repository_candidate_commit = $SourceCommit
+        repository_candidate_tree = $candidateTree
+        approval_canonical_request_hash = $requestHash
+        issued_at_utc = $IssuedAtUtc
+        expires_at_utc = $ExpiresAtUtc
+        revocation_state = 'not-revoked'
+        reopen_condition = $ReopenCondition
+        rollback_condition = $RollbackCondition
+        proof_ceiling = $script:GovernorRetirementProofCeiling
+        consumers = @($normalizedConsumers)
+    }
+    if ([string]::IsNullOrWhiteSpace($OwnerReceiptPath)) {
+        throw 'retirement approval issuance requires the signed owner receipt output path as an explicit absolute path outside the candidate tree'
+    }
+    $ownerReceiptFull = [System.IO.Path]::GetFullPath($OwnerReceiptPath)
+    $ownerReceiptText = Get-GovernorRetirementOwnerEvidenceText ([pscustomobject]$ownerReceipt)
+    $ownerReceiptContentBytes = [System.Text.Encoding]::UTF8.GetBytes($ownerReceiptText)
+    $ownerReceiptContentDigest = Get-GovernorApprovalSha256 $ownerReceiptText
+    Add-Type -AssemblyName System.Security.Cryptography.Pkcs -ErrorAction SilentlyContinue
+    $issuerCertificateSubject = if ([string]::IsNullOrWhiteSpace([string]$issuerCertificate.Subject)) { 'unnamed' } else { [string]$issuerCertificate.Subject }
+    $privateKey = $null
+    foreach ($candidate in @($issuerCertificate, $issuerCertificate.PSParentCertificate)) {
+        if ($candidate -and $candidate.HasPrivateKey) { $privateKey = $candidate; break }
+    }
+    if (-not $privateKey) {
+        throw "the owner release controller certificate $issuerCertificateSubject carries no accessible private key; issuance runs on the owner host so the issuer never signs with a transported key"
+    }
+    $cms = [System.Security.Cryptography.Pkcs.SignedCms]::new([System.Security.Cryptography.Pkcs.ContentInfo]::new($ownerReceiptContentBytes), $true)
+    $cmsSigner = [System.Security.Cryptography.Pkcs.CmsSigner]::new($script:GovernorRetirementIssuerSignatureAlgorithm)
+    $cmsSigner.Certificate = $issuerCertificate
+    try {
+        $cms.ComputeSignature($cmsSigner)
+    }
+    catch {
+        throw "the owner release controller could not sign the owner receipt with ${issuerCertificateSubject}: $([string]$_.Exception.Message)"
+    }
+    $ownerEnvelope = [ordered]@{
+        schema = [string]$script:GovernorRetirementOwnerReceiptSchema
+        issuer = [string]$issuer.issuer_identity
+        issuer_receipt_kind = $issuerReceiptKind
+        issuer_certificate_sha256 = $issuerCertificateSha256
+        content_sha256 = $ownerReceiptContentDigest
+        content_base64 = [System.Convert]::ToBase64String($ownerReceiptContentBytes)
+        signature_base64 = [System.Convert]::ToBase64String($cms.Encode())
+        signature_algorithm = [string]$script:GovernorRetirementIssuerSignatureAlgorithm
+        receipt = [pscustomobject]$ownerReceipt
+    }
+    $ownerReceiptJson = ([pscustomobject]$ownerEnvelope) | ConvertTo-Json -Depth 6
+    $ownerReceiptParent = Split-Path -Parent $ownerReceiptFull
+    if (-not [string]::IsNullOrWhiteSpace($ownerReceiptParent) -and -not (Test-Path -LiteralPath $ownerReceiptParent -PathType Container)) {
+        throw "the signed owner receipt parent directory does not exist: $ownerReceiptParent"
+    }
+    $ownerStream = [System.IO.File]::Open($ownerReceiptFull, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $ownerPayload = [System.Text.Encoding]::UTF8.GetBytes($ownerReceiptJson)
+        $ownerStream.Write($ownerPayload, 0, $ownerPayload.Length)
+        $ownerStream.Flush($true)
+    }
+    finally {
+        $ownerStream.Dispose()
+    }
+    $ownerReceiptSha256 = Get-GovernorApprovalSha256Bytes ([System.Text.Encoding]::UTF8.GetBytes($ownerReceiptJson))
+    # The approval now names the exact owner evidence bytes the issuer signed,
+    # and `issuer_readback_ref` names that same file, so the verifier resolves
+    # the reference and re-derives the signed content itself.
+    $body.issuer_evidence_sha256 = $ownerReceiptSha256
     $contentDigest = Get-GovernorApprovalContentDigest $body
     $body.content_sha256 = $contentDigest
     $closure | Add-Member -MemberType NoteProperty -Name declaration_path -Value $script:GovernorRetirementDispositionInventoryPath
@@ -2000,6 +2627,15 @@ function New-GovernorRetirementApproval(
     if ((Get-GovernorApprovalContentDigest $roundtrip) -cne $contentDigest) {
         throw 'the issued detached approval does not read back its own content digest; issuance refused'
     }
+    # The issuer verifies its own evidence through the same executed readback
+    # path the release builder and the finalizer use, so an R(C) that the
+    # verifier would refuse is never emitted.
+    $selfVerified = Resolve-GovernorRetirementOwnerEvidence `
+        (Resolve-GovernorRetirementDetachedInput $ownerReceiptFull 'issued signed owner retirement receipt') `
+        $Repo `
+        $issuer `
+        $ownerPolicy `
+        $roundtrip
     [pscustomobject]@{
         path = $outputFull
         sha256 = Get-GovernorApprovalSha256 $json
@@ -2011,6 +2647,12 @@ function New-GovernorRetirementApproval(
         closure_digest_sha256 = [string]$closure.digest_sha256
         closure_count = [int]$closure.classified_count
         issuer = [string]$issuer.issuer_identity
+        issuer_certificate_sha256 = $issuerCertificateSha256
+        owner_receipt_path = $ownerReceiptFull
+        owner_receipt_sha256 = $ownerReceiptSha256
+        owner_evidence_content_sha256 = [string]$selfVerified.content_sha256
+        owner_policy_ref = [string]$ownerPolicy.owner_ref
+        owner_policy_commit = [string]$ownerPolicy.owner_commit
         issued_at_utc = $IssuedAtUtc
         expires_at_utc = $ExpiresAtUtc
     }
@@ -2021,7 +2663,9 @@ function Resolve-GovernorRetirementApprovalBinding(
     [string]$SourceCommit,
     [object]$Approval,
     [object]$TrustPolicy,
-    [object]$Issuer) {
+    [object]$Issuer,
+    [object]$OwnerPolicy = $null,
+    [object]$OwnerReceiptInput = $null) {
     # R(C) remains the original owner-issued approval for historical source C.
     # D is the release candidate. Select the closure version recorded in R(C),
     # recompute C under that exact historical/current rule, and select the
@@ -2144,6 +2788,26 @@ function Resolve-GovernorRetirementApprovalBinding(
     if ($boundIssuer -cne [string]$Issuer.issuer_identity) {
         return (& $rejected 'APPROVAL_TRUST_UNAVAILABLE' "the detached approval names issuer '$boundIssuer' but the root-owned trust policy admits only '$([string]$Issuer.issuer_identity)'")
     }
+    # AUD-5918050095-1: the trust root that admitted this issuer must be the
+    # owner-pinned policy resolved from the protected owner ref, never a trust
+    # root carried by the candidate commit being approved.
+    if (-not $OwnerPolicy -or -not [bool]$OwnerPolicy.available) {
+        return (& $rejected 'APPROVAL_OWNER_POLICY_UNAVAILABLE' "the owner-pinned release policy that admits a retirement-approval issuer could not be resolved from $($script:GovernorRetirementOwnerPolicyRef): $(if ($OwnerPolicy) { [string]$OwnerPolicy.reason } else { 'not resolved' })")
+    }
+    $ownerVerified = $null
+    try {
+        # AUD-5918050095-3: `issuer_readback_ref` is executed here. The named
+        # owner receipt is resolved through the release safe path/handle reader,
+        # its bytes must equal the approval's issuer_evidence_sha256, its
+        # detached CMS signature must verify against the owner-pinned issuer
+        # certificate, and its decoded owner decision must agree with this
+        # approval on issuer, role, operation, candidate, currentness and
+        # revocation.
+        $ownerVerified = Resolve-GovernorRetirementOwnerEvidence $OwnerReceiptInput $Repo $Issuer $OwnerPolicy $Approval
+    }
+    catch {
+        return (& $rejected 'APPROVAL_OWNER_EVIDENCE_UNVERIFIED' "the detached approval's issuer_readback_ref does not resolve to verified owner evidence: $([string]$_.Exception.Message)")
+    }
     [pscustomobject]@{
         kind = 'Retired'
         state = 'ADMITTED'
@@ -2175,6 +2839,11 @@ function Resolve-GovernorRetirementApprovalBinding(
         issuer_evidence_sha256 = (ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'issuer_evidence_sha256')).ToLowerInvariant()
         issuer_receipt_kind = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'issuer_receipt_kind')
         issuer_readback_ref = ConvertTo-GovernorApprovalString (Read-GovernorApprovalField $Approval 'issuer_readback_ref')
+        owner_evidence_content_sha256 = [string]$ownerVerified.content_sha256
+        owner_policy_ref = [string]$OwnerPolicy.owner_ref
+        owner_policy_commit = [string]$OwnerPolicy.owner_commit
+        owner_policy_sha256 = [string]$OwnerPolicy.owner_policy_sha256
+        owner_certificate_sha256 = [string]$OwnerPolicy.owner_certificate_sha256
         operation_id = [string]$shape.operation_id
         canonical_request_hash = [string]$shape.canonical_request_hash
         content_sha256 = [string]$shape.content_sha256
@@ -2223,6 +2892,11 @@ function New-GovernorRetirementApprovalReference([object]$Binding, [string]$Appr
         issuer_receipt_kind = [string]$Binding.issuer_receipt_kind
         issuer_evidence_sha256 = [string]$Binding.issuer_evidence_sha256
         issuer_readback_ref = [string]$Binding.issuer_readback_ref
+        owner_evidence_content_sha256 = [string]$Binding.owner_evidence_content_sha256
+        owner_policy_ref = [string]$Binding.owner_policy_ref
+        owner_policy_commit = [string]$Binding.owner_policy_commit
+        owner_policy_sha256 = [string]$Binding.owner_policy_sha256
+        owner_certificate_sha256 = [string]$Binding.owner_certificate_sha256
         approval_file = $script:GovernorRetirementBundleApprovalFile
         approval_file_sha256 = $ApprovalFileSha256
         trust_file = $script:GovernorRetirementBundleTrustFile
@@ -2275,6 +2949,10 @@ function New-GovernorRetirementReplayRecord([object]$Reference, [object]$Approva
         approved_denominator = [int]$Reference.closure_count
         release_candidate_denominator = [int]$Reference.candidate_closure_count
         approved_content_sha256 = [string]$Reference.content_sha256
+        owner_evidence_sha256 = [string]$Reference.issuer_evidence_sha256
+        owner_evidence_content_sha256 = [string]$Reference.owner_evidence_content_sha256
+        owner_policy_commit = [string]$Reference.owner_policy_commit
+        owner_certificate_sha256 = [string]$Reference.owner_certificate_sha256
         replay_semantics = 'EXACT_REPLAY_SAME_OWNER_DECISION; RELEASE_CANDIDATE_D_IS_SEPARATELY_BOUND'
     }
 }
@@ -2292,7 +2970,7 @@ function New-GovernorRetiredGovernorEvidence([string]$SourceCommit, [object]$Ref
     # The evidence names both time points: the owner digest remains the v1
     # approval for historical C, while the release binding identifies exact D
     # and its independently recomputed candidate closure.
-    $canonical = "$($script:GovernorRetirementApprovalDomain)|retired|$SourceCommit|$([string]$Reference.candidate_tree)|$([string]$Reference.owner_candidate_commit)|$([string]$Reference.owner_candidate_tree)|$([string]$Reference.content_sha256)|$([string]$Reference.closure_digest_sha256)|$([string]$Reference.candidate_closure_digest_sha256)|$([string]$Reference.candidate_closure_count)|$([string]$Reference.canonical_request_hash)|$([string]$Reference.issuer_evidence_sha256)|$([string]$Reference.release_policy_revision)"
+    $canonical = "$($script:GovernorRetirementApprovalDomain)|retired|$SourceCommit|$([string]$Reference.candidate_tree)|$([string]$Reference.owner_candidate_commit)|$([string]$Reference.owner_candidate_tree)|$([string]$Reference.content_sha256)|$([string]$Reference.closure_digest_sha256)|$([string]$Reference.candidate_closure_digest_sha256)|$([string]$Reference.candidate_closure_count)|$([string]$Reference.canonical_request_hash)|$([string]$Reference.issuer_evidence_sha256)|$([string]$Reference.owner_evidence_content_sha256)|$([string]$Reference.owner_policy_commit)|$([string]$Reference.release_policy_revision)"
     [ordered]@{
         kind = 'retired'
         source_commit = $SourceCommit
@@ -2306,6 +2984,10 @@ function New-GovernorRetiredGovernorEvidence([string]$SourceCommit, [object]$Ref
         trust_file_sha256 = [string]$Reference.trust_file_sha256
         issuer = [string]$Reference.issuer
         issuer_evidence_sha256 = [string]$Reference.issuer_evidence_sha256
+        owner_evidence_content_sha256 = [string]$Reference.owner_evidence_content_sha256
+        owner_policy_ref = [string]$Reference.owner_policy_ref
+        owner_policy_commit = [string]$Reference.owner_policy_commit
+        owner_certificate_sha256 = [string]$Reference.owner_certificate_sha256
         release_policy_revision = [string]$Reference.release_policy_revision
         closure_rule_set = [string]$Reference.closure_rule_set
         closure_digest_sha256 = [string]$Reference.closure_digest_sha256
