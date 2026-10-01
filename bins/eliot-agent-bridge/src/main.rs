@@ -3320,12 +3320,7 @@ fn serve_loopback_http_connection(
     runner: &mut BridgeRunner,
     provider_failure: &mut bool,
 ) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(HTTP_REQUEST_READ_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(STDOUT_WRITE_TIMEOUT))
-        .map_err(|error| error.to_string())?;
+    configure_loopback_http_deadlines(&mut stream)?;
     let mut state = McpFrontDoor::new();
     loop {
         let request = match read_loopback_http_request(&mut stream) {
@@ -3354,6 +3349,18 @@ fn serve_loopback_http_connection(
             return Ok(());
         }
     }
+}
+
+/// Applies the same finite socket deadlines to each production loopback
+/// connection before its first request read.
+fn configure_loopback_http_deadlines(stream: &mut std::net::TcpStream) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(HTTP_REQUEST_READ_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(STDOUT_WRITE_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// Admits one request through the I7.5 policy and dispatches it.
@@ -5433,24 +5440,32 @@ mod tests {
     }
 
     #[test]
-    fn loopback_http_idle_peer_times_out_without_a_request() {
+    fn loopback_http_partial_request_peer_times_out_at_production_deadline() {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds loopback");
-        let client = std::net::TcpStream::connect(
+        let mut client = std::net::TcpStream::connect(
             listener.local_addr().expect("listener has a local address"),
         )
         .expect("test client connects");
         let (mut server, _) = listener.accept().expect("test server accepts");
-        server
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("test read deadline is installed");
+        configure_loopback_http_deadlines(&mut server)
+            .expect("production loopback deadlines install on the accepted socket");
+        use std::io::Write as _;
+        client
+            .write_all(b"POST /mcp HTTP/1.1\r\n")
+            .expect("peer sends an incomplete request header");
 
+        let started = std::time::Instant::now();
         assert!(
             matches!(
                 read_loopback_http_request(&mut server),
                 LoopbackHttpRead::Eof
             ),
-            "an idle peer must be closed when its finite read deadline elapses"
+            "a peer that stalls mid-header must close when the production deadline elapses"
+        );
+        assert!(
+            started.elapsed() + Duration::from_secs(2) >= HTTP_REQUEST_READ_TIMEOUT,
+            "the peer must remain blocked until the declared production deadline"
         );
         drop(client);
     }

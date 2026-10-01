@@ -4405,8 +4405,12 @@ mod tests {
             match outcome_for(state) {
                 Err(PortFailure::TransportBindingRejected { reason }) => {
                     assert!(
-                        reason.contains("terminal"),
-                        "terminal rejection must name reconciliation"
+                        reason.contains(&format!("is {state:?}")),
+                        "typed rejection must preserve the exact durable state"
+                    );
+                    assert!(
+                        reason.contains("reconcile the exact operation"),
+                        "terminal rejection must direct exact-operation reconciliation"
                     );
                 }
                 other => panic!("expected terminal rejection, got {other:?}"),

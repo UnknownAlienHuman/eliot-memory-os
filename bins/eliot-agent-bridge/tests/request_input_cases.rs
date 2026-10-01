@@ -157,16 +157,41 @@ fn production_call_chain_has_no_unbounded_bypass_or_cloned_decoder() {
         main.contains("const HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);"),
         "loopback HTTP must keep its finite thirty-second read deadline"
     );
-    let http_connection = main
+    let http_handler = main
         .split_once("fn serve_loopback_http_connection(")
         .expect("loopback HTTP connection handler must exist")
         .1
-        .split_once("\n/// Validates the `Authorization` header as the scoped bearer credential,")
-        .expect("loopback HTTP handler must have a bounded function body")
+        .split_once("\n/// Applies the same finite socket deadlines")
+        .expect("loopback HTTP handler must end before the shared deadline helper")
         .0;
     assert!(
-        http_connection.contains(".set_read_timeout(Some(HTTP_REQUEST_READ_TIMEOUT))"),
-        "loopback HTTP handler must apply its declared read deadline"
+        http_handler.contains("configure_loopback_http_deadlines(&mut stream)?;"),
+        "production connection handler must delegate socket deadlines to the shared helper"
+    );
+    let deadline_helper = main
+        .split_once("fn configure_loopback_http_deadlines(")
+        .expect("production socket deadline helper must exist")
+        .1
+        .split_once("\n/// Admits one request through the I7.5 policy")
+        .expect("deadline helper must have a bounded body")
+        .0;
+    assert!(
+        deadline_helper.contains(".set_read_timeout(Some(HTTP_REQUEST_READ_TIMEOUT))"),
+        "shared production helper must apply the declared HTTP read deadline"
+    );
+    assert!(
+        deadline_helper.contains(".set_write_timeout(Some(STDOUT_WRITE_TIMEOUT))"),
+        "shared production helper must retain the bounded response write deadline"
+    );
+    let deadline_install = http_handler
+        .find("configure_loopback_http_deadlines(&mut stream)?;")
+        .expect("production handler must install deadlines");
+    let first_request_read = http_handler
+        .find("read_loopback_http_request(&mut stream)")
+        .expect("production handler must read the admitted request");
+    assert!(
+        deadline_install < first_request_read,
+        "production connection handler must install deadlines before its first read"
     );
     assert!(
         !decoder.contains("set_read_timeout"),
