@@ -253,10 +253,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
     /// for the `Begin` send itself, where the begin request does cross the
     /// wire; this check covers the `Page`/`End` sends, whose envelope carries
     /// only the handle and cursor.
-    fn validate_begin_scope_fence(
-        &self,
-        begin: &SnapshotBeginRequest,
-    ) -> Result<(), StoreError> {
+    fn validate_begin_scope_fence(&self, begin: &SnapshotBeginRequest) -> Result<(), StoreError> {
         self.validate_requirement_fence(&begin.scope.state_fence)?;
         Ok(())
     }
