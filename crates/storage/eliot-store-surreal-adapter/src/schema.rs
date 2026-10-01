@@ -257,23 +257,43 @@ DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
 
 pub(crate) const SCHEMA_MIGRATION_V1_TO_V2_DDL: &str = RECOVERY_TABLES_DDL;
 
-/// Erasure intent/outcome tables (688-B). Additive delta applied on top of a
-/// v2 baseline: `erasure_intent` carries the exact durable intent row bound by
+/// Forward-migration body for the v2-to-v3 step. Like the v1-to-v2 body it is a
+/// delta: no `schema_meta` redefinition, no data statements.
+///
+/// It has two halves and both are required.
+///
+/// The first is the erasure intent/outcome tables (688-B). `erasure_intent`
+/// carries the exact durable intent row bound by
 /// `erasure_transaction_bindings` (`operation_id`, `subject`, `payload_ref`,
 /// `encryption_key_ref`, `deadline_unix_ms`, `scope_id`, `surfaces`,
-/// `state_fence`, `operation_count`), and `erasure_outcome`
-/// carries the sealed per-surface outcomes (`operation_id`, `scope_id`,
-/// `outcomes`). `operation_id` is unique in each table; one intent row plus its
-/// single outcome seal per operation — never a second ledger.
+/// `state_fence`, `operation_count`), and `erasure_outcome` carries the sealed
+/// per-surface outcomes (`operation_id`, `scope_id`, `outcomes`).
+/// `operation_id` is unique in each table; one intent row plus its single outcome
+/// seal per operation — never a second ledger. `erasure_outcome.scope_id` is the
+/// *sealed* row's own copy of the single admitted scope, copied verbatim from the
+/// frozen intent that opened the transaction by `erasure_transaction_bindings`
+/// and never derived: a privacy purge ledger is read per scope, so a seal
+/// carrying only `operation_id` could not attribute its own outcomes to the scope
+/// whose data they purged. The scope the seal's identity rests on is still the
+/// intent row's, which `TX_ERASURE_INTENT` compares in the same transaction.
 ///
-/// `erasure_outcome.scope_id` is the *sealed* row's own copy of the single
-/// admitted scope, copied verbatim from the frozen intent that opened the
-/// transaction by `erasure_transaction_bindings` and never derived. A privacy
-/// purge ledger is read per scope, so a seal carrying only `operation_id` could
-/// not attribute its own outcomes to the scope whose data they purged. The
-/// scope the seal's identity rests on is still the intent row's, which
-/// `TX_ERASURE_INTENT` compares in the same transaction.
-pub(crate) const ERASURE_TABLES_DDL: &str = r"
+/// The second half is the seven `scope_id` census columns of the
+/// third-generation baseline (issue #1871). The census reads the *baseline*
+/// ([`SCHEMA_DDL_V3`]), so this delta has to create exactly the same columns: a
+/// store that arrived here by this route and a store that arrived by the
+/// baseline are both at generation 3, and declaring a column in the baseline
+/// alone would make `backup_snapshot.rs::captures_scope_column` answer `true` for
+/// a delta-route store whose tables have no such column — a predicate satisfied
+/// by evidence that does not exist. This is also the body whose digest
+/// `schema_contract.rs::is_admitted_v3_entry` compares a recorded v2-to-v3 head
+/// against, so a delta that dropped either half would stop matching a store it
+/// had legitimately produced.
+///
+/// The census columns are additive `DEFINE FIELD` statements: no table is
+/// created, none is dropped, and no row is rewritten, so a store that already
+/// carries data under these tables keeps it — see the note on
+/// [`SCHEMA_DDL_V3`] for how a row written before the column existed reads back.
+pub(crate) const SCHEMA_MIGRATION_V2_TO_V3_DDL: &str = r"
 DEFINE TABLE erasure_intent SCHEMALESS;
 DEFINE FIELD operation_id ON erasure_intent TYPE string;
 DEFINE FIELD subject ON erasure_intent TYPE string;
@@ -291,11 +311,15 @@ DEFINE FIELD operation_id ON erasure_outcome TYPE string;
 DEFINE FIELD scope_id ON erasure_outcome TYPE string;
 DEFINE FIELD outcomes ON erasure_outcome TYPE array;
 DEFINE INDEX eo_operation ON erasure_outcome FIELDS operation_id UNIQUE;
-";
 
-/// Forward-migration body for the v2-to-v3 erasure step. Like the v1-to-v2
-/// body it is a delta: no `schema_meta` redefinition, no data statements.
-pub(crate) const SCHEMA_MIGRATION_V2_TO_V3_DDL: &str = ERASURE_TABLES_DDL;
+DEFINE FIELD scope_id ON write_receipt TYPE string;
+DEFINE FIELD scope_id ON revision_head TYPE string;
+DEFINE FIELD scope_id ON canonical_event TYPE string;
+DEFINE FIELD scope_id ON projection_record TYPE string;
+DEFINE FIELD scope_id ON relation_record TYPE string;
+DEFINE FIELD scope_id ON outbox_event TYPE string;
+DEFINE FIELD scope_id ON recovery_owner TYPE string;
+";
 
 /// Notification record table (issue #1780). Additive delta in the erasure
 /// migration style: one row per dedup key with the current record, the
@@ -487,11 +511,49 @@ DEFINE FIELD value_digest ON recovery_job TYPE string;
 DEFINE INDEX rj_namespace_key ON recovery_job FIELDS namespace, key UNIQUE;
 ";
 
-/// Third-generation full schema: every v2 table verbatim plus the two
+/// Third-generation full schema: every v2 table verbatim, the `scope_id`
+/// census column on the seven scoped member tables (issue #1871), plus the two
 /// additive erasure tables (688-B). A fresh database reaches v3 by applying
 /// v1, then the v1-to-v2 delta, then the v2-to-v3 delta below, in order; the
 /// assembled body here is the checksum-level proof that the chain stays
 /// exactly additive.
+///
+/// `scope_id` is declared on exactly the tables whose owning writer already
+/// holds the admitted `PreparedTransition::scope_id` at the point it writes the
+/// row, and the write path populates it from that value verbatim — never from a
+/// second derivation and never as `None`:
+///
+/// * `write_receipt`, `canonical_event`, `projection_record`, `relation_record`
+///   and `outbox_event` are all written inside one canonical transaction by
+///   `apply/atomic_write.rs::build_apply_statements`, which has the admitted
+///   `transition` in hand for every one of them;
+/// * `revision_head` is the head of the revision key that `plan.rs::revision_keys`
+///   derives as `scope:<scope_id>` from that same admitted value;
+/// * `recovery_owner` is written by the four `append_*_owner_statement*` writers
+///   in the same transaction, each of which already receives the `transition`.
+///
+/// Two captured member tables deliberately do **not** declare the column, and
+/// `backup_snapshot.rs::captures_scope_column` therefore still reports the
+/// requested-scope closure as unproven. That is the honest state, not an
+/// oversight:
+///
+/// * `ordering_head` is keyed by an `OrderingScopeId`, a *different* identity
+///   from the admitted `ScopeId`. `plan.rs::build_apply_plan` advances one head
+///   per `transition.ordering_scopes` entry, and the Kernel derives those scopes
+///   from the observed `expected_ordering_heads` rather than from `scope_id`
+///   (`bins/eliotd/src/notification_state_emit.rs`), so a head's own scope is
+///   not the transition's scope and writing the transition's value into the row
+///   would record a scope the head does not have;
+/// * `recovery_job` carries the Dreamer ledger
+///   (`dreamer_job.rs::build_recovery_row`, whose signature takes no scope) and
+///   the restore registry (`client/backup_restore.rs`, whose batch type
+///   `CanonicalRestoreBatch` declares no `scope_id` at all). Neither writer
+///   holds a scope identity, so a column here could only ever be written `None`.
+///
+/// Closing those two honestly needs an owner this crate does not have: an
+/// `OrderingScopeId`-typed census column (or a decision that ordering heads are
+/// out of the requested-scope closure entirely) on one side, and a scope on the
+/// `CanonicalRestoreBatch` plus the Dreamer job ledger on the other.
 pub(crate) const SCHEMA_DDL_V3: &str = r"
 DEFINE TABLE schema_meta SCHEMALESS;
 DEFINE FIELD generation ON schema_meta TYPE string;
@@ -505,11 +567,13 @@ DEFINE FIELD updated_at ON schema_meta TYPE string;
 DEFINE TABLE write_receipt SCHEMALESS;
 DEFINE FIELD operation_id ON write_receipt TYPE string;
 DEFINE FIELD idempotency_key ON write_receipt TYPE string;
+DEFINE FIELD scope_id ON write_receipt TYPE string;
 DEFINE INDEX wr_operation ON write_receipt FIELDS operation_id UNIQUE;
 DEFINE INDEX wr_idempotency ON write_receipt FIELDS idempotency_key UNIQUE;
 
 DEFINE TABLE revision_head SCHEMALESS;
 DEFINE FIELD revision_key ON revision_head TYPE string;
+DEFINE FIELD scope_id ON revision_head TYPE string;
 DEFINE INDEX rh_key ON revision_head FIELDS revision_key UNIQUE;
 
 DEFINE TABLE ordering_head SCHEMALESS;
@@ -518,18 +582,22 @@ DEFINE INDEX oh_scope ON ordering_head FIELDS ordering_scope UNIQUE;
 
 DEFINE TABLE canonical_event SCHEMALESS;
 DEFINE FIELD event_id ON canonical_event TYPE string;
+DEFINE FIELD scope_id ON canonical_event TYPE string;
 DEFINE INDEX ce_id ON canonical_event FIELDS event_id UNIQUE;
 
 DEFINE TABLE projection_record SCHEMALESS;
 DEFINE FIELD publication_id ON projection_record TYPE string;
+DEFINE FIELD scope_id ON projection_record TYPE string;
 DEFINE INDEX pr_id ON projection_record FIELDS publication_id UNIQUE;
 
 DEFINE TABLE relation_record SCHEMALESS;
 DEFINE FIELD relation_id ON relation_record TYPE string;
+DEFINE FIELD scope_id ON relation_record TYPE string;
 DEFINE INDEX rr_id ON relation_record FIELDS relation_id UNIQUE;
 
 DEFINE TABLE outbox_event SCHEMALESS;
 DEFINE FIELD outbox_id ON outbox_event TYPE string;
+DEFINE FIELD scope_id ON outbox_event TYPE string;
 DEFINE INDEX oe_id ON outbox_event FIELDS outbox_id UNIQUE;
 
 DEFINE TABLE canonical_fence SCHEMALESS;
@@ -544,6 +612,7 @@ DEFINE FIELD revision ON recovery_owner TYPE int;
 DEFINE FIELD schema ON recovery_owner TYPE string;
 DEFINE FIELD payload ON recovery_owner TYPE bytes;
 DEFINE FIELD value_digest ON recovery_owner TYPE string;
+DEFINE FIELD scope_id ON recovery_owner TYPE string;
 DEFINE INDEX ro_namespace_key ON recovery_owner FIELDS namespace, key UNIQUE;
 
 DEFINE TABLE recovery_job SCHEMALESS;
@@ -698,18 +767,23 @@ pub(crate) fn forward_migration_sql() -> String {
     )
 }
 
-/// Forward migration from a v2 baseline to the v3 erasure schema: creates
-/// only the `erasure_intent` and `erasure_outcome` tables under exactly the
-/// same fence plus predecessor (`migrations[0]`) guards as the v1-to-v2
-/// forward migration above. The caller supplies the v2 predecessor bindings
-/// through the same `forward_migration_expected_bindings` shape.
+/// Forward migration from a v2 baseline to the v3 schema: applies
+/// [`SCHEMA_MIGRATION_V2_TO_V3_DDL`] — the erasure tables and the seven
+/// `scope_id` census columns — under exactly the same fence plus predecessor
+/// (`migrations[0]`) guards as the v1-to-v2 forward migration above. The caller
+/// supplies the v2 predecessor bindings through the same
+/// `forward_migration_expected_bindings` shape.
+///
+/// It applies the *delta* constant rather than the erasure-only body precisely
+/// so a store arriving at generation 3 through this transaction receives the
+/// same columns the census reads in the baseline.
 #[allow(dead_code)]
 pub(crate) fn erasure_forward_migration_sql() -> String {
     format!(
         "{} {} {} {} {} {}",
         TX_BEGIN,
         TX_GUARD_FENCE,
-        ERASURE_TABLES_DDL.trim(),
+        SCHEMA_MIGRATION_V2_TO_V3_DDL.trim(),
         TX_GUARD_SCHEMA_PREDECESSOR,
         TX_UPDATE_SCHEMA_META_CAS,
         TX_COMMIT

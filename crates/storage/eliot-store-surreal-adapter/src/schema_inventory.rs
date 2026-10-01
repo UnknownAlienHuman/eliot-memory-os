@@ -164,7 +164,7 @@ pub(crate) static EMBEDDED_SCHEMA_BODIES: [EmbeddedSchemaBody; 10] = [
         predecessor_generation: Some(schema::GENERATION_V2),
         ddl: schema::SCHEMA_MIGRATION_V2_TO_V3_DDL,
         disposition: BodyDisposition::ExecutableGraph,
-        note: "additive v2-to-v3 delta; the same bytes as the ERASURE_TABLES_DDL body it aliases. Admitted so a store already carrying a schema_meta row can reach the generation its capture census is built for; it is the forward route into generation 3, while the baseline below is the empty-database route",
+        note: "additive v2-to-v3 delta: the erasure tables plus the seven scope_id census columns the baseline below declares inline. Admitted so a store already carrying a schema_meta row can reach the generation its capture census is built for; it is the forward route into generation 3, while the baseline below is the empty-database route. Both routes must create the same census columns, because the census classifies against the baseline text",
         pinned_sha256: None,
     },
     EmbeddedSchemaBody {

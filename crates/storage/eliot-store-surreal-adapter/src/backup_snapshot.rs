@@ -817,6 +817,27 @@ const SOURCE_PURGE_LEDGER_TABLES: &[&str] = &[
 /// A scope-to-record closure needs a physical column to filter on. This is the
 /// same baseline text the census classifies against, so the answer changes with
 /// the generation the adapter admits and never with a hand-maintained list.
+///
+/// Seven of the nine non-erasure captured tables now declare it in the admitted
+/// third-generation baseline, each populated by the writer that already held the
+/// admitted `PreparedTransition::scope_id` (see `schema::SCHEMA_DDL_V3`). Two do
+/// not, and this predicate therefore still answers `false` — correctly, because
+/// their owning writers hold no scope to record:
+///
+/// * `ordering_head` is keyed by an `OrderingScopeId`, a different identity
+///   from the admitted `ScopeId`, and one head is advanced per
+///   `transition.ordering_scopes` entry. Recording the transition's scope would
+///   attach to the head a scope it does not have.
+/// * `recovery_job` is written by the Dreamer ledger, whose row builder takes no
+///   scope, and by the restore registry, whose `CanonicalRestoreBatch` declares
+///   no `scope_id`. A column here could only be written `None`.
+///
+/// The predicate is deliberately left demanding the column on *every* captured
+/// member. Relaxing it to the seven tables that have one would make this return
+/// `true` and close [`EcxfCaptureGap::RequestedScopeClosureUnproven`] while two
+/// captured tables still have no provable scope — the census would then assert a
+/// requested-scope closure it has not observed. Closing the gap honestly needs
+/// an owner this crate does not have, so the gap stands.
 fn captures_scope_column(ddl: &'static str) -> bool {
     captured_member_tables()
         .all(|table| ddl.contains(&format!("DEFINE FIELD scope_id ON {table} ")))

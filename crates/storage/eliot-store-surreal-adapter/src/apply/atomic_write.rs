@@ -651,6 +651,13 @@ fn build_apply_statements(
         "revision_record".to_owned(),
         json!({
             "revision_key": revision.key.to_string(),
+            // The revision key is `scope:<scope_id>` (see
+            // `plan.rs::revision_keys`), so the head belongs to exactly the one
+            // admitted scope its key already names. The column carries that
+            // same admitted value verbatim — the same string the key was built
+            // from — so a census filter on the column and a read of the key
+            // cannot disagree. Nothing is derived here.
+            "scope_id": transition.scope_id.to_string(),
             "body": to_value(revision)?,
         }),
     );
@@ -718,6 +725,11 @@ fn build_apply_statements(
             json!({
                 "event_id": event_id.to_string(),
                 "operation_id": operation_id,
+                // The event is the one immutable event this transition commits
+                // (`plan.rs::event_ids` admits exactly one), so the transition's
+                // admitted scope is the event's own scope, not a guess about
+                // which of several scopes it might belong to.
+                "scope_id": transition.scope_id.to_string(),
                 "body": to_value(&plan.canonical_event)?,
                 "audit_chain_digest": plan.audit_chain_digest,
             }),
@@ -739,6 +751,9 @@ fn build_apply_statements(
             format!("projection{suffix}"),
             json!({
                 "publication_id": projection.publication_id.to_string(),
+                // A publication record is derived from this transition alone, so
+                // the admitted scope is the scope it was published under.
+                "scope_id": transition.scope_id.to_string(),
                 "body": to_value(projection)?,
             }),
         );
@@ -764,6 +779,11 @@ fn build_apply_statements(
                 "relation_id": relation_id,
                 "relation_kind": relation_kind,
                 "operation_id": operation_id,
+                // The relation row's own `operation_id` names the write receipt
+                // this edge points into; that receipt was issued from the same
+                // admitted `transition`, so the edge and its target cannot
+                // disagree about the scope they were admitted under.
+                "scope_id": transition.scope_id.to_string(),
                 "state_fence": transition.state_fence,
             }),
         );
@@ -785,6 +805,10 @@ fn build_apply_statements(
             json!({
                 "outbox_id": outbox.outbox_id.to_string(),
                 "operation_id": operation_id,
+                // One outbox intent per event of this transition
+                // (`plan.rs::outbox_records`), so the admitted scope is the
+                // scope the delivery was queued under.
+                "scope_id": transition.scope_id.to_string(),
                 "sequence": outbox.sequence,
                 "body": to_value(outbox)?,
             }),
@@ -824,6 +848,16 @@ fn build_apply_statements(
         json!({
             "operation_id": receipt.operation_id.to_string(),
             "idempotency_key": receipt.idempotency_key,
+            // The admitted scope of the transition this receipt linearizes. This
+            // is the SAME value the receipt's own envelope already carries at
+            // `body.envelope.core.work_scope.scope_id` —
+            // `eliot_store_api::issue_store_receipt_envelope` renders it from
+            // `transition.scope_id` verbatim — so the column is a copy of a value
+            // the row already holds, not a second derivation of it. That matters
+            // because `TX_ERASURE_SCRUB_AUTHORITY` already filters on the
+            // in-body copy (`body.envelope.core.work_scope.scope_id`); the two
+            // must never be able to disagree.
+            "scope_id": transition.scope_id.to_string(),
             "body": to_value(receipt)?,
             // Opaque payload authorities (issue #10): exact versioned,
             // digest-bound bytes persisted alongside — never inside —
@@ -968,6 +1002,15 @@ fn append_module_registry_owner_statement(
         "value_digest".to_owned(),
         json!(eliot_store_api::sha256_hex(payload)),
     );
+    // The admitted scope of the transition that advanced this owner image,
+    // copied verbatim from the transition this writer already holds. The
+    // capability-evidence owner writer below has always recorded it this way;
+    // this closes the same column for the module-registry image rather than
+    // leaving one shared table's rows carrying a scope and others not.
+    record.insert(
+        "scope_id".to_owned(),
+        json!(transition.scope_id.to_string()),
+    );
 
     sql.push_str(schema::TX_MODULE_REGISTRY_OWNER);
     bindings.insert(
@@ -1063,6 +1106,12 @@ fn append_finish_evidence_owner_statement(
         "value_digest".to_owned(),
         json!(eliot_store_api::sha256_hex(payload)),
     );
+    // The admitted scope of the transition that advanced this owner image,
+    // copied verbatim from the transition this writer already holds.
+    record.insert(
+        "scope_id".to_owned(),
+        json!(transition.scope_id.to_string()),
+    );
 
     sql.push_str(schema::TX_CANONICAL_OWNER);
     bindings.insert(
@@ -1156,6 +1205,12 @@ fn append_finish_owner_statement(
     record.insert(
         "value_digest".to_owned(),
         json!(eliot_store_api::sha256_hex(payload)),
+    );
+    // The admitted scope of the transition that advanced this owner image,
+    // copied verbatim from the transition this writer already holds.
+    record.insert(
+        "scope_id".to_owned(),
+        json!(transition.scope_id.to_string()),
     );
 
     sql.push_str(schema::TX_FINISH_OWNER);
