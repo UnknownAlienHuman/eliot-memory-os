@@ -11,8 +11,9 @@ use std::num::NonZeroU64;
 
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupError, BackupInput, EventRange,
-    ExportFence, OrsSnapshotFence, WatchdogSpoolFence, WrappedKeyEntry, WrappedKeyManifest,
-    issue_full_recovery, issue_restoration_receipts, verify_key_coverage,
+    ExportFence, OrsSnapshotFence, SchemaGenerationObservation, SourceObservation,
+    WatchdogSpoolFence, WrappedKeyEntry, WrappedKeyManifest, issue_full_recovery,
+    issue_restoration_receipts, verify_key_coverage,
 };
 use eliot_blob_api::{
     BlobHash, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor, ObjectResidencyKey,
@@ -103,6 +104,13 @@ fn full_input_with_blob() -> BackupInput {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-1873p".to_owned(),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: "schema-1".to_owned(),
+                observation: SourceObservation {
+                    observed_by: "test-adapter".to_owned(),
+                    observed_at: source_fence.clone(),
+                },
+            }),
             store_generation: "store-1873p".to_owned(),
             state_fence: source_fence.clone(),
             scope_id: None,

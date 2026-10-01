@@ -17,7 +17,8 @@ use std::num::NonZeroU64;
 use eliot_backup::{
     BackupArtifact, BackupBlob, BackupBundle, BackupClass, BackupError, BackupInput,
     CanonicalRecord, EventRange, ExportFence, OrsSnapshotFence, RestoreArchiveDisposition,
-    RestoreArchiveDispositionKind, RestoreEvidenceLevel, WatchdogSpoolFence,
+    RestoreArchiveDispositionKind, RestoreEvidenceLevel, SchemaGenerationObservation,
+    SourceObservation, WatchdogSpoolFence,
 };
 use eliot_blob_api::{
     BlobHash, BlobId, BlobLocator, CompressionDescriptor, CryptoDescriptor, ObjectResidencyKey,
@@ -107,6 +108,13 @@ fn export_fence(blobs: &[BackupBlob], event_count: u64) -> ExportFence {
     };
     ExportFence {
         export_id: "export-948-b".to_owned(),
+        schema_generation: Some(SchemaGenerationObservation {
+            generation: "schema-1".to_owned(),
+            observation: SourceObservation {
+                observed_by: "test-adapter".to_owned(),
+                observed_at: fence(),
+            },
+        }),
         store_generation: "store-948-b".to_owned(),
         state_fence: fence(),
         scope_id: None,
@@ -186,6 +194,13 @@ fn full_input() -> BackupInput {
         schema_generation: "schema-1".to_owned(),
         export_fence: ExportFence {
             export_id: "export-948-b-full".to_owned(),
+            schema_generation: Some(SchemaGenerationObservation {
+                generation: "schema-1".to_owned(),
+                observation: SourceObservation {
+                    observed_by: "test-adapter".to_owned(),
+                    observed_at: fence(),
+                },
+            }),
             store_generation: "store-948-b".to_owned(),
             state_fence: source_fence.clone(),
             scope_id: None,
