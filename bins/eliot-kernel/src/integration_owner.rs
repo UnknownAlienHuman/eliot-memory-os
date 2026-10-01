@@ -364,10 +364,7 @@ pub fn advance_integration_owner(
             pressure,
         }),
         Err(IntegrationLeaseError::StaleMarked { stale }) => {
-            Ok(OwnerAdvanceOutcome::StaleRecorded {
-                stale,
-                pressure,
-            })
+            Ok(OwnerAdvanceOutcome::StaleRecorded { stale, pressure })
         }
         Err(other) => Err(IntegrationOwnerError::Lease(Box::new(other))),
     }
