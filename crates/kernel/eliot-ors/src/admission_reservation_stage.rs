@@ -118,6 +118,7 @@
 use eliot_contracts::EpochId;
 use eliot_receipts::ReceiptIdentity;
 use serde::{Deserialize, Serialize};
+use eliot_store_api::WorkAdmissionSemanticRevision;
 
 use crate::{
     AdmissionReservationActivatedOutcome, AdmissionReservationActivationEvidence,
@@ -722,15 +723,15 @@ pub enum CanonicalAdmissionUnknownReason {
 /// breaking change for every reservation staged under the old revision, so the
 /// revision travels inside the preimage: two different revisions can never
 /// collide on one reservation identity.
-pub const ADMISSION_RESERVATION_STAGE_VERSION: u16 = 1;
+pub const ADMISSION_RESERVATION_STAGE_VERSION: u16 = 2;
 
 /// Domain separator binding a derived identity to this exact contract and
 /// revision. Without it a derived digest could collide with any other ORS
 /// identity derived from the same immutable inputs.
-const RESERVATION_IDENTITY_DOMAIN: &str = "eliot.ors.admission-reservation.identity.v1";
+const RESERVATION_IDENTITY_DOMAIN: &str = "eliot.ors.admission-reservation.identity.v2";
 
 /// Domain separator binding a proposed-attempt identity to this saga half.
-const PROPOSED_ATTEMPT_DOMAIN: &str = "eliot.ors.admission-reservation.attempt.v1";
+const PROPOSED_ATTEMPT_DOMAIN: &str = "eliot.ors.admission-reservation.attempt.v2";
 
 /// The exact immutable inputs one reservation identity is derived from.
 ///
@@ -746,7 +747,9 @@ pub struct AdmissionReservationIdentityInput {
     /// Attempt identity proposed before canonical admission.
     pub proposed_attempt_id: OperationIdentity,
     /// Exact semantic admission revision this reservation is bound to.
-    pub semantic_admission_revision: String,
+    pub semantic_admission_revision: WorkAdmissionSemanticRevision,
+    /// Owner-observed predecessor for the original canonical owner CAS.
+    pub semantic_admission_predecessor_revision: u64,
     /// Complete immutable claim set the reservation reserves.
     pub claims: AdmissionReservationClaims,
     /// Exact State Fence observed for this admission proposal.
@@ -789,16 +792,17 @@ pub fn admission_reservation_identity(
             reason: "work item and proposed attempt identities must be non-blank",
         });
     }
-    crate::model::validate_text(
-        &input.semantic_admission_revision,
-        "admission_reservation.semantic_admission_revision",
-    )?;
+    input
+        .semantic_admission_revision
+        .validate_owner_canonical(input.semantic_admission_predecessor_revision)
+        .map_err(|_| OrsError::ReconciliationMismatch)?;
     let preimage = serde_json::to_vec(&(
         RESERVATION_IDENTITY_DOMAIN,
         ADMISSION_RESERVATION_STAGE_VERSION,
         &input.work_item_id,
         &input.proposed_attempt_id,
         &input.semantic_admission_revision,
+        input.semantic_admission_predecessor_revision,
         &input.claims,
         &input.state_fence,
         &input.authority_epoch,
@@ -851,6 +855,7 @@ pub fn proposed_attempt_identity(
         ADMISSION_RESERVATION_STAGE_VERSION,
         &input.work_item_id,
         &input.semantic_admission_revision,
+        input.semantic_admission_predecessor_revision,
         &input.claims,
         &input.state_fence,
         &input.authority_epoch,
@@ -988,6 +993,10 @@ pub struct AdmissionReservationStageRequest {
     pub work_item_id: OperationIdentity,
     /// Stable proposed attempt identity.
     pub proposed_attempt_id: OperationIdentity,
+    /// Exact semantic revision proposed by the canonical admission owner.
+    pub semantic_admission_revision: WorkAdmissionSemanticRevision,
+    /// Exact predecessor captured from the same owner state before staging.
+    pub semantic_admission_predecessor_revision: u64,
     /// ORS operation identity for this first stage.
     pub operation_id: OperationIdentity,
     /// Exact complete owner-defined claims (resource, lane, environment,
@@ -1057,6 +1066,10 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
     // The immutable binding is validated BEFORE the write with the existing
     // validators, by value, against the ORIGINAL recorded fence and epoch.
     request.claims.validate()?;
+    request
+        .semantic_admission_revision
+        .validate_owner_canonical(request.semantic_admission_predecessor_revision)
+        .map_err(|_| OrsError::ReconciliationMismatch)?;
     request.authority_epoch.validate()?;
     request
         .state_fence
@@ -1075,6 +1088,10 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         reservation_id: request.reservation_id.clone(),
         work_item_id: request.work_item_id.clone(),
         proposed_attempt_id: request.proposed_attempt_id.clone(),
+        semantic_admission_revision: Some(request.semantic_admission_revision.clone()),
+        semantic_admission_predecessor_revision: Some(
+            request.semantic_admission_predecessor_revision,
+        ),
         stage_operation_id: request.operation_id.clone(),
         operation_id: request.operation_id.clone(),
         claims: request.claims.clone(),
@@ -1098,6 +1115,8 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         reservation_id: request.reservation_id.clone(),
         work_item_id: request.work_item_id.clone(),
         proposed_attempt_id: request.proposed_attempt_id.clone(),
+        semantic_admission_revision: request.semantic_admission_revision.clone(),
+        semantic_admission_predecessor_revision: request.semantic_admission_predecessor_revision,
         operation_id: request.operation_id.clone(),
         claims: request.claims.clone(),
         authority_epoch: request.authority_epoch.clone(),
@@ -1117,6 +1136,9 @@ pub fn stage_admission_reservation_inactive<S: OperationalRecoveryStore + ?Sized
         || staged.record().state != candidate.state
         || staged.record().work_item_id != candidate.work_item_id
         || staged.record().proposed_attempt_id != candidate.proposed_attempt_id
+        || staged.record().semantic_admission_revision != candidate.semantic_admission_revision
+        || staged.record().semantic_admission_predecessor_revision
+            != candidate.semantic_admission_predecessor_revision
         || staged.record().operation_id != candidate.operation_id
         || staged.record().expires_at_ms != candidate.expires_at_ms
         || staged.record().canonical_admission.is_some()

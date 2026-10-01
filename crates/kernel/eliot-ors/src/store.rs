@@ -33237,6 +33237,10 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             reservation_id: stage.reservation_id,
             work_item_id: stage.work_item_id,
             proposed_attempt_id: stage.proposed_attempt_id,
+            semantic_admission_revision: Some(stage.semantic_admission_revision),
+            semantic_admission_predecessor_revision: Some(
+                stage.semantic_admission_predecessor_revision,
+            ),
             stage_operation_id,
             operation_id: stage.operation_id,
             claims: stage.claims,
@@ -33273,6 +33277,9 @@ impl OperationalRecoveryStore for RedbRecoveryStore {
             let same_stage_request = existing_record.reservation_id == record.reservation_id
                 && existing_record.work_item_id == record.work_item_id
                 && existing_record.proposed_attempt_id == record.proposed_attempt_id
+                && existing_record.semantic_admission_revision == record.semantic_admission_revision
+                && existing_record.semantic_admission_predecessor_revision
+                    == record.semantic_admission_predecessor_revision
                 && existing_record.stage_operation_id == record.stage_operation_id
                 && existing_record.claims == record.claims
                 && existing_record.authority_epoch == record.authority_epoch

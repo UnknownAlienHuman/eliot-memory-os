@@ -122,6 +122,7 @@ pub use native_worker_material::{
     NativeWorkerRetainedProviderMaterialResolveRequestV1,
     NativeWorkerRetainedProviderMaterialResolveResponseV1,
     NativeWorkerRetainedProviderMaterialRefV1,
+    NativeWorkerPromptRetentionReceiptV1,
 };
 
 mod work_admission;
