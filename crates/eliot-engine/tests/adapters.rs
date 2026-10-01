@@ -7,11 +7,11 @@ use eliot_engine::{
 };
 use eliot_store::{BlobStore, CanonicalStore, ControlWal};
 use eliot_types::{
-    AdapterAuthorityProfile, AdapterCapability, AdapterClass, AdapterResult, AdapterResultStatus,
-    AdapterState, AgentHostId, BlackboardItemKind, BlobStoreConfig, CapabilityManifest,
-    ControlWalConfig, GovernorConfig, MailboxMessageKind, ModuleAuthorityProfile, ModuleCapability,
-    OperationPhase, OperationReconciliationState, ProviderDeclaredBudget, ProviderDispatchState,
-    ProviderRoutePolicy, TaintClass,
+    AdapterAuthorityProfile, AdapterCapability, AdapterCircuitState, AdapterClass, AdapterResult,
+    AdapterResultStatus, AdapterState, AgentHostId, BlackboardItemKind, BlobStoreConfig,
+    CapabilityManifest, ControlWalConfig, GovernorConfig, MailboxMessageKind,
+    ModuleAuthorityProfile, ModuleCapability, OperationPhase, OperationReconciliationState,
+    ProviderDeclaredBudget, ProviderDispatchState, ProviderRoutePolicy, TaintClass,
 };
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -343,6 +343,7 @@ async fn adapter_supervisor_circuit_breaker_opens() -> TestResult {
     let health = supervisor.health_probe("test-failing").await;
     assert_eq!(health.state, AdapterState::CircuitOpen);
     assert!(health.circuit_open);
+    assert_eq!(health.consecutive_failures, 5);
     Ok(())
 }
 
@@ -409,15 +410,23 @@ async fn adapter_supervisor_does_not_redispatch_before_provider_dispatch() -> Te
         .ok_or_else(|| std::io::Error::other("restart checkpoint missing"))?;
     assert_eq!(checkpoint.generation, 1);
     assert_eq!(checkpoint.restart_count, 0);
+    assert_eq!(checkpoint.dispatch_state, ProviderDispatchState::NotStarted);
     assert_eq!(checkpoint.phase, OperationPhase::Failed);
     let window = runtime
         .load_restart_window("flaky-external")
         .await?
         .ok_or_else(|| std::io::Error::other("restart window missing"))?;
     assert!(window.restart_timestamps.is_empty());
+    assert_eq!(window.key, "flaky-external");
+    assert_eq!(window.consecutive_failures, 1);
+    assert_eq!(window.circuit_state, AdapterCircuitState::Closed);
     assert!(window.last_failure_at.is_some());
     assert!(window.last_success_at.is_none());
-    assert!(window.last_failure_class.is_some());
+    assert_eq!(window.last_failure_class.as_deref(), Some("adapter_failure"));
+    assert_eq!(
+        window.last_failure_at.as_deref(),
+        Some(window.updated_at.as_str())
+    );
     assert_eq!(
         window.last_terminal_operation_ref.as_deref(),
         Some(operation_id.as_str())

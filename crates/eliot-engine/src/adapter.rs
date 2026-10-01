@@ -77,6 +77,7 @@ enum CircuitEvent {
     Success,
     TransportFailure,
     IntegrityFailure,
+    AdapterFailure,
     HalfOpenProbe,
 }
 
@@ -527,6 +528,7 @@ impl AdapterSupervisor {
             AdapterResultStatus::Succeeded => CircuitEvent::Success,
             AdapterResultStatus::TransportFailure => CircuitEvent::TransportFailure,
             AdapterResultStatus::IntegrityFailure => CircuitEvent::IntegrityFailure,
+            AdapterResultStatus::Failed => CircuitEvent::AdapterFailure,
             _ => return None,
         };
         let Ok(mut circuits) = self.circuits.lock() else {
@@ -539,7 +541,9 @@ impl AdapterSupervisor {
                 record.circuit_open = false;
                 record.state = AdapterState::Healthy;
             }
-            AdapterResultStatus::TransportFailure | AdapterResultStatus::IntegrityFailure => {
+            AdapterResultStatus::TransportFailure
+            | AdapterResultStatus::IntegrityFailure
+            | AdapterResultStatus::Failed => {
                 record.consecutive_failures += 1;
                 let threshold = self
                     .registry
@@ -667,6 +671,10 @@ impl AdapterSupervisor {
                 window.last_failure_at = Some(now_epoch.to_string());
                 window.last_failure_class = Some("integrity_failure".to_owned());
             }
+            CircuitEvent::AdapterFailure => {
+                window.last_failure_at = Some(now_epoch.to_string());
+                window.last_failure_class = Some("adapter_failure".to_owned());
+            }
             CircuitEvent::Success => {
                 window.last_success_at = Some(now_epoch.to_string());
             }
@@ -679,12 +687,16 @@ impl AdapterSupervisor {
         window.circuit_state = match event {
             CircuitEvent::HalfOpenProbe => AdapterCircuitState::HalfOpen,
             CircuitEvent::Success => AdapterCircuitState::Closed,
-            CircuitEvent::TransportFailure | CircuitEvent::IntegrityFailure
+            CircuitEvent::TransportFailure
+            | CircuitEvent::IntegrityFailure
+            | CircuitEvent::AdapterFailure
                 if record.circuit_open =>
             {
                 AdapterCircuitState::Open
             }
-            CircuitEvent::TransportFailure | CircuitEvent::IntegrityFailure => {
+            CircuitEvent::TransportFailure
+            | CircuitEvent::IntegrityFailure
+            | CircuitEvent::AdapterFailure => {
                 AdapterCircuitState::Closed
             }
         };

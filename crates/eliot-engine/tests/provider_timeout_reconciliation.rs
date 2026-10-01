@@ -133,27 +133,34 @@ fn process_facts_terminalize_before_local_output_admission() -> TestResult {
 
 #[test]
 fn legacy_attempt_without_route_policy_remains_loadable() -> TestResult {
+    // The accepted ProviderInvocationAttempt decoder contract in
+    // eliot-types/src/provider_invocation.rs makes this required-nullable:
+    // explicit null decodes to None, while omission is a typed missing-field error.
     let root = temp_root("legacy-load");
-    let path = root.join("runtime/provider-invocations/legacy-load.json");
-    fs::create_dir_all(path.parent().ok_or("legacy attempt parent missing")?)?;
-    let mut value = serde_json::to_value(attempt("legacy-load"))?;
-    let object = value
+    let nullable_id = "legacy-load-null-policy";
+    let nullable_path = root.join(format!("runtime/provider-invocations/{nullable_id}.json"));
+    fs::create_dir_all(nullable_path.parent().ok_or("legacy attempt parent missing")?)?;
+    let mut nullable_value = serde_json::to_value(attempt(nullable_id))?;
+    nullable_value["provider_route_policy"] = serde_json::Value::Null;
+    fs::write(&nullable_path, serde_json::to_vec_pretty(&nullable_value)?)?;
+
+    let loaded = ProviderInvocationJournal::new(&root).load(nullable_id)?;
+    assert!(loaded.provider_route_policy.is_none());
+    assert!(loaded.process_reap_receipt.is_none());
+
+    let missing_id = "legacy-load-missing-policy";
+    let missing_path = root.join(format!("runtime/provider-invocations/{missing_id}.json"));
+    let mut missing_value = serde_json::to_value(attempt(missing_id))?;
+    let object = missing_value
         .as_object_mut()
         .ok_or("attempt did not serialize as an object")?;
     object.remove("provider_route_policy");
-    object.remove("process_reap_receipt");
-    object.remove("process_timed_out");
-    object.remove("process_cancelled");
-    object.remove("process_worker_error");
-    object.remove("stdout_total_bytes");
-    object.remove("stderr_total_bytes");
-    object.remove("stdout_truncated");
-    object.remove("stderr_truncated");
-    fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+    fs::write(&missing_path, serde_json::to_vec_pretty(&missing_value)?)?;
 
-    let loaded = ProviderInvocationJournal::new(&root).load("legacy-load")?;
-    assert!(loaded.provider_route_policy.is_none());
-    assert!(loaded.process_reap_receipt.is_none());
+    let error = ProviderInvocationJournal::new(&root)
+        .load(missing_id)
+        .expect_err("a missing required route-policy field must be rejected");
+    assert!(error.to_string().contains("provider_route_policy"));
     cleanup(&root);
     Ok(())
 }
