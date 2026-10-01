@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use eliot_contracts::sha256_hex;
-use eliot_platform_windows::{ProtectedRuntimePathLease, windows_paths_equal};
+use eliot_platform_windows::{
+    EventLogError, ProtectedRuntimePathLease, validate_event_log_insertion, windows_paths_equal,
+};
 use eliot_watchdog_core::{
     WatchdogSpoolAcknowledgement, WatchdogSpoolCursor, WatchdogSpoolExportBatch,
     WatchdogSpoolExportEntry, WatchdogSpoolPayloadKind, WatchdogSpoolReconciliationError,
@@ -2791,6 +2793,729 @@ fn validate_intent_submission_receipt(
         }
     }
     Ok(())
+}
+
+/// Responsiveness-audit ledger: the spool half of dual audit streams (issue
+/// #1757 W12).
+///
+/// Every challenge, timeout, denied/budget-exhausted decision, SCM request,
+/// and SCM readback is persisted here correlated by operation/policy/target
+/// identity, and its Event Log delivery is recorded here as an independent
+/// fact. Spool persistence never implies delivery and delivery never implies
+/// visibility: the strongest delivery state is OS acceptance, and no code
+/// claims visibility until the actual event can be read back.
+///
+/// Split-phase shape, stated exactly: [`WatchdogSpool::persist_responsiveness_audit`]
+/// validates and durably stores the audit row with delivery
+/// [`WatchdogAuditDelivery::Pending`], then hands the returned insertion
+/// string to the owner-lane finite handoff; the handoff runs the blocking
+/// owner-port report off the control path with at most one in-flight report
+/// per row and a bounded wait of [`AUDIT_EVENT_LOG_HANDOFF_TIMEOUT_MS`]
+/// milliseconds. A wait that times out abandons the wait only — the
+/// synchronous OS call runs on, delivery stays pending, and the timed-out
+/// row is never resubmitted by replaying its SCM effect. The owner lane
+/// settles the row through
+/// [`WatchdogSpool::settle_responsiveness_audit_delivery`] with the typed
+/// port outcome, and gates effects through [`audit_effect_gate`] under the
+/// predeclared `audit_failure_refuses_effects` policy.
+///
+/// Redaction by construction: rows carry operation identity, policy/target
+/// digests, closed kind/decision codes, and delivery state only. There is no
+/// nonce, credential, raw path, or user-data field anywhere in this ledger,
+/// and the insertion admits only the fixed `watchdog_audit` vocabulary that
+/// already passed the owner port's redaction gate.
+///
+/// STITCH (owner rule, one writer per shared file): the composition lane
+/// calls persist/settle/readback plus the gate around its fenced stop/start
+/// operation; the #984 owner lane exports the `EliotWatchdog` port symbols
+/// and the #889 consumer admits them to its bounded writer; installer
+/// provisioning owns source installation. This file performs no SCM effect,
+/// opens no second database, and retries nothing.
+///
+/// Per-row table inside the same `watchdog.redb` file, keyed by audit
+/// sequence starting at 1. Key 0 holds the allocator ledger row; rows never
+/// move, so a delivery settlement can never relocate onto another audit.
+pub const SPOOL_RESPONSIVENESS_AUDIT_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("eliot_watchdog_spool_responsiveness_audit_v1");
+/// Storage revision of one responsiveness-audit row and its ledger row.
+///
+/// A future shape change refuses to reinterpret existing rows instead of
+/// mixing generations.
+pub const RESPONSIVENESS_AUDIT_SCHEMA_VERSION: u16 = 1;
+/// Reserved key of the allocator ledger row inside the audit table.
+const RESPONSIVENESS_AUDIT_LEDGER_KEY: u64 = 0;
+/// Retention ceiling for responsiveness-audit rows.
+///
+/// Small against `SPOOL_MAX_RECORDS`: the ledger evicts the oldest rows past
+/// this ceiling exactly like the main spool evicts past its own ceiling, so
+/// audit retention stays bounded without a second store.
+pub const RESPONSIVENESS_AUDIT_MAX_ROWS: u64 = 256;
+/// Bound for one persisted operation/policy/target identity string.
+///
+/// Operation identities are short owner-issued names and digests are
+/// lowercase hex; the cap keeps rows tiny and fails closed on corrupt
+/// oversized values.
+pub const RESPONSIVENESS_AUDIT_IDENTITY_MAX: usize = 128;
+/// Bound for one persisted kind/decision code string.
+pub const RESPONSIVENESS_AUDIT_CODE_MAX: usize = 64;
+/// Bound for one persisted delivery-outcome name.
+pub const RESPONSIVENESS_AUDIT_OUTCOME_MAX: usize = 32;
+/// Finite Event Log handoff wait bound, in milliseconds.
+///
+/// The owner-lane asynchronous handoff waits at most this long for the single
+/// in-flight report of one audit row. Expiry abandons the wait only: it never
+/// cancels the synchronous OS call, never replays the SCM effect, and never
+/// claims delivery — the row stays pending and failure-closed under the
+/// predeclared policy.
+pub const AUDIT_EVENT_LOG_HANDOFF_TIMEOUT_MS: u64 = 5_000;
+
+/// Closed kind of one responsiveness-audit row.
+///
+/// Covers exactly the W12 correlation list: challenge, timeout,
+/// denied/budget-exhausted decision, SCM request, and SCM readback. The
+/// owner lane maps these to the fixed `EliotWatchdog` port events
+/// (`ChallengeAttempted`, `ChallengeTimeout`, `RecoveryDenied`,
+/// `BudgetExhausted`, `ScmRequest`, `ScmReadback`); this ledger stores the
+/// short kind name only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum ResponsivenessAuditKind {
+    /// A responsiveness challenge record was handed to the sink.
+    ChallengeAttempted,
+    /// A competently attempted challenge timed out inside its bound.
+    ChallengeTimeout,
+    /// A recovery attempt was denied (challenge unresolved or refused).
+    RecoveryDenied,
+    /// The recovery budget is exhausted: no restart, no SCM effect.
+    BudgetExhausted,
+    /// One fenced SCM effect was requested under the admitted operation.
+    ScmRequest,
+    /// One SCM readback was reconciled against the admitted operation.
+    ScmReadback,
+}
+
+impl ResponsivenessAuditKind {
+    /// Stable kind name carried in the row and the insertion string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChallengeAttempted => "challenge_attempted",
+            Self::ChallengeTimeout => "challenge_timeout",
+            Self::RecoveryDenied => "recovery_denied",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ScmRequest => "scm_request",
+            Self::ScmReadback => "scm_readback",
+        }
+    }
+}
+
+/// Independent Event Log delivery fact for one audit row.
+///
+/// Spool persistence and this disposition are independent facts: the row's
+/// existence proves the audit was journalled, and only this field speaks
+/// about the sink. There is no visible/delivered variant by design —
+/// visibility holds only once the actual event can be read back, which no
+/// code path asserts.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum WatchdogAuditDelivery {
+    /// Journalled; the handoff is outstanding, timed out, or never ran.
+    /// Unknown by construction: never success, never failure.
+    Pending,
+    /// The OS accepted the record. Registration, downstream delivery, and
+    /// visibility stay unproven. Terminal: never overwritten by a later
+    /// failure.
+    OsAccepted,
+    /// The sink refused or was unavailable. Carries only the fixed outcome
+    /// name, never message text or insertion contents.
+    Failed {
+        /// Fixed sink-outcome name (`invalid_record`,
+        /// `event_log_unavailable`, `source_unavailable`, `report_refused`).
+        outcome: String,
+    },
+}
+
+impl WatchdogAuditDelivery {
+    /// Stable outcome name for the insertion string and diagnostics.
+    ///
+    /// Names the typed outcome only: no message text and no insertion
+    /// contents cross this boundary.
+    #[must_use]
+    pub fn outcome_name(&self) -> String {
+        match self {
+            Self::Pending => "pending".to_owned(),
+            Self::OsAccepted => "os_accepted".to_owned(),
+            Self::Failed { outcome } => format!("failed_{outcome}"),
+        }
+    }
+
+    /// Maps the owner port's typed failure to the ledger's delivery fact.
+    ///
+    /// Unavailable and unsupported ports stay `event_log_unavailable`;
+    /// refused source acquisition and refused reports keep their fixed
+    /// outcome names; pre-OS rejections stay invalid. Codes, message text,
+    /// and insertion contents never enter the row.
+    #[must_use]
+    pub fn from_port_error(error: &EventLogError) -> Self {
+        match error {
+            EventLogError::InvalidInput => Self::Failed {
+                outcome: "invalid_record".to_owned(),
+            },
+            EventLogError::Unavailable | EventLogError::UnsupportedPlatform => Self::Failed {
+                outcome: "event_log_unavailable".to_owned(),
+            },
+            EventLogError::RegistrationFailed { .. } => Self::Failed {
+                outcome: "source_unavailable".to_owned(),
+            },
+            EventLogError::ReportFailed { .. } => Self::Failed {
+                outcome: "report_refused".to_owned(),
+            },
+        }
+    }
+}
+
+/// Predeclared-policy gate for one settled audit row.
+///
+/// The installation-approved recovery policy declares
+/// `audit_failure_refuses_effects` up front; this gate obeys it after the
+/// fact instead of inventing a disposition at the irreversible boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditEffectGate {
+    /// The SCM effect may proceed under its own fence.
+    Proceed,
+    /// The SCM effect must not be requested on this audit's account.
+    RefuseEffects,
+}
+
+impl AuditEffectGate {
+    /// Stable gate name for a bounded diagnostic record.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proceed => "proceed",
+            Self::RefuseEffects => "refuse_effects",
+        }
+    }
+}
+
+/// Obeys the predeclared audit-failure disposition for one audit row.
+///
+/// A refused gate forbids requesting the SCM effect; it never retries the
+/// effect, never replays it to retry its log, and never changes a decision
+/// that is already journalled. With the flag clear, an unproven sink stays a
+/// visible pending/failed fact while the fenced operation proceeds on its
+/// own evidence.
+#[must_use]
+pub fn audit_effect_gate(
+    audit_failure_refuses_effects: bool,
+    delivery: &WatchdogAuditDelivery,
+) -> AuditEffectGate {
+    match delivery {
+        WatchdogAuditDelivery::OsAccepted => AuditEffectGate::Proceed,
+        WatchdogAuditDelivery::Pending | WatchdogAuditDelivery::Failed { .. } => {
+            if audit_failure_refuses_effects {
+                AuditEffectGate::RefuseEffects
+            } else {
+                AuditEffectGate::Proceed
+            }
+        }
+    }
+}
+
+/// Caller-supplied correlation evidence for one audit row.
+///
+/// All identities are already-redacted owner-issued values: the stable
+/// recovery-operation identity, the installation-approved policy digest, and
+/// the observed target service/epoch digests. Nonces, credentials, raw
+/// paths, and user data have no field here and must never be passed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResponsivenessAuditEvidence {
+    /// Stable recovery-operation identity correlating every audit of one
+    /// challenge through stop/start uncertainty.
+    pub operation_id: String,
+    /// Installation-approved recovery-policy digest.
+    pub policy_digest: String,
+    /// Observed target service-registration digest.
+    pub target_service_digest: String,
+    /// Observed target owner-epoch digest.
+    pub target_epoch_digest: String,
+    /// Which W12 correlation list entry this row records.
+    pub kind: ResponsivenessAuditKind,
+    /// Closed decision code (`alive_unresponsive`, `budget_exhausted`,
+    /// `scm_stop_requested`, ...): fixed vocabulary, never free text.
+    pub decision_code: String,
+}
+
+/// Durable audit row plus its validated Event Log handoff.
+///
+/// Returned by [`WatchdogSpool::persist_responsiveness_audit`]: the row is
+/// already journalled with delivery pending, and the insertion string is the
+/// exact redacted text the owner-lane handoff submits — already through the
+/// owner port's redaction gate, so the handoff never reformats or re-derives
+/// it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResponsivenessAuditTicket {
+    /// Audit sequence keying the durable row.
+    pub audit_seq: u64,
+    /// Exact `watchdog_audit` insertion string for the handoff to submit.
+    pub event_log_insertion: String,
+}
+
+/// One journalled responsiveness audit: the spool fact and its independent
+/// delivery fact together.
+///
+/// Read back through [`WatchdogSpool::read_responsiveness_audits`]; the row
+/// key always equals `audit_seq`, so a settlement can never relocate onto
+/// another audit.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredResponsivenessAudit {
+    /// Storage revision that wrote this row.
+    pub schema_version: u16,
+    /// Audit sequence; always equals the table key of this row.
+    pub audit_seq: u64,
+    /// Stable recovery-operation identity.
+    pub operation_id: String,
+    /// Installation-approved recovery-policy digest.
+    pub policy_digest: String,
+    /// Observed target service-registration digest.
+    pub target_service_digest: String,
+    /// Observed target owner-epoch digest.
+    pub target_epoch_digest: String,
+    /// Which W12 correlation list entry this row records.
+    pub kind: ResponsivenessAuditKind,
+    /// Closed decision code.
+    pub decision_code: String,
+    /// Owner clock at journal time, milliseconds since the Unix epoch.
+    pub created_at_ms: u64,
+    /// Independent Event Log delivery fact.
+    pub delivery: WatchdogAuditDelivery,
+}
+
+/// Allocator ledger row stored under key 0 of the audit table.
+///
+/// Rows are assigned `next_seq` then the allocator advances, and retention
+/// evicts from `first_seq` upward exactly like the main spool, so assigned
+/// keys stay contiguous and readback walks them without a table scan.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsivenessAuditLedger {
+    schema_version: u16,
+    next_seq: u64,
+    first_seq: u64,
+    count: u64,
+}
+
+/// Fails closed on a correlation identity that is not digest-shaped.
+///
+/// Accepts ASCII alphanumerics plus `-_.` only, inside its length bound, so
+/// raw paths, user data, and credential shapes cannot enter the ledger.
+/// Shape only: callers still owe digests, never secrets.
+fn validate_audit_identity(value: &str, label: &str) -> Result<(), SpoolError> {
+    if value.is_empty() || value.len() > RESPONSIVENESS_AUDIT_IDENTITY_MAX {
+        return Err(SpoolError::Corrupt(format!(
+            "watchdog responsiveness audit {label} breaks its length bound"
+        )));
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
+    }) {
+        return Err(SpoolError::Corrupt(format!(
+            "watchdog responsiveness audit {label} is not a digest-shaped identity"
+        )));
+    }
+    Ok(())
+}
+
+/// Fails closed on a decision code outside the fixed vocabulary shape.
+///
+/// Codes are short `snake_case` tokens; anything else is refused before any
+/// write.
+fn validate_audit_code(value: &str) -> Result<(), SpoolError> {
+    if value.is_empty() || value.len() > RESPONSIVENESS_AUDIT_CODE_MAX {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit decision breaks its length bound".to_owned(),
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit decision is not a fixed-vocabulary code".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fails closed on a delivery-outcome name outside its fixed shape.
+fn validate_audit_outcome(value: &str) -> Result<(), SpoolError> {
+    if value.is_empty() || value.len() > RESPONSIVENESS_AUDIT_OUTCOME_MAX {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit outcome breaks its length bound".to_owned(),
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit outcome is not a fixed-vocabulary name".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Fails closed on a delivery fact that is not in canonical form.
+fn validate_audit_delivery(delivery: &WatchdogAuditDelivery) -> Result<(), SpoolError> {
+    match delivery {
+        WatchdogAuditDelivery::Pending | WatchdogAuditDelivery::OsAccepted => Ok(()),
+        WatchdogAuditDelivery::Failed { outcome } => validate_audit_outcome(outcome),
+    }
+}
+
+/// Fails closed on audit evidence that is not in canonical form.
+fn validate_responsiveness_evidence(
+    evidence: &ResponsivenessAuditEvidence,
+) -> Result<(), SpoolError> {
+    validate_audit_identity(&evidence.operation_id, "operation identity")?;
+    validate_audit_identity(&evidence.policy_digest, "policy digest")?;
+    validate_audit_identity(&evidence.target_service_digest, "target service digest")?;
+    validate_audit_identity(&evidence.target_epoch_digest, "target epoch digest")?;
+    validate_audit_code(&evidence.decision_code)?;
+    Ok(())
+}
+
+/// Builds the exact redacted insertion string the handoff submits.
+///
+/// Fixed `watchdog_audit` vocabulary over validated identities only; the
+/// owner port's redaction gate runs before return, so a record that could
+/// not be submitted is refused before any write instead of journalled with
+/// an unusable ticket. Error values never echo the insertion.
+fn build_audit_insertion(evidence: &ResponsivenessAuditEvidence) -> Result<String, SpoolError> {
+    validate_responsiveness_evidence(evidence)?;
+    let operation_id = evidence.operation_id.as_str();
+    let kind = evidence.kind.as_str();
+    let policy_digest = evidence.policy_digest.as_str();
+    let target_service_digest = evidence.target_service_digest.as_str();
+    let target_epoch_digest = evidence.target_epoch_digest.as_str();
+    let decision_code = evidence.decision_code.as_str();
+    let insertion = format!(
+        "watchdog_audit op={operation_id} kind={kind} policy={policy_digest} target={target_service_digest}/{target_epoch_digest} decision={decision_code} delivery=pending"
+    );
+    validate_event_log_insertion(&insertion).map_err(|_| {
+        SpoolError::Corrupt(
+            "watchdog responsiveness audit insertion failed the Event Log redaction gate"
+                .to_owned(),
+        )
+    })?;
+    Ok(insertion)
+}
+
+fn encode_audit_ledger(ledger: &ResponsivenessAuditLedger) -> Result<Vec<u8>, SpoolError> {
+    serde_json::to_vec(ledger).map_err(|error| SpoolError::Serialization(error.to_string()))
+}
+
+fn decode_audit_ledger(bytes: &[u8]) -> Result<ResponsivenessAuditLedger, SpoolError> {
+    let ledger: ResponsivenessAuditLedger =
+        serde_json::from_slice(bytes).map_err(|error| {
+            SpoolError::Corrupt(format!(
+                "watchdog responsiveness audit ledger is invalid: {error}"
+            ))
+        })?;
+    if ledger.schema_version != RESPONSIVENESS_AUDIT_SCHEMA_VERSION {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit ledger schema is unsupported".to_owned(),
+        ));
+    }
+    if ledger.next_seq == 0
+        || ledger.count > RESPONSIVENESS_AUDIT_MAX_ROWS
+        || (ledger.count == 0 && ledger.first_seq != 0)
+        || (ledger.count > 0 && (ledger.first_seq == 0 || ledger.first_seq >= ledger.next_seq))
+    {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit ledger carries an unusable allocator".to_owned(),
+        ));
+    }
+    Ok(ledger)
+}
+
+fn encode_responsiveness_audit(row: &StoredResponsivenessAudit) -> Result<Vec<u8>, SpoolError> {
+    serde_json::to_vec(row).map_err(|error| SpoolError::Serialization(error.to_string()))
+}
+
+/// Decodes one audit row strictly into the exact shape its revision wrote.
+///
+/// The row key is re-checked against `audit_seq` on every read, and every
+/// identity/code/outcome field is revalidated, so a row can never be
+/// relocated onto another audit or reinterpreted under another revision.
+fn decode_responsiveness_audit(
+    key: u64,
+    bytes: &[u8],
+) -> Result<StoredResponsivenessAudit, SpoolError> {
+    let row: StoredResponsivenessAudit =
+        serde_json::from_slice(bytes).map_err(|error| {
+            SpoolError::Corrupt(format!(
+                "watchdog responsiveness audit row is invalid: {error}"
+            ))
+        })?;
+    if row.schema_version != RESPONSIVENESS_AUDIT_SCHEMA_VERSION {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit row schema is unsupported".to_owned(),
+        ));
+    }
+    if row.audit_seq != key || row.audit_seq == 0 {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit row carries an unusable sequence".to_owned(),
+        ));
+    }
+    if row.created_at_ms == 0 {
+        return Err(SpoolError::Corrupt(
+            "watchdog responsiveness audit row carries an unusable timestamp".to_owned(),
+        ));
+    }
+    validate_audit_identity(&row.operation_id, "operation identity")?;
+    validate_audit_identity(&row.policy_digest, "policy digest")?;
+    validate_audit_identity(&row.target_service_digest, "target service digest")?;
+    validate_audit_identity(&row.target_epoch_digest, "target epoch digest")?;
+    validate_audit_code(&row.decision_code)?;
+    validate_audit_delivery(&row.delivery)?;
+    Ok(row)
+}
+
+impl WatchdogSpool {
+    /// Journals one responsiveness audit and stages its Event Log handoff.
+    ///
+    /// Validates the correlation evidence, builds the exact redacted
+    /// insertion through the owner port's gate, then stores the row with
+    /// delivery pending and returns the ticket the owner-lane finite handoff
+    /// submits. The journalled row is the spool fact; the insertion is
+    /// handed off at most once per row, off the control path, with a bounded
+    /// wait — never retried by replaying the SCM effect.
+    ///
+    /// STITCH (owner rule): the composition lane calls this around its
+    /// fenced stop/start operation for every challenge, timeout,
+    /// denied/budget-exhausted decision, SCM request, and SCM readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the evidence is not in canonical form,
+    /// the insertion fails the redaction gate, or the ledger cannot be
+    /// written. A refusal writes nothing: validation failure means
+    /// not-attempted, never a half-journalled audit.
+    pub fn persist_responsiveness_audit(
+        &self,
+        evidence: &ResponsivenessAuditEvidence,
+    ) -> Result<ResponsivenessAuditTicket, SpoolError> {
+        let insertion = build_audit_insertion(evidence)?;
+        let created_at_ms = current_unix_ms()?.max(1);
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let ticket = {
+            let mut table = write
+                .open_table(SPOOL_RESPONSIVENESS_AUDIT_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            let mut ledger = match table
+                .get(RESPONSIVENESS_AUDIT_LEDGER_KEY)
+                .map_err(|error| SpoolError::Database(error.to_string()))? {
+                Some(value) => decode_audit_ledger(value.value())?,
+                None => ResponsivenessAuditLedger {
+                    schema_version: RESPONSIVENESS_AUDIT_SCHEMA_VERSION,
+                    next_seq: 1,
+                    first_seq: 0,
+                    count: 0,
+                },
+            };
+            while ledger.count + 1 > RESPONSIVENESS_AUDIT_MAX_ROWS {
+                if ledger.count == 0 {
+                    break;
+                }
+                table
+                    .remove(ledger.first_seq)
+                    .map_err(|error| SpoolError::Database(error.to_string()))?
+                    .ok_or_else(|| {
+                        SpoolError::Corrupt(
+                            "watchdog responsiveness audit retention record is missing"
+                                .to_owned(),
+                        )
+                    })?;
+                ledger.first_seq = ledger.first_seq.checked_add(1).ok_or_else(|| {
+                    SpoolError::Corrupt(
+                        "watchdog responsiveness audit sequence overflow".to_owned(),
+                    )
+                })?;
+                ledger.count -= 1;
+            }
+            let audit_seq = ledger.next_seq;
+            ledger.next_seq = ledger.next_seq.checked_add(1).ok_or_else(|| {
+                SpoolError::Corrupt("watchdog responsiveness audit sequence overflow".to_owned())
+            })?;
+            if ledger.count == 0 {
+                ledger.first_seq = audit_seq;
+            }
+            ledger.count += 1;
+            let row = StoredResponsivenessAudit {
+                schema_version: RESPONSIVENESS_AUDIT_SCHEMA_VERSION,
+                audit_seq,
+                operation_id: evidence.operation_id.clone(),
+                policy_digest: evidence.policy_digest.clone(),
+                target_service_digest: evidence.target_service_digest.clone(),
+                target_epoch_digest: evidence.target_epoch_digest.clone(),
+                kind: evidence.kind,
+                decision_code: evidence.decision_code.clone(),
+                created_at_ms,
+                delivery: WatchdogAuditDelivery::Pending,
+            };
+            table
+                .insert(
+                    audit_seq,
+                    encode_responsiveness_audit(&row)?.as_slice(),
+                )
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(
+                    RESPONSIVENESS_AUDIT_LEDGER_KEY,
+                    encode_audit_ledger(&ledger)?.as_slice(),
+                )
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            ResponsivenessAuditTicket {
+                audit_seq,
+                event_log_insertion: insertion,
+            }
+        };
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(ticket)
+    }
+
+    /// Records the independent Event Log delivery fact for one journalled audit.
+    ///
+    /// The owner lane calls this once per handoff attempt with the typed port
+    /// outcome: [`WatchdogAuditDelivery::OsAccepted`] on acceptance, or
+    /// [`WatchdogAuditDelivery::from_port_error`] on refusal. A handoff wait
+    /// that times out settles nothing — the row stays pending, which is the
+    /// honest unknown — and no settlement ever requests, retries, or replays
+    /// an SCM effect. Acceptance is terminal: once the OS has accepted the
+    /// record, a later failure cannot overwrite it. Settling an unknown
+    /// sequence fails closed.
+    ///
+    /// STITCH (owner rule): the composition lane calls this from its finite
+    /// handoff continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the sequence is unknown, the delivery fact
+    /// is not in canonical form, or the ledger cannot be written.
+    pub fn settle_responsiveness_audit_delivery(
+        &self,
+        audit_seq: u64,
+        delivery: &WatchdogAuditDelivery,
+    ) -> Result<WatchdogAuditDelivery, SpoolError> {
+        if audit_seq == 0 {
+            return Err(SpoolError::Corrupt(
+                "watchdog responsiveness audit settlement carries an unusable sequence"
+                    .to_owned(),
+            ));
+        }
+        validate_audit_delivery(delivery)?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let stored = {
+            let table = write
+                .open_table(SPOOL_RESPONSIVENESS_AUDIT_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            let value = table
+                .get(audit_seq)
+                .map_err(|error| SpoolError::Database(error.to_string()))?
+                .ok_or_else(|| {
+                    SpoolError::Corrupt(
+                        "watchdog responsiveness audit settlement names an unknown sequence"
+                            .to_owned(),
+                    )
+                })?;
+            decode_responsiveness_audit(audit_seq, value.value())?
+        };
+        if stored.delivery == WatchdogAuditDelivery::OsAccepted {
+            return Ok(stored.delivery);
+        }
+        let updated = StoredResponsivenessAudit {
+            delivery: delivery.clone(),
+            ..stored
+        };
+        {
+            let mut table = write
+                .open_table(SPOOL_RESPONSIVENESS_AUDIT_TABLE)
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+            table
+                .insert(
+                    audit_seq,
+                    encode_responsiveness_audit(&updated)?.as_slice(),
+                )
+                .map_err(|error| SpoolError::Database(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        Ok(updated.delivery)
+    }
+
+    /// Reads back every retained responsiveness audit in sequence order.
+    ///
+    /// Read-only: this opens a read transaction and writes nothing. Both
+    /// facts come back together — the journalled spool record and its
+    /// independent delivery disposition — so an operator (or the composition
+    /// lane before an irreversible boundary) verifies what was journalled
+    /// and what the sink actually accepted, and never mistakes one for the
+    /// other or for visibility, which only an actual event readback proves.
+    ///
+    /// STITCH (owner rule): the composition lane calls this for boundary
+    /// revalidation and for the dual-audit proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError`] when the ledger disagrees with its rows or any
+    /// retained row is not in canonical form.
+    pub fn read_responsiveness_audits(&self) -> Result<Vec<StoredResponsivenessAudit>, SpoolError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|error| SpoolError::Database(error.to_string()))?;
+        let table = match read.open_table(SPOOL_RESPONSIVENESS_AUDIT_TABLE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(SpoolError::Database(error.to_string())),
+        };
+        let ledger = match table
+            .get(RESPONSIVENESS_AUDIT_LEDGER_KEY)
+            .map_err(|error| SpoolError::Database(error.to_string()))? {
+            Some(value) => decode_audit_ledger(value.value())?,
+            None => {
+                return Err(SpoolError::Corrupt(
+                    "watchdog responsiveness audit ledger is missing".to_owned(),
+                ));
+            }
+        };
+        let mut rows = Vec::new();
+        let mut sequence = ledger.first_seq;
+        while sequence < ledger.next_seq {
+            let value = table
+                .get(sequence)
+                .map_err(|error| SpoolError::Database(error.to_string()))?
+                .ok_or_else(|| {
+                    SpoolError::Corrupt(
+                        "watchdog responsiveness audit ledger points at a missing row".to_owned(),
+                    )
+                })?;
+            rows.push(decode_responsiveness_audit(sequence, value.value())?);
+            sequence = sequence.checked_add(1).ok_or_else(|| {
+                SpoolError::Corrupt("watchdog responsiveness audit sequence overflow".to_owned())
+            })?;
+        }
+        Ok(rows)
+    }
 }
 
 /// Storage encoding of the Watchdog-owned export cursor.

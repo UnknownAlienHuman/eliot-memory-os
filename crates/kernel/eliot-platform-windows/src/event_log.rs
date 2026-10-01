@@ -28,6 +28,36 @@
 //!                    204/kernel_quarantine/error
 //! ```
 //!
+//! ```text
+//! Watchdog source:   EliotWatchdog (fixed; no fallback, no substitution)
+//! Watchdog events:   300/watchdog_challenge_attempted/information,
+//!                    301/watchdog_challenge_timeout/error,
+//!                    302/watchdog_recovery_denied/error,
+//!                    303/watchdog_recovery_budget_exhausted/error,
+//!                    304/watchdog_scm_request/information,
+//!                    305/watchdog_scm_readback/information
+//! insertions:        exactly one already-redacted string,
+//!                    at most 1024 bytes and 1024 UTF-16 units, NUL-free
+//! in-flight bound:   1 Watchdog audit record (owned by the Watchdog audit
+//!                    handoff; informational here)
+//! ```
+//!
+//! The Watchdog profile (issue #1757 W12) carries Watchdog
+//! responsiveness-audit records — challenge, timeout, denied/budget-exhausted
+//! decision, SCM request, and SCM readback — correlated by
+//! operation/policy/target identity. It is a closed contract through this
+//! owner port: Watchdog records are never admitted under the fixed
+//! `EliotHost` source, and no caller passes an arbitrary source name.
+//! Installing the `EliotWatchdog` source (registry provisioning) belongs to
+//! the approved installation policy, not to this writer; delivery goes
+//! through the #889 consumer's finite bounded handoff, never through a direct
+//! blocking call on a control path. A handoff wait that times out abandons
+//! the wait only: exactly as with cancellation, a timed-out wait never
+//! interrupts the in-flight synchronous OS call, and uncertain delivery stays
+//! visible as [`EventLogError`] rather than claimed success. OS acceptance
+//! never proves visibility: no success is claimed until the actual event can
+//! be read back.
+//!
 //! Local-only: the server name passed to `RegisterEventSourceW` is always
 //! null (local machine). There is no remote-host, log-name, registry-path,
 //! command, or credential parameter, so the Security log cannot be selected
@@ -73,6 +103,11 @@ pub const EVENT_LOG_SOURCE: &str = "EliotHost";
 /// Fixed Event Log source for the admitted Kernel diagnostics profile.
 pub const KERNEL_EVENT_LOG_SOURCE: &str = "EliotKernel";
 
+/// Fixed Event Log source for the admitted Watchdog responsiveness-audit
+/// profile (issue #1757 W12). The only admitted Watchdog name: no fallback,
+/// no substitution, and never the Host or Kernel source.
+pub const WATCHDOG_EVENT_LOG_SOURCE: &str = "EliotWatchdog";
+
 /// Bound for one redacted insertion string, in bytes.
 pub const EVENT_LOG_MAX_INSERTION_BYTES: usize = 1024;
 
@@ -109,6 +144,31 @@ pub const KERNEL_EVENT_LOG_RESTART_EXHAUSTED_ID: u32 = 203;
 
 /// Admitted event identifier for Kernel quarantine.
 pub const KERNEL_EVENT_LOG_QUARANTINE_ID: u32 = 204;
+
+/// Admitted event identifier for a Watchdog responsiveness challenge record.
+pub const WATCHDOG_EVENT_LOG_CHALLENGE_ID: u32 = 300;
+
+/// Admitted event identifier for a Watchdog challenge-timeout record.
+pub const WATCHDOG_EVENT_LOG_CHALLENGE_TIMEOUT_ID: u32 = 301;
+
+/// Admitted event identifier for a Watchdog denied-recovery record.
+pub const WATCHDOG_EVENT_LOG_RECOVERY_DENIED_ID: u32 = 302;
+
+/// Admitted event identifier for a Watchdog budget-exhausted record.
+pub const WATCHDOG_EVENT_LOG_BUDGET_EXHAUSTED_ID: u32 = 303;
+
+/// Admitted event identifier for a Watchdog SCM-request record.
+pub const WATCHDOG_EVENT_LOG_SCM_REQUEST_ID: u32 = 304;
+
+/// Admitted event identifier for a Watchdog SCM-readback record.
+pub const WATCHDOG_EVENT_LOG_SCM_READBACK_ID: u32 = 305;
+
+/// Admitted in-flight bound for the Watchdog audit handoff.
+///
+/// Informational here: the Watchdog audit handoff owns admission, drop
+/// counting, and the finite wait, and admits at most one in-flight report per
+/// audit record — no queue, no retry, no replayed SCM effect.
+pub const WATCHDOG_EVENT_LOG_MAX_IN_FLIGHT: usize = 1;
 
 /// Severity admitted for one Event Log record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,10 +257,11 @@ impl AdmittedEventLogEvent {
     /// Closed Watchdog-audit rule (issue #1757): no Watchdog responsiveness
     /// record — challenge, timeout, denied/budget-exhausted decision, SCM
     /// request, or readback — is admitted under the fixed `EliotHost` source
-    /// from this port. Always false here; extending the installed
-    /// source/event contract is coordinated through its owners (issue #984
-    /// source owner, `bins/eliot-host#889` consumer) instead of impersonating
-    /// `EliotHost` or passing arbitrary source names.
+    /// from this port. Always false here; the admitted Watchdog profile is the
+    /// separate fixed `EliotWatchdog` source with
+    /// [`AdmittedWatchdogAuditEvent`], coordinated through its owners (issue
+    /// #984 source owner, `bins/eliot-host#889` consumer) instead of
+    /// impersonating `EliotHost` or passing arbitrary source names.
     #[must_use]
     pub const fn admits_watchdog_audit() -> bool {
         false
@@ -209,10 +270,95 @@ impl AdmittedEventLogEvent {
     /// Owner to coordinate the installed Watchdog-audit source/event
     /// extension with. Spool persistence and Event Log delivery stay
     /// independent facts; sink failure must remain visible and must never
-    /// trigger a replayed SCM effect.
+    /// trigger a replayed SCM effect. The admitted `EliotWatchdog` profile
+    /// ([`AdmittedWatchdogAuditEvent`]) is the extension this owner admits;
+    /// installing its source stays installer-owned and delivery stays with
+    /// the #889 bounded consumer.
     #[must_use]
     pub const fn watchdog_audit_sink_owner() -> &'static str {
         "issue #984 (Event Log source owner) via bins/eliot-host#889 (consumer)"
+    }
+}
+
+/// The only Watchdog responsiveness-audit events admitted to the Event Log
+/// (issue #1757 W12).
+///
+/// Every challenge, timeout, denied/budget-exhausted decision, SCM request,
+/// and SCM readback is correlated by operation/policy/target identity in the
+/// single redacted insertion string; the closed event set carries no
+/// credentials, nonces, or raw path/user data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmittedWatchdogAuditEvent {
+    /// A responsiveness challenge record was handed to the sink.
+    ChallengeAttempted,
+    /// A competently attempted challenge timed out inside its bound.
+    ChallengeTimeout,
+    /// A recovery attempt was denied (challenge unresolved or refused).
+    RecoveryDenied,
+    /// The recovery budget is exhausted: no restart, no SCM effect.
+    BudgetExhausted,
+    /// One fenced SCM effect was requested under the admitted operation.
+    ScmRequest,
+    /// One SCM readback was reconciled against the admitted operation.
+    ScmReadback,
+}
+
+impl AdmittedWatchdogAuditEvent {
+    /// Stable event name for the Watchdog audit contract.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChallengeAttempted => "watchdog_challenge_attempted",
+            Self::ChallengeTimeout => "watchdog_challenge_timeout",
+            Self::RecoveryDenied => "watchdog_recovery_denied",
+            Self::BudgetExhausted => "watchdog_recovery_budget_exhausted",
+            Self::ScmRequest => "watchdog_scm_request",
+            Self::ScmReadback => "watchdog_scm_readback",
+        }
+    }
+
+    /// Fixed event identifier for the Watchdog audit contract.
+    #[must_use]
+    pub const fn event_id(self) -> u32 {
+        match self {
+            Self::ChallengeAttempted => WATCHDOG_EVENT_LOG_CHALLENGE_ID,
+            Self::ChallengeTimeout => WATCHDOG_EVENT_LOG_CHALLENGE_TIMEOUT_ID,
+            Self::RecoveryDenied => WATCHDOG_EVENT_LOG_RECOVERY_DENIED_ID,
+            Self::BudgetExhausted => WATCHDOG_EVENT_LOG_BUDGET_EXHAUSTED_ID,
+            Self::ScmRequest => WATCHDOG_EVENT_LOG_SCM_REQUEST_ID,
+            Self::ScmReadback => WATCHDOG_EVENT_LOG_SCM_READBACK_ID,
+        }
+    }
+
+    /// Fixed severity: timeout, denial, and exhaustion are errors;
+    /// challenge, request, and readback records are informational.
+    #[must_use]
+    pub const fn severity(self) -> EventLogSeverity {
+        match self {
+            Self::ChallengeTimeout | Self::RecoveryDenied | Self::BudgetExhausted => {
+                EventLogSeverity::Error
+            }
+            Self::ChallengeAttempted | Self::ScmRequest | Self::ScmReadback => {
+                EventLogSeverity::Information
+            }
+        }
+    }
+
+    /// Classifies an event identifier without touching the OS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventLogError::InvalidInput`] for any unadmitted identifier.
+    pub fn from_event_id(event_id: u32) -> Result<Self, EventLogError> {
+        match event_id {
+            WATCHDOG_EVENT_LOG_CHALLENGE_ID => Ok(Self::ChallengeAttempted),
+            WATCHDOG_EVENT_LOG_CHALLENGE_TIMEOUT_ID => Ok(Self::ChallengeTimeout),
+            WATCHDOG_EVENT_LOG_RECOVERY_DENIED_ID => Ok(Self::RecoveryDenied),
+            WATCHDOG_EVENT_LOG_BUDGET_EXHAUSTED_ID => Ok(Self::BudgetExhausted),
+            WATCHDOG_EVENT_LOG_SCM_REQUEST_ID => Ok(Self::ScmRequest),
+            WATCHDOG_EVENT_LOG_SCM_READBACK_ID => Ok(Self::ScmReadback),
+            _ => Err(EventLogError::InvalidInput),
+        }
     }
 }
 
@@ -448,12 +594,64 @@ impl KernelEventLogReceipt {
     }
 }
 
-/// Private union of the two admitted local profiles. Keeping source selection
+/// Proof that the OS accepted one validated record under the Watchdog
+/// responsiveness-audit profile.
+///
+/// OS acceptance only: not delivery, not registered-source proof, not
+/// visibility, and not a Host semantic result. Visibility is never claimed
+/// here: it holds only once the actual event can be read back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WatchdogAuditReceipt {
+    event: AdmittedWatchdogAuditEvent,
+    availability: EventLogSourceAvailability,
+}
+
+impl WatchdogAuditReceipt {
+    const fn accepted(event: AdmittedWatchdogAuditEvent) -> Self {
+        Self {
+            event,
+            availability: EventLogSourceAvailability::Unknown,
+        }
+    }
+
+    /// The admitted Watchdog audit event that was accepted.
+    #[must_use]
+    pub const fn event(&self) -> AdmittedWatchdogAuditEvent {
+        self.event
+    }
+
+    /// The fixed event identifier that was reported.
+    #[must_use]
+    pub const fn event_id(&self) -> u32 {
+        self.event.event_id()
+    }
+
+    /// The fixed severity that was reported.
+    #[must_use]
+    pub const fn severity(&self) -> EventLogSeverity {
+        self.event.severity()
+    }
+
+    /// The fixed Watchdog source the record was reported under.
+    #[must_use]
+    pub const fn source(&self) -> &'static str {
+        WATCHDOG_EVENT_LOG_SOURCE
+    }
+
+    /// Registration knowledge for this acceptance (always unknown here).
+    #[must_use]
+    pub const fn source_availability(&self) -> EventLogSourceAvailability {
+        self.availability
+    }
+}
+
+/// Private union of the three admitted local profiles. Keeping source selection
 /// here prevents callers from supplying arbitrary Event Log source names.
 #[derive(Clone, Copy)]
 enum AdmittedLocalEventLogEvent {
     Host(AdmittedEventLogEvent),
     Kernel(AdmittedKernelEventLogEvent),
+    Watchdog(AdmittedWatchdogAuditEvent),
 }
 
 impl AdmittedLocalEventLogEvent {
@@ -461,6 +659,7 @@ impl AdmittedLocalEventLogEvent {
         match self {
             Self::Host(_) => EVENT_LOG_SOURCE,
             Self::Kernel(_) => KERNEL_EVENT_LOG_SOURCE,
+            Self::Watchdog(_) => WATCHDOG_EVENT_LOG_SOURCE,
         }
     }
 
@@ -468,6 +667,7 @@ impl AdmittedLocalEventLogEvent {
         match self {
             Self::Host(event) => event.event_id(),
             Self::Kernel(event) => event.event_id(),
+            Self::Watchdog(event) => event.event_id(),
         }
     }
 
@@ -475,6 +675,7 @@ impl AdmittedLocalEventLogEvent {
         match self {
             Self::Host(event) => event.severity(),
             Self::Kernel(event) => event.severity(),
+            Self::Watchdog(event) => event.severity(),
         }
     }
 }
@@ -590,6 +791,33 @@ pub fn report_kernel_event(
 ) -> Result<KernelEventLogReceipt, EventLogError> {
     report_admitted_local_event(AdmittedLocalEventLogEvent::Kernel(event), insertion)?;
     Ok(KernelEventLogReceipt::accepted(event))
+}
+
+/// Reports one admitted Watchdog responsiveness-audit event with one redacted
+/// insertion to the local Event Log under the fixed `EliotWatchdog` source.
+///
+/// This call is synchronous and may block; there is no timeout, and
+/// abandoning the caller does not interrupt the OS work. Production Watchdog
+/// code never calls this on a control path: delivery goes through the finite
+/// bounded handoff owned by the Watchdog audit lane (at most one in-flight
+/// report per audit record), and a handoff wait that times out leaves
+/// delivery pending without cancelling this call. The returned receipt proves
+/// OS acceptance only — never visibility, which holds only once the actual
+/// event can be read back.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::InvalidInput`] before any FFI when the bounds or
+/// redaction checks fail; [`EventLogError::UnsupportedPlatform`] off Windows;
+/// [`EventLogError::RegistrationFailed`] when no handle could be acquired
+/// (nothing submitted); [`EventLogError::ReportFailed`] when the OS refused
+/// the validated record.
+pub fn report_watchdog_audit_event(
+    event: AdmittedWatchdogAuditEvent,
+    insertion: &str,
+) -> Result<WatchdogAuditReceipt, EventLogError> {
+    report_admitted_local_event(AdmittedLocalEventLogEvent::Watchdog(event), insertion)?;
+    Ok(WatchdogAuditReceipt::accepted(event))
 }
 
 fn report_admitted_local_event(
