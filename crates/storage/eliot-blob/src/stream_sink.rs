@@ -102,6 +102,32 @@
 //! inline preview by the shared terminal-evidence invariant, so a raw
 //! pre-policy preview can never reach the durable record.
 //!
+//! Transformation binding (issue #267 W7): this adapter applies NO byte-level
+//! transformation. It normalizes nothing, decodes nothing, re-encodes nothing,
+//! inserts no header or length prefix and joins no chunk boundary by rewriting
+//! bytes — admitted chunks are staged verbatim and their SHA-256 is the
+//! transport digest. The only byte-touching derivations are the two digests the
+//! owner needs: BLAKE3 over the staged bytes for the store's content identity
+//! ([`BlobStoreStreamSink::stage_request`]) and SHA-256 over them for the
+//! ready-receipt and readback commitment.
+//!
+//! Because it holds no transformed bytes it can never OBSERVE a transformation's
+//! output, so it refuses every terminal command that declares one
+//! ([`refuse_transformation`]) instead of recording an unverified output digest.
+//! A raw pre-policy preview therefore cannot reach the durable record through
+//! this adapter in either direction: transformed output is refused outright, and
+//! a policy-prohibited or failed-redaction terminal cannot carry an inline
+//! preview at all.
+//!
+//! Owner boundary still open elsewhere: the transformer producer contract — the
+//! owner that would stage transformed bytes together with their exact
+//! input/output receipt — does not exist. `ProcessStreamTransformationBinding`
+//! already carries the receipt, policy and redaction references the process
+//! contract needs; what is missing is a caller that produces transformed bytes
+//! and an append-shaped way to stage them under the one bound blob operation
+//! identity (issue #297). No policy identifier or transformation enum was
+//! invented here to fill that gap.
+//!
 //! Owner boundary still open elsewhere: the append-only *temporary* object
 //! required by I10.8.5 needs an `append`-shaped operation on the one blob
 //! owner (issue #297, `eliot-blob-api` + `eliot-blob` service). The bound
@@ -384,10 +410,6 @@ struct SinkState {
     /// running digest. It stops filling at the session preview ceiling, so the
     /// preview cost is bounded independently of the staged plaintext.
     preview: BoundedPreviewDigest,
-    /// Declared admissible-source identity. `None` until a terminal command
-    /// declares a transformation; the exact-transport default then describes
-    /// the admitted stream itself.
-    admissible_source: Option<BlobStreamAdmissibleSourceMeasure>,
     admitted_chunks: Vec<AdmittedChunk>,
     /// The QUEUED / IN-FLIGHT half of the accounting, independent of the
     /// RETAINED half (`next_offset` against `max_total_admitted_bytes`).
@@ -436,15 +458,15 @@ struct BoundedPreviewDigest {
     truncated_at_ceiling: bool,
 }
 
-/// Admissible-source byte count/digest after the declared policy transformation.
+/// Admissible-source byte count/digest — the exact bytes this adapter stages.
 ///
-/// It is a different quantity from the transport measure: only bytes the policy
-/// admits count. When no transformation is declared the admissible source is the
-/// admitted transport stream itself and the two measures are one measure over
-/// one byte set; when a transformation is declared its output identity is the
-/// caller's exact input/output receipt, never a digest derived by transforming
-/// the transport digest. Bytes the policy rejected are never fed to it and never
-/// staged.
+/// This adapter stages the admitted transport stream verbatim and refuses any
+/// command declaring a policy transformation (see [`refuse_transformation`]), so
+/// the admissible source is always `ExactTransportBytes`: one measure over the
+/// admitted byte set, identical in value to the transport measure and never a
+/// digest derived by transforming it. The `representation` field stays because
+/// the process contract's preview coordinates are expressed against it, but
+/// `PolicyTransformed` is not a value this adapter can produce.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobStreamAdmissibleSourceMeasure {
     /// Relationship between this source and the physical transport bytes.
@@ -735,7 +757,6 @@ impl SinkState {
             publication: None,
             transport: TransportDigest::new(),
             preview: BoundedPreviewDigest::new(),
-            admissible_source: None,
             admitted_chunks: Vec::new(),
             persistence_queue: PersistenceQueueBound {
                 queued_chunks: 0,
@@ -758,20 +779,19 @@ impl SinkState {
     /// revisions, so re-binding is idempotent; a differing open digest is refused
     /// before this point, so a measure can never be stamped with a revision other
     /// than the one its session committed to.
-    fn bind_measure_revisions(
-        &mut self,
-        session: &ProcessStreamSinkSession,
-    ) -> Result<(), ProcessStreamSinkError> {
-        if let Some(existing) = &self.admissible_source
-            && existing.digest_algorithm != session.source_digest_algorithm()
-        {
-            return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "declared source digest revision does not match the session".to_owned(),
-            });
-        }
+    fn bind_measure_revisions(&mut self, session: &ProcessStreamSinkSession) {
+        // W7: this used to be guarded by a `self.admissible_source` field that
+        // was initialised to `None` and NEVER assigned anywhere, so the guard
+        // could not fire and the field's own documentation ("`None` until a
+        // terminal command declares a transformation") described behaviour that
+        // did not exist. A declared-but-never-written revision check is the same
+        // unaccounted-quantity shape as an unused ceiling: it reads as a live
+        // invariant and proves nothing. The admissible source is derived per
+        // terminal command by `admissible_source_measure`, so there is no stored
+        // revision to disagree with, and the real binding — the transport
+        // revision this session's measures are stamped with — is below.
         self.transport = TransportDigest::new_with(session.transport_digest_algorithm());
         self.preview = BoundedPreviewDigest::new_with(session.transport_digest_algorithm());
-        Ok(())
     }
 
     /// Feeds one admitted chunk into every measure that covers it.
@@ -798,33 +818,24 @@ impl SinkState {
         self.transport.digest()
     }
 
-    /// The exact admissible-source measure for a terminal command.
+    /// The exact admissible-source measure for one terminal command.
     ///
-    /// With no declared transformation the admissible source IS the admitted
-    /// transport stream, so this returns the transport measure's own values and
-    /// names them `ExactTransportBytes`: one measure over one byte set, never a
-    /// digest derived from another. With a declared transformation the output
-    /// identity comes from the caller's exact input/output receipt alone, so this
-    /// adapter neither transforms the transport digest nor claims an output it
-    /// never observed.
-    fn admissible_source_measure(
-        &self,
-        session: &ProcessStreamSinkSession,
-        request_transformation: Option<&ProcessStreamTransformationBinding>,
-    ) -> BlobStreamAdmissibleSourceMeasure {
-        let Some(transformation) = request_transformation else {
-            return BlobStreamAdmissibleSourceMeasure {
-                representation: DurableStreamRepresentation::ExactTransportBytes,
-                digest_algorithm: self.transport.algorithm,
-                byte_count: self.transport.byte_count,
-                sha256: self.admitted_sha256(),
-            };
-        };
+    /// No transformation reaches this function: every terminal command is
+    /// refused by [`refuse_transformation`] before `measures_for` builds any
+    /// measure, so the admissible source is ALWAYS the admitted transport stream
+    /// itself and is named `ExactTransportBytes` — one measure over one byte
+    /// set, never a digest derived from another and never an unobserved
+    /// transformed output.
+    ///
+    /// A `DurableSourceBytes` preview still measures against this measure's
+    /// `byte_count`, which is exactly the admitted length, so a durable-source
+    /// preview cannot claim coordinates this adapter never covered.
+    fn admissible_source_measure(&self) -> BlobStreamAdmissibleSourceMeasure {
         BlobStreamAdmissibleSourceMeasure {
-            representation: DurableStreamRepresentation::PolicyTransformed,
-            digest_algorithm: session.source_digest_algorithm(),
-            byte_count: transformation.output_byte_length(),
-            sha256: transformation.output_sha256().to_owned(),
+            representation: DurableStreamRepresentation::ExactTransportBytes,
+            digest_algorithm: self.transport.algorithm,
+            byte_count: self.transport.byte_count,
+            sha256: self.admitted_sha256(),
         }
     }
 
@@ -886,13 +897,16 @@ impl SinkState {
 
     /// All three measures for one terminal command, bound to the exact
     /// admissible source this command declares.
+    ///
+    /// The admissible source is proven transform-free first, so no measure can
+    /// ever be derived from a transformation output this adapter does not hold.
     fn measures_for(
         &self,
-        session: &ProcessStreamSinkSession,
         request_preview: &ProcessStreamPrefixPreview,
         request_transformation: Option<&ProcessStreamTransformationBinding>,
     ) -> Result<BlobStreamEvidenceMeasures, ProcessStreamSinkError> {
-        let admissible_source = self.admissible_source_measure(session, request_transformation);
+        refuse_transformation(request_transformation)?;
+        let admissible_source = self.admissible_source_measure();
         let bounded_preview = self.bounded_preview_measure(request_preview, &admissible_source)?;
         Ok(BlobStreamEvidenceMeasures {
             transport: self.transport_measure(),
@@ -1270,6 +1284,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request.expected_final_offset(),
         )?;
         Self::check_observed(state, request.observed_sha256(), request.observed_bytes())?;
+        // An abort never publishes, so it has no durable source and nowhere to
+        // bind a transformation receipt: the same refusal as `plan_finalize`,
+        // with the same truthful cause (W7).
+        refuse_transformation(request.transformation())?;
         // Abort never publishes: no stage call for any reason, so a
         // policy-prohibited or failed-redaction session cannot stage raw
         // bytes. The staged plaintext is dropped with the terminal.
@@ -1565,19 +1583,20 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Self::check_observed(&state, request.observed_sha256(), request.observed_bytes())?;
         let publishes =
             request.gaps().is_empty() && request.transport() == StreamTransportStatus::Complete;
+        // This adapter stages EXACT admitted transport bytes and never transformed
+        // output, so a finalize that declares a transformation is refused for
+        // BOTH outcomes — not only the publishing one — and it is refused BEFORE
+        // any measure is built. See [`refuse_transformation`] for the two W7
+        // defects this closes; `measures_for` below is the single place that
+        // enforcement happens, for finalize and abort alike.
+        //
         // The three measures of THIS terminal, computed once here from the
         // digests accumulated while its bytes arrived and from this exact
-        // command's preview/transformation. Every ticket below carries this
-        // one value; no site re-derives it, so a resumed publish records the
-        // same measures its first planning pass computed.
-        let measures =
-            state.measures_for(&existing, request.preview(), request.transformation())?;
+        // command's preview. Every ticket below carries this one value; no site
+        // re-derives it, so a resumed publish records the same measures its
+        // first planning pass computed.
+        let measures = state.measures_for(request.preview(), request.transformation())?;
         if publishes {
-            if request.transformation().is_some() {
-                return Err(ProcessStreamSinkError::EvidenceInvariant {
-                    reason: "adapter stages exact transport bytes only".to_owned(),
-                });
-            }
             // A reservation already holds the exact admitted byte commitment
             // it was created from, and a resumed publish has moved the staged
             // plaintext out of the session. Re-deriving the transport prefix
@@ -1992,6 +2011,49 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// Refuses a terminal command that declares a policy transformation (W7).
+///
+/// This adapter stages EXACT admitted transport bytes and holds no transformed
+/// bytes, so it can never observe a transformation's output and can never bind
+/// one to a durable object. Two defects are closed by this one refusal, applied
+/// by BOTH terminal commands before any measure is built:
+///
+/// * **Unverified output, unverified input.** The declared transformation's
+///   `input_sha256`/`input_byte_length` were previously read NOWHERE in this
+///   file, so a caller could present a receipt claiming an arbitrary input
+///   while the adapter copied only that receipt's unverified OUTPUT digest into
+///   the admissible-source measure. Two different transformations that happen to
+///   emit the same output for the same input produced the SAME recorded
+///   `PolicyTransformed` measure, so a consumer could not tell which one ran.
+/// * **Untruthful failure.** A gapped finalize or an abort carrying a
+///   transformation fell through to terminal construction and failed with
+///   `TerminalIdentityConflict`, naming an identity collision for what is
+///   actually an unsupported transformation.
+///
+/// Refusing BEFORE any measure is derived also fixes the ordering the owner's
+/// audit keeps finding: a result must never be counted before the
+/// transformation that produced it is known, and here no admissible-source
+/// identity is ever derived from a transformation at all.
+///
+/// Nothing is invented: no enum variant, no policy identifier, no
+/// transformation type. `ProcessStreamTransformationBinding` already carries the
+/// input/output receipt, policy reference and redaction reference; this adapter
+/// simply cannot honour one and says so instead of half-recording it. Closing
+/// the remaining half of W7 — actually STAGING transformed bytes with their
+/// exact receipt — needs the transformer producer contract that no caller
+/// supplies; that is the owner reported in the accompanying report, not a field
+/// invented here.
+fn refuse_transformation(
+    request_transformation: Option<&ProcessStreamTransformationBinding>,
+) -> Result<(), ProcessStreamSinkError> {
+    if request_transformation.is_some() {
+        return Err(ProcessStreamSinkError::EvidenceInvariant {
+            reason: "adapter stages exact transport bytes only".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// The exact provider-side reason a durable source is unavailable.
 ///
 /// The declared gaps are the only input, so this can never invent a cause the
@@ -2075,13 +2137,12 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
                 Ok(existing.clone())
             }
             Some(_) => Err(ProcessStreamSinkError::OpenDigestMismatch),
-            None => ProcessStreamSinkSession::from_open_request(request)
-                .inspect(|session| state.session = Some(session.clone()))
-                .and_then(|session| {
-                    // The measures this session will be stamped with are bound
-                    // to the revisions its own open request declared.
-                    state.bind_measure_revisions(&session).map(|()| session)
-                }),
+            None => ProcessStreamSinkSession::from_open_request(request).inspect(|session| {
+                // The measures this session will be stamped with are bound
+                // to the revisions its own open request declared.
+                state.session = Some(session.clone());
+                state.bind_measure_revisions(session);
+            }),
         };
         Self::ready(result)
     }
