@@ -6147,7 +6147,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             .into());
         }
         let service = self.finish_attempt_service();
-        let plan = service.admit_task_controller_plan(task_id)?;
+        let (plan, task_revision) = service.admit_task_controller_plan(task_id)?;
         // Already current: the owner holds exactly this plan, so there is no
         // owner image to publish and no revision to advance.
         if self
@@ -6159,7 +6159,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Ok(None);
         }
         let snapshot = self.owners.canonical.prepare_current_plan(plan)?;
-        let envelope = current_plan_envelope(identity, operation_id, &snapshot, task_id)?;
+        let envelope =
+            current_plan_envelope(identity, operation_id, &snapshot, task_id, task_revision)?;
         Ok(Some(
             service.prepare_current_plan_exchange(identity, envelope)?,
         ))

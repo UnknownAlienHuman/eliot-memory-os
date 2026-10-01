@@ -895,7 +895,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
     pub fn admit_task_controller_plan(
         &self,
         task_id: &TaskId,
-    ) -> Result<CanonicalPlanBinding, FinishAttemptError> {
+    ) -> Result<(CanonicalPlanBinding, u64), FinishAttemptError> {
         let task = self.task.task(task_id).ok_or_else(|| {
             FinishAttemptError::Composition(CompositionError::Recovery(format!(
                 "canonical task {} is absent; no current plan can be admitted for it",
@@ -919,7 +919,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         if let Some(retained) = self.retained_verifier_state(&plan, &fence) {
             plan.verifier = retained;
         }
-        Ok(plan)
+        Ok((plan, task.revision))
     }
 
     /// Resolves the Task Controller's published plan identity for one task from
@@ -1436,6 +1436,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             fact_operation,
             &snapshot,
             task_id.as_str(),
+            fact.task_revision,
             &fact.verification_run.run_id.to_string(),
         )?;
         prepare_exchange(self.canonical, fact_identity, envelope).map(Some)
@@ -1542,8 +1543,12 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             deadline_unix_ms: identity.deadline_unix_ms,
             cancellation_id: identity.cancellation_id.clone(),
         };
-        let envelope =
-            finish_evidence_envelope(&evidence_identity, evidence_operation, &produced.snapshot)?;
+        let envelope = finish_evidence_envelope(
+            &evidence_identity,
+            evidence_operation,
+            &produced.snapshot,
+            produced.canonical.evidence.current_task_revision,
+        )?;
         prepare_exchange(self.canonical, &evidence_identity, envelope).map(Some)
     }
 
@@ -1662,6 +1667,7 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
             &context,
             &receipts,
             self.finish_owner_revision,
+            context.current_task_revision,
         )?;
         let exchange = prepare_exchange(self.canonical, identity, envelope)?;
         Ok(PreparedFinishDecision {
@@ -1737,6 +1743,7 @@ fn canonical_owner_snapshot_envelope(
     operation_id: OperationId,
     snapshot: &CanonicalAdmissionSnapshot,
     task_id: &str,
+    task_revision: u64,
     required_proof_ref: &str,
 ) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
     let snapshot_bytes = canonical_json_bytes(snapshot)
@@ -1761,6 +1768,15 @@ fn canonical_owner_snapshot_envelope(
     parameters.insert(
         "snapshot_json".to_owned(),
         serde_json::Value::String(snapshot_json),
+    );
+    if task_revision == 0 {
+        return Err(FinishAttemptError::Serialization(
+            "canonical owner snapshot has no admitted task revision".to_owned(),
+        ));
+    }
+    parameters.insert(
+        "task_revision".to_owned(),
+        serde_json::Value::String(task_revision.to_string()),
     );
     let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
@@ -1814,6 +1830,7 @@ pub(crate) fn current_plan_envelope(
     operation_id: &OperationId,
     snapshot: &CanonicalAdmissionSnapshot,
     task_id: &TaskId,
+    task_revision: u64,
 ) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
     let plan = snapshot.current_plan.as_ref().ok_or_else(|| {
         FinishAttemptError::Serialization(
@@ -1834,6 +1851,7 @@ pub(crate) fn current_plan_envelope(
         operation_id.clone(),
         snapshot,
         task_id.as_str(),
+        task_revision,
         &format!("current-plan:{plan_digest}"),
     )
 }
@@ -1842,6 +1860,7 @@ fn finish_evidence_envelope(
     identity: &RequestIdentity,
     operation_id: OperationId,
     snapshot: &CanonicalAdmissionSnapshot,
+    task_revision: u64,
 ) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
     let evidence = snapshot.finish_evidence.as_ref().ok_or_else(|| {
         FinishAttemptError::Serialization(
@@ -1853,6 +1872,7 @@ fn finish_evidence_envelope(
         operation_id,
         snapshot,
         &evidence.evidence.task_id,
+        task_revision,
         &evidence.finish_authority_ref,
     )
 }
@@ -1864,6 +1884,7 @@ fn finish_envelope(
     context: &FinishContext,
     receipts: &[FinishDecisionReceipt],
     expected_finish_revision: u64,
+    task_revision: u64,
 ) -> Result<CanonicalWriteEnvelope, FinishAttemptError> {
     let receipt_bytes = canonical_json_bytes(&receipts)
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
@@ -1884,6 +1905,15 @@ fn finish_envelope(
     parameters.insert(
         "receipt_json".to_owned(),
         serde_json::Value::String(receipt_json),
+    );
+    if task_revision == 0 {
+        return Err(FinishAttemptError::Serialization(
+            "finish decision has no admitted task revision".to_owned(),
+        ));
+    }
+    parameters.insert(
+        "task_revision".to_owned(),
+        serde_json::Value::String(task_revision.to_string()),
     );
     let scope_id = ScopeId::new(GOVERNOR_SCOPE_ID)
         .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
