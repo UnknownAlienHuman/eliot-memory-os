@@ -3459,14 +3459,14 @@ pub enum NativeWorkerClaimReceiptKind {
 
 impl NativeWorkerClaimReceiptKind {
     /// Returns the durable slot this kind records into.
-    fn slot(self, payloads: &NativeWorkerClaimReceiptPayloads) -> &Option<String> {
+    fn slot(self, payloads: &NativeWorkerClaimReceiptPayloads) -> Option<&String> {
         match self {
-            Self::Admission => &payloads.admission_payload_sha256,
-            Self::Cancellation => &payloads.cancellation_payload_sha256,
-            Self::WorkerFence => &payloads.worker_fence_payload_sha256,
-            Self::Reassignment => &payloads.reassignment_payload_sha256,
-            Self::Result => &payloads.result_payload_sha256,
-            Self::UnknownOutcome => &payloads.unknown_outcome_payload_sha256,
+            Self::Admission => payloads.admission_payload_sha256.as_ref(),
+            Self::Cancellation => payloads.cancellation_payload_sha256.as_ref(),
+            Self::WorkerFence => payloads.worker_fence_payload_sha256.as_ref(),
+            Self::Reassignment => payloads.reassignment_payload_sha256.as_ref(),
+            Self::Result => payloads.result_payload_sha256.as_ref(),
+            Self::UnknownOutcome => payloads.unknown_outcome_payload_sha256.as_ref(),
         }
     }
 
@@ -22716,7 +22716,7 @@ impl RedbRecoveryStore {
                 // presented slot values are never persisted here and no
                 // caller-echo digest can be planted at stage.
                 let mut fresh = record.clone();
-                fresh.receipt_payloads = Default::default();
+                fresh.receipt_payloads = NativeWorkerClaimReceiptPayloads::default();
                 let payload = encode(&fresh)?;
                 table
                     .insert(key.as_str(), payload.as_str())
