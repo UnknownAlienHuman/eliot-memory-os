@@ -664,7 +664,7 @@ fn matched_observation(
         route_state: RouteObservationState::Matched,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::Observed,
-        request_digest: zero_digest()?,
+        request_digest: binding.start_request_sha256.clone(),
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -713,7 +713,7 @@ fn unknown_observation(
         route_state: RouteObservationState::Matched,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::UnknownOutcome,
-        request_digest: zero_digest()?,
+        request_digest: binding.start_request_sha256.clone(),
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -2235,6 +2235,7 @@ fn use_result_binding(
     binding: &ProviderExecutionBinding,
 ) -> TestResult<()> {
     submission.result.actual_route.binding = binding.clone();
+    submission.result.actual_route.request_digest = binding.start_request_sha256.clone();
     submission.result.actual_route.self_digest = submission.result.actual_route.compute_digest()?;
     Ok(())
 }
@@ -2508,7 +2509,7 @@ fn diverged_observation(
         route_state: RouteObservationState::Diverged,
         diverged_fields: diverged,
         execution_outcome: ExecutionOutcome::Observed,
-        request_digest: zero.clone(),
+        request_digest: binding.start_request_sha256.clone(),
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -2559,7 +2560,7 @@ fn unobserved_observation(
         route_state: RouteObservationState::Unobserved,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::UnknownOutcome,
-        request_digest: zero.clone(),
+        request_digest: binding.start_request_sha256.clone(),
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -2747,6 +2748,21 @@ fn forged_binding_rejects_at_intake() -> TestResult {
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
     let stored = bind_result_fixture(&mut coordinator, &context, &lane, "forged")?;
+    // A correct full binding does not allow a presentation to substitute a
+    // different request commitment. Result intake must use the digest retained
+    // on the owner-issued start binding, not a receipt or fixture-local hash.
+    let mut wrong_request = result_submission("forged", &lane, ResultDisposition::Partial)?;
+    wrong_request.provider_result_receipt_ref = "proof-result-forged".to_owned();
+    use_result_binding(&mut wrong_request, &stored)?;
+    wrong_request.result.actual_route.request_digest = zero_digest()?;
+    wrong_request.result.actual_route.self_digest =
+        wrong_request.result.actual_route.compute_digest()?;
+    let events_before_wrong_request = coordinator.events().len();
+    assert_eq!(
+        coordinator.submit_result(context.clone(), wrong_request).err(),
+        Some(CoordinatorError::IdentityConflict("execution_binding"))
+    );
+    assert_eq!(coordinator.events().len(), events_before_wrong_request);
     // Forge the lease: the presented binding no longer agrees with the
     // admitted attempt on the exact typed lease, so intake fails closed.
     let mut binding = stored;
@@ -3979,7 +3995,13 @@ fn production_verifier_reconciles_unknown_outcome() -> TestResult {
     let context = ExecutionContext::from(&admitted);
     let lane = admitted.admitted_lanes[0].clone();
     coordinator.start_attempt(context.clone(), lane.attempt_id.clone())?;
-    let submission = result_submission("prod-unknown", &lane, ResultDisposition::UnknownOutcome)?;
+    let binding = coordinator.bind_provider_execution(
+        context.clone(),
+        binding_submission("prod-unknown", &lane, "unit-prod-unknown", "scope-prod-unknown")?,
+    )?;
+    let mut submission =
+        result_submission("prod-unknown", &lane, ResultDisposition::UnknownOutcome)?;
+    use_result_binding(&mut submission, &binding)?;
     let submission_id = submission.submission_id.clone();
     coordinator.submit_result(context.clone(), submission)?;
     let final_receipt = coordinator.reconcile_unknown_outcome(
