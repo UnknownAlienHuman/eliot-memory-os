@@ -788,6 +788,12 @@ pub struct BlobProcessStreamKernelResponse {
     pub capability: ProcessStreamSinkCapabilityRef,
     /// Echo of the one-use token reference and ordinal.
     pub call_token: BlobProcessStreamCallToken,
+    /// Next Kernel-issued one-use token, persisted before this response is
+    /// exposed. It is present for every completed operation while the grant
+    /// remains active, including stream terminal operations; source readback
+    /// has its own bounded chunk sequence and still needs fresh calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_call_token: Option<BlobProcessStreamCallToken>,
     /// Retained outcome for this exact operation.
     pub outcome: BlobProcessStreamKernelOutcome,
 }
@@ -802,6 +808,18 @@ impl BlobProcessStreamKernelResponse {
         }
         self.capability.validate()?;
         self.call_token.validate()?;
+        if let Some(next_call_token) = &self.next_call_token {
+            next_call_token.validate()?;
+            if !matches!(
+                &self.outcome,
+                BlobProcessStreamKernelOutcome::Completed { .. }
+            )
+                || next_call_token.ordinal <= self.call_token.ordinal
+                || next_call_token.reference == self.call_token.reference
+            {
+                return Err(WireValidationError::InvalidField("next_call_token"));
+            }
+        }
         match &self.outcome {
             BlobProcessStreamKernelOutcome::Completed {
                 operation_sha256,
