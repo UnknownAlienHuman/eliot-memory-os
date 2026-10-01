@@ -370,47 +370,10 @@ pub fn apply_integration_candidate(
         "pre_apply",
     )?;
     if request.pre_apply.verdict == VerifierVerdict::Fail {
-        let rollback = check_rollback_evidence(candidate, request.rollback.clone())?;
-        let receipt = finish_receipt(
-            candidate,
-            lease,
-            request,
-            BTreeSet::new(),
-            None,
-            rollback,
-            candidate.status,
-        );
-        return Err(IntegrationBridgeError::VerifierFailed {
-            receipt: Box::new(receipt),
-        });
+        return Err(refuse_pre_apply_failure(candidate, lease, request));
     }
     if request.semantic_conflict {
-        let detail = request.semantic_conflict_detail.as_ref().ok_or(
-            IntegrationBridgeError::InvalidField {
-                field: "semantic_conflict_detail",
-                reason: "a declared conflict must carry its detail",
-            },
-        )?;
-        require_text(detail, "semantic_conflict_detail", MAX_REF_LEN)?;
-        let rollback = check_rollback_evidence(candidate, request.rollback.clone())?;
-        let transitioned = transition(
-            candidate,
-            IntegrationCandidateStatus::Conflicted,
-            request.observed_at_unix_ms,
-        );
-        let receipt = finish_receipt(
-            candidate,
-            lease,
-            request,
-            BTreeSet::new(),
-            None,
-            rollback,
-            IntegrationCandidateStatus::Conflicted,
-        );
-        return Ok(BridgeApplySuccess {
-            candidate: transitioned,
-            receipt,
-        });
+        return apply_semantic_conflict(candidate, lease, request);
     }
     if request.semantic_conflict_detail.is_some() {
         return Err(IntegrationBridgeError::InvalidField {
@@ -429,30 +392,7 @@ pub fn apply_integration_candidate(
         "post_apply",
     )?;
     if request.post_apply.verdict == VerifierVerdict::Fail {
-        if let Some(handle) = candidate.rollback_or_compensation.clone() {
-            if request.rollback.is_none() {
-                return Err(IntegrationBridgeError::RollbackMissing { handle });
-            }
-        }
-        let rollback = check_rollback_evidence(candidate, request.rollback.clone())?;
-        let status = match rollback.as_ref().map(|run| run.outcome) {
-            Some(RollbackOutcome::Failed) => IntegrationCandidateStatus::UnknownOutcome,
-            _ => IntegrationCandidateStatus::Rejected,
-        };
-        let transitioned = transition(candidate, status, request.observed_at_unix_ms);
-        let receipt = finish_receipt(
-            candidate,
-            lease,
-            request,
-            request.applied_changed_paths.clone(),
-            Some(request.post_apply.clone()),
-            rollback,
-            status,
-        );
-        return Ok(BridgeApplySuccess {
-            candidate: transitioned,
-            receipt,
-        });
+        return apply_post_apply_failure(candidate, lease, request);
     }
     if request.rollback.is_some() {
         return Err(IntegrationBridgeError::InvalidField {
@@ -473,6 +413,104 @@ pub fn apply_integration_candidate(
         Some(request.post_apply.clone()),
         None,
         IntegrationCandidateStatus::Accepted,
+    );
+    Ok(BridgeApplySuccess {
+        candidate: transitioned,
+        receipt,
+    })
+}
+
+/// Refuses a failed pre-apply verifier with its failure receipt.
+///
+/// The candidate and its history stay intact; the receipt records the
+/// failure so the caller keeps its retry identity.
+fn refuse_pre_apply_failure(
+    candidate: &IntegrationCandidate,
+    lease: IntegrationOwnerLease,
+    request: &BridgeApplyRequest,
+) -> IntegrationBridgeError {
+    let rollback = match check_rollback_evidence(candidate, request.rollback.clone()) {
+        Ok(rollback) => rollback,
+        Err(error) => return error,
+    };
+    let receipt = finish_receipt(
+        candidate,
+        lease,
+        request,
+        BTreeSet::new(),
+        None,
+        rollback,
+        candidate.status,
+    );
+    IntegrationBridgeError::VerifierFailed {
+        receipt: Box::new(receipt),
+    }
+}
+
+/// Applies a declared semantic conflict as `Conflicted`, never merged.
+fn apply_semantic_conflict(
+    candidate: &IntegrationCandidate,
+    lease: IntegrationOwnerLease,
+    request: &BridgeApplyRequest,
+) -> Result<BridgeApplySuccess, IntegrationBridgeError> {
+    let detail =
+        request
+            .semantic_conflict_detail
+            .as_ref()
+            .ok_or(IntegrationBridgeError::InvalidField {
+                field: "semantic_conflict_detail",
+                reason: "a declared conflict must carry its detail",
+            })?;
+    require_text(detail, "semantic_conflict_detail", MAX_REF_LEN)?;
+    let rollback = check_rollback_evidence(candidate, request.rollback.clone())?;
+    let transitioned = transition(
+        candidate,
+        IntegrationCandidateStatus::Conflicted,
+        request.observed_at_unix_ms,
+    );
+    let receipt = finish_receipt(
+        candidate,
+        lease,
+        request,
+        BTreeSet::new(),
+        None,
+        rollback,
+        IntegrationCandidateStatus::Conflicted,
+    );
+    Ok(BridgeApplySuccess {
+        candidate: transitioned,
+        receipt,
+    })
+}
+
+/// Applies a failed post-apply verifier with rollback evidence.
+///
+/// A missing rollback where the candidate declares compensation refuses;
+/// executed rollback evidence decides `UnknownOutcome` vs `Rejected`.
+fn apply_post_apply_failure(
+    candidate: &IntegrationCandidate,
+    lease: IntegrationOwnerLease,
+    request: &BridgeApplyRequest,
+) -> Result<BridgeApplySuccess, IntegrationBridgeError> {
+    if let Some(handle) = candidate.rollback_or_compensation.clone()
+        && request.rollback.is_none()
+    {
+        return Err(IntegrationBridgeError::RollbackMissing { handle });
+    }
+    let rollback = check_rollback_evidence(candidate, request.rollback.clone())?;
+    let status = match rollback.as_ref().map(|run| run.outcome) {
+        Some(RollbackOutcome::Failed) => IntegrationCandidateStatus::UnknownOutcome,
+        _ => IntegrationCandidateStatus::Rejected,
+    };
+    let transitioned = transition(candidate, status, request.observed_at_unix_ms);
+    let receipt = finish_receipt(
+        candidate,
+        lease,
+        request,
+        request.applied_changed_paths.clone(),
+        Some(request.post_apply.clone()),
+        rollback,
+        status,
     );
     Ok(BridgeApplySuccess {
         candidate: transitioned,

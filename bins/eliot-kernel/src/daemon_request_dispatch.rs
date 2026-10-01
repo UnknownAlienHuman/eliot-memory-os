@@ -2961,7 +2961,7 @@ fn integration_bridge_apply_terminal_code(error: &IntegrationBridgeError) -> &'s
 /// history stay intact. Nothing is applied on any refusal path.
 fn integration_bridge_apply_answer(
     terminal_code: Option<&'static str>,
-    body: serde_json::Value,
+    body: &serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "status": "known",
@@ -2988,7 +2988,7 @@ fn integration_bridge_apply_refusal(
     };
     Ok(integration_bridge_apply_answer(
         Some(integration_bridge_apply_terminal_code(error)),
-        serde_json::json!({
+        &serde_json::json!({
             "reason": error.to_string(),
             "receipt": receipt,
         }),
@@ -3030,7 +3030,7 @@ impl KernelComposition {
                     .map_err(|_| TransportError::SessionFenced)?;
                 Ok(integration_bridge_apply_answer(
                     None,
-                    serde_json::json!({
+                    &serde_json::json!({
                         "candidate": candidate,
                         "receipt": receipt,
                     }),
