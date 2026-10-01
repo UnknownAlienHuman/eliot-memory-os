@@ -1820,10 +1820,11 @@ fn coordinator_case_17_candidate_disposition_is_candidate_only_and_capped() -> T
     // Serialized receipt is candidate-only.
     let wire = serde_json::to_value(&receipt)?;
     assert_eq!(wire["provider_disposition"], "CANDIDATE_SUCCEEDED");
-    // No conversion path exists to FinishDecisionOutcome::VerifiedComplete.
-    let source = include_str!("core.rs");
-    assert!(!source.contains("FinishDecision"));
-    assert!(!source.contains("VerifiedComplete"));
+    // Issue #370 S5 and the Coordinator candidate-only contract fix this
+    // receipt's ceiling at CandidateArtifact; assert the serialized contract
+    // directly instead of inspecting unrelated source identifiers.
+    assert_eq!(wire["proof_ceiling"], "CANDIDATE_ARTIFACT");
+    assert!(wire.get("finish_decision").is_none());
     Ok(())
 }
 
@@ -3853,7 +3854,14 @@ fn observe_e2e_lost_ack_reconstruct_replay_once_without_duplicate_effects() -> T
     // The replays synthesized no usage/result: exact intake still closes
     // exactly once, and a second intake is a duplicate.
     let mut submission = result_submission("e2e-observe", &lane, ResultDisposition::Partial)?;
-    submission.result.actual_route = matched_observation(&lane, &stored)?;
+    let mut actual = matched_observation(&lane, &stored)?;
+    // Issue #369 A31/W34 requires result intake to extend the accepted host
+    // event boundary and retain its cursor: sequence 2 follows event 1.
+    actual.event_sequence = 2;
+    actual.event_cursor = EventCursor::new("cursor-e2e-1")?;
+    actual.self_digest = actual.compute_digest()?;
+    actual.validate()?;
+    submission.result.actual_route = actual;
     let intake = restored.submit_result(context.clone(), submission)?;
     assert_eq!(
         intake.proof_ceiling(),
