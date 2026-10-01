@@ -30,6 +30,22 @@ pub const FORMAT_VERSION: &str = "ECXF/1";
 pub const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SECTION_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Algorithm token `IdentitySectionCodec` records for the sections it emits.
+///
+/// A name and not a placeholder: this codec copies the canonical NDJSON through
+/// unchanged, so "identity" is the accurate description of the emitted bytes and
+/// not a stand-in for a codec that was not chosen.
+pub const IDENTITY_COMPRESSION_ALGORITHM: &str = "identity";
+
+/// Algorithm token `IdentitySectionCodec` records for the encryption it
+/// applies.
+///
+/// `none` is a positive statement — this codec encrypts nothing — and it is
+/// distinct from "no owner declared a profile", which
+/// [`SectionCodec::encryption_profile`] makes unrepresentable because a codec
+/// always has to answer.
+pub const IDENTITY_ENCRYPTION_ALGORITHM: &str = "none";
+
 /// Emitted package member names, owned here so the writer in [`EcxfArchive::layout`]
 /// and the reader in [`admit_ecxf_import`] cannot drift apart.
 const MANIFEST_FILE: &str = "manifest.json";
@@ -1253,6 +1269,17 @@ impl EcxfArchive {
     /// fence (D3).
     pub fn layout(&self, codec: &dyn SectionCodec) -> Result<BTreeMap<String, Vec<u8>>, EcxfError> {
         self.validate()?;
+        // The manifest's codec members are re-checked against the codec that is
+        // actually about to encode the sections. Without this the two are
+        // independent claims about the same package and a caller could record
+        // "gzip/2" while writing identity bytes, which is the defect class the
+        // fence's other provenance members exist to prevent.
+        if self.manifest.compression != codec.compression_profile() {
+            return Err(EcxfError::InconsistentBoundary);
+        }
+        if self.manifest.encryption != codec.encryption_profile() {
+            return Err(EcxfError::InconsistentBoundary);
+        }
         let mut files = BTreeMap::new();
         files.insert(MANIFEST_FILE.to_owned(), self.manifest_json()?);
         files.insert(
@@ -1300,6 +1327,24 @@ impl EcxfArchive {
 
 pub trait SectionCodec: Send + Sync {
     fn suffix(&self) -> &'static str;
+    /// The compression profile this codec actually applies to the sections it
+    /// encodes.
+    ///
+    /// The profile is a property of the CODEC, not of the source store the
+    /// export is taken from: the manifest records what the emitted bytes are,
+    /// and only the codec that produced them knows that. `EcxfArchive::layout`
+    /// validates the manifest's `compression` against this value, so a caller
+    /// cannot declare a profile the codec it passed does not implement — which is
+    /// what makes the manifest member a record rather than a claim.
+    fn compression_profile(&self) -> CompressionProfile;
+    /// The encryption profile this codec actually applies.
+    ///
+    /// The same ownership argument as [`Self::compression_profile`]. A codec
+    /// that encrypts declares its key lineage here; one that does not declares
+    /// `plaintext_keys_present: false`, which
+    /// [`EncryptionProfile::validate`] requires and which
+    /// [`EcxfArchive::layout`] re-checks.
+    fn encryption_profile(&self) -> EncryptionProfile;
     fn encode(&self, canonical_ndjson: &[u8]) -> Result<Vec<u8>, EcxfError>;
     /// Restores the canonical NDJSON bytes of one encoded section member.
     ///
@@ -1311,12 +1356,37 @@ pub trait SectionCodec: Send + Sync {
     fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, EcxfError>;
 }
 
+/// The only codec this crate ships: sections are emitted as the canonical NDJSON
+/// they already are, uncompressed and unencrypted.
+///
+/// The two profile values are therefore FACTS about what this codec does rather
+/// than placeholders — it applies no compression and no encryption — and
+/// `EncryptionProfile::validate` forbids `plaintext_keys_present`, which this
+/// value states affirmatively. A reader of an emitted manifest can check the
+/// recorded profile against the member it landed on: `suffix()` is empty, so a
+/// section member is exactly its `.ndjson` bytes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IdentitySectionCodec;
 
 impl SectionCodec for IdentitySectionCodec {
     fn suffix(&self) -> &'static str {
         ""
+    }
+
+    fn compression_profile(&self) -> CompressionProfile {
+        CompressionProfile {
+            algorithm: IDENTITY_COMPRESSION_ALGORITHM.to_owned(),
+            version: 1,
+        }
+    }
+
+    fn encryption_profile(&self) -> EncryptionProfile {
+        EncryptionProfile {
+            algorithm: IDENTITY_ENCRYPTION_ALGORITHM.to_owned(),
+            version: 1,
+            key_lineage: None,
+            plaintext_keys_present: false,
+        }
     }
 
     fn encode(&self, canonical_ndjson: &[u8]) -> Result<Vec<u8>, EcxfError> {
@@ -1460,6 +1530,16 @@ pub fn import_ecxf_package(
     let manifest: EcxfManifest = serde_json::from_slice(manifest_bytes)
         .map_err(|error| EcxfError::Serialization(error.to_string()))?;
     manifest.validate()?;
+    // The recorded codec profiles must describe the codec this import is
+    // actually decoding with, for the same reason `layout` checks it on the way
+    // out: the profile records what was applied to the bytes, so a package
+    // claiming a profile the caller's codec does not implement would otherwise be
+    // admitted on a claim nothing backs.
+    if manifest.compression != codec.compression_profile()
+        || manifest.encryption != codec.encryption_profile()
+    {
+        return Err(EcxfError::InconsistentBoundary);
+    }
     let integrity: IntegrityManifest = serde_json::from_slice(integrity_bytes)
         .map_err(|error| EcxfError::Serialization(error.to_string()))?;
     integrity.validate()?;
