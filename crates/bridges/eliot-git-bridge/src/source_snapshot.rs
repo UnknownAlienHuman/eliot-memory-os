@@ -43,6 +43,9 @@ pub enum GitSnapshotError {
     },
     /// A complete tree could not be archived with every referenced blob.
     IncompleteArchive { path: String },
+    /// The current selected source does not occur with the observed bytes in
+    /// the owner-captured Git tree.
+    SelectedSourceMismatch { path: String },
     /// The selected workspace changed while the capture was in progress.
     WorkspaceChanged,
     /// The captured source archive exceeded the admitted byte ceiling.
@@ -91,6 +94,9 @@ impl fmt::Display for GitSnapshotError {
             }
             Self::IncompleteArchive { path } => {
                 write!(f, "Git archive omitted or changed source entry {path}")
+            }
+            Self::SelectedSourceMismatch { path } => {
+                write!(f, "selected source bytes do not match Git tree entry {path}")
             }
             Self::WorkspaceChanged => {
                 f.write_str("selected workspace changed during source capture")
@@ -169,8 +175,52 @@ impl SourceTreeSnapshot {
                 detail: "admitted source archive ceiling must be nonzero".to_owned(),
             });
         }
-        let before = capture_once_async(root, runner, max_archive_bytes).await?;
-        let after = capture_once_async(root, runner, max_archive_bytes).await?;
+        let before = capture_once_async(root, runner, max_archive_bytes, None).await?;
+        let after = capture_once_async(root, runner, max_archive_bytes, None).await?;
+        if !before.same_source(&after) {
+            return Err(GitSnapshotError::WorkspaceChanged);
+        }
+        Ok(after)
+    }
+
+    /// Captures the current Git source tree twice and requires the exact
+    /// selected file bytes observed by the caller to occur at the selected
+    /// normalized path in both owner-captured trees.
+    ///
+    /// The caller's path and bytes are observations, not authority: the path
+    /// must be a normalized repository-relative file name and the Git owner
+    /// independently reads the complete tree blobs and verifies the emitted
+    /// archive. This join prevents a path-only candidate observation from
+    /// being paired with a different tree snapshot that happened to have the
+    /// same workspace root.
+    pub async fn capture_current_async_for_selected_source(
+        root: &RepoRoot,
+        runner: &dyn AsyncProcessRunner,
+        max_archive_bytes: u64,
+        selected_relative_path: &str,
+        selected_source_bytes: &[u8],
+    ) -> Result<Self, GitSnapshotError> {
+        validate_selected_relative_path(selected_relative_path)?;
+        if max_archive_bytes == 0 {
+            return Err(GitSnapshotError::InvalidGitOutput {
+                operation: "archive bound",
+                detail: "admitted source archive ceiling must be nonzero".to_owned(),
+            });
+        }
+        let before = capture_once_async(
+            root,
+            runner,
+            max_archive_bytes,
+            Some((selected_relative_path, selected_source_bytes)),
+        )
+        .await?;
+        let after = capture_once_async(
+            root,
+            runner,
+            max_archive_bytes,
+            Some((selected_relative_path, selected_source_bytes)),
+        )
+        .await?;
         if !before.same_source(&after) {
             return Err(GitSnapshotError::WorkspaceChanged);
         }
@@ -373,6 +423,7 @@ async fn capture_once_async(
     root: &RepoRoot,
     runner: &dyn AsyncProcessRunner,
     max_archive_bytes: u64,
+    selected_source: Option<(&str, &[u8])>,
 ) -> Result<SourceTreeSnapshot, GitSnapshotError> {
     let requested = root.path();
     let (workspace_root, index, profile) = prepare_snapshot_capture(root)?;
@@ -445,6 +496,18 @@ async fn capture_once_async(
         max_archive_bytes,
     )
     .await?;
+    if let Some((relative_path, expected_bytes)) = selected_source {
+        let source_blob = blobs.get(relative_path.as_bytes()).ok_or_else(|| {
+            GitSnapshotError::SelectedSourceMismatch {
+                path: relative_path.to_owned(),
+            }
+        })?;
+        if source_blob.bytes.as_slice() != expected_bytes {
+            return Err(GitSnapshotError::SelectedSourceMismatch {
+                path: relative_path.to_owned(),
+            });
+        }
+    }
     let archive = run_git_async(
         runner,
         &workspace_root,
@@ -473,6 +536,20 @@ async fn capture_once_async(
         archive_bytes: archive.stdout,
         max_archive_bytes,
     })
+}
+
+fn validate_selected_relative_path(path: &str) -> Result<(), GitSnapshotError> {
+    if path.is_empty()
+        || path.contains('\\')
+        || path.starts_with('/')
+        || path.split('/').any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(GitSnapshotError::InvalidGitOutput {
+            operation: "selected source path",
+            detail: "selected path must be a normalized repository-relative file path".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 struct OwnedGitIndex {
