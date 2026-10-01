@@ -456,7 +456,7 @@ pub struct ScopeBindingGuardReceipt {
 }
 
 /// Original, owner-admitted source inputs required to compile cold-start
-/// readiness. This data is retained inside the canonical WorkScope snapshot;
+/// readiness. This data is retained inside the canonical `WorkScope` snapshot;
 /// the policy owner remains independently owned and is named by its exact
 /// admission reference and revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -464,9 +464,9 @@ pub struct ScopeBindingGuardReceipt {
 pub struct ColdStartOwnerInputs {
     /// Full owner fence the original binding admission was accepted under.
     pub state_fence: StateFence,
-    /// Exact WorkScope owner revision issued for the retained snapshot.
+    /// Exact `WorkScope` owner revision issued for the retained snapshot.
     pub owner_revision: u64,
-    /// The exact descriptor admitted at the same StateFence.
+    /// The exact descriptor admitted at the same `StateFence`.
     pub descriptor: WorkScopeDescriptor,
     /// Root identity independently observed by the Host during admission.
     pub explicit_root_identity: String,
@@ -490,7 +490,7 @@ pub struct ColdStartOwnerInputs {
     /// Original privacy boundary admitted with the descriptor and source set.
     pub privacy: PrivacyProfile,
     /// Exact full boundary admitted from original bootstrap discovery/Policy.
-    /// The profile boundary reference alone cannot recreate its admitted set.
+    /// The admitted privacy classes alone cannot recreate the full boundary.
     #[serde(default)]
     pub privacy_boundary: Option<PrivacyBoundary>,
     /// Full original discovery producer input, retained to preserve its scan
@@ -507,7 +507,7 @@ pub struct ColdStartOwnerInputs {
     /// Kernel issues it. Initial scope admission may precede that lease.
     #[serde(default)]
     pub discovery_lease: Option<DiscoveryReadLease>,
-    /// Original bounded scan output retained by the WorkScope owner so a
+    /// Original bounded scan output retained by the `WorkScope` owner so a
     /// later readiness read can reproduce the exact dirty/source key.
     #[serde(default)]
     pub scan_evidence: Option<BootstrapScanEvidence>,
@@ -863,7 +863,7 @@ impl PrivacyProfile {
 /// Every verdict [`resolve_bridge_ingest_disclosure`] decides is recorded at
 /// this revision; a verdict naming another revision was decided under another
 /// policy and never authorizes persistence. This names the privacy rule
-/// version — never a fencing, transport, or resource generation, which measure
+/// version â€” never a fencing, transport, or resource generation, which measure
 /// liveness rather than policy.
 pub const BRIDGE_INGEST_PRIVACY_POLICY_REVISION: u64 = 1;
 
@@ -936,8 +936,8 @@ impl BridgeIngestDisclosure {
 /// side the evaluated evidence determined.
 ///
 /// The scope boundary profile, provider retention constraints, and the
-/// Governor's `DisclosureDecision` do not reach this query — no caller on the
-/// bridge-ingest path carries them — so nothing here can admit what those legs
+/// Governor's `DisclosureDecision` do not reach this query â€” no caller on the
+/// bridge-ingest path carries them â€” so nothing here can admit what those legs
 /// would deny; events requiring them stay withheld until decided through the
 /// Governor path that presents them.
 pub fn resolve_bridge_ingest_disclosure(
@@ -2904,7 +2904,7 @@ impl OnboardingSingleFlight {
     /// caller names the exact workspace filesystem/VCS identity
     /// (`lineage_candidate_ref` + `workspace_instance_candidate_ref`), privacy
     /// boundary and governing-source generation, and receives the cloned
-    /// retained lease with the terminal receipt the lease published — or
+    /// retained lease with the terminal receipt the lease published â€” or
     /// `None` when no lease owns the key or no terminal was published yet. It
     /// never joins, compiles, or mutates; joining stays with
     /// [`OnboardingSingleFlight::join`] and
@@ -2993,9 +2993,9 @@ impl OnboardingSingleFlight {
     /// Drives one live attach trigger end to end: join, compile, publish.
     ///
     /// This is the Governor/WorkScopeResolver-owned live-trigger entry point
-    /// (I4.4.1): the caller — first UI project open, agent attach/launch,
+    /// (I4.4.1): the caller â€” first UI project open, agent attach/launch,
     /// unknown-workspace event, explicit onboarding request, stale
-    /// generation, or resume without a current task — supplies the trigger,
+    /// generation, or resume without a current task â€” supplies the trigger,
     /// the privacy-bounded discovery lease, the proposed onboarding lease,
     /// and every exact identity the freeze requires (scope, instance,
     /// lineage, candidate, governing sources, fence, governance/route
@@ -3014,7 +3014,7 @@ impl OnboardingSingleFlight {
     /// terminal state follows the compiled receipt: `ReadyMaterial` and
     /// `ReadyReadOnly` publish `Ready`, a `NeedsTask` receipt over an
     /// ambiguous task binding publishes `Ambiguous`, and any other compiled
-    /// but incomplete receipt publishes `Failed` — the exact missing
+    /// but incomplete receipt publishes `Failed` â€” the exact missing
     /// question stays in the terminal surface, and the next trigger starts a
     /// new lease revision rather than mutating this one. A ready terminal is
     /// returned only after authenticated owner readback of its exact scan
@@ -3125,7 +3125,7 @@ impl OnboardingSingleFlight {
     /// The terminal state follows the compiled receipt: `ReadyMaterial` and
     /// `ReadyReadOnly` publish `Ready`, a `NeedsTask` receipt over an
     /// ambiguous task binding publishes `Ambiguous`, and any other compiled
-    /// but incomplete receipt publishes `Failed` — the exact missing
+    /// but incomplete receipt publishes `Failed` â€” the exact missing
     /// question stays in the terminal surface, and the next trigger starts a
     /// new lease revision rather than mutating this one.
     ///
@@ -3538,6 +3538,10 @@ impl ColdStartOwnerInputs {
             text(&discovery.scan_ref, "bootstrap_discovery.scan_ref")?;
             discovery.evidence.validate()?;
         }
+        self.validate_retained_scan_disclosure()
+    }
+
+    fn validate_retained_scan_disclosure(&self) -> Result<(), WorkScopeError> {
         match (
             &self.scan_evidence,
             &self.scan_binding,
@@ -3661,7 +3665,7 @@ impl WorkScopeBindingOwner {
     }
 
     /// Retains the exact admitted descriptor, explicit root, source admission,
-    /// policy reference and discovery lease in the same WorkScope owner row.
+    /// policy reference and discovery lease in the same `WorkScope` owner row.
     pub fn retain_cold_start_inputs(
         mut self,
         inputs: ColdStartOwnerInputs,
