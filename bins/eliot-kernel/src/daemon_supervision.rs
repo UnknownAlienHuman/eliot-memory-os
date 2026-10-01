@@ -13,6 +13,7 @@ use eliot_contracts::StateFence;
 use eliot_kernel_service::KernelServiceState;
 use eliot_kernel_service::{KernelActivationReceipt, KernelServiceError};
 use eliot_ors::{SupervisionLeaseOperation, SupervisionLeaseSnapshot};
+use eliot_process::OperationId;
 #[cfg(not(windows))]
 use eliot_process::ProcessStartReceipt;
 #[cfg(windows)]
@@ -40,6 +41,70 @@ pub(crate) enum DaemonRuntimeStatus {
     Ready,
     Degraded(String),
     Failed(String),
+    /// The bounded restart budget for this exact process lineage is spent.
+    /// The exact process receipt or durable restart-disposition key remains
+    /// attached until an explicit replacement owner admits a new lineage.
+    Quarantined(DaemonQuarantineEvidence),
+}
+
+/// Original daemon identity retained when restart exhaustion is observed.
+///
+/// A live transition retains the exact process receipt. After Kernel restart,
+/// the durable caller/generation key is the only proven handle unless the
+/// process owner separately rehydrates a receipt; this variant does not invent
+/// one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonQuarantineLineage {
+    /// Exact active process receipt retained from this Kernel lifetime.
+    ProcessReceipt(ProcessStartReceipt),
+    /// Exact durable restart-disposition key recovered before first launch.
+    DurableRestartBudget { module_id: String, generation: u64 },
+}
+
+impl DaemonQuarantineLineage {
+    pub(crate) fn process_receipt(&self) -> Option<&ProcessStartReceipt> {
+        match self {
+            Self::ProcessReceipt(receipt) => Some(receipt),
+            Self::DurableRestartBudget { .. } => None,
+        }
+    }
+
+    pub(crate) fn recovery_evidence_handle(&self) -> DaemonQuarantineEvidenceHandle {
+        match self {
+            Self::ProcessReceipt(receipt) => {
+                DaemonQuarantineEvidenceHandle::ProcessOperation(receipt.operation_id().clone())
+            }
+            Self::DurableRestartBudget {
+                module_id,
+                generation,
+            } => DaemonQuarantineEvidenceHandle::DurableRestartBudget {
+                module_id: module_id.clone(),
+                generation: *generation,
+            },
+        }
+    }
+}
+
+/// Existing identity that a manual recovery owner must cite when handling a
+/// quarantine; it is evidence, not authority to clear the fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonQuarantineEvidenceHandle {
+    /// Existing process operation identity.
+    ProcessOperation(OperationId),
+    /// Existing ORS restart-disposition key.
+    DurableRestartBudget { module_id: String, generation: u64 },
+}
+
+/// Exact original lineage evidence retained by a quarantine transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DaemonQuarantineEvidence {
+    /// Exact process receipt or durable caller/generation identity.
+    pub(crate) original_lineage: DaemonQuarantineLineage,
+    /// Existing receipt operation or durable restart-disposition identity.
+    pub(crate) recovery_evidence_handle: DaemonQuarantineEvidenceHandle,
+    /// Restart exhaustion precedes process-tree closure; no closure is
+    /// inferred by entering quarantine.
+    pub(crate) process_tree_closure_proven: bool,
 }
 
 /// F-LOG-KERNEL-3 (#901): supervision boundary observations.

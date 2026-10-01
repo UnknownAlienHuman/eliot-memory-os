@@ -23,6 +23,7 @@ use eliot_process::{
 
 #[cfg(windows)]
 use super::DaemonRestartRefusal;
+use super::daemon_supervision::DaemonQuarantineLineage;
 use super::diagnostic_brief::DiagnosticTrigger;
 use super::kernel_audit::{AuditEventDraft, AuditEventKind};
 use super::{
@@ -220,6 +221,12 @@ impl KernelComposition {
                             KernelBuildError::Service(format!(
                                 "eliotd failed before authenticated readiness: {reason}"
                             )),
+                        ),
+                        DaemonRuntimeStatus::Quarantined(_) => AwaitDecision::Rejected(
+                            "quarantined_before_ready",
+                            KernelBuildError::Service(
+                                "eliotd lineage is quarantined for explicit recovery".to_owned(),
+                            ),
                         ),
                         DaemonRuntimeStatus::NotLaunched | DaemonRuntimeStatus::Launching => {
                             AwaitDecision::Rejected(
@@ -685,6 +692,119 @@ impl KernelComposition {
         Ok(Some(DaemonRestartRefusal::RestartBudgetExhausted))
     }
 
+    /// Records the one in-memory quarantine transition for an exhausted
+    /// durable restart lineage. The exact receipt or caller/generation key
+    /// remains the recovery handle; no tree closure is inferred.
+    #[cfg(windows)]
+    fn quarantine_daemon_lineage(
+        &self,
+        lineage: DaemonQuarantineLineage,
+    ) -> Result<bool, KernelServiceError> {
+        let reason_handle = PlatformHandle::new("eliotd-restart-budget-exhausted".to_owned())
+            .map_err(|error| KernelServiceError::Platform(error.to_string()))?;
+        let receipt = lineage.process_receipt();
+        let audit_detail = match &lineage {
+            DaemonQuarantineLineage::ProcessReceipt(_) => {
+                "restart_budget_exhausted; process_tree_closure=unproven".to_owned()
+            }
+            DaemonQuarantineLineage::DurableRestartBudget {
+                module_id,
+                generation,
+            } => format!(
+                "restart_budget_exhausted; original_receipt_not_rehydrated; caller={module_id}; generation={generation}; process_tree_closure=unproven"
+            ),
+        };
+        {
+            let mut state = self.daemon_runtime.lock().map_err(|_| {
+                KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
+            })?;
+            if matches!(state.status, DaemonRuntimeStatus::Quarantined(_)) {
+                return Ok(false);
+            }
+            match (&lineage, state.receipt.as_ref()) {
+                (DaemonQuarantineLineage::ProcessReceipt(expected), Some(actual))
+                    if expected == actual => {}
+                (DaemonQuarantineLineage::DurableRestartBudget { .. }, None)
+                    if state.status == DaemonRuntimeStatus::NotLaunched => {}
+                _ => return Err(KernelServiceError::ReadinessNotProven),
+            }
+            state.status = DaemonRuntimeStatus::Quarantined(DaemonQuarantineEvidence {
+                recovery_evidence_handle: lineage.recovery_evidence_handle(),
+                original_lineage: lineage.clone(),
+                process_tree_closure_proven: false,
+            });
+            state.supervision = None;
+            state.live_ready = None;
+        }
+        self.daemon_status_changed.notify_one();
+
+        // The status fence is published first. Even if revocation or the
+        // service-state projection fails, ordinary readiness/admission stays
+        // closed and the transition receives its audit and trigger below.
+        let revoke_result = self.revoke_daemon_agent_bridge_profile();
+        let service_result = self
+            .service
+            .lock()
+            .map_err(|_| KernelServiceError::Platform("service lock poisoned".to_owned()))
+            .and_then(|mut service| {
+                if matches!(
+                    service.state(),
+                    KernelServiceState::Activating
+                        | KernelServiceState::Ready
+                        | KernelServiceState::Degraded
+                ) {
+                    service.apply(KernelControlCommand::Degrade(reason_handle))?;
+                }
+                Ok(())
+            });
+        self.audit_observe(AuditEventDraft::process_daemon_status(
+            AuditEventKind::PROCESS_QUARANTINED,
+            receipt,
+            &audit_detail,
+            self.current_state_fence().as_ref(),
+        ));
+        self.observe_diagnostic_problem(DiagnosticTrigger::ModuleCrashOrRestartExhaustion);
+
+        revoke_result?;
+        service_result?;
+        Ok(true)
+    }
+
+    /// Rehydrates the exhausted caller/generation disposition before an
+    /// activation's first process launch. Kernel restart may discard the
+    /// process receipt, but it cannot turn the retained ORS row into a fresh
+    /// restart window or start the same daemon generation again.
+    #[cfg(windows)]
+    pub(super) fn quarantine_daemon_restart_budget_before_launch(
+        &self,
+        launch: &EliotdLaunchDescriptor,
+    ) -> Result<bool, KernelBuildError> {
+        let generation = launch.generation.value();
+        let recorded = self
+            .generation_gateway
+            .ors
+            .load_kernel_restart_reconciliation(ACTIVE_DAEMON_CALLER, generation)
+            .map_err(|error| {
+                KernelBuildError::Service(format!(
+                    "eliotd durable restart disposition is unreadable; launch remains blocked: {error}"
+                ))
+            })?;
+        if recorded.is_none() {
+            return Ok(false);
+        }
+        self.quarantine_daemon_lineage(DaemonQuarantineLineage::DurableRestartBudget {
+            module_id: ACTIVE_DAEMON_CALLER.to_owned(),
+            generation,
+        })
+        .map_err(|_| {
+            KernelBuildError::Service(
+                "eliotd durable restart budget is exhausted; quarantine transition could not be completed"
+                    .to_owned(),
+            )
+        })?;
+        Ok(true)
+    }
+
     /// Performs one Kernel-owned bounded recovery of a failed daemon
     /// attempt. The old process effect must be known terminal before the
     /// active descriptor, nonce, and operation identity are replaced.
@@ -792,6 +912,12 @@ impl KernelComposition {
                     .to_owned(),
             ));
         }
+        if matches!(status, DaemonRuntimeStatus::Quarantined(_)) {
+            *child_terminal_owned = true;
+            return Err(KernelBuildError::Service(
+                "eliotd lineage is quarantined for explicit recovery/requalification".to_owned(),
+            ));
+        }
         if matches!(status, DaemonRuntimeStatus::Ready) {
             if let Some(receipt) = previous_receipt {
                 if self
@@ -841,6 +967,24 @@ impl KernelComposition {
             if let Some(refusal) = refused {
                 let reason = daemon_restart_refusal_reason(&refusal);
                 observe_daemon_runtime("kernel.daemon.restart_refused", reason);
+                if matches!(refusal, DaemonRestartRefusal::RestartBudgetExhausted) {
+                    if let Some(receipt) = previous_receipt.as_ref() {
+                        *child_terminal_owned = true;
+                        self.quarantine_daemon_lineage(DaemonQuarantineLineage::ProcessReceipt(
+                            receipt.clone(),
+                        ))
+                        .map_err(|_| {
+                            KernelBuildError::Service(
+                                "eliotd restart budget is exhausted; quarantine transition evidence could not be completed"
+                                    .to_owned(),
+                            )
+                        })?;
+                        return Err(KernelBuildError::Service(
+                            "eliotd restart budget exhausted; lineage quarantined for explicit recovery/requalification"
+                                .to_owned(),
+                        ));
+                    }
+                }
                 return Err(self
                     .daemon_failure_error(format!("eliotd automatic restart refused: {reason}")));
             }
@@ -1093,6 +1237,9 @@ impl KernelComposition {
             let state = self.daemon_runtime.lock().map_err(|_| {
                 KernelServiceError::Platform("daemon runtime lock poisoned".to_owned())
             })?;
+            if matches!(state.status, DaemonRuntimeStatus::Quarantined(_)) {
+                return Ok(());
+            }
             if state.receipt.is_none() {
                 return Err(KernelServiceError::ReadinessNotProven);
             }
@@ -1103,6 +1250,9 @@ impl KernelComposition {
             .daemon_runtime
             .lock()
             .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
+        if matches!(state.status, DaemonRuntimeStatus::Quarantined(_)) {
+            return Ok(());
+        }
         if state.receipt.is_none() {
             return Err(KernelServiceError::ReadinessNotProven);
         }
@@ -1142,6 +1292,9 @@ impl KernelComposition {
             .daemon_runtime
             .lock()
             .map_err(|_| KernelServiceError::Platform("daemon runtime lock poisoned".to_owned()))?;
+        if matches!(state.status, DaemonRuntimeStatus::Quarantined(_)) {
+            return Ok(());
+        }
         let receipt = state.receipt.clone();
         state.status = DaemonRuntimeStatus::Failed(reason.to_owned());
         state.recovery_fenced |= recovery_fenced;
