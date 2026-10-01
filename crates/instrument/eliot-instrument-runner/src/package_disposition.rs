@@ -57,7 +57,7 @@ use crate::registry::ProviderRegistry;
 /// This is the completeness authority for the ledger: every member must carry
 /// exactly one disposition and no disposition may name a package outside this
 /// set.
-pub const INSTRUMENT_PACKAGE_FAMILY: [&str; 17] = [
+pub const INSTRUMENT_PACKAGE_FAMILY: [&str; 18] = [
     "eliot-artifact",
     "eliot-build-test-graph",
     "eliot-code-cortex",
@@ -70,6 +70,7 @@ pub const INSTRUMENT_PACKAGE_FAMILY: [&str; 17] = [
     "eliot-instrument-rustc",
     "eliot-instrument-rustfmt",
     "eliot-instrument-scip",
+    "eliot-lsp-bridge",
     "eliot-observability",
     "eliot-product-evaluation",
     "eliot-reports",
@@ -96,7 +97,7 @@ pub const TESTD_DISPATCH_UNIVERSE: [&str; 4] = [
 ///
 /// A package that is not dispatchable (bounded fixture or deleted) must not
 /// name any member of this universe.
-pub const TESTD_PROFILE_UNIVERSE: [&str; 12] = [
+pub const TESTD_PROFILE_UNIVERSE: [&str; 14] = [
     "eliot.instrument.build-test-graph",
     "eliot.instrument.cargo",
     "eliot.instrument.diagnostic",
@@ -106,6 +107,8 @@ pub const TESTD_PROFILE_UNIVERSE: [&str; 12] = [
     "eliot.instrument.product-evaluation",
     "eliot.instrument.rustc",
     "eliot.instrument.rustfmt",
+    "eliot.instrument.rust-analyzer.diagnostics",
+    "eliot.instrument.rust-analyzer.version",
     "eliot.instrument.scip",
     "eliot.instrument.test-selection",
     "eliot.instrument.verifier",
@@ -278,7 +281,7 @@ pub struct PackageDispositionRecord {
 /// execution graph. Five packages have no production consumer at all and are
 /// retained as bounded fixtures with a recorded expiry and removal condition.
 /// No package is deleted in this ledger.
-pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
+pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 18] = [
     PackageDispositionRecord {
         package: "eliot-build-test-graph",
         route: PackageRoute::LiveLibrarySurface,
@@ -397,6 +400,21 @@ pub const PACKAGE_DISPOSITIONS: [PackageDispositionRecord; 17] = [
         proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/registry.rs::ProviderRegistry::resolve_current",
         proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
         removal_boundary: "delete only after the code-intelligence adapter migrates off the decoder and no Cargo, feature, route, documentation or test reference remains",
+        fixture_expiry: None,
+    },
+    PackageDispositionRecord {
+        package: "eliot-lsp-bridge",
+        route: PackageRoute::LiveTestdProfile,
+        execution_contour: ExecutionContour::GovernedProcessExecutor,
+        testd_profile: "eliot.instrument.rust-analyzer.diagnostics",
+        testd_dispatch_profile: "",
+        live_consumer: "eliot-lsp-bridge",
+        capability_owner: "eliot-instrument-runner::registry",
+        state_owner: "stateless",
+        contract: "eliot.instrument.rust-analyzer.diagnostics",
+        proof_entrypoint: "crates/instrument/eliot-instrument-runner/src/rust_analyzer_profile.rs::resolve_current",
+        proof_ceiling: "INSTRUMENT_PROFILE_GRAPH_CANDIDATE",
+        removal_boundary: "delete only after Rust semantic diagnostics and version probing migrate to another admitted one-shot process profile and no Cargo, feature, route, documentation or test reference remains",
         fixture_expiry: None,
     },
     PackageDispositionRecord {
