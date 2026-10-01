@@ -11,10 +11,9 @@ use eliot_agent_api::{AttemptId, RouteFingerprint};
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub(crate) use eliot_agent_contracts::preference_policy_digest;
 pub use eliot_agent_contracts::{
     BillingClass, HumanModelPreferencePolicy, MODEL_PREFERENCE_SCHEMA_VERSION, ModelControlError,
-    ModelRole, ModelSelector, RoleModelPreference,
+    ModelRole, ModelSelector, RoleModelPreference, preference_policy_digest,
 };
 
 use crate::CoordinatedAttemptState;
