@@ -162,8 +162,8 @@ fn authorized_effect_rejects_string_and_unzoned_times() {
 }
 
 #[test]
-fn v6_legacy_effect_wire_is_rejected_by_current_schema_and_ceiling() -> Result<(), Box<dyn std::error::Error>>
-{
+fn v6_legacy_effect_wire_is_rejected_by_current_schema_and_ceiling()
+-> Result<(), Box<dyn std::error::Error>> {
     // Preserve the v6 effect member shape: its digest was an untyped string.
     let v6 = serde_json::json!({
         "effect_id": "effect-1",
