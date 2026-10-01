@@ -691,6 +691,7 @@ impl KernelComposition {
         let expired = activation_deadline_expired(now, envelope.identity.deadline_unix_ms);
 
         let (descriptor, receipt) = self.host_request_connection_gate_under_transition(envelope)?;
+<<<<<<< Updated upstream
         self.host_request_application_binding_gate_under_transition(envelope, task_relative_tool)?;
         if matches!(
             envelope.kind,
@@ -700,6 +701,9 @@ impl KernelComposition {
         ) {
             self.validate_host_request_parent_owner_under_transition(envelope, &descriptor)?;
         }
+=======
+        self.host_request_application_binding_gate_under_transition(envelope)?;
+>>>>>>> Stashed changes
         self.host_request_service_gate(&descriptor, envelope)?;
         let binding = bridge_process_binding(&descriptor, &receipt, &envelope.connection_id)?;
 
@@ -2234,6 +2238,7 @@ impl KernelComposition {
         Ok((profile.admission, receipt))
     }
 
+<<<<<<< Updated upstream
     /// Verifies that the retained activation binding still correlates to the
     /// exact Kernel-issued ticket and typed result that produced it (issue
     /// #1746 W2).
@@ -2393,6 +2398,8 @@ impl KernelComposition {
             && digest.as_deref() == Some(retained.kernel_owner_bundle_sha256.as_str())
     }
 
+=======
+>>>>>>> Stashed changes
     /// Verifies claimed application session/task/scope continuity against the
     /// exact binding retained from this connection's `Resolved` activation
     /// (issue #1746).
@@ -2401,15 +2408,22 @@ impl KernelComposition {
     /// binds the authenticated transport to the activation-derived
     /// application authority. It is mechanical only: claimed values are
     /// compared for exact equality against retained values, nothing is
+<<<<<<< Updated upstream
     /// re-resolved and no task is ever selected here. An absent task claim is
     /// allowed only for capabilities classified as task-safe after this
     /// connection has a `Resolved` activation. `TaskSelectionRequired` does
     /// not publish an application binding, so this is not a preselection route.
+=======
+    /// re-resolved and no task is ever selected here. Absent claims are not
+    /// invented: discovery stays reachable without a task, and whether a
+    /// capability requires a task remains the Governor's semantic decision.
+>>>>>>> Stashed changes
     ///
     /// A claim naming a different session, task, scope, or task revision than
     /// the retained activation binding is `IdentityConflict`: the request must
     /// re-activate under the new binding, it is never silently rebound or
     /// rewritten. A claim matching the retained binding whose application
+<<<<<<< Updated upstream
     /// session is unknown, terminal, epoch-mismatched, never bound to the
     /// presenting connection, or carries an expired or revoked session-bound
     /// lease is `SessionFenced`.
@@ -2430,6 +2444,13 @@ impl KernelComposition {
         &self,
         envelope: &HostRequestEnvelope,
         task_relative_tool: Option<bool>,
+=======
+    /// session is unknown, terminal, epoch-mismatched, or never bound to the
+    /// presenting connection is `SessionFenced`.
+    fn host_request_application_binding_gate_under_transition(
+        &self,
+        envelope: &HostRequestEnvelope,
+>>>>>>> Stashed changes
     ) -> Result<(), TransportError> {
         if envelope.kind == HostRequestKind::Activation {
             return Ok(());
@@ -2447,6 +2468,7 @@ impl KernelComposition {
                 .clone()
                 .ok_or(TransportError::SessionFenced)?
         };
+<<<<<<< Updated upstream
         // The activation's own principal is the end user. A blank principal was
         // already refused when the binding was retained, so re-checking it here
         // keeps "no retained identity means no authority" true even if a future
@@ -2482,6 +2504,30 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         self.validate_host_request_application_session(envelope, &retained)?;
+=======
+        if let Some(claimed) = envelope.identity.session_id.as_deref() {
+            if claimed != retained.session_id {
+                return Err(TransportError::IdentityConflict);
+            }
+            let sessions = self
+                .agent_application_sessions
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let live = sessions.get(claimed).is_some_and(|session| {
+                !session.state().is_terminal()
+                    && session
+                        .authority_epoch()
+                        .is_same_authority(&envelope.state_fence.authority_epoch)
+                    && session
+                        .transport_bindings()
+                        .iter()
+                        .any(|binding| binding.binding_id == envelope.connection_id)
+            });
+            if !live {
+                return Err(TransportError::SessionFenced);
+            }
+        }
+>>>>>>> Stashed changes
         if let Some(claimed) = envelope.identity.task_id.as_deref()
             && claimed != retained.task_id
         {
@@ -2497,6 +2543,7 @@ impl KernelComposition {
         {
             return Err(TransportError::IdentityConflict);
         }
+<<<<<<< Updated upstream
         // A task-relative/effectful Invocation is the case I7.8 steps 7-12
         // and the A1 acceptance forbid without task-bound authority: its
         // envelope must carry the retained task, scope, and revision. A
@@ -2577,6 +2624,11 @@ impl KernelComposition {
         }
     }
 
+=======
+        Ok(())
+    }
+
+>>>>>>> Stashed changes
     /// Applies the service-state rule that mirrors the admission gate: full
     /// admission requires `Ready`, while `Cancellation`, `Status`, and
     /// `Reconciliation` additionally route while `Degraded`. The gate itself
@@ -3415,6 +3467,37 @@ impl KernelComposition {
     /// a null poll, not an error. Pure queue memory: no store IO, so
     /// already-resulted pairs are retired by the submit legs rather than
     /// re-checked here.
+    /// Revalidates a queued operation's claimed application session against
+    /// the live session authority before a daemon claim (issue #1746).
+    ///
+    /// Admission verified the claim; this closes the logout/revocation window
+    /// between enqueue and claim. A pair whose claimed session is unknown,
+    /// terminal, epoch-mismatched, or never bound to the presenting
+    /// connection is not claimable. Pairs without a session claim carry
+    /// nothing to revalidate here.
+    fn application_session_live_for_claim(
+        &self,
+        envelope: &HostRequestEnvelope,
+    ) -> Result<bool, TransportError> {
+        let Some(claimed) = envelope.identity.session_id.as_deref() else {
+            return Ok(true);
+        };
+        let sessions = self
+            .agent_application_sessions
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        Ok(sessions.get(claimed).is_some_and(|session| {
+            !session.state().is_terminal()
+                && session
+                    .authority_epoch()
+                    .is_same_authority(&envelope.state_fence.authority_epoch)
+                && session
+                    .transport_bindings()
+                    .iter()
+                    .any(|binding| binding.binding_id == envelope.connection_id)
+        }))
+    }
+
     pub(crate) fn claim_local_read_pair(
         &self,
         session: &Session,
@@ -3449,7 +3532,11 @@ impl KernelComposition {
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
+<<<<<<< Updated upstream
                 if !self.application_binding_live_for_claim(envelope, &admission_owner, false)? {
+=======
+                if !self.application_session_live_for_claim(envelope)? {
+>>>>>>> Stashed changes
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
@@ -5205,12 +5292,16 @@ impl KernelComposition {
                     position += 1;
                     continue;
                 }
+<<<<<<< Updated upstream
                 let task_relative_tool = check_observe_tool_linkage(envelope, tool)?;
                 if !self.application_binding_live_for_claim(
                     envelope,
                     &admission_owner,
                     task_relative_tool,
                 )? {
+=======
+                if !self.application_session_live_for_claim(envelope)? {
+>>>>>>> Stashed changes
                     position += 1;
                     continue;
                 }

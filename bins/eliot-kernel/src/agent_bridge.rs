@@ -1908,10 +1908,23 @@ impl KernelComposition {
             return Err(TransportError::IdentityConflict);
         }
         // Retain the exact Resolved task/scope binding for later dispatch
+<<<<<<< Updated upstream
         // continuity (issue #1746); fails closed here, before any retained
         // state is mutated.
         let activated_binding =
             Self::activated_application_binding(binding, pending, result, &receipt, connection_id)?;
+=======
+        // continuity (issue #1746). The revision must be the canonical
+        // decimal `TaskRevision`; anything else fails closed here, before any
+        // retained state is mutated.
+        let activated_task_revision = binding
+            .task_revision
+            .parse::<u64>()
+            .ok()
+            .filter(|revision| revision.to_string() == binding.task_revision)
+            .and_then(|revision| eliot_contracts::TaskRevision::new(revision).ok())
+            .ok_or(TransportError::SessionFenced)?;
+>>>>>>> Stashed changes
         // Complete every fallible response projection and connection check
         // before mutating the retained application session. Publication below
         // this point is infallible.
@@ -1922,7 +1935,16 @@ impl KernelComposition {
             session.session_epoch,
         )?;
         state.session = Some(session);
+<<<<<<< Updated upstream
         state.activated_binding = Some(activated_binding);
+=======
+        state.activated_binding = Some(super::ActivatedApplicationBinding {
+            session_id: binding.session_id.clone(),
+            task_id: binding.task_id.clone(),
+            work_scope_id: binding.work_scope_id.clone(),
+            task_revision: activated_task_revision,
+        });
+>>>>>>> Stashed changes
         state.activation_completed = true;
         Ok(reply)
     }

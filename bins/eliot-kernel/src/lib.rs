@@ -1039,6 +1039,7 @@ struct AgentBridgeProfile {
 /// values instead of trusting caller claims. Selection currency against live
 /// Governor state stays the Governor's; a claim naming another task or scope
 /// fails as a conflict and must re-activate, it is never silently rebound.
+<<<<<<< Updated upstream
 ///
 /// The retained record is the A12.2 application binding in full: the
 /// harness/installation-established `principal_id`, the durable semantic
@@ -1055,6 +1056,11 @@ struct ActivatedApplicationBinding {
     /// Application principal the activation owner resolved for this
     /// connection. Never the bridge module identity or the pipe peer identity.
     principal_id: String,
+=======
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct ActivatedApplicationBinding {
+>>>>>>> Stashed changes
     /// Application session resolved by Governor for this activation.
     session_id: String,
     /// Governor-owned task selected at activation time.
@@ -1063,6 +1069,7 @@ struct ActivatedApplicationBinding {
     work_scope_id: String,
     /// `TaskContract` revision selected at activation time.
     task_revision: eliot_contracts::TaskRevision,
+<<<<<<< Updated upstream
     /// Authority epoch the activation fence carried when the result was
     /// accepted; a later request under another epoch is not this binding.
     authority_epoch: eliot_contracts::EpochId,
@@ -1085,6 +1092,8 @@ struct ActivatedApplicationBinding {
     /// Current P-07 owner projection under which the result was accepted.
     kernel_owner_revision: u64,
     kernel_owner_bundle_sha256: String,
+=======
+>>>>>>> Stashed changes
 }
 
 #[cfg(windows)]
