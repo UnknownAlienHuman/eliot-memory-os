@@ -882,7 +882,8 @@ enum SetupCommand {
         owner_ref: String,
     },
     /// With automation disabled, record one deduplicated Human-board
-    /// recommendation for a needed action; no job starts.
+    /// recommendation for a needed action; no job starts. The stable dedup
+    /// key covers family, scope, reason, and policy episode.
     Recommend {
         /// Automation mode: `suggest_only`, `manual`, `idle_only`,
         /// `scheduled`, `continuous_bounded`, or `off`.
@@ -894,6 +895,12 @@ enum SetupCommand {
         /// Affected scope reference.
         #[arg(long)]
         scope: String,
+        /// Reason the maintenance/requalification action is needed.
+        #[arg(long)]
+        reason: String,
+        /// Policy episode that determined the action is needed.
+        #[arg(long)]
+        policy_episode: String,
     },
     /// Prepare the first signed configuration payload from the confirmed
     /// privacy mode and first-run choices (I3.2 milestone 7).
@@ -1069,10 +1076,14 @@ fn run_setup(command: SetupCommand) -> Result<i32> {
             automation,
             family,
             scope,
+            reason,
+            policy_episode,
         } => first_run_flow::run_setup_recommend(&first_run_flow::SetupRecommendArgs {
             automation,
             family,
             scope,
+            reason,
+            policy_episode,
         }),
         SetupCommand::InitialConfig {
             snapshot_id,

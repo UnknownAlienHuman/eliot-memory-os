@@ -80,11 +80,14 @@ pub struct SetupSetArgs {
 }
 
 /// Decoded `setup recommend` arguments for a needed maintenance action when
-/// automation is disabled.
+/// automation is disabled. Every field is caller-supplied text; blank values
+/// fail closed before any board mutation.
 pub struct SetupRecommendArgs {
     pub automation: String,
     pub family: String,
     pub scope: String,
+    pub reason: String,
+    pub policy_episode: String,
 }
 
 /// Decoded `setup initial-config` arguments for the first signed configuration
@@ -506,17 +509,24 @@ pub fn run_setup_set(args: &SetupSetArgs) -> Result<i32> {
 /// Human-board recommendation and starts no job.
 pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
     let automation = parse_automation(&args.automation)?;
-    if args.family.trim().is_empty() || args.scope.trim().is_empty() {
-        anyhow::bail!("recommendation family and scope must be non-blank");
+    let family = args.family.trim();
+    let scope = args.scope.trim();
+    let reason = args.reason.trim();
+    let policy_episode = args.policy_episode.trim();
+    if family.is_empty() || scope.is_empty() || reason.is_empty() || policy_episode.is_empty() {
+        anyhow::bail!("recommendation family, scope, reason, and policy episode must be non-blank");
     }
-    let Some((recommendation, admits_job)) = recommend_when_automation_disabled(
-        automation,
-        false,
-        args.family.as_str(),
-        args.scope.as_str(),
-    ) else {
+    let Some((mut recommendation, admits_job)) =
+        recommend_when_automation_disabled(automation, false, family, scope)
+    else {
         anyhow::bail!("automation mode permits the governed job path; no board recommendation");
     };
+    // Fuller dedup identity for the needed action: one entry per
+    // maintenance family, scope, reason, and policy episode. The owner still
+    // gates the disabled-automation path and owns dedup/no-job semantics;
+    // this narrows the key, never a second scheme.
+    recommendation.dedup_key = format!("maintenance:{family}:{scope}:{reason}:{policy_episode}");
+    recommendation.reason = reason.to_owned();
     let mut board = RecommendationBoard::new();
     let is_new = board
         .insert_dedup(&recommendation)
@@ -705,6 +715,8 @@ mod tests {
             automation: "off".to_owned(),
             family: "RESEARCH_EXCHANGE_CLEANUP".to_owned(),
             scope: "scope-1".to_owned(),
+            reason: "requalification-due".to_owned(),
+            policy_episode: "episode-7".to_owned(),
         };
         assert_eq!(run_setup_recommend(&args).expect("recommend"), 0);
     }
@@ -719,6 +731,8 @@ mod tests {
                 automation: "off".to_owned(),
                 family,
                 scope,
+                reason: "requalification-due".to_owned(),
+                policy_episode: "episode-7".to_owned(),
             };
             assert!(
                 run_setup_recommend(&args).is_err(),
