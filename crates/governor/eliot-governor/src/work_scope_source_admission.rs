@@ -92,6 +92,9 @@ pub enum WorkScopeSourceAdmissionError {
 /// `capture_normative_pair_sources` over the same explicit repository root;
 /// WorkScope validates its canonical bytes and the role/reference/content
 /// digest join against the admitted `sources` before accepting the snapshot.
+/// `operation_id` is the exact admitted Store operation identity retained by
+/// the authenticated Task Controller attempt; this producer never aliases it
+/// to the transport `RequestId`.
 ///
 /// `owner_readback` must be the exact-fence named `owner/work_scope` read.
 /// This initial-admission function accepts only an empty baseline row; a bound
