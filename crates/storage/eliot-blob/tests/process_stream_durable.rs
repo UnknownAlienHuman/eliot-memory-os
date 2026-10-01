@@ -653,6 +653,19 @@ mod windows_durable_owner {
         .expect("owner returns only the bounded source range");
         assert_eq!(range.offset(), 13);
         assert_eq!(range.bytes(), &bytes[13..30]);
+        range.validate().expect("range retains the full-source read receipt");
+        assert_eq!(range.ready_receipt().plaintext_sha256(), sha256(&bytes));
+        assert_eq!(range.ready_receipt().plaintext_length(), bytes.len() as u64);
+        assert_eq!(
+            range
+                .ready_receipt()
+                .receipt()
+                .identity
+                .receipt_id
+                .as_str(),
+            ready.receipt().identity.receipt_id.as_str()
+        );
+        assert!(range.clone().bounded_range(1, 2).is_err());
         assert!(block_on(store.read_process_stream_source_authorized_range_context(
             BlobProcessStreamReadbackRangeRequest {
                 source,

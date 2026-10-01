@@ -2323,7 +2323,6 @@ pub struct BlobReadChunk {
     offset: u64,
     complete: bool,
     bytes: Vec<u8>,
-    bytes_sha256: String,
     anchor_fingerprint: String,
 }
 
@@ -2347,14 +2346,12 @@ impl BlobReadChunk {
         {
             return Err(BlobError::MetadataPayloadMismatch);
         }
-        let bytes_sha256 = hex_sha256(&bytes);
         let value = Self {
             receipt: verified.receipt().clone(),
             ready_receipt,
             offset: 0,
             complete: true,
             bytes,
-            bytes_sha256,
             anchor_fingerprint: verified.anchor_fingerprint().to_owned(),
         };
         value.validate()?;
@@ -2366,6 +2363,12 @@ impl BlobReadChunk {
     /// Store boundary as one `Vec`.
     pub fn bounded_range(mut self, offset: u64, max_bytes: u64) -> Result<Self, BlobError> {
         self.validate()?;
+        if self.offset != 0 || !self.complete {
+            return Err(BlobError::InvalidField {
+                field: "readback_range",
+                reason: "only a complete source read can be projected into a range",
+            });
+        }
         if max_bytes == 0 || offset > self.ready_receipt.plaintext_length {
             return Err(BlobError::InvalidField {
                 field: "readback_range",
@@ -2382,7 +2385,6 @@ impl BlobReadChunk {
             .to_vec();
         self.offset = offset;
         self.complete = offset == 0 && bytes.len() as u64 == self.ready_receipt.plaintext_length;
-        self.bytes_sha256 = hex_sha256(&bytes);
         self.bytes = bytes;
         self.validate()?;
         Ok(self)
@@ -2432,9 +2434,8 @@ impl BlobReadChunk {
             && self.bytes.len() as u64 == self.ready_receipt.plaintext_length;
         if end > self.ready_receipt.plaintext_length
             || self.complete != complete_range
-            || hex_sha256(&self.bytes) != self.bytes_sha256
             || (complete_range
-                && (self.bytes_sha256 != self.ready_receipt.plaintext_sha256
+                && (hex_sha256(&self.bytes) != self.ready_receipt.plaintext_sha256
                     || blake3::hash(&self.bytes).to_hex().as_str()
                         != self.ready_receipt.locator.hash.as_str()))
         {
