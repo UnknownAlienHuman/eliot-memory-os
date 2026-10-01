@@ -935,7 +935,6 @@ pub struct KernelComposition {
     pub(crate) diagnostic_brief: Mutex<Option<diagnostic_brief::DiagnosticBrief>>,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) struct ScanDisclosureStorageLease {
     #[cfg(windows)]
     root: ProtectedRootLease,
