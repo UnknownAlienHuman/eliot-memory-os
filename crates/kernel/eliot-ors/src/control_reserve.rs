@@ -769,7 +769,7 @@ impl OrsReserve {
             issued_at_ms,
             expires_at_ms: u64::MAX,
             owner_evidence_refs: vec![
-                self.issue_evidence(dimension, request.operation.capacity_class())
+                self.issue_evidence(dimension, request.operation.capacity_class()),
             ],
         };
         debug_assert!(
