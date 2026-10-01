@@ -620,7 +620,7 @@ pub(crate) const TX_ALLOC_PROOF: &str = "LET $alloc_proof = { operation_id: $all
 /// revision conflict by the adapter.
 pub(crate) const TX_FINISH_OWNER: &str = "LET $finish_existing = (SELECT VALUE { namespace: namespace, key: key, state_fence: state_fence, revision: revision } FROM ONLY type::record($finish_owner_table, $finish_owner_id)); IF type::is_object($finish_existing) { LET $finish_owner_cas = (UPDATE type::record($finish_owner_table, $finish_owner_id) CONTENT $finish_owner_record WHERE state_fence = $finish_expected_state_fence AND revision = $finish_expected_revision RETURN AFTER); IF array::len($finish_owner_cas ?? []) != 1 { THROW 'finish_owner_cas_conflict'; }; } ELSE { IF $finish_expected_revision != 0 { THROW 'finish_owner_create_conflict'; }; LET $finish_owner_create = (CREATE type::record($finish_owner_table, $finish_owner_id) CONTENT $finish_owner_record RETURN AFTER); IF array::len($finish_owner_create ?? []) != 1 { THROW 'finish_owner_create_conflict'; }; };";
 
-/// Asserts Finish against the latest typed TaskControl projection for the
+/// Asserts Finish against the latest typed `TaskControl` projection for the
 /// exact task and owner scope. The committed authority bytes are JSON-decoded
 /// before task identity and predecessor revision are compared, matching
 /// `GetTaskState`'s structured parameter projection without substring matches.
