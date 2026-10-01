@@ -362,12 +362,15 @@ const BACKUP_VERIFY_REQUEST_ENCODING_VERSION: u16 = 1;
 /// sees only gates that passed.
 ///
 /// The first six are the shape gates, which run in this order before any
-/// owner-held state is touched. The four owner-held gates that follow are
+/// owner-held state is touched. The five owner-held gates that follow are
 /// appended by [`handle_backup_restore_test`] at the moment each one passes, so
 /// the reported route is the route this execution actually took rather than a
 /// fixed list: `archive-decode` (the owner's own `BackupBundle::decode` and
 /// validation), `plan-compile` (`KernelBackupRestore::compile_plan`, the pure
-/// lineage-advance gate), `journal-admission` (the owner-issued
+/// lineage-advance gate), `operation-identity`
+/// (`KernelBackupRestore::bind_operation`, binding this request's own correlated
+/// operation identity onto the plan so the durable restore stream is named for
+/// THIS operation), `journal-admission` (the owner-issued
 /// `RestoreJournalAdmission` from the durable ORS owner), and
 /// `isolated-rehearsal` (the journalled engine returning its own validated
 /// receipt). A gate inside the owner's execution body is reported only through
@@ -3381,7 +3384,7 @@ fn require_object<'a>(
 /// This is the front door the audit found missing: the route now obtains the
 /// owner-issued `RestoreJournalAdmission` from the durable ORS owner
 /// (#962/#958, `KernelBackupRestore::admit_restore_journal`), binds the operation
-/// identity the owner itself derives
+/// identity this request itself carried
 /// ([`OrsRestoreBinding::from_composition`]), and runs the full isolated
 /// rehearsal through
 /// [`KernelComposition::backup_restore_with_ors_journal`]
@@ -3391,13 +3394,26 @@ fn require_object<'a>(
 ///
 /// ## The execution identity: what is owner-derived and what is only re-proved
 ///
-/// The frame's `idempotency_key` is correlation only and is echoed back
-/// unchanged; it selects nothing here. The execution identity is
-/// [`OrsRestoreBinding`], which has exactly one constructor, and whose
-/// `installation_ref` is read from the live `crate::dispatch_contour` cell
-/// rather than settable by any caller — so no frame, payload or spelling of the
-/// key can name the INSTALLATION this restore runs against. One of the other
-/// three arguments is the Kernel's own writer identity,
+/// The frame's `idempotency_key` is BOTH the correlation this answer is echoed
+/// under and the correlated OPERATION identity this restore runs under: it is
+/// carried through unchanged into [`OrsRestoreBinding::operation_ref`], from
+/// which the coordinator binds it onto the plan with
+/// [`RestorePlan::bind_operation`](eliot_backup::RestorePlan::bind_operation).
+/// That is not a new authority this route claims over the key — it is the same
+/// value the same request already carries and the same one
+/// [`backup_verify_admitted_identity`] maps to `operation_id` on the sibling
+/// verify route. It is there because the durable restore stream is keyed by
+/// `sha256(plan_id, bundle_sha256, operation_id)`, and the archive and target
+/// are byte-identical across two restore operations: without the request's own
+/// identity in the key, the second operation would address the first's stream
+/// and read back its final receipt under its own correlation. A blank or
+/// control-bearing key is refused by the constructor rather than defaulted.
+///
+/// The rest of the execution identity is [`OrsRestoreBinding`], which has
+/// exactly one constructor, and whose `installation_ref` is read from the live
+/// `crate::dispatch_contour` cell rather than settable by any caller — so no
+/// frame, payload or spelling of the key can name the INSTALLATION this restore
+/// runs against. One of the other arguments is the Kernel's own writer identity,
 /// [`RESTORE_JOURNAL_WRITER_ID`], and two are the archive's OWN manifest fields:
 /// the source archive identity and the class are read out of the decoded
 /// bundle, never out of a second request field that could disagree with it.
@@ -3531,7 +3547,7 @@ fn handle_backup_restore_test(
     // class denominator, its checksums and the lineage-advance rule all run
     // there, so a target that does not advance the archive's lineage refuses
     // before any journal row or destination byte exists.
-    let plan = match KernelBackupRestore::compile_plan(&bundle, admitted.target.clone()) {
+    let mut plan = match KernelBackupRestore::compile_plan(&bundle, admitted.target.clone()) {
         Ok(plan) => plan,
         Err(error) => return refuse(&error, &gates_passed, &gates_not_admitted),
     };
@@ -3541,10 +3557,33 @@ fn handle_backup_restore_test(
         restore_journal_archive_class(bundle.manifest.class),
         admitted.target.target_id.clone(),
         RESTORE_JOURNAL_WRITER_ID.to_owned(),
+        // The correlated operation identity this request carried, carried
+        // through unchanged. It is the frame's own `identity.idempotency_key`,
+        // read by the dispatcher above from the admitted `RequestIdentity` and
+        // already echoed back unchanged on every answer this route gives, so
+        // the operation a caller reconciles under is the operation the durable
+        // restore stream is filed under. It is never re-derived, never hashed
+        // into a second name and never defaulted: `from_composition` refuses a
+        // blank or control-bearing value as `InvalidInput`, and a defaulted key
+        // would be precisely the collision #963 AUD3 is about — two operations
+        // over byte-identical bundles sharing one stream and reading back each
+        // other's receipts.
+        idempotency_key.to_owned(),
     ) {
         Ok(identity) => identity,
         Err(error) => return refuse(&error, &gates_passed, &gates_not_admitted),
     };
+    // The correlated operation identity this request carried is bound to the
+    // plan BEFORE the journal admission is issued against it, because the
+    // issuer derives this plan's durable stream key
+    // (`sha256(plan_id, bundle_sha256, operation_id)`) from it. A plan left
+    // unbound addresses no stream and every journal-facing derivation refuses,
+    // so the value comes from the binding above — this request's own identity —
+    // and never from a default.
+    if let Err(error) = KernelBackupRestore::bind_operation(&mut plan, &identity) {
+        return refuse(&error, &gates_passed, &gates_not_admitted);
+    }
+    gates_passed.push("operation-identity");
     // The owner-issued admission, from the durable ORS owner this composition
     // owns: `issue_journal_stream` establishes this plan's stream before the
     // admission is proved against it, so a first run is admitted and the

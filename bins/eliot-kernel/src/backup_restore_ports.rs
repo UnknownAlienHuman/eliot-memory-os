@@ -56,7 +56,8 @@
 //! refuses a production restore for not naming. The admission and the ORS
 //! namespace the adapter actually writes are therefore the same owner channel.
 //! It is deliberately NOT the per-execution stream key
-//! (`sha256(plan_id, bundle_sha256)`, different for every plan/bundle pair): one
+//! (`sha256(plan_id, bundle_sha256, operation_id)`, different for every
+//! plan/bundle/operation triple): one
 //! field cannot carry both, so the channel is checked here against the constant
 //! and the per-execution stream is checked where it is derived, by
 //! `binds_owner_record` reading the live journal under this plan's own stream.
@@ -104,7 +105,8 @@ use eliot_security_contracts::{InstructionTaint, PrivacyClass};
 /// ## What it is not
 ///
 /// It is not the per-execution stream key, which is
-/// `sha256(plan_id, bundle_sha256)` and different for every plan/bundle pair.
+/// `sha256(plan_id, bundle_sha256, operation_id)` and different for every
+/// plan/bundle/operation triple.
 /// A fixed channel name and a per-execution digest cannot occupy one field, so
 /// `journal_identity_ref` carries the CHANNEL and is compared against this
 /// constant, while the per-execution stream is proved where it is derived: by
@@ -929,11 +931,12 @@ pub struct PinnedDestinationAdmission {
 /// Every field is private and there is exactly one constructor
 /// ([`OrsRestoreBinding::from_composition`]): a caller cannot build this value
 /// field by field, name its own installation, or write a blank or malformed
-/// value that a placeholder would then have to replace. The other three fields
-/// are the archive's own manifest facts, this Kernel's own writer identity, and
-/// the DECLARED destination of the execution being bound — each field's own doc
-/// states exactly which of those it is, and which of them the owner re-proves
-/// rather than the constructor accepting.
+/// value that a placeholder would then have to replace. The other four fields
+/// are the archive's own manifest facts, this Kernel's own writer identity, the
+/// DECLARED destination of the execution being bound, and the correlated
+/// operation identity the restore REQUEST carried — each field's own doc states
+/// exactly which of those it is, and which of them the owner re-proves rather
+/// than the constructor accepting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrsRestoreBinding {
     /// Exact source archive identity under restore.
@@ -987,6 +990,34 @@ pub struct OrsRestoreBinding {
     /// comparison against the live composition cell, which is a composition
     /// fact, not a durable one.
     installation_ref: String,
+    /// The correlated operation identity this restore runs under, carried
+    /// through unchanged from the restore request.
+    ///
+    /// It is the admitted request's own `identity.idempotency_key` — the same
+    /// value the reply is correlated under and the same value
+    /// `BackupVerifyRequestIdentity::operation_id` already carries on the
+    /// sibling verify route — passed here verbatim by the front door. It is
+    /// never re-derived, never hashed into a second name, never defaulted and
+    /// never a literal: a blank or control-bearing value refuses in
+    /// [`OrsRestoreBinding::from_composition`] rather than becoming a
+    /// placeholder key.
+    ///
+    /// It exists here because it is part of the durable stream identity. The
+    /// stream key `sha256(plan_id, bundle_sha256, operation_id)` is computed
+    /// inside `eliot-backup` from the plan's own
+    /// [`RestorePlan::operation_id`](eliot_backup::RestorePlan::bind_operation),
+    /// and the plan is compiled from the bundle and the target alone — neither
+    /// of which distinguishes two operations over byte-identical bytes. Without
+    /// this field the Kernel has no channel at all by which the request's own
+    /// identity could reach `RestorePlan::bind_operation`, and every journal
+    /// entry would refuse.
+    ///
+    /// What stands behind the value is therefore the request's own admission,
+    /// not a re-proof here: `admit_backup_caller` has already admitted the
+    /// session, and the identity is read from the admitted
+    /// `RequestIdentity` and echoed back unchanged, so the operation a caller
+    /// reconciles under is the operation this stream is filed under.
+    operation_ref: String,
 }
 
 impl OrsRestoreBinding {
@@ -995,16 +1026,25 @@ impl OrsRestoreBinding {
     /// there is no code path — production or test — that puts a caller's
     /// string into `installation_ref`.
     ///
+    /// `operation_id` is the restore request's own correlated identity, carried
+    /// through unchanged. It is validated exactly like the other three arguments
+    /// and therefore refuses blank rather than defaulting: a defaulted key
+    /// would collapse two operations over byte-identical bundles onto one
+    /// durable stream, which is the collision
+    /// [`RestorePlan::bind_operation`](eliot_backup::RestorePlan::bind_operation)
+    /// exists to prevent.
+    ///
     /// Refuses [`KernelRestoreError::InvalidInput`] for a blank or
-    /// control-character source archive, destination or writer identity, and
-    /// [`KernelRestoreError::OwnerEvidenceInvalid`] when the dispatch contour is
-    /// not composed, because an uncomposed Kernel has no installation identity
-    /// to admit a journal against.
+    /// control-character source archive, destination, writer or operation
+    /// identity, and [`KernelRestoreError::OwnerEvidenceInvalid`] when the
+    /// dispatch contour is not composed, because an uncomposed Kernel has no
+    /// installation identity to admit a journal against.
     pub fn from_composition(
         source_archive_id: String,
         archive_class: RestoreJournalArchiveClass,
         destination_ref: String,
         writer_id: String,
+        operation_id: String,
     ) -> Result<Self, KernelRestoreError> {
         for (value, field) in [
             (
@@ -1016,6 +1056,10 @@ impl OrsRestoreBinding {
                 "restore.journal_admission.destination_ref",
             ),
             (writer_id.as_str(), "restore.journal_admission.writer_id"),
+            (
+                operation_id.as_str(),
+                "restore.journal_admission.operation_id",
+            ),
         ] {
             non_blank(value, field)?;
         }
@@ -1025,6 +1069,7 @@ impl OrsRestoreBinding {
             destination_ref,
             writer_id,
             installation_ref: live_installation_id()?.to_owned(),
+            operation_ref: operation_id,
         })
     }
 
@@ -1057,6 +1102,19 @@ impl OrsRestoreBinding {
     #[must_use]
     pub fn installation_ref(&self) -> &str {
         &self.installation_ref
+    }
+
+    /// The correlated operation identity the restore request carried, which the
+    /// coordinator binds onto the plan as
+    /// [`RestorePlan::bind_operation`](eliot_backup::RestorePlan::bind_operation)
+    /// so this execution's durable stream is named for THIS operation.
+    ///
+    /// This is the one accessor `check_ors_journal_binding` compares the bound
+    /// plan's own `operation_id` against, so a binding whose operation differs
+    /// from the plan it is filed under refuses before a row is read or written.
+    #[must_use]
+    pub fn operation_ref(&self) -> &str {
+        &self.operation_ref
     }
 
     fn stream_binding(
@@ -1203,9 +1261,10 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 ///   Kernel-owned constant and what the coordinator's channel check in
 ///   [`KernelBackupRestore::admit_restore_journal`](super::backup_restore::KernelBackupRestore::admit_restore_journal)
 ///   requires. It is deliberately NOT the per-execution stream key: that key is
-///   `sha256(plan_id, bundle_sha256)`, different for every plan/bundle pair, so
-///   the two can never occupy one field. The stream this record was read under
-///   is the `journal_key` argument, and it is proved exactly by that read plus
+///   `sha256(plan_id, bundle_sha256, operation_id)`, different for every
+///   plan/bundle/operation triple, so the two can never occupy one field. The
+///   stream this record was read under is the `journal_key` argument, and it is
+///   proved exactly by that read plus
 ///   [`matches_stream`], which compares the persisted binding's source archive,
 ///   class, destination, writer identity and writer fence digest against this
 ///   owner's own binding — not by this field.

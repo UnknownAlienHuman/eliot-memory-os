@@ -900,9 +900,14 @@ impl KernelBackupRestore {
     /// a FIRST run is admitted and not only a resume.
     ///
     /// This file derives nothing and cannot: the stream key is
-    /// `sha256(plan_id, bundle_sha256)`, computed inside `eliot-backup` where
-    /// the plan lives, and the Kernel asks the owner for the key rather than
-    /// reconstructing it — a key the owner did not issue is not the owner's key.
+    /// `sha256(plan_id, bundle_sha256, operation_id)`, computed inside
+    /// `eliot-backup` where the plan lives, and the Kernel asks the owner for
+    /// the key rather than reconstructing it — a key the owner did not issue is
+    /// not the owner's key. The plan that key is derived from must therefore
+    /// already be bound to this restore's operation identity, which is
+    /// [`Self::bind_operation`]'s whole job; an unbound plan derives no stream
+    /// and refuses rather than keying one on the archive alone.
+    ///
     /// What the owner establishes is exactly the row the engine would have
     /// written as its own first act (same transaction, revision 0, phase
     /// `Pending`, state `Ready`, no intent, no receipt, no effect), committed
@@ -1036,10 +1041,18 @@ impl KernelBackupRestore {
         // compiles the same plan again to build its target. The coordinator
         // needs the plan here because the admission is bound to the plan's own
         // operation and the plan is never a parameter of the issuer.
-        let plan = Self::compile_plan(bundle, target.clone())?;
+        let mut plan = Self::compile_plan(bundle, target.clone())?;
+        // The correlated operation identity the restore request carried is bound
+        // to the plan BEFORE the admission is issued against it, because the
+        // issuer derives this plan's durable stream key from it
+        // (`sha256(plan_id, bundle_sha256, operation_id)`). A plan that reached
+        // the journal unbound would derive no stream at all and refuse, so the
+        // binding is the request's own value carried through unchanged and never
+        // a default — see [`Self::bind_operation`].
+        Self::bind_operation(&mut plan, identity)?;
         let admission = self.admit_restore_journal(ors, &plan, ports.kernel_fence, identity)?;
         let admitted = admitted_restore_ports(ports, &admission);
-        check_ors_journal_binding(bundle, &target, &admitted, identity)?;
+        check_ors_journal_binding(bundle, &target, &plan, &admitted, identity)?;
         let mut journal = OrsRestoreJournal::production(
             std::sync::Arc::clone(ors),
             ports.kernel_fence,
@@ -1048,7 +1061,14 @@ impl KernelBackupRestore {
                 .join(".eliot")
                 .join(RESTORE_JOURNAL_PAYLOAD_AREA),
         )?;
-        self.restore_with_owner(bundle, target, &admitted, &mut journal, Some(ors))
+        self.restore_with_owner(
+            bundle,
+            target,
+            &admitted,
+            &mut journal,
+            Some(ors),
+            Some(identity),
+        )
     }
 
     /// Compiles the governed plan for one archive and target context.
@@ -1057,6 +1077,12 @@ impl KernelBackupRestore {
     /// validation (bundle, checksums, schema, purge binding, class
     /// denominator, lineage advance) with no effects, for composition
     /// diagnostics before execution.
+    ///
+    /// The compiled plan is NOT bound to an operation identity: `compile` is
+    /// also how a diagnostic preview addresses no journal at all, and it cannot
+    /// know the request's identity. Every execution path therefore calls
+    /// [`Self::bind_operation`] before anything derives a durable stream from
+    /// the plan.
     pub fn compile_plan(
         bundle: &BackupBundle,
         target: RestoreContext,
@@ -1065,6 +1091,32 @@ impl KernelBackupRestore {
             .validate()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
         RestorePlan::compile(bundle, target)
+            .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))
+    }
+
+    /// Binds the correlated operation identity the restore REQUEST carried onto
+    /// `plan`, so this execution's durable journal stream and recorded
+    /// transaction are named for THIS operation (issue #963 AUD3).
+    ///
+    /// The value is [`OrsRestoreBinding::operation_ref`] — the admitted
+    /// request's own `identity.idempotency_key`, carried through unchanged.
+    /// It is not re-derived here, not hashed into a second name, not taken from
+    /// the archive and not defaulted: a defaulted key is exactly the collision
+    /// this binding exists to prevent, because two operations over
+    /// byte-identical bundles differ only in their operation identity and would
+    /// otherwise share one stream and read back each other's receipts.
+    ///
+    /// `bind_operation` is the accepted gate that refuses a blank or
+    /// control-bearing identity, so a binding whose operation identity is
+    /// absent refuses typed here rather than keying a stream on the archive
+    /// alone. The plan's own [`require_operation_identity`] gate
+    /// (`eliot-backup`) is not weakened: this only ever supplies the value it
+    /// demands.
+    pub(crate) fn bind_operation(
+        plan: &mut RestorePlan,
+        identity: &OrsRestoreBinding,
+    ) -> Result<(), KernelRestoreError> {
+        plan.bind_operation(identity.operation_ref())
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))
     }
 
@@ -1271,7 +1323,7 @@ impl KernelBackupRestore {
         ports: &RestorePorts<'_>,
         journal: &mut J,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
-        self.restore_with_owner(bundle, target, ports, journal, None)
+        self.restore_with_owner(bundle, target, ports, journal, None, None)
     }
 
     /// The single execution body, with the purge ledger's owner route named.
@@ -1283,6 +1335,19 @@ impl KernelBackupRestore {
     /// [`restore`](Self::restore) with `None` — so there is no second engine,
     /// no second phase order, and no path that applies a purge ledger without
     /// the owner that issues its revision.
+    /// `identity` is the owner-issued binding whose
+    /// [`OrsRestoreBinding::operation_ref`] is the correlated operation
+    /// identity this restore runs under, and it is `None` only for the
+    /// injected-`J` [`restore`](Self::restore) entry, which holds no ORS
+    /// binding at all.
+    ///
+    /// `None` is a refusal, not a fallback. The execution body binds the
+    /// operation identity before it compiles any journal identity, so an entry
+    /// that carries no binding reaches
+    /// [`RestorePlan::require_operation_identity`] unbound and refuses typed
+    /// with the `eliot-backup` crate's own
+    /// [`BackupError::InvalidField`](eliot_backup::BackupError::InvalidField)
+    /// rather than keying a durable stream on the archive alone.
     #[allow(clippy::too_many_lines)]
     #[allow(
         clippy::needless_pass_by_value,
@@ -1295,6 +1360,7 @@ impl KernelBackupRestore {
         ports: &RestorePorts<'_>,
         journal: &mut J,
         ors: Option<&std::sync::Arc<RedbRecoveryStore>>,
+        identity: Option<&OrsRestoreBinding>,
     ) -> Result<KernelRestoreOutcome, KernelRestoreError> {
         bundle
             .validate()
@@ -1345,7 +1411,15 @@ impl KernelBackupRestore {
                 ));
             }
         }
-        let plan = Self::compile_plan(bundle, target.clone())?;
+        let mut plan = Self::compile_plan(bundle, target.clone())?;
+        // The same binding as the admission above, applied to the plan THIS body
+        // executes. Both are compiled from the same bundle and target by the
+        // same pure gate, so this is the same value and not a second derivation;
+        // binding both is what makes the executed plan's durable stream and the
+        // admitted stream the same operation's stream.
+        if let Some(identity) = identity {
+            Self::bind_operation(&mut plan, identity)?;
+        }
         let transaction = plan
             .transaction()
             .map_err(|error| KernelRestoreError::ArchiveInvalid(error.to_string()))?;
@@ -3865,7 +3939,8 @@ fn admitted_restore_ports<'a>(
 ///
 /// This field carries the CHANNEL and only the channel. It cannot also carry
 /// the per-execution stream key: that key is
-/// `sha256(plan_id, bundle_sha256)` and differs for every plan/bundle pair, so
+/// `sha256(plan_id, bundle_sha256, operation_id)` and differs for every
+/// plan/bundle/operation triple, so
 /// requiring the two to be equal refused every owner-issued admission — the
 /// constant here and the derived key in the issuer's re-proof were mutually
 /// exclusive requirements on one field, and the route was dead in both
@@ -3880,6 +3955,7 @@ fn admitted_restore_ports<'a>(
 fn check_ors_journal_binding(
     bundle: &BackupBundle,
     target: &RestoreContext,
+    plan: &RestorePlan,
     ports: &RestorePorts<'_>,
     identity: &OrsRestoreBinding,
 ) -> Result<(), KernelRestoreError> {
@@ -3927,6 +4003,24 @@ fn check_ors_journal_binding(
     if identity.archive_class() != declared {
         return Err(KernelRestoreError::OwnerEvidenceInvalid(
             "restore journal archive class does not match the declared class".to_owned(),
+        ));
+    }
+    // The operation identity is the fifth conjunct, and it is the one the other
+    // four cannot express: the archive and the target are byte-identical across
+    // two restore operations, so the binding's correlated operation identity is
+    // what separates their durable streams. The plan this execution is about to
+    // run is therefore required to be bound to exactly that identity, read
+    // through the plan's own `require_operation_identity` gate so an unbound
+    // plan refuses rather than comparing equal to anything. A binding naming
+    // another operation refuses before a single row is read or written, which
+    // is what stops one operation being filed under another's stream.
+    if plan
+        .require_operation_identity()
+        .map_err(|error| KernelRestoreError::OwnerEvidenceInvalid(error.to_string()))?
+        != identity.operation_ref()
+    {
+        return Err(KernelRestoreError::OwnerEvidenceInvalid(
+            "restore journal operation identity does not name this restore operation".to_owned(),
         ));
     }
     Ok(())
