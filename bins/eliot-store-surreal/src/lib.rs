@@ -261,10 +261,9 @@ pub fn store_bootstrap_descriptor(
 /// [`PreparedTransition::validate`], and the recorded `operation_manifest_digest`
 /// through `validate_against_catalogue` against the generated manifests.
 ///
-/// `admission_contract_set_digest` is not claimed here either: it is carried and
-/// hash-bound, but the bridge holds no live contract-set value to compare it
-/// against, because I05-15 records that no generated authoritative catalogue
-/// exists yet. This boundary refuses to invent one.
+/// The recorded `admission_contract_set_digest` is compared against the
+/// independently derived Store API support identity, which binds the current
+/// Store API/write-admission revisions and generated operation catalogue.
 fn admit_prepared_for_execution(
     context: &RequestMeta,
     transition: &PreparedTransition,
@@ -275,6 +274,12 @@ fn admit_prepared_for_execution(
         .validate()
         .map_err(StoreError::Foundation)
         .map_err(StoreCompositionError::Store)?;
+    if transition.admission_contract_set_digest
+        != eliot_store_api::supported_admission_contract_set_digest()
+            .map_err(StoreCompositionError::Store)?
+    {
+        return Err(StoreCompositionError::Store(StoreError::ManifestMismatch));
+    }
     transition
         .validate()
         .map_err(StoreCompositionError::Store)?;

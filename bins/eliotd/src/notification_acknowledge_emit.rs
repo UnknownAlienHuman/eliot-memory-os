@@ -120,17 +120,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use eliot_contracts::{
-    ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
-    canonical_json_bytes, sha256_hex,
-};
+use eliot_contracts::{ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::RequestBinding;
 use eliot_store_api::{
     CanonicalReadClient, NOTIFICATION_STATE_MUTATION_NAME, NOTIFY_MUTATION_ACKNOWLEDGE,
-    NOTIFY_PAGE_RECORDS, NOTIFY_PARAM_MUTATION, NOTIFY_PARAM_NOTIFICATION_ID,
-    NOTIFY_PARAM_PRINCIPAL, NamedReadResponse, StoreError, WriteReceipt, WriteReceiptStatus,
-    notification_read_request,
+    NOTIFY_PAGE_RECORDS, NOTIFY_PARAM_DEDUP_KEY, NOTIFY_PARAM_MUTATION,
+    NOTIFY_PARAM_NOTIFICATION_ID, NOTIFY_PARAM_PRINCIPAL, NamedReadResponse, StoreError,
+    WriteReceipt, WriteReceiptStatus, notification_read_request,
 };
 
 use super::notification_state_emit::{
@@ -231,14 +228,9 @@ pub async fn emit_notification_acknowledgement(
         NOTIFY_PARAM_PRINCIPAL.to_owned(),
         serde_json::Value::String(principal.to_owned()),
     );
-    // The admitted semantic contract set for this leg is the canonical-JSON
-    // digest of exactly what was admitted — the addressed `dedup_key`, the
-    // named `notification_id`, and the acknowledging `principal` — so a
-    // substituted plan fails the canonical request hash rather than reaching
-    // the store.
-    let admitted_content_digest = sha256_hex(
-        &canonical_json_bytes(&(dedup_key, notification_id, principal))
-            .map_err(|error| StoreError::Serialization(error.to_string()))?,
+    parameters.insert(
+        NOTIFY_PARAM_DEDUP_KEY.to_owned(),
+        serde_json::Value::String(dedup_key.to_owned()),
     );
     // Issue #1927: the one I5.6 admission sequence, shared with the upsert
     // leg. The plan it returns is the plan that is submitted, over the exact
@@ -248,7 +240,6 @@ pub async fn emit_notification_acknowledgement(
         &super::notification_plan_admission::NotificationPlanAdmission {
             identity: &identity,
             operation_text: &operation_text,
-            admission_contract_set_digest: &admitted_content_digest,
             parameters,
             ordering_head: &ordering_head,
         },

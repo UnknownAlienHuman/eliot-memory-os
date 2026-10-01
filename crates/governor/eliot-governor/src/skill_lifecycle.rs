@@ -482,7 +482,10 @@ fn skill_envelope(
             .map(|task| task.as_str().to_owned()),
         transition_class: TransitionClass::LifecyclePolicy,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: candidate.candidate_digest.clone(),
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
+            .map_err(|error| {
+            SkillError::Serialization(error.to_string())
+        })?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![NamedMutationRequest {
             operation: NamedMutationOperation::ApplyLifecyclePolicy,

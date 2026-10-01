@@ -51,8 +51,9 @@
 //!                         lineage, never a task binding
 //! transition_class        CaptureCandidate; ceiling Candidate
 //! admission_contract_set_digest
-//!                         the presented record digest from the decoded
-//!                         named request
+//!                         the current supported Store API admission contract
+//!                         set; the record digest remains bound in the named
+//!                         operation parameters and record identity
 //! operation_manifest_digest
 //!                         computed live from
 //!                         `generated_operation_manifests`
@@ -314,7 +315,7 @@ pub async fn commit_learning_record<P: KernelGenerationPort + ?Sized>(
         task_id: None,
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: decoded.record_digest.clone(),
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest,
         semantic_commands: vec![request],
         event_projection_relation_intents: EventProjectionRelationIntents {

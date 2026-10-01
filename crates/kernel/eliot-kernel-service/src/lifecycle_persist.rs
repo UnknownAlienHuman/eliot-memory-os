@@ -59,7 +59,7 @@ use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, EffectClass, EventId,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
     OperationIdentity, OrderingScopeId, PreparedTransition, ReceiptEnvelope, RequestMetadata,
-    ScopeId, SecurityContext, StateFence, StoreError, TransitionClass, canonical_json_bytes,
+    ScopeId, SecurityContext, StateFence, StoreError, TransitionClass,
     epistemic_revision::{EpistemicCommit, EpistemicRevisionPayload},
     generated_operation_manifests, operation_manifest_set_digest, sha256_hex,
     verify_canonical_request_hash,
@@ -537,21 +537,8 @@ pub fn build_persist_transitions(
                 field: "lifecycle.persist.session",
                 reason: "bound session is required",
             })?;
-    let mut admission_view = request.clone();
-    for identity in &mut admission_view.hop_identities {
-        identity.canonical_request_hash = String::new();
-    }
-    for input in admission_view
-        .hop_mutations
-        .iter_mut()
-        .filter_map(|slot| slot.as_mut())
-    {
-        input.identity.canonical_request_hash = String::new();
-    }
-    let admission_digest = sha256_hex(
-        &canonical_json_bytes(&admission_view)
-            .map_err(|_| LifecyclePersistError::DigestMismatch)?,
-    );
+    let admission_contract_set_digest = eliot_store_api::supported_admission_contract_set_digest()
+        .map_err(LifecyclePersistError::from_store)?;
     let mut built = Vec::with_capacity(
         request.hop_identities.len() + request.hop_mutations.iter().flatten().count(),
     );
@@ -567,7 +554,7 @@ pub fn build_persist_transitions(
         scope,
         ordering,
         manifest_digest,
-        admission_digest,
+        admission_contract_set_digest,
     };
     let capture_identity = request.hop_identities[0].clone();
     let capture_transition = transition_for(
@@ -866,7 +853,7 @@ struct TransitionBindings {
     scope: ScopeId,
     ordering: OrderingScopeId,
     manifest_digest: eliot_store_api::OperationManifestDigest,
-    admission_digest: String,
+    admission_contract_set_digest: String,
 }
 
 /// Builds one revision/policy mutation leg from caller-supplied exact
@@ -900,7 +887,7 @@ fn mutation_transition_for(
                 ordering_scopes: vec![bindings.ordering.clone()],
                 transition_class: TransitionClass::Epistemic,
                 requested_effect_ceiling: TransitionClass::Epistemic.maximum_effect(),
-                admission_contract_set_digest: bindings.admission_digest.clone(),
+                admission_contract_set_digest: bindings.admission_contract_set_digest.clone(),
                 operation_manifest_digest: bindings.manifest_digest.clone(),
                 // Issue-#18 digests are derived below via
                 // `bind_issue18_digests`, never defaulted; this Kernel leg
@@ -975,7 +962,7 @@ fn transition_for(
         ordering_scopes: vec![bindings.ordering.clone()],
         transition_class: spec.class,
         requested_effect_ceiling: spec.ceiling,
-        admission_contract_set_digest: bindings.admission_digest.clone(),
+        admission_contract_set_digest: bindings.admission_contract_set_digest.clone(),
         operation_manifest_digest: bindings.manifest_digest.clone(),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this Kernel leg binds no semantic source (`[]`).

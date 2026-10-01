@@ -651,7 +651,7 @@ fn problem_owner_envelope(
         // The admission digest binds the exact candidate bytes: the decision
         // this transition commits is the record it produced, not a restatement
         // of the request that asked for it.
-        admission_contract_set_digest: record_digest.clone(),
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest_digest.clone(),
         semantic_commands: vec![problem_owner_state_mutation_request(parameters)],
         event_projection_relation_intents: EventProjectionRelationIntents {

@@ -18,10 +18,9 @@ use eliot_store_api::{
     CanonicalRequestView, CanonicalStoreClient, EffectClass, EventProjectionRelationIntents,
     OperationId, OperationManifestDigest, OrderingScopeId, PreparedTransition, ReceiptEnvelope,
     RequestMetadata, ScopeId, SecurityContext, StoreError, TransitionClass, WriteReceiptStatus,
-    canonical_json_bytes, generated_operation_manifests, operation_manifest_set_digest,
-    reactive_ledger_mutation_request, reactive_ledger_read_request,
-    resource_snapshot_mutation_request, resource_snapshot_read_request, sha256_hex,
-    verify_canonical_request_hash,
+    generated_operation_manifests, operation_manifest_set_digest, reactive_ledger_mutation_request,
+    reactive_ledger_read_request, resource_snapshot_mutation_request,
+    resource_snapshot_read_request, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -649,16 +648,8 @@ where
 {
     let manifest_digest = operation_manifest_set_digest(&generated_operation_manifests()?)
         .map_err(|_| ReactiveServiceError::ManifestMismatch)?;
-    // The admission digest binds the admitted request with the identity-hash
-    // field cleared: the hash itself is bound separately by the transition
-    // view, so clearing keeps admission deterministic across sealing (which
-    // fills the hash after building) and dispatch (which rebuilds from the
-    // sealed request). A caller-supplied admission digest is never trusted.
-    let mut admission_view = request.admission_view();
-    admission_view.clear_hash();
-    let admission_digest = sha256_hex(
-        &canonical_json_bytes(&admission_view).map_err(|_| ReactiveServiceError::DigestMismatch)?,
-    );
+    let admission_contract_set_digest = eliot_store_api::supported_admission_contract_set_digest()
+        .map_err(ReactiveServiceError::from_store)?;
     let scope = ScopeId::new(eliot_store_api::REACTIVE_STATE_SCOPE).map_err(|_| {
         ReactiveServiceError::InvalidField {
             field: "reactive.scope",
@@ -674,7 +665,7 @@ where
         ordering_scopes: vec![ordering()?],
         transition_class: TransitionClass::ReactiveState,
         requested_effect_ceiling: EffectClass::ReversibleMutation,
-        admission_contract_set_digest: admission_digest,
+        admission_contract_set_digest,
         operation_manifest_digest: manifest_digest.clone(),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this Kernel leg binds no semantic source (`[]`).
@@ -706,27 +697,6 @@ trait ReactiveTransitionRequest {
     fn fence(&self) -> &StateFence;
     /// Caller task binding, when present.
     fn task_id(&self) -> Option<String>;
-    /// Canonical admission view for the digest.
-    fn admission_view(&self) -> ReactiveAdmissionView;
-}
-
-/// Canonical admission view with a clearable identity hash.
-#[derive(Clone, Debug, Serialize)]
-struct ReactiveAdmissionView {
-    context: RequestMetadata,
-    state_fence: StateFence,
-    session_id: String,
-    ledger_json: String,
-    uri: String,
-    content: Vec<u8>,
-    canonical_request_hash: String,
-}
-
-impl ReactiveAdmissionView {
-    /// Clears the identity hash before admission digesting.
-    fn clear_hash(&mut self) {
-        self.canonical_request_hash = String::new();
-    }
 }
 
 impl ReactiveTransitionRequest for ReactiveLedgerRequest {
@@ -741,18 +711,6 @@ impl ReactiveTransitionRequest for ReactiveLedgerRequest {
     fn task_id(&self) -> Option<String> {
         self.context.task_id.clone().map(|task| task.to_string())
     }
-
-    fn admission_view(&self) -> ReactiveAdmissionView {
-        ReactiveAdmissionView {
-            context: self.context.clone(),
-            state_fence: self.state_fence.clone(),
-            session_id: self.session_id.clone(),
-            ledger_json: self.ledger_json.clone(),
-            uri: String::new(),
-            content: Vec::new(),
-            canonical_request_hash: self.operation.canonical_request_hash.clone(),
-        }
-    }
 }
 
 impl ReactiveTransitionRequest for ResourceSnapshotRequest {
@@ -766,18 +724,6 @@ impl ReactiveTransitionRequest for ResourceSnapshotRequest {
 
     fn task_id(&self) -> Option<String> {
         self.context.task_id.clone().map(|task| task.to_string())
-    }
-
-    fn admission_view(&self) -> ReactiveAdmissionView {
-        ReactiveAdmissionView {
-            context: self.context.clone(),
-            state_fence: self.state_fence.clone(),
-            session_id: String::new(),
-            ledger_json: String::new(),
-            uri: self.uri.clone(),
-            content: self.content.clone(),
-            canonical_request_hash: self.operation.canonical_request_hash.clone(),
-        }
     }
 }
 

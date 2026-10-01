@@ -1786,18 +1786,8 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
         let parameters = self.mutation_parameters(request).await?;
         let operation = automation_mutation_request(parameters);
         let manifest_digest = operation_manifest_set_digest(&generated_operation_manifests()?)?;
-        // The admission digest binds the admitted request with the
-        // identity-hash field cleared: the hash itself is bound separately
-        // by the transition view, so clearing keeps admission deterministic
-        // across sealing (which fills the hash after building) and dispatch
-        // (which rebuilds from the sealed request). A caller-supplied
-        // admission digest is never trusted.
-        let mut admission_view = request.clone();
-        admission_view.identity.canonical_request_hash = String::new();
-        let admission_digest = sha256_hex(
-            &canonical_json_bytes(&admission_view)
-                .map_err(|error| StoreError::Serialization(error.to_string()))?,
-        );
+        let admission_contract_set_digest =
+            eliot_store_api::supported_admission_contract_set_digest()?;
         let automation_id = automation_scope(&request.intent.operation)?;
         let mut transition = PreparedTransition {
             contract_version: eliot_store_api::CONTRACT_VERSION,
@@ -1808,7 +1798,7 @@ impl<C: CanonicalStoreClient> CanonicalUserAutomationStore<C> {
             ordering_scopes: vec![OrderingScopeId::new(format!("automation:{automation_id}"))?],
             transition_class: TransitionClass::UserAutomation,
             requested_effect_ceiling: TransitionClass::UserAutomation.maximum_effect(),
-            admission_contract_set_digest: admission_digest,
+            admission_contract_set_digest,
             operation_manifest_digest: manifest_digest.clone(),
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; this Kernel leg binds no semantic source (`[]`).
