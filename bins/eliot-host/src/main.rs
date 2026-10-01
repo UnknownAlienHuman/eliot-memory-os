@@ -445,6 +445,24 @@ fn main() {
         // HOST-0 (issue #889): the single reference failure observation.
         // Diagnostics observe only; capsule, stderr, and exit code below
         // still own the terminal receipt. Other sites stay for #891/#982.
+        //
+        // F-LOG-HOST-2 (#893 D1) correlation ceiling at this production
+        // caller: `run_console` returns a collapsed boolean, so by the time
+        // this terminal is emitted main holds no owner-issued transaction,
+        // effect, or request handle for the console run — the operation
+        // subject never reached this frame. `observe_terminal_error`
+        // therefore renders this terminal with correlation explicitly
+        // unavailable (`correlation_available = false`, `tx_missing`,
+        // `effect_missing`, `req_missing`) instead of leaving a reader to infer
+        // the pairing from record order (I13.11: correlation, not adjacency).
+        //
+        // The identities this run DOES own — installation and transaction-plan
+        // generation from the retained launch options — are carried by the
+        // subordinate projection below, and the operation-specific Phase-B and
+        // credential terminals inside lib.rs/`credential_control.rs` bind their
+        // own exact `tx`/`effect`/`req` token. Binding a fabricated or inferred
+        // token here would be worse than an explicit missing field, so this
+        // call stays the uncorrelated facade entry point deliberately.
         eliot_host::host_diagnostics::observe_terminal_error(
             eliot_host::host_diagnostics::HOST_TERMINAL_CODE_CONSOLE_FAILED,
         );
