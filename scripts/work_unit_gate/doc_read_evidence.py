@@ -49,6 +49,19 @@ checkout is resolved by :func:`merge_integration_status`; when it is external,
 its exact integration/config version is a blocking owner action and part of
 acceptance. It is never simulated here, and no second GitHub-Action-only
 verifier with different semantics is introduced.
+
+Event-base / merge-parent drift (issue #4634): the CI/controller boundary
+passes the PR EVENT base (``pull_request.base.sha``) with the FINAL merge
+candidate to the shared command. When concurrent main movement lands between
+the event base and the merge's actual first parent, the event-base
+denominator is the union of inherited upstream paths and the merge's own
+author delta, and a single route over that whole denominator can
+legitimately exceed the required payload bound. :func:`_resolve_provenance`
+defines and validates that relationship from git objects, and the versioned
+bounded composition ``eliot-doc-read-pr-evidence-v3`` carries it: parts
+partition the complete denominator exactly, each part is routed and read
+through the SOLE router/reader algorithms under the UNCHANGED bounds, and
+only the existing verifier accepting the whole composition is proof.
 """
 from __future__ import annotations
 
@@ -350,6 +363,171 @@ def _changed_paths(root: Path, base_tree: str, candidate_tree: str) -> list[str]
         root, "diff", "--name-only", "--diff-filter=ACMRTUXBD", "-M", base_tree, candidate_tree,
     )
     return sorted({_router.normalize_repo_path(line) for line in output.splitlines() if line.strip()})
+
+
+# ---------------------------------------------------------------------------
+# Event-base / merge-parent reconciliation (issue #4634).
+#
+# The real CI/controller boundary passes the PR EVENT base
+# (``pull_request.base.sha``) together with the FINAL merge candidate to
+# the shared command. When concurrent main movement lands between the
+# event base and the merge's actual first parent, the event-base
+# denominator is the union of inherited upstream paths and the merge's
+# own author delta (author changes plus conflict-resolution edits); a
+# single route over that whole denominator can legitimately exceed the
+# required payload bound, while the smaller merge-parent diff alone can
+# never substitute for the event-base contract.
+#
+# :func:`_resolve_provenance` defines and validates that relationship
+# from git objects, never from prose:
+# * ``direct`` — the candidate is not a merge commit, so the whole
+#   event-base denominator is the scope (today's contract). When both
+#   ends are commits the event base must still be the ancestry the
+#   candidate builds on.
+# * ``fresh`` — the candidate is a merge commit whose first-parent tree
+#   equals the event base tree: no drift, no inherited partition.
+# * ``reconciled`` — the candidate is a merge commit and the event base
+#   commit is a strict ancestor of the first parent: the denominator
+#   splits into the author delta (first parent to candidate, including
+#   conflict-resolution edits) and the inherited upstream remainder.
+# Anything else — an event base that is not an ancestor of the merge
+# parent, or a bare tree base behind a moved parent whose drift cannot
+# be proven — fails closed as BASE_OR_CANDIDATE_MISMATCH. A smaller diff
+# is never silently substituted: the governed denominator stays the
+# complete event-base-to-candidate change.
+# ---------------------------------------------------------------------------
+
+COMPOSED_SCHEMA = "eliot-doc-read-pr-evidence-v3"
+PROVENANCE_AUTHOR = "author"
+PROVENANCE_INHERITED = "inherited-upstream"
+PART_PROVENANCE = (PROVENANCE_AUTHOR, PROVENANCE_INHERITED)
+RELATION_DIRECT = "direct"
+RELATION_FRESH = "fresh"
+RELATION_RECONCILED = "reconciled"
+BASE_RELATIONS = (RELATION_DIRECT, RELATION_FRESH, RELATION_RECONCILED)
+
+
+@dataclass(frozen=True)
+class Provenance:
+    """Authoritative base/candidate relation recomputed from git objects.
+
+    ``author_paths`` is the merge's own delta (first parent to candidate
+    for a merge candidate, otherwise the whole denominator);
+    ``inherited_paths`` is the upstream remainder (event base to first
+    parent minus the author delta, empty unless reconciled).
+    """
+
+    base_tree: str
+    candidate_tree: str
+    base_commit: str | None
+    candidate_commit: str | None
+    parent_commit: str | None
+    parent_tree: str | None
+    relation: str
+    author_paths: tuple[str, ...]
+    inherited_paths: tuple[str, ...]
+
+
+def _commit_of(root: Path, revision: str) -> str | None:
+    """Full commit id when the revision is a commit object, else None."""
+    if _git(root, "cat-file", "-t", revision) != "commit":
+        return None
+    resolved = _git(root, "rev-parse", revision)
+    if not _FULL_COMMIT.fullmatch(resolved):
+        _fail(EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH, "revision did not resolve to a full commit id")
+    return resolved
+
+
+def _commit_parents(root: Path, commit: str) -> list[str]:
+    """First-parent-first commit parents of one commit object."""
+    output = _git(root, "rev-list", "--parents", "-n", "1", commit)
+    tokens = output.split()
+    if not tokens or tokens[0] != commit:
+        _fail(EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH, "cannot read the candidate commit parents")
+    parents = [token for token in tokens[1:] if _FULL_COMMIT.fullmatch(token)]
+    if len(parents) != len(tokens) - 1:
+        _fail(EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH, "candidate commit parents are not full object ids")
+    return parents
+
+
+def _is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    """True only when git proves ancestor-or-equal commit ancestry."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", ancestor, descendant],
+            capture_output=True, timeout=GIT_TIMEOUT_S, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _fail(EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH, f"git unavailable ({type(exc).__name__})")
+    if completed.returncode not in (0, 1):
+        _fail(EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH, "cannot test the event-base ancestry")
+    return completed.returncode == 0
+
+
+def _resolve_provenance(
+    root: Path, base: str, candidate: str, base_tree: str, candidate_tree: str
+) -> Provenance:
+    """Recompute the authoritative base/candidate relation (issue #4634).
+
+    Raises :class:`EvidenceError` with BASE_OR_CANDIDATE_MISMATCH when the
+    event base is stale or inconsistent with the candidate's merge
+    boundary. Never substitutes a smaller diff: the governed denominator
+    stays the complete event-base-to-candidate change computed by
+    :func:`_changed_paths`.
+    """
+    base_commit = _commit_of(root, base)
+    candidate_commit = _commit_of(root, candidate)
+    changed = tuple(_changed_paths(root, base_tree, candidate_tree))
+    parents = _commit_parents(root, candidate_commit) if candidate_commit is not None else []
+    if len(parents) < 2:
+        if base_commit is not None and candidate_commit is not None:
+            if base_commit != candidate_commit and not _is_ancestor(root, base_commit, candidate_commit):
+                _fail(
+                    EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+                    "event base is stale or inconsistent: it is not an ancestor of the candidate",
+                )
+        return Provenance(
+            base_tree=base_tree, candidate_tree=candidate_tree,
+            base_commit=base_commit, candidate_commit=candidate_commit,
+            parent_commit=None, parent_tree=None, relation=RELATION_DIRECT,
+            author_paths=changed, inherited_paths=(),
+        )
+    parent_commit = parents[0]
+    parent_tree = _resolve_tree(root, parent_commit, "merge parent")
+    if base_tree == parent_tree:
+        relation = RELATION_FRESH
+    elif base_commit is None:
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "event base is a bare tree behind the merge parent: "
+            "pass the event base commit so the drift is provable",
+        )
+    elif _is_ancestor(root, base_commit, parent_commit):
+        relation = RELATION_RECONCILED
+    else:
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "event base is stale or inconsistent: it is not an ancestor of the merge parent",
+        )
+    author = tuple(_changed_paths(root, parent_tree, candidate_tree))
+    author_set = set(author)
+    inherited = tuple(
+        path for path in _changed_paths(root, base_tree, parent_tree) if path not in author_set
+    )
+    inherited_set = set(inherited)
+    uncovered = [path for path in changed if path not in author_set and path not in inherited_set]
+    if uncovered:
+        preview = ", ".join(uncovered[:MAX_DIAGNOSTIC_PATHS])
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            f"cannot reconcile the event-base denominator with the merge parent: {preview}",
+        )
+    return Provenance(
+        base_tree=base_tree, candidate_tree=candidate_tree,
+        base_commit=base_commit, candidate_commit=candidate_commit,
+        parent_commit=parent_commit, parent_tree=parent_tree, relation=relation,
+        author_paths=author, inherited_paths=inherited,
+    )
 
 
 def _materialize_full_tree(root: Path, candidate_tree: str) -> Path:
@@ -1552,6 +1730,300 @@ def refresh_provenance(
 
 
 # ---------------------------------------------------------------------------
+# Bounded composition for large complete deltas (issue #4634).
+#
+# When the reconciled event-base denominator is legitimately larger than
+# the required payload bound, the evidence may travel as a versioned
+# bounded composition (``eliot-doc-read-pr-evidence-v3``) instead of a
+# single envelope: the parts partition the complete denominator exactly
+# (pairwise disjoint, union-equal — a gap names its paths as
+# UNCOVERED_CHANGED_PATH, an overlap or an outside path is
+# MALFORMED_EVIDENCE_BLOCK), each part carries an author /
+# inherited-upstream provenance label verified against the recomputed
+# partition (misattributed inherited reading fails as
+# BASE_OR_CANDIDATE_MISMATCH, never as authorship), and every part is
+# routed and read through the SOLE router/reader algorithms under the
+# UNCHANGED byte/count bounds — an over-limit part refuses with the same
+# ROUTER_INPUT_MISMATCH a single over-limit route produces. No limit is
+# raised, no required material is relabeled optional, no second router is
+# introduced, and a locally split route alone never counts: only the
+# existing verifier accepting the whole composition is proof. The
+# checklist state reuses the same four-valued contract lookup and the
+# same CHECKLIST_REQUIRED_MISSING cause, distinct from every
+# identity/payload-size failure.
+# ---------------------------------------------------------------------------
+
+_COMPOSED_FIELDS = (
+    "schema_version", "repository", "base_sha", "candidate", "provenance",
+    "changed_paths", "topic", "pair_key", "parts",
+    "contract_inputs", "attestation", "checklist",
+)
+_PART_FIELDS = (
+    "provenance", "paths", "topic", "pair_key", "matched_routes",
+    "route_receipt_id", "read_receipt_id", "required_items",
+    "bundle", "optional_expansions",
+)
+_PROVENANCE_FIELDS = ("event_base_commit", "merge_parent_commit", "relation")
+
+
+def _shape_composed(envelope: dict[str, Any]) -> dict[str, Any]:
+    if envelope.get("schema_version") != COMPOSED_SCHEMA:
+        _fail(
+            EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+            f"schema_version must be {OUTER_SCHEMA} or {COMPOSED_SCHEMA}",
+        )
+    missing = [key for key in _COMPOSED_FIELDS if key not in envelope]
+    if missing:
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"missing field(s): {','.join(missing)}")
+    unknown = sorted(set(envelope) - set(_COMPOSED_FIELDS))
+    if unknown:
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"unknown field(s): {','.join(unknown)}")
+    return envelope
+
+
+def _verify_composed_provenance(root: Path, recorded: Any, provenance: Provenance) -> None:
+    """Compare the recorded provenance block against the recomputed relation."""
+    block = _closed(recorded, _PROVENANCE_FIELDS, "provenance")
+    event_base = block["event_base_commit"]
+    if type(event_base) is not str or not _FULL_COMMIT.fullmatch(event_base):
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "provenance.event_base_commit must be a full 40-hex commit id",
+        )
+    if _resolve_tree(root, event_base, "provenance.event_base_commit") != provenance.base_tree:
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "provenance.event_base_commit is not the verified event base",
+        )
+    parent = block["merge_parent_commit"]
+    if parent is not None and (type(parent) is not str or not _FULL_COMMIT.fullmatch(parent)):
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "provenance.merge_parent_commit must be a full 40-hex commit id or null",
+        )
+    if (parent is None) != (provenance.parent_commit is None):
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "provenance.merge_parent_commit does not match the verified candidate boundary",
+        )
+    if parent is not None and parent != provenance.parent_commit:
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "provenance.merge_parent_commit is not the verified merge parent",
+        )
+    relation = block["relation"]
+    if relation not in BASE_RELATIONS:
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "provenance.relation must be direct, fresh or reconciled",
+        )
+    if relation != provenance.relation:
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            f"provenance.relation {relation!r} is not the recomputed relation {provenance.relation!r}",
+        )
+
+
+def _verify_composed_denominator(recorded: Any, changed: Sequence[str]) -> None:
+    """The composed envelope records the complete governed denominator exactly.
+
+    Unlike the single envelope (which tolerates recorded extras and reports
+    only omissions), a composition must name the denominator exactly: an
+    extra path claims governed material the base-to-candidate diff never
+    changed.
+    """
+    if type(recorded) is not list or not recorded or len(recorded) > MAX_ITEMS:
+        _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, "changed_paths must be a non-empty list")
+    if not all(type(entry) is str and entry.strip() for entry in recorded):
+        _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, "changed_paths entries must be non-empty strings")
+    try:
+        normalized = [_router.normalize_repo_path(entry) for entry in recorded]
+    except _router.RouteError as exc:
+        _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, f"changed_paths entry is not repository-relative: {exc}")
+    if len(set(normalized)) != len(normalized):
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "changed_paths contains duplicate entries")
+    uncovered = [path for path in changed if path not in set(normalized)]
+    if uncovered:
+        preview = ", ".join(uncovered[:MAX_DIAGNOSTIC_PATHS])
+        more = "" if len(uncovered) <= MAX_DIAGNOSTIC_PATHS else f" (+{len(uncovered) - MAX_DIAGNOSTIC_PATHS} more)"
+        _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, f"final changed path(s) not covered: {preview}{more}")
+    extra = sorted(set(normalized) - set(changed))
+    if extra:
+        preview = ", ".join(extra[:MAX_DIAGNOSTIC_PATHS])
+        _fail(
+            EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+            f"changed_paths claims path(s) outside the governed denominator: {preview}",
+        )
+
+
+def _verify_composed(
+    root: Path, envelope: dict[str, Any], provenance: Provenance,
+    changed: Sequence[str], work_issue: int | None = None,
+) -> dict[str, Any]:
+    """Verify a versioned bounded composition through the existing verifier.
+
+    Raises :class:`EvidenceError` with a stable typed code on any failure.
+    """
+    if provenance.base_commit is None:
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            "bounded composition requires the event base commit, not a bare tree",
+        )
+    recorded_base = _sha256(envelope["base_sha"], "base_sha", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH)
+    if recorded_base != _tree_digest(provenance.base_tree):
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            f"base tree digest mismatch: recorded={recorded_base} actual={_tree_digest(provenance.base_tree)}",
+        )
+    candidate = _closed(envelope["candidate"], ("commit", "tree"), "candidate")
+    recorded_tree = _sha256(candidate["tree"], "candidate.tree", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH)
+    if recorded_tree != _tree_digest(provenance.candidate_tree):
+        _fail(
+            EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+            f"candidate tree digest mismatch: recorded={recorded_tree} actual={_tree_digest(provenance.candidate_tree)}",
+        )
+    if candidate["commit"] is not None:
+        commit = _text(candidate["commit"], "candidate.commit", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH)
+        if not _FULL_COMMIT.fullmatch(commit):
+            _fail(EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH, "candidate.commit must be a full 40-hex commit id")
+    _verify_composed_provenance(root, envelope["provenance"], provenance)
+    _verify_composed_denominator(envelope["changed_paths"], changed)
+    topic = _text(envelope["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH, descriptive=True)
+    pair_key = _sha256(envelope["pair_key"], "pair_key", EvidenceFailure.PAIR_KEY_MISMATCH)
+    parts = envelope["parts"]
+    if type(parts) is not list or not parts or len(parts) > MAX_ITEMS:
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, "parts must be a non-empty list")
+    normalized_parts: list[list[str]] = []
+    claimed: dict[str, int] = {}
+    for index, part in enumerate(parts):
+        label = f"part[{index}]"
+        _closed(part, _PART_FIELDS, label)
+        if part["provenance"] not in PART_PROVENANCE:
+            _fail(
+                EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+                f"{label} provenance must be author or inherited-upstream",
+            )
+        raw = part["paths"]
+        if type(raw) is not list or not raw or len(raw) > MAX_ITEMS:
+            _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"{label} paths must be a non-empty list")
+        if not all(type(entry) is str and entry.strip() for entry in raw):
+            _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"{label} paths entries must be non-empty strings")
+        try:
+            normalized = [_router.normalize_repo_path(entry) for entry in raw]
+        except _router.RouteError as exc:
+            _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"{label} path is not repository-relative: {exc}")
+        if len(set(normalized)) != len(normalized):
+            _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"{label} contains duplicate paths")
+        for path in normalized:
+            if path in claimed:
+                _fail(
+                    EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+                    f"composed parts overlap on {path} (part[{claimed[path]}] and {label})",
+                )
+            claimed[path] = index
+        normalized_parts.append(normalized)
+    denominator = set(changed)
+    extra = sorted(set(claimed) - denominator)
+    if extra:
+        preview = ", ".join(extra[:MAX_DIAGNOSTIC_PATHS])
+        _fail(
+            EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+            f"composed part path(s) outside the governed denominator: {preview}",
+        )
+    missing = sorted(denominator - set(claimed))
+    if missing:
+        preview = ", ".join(missing[:MAX_DIAGNOSTIC_PATHS])
+        more = "" if len(missing) <= MAX_DIAGNOSTIC_PATHS else f" (+{len(missing) - MAX_DIAGNOSTIC_PATHS} more)"
+        _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, f"final changed path(s) not covered by any part: {preview}{more}")
+    author_set = set(provenance.author_paths)
+    inherited_set = set(provenance.inherited_paths)
+    roots: list[Path] = []
+    summaries: list[dict[str, Any]] = []
+    required_total = 0
+    try:
+        for index, (part, normalized) in enumerate(zip(parts, normalized_parts)):
+            label = f"part[{index}]"
+            expected = author_set if part["provenance"] == PROVENANCE_AUTHOR else inherited_set
+            scope = "author delta" if part["provenance"] == PROVENANCE_AUTHOR else "inherited upstream delta"
+            foreign = sorted(path for path in normalized if path not in expected)
+            if foreign:
+                preview = ", ".join(foreign[:MAX_DIAGNOSTIC_PATHS])
+                _fail(
+                    EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+                    f"{label} claims {part['provenance']} provenance for path(s) "
+                    f"outside the recomputed {scope}: {preview}",
+                )
+            if part["pair_key"] != pair_key:
+                _fail(EvidenceFailure.PAIR_KEY_MISMATCH, f"{label} pair key differs from the composed pair key")
+            candidate_root, recomputed = _recompute_final(root, provenance.candidate_tree, normalized, topic)
+            roots.append(candidate_root)
+            _compare_router_input(part, recomputed)
+            _compare_required(part["required_items"], recomputed)
+            _compare_bundle(part["bundle"], recomputed)
+            _compare_optional(part["optional_expansions"], recomputed)
+            summaries.append(
+                {
+                    "provenance": part["provenance"],
+                    "paths": list(normalized),
+                    "route_receipt_id": recomputed.route["receipt_id"],
+                    "read_receipt_id": recomputed.read_receipt["read_receipt_id"],
+                    "required_items": len(recomputed.read_receipt["required"]),
+                    "bundle_sha256": str(recomputed.read_receipt["bundle_sha256"]),
+                    "bundle_bytes": int(recomputed.read_receipt["bundle_bytes"]),
+                }
+            )
+            required_total += len(recomputed.read_receipt["required"])
+        repository = _closed(envelope["repository"], ("owner", "name"), "repository")
+        owner = _text(repository["owner"], "repository.owner", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH)
+        name = _text(repository["name"], "repository.name", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH)
+        expected_name = _candidate_repository(roots[0])
+        if expected_name and f"{owner}/{name}" != expected_name:
+            _fail(
+                EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+                f"repository identity {owner}/{name} is not this checkout ({expected_name})",
+            )
+        _compare_contract_inputs(envelope["contract_inputs"], roots[0])
+        _compare_attestation(envelope["attestation"])
+        state = _checklist_state(envelope["checklist"], roots[0], provenance.candidate_tree, work_issue)
+        assignment = _assignment_contract(roots[0])
+    finally:
+        for candidate_root in roots:
+            _release_candidate(candidate_root)
+    if state is ChecklistState.REQUIRED_MISSING:
+        _fail(
+            EvidenceFailure.CHECKLIST_REQUIRED_MISSING,
+            "the assignment contract requires a checklist/work-unit record for this issue and none is recorded",
+        )
+    if state is ChecklistState.STALE:
+        _fail(
+            EvidenceFailure.CHECKLIST_REQUIRED_MISSING,
+            "the recorded checklist is bound to a different candidate tree; regenerate it for the final candidate",
+        )
+    return {
+        "schema_version": COMPOSED_SCHEMA,
+        "result": "PASS",
+        "base_tree": _tree_digest(provenance.base_tree),
+        "candidate_tree": _tree_digest(provenance.candidate_tree),
+        "relation": provenance.relation,
+        "event_base_commit": provenance.base_commit,
+        "merge_parent_commit": provenance.parent_commit,
+        "pair_key": pair_key,
+        "parts": summaries,
+        "required_items": required_total,
+        "changed_paths": list(changed),
+        "bundle_sha256": "+".join(part["bundle_sha256"] for part in summaries),
+        # The four-valued conditional checklist state, decided from the same
+        # independent contract rows as the single envelope and reported
+        # separately from the documentation-read result, never folded into a
+        # documentation-read failure.
+        "checklist_state": state.value,
+        "assignment_contract": sorted(assignment),
+        "proof_ceiling": PROOF_CEILING,
+        "merge_integration": merge_integration_status(root),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Merge-boundary integration visibility (issue #2965 item 12/13).
 # ---------------------------------------------------------------------------
 
@@ -1609,7 +2081,10 @@ def verify(
 ) -> dict[str, Any]:
     """Recompute every envelope field for the final merge candidate and compare.
 
-    Raises :class:`EvidenceError` with a stable typed code on any failure.
+    Accepts the single envelope (``eliot-doc-read-pr-evidence-v2``) and the
+    versioned bounded composition (``eliot-doc-read-pr-evidence-v3``,
+    issue #4634) through this same entry point. Raises :class:`EvidenceError`
+    with a stable typed code on any failure.
     """
     root = root.resolve()
     base_tree = _resolve_tree(root, base, "base")
@@ -1617,7 +2092,17 @@ def verify(
 
     # Shape is checked before any repository work so an absent or malformed
     # envelope is EMPTY/MALFORMED and no prose attestation can rescue it.
-    envelope = _shape(_extract_envelope(pr_body))
+    envelope = _extract_envelope(pr_body)
+    schema = envelope.get("schema_version")
+    if schema not in (OUTER_SCHEMA, COMPOSED_SCHEMA):
+        _fail(
+            EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+            f"schema_version must be {OUTER_SCHEMA} or {COMPOSED_SCHEMA}",
+        )
+    if schema == COMPOSED_SCHEMA:
+        shaped = _shape_composed(envelope)
+    else:
+        shaped = _shape(envelope)
 
     # Item 14 precedes all content comparison: a candidate that commits local
     # evidence can never pass, however exact its envelope otherwise is.
@@ -1626,6 +2111,11 @@ def verify(
     changed = _changed_paths(root, base_tree, candidate_tree)
     if not changed:
         _fail(EvidenceFailure.UNCOVERED_CHANGED_PATH, "base and candidate differ in no tracked path")
+    # Issue #4634: the authoritative event-base/candidate relation is
+    # recomputed from git objects before any content comparison. A stale or
+    # inconsistent event base fails here, for single and composed envelopes
+    # alike; a smaller diff is never silently substituted.
+    provenance = _resolve_provenance(root, base, candidate, base_tree, candidate_tree)
     # Issue #1225 step 10 (I18.27): an oracle-touching candidate cannot
     # use its newly modified oracle as acceptance. The blind-reviewer
     # envelope is required only when the decision crosses the oracle
@@ -1634,11 +2124,14 @@ def verify(
     if oracle_changed:
         _require_oracle_blind_review(root, pr_body, base_tree, candidate_tree, oracle_changed)
 
-    topic = _text(envelope["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH, descriptive=True)
+    if schema == COMPOSED_SCHEMA:
+        return _verify_composed(root, shaped, provenance, changed, work_issue)
+
+    topic = _text(shaped["topic"], "topic", EvidenceFailure.ROUTER_INPUT_MISMATCH, descriptive=True)
     candidate_root, recomputed = _recompute_final(root, candidate_tree, changed, topic)
     try:
         checklist_state, assignment_contract = _compare(
-            envelope, recomputed, base_tree, candidate_tree, changed, candidate_root,
+            shaped, recomputed, base_tree, candidate_tree, changed, candidate_root,
             work_issue,
         )
     finally:
@@ -1692,7 +2185,10 @@ def verify(
 # genuinely valid `eliot-doc-read-pr-evidence-v2` envelope for that exact
 # candidate with the sole router/reader algorithms. Each negative case is that
 # valid envelope with exactly one bounded defect, so every typed failure is
-# demonstrated against an otherwise correct envelope.
+# demonstrated against an otherwise correct envelope. The concurrent-movement
+# phase (issue #4634) builds a second hermetic repository shaped like the
+# frozen event-base/upstream/author/merge graph and demonstrates the
+# whole-PR refusal plus the versioned bounded composition the same way.
 #
 # This is the module's own verification entrypoint, not a test framework: there
 # is no test module, no test function and no test runner. The committed samples
@@ -1930,6 +2426,414 @@ def _valid_envelope(root: Path, base: str, candidate: str, topic: str) -> str:
     return f"{BLOCK_START}\n```json\n{payload}\n```\n{BLOCK_END}\n"
 
 
+# ---------------------------------------------------------------------------
+# Concurrent-movement acceptance corpus (issue #4634).
+#
+# A second hermetic repository mirrors the frozen PR4599 graph shape: an
+# event base E, concurrent upstream movement U (many inherited-only files,
+# one rename, one shared-file edit), an author branch A from E (fewer
+# authored files, one shared-file edit, one deletion), and a merge M whose
+# first parent is the upstream side and whose conflict-resolution edit is
+# part of the author delta. The event-base denominator (authored plus
+# inherited paths) exceeds the corpus route bound while each provenance
+# part fits it, so the single envelope reproduces the pre-repair typed
+# refusal and only the versioned bounded composition validates. Every
+# byte is deterministic sanitized filler; no normative text, no secrets.
+# ---------------------------------------------------------------------------
+
+CONCURRENT_TOPIC = "concurrent movement reconciliation proof"
+CONCURRENT_MAX_BYTES = 30000
+CONCURRENT_AUTHOR_FILES = 15
+CONCURRENT_UPSTREAM_FILES = 74
+CONCURRENT_AUTHOR_NOTE_LINES = 850
+CONCURRENT_UPSTREAM_NOTE_LINES = 850
+
+
+def _write_concurrent_corpus(root: Path) -> None:
+    """Replace the seed routing corpus with the concurrent-movement one.
+
+    Assumes :func:`_write_seed` already materialized the skeleton (the
+    committed assignment contract, the normative pair receipt, the root
+    AGENTS.md and the seed fragments are reused, so repository identity
+    and the checklist contract stay the sanitized acceptance ones).
+    """
+    fragments = {
+        "A0.1": "docs/architecture/A00-01-seed.md",
+        "A0.2": "docs/architecture/A00-02-seed.md",
+        "I0.1": "docs/architecture/I00-01-seed.md",
+    }
+    handles = {}
+    for handle, relative in fragments.items():
+        raw = (root / relative).read_bytes()
+        handles[handle] = {
+            "path": relative,
+            "anchor": handle.casefold().replace(".", "-"),
+            "source_anchor": handle.casefold().replace(".", "-"),
+            "fragment_sha256": hashlib.sha256(raw).hexdigest(),
+            "fragment_bytes": len(raw),
+        }
+    (root / "docs" / "architecture" / "handle-index.json").write_text(
+        json.dumps({"schema_version": "eliot-handle-index-v1", "handles": handles}, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
+    )
+    # The author part needs its own bulk required file and the inherited
+    # part needs its own, so each part fits the bound while their union
+    # (the whole drifted denominator) exceeds it. The topic carries no
+    # route keyword, so every part matches by path alone.
+    (root / "docs" / "architecture" / "route-rules.toml").write_text(
+        'schema_version = "eliot-doc-routes-v1"\n'
+        'pair_schema = "eliot-normative-pair-v2-sharded"\n'
+        "\n"
+        "[baseline]\n"
+        'required_handles = ["A0.1"]\n'
+        'required_files = ["AGENTS.md"]\n'
+        "optional_handles = []\n"
+        "optional_files = []\n"
+        f"max_required_bytes = {CONCURRENT_MAX_BYTES}\n"
+        "\n"
+        "[[route]]\n"
+        'id = "concurrent-author"\n'
+        'description = "Sanitized concurrent-movement author route."\n'
+        'path_globs = ["src/author/**"]\n'
+        'topic_keywords = ["author-drift"]\n'
+        'required_handles = ["A0.2"]\n'
+        'optional_handles = []\n'
+        'required_files = ["docs/author-notes.md"]\n'
+        "optional_files = []\n"
+        "\n"
+        "[[route]]\n"
+        'id = "concurrent-upstream"\n'
+        'description = "Sanitized concurrent-movement upstream route."\n'
+        'path_globs = ["src/upstream/**"]\n'
+        'topic_keywords = ["upstream-drift"]\n'
+        'required_handles = ["I0.1"]\n'
+        'optional_handles = []\n'
+        'required_files = ["docs/upstream-notes.md"]\n'
+        "optional_files = []\n",
+        encoding="utf-8", newline="\n",
+    )
+    author_notes = "".join(f"Author context line {index:04d}.\n" for index in range(CONCURRENT_AUTHOR_NOTE_LINES))
+    (root / "docs" / "author-notes.md").write_text(author_notes, encoding="utf-8", newline="\n")
+    upstream_notes = "".join(
+        f"Upstream context line {index:04d}.\n" for index in range(CONCURRENT_UPSTREAM_NOTE_LINES)
+    )
+    (root / "docs" / "upstream-notes.md").write_text(upstream_notes, encoding="utf-8", newline="\n")
+    (root / "docs" / "seed-rename-me.md").write_text("# Rename target\n\nSeed.\n", encoding="utf-8", newline="\n")
+
+
+def _build_concurrent_repo() -> tuple[Path, str, str, str]:
+    """Build the hermetic event-base/upstream/author/merge graph.
+
+    Returns ``(root, event_base, merge_parent, candidate)`` where the
+    candidate is a merge commit whose first parent is the upstream side.
+    The shared ``docs/note.md`` edit on both sides forces a genuine
+    conflict resolved deterministically in the merge, so the
+    conflict-resolution edit lands in the author delta; the resolution
+    write runs unconditionally, so the corpus is deterministic whether
+    or not git reports the conflict.
+    """
+    directory = tempfile.mkdtemp(prefix="eliot-doc-read-concurrent-")
+    root = Path(directory)
+    _write_seed(root)
+    _write_concurrent_corpus(root)
+    _git_seed(root, "init", "-b", "main")
+    _git_seed(root, "config", "user.name", "ELIOT Acceptance")
+    _git_seed(root, "config", "user.email", "acceptance@example.invalid")
+    _git_seed(root, "config", "commit.gpgsign", "false")
+    # Pin byte-exact blobs: an inherited autocrlf/eol conversion would rewrite
+    # the very bytes the envelope is computed over.
+    _git_seed(root, "config", "core.autocrlf", "false")
+    _git_seed(root, "config", "core.eol", "lf")
+    _git_seed(root, "add", "-A")
+    _git_seed(root, "commit", "-m", "event base")
+    base = _git(root, "rev-parse", "HEAD")
+
+    upstream_dir = root / "src" / "upstream"
+    upstream_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(CONCURRENT_UPSTREAM_FILES):
+        (upstream_dir / f"f{index:02d}.rs").write_text(
+            f"pub fn upstream_{index}() {{}}\n", encoding="utf-8", newline="\n"
+        )
+    (root / "docs" / "note.md").write_text("# Note\n\nUpstream movement.\n", encoding="utf-8", newline="\n")
+    _git_seed(root, "mv", "docs/seed-rename-me.md", "docs/renamed-upstream.md")
+    _git_seed(root, "add", "-A")
+    _git_seed(root, "commit", "-m", "concurrent upstream movement")
+    parent = _git(root, "rev-parse", "HEAD")
+
+    _git_seed(root, "checkout", "-b", "author", base)
+    author_dir = root / "src" / "author"
+    author_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(CONCURRENT_AUTHOR_FILES):
+        (author_dir / f"g{index:02d}.rs").write_text(
+            f"pub fn authored_{index}() {{}}\n", encoding="utf-8", newline="\n"
+        )
+    (root / "docs" / "note.md").write_text("# Note\n\nAuthor edit.\n", encoding="utf-8", newline="\n")
+    (root / "src" / "core" / "legacy.rs").unlink()
+    _git_seed(root, "add", "-A")
+    _git_seed(root, "commit", "-m", "author delta")
+    author = _git(root, "rev-parse", "HEAD")
+
+    _git_seed(root, "checkout", "main")
+    subprocess.run(
+        ["git", "-C", str(root), "merge", "--no-ff", "--no-commit", author],
+        capture_output=True, timeout=GIT_TIMEOUT_S, check=False,
+    )
+    (root / "docs" / "note.md").write_text(
+        "# Note\n\nResolved after concurrent movement.\n", encoding="utf-8", newline="\n"
+    )
+    _git_seed(root, "add", "-A")
+    _git_seed(root, "commit", "-m", "merge author into upstream")
+    candidate = _git(root, "rev-parse", "HEAD")
+    return root, base, parent, candidate
+
+
+def _valid_composed_envelope(root: Path, base: str, parent: str, candidate: str, topic: str) -> str:
+    """Compute a genuinely valid v3 composition for the concurrent candidate."""
+    base_tree = _resolve_tree(root, base, "base")
+    candidate_tree = _resolve_tree(root, candidate, "candidate")
+    parent_tree = _resolve_tree(root, parent, "merge parent")
+    changed = _changed_paths(root, base_tree, candidate_tree)
+    author_set = set(_changed_paths(root, parent_tree, candidate_tree))
+    author_part = sorted(set(changed) & author_set)
+    inherited_part = sorted(set(changed) - author_set)
+    if not author_part or not inherited_part:
+        _fail(
+            EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+            "concurrent corpus did not partition; refusing a degenerate composition",
+        )
+    parts: list[dict[str, Any]] = []
+    roots: list[Path] = []
+    try:
+        for label, paths in (
+            (PROVENANCE_AUTHOR, author_part),
+            (PROVENANCE_INHERITED, inherited_part),
+        ):
+            candidate_root, recomputed = _recompute_final(root, candidate_tree, paths, topic)
+            roots.append(candidate_root)
+            parts.append(
+                {
+                    "provenance": label,
+                    "paths": list(paths),
+                    "topic": topic,
+                    "pair_key": recomputed.route["pair_key"],
+                    "matched_routes": list(recomputed.route["matched_routes"]),
+                    "route_receipt_id": recomputed.route["receipt_id"],
+                    "read_receipt_id": recomputed.read_receipt["read_receipt_id"],
+                    "required_items": [
+                        {
+                            "path": item["path"],
+                            "sha256": item["sha256"],
+                            "bytes": item["bytes"],
+                            "handles": sorted(item.get("handles", [])),
+                        }
+                        for item in recomputed.read_receipt["required"]
+                    ],
+                    "bundle": {
+                        "sha256": recomputed.read_receipt["bundle_sha256"],
+                        "bytes": recomputed.read_receipt["bundle_bytes"],
+                    },
+                    "optional_expansions": "none",
+                }
+            )
+        contract = _contract_inputs(roots[0])
+    finally:
+        for candidate_root in roots:
+            _release_candidate(candidate_root)
+    envelope = {
+        "schema_version": COMPOSED_SCHEMA,
+        "repository": {"owner": "sanitized", "name": "acceptance"},
+        "base_sha": _tree_digest(base_tree),
+        "candidate": {"commit": candidate, "tree": _tree_digest(candidate_tree)},
+        "provenance": {
+            "event_base_commit": base,
+            "merge_parent_commit": parent,
+            "relation": RELATION_RECONCILED,
+        },
+        "changed_paths": list(changed),
+        "topic": topic,
+        "pair_key": parts[0]["pair_key"],
+        "parts": parts,
+        "contract_inputs": contract,
+        "attestation": {
+            "read_by": "sanitized acceptance runner",
+            "statement": (
+                "Every required item in both parts was opened and read before mutation. "
+                "The inherited-upstream part records post-integration reading of concurrent "
+                "main movement; it is not presented as pre-edit authorship."
+            ),
+        },
+        "checklist": {
+            "issue": 2965,
+            "recorded": True,
+            "bound_candidate_tree": _tree_digest(candidate_tree),
+        },
+    }
+    payload = json.dumps(envelope, indent=2, sort_keys=True)
+    return f"{BLOCK_START}\n```json\n{payload}\n```\n{BLOCK_END}\n"
+
+
+def _unroutable_single_body(root: Path, base: str, candidate: str, topic: str) -> str:
+    """Single envelope over the drifted denominator with unvalidated machine fields.
+
+    The shared verifier recomputes the whole-denominator route before
+    comparing any recorded field, so this body deterministically exercises
+    the pre-repair typed refusal (ROUTER_INPUT_MISMATCH) on the frozen
+    graph shape. It can never validate: the whole route exceeds the bound.
+    """
+    base_tree = _resolve_tree(root, base, "base")
+    candidate_tree = _resolve_tree(root, candidate, "candidate")
+    changed = _changed_paths(root, base_tree, candidate_tree)
+    envelope = {
+        "schema_version": OUTER_SCHEMA,
+        "repository": {"owner": "sanitized", "name": "acceptance"},
+        "base_sha": _tree_digest(base_tree),
+        "candidate": {"commit": candidate, "tree": _tree_digest(candidate_tree)},
+        "changed_paths": list(changed),
+        "topic": topic,
+        "route_receipt_id": "sha256:" + "0" * 64,
+        "read_receipt_id": "sha256:" + "0" * 64,
+        "pair_key": "sha256:" + "0" * 64,
+        "matched_routes": ["concurrent-author"],
+        "required_items": [],
+        "bundle": {"sha256": "0" * 64, "bytes": 0},
+        "optional_expansions": "none",
+        "contract_inputs": {},
+        "attestation": {},
+        "checklist": {},
+    }
+    payload = json.dumps(envelope, indent=2, sort_keys=True)
+    return f"{BLOCK_START}\n```json\n{payload}\n```\n{BLOCK_END}\n"
+
+
+def _apply_composed_mutation(valid_body: str, mutation: str) -> str:
+    """Return the valid composed body with exactly one bounded defect applied."""
+    if mutation == "valid":
+        return valid_body
+    envelope = _extract_envelope(valid_body)
+    mutated = json.loads(json.dumps(envelope))
+    parts = mutated["parts"]
+    author_part = next(part for part in parts if part["provenance"] == PROVENANCE_AUTHOR)
+    inherited_part = next(part for part in parts if part["provenance"] == PROVENANCE_INHERITED)
+    if mutation == "drop_inherited_part_path":
+        inherited_part["paths"] = inherited_part["paths"][:-1]
+    elif mutation == "overlap_part_path":
+        inherited_part["paths"] = sorted(set(inherited_part["paths"]) | {author_part["paths"][0]})
+    elif mutation == "extra_part_path":
+        author_part["paths"] = sorted(set(author_part["paths"]) | {"AGENTS.md"})
+    elif mutation == "mislabel_inherited":
+        inherited_part["provenance"] = PROVENANCE_AUTHOR
+    elif mutation == "forge_part_receipt":
+        inherited_part["route_receipt_id"] = "sha256:" + "a1" * 32
+    elif mutation == "tamper_part_required":
+        inherited_part["required_items"][-1]["sha256"] = "f" * 64
+    elif mutation == "stale_provenance":
+        mutated["provenance"]["event_base_commit"] = mutated["provenance"]["merge_parent_commit"]
+    elif mutation == "wrong_relation":
+        mutated["provenance"]["relation"] = RELATION_FRESH
+    elif mutation == "unrecord_checklist":
+        mutated["checklist"]["recorded"] = False
+        mutated["checklist"]["bound_candidate_tree"] = None
+    else:  # pragma: no cover - the mutation table is closed
+        _fail(EvidenceFailure.MALFORMED_EVIDENCE_BLOCK, f"unknown composed mutation: {mutation}")
+    payload = json.dumps(mutated, indent=2, sort_keys=True)
+    return f"{BLOCK_START}\n```json\n{payload}\n```\n{BLOCK_END}\n"
+
+
+COMPOSED_EXPECTATIONS: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
+    ("composed-valid", "valid", None,
+     "a bounded composition covering the whole drifted denominator validates with reconciled provenance"),
+    ("composed-gap", "drop_inherited_part_path", EvidenceFailure.UNCOVERED_CHANGED_PATH,
+     "a part subset omitting a governed path fails and names it"),
+    ("composed-overlap", "overlap_part_path", EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+     "parts claiming one path twice fail"),
+    ("composed-extra-path", "extra_part_path", EvidenceFailure.MALFORMED_EVIDENCE_BLOCK,
+     "a part path outside the governed denominator fails"),
+    ("composed-mislabel", "mislabel_inherited", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+     "inherited reading presented as authorship fails"),
+    ("composed-forged-part", "forge_part_receipt", EvidenceFailure.ROUTE_RECEIPT_MISMATCH,
+     "a fabricated part route id fails deterministic recomputation"),
+    ("composed-required-item", "tamper_part_required", EvidenceFailure.REQUIRED_ITEM_MISMATCH,
+     "a tampered part required hash fails closed"),
+    ("composed-stale-provenance", "stale_provenance", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+     "a provenance block naming the wrong event base fails"),
+    ("composed-wrong-relation", "wrong_relation", EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH,
+     "a provenance block denying the recomputed drift fails"),
+    ("composed-checklist-missing", "unrecord_checklist", EvidenceFailure.CHECKLIST_REQUIRED_MISSING,
+     "a missing checklist blocks composed evidence with the checklist cause alone"),
+)
+
+
+def _run_concurrent_acceptance(surprising: list[str]) -> tuple[Path, int]:
+    """Concurrent-movement phase of the acceptance demonstration (issue #4634).
+
+    Builds the hermetic event-base/upstream/author/merge graph, reproduces
+    the frozen-graph typed refusal for the drifted whole-PR route, then
+    verifies the bounded composition and its negative cases through the
+    same real verifier entry point. Appends researcher-visible surprises
+    and returns the corpus root (for cleanup) with the case count.
+    """
+    root, base, parent, candidate = _build_concurrent_repo()
+    ran = 0
+    topic = CONCURRENT_TOPIC
+    valid_body = _valid_composed_envelope(root, base, parent, candidate, topic)
+    ran += 1
+    try:
+        verify(root, base, candidate, _unroutable_single_body(root, base, candidate, topic))
+    except EvidenceError as exc:
+        if exc.code is EvidenceFailure.ROUTER_INPUT_MISMATCH:
+            print(f"  frozen-event-base: FAIL-CLOSED {exc.code.value} (the drifted whole-PR route still refuses over the bound)")
+        else:
+            surprising.append(f"frozen-event-base: got {exc.code.value}, want ROUTER_INPUT_MISMATCH")
+            print(f"  frozen-event-base: WRONG-CODE {exc.code.value} != ROUTER_INPUT_MISMATCH")
+    else:
+        surprising.append("frozen-event-base: unexpectedly passed")
+        print("  frozen-event-base: UNEXPECTED-PASS")
+    for name, mutation, expect, note in COMPOSED_EXPECTATIONS:
+        ran += 1
+        try:
+            result = verify(root, base, candidate, _apply_composed_mutation(valid_body, mutation))
+        except EvidenceError as exc:
+            if expect is not None and exc.code is expect:
+                print(f"  {name}: FAIL-CLOSED {exc.code.value} ({note})")
+            else:
+                want = expect.value if expect is not None else "PASS"
+                surprising.append(f"{name}: got {exc.code.value}, want {want}")
+                print(f"  {name}: WRONG-CODE {exc.code.value} != {want} ({note})")
+        else:
+            if expect is None:
+                print(
+                    f"  {name}: PASS relation={result['relation']} parts={len(result['parts'])} "
+                    f"required={result['required_items']} paths={len(result['changed_paths'])} "
+                    f"checklist={result['checklist_state']} ({note})"
+                )
+            else:
+                surprising.append(f"{name}: unexpectedly passed")
+                print(f"  {name}: UNEXPECTED-PASS ({note})")
+    ran += 1
+    (root / "docs" / "note.md").write_text(
+        "# Note\n\nResolved after concurrent movement.\nExtra post-merge line.\n",
+        encoding="utf-8", newline="\n",
+    )
+    _git_seed(root, "add", "-A")
+    _git_seed(root, "commit", "-m", "post-merge movement")
+    moved = _git(root, "rev-parse", "HEAD")
+    try:
+        verify(root, base, moved, valid_body)
+    except EvidenceError as exc:
+        if exc.code is EvidenceFailure.BASE_OR_CANDIDATE_MISMATCH:
+            print(
+                f"  composed-moved-candidate: FAIL-CLOSED {exc.code.value} "
+                "(evidence bound to the merged tree does not follow a moved candidate)"
+            )
+        else:
+            surprising.append(f"composed-moved-candidate: got {exc.code.value}, want BASE_OR_CANDIDATE_MISMATCH")
+            print(f"  composed-moved-candidate: WRONG-CODE {exc.code.value} != BASE_OR_CANDIDATE_MISMATCH")
+    else:
+        surprising.append("composed-moved-candidate: unexpectedly passed")
+        print("  composed-moved-candidate: UNEXPECTED-PASS")
+    return root, ran
+
+
 ACCEPTANCE_TOPIC = "seed source and seed generated acceptance routing"
 
 ACCEPTANCE_CASES: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
@@ -2009,7 +2913,7 @@ def _verify_mutation(root: Path, base: str, candidate: str, valid_body: str,
 
 
 def run_acceptance(_live_root: Path) -> int:
-    """Demonstrate every #2965 acceptance case over a real sanitized candidate.
+    """Demonstrate every #2965 and #4634 acceptance case over real sanitized candidates.
 
     ``_live_root`` is unused: the demonstration is hermetic by design so it does
     not depend on the current branch state of the repository it runs in. It is
@@ -2020,6 +2924,7 @@ def run_acceptance(_live_root: Path) -> int:
     """
     del _live_root
     root, base, candidate, _ = _build_acceptance_repo()
+    concurrent_root: Path | None = None
     try:
         valid_body = _valid_envelope(root, base, candidate, ACCEPTANCE_TOPIC)
         expectations: tuple[tuple[str, str, EvidenceFailure | None, str], ...] = (
@@ -2090,6 +2995,11 @@ def run_acceptance(_live_root: Path) -> int:
                 surprising.append(f"{name}: got {code}, want {expect.value}")
                 print(f"  {name}: WRONG-CODE {code} != {expect.value} ({note})")
         total = len(ACCEPTANCE_CASES) + len(expectations)
+        # Issue #4634 concurrent-movement phase: the frozen-graph refusal plus
+        # the bounded composition and its negative cases, all through the same
+        # real verifier entry point.
+        concurrent_root, concurrent_ran = _run_concurrent_acceptance(surprising)
+        total += concurrent_ran
         if surprising:
             print(f"DOC_READ_EVIDENCE_ACCEPTANCE: FAIL cases={total}: {'; '.join(surprising)}")
             return 1
@@ -2097,6 +3007,8 @@ def run_acceptance(_live_root: Path) -> int:
         return 0
     finally:
         shutil.rmtree(root, ignore_errors=True)
+        if concurrent_root is not None:
+            shutil.rmtree(concurrent_root, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2110,7 +3022,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Executable pre-merge contract for documentation read evidence (#2965). "
             "Recomputes routing and the verified read bundle over the FINAL merge candidate "
             "using the single docs_router/docs_read algorithms and compares every field of "
-            "the one versioned eliot-doc-read-pr-evidence-v2 envelope. The real "
+            "the one versioned single (eliot-doc-read-pr-evidence-v2) or bounded-composition "
+            "(eliot-doc-read-pr-evidence-v3) envelope. The real "
             "root/controller merge action must run this command on the final merge candidate "
             "and refuse a nonzero exit."
         ),
@@ -2142,9 +3055,37 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _emit_tail(result: dict[str, Any]) -> None:
+    print(f"  checklist_state={result['checklist_state']}")
+    contract = ",".join(str(issue) for issue in result["assignment_contract"]) or "none"
+    print(f"  assignment_contract={contract}")
+    print(f"  proof_ceiling={result['proof_ceiling']}")
+    merge = result["merge_integration"]
+    print(f"  merge_in_repository_consumers={','.join(merge['in_repository_merge_consumers']) or 'none'}")
+    if merge["external_merge_action_required"]:
+        print("  external_merge_action_required=True (blocking owner action, not simulated)")
+
+
 def _emit(result: dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if result.get("schema_version") == COMPOSED_SCHEMA:
+        print("DOC_READ_EVIDENCE: PASS (composed)")
+        print(f"  base_tree={result['base_tree']}")
+        print(f"  candidate_tree={result['candidate_tree']}")
+        print(f"  relation={result['relation']}")
+        print(f"  event_base={result['event_base_commit']}")
+        print(f"  merge_parent={result['merge_parent_commit'] or 'none'}")
+        print(f"  pair_key={result['pair_key']}")
+        for index, part in enumerate(result["parts"]):
+            print(
+                f"  part[{index}] provenance={part['provenance']} paths={len(part['paths'])} "
+                f"route={part['route_receipt_id']} read={part['read_receipt_id']} "
+                f"required={part['required_items']} bundle={part['bundle_sha256']}:{part['bundle_bytes']}"
+            )
+        print(f"  changed_paths={len(result['changed_paths'])}")
+        _emit_tail(result)
         return
     print("DOC_READ_EVIDENCE: PASS")
     print(f"  base_tree={result['base_tree']}")
@@ -2156,14 +3097,7 @@ def _emit(result: dict[str, Any], as_json: bool) -> None:
     print(f"  required_items={result['required_items']}")
     print(f"  changed_paths={len(result['changed_paths'])}")
     print(f"  bundle_sha256={result['bundle_sha256']}")
-    print(f"  checklist_state={result['checklist_state']}")
-    contract = ",".join(str(issue) for issue in result["assignment_contract"]) or "none"
-    print(f"  assignment_contract={contract}")
-    print(f"  proof_ceiling={result['proof_ceiling']}")
-    merge = result["merge_integration"]
-    print(f"  merge_in_repository_consumers={','.join(merge['in_repository_merge_consumers']) or 'none'}")
-    if merge["external_merge_action_required"]:
-        print("  external_merge_action_required=True (blocking owner action, not simulated)")
+    _emit_tail(result)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
