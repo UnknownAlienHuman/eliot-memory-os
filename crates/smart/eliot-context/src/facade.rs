@@ -51,7 +51,7 @@
 //!
 //! | caller | classification |
 //! |---|---|
-//! | `ContextCompiler::compile`, `compile_with_revocation` | bounded compatibility consumer; `#[deprecated]`, `LegacyFrozen`, and only `tests/admission_integrity.rs` calls them |
+//! | `ContextCompiler::compile`, `compile_with_revocation` | bounded compatibility consumer; `#[deprecated]`, `LegacyFrozen`, and no binary reaches them. Two in-crate test files call `compile` — `tests/admission_integrity.rs` and `tests/cue_kind_boundary.rs` — so the zero-consumer denominator is those two files, not one. `compile_with_revocation` has no caller other than `compile`, which delegates to it at `lib.rs:531` |
 //! | `ContextCompiler::compile_with_campaign_learning_state` | bounded compatibility consumer; zero product callers, recorded in `cognitive-donor-map.toml` and `cognitive-edge-map.toml` |
 //! | `CampaignCompiledContext`, `CampaignLearningStateCompileInput`, `CampaignContextRolePolicy`, `CampaignContextCompileError` | bounded compatibility consumer; zero callers outside this crate |
 //! | `compile_plan`/`compile_control_unfinalized` in `crates/eliot-engine` and `crates/eliot-app` | NOT this surface; those are `eliot_engine::context::ContextCompiler`, a different type with its own owner, and they never name a crate-root item here |
