@@ -445,6 +445,8 @@ mod instrument_registry_submission;
 #[cfg(windows)]
 mod lsp_launch_claims;
 #[cfg(windows)]
+mod lsp_source_owner_inputs;
+#[cfg(windows)]
 mod instrument_registry_registration;
 mod kernel_authority_client;
 mod kernel_context_read_client;

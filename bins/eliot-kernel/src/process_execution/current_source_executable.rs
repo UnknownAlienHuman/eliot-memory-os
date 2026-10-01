@@ -19,7 +19,6 @@ struct CurrentSourceExecutableObservationRequest {
     work_scope_id: String,
     work_scope_root_locator: String,
     executable_locator: String,
-    executable_root_locator: String,
     admitted_content_sha256: String,
     admitted_instrument: String,
     child_identity: RequestIdentity,
@@ -44,12 +43,14 @@ impl KernelComposition {
     /// Observes the exact executable named by a Governor-recovered admitted
     /// profile while the original WorkScope HostRequest remains current.
     ///
-    /// `executable_locator` and `admitted_content_sha256` are selectors only:
-    /// the Kernel confines the locator to its retained WorkScope root, holds
-    /// the platform no-follow path lease while hashing the file, and returns
-    /// the native file identity with the machine-derived bytes. The caller
-    /// must still compare that data with the exact current profile/provider
-    /// owners before it can be used as admission evidence.
+    /// `executable_locator` and `admitted_content_sha256` are selectors only.
+    /// Until an original toolchain-root owner is available, the Kernel uses
+    /// its own retained work root as the only permitted executable root; it
+    /// never accepts a caller-supplied executable-root authority. The
+    /// platform holds the no-follow path lease while hashing the file and
+    /// returns the native file identity with the machine-derived bytes. The
+    /// caller must still compare that data with the exact current profile and
+    /// provider owners before it can be used as admission evidence.
     pub(crate) fn observe_current_source_executable_operation(
         &self,
         session: &Session,
@@ -98,8 +99,6 @@ impl KernelComposition {
             || request.work_scope_id.chars().any(char::is_control)
             || request.work_scope_root_locator.trim().is_empty()
             || request.work_scope_root_locator.chars().any(char::is_control)
-            || request.executable_root_locator.trim().is_empty()
-            || request.executable_root_locator.chars().any(char::is_control)
             || request.admitted_instrument.trim().is_empty()
             || request.admitted_instrument.chars().any(char::is_control)
         {
@@ -222,19 +221,19 @@ impl KernelComposition {
         }
         let canonical_executable = std::fs::canonicalize(&executable)
             .map_err(|_| TransportError::SessionFenced)?;
-        let executable_root = std::fs::canonicalize(&request.executable_root_locator)
-            .map_err(|_| TransportError::SessionFenced)?;
-        if !canonical_executable.starts_with(&executable_root)
-            || canonical_executable.to_string_lossy() != request.executable_locator
-            || request.process_intent.working_directory() != work_root.to_string_lossy().as_ref()
-        {
+        if !executable_observation_is_confined(
+            &work_root,
+            &canonical_executable,
+            &request.executable_locator,
+            request.process_intent.working_directory(),
+        ) {
             return Err(TransportError::SessionFenced);
         }
         let lease = self
             .platform
             .retain_process_path_lease(
                 &canonical_executable,
-                &executable_root,
+                &work_root,
                 &request.admitted_content_sha256,
             )
             .map_err(|_| TransportError::SessionFenced)?;
@@ -246,7 +245,7 @@ impl KernelComposition {
         lease
             .validate(
                 &canonical_executable,
-                &executable_root,
+                &work_root,
                 &request.admitted_content_sha256,
             )
             .map_err(|_| TransportError::IdentityConflict)?;
@@ -273,4 +272,45 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn executable_observation_is_confined(
+    work_root: &std::path::Path,
+    canonical_executable: &std::path::Path,
+    requested_locator: &str,
+    working_directory: &str,
+) -> bool {
+    canonical_executable.starts_with(work_root)
+        && canonical_executable.to_string_lossy() == requested_locator
+        && working_directory == work_root.to_string_lossy()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::executable_observation_is_confined;
+    use std::path::Path;
+
+    #[test]
+    fn current_source_executable_observation_uses_kernel_owned_root() {
+        let root = Path::new(r"C:\eliot\work");
+        let executable = Path::new(r"C:\eliot\work\tools\rust-analyzer.exe");
+        assert!(executable_observation_is_confined(
+            root,
+            executable,
+            r"C:\eliot\work\tools\rust-analyzer.exe",
+            r"C:\eliot\work",
+        ));
+    }
+
+    #[test]
+    fn current_source_executable_observation_refuses_external_toolchain_root() {
+        let root = Path::new(r"C:\eliot\work");
+        let executable = Path::new(r"C:\Users\agent\.cargo\bin\rust-analyzer.exe");
+        assert!(!executable_observation_is_confined(
+            root,
+            executable,
+            r"C:\Users\agent\.cargo\bin\rust-analyzer.exe",
+            r"C:\eliot\work",
+        ));
+    }
 }
