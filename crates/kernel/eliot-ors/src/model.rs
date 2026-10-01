@@ -86,6 +86,160 @@ pub type RecoveryOwner = OpaqueLabel;
 /// Operation/checkpoint identity preserved without creating an authority owner.
 pub type OperationIdentity = OpaqueLabel;
 
+/// Kernel-derived identity for a retained bridge stream owner returned by
+/// the committed Governor observation readback. These fields mirror the
+/// existing `BridgeStreamOwnerRow`; they do not create a second namespace or
+/// grant access by themselves.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventObservationOwner {
+    /// Existing ORS owner namespace digest.
+    pub owner_namespace: String,
+    /// Existing owner-list index position, scoped by lineage and principal.
+    pub owner_list_sequence: u64,
+    /// Original authority lineage retained by the owner row.
+    pub authority_lineage: OpaqueLabel,
+    /// Original authenticated principal retained by the owner row.
+    pub principal: OpaqueLabel,
+    /// Original admitted producer retained by the owner row.
+    pub producer_id: OpaqueLabel,
+    /// Original local stream name retained by the owner row.
+    pub local_stream: OpaqueLabel,
+    /// Creating connection retained by the owner row.
+    pub creating_connection: OpaqueLabel,
+    /// Creating launch nonce retained by the owner row.
+    pub creating_launch_nonce: OpaqueLabel,
+    /// Creating session epoch retained by the owner row.
+    pub creating_session_epoch: u64,
+    /// Current owner-row revision expected by the checked read.
+    pub revision: u64,
+    /// Current store-issued stream incarnation expected by the checked read.
+    pub incarnation: u64,
+}
+
+/// Bounded read-only owner roster query. The first page omits both snapshot
+/// bounds; continuations must carry both values returned by the first page.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventObservationRosterQuery {
+    /// Active Kernel authority lineage; daemon callers cannot set this.
+    pub authority_lineage: OpaqueLabel,
+    /// Active authenticated principal; daemon callers cannot set this.
+    pub principal: OpaqueLabel,
+    /// Finite owner-list cutoff from the first page, when continuing.
+    pub owner_cutoff: Option<u64>,
+    /// Independently counted stream-owner denominator from the first page.
+    pub owner_total: Option<u64>,
+    /// Continue after this owner-list sequence.
+    pub after_owner_sequence: u64,
+    /// Bounded page size.
+    pub page_limit: u16,
+}
+
+/// One authenticated, bounded page of existing stream owners.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventObservationRosterPage {
+    /// Snapshot authority lineage.
+    pub authority_lineage: OpaqueLabel,
+    /// Snapshot authenticated principal.
+    pub principal: OpaqueLabel,
+    /// Finite owner-list sequence cutoff covered by this page.
+    pub owner_cutoff: u64,
+    /// Independently counted stream-owner denominator within that cutoff.
+    pub owner_total: u64,
+    /// Owners returned after the request cursor.
+    pub owners: Vec<BridgeEventObservationOwner>,
+    /// Last returned owner-list sequence when more owners remain.
+    pub continuation: Option<u64>,
+}
+
+/// Checked page query for one exact retained bridge stream owner.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventObservationQuery {
+    /// Full owner row identity resolved from active Kernel admission state.
+    pub owner: BridgeEventObservationOwner,
+    /// Return retained source records strictly after this sequence.
+    pub after_event_sequence: u64,
+    /// Bounded page size.
+    pub page_limit: u16,
+}
+
+/// Original committed source row plus the related persisted projection and
+/// privacy/provenance facts. Event-envelope bytes remain opaque to ORS.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventObservationRecord {
+    pub event_id: String,
+    pub sequence: u64,
+    pub producer_generation: u64,
+    pub authority_epoch: String,
+    pub envelope_sha256: String,
+    pub transport_hash: String,
+    /// Exact UTF-8 canonical JSON stored in the existing event row. It is a
+    /// string on the API to preserve those bytes without JSON integer-array
+    /// expansion; ORS does not parse or reinterpret the event semantics.
+    pub stored_envelope_bytes: String,
+    /// Exact UTF-8 canonical JSON of the existing bound projection.
+    pub normalized_projection_bytes: String,
+    pub staging_connection: String,
+    pub staged_at_ms: u64,
+    pub phase: String,
+    pub redacted: bool,
+    pub redaction_reason: String,
+    pub redacted_classes: Vec<String>,
+    pub redaction_marker: String,
+    pub redaction_version: u16,
+    pub admitted_source: String,
+    pub admitted_scope: String,
+    pub admitted_policy_revision: u64,
+    pub adapter_version: String,
+    pub transformation_version: u16,
+    pub requested_route: String,
+    pub actual_route: String,
+    pub normalization_warnings: Vec<String>,
+}
+
+/// Original durable, observed, acknowledged and compacted frontiers.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventObservationCursorBounds {
+    pub durable_sequence: u64,
+    pub observed_sequence: u64,
+    pub acked_sequence: u64,
+    pub compacted_sequence: u64,
+}
+
+/// One original gap row scoped to the selected owner namespace.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventObservationGap {
+    pub gap_id: String,
+    pub stream_id: String,
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+    pub reason_ref: String,
+    pub staging_connection: String,
+    pub recorded_at_ms: u64,
+}
+
+/// Committed source observation page. `owner_total` is exposed by the roster
+/// separately; neither returned rows nor cursor values imply source
+/// completeness or an ALL_EVENTS denominator.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeEventObservationPage {
+    pub owner: BridgeEventObservationOwner,
+    pub after_event_sequence: u64,
+    pub observed_through_sequence: u64,
+    pub cursor: BridgeEventObservationCursorBounds,
+    pub records: Vec<BridgeEventObservationRecord>,
+    pub gaps: Vec<BridgeEventObservationGap>,
+    pub gap_total: u64,
+    pub continuation: Option<u64>,
+}
+
 /// Current explicit version of the authenticated bridge event owner namespace.
 ///
 /// The version is fixed by the ORS contract and is included in the canonical
