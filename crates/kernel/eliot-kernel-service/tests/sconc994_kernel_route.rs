@@ -70,11 +70,11 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CAPABILITY_RESERVED_WRITE, CanonicalRequestView, CommitId, EffectClass,
     EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationIdentity, OperationManifestDigest, OrderingHead, OrderingHeadExpectation,
-    OrderingScopeId, PreparedTransition, ReadinessReceipt, RequestMeta, ReservedWriteRequest,
-    Resubmission, RevisionHeadExpectation, RevisionKey, ScopeId, SecurityContext, StoreRequest,
-    StoreResponse, TransitionClass, WriteReceipt, WriteReceiptStatus, canonical_request_hash,
-    decode_request_frame, response_frame,
+    OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId, PreparedTransition,
+    ReadinessReceipt, RequestMeta, ReservedWriteRequest, Resubmission, RevisionHeadExpectation,
+    RevisionKey, ScopeId, SecurityContext, StoreRequest, StoreResponse, TransitionClass,
+    WriteReceipt, WriteReceiptStatus, canonical_request_hash, decode_request_frame,
+    generated_operation_manifests, operation_manifest_set_digest, response_frame,
 };
 use serde_json::json;
 
@@ -140,9 +140,16 @@ fn transition_for(tag: &str, scopes: &[&str]) -> PreparedTransition {
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
-        operation_manifest_digest: OperationManifestDigest::new(format!("manifest-994-kr-{tag}"))
-            .expect("994-kr manifest digest"),
+        // Owner-issued admission contract set digest; the operation
+        // manifest digest is the generated catalogue set digest. The Kernel
+        // route admits a plan only under exactly these two owner values, so a
+        // placeholder here is refused at the digest gate before any ORS work.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("supported admission contract set digest"),
+        operation_manifest_digest: operation_manifest_set_digest(
+            &generated_operation_manifests().expect("generated catalogue"),
+        )
+        .expect("set digest computes"),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).
         admission_digest: String::new(),

@@ -364,7 +364,15 @@ fn transition_for_with(
             .collect(),
         transition_class,
         requested_effect_ceiling,
-        admission_contract_set_digest: fixture.admission_contract_set_digest.clone(),
+        // The admission contract set digest is OWNER-ISSUED, not frozen
+        // domain data: a recorded plan is admissible only when it carries the
+        // digest of the contract set this build supports. The fixture's
+        // `"bbbb..."` literal was shape-validated above but never satisfiable,
+        // so every reservation was refused with `ManifestMismatch` before any
+        // ORS or Store work. Derive it from the same generated catalogue the
+        // owner validates against.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("supported admission contract set digest"),
         operation_manifest_digest: OperationManifestDigest::new(manifest).unwrap(),
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; this fixture leg binds no semantic source (`[]`).

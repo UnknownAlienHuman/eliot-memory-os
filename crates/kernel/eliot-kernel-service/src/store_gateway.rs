@@ -10690,7 +10690,11 @@ mod tests {
             ],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            // Owner-issued: this build admits a recorded plan only under the
+            // admission contract set it supports.
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .unwrap_or_else(|_| unreachable!()),
             operation_manifest_digest: set_digest,
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; no semantic source is bound here (`[]`).
@@ -11529,7 +11533,11 @@ mod live_surreal_evidence_pack_e2e {
             ordering_scopes: vec![OrderingScopeId::new(scope.as_str()).expect("ordering scope")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: set_digest.as_str().to_owned(),
+            // Owner-issued admission contract set digest; the operation
+            // manifest digest is the generated catalogue set digest.
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("supported admission contract set digest"),
             operation_manifest_digest: set_digest,
             // Issue-#18 digests are derived, never defaulted; no semantic
             // source is bound here (`[]`).

@@ -939,8 +939,9 @@ mod tests {
         StateFence,
     };
     use eliot_store_api::{
-        EffectClass, EventProjectionRelationIntents, OperationIdentity, OperationManifestDigest,
-        OrderingScopeId, ScopeId, SecurityContext, TransitionClass,
+        EffectClass, EventProjectionRelationIntents, OperationIdentity, OrderingScopeId, ScopeId,
+        SecurityContext, TransitionClass, generated_operation_manifests,
+        operation_manifest_set_digest,
     };
     use std::num::NonZeroU64;
 
@@ -978,9 +979,13 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-gate").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "c".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-gate")
-                .expect("manifest"),
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("supported admission contract set digest"),
+            operation_manifest_digest: operation_manifest_set_digest(
+                &generated_operation_manifests().expect("generated catalogue"),
+            )
+            .expect("set digest computes"),
             // Issue-#18 digests are derived, never defaulted; no semantic
             // source is bound here (`[]`). The caller-supplied hash stays
             // untouched: this fixture probes hash-mismatch refusal.

@@ -102,7 +102,13 @@ fn transition(
         ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "a".repeat(64),
+        // Owner-issued admission contract set digest: this build admits a
+        // recorded plan only under the contract set it supports, so the value
+        // is derived from the generated catalogue rather than pinned to the
+        // former `"a".repeat(64)` placeholder, which no positive path could
+        // ever satisfy.
+        admission_contract_set_digest:
+            eliot_store_api::supported_admission_contract_set_digest()?,
         operation_manifest_digest: manifest()?.digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).

@@ -1141,10 +1141,10 @@ mod tests {
     use eliot_store_api::StoreResponse;
     use eliot_store_api::{
         CommitId, EffectClass, EventProjectionRelationIntents, NamedMutationOperation,
-        NamedMutationRequest, OperationIdentity, OperationManifestDigest, ReservedScopeBinding,
-        Resubmission, StoreFailure, StoreFailureIdentityContext, TransitionClass,
-        WriteAdmissionParams, WriteAdmissionProjection, WriteReceiptStatus, WriterEpochBinding,
-        canonical_request_hash,
+        NamedMutationRequest, OperationIdentity, ReservedScopeBinding, Resubmission, StoreFailure,
+        StoreFailureIdentityContext, TransitionClass, WriteAdmissionParams,
+        WriteAdmissionProjection, WriteReceiptStatus, WriterEpochBinding, canonical_request_hash,
+        generated_operation_manifests, operation_manifest_set_digest,
     };
     use serde_json::json;
     use std::num::NonZeroU64;
@@ -1699,9 +1699,17 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-authority").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
-                .expect("manifest digest"),
+            // Owner-issued: this build admits a recorded plan only under the
+            // admission contract set it supports, so the value is derived from
+            // the generated catalogue rather than pinned to a placeholder that
+            // no admitted plan can carry.
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("supported admission contract set digest"),
+            operation_manifest_digest: operation_manifest_set_digest(
+                &generated_operation_manifests().expect("generated catalogue"),
+            )
+            .expect("set digest computes"),
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; the admitted expected heads render here via
             // `render_semantic_source_revisions`, mirroring the Governor
@@ -2351,9 +2359,15 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-991-k1").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
-            operation_manifest_digest: OperationManifestDigest::new("manifest-991-k1")
-                .expect("manifest digest"),
+            // Owner-issued: derived from the generated catalogue this build
+            // supports, never a placeholder literal.
+            admission_contract_set_digest:
+                eliot_store_api::supported_admission_contract_set_digest()
+                    .expect("supported admission contract set digest"),
+            operation_manifest_digest: operation_manifest_set_digest(
+                &generated_operation_manifests().expect("generated catalogue"),
+            )
+            .expect("set digest computes"),
             // Issue-#18 digests are derived below via `bind_issue18_digests`,
             // never defaulted; the admitted expected heads render here via
             // `render_semantic_source_revisions`, mirroring the Governor

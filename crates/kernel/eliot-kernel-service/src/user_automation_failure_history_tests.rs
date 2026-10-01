@@ -437,7 +437,10 @@ async fn create_revision(store: &MemoryStore, automation_id: &str, revision_id: 
         ordering_scopes: vec![OrderingScopeId::new("user-automation").expect("ordering")],
         transition_class: TransitionClass::UserAutomation,
         requested_effect_ceiling: eliot_receipts::EffectClass::ReversibleMutation,
-        admission_contract_set_digest: "c".repeat(64),
+        // Owner-issued: derived from the generated catalogue this build
+        // supports, never a placeholder literal.
+        admission_contract_set_digest: eliot_store_api::supported_admission_contract_set_digest()
+            .expect("supported admission contract set digest"),
         operation_manifest_digest: manifest_digest,
         // Issue-#18 digests are derived below via `bind_issue18_digests`,
         // never defaulted; no semantic source is bound here (`[]`).
