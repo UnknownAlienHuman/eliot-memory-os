@@ -3735,16 +3735,14 @@ fn resolved_invocation_outcome(
         let due = observe_write_stage_due(request, record.deadline_unix_ms, || {
             unknown_resolve_outcome(logical_key)
         })?;
-        if due {
-            if let Some(stage) = record.staged_write_submission.clone() {
-                return staged_resolved_observe_outcome(
-                    record,
-                    request,
-                    occurrence,
-                    stage,
-                    logical_key,
-                );
-            }
+        if due && let Some(stage) = record.staged_write_submission.clone() {
+            return staged_resolved_observe_outcome(
+                record,
+                request,
+                occurrence,
+                stage,
+                logical_key,
+            );
         }
         return Err(unknown_resolve_outcome(logical_key));
     }
@@ -3791,12 +3789,10 @@ fn admitted_invocation_outcome(
         let due = observe_write_stage_due(request, record.deadline_unix_ms, || {
             unknown_outcome(&envelope.envelope_sha256)
         })?;
-        if due {
-            if let Some(stage) = stage {
-                let handle = HostOperationHandle::new(receipt.operation_id.clone())
-                    .map_err(|_| request_failure())?;
-                return staged_observe_outcome(handle, request, envelope, stage);
-            }
+        if due && let Some(stage) = stage {
+            let handle = HostOperationHandle::new(receipt.operation_id.clone())
+                .map_err(|_| request_failure())?;
+            return staged_observe_outcome(handle, request, envelope, stage);
         }
         return Err(unknown_outcome(&envelope.envelope_sha256));
     }
