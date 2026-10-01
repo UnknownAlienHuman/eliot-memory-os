@@ -148,6 +148,25 @@ async fn maintain_governor_authority_observation_inner(
 /// becomes a typed unavailable observation; it cannot create or restore an
 /// adapter identity, and the Governor can use it only to degrade its retained
 /// profile.
+/// Preserves unavailable owner evidence without creating an adapter identity.
+fn unavailable_governor_observation(
+    adapter: Option<AdapterAdmissionIdentity>,
+    reason: &str,
+) -> GovernorAuthorityObservation {
+    GovernorAuthorityObservation {
+        adapter,
+        source: SourceReadback::Unavailable {
+            reason: reason.to_owned(),
+        },
+        watchdog: EvidenceAvailability::Unavailable {
+            reason: reason.to_owned(),
+        },
+        trace: EvidenceAvailability::Unavailable {
+            reason: reason.to_owned(),
+        },
+    }
+}
+
 async fn read_governor_authority_observation(
     kernel: &Arc<DaemonKernelClient>,
     after_owner_sequence: u64,
@@ -158,19 +177,6 @@ async fn read_governor_authority_observation(
         after_event_sequence,
         page_limit: GOVERNOR_AUTHORITY_OBSERVATION_PAGE_LIMIT,
     };
-    let unavailable =
-        |adapter: Option<AdapterAdmissionIdentity>, reason: &str| GovernorAuthorityObservation {
-            adapter,
-            source: SourceReadback::Unavailable {
-                reason: reason.to_owned(),
-            },
-            watchdog: EvidenceAvailability::Unavailable {
-                reason: reason.to_owned(),
-            },
-            trace: EvidenceAvailability::Unavailable {
-                reason: reason.to_owned(),
-            },
-        };
     let Ok(response) = kernel
         .transact_async(
             READ_GOVERNOR_AUTHORITY_OBSERVATION_OPERATION,
@@ -182,15 +188,26 @@ async fn read_governor_authority_observation(
         )
         .await
     else {
-        return unavailable(None, "authenticated Kernel observation read failed");
+        return unavailable_governor_observation(
+            None,
+            "authenticated Kernel observation read failed",
+        );
     };
     let Ok(value) = kind_value(&response, GOVERNOR_AUTHORITY_OBSERVATION_KIND) else {
-        return unavailable(None, "Kernel observation response kind was invalid");
+        return unavailable_governor_observation(
+            None,
+            "Kernel observation response kind was invalid",
+        );
     };
     let wire: GovernorAuthorityObservationResponseWire =
         match serde_json::from_value::<GovernorAuthorityObservationResponseWire>(value) {
             Ok(wire) if wire.schema_version == 1 => wire,
-            _ => return unavailable(None, "Kernel observation response schema was invalid"),
+            _ => {
+                return unavailable_governor_observation(
+                    None,
+                    "Kernel observation response schema was invalid",
+                );
+            }
         };
     let reason = wire
         .source_reason
@@ -211,7 +228,7 @@ async fn read_governor_authority_observation(
                 serde_json::Value::Object(source)
             }
             Some(_) | None => {
-                return unavailable(
+                return unavailable_governor_observation(
                     wire.admission.clone(),
                     "Kernel observation source page carried an unexpected shape",
                 );
@@ -222,7 +239,7 @@ async fn read_governor_authority_observation(
             "reason": reason,
         }),
         _ => {
-            return unavailable(
+            return unavailable_governor_observation(
                 wire.admission.clone(),
                 "Kernel observation status and source page disagreed",
             );
@@ -244,13 +261,16 @@ async fn read_governor_authority_observation(
             {
                 observation
             }
-            SourceReadback::Available { .. } => unavailable(
+            SourceReadback::Available { .. } => unavailable_governor_observation(
                 observation.adapter.clone(),
                 "Kernel observation selectors did not match the request",
             ),
             SourceReadback::Unavailable { .. } => observation,
         },
-        Err(_) => unavailable(wire.admission, "Kernel observation source DTO was invalid"),
+        Err(_) => unavailable_governor_observation(
+            wire.admission,
+            "Kernel observation source DTO was invalid",
+        ),
     }
 }
 
