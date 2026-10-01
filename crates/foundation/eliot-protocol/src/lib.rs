@@ -3798,6 +3798,10 @@ pub enum HostRequestKind {
     Activation,
     /// Invocation of an exact admitted capability under a bound Session.
     Invocation,
+    /// One-shot selected-source capture admitted as its own typed mutation.
+    /// This is separate from query/read requests and carries no LocalRead
+    /// attempt or Task Controller transition semantics.
+    SelectedSourceCapture,
     /// Cancellation of one exact previously admitted operation.
     Cancellation,
     /// Observation-only status read of one exact admitted operation.
@@ -4078,6 +4082,32 @@ impl HostRequestIdentity {
                     return Err(ProtocolError::InvalidField {
                         field: "host_request.session_id",
                         reason: "invocation must bind an exact durable Session identity",
+                    });
+                }
+            }
+            HostRequestKind::SelectedSourceCapture => {
+                if self
+                    .correlation_projection
+                    .as_ref()
+                    .is_some_and(|projection| {
+                        projection.domain() != eliot_contracts::HostCorrelationDomain::Request
+                    })
+                {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.correlation_projection",
+                        reason: "selected-source capture projection must use request domain",
+                    });
+                }
+                if self.session_id.is_none() || self.task_id.is_none() || self.work_scope_id.is_none() {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.selected_source_capture_identity",
+                        reason: "selected-source capture must bind its current Session, Task, and WorkScope",
+                    });
+                }
+                if self.parent_operation_id.is_some() {
+                    return Err(ProtocolError::InvalidField {
+                        field: "host_request.parent_operation_id",
+                        reason: "selected-source capture is a new operation and must not reuse a parent operation identity",
                     });
                 }
             }
