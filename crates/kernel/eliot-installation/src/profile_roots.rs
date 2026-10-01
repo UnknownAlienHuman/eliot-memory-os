@@ -196,6 +196,15 @@ impl InstallationRoots {
     /// checked against the exact sibling layout derived from its retained
     /// `LocalAppData` anchor. `portable_dev` is explicitly disposable, so
     /// profile agreement and root separation above are its complete join.
+    ///
+    /// The two profiled contours differ in where the product root sits, so the
+    /// refined root each arm proves below the durable-data root differs too.
+    /// `UserMode` keeps its durable root one level below the product root, so
+    /// both the product root and the installation root sit below it.
+    /// `system_service` resolves its I3.1 durable root to the product root
+    /// itself (`select_profile_roots` binds it to `<anchor>\Eliot`, which is
+    /// `installer_profile_root()`), leaving the per-installation installation
+    /// root as the one refined root that must sit strictly below it.
     fn validate_durable_runtime_join(
         &self,
         profile: InstallationProfile,
@@ -215,9 +224,21 @@ impl InstallationRoots {
                     ),
                     "durable_data",
                 )?;
+                // `expected_durable` is byte-identical to `profile_root`: the
+                // I3.1 `system_service` durable root IS the profile's product
+                // root. The refinement this arm proves is therefore the one the
+                // contract states — the durable root is retained as the
+                // top-level state contour and refined into per-installation
+                // runtime directories — so the root that must sit strictly
+                // below it is the installation root, not the product root that
+                // is the durable root.
+                let installation_root = WindowsPathIdentity::parse_root(
+                    self.runtime_state_roots.installation_root.as_str(),
+                    "runtime_state_roots.installation_root",
+                )?;
                 if durable != expected_durable
-                    || durable == profile_root
-                    || !durable.contains(&profile_root)
+                    || durable == installation_root
+                    || !durable.contains(&installation_root)
                 {
                     return Err(InstallationError::ProfileViolation(
                         "runtime installation root must sit strictly below the I3.1 durable-data root"
