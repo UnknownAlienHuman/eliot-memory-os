@@ -751,3 +751,176 @@ pub fn rebuild_coordination_map_view(
         entries,
     })
 }
+// Large-payload handles (issue #1820, payload-handles slice W4).
+//
+// Large content never travels as inline bytes above the shared bound:
+// [`MAX_MAILBOX_BODY_BYTES`] still caps every admitted `body`, and a handle
+// carries only the artifact locator, the content digest, and the byte bound.
+// The record stays immutable after admission; attachment is a separate durable
+// row keyed by the message identity, attached and detached by identity.
+//
+// The owner seam is `eliot-artifact` (`ArtifactOwner::read` through the
+// injected `ArtifactBlobReader` around the one `BlobStoreClient` owner, plus
+// `ArtifactReference`/`ArtifactIdentity`/`ContentAddress` for the
+// locator-plus-digest shape). The Kernel handle reuses only foundation types
+// (`ArtifactId` from `eliot-contracts`, plain bounded text, `u64` bound) and
+// never mints a second identity scheme: the Governor `payload_handle` text in
+// `eliot-coordination` is Governor semantics and is not interpreted here.
+//
+// Production chain: the Store bridge / delivery slice reads the bytes through
+// the artifact owner, then calls [`resolve_mailbox_payload_handle`] with the
+// owner-supplied bytes for the pure digest-plus-length check. That read lives
+// in the bridge/dispatch seam outside this file, so the production caller is
+// STITCH. Typed failures stay typed: every rejection is a
+// [`CoordinationMailboxError`].
+//
+// Out of scope here: map view, route capabilities, and expiry/reassignment
+// (other slices).
+// ============================================================================
+
+/// Large-payload handle for one message whose content exceeds the inline
+/// bound. Carries the artifact locator, the content digest, and the byte
+/// bound; it never carries payload bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxPayloadHandle {
+    /// Immutable artifact identity bound by the producing owner (foundation
+    /// type, no second scheme).
+    pub artifact_id: eliot_contracts::ArtifactId,
+    /// Opaque artifact locator issued by the owning store. Bounded like
+    /// provenance: retained opaquely, never interpreted here.
+    pub locator: String,
+    /// Lowercase SHA-256 hex digest of the exact payload bytes.
+    pub content_digest: String,
+    /// Exact payload length in bytes. Always above [`MAX_MAILBOX_BODY_BYTES`]:
+    /// content that fits inline travels inline, never by handle.
+    pub byte_len: u64,
+}
+
+/// Durable attachment of one handle to one admitted message, keyed by the
+/// message identity. The attachment carries the handle only, never payload
+/// bytes, so a stored row cannot duplicate the artifact content.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxPayloadAttachment {
+    /// Identity of the admitted message this handle is attached to.
+    pub message_id: String,
+    /// The attached handle.
+    pub handle: MailboxPayloadHandle,
+}
+
+/// Attaches a large-payload handle to one admitted message, by identity.
+///
+/// The message must already be admitted; `existing` is the caller-read-back
+/// attachment view (the Store bridge readback in production) and this
+/// function stores nothing itself. A reused identity with the identical
+/// handle replays the existing attachment with no second effect; a reused
+/// identity with a different handle is an identity conflict, never a silent
+/// overwrite.
+pub fn attach_mailbox_payload_handle(
+    messages: &[CoordinationMailboxRecord],
+    existing: &[MailboxPayloadAttachment],
+    message_id: &str,
+    handle: MailboxPayloadHandle,
+) -> Result<MailboxPayloadAttachment, CoordinationMailboxError> {
+    require_text(message_id, "message_id", MAX_IDENTITY_LEN)?;
+    if !messages
+        .iter()
+        .any(|record| record.message_id == message_id)
+    {
+        return Err(CoordinationMailboxError::NotFound {
+            message_id: message_id.to_owned(),
+        });
+    }
+    validate_payload_handle(&handle)?;
+    if let Some(known) = existing
+        .iter()
+        .find(|attachment| attachment.message_id == message_id)
+    {
+        if known.handle != handle {
+            return Err(CoordinationMailboxError::IdentityConflict {
+                message_id: message_id.to_owned(),
+            });
+        }
+        return Ok(known.clone());
+    }
+    Ok(MailboxPayloadAttachment {
+        message_id: message_id.to_owned(),
+        handle,
+    })
+}
+
+/// Detaches the handle attached to one message, by identity.
+///
+/// Returns the removed attachment view so the caller drops exactly the row
+/// it read back; this function stores nothing itself.
+pub fn detach_mailbox_payload_handle(
+    existing: &[MailboxPayloadAttachment],
+    message_id: &str,
+) -> Result<MailboxPayloadAttachment, CoordinationMailboxError> {
+    require_text(message_id, "message_id", MAX_IDENTITY_LEN)?;
+    existing
+        .iter()
+        .find(|attachment| attachment.message_id == message_id)
+        .cloned()
+        .ok_or_else(|| CoordinationMailboxError::NotFound {
+            message_id: message_id.to_owned(),
+        })
+}
+
+/// Resolves a handle to the owner-supplied bytes.
+///
+/// `bytes` are the exact bytes the production caller read through the
+/// artifact owner (`ArtifactOwner::read` via the injected
+/// `ArtifactBlobReader`); this function verifies length and digest and
+/// returns the same slice, never a copy beside the handle. Mismatches are
+/// typed rejections, never silent truncation.
+pub fn resolve_mailbox_payload_handle<'a>(
+    handle: &MailboxPayloadHandle,
+    bytes: &'a [u8],
+) -> Result<&'a [u8], CoordinationMailboxError> {
+    validate_payload_handle(handle)?;
+    if bytes.len() as u64 != handle.byte_len {
+        return Err(CoordinationMailboxError::InvalidField {
+            field: "payload",
+            reason: "length mismatch",
+        });
+    }
+    if eliot_contracts::sha256_hex(bytes) != handle.content_digest {
+        return Err(CoordinationMailboxError::InvalidField {
+            field: "payload",
+            reason: "digest mismatch",
+        });
+    }
+    Ok(bytes)
+}
+
+/// Validates one handle: opaque locator bound, digest shape, and the shared
+/// inline-bound ceiling (handles are only for content above it).
+fn validate_payload_handle(handle: &MailboxPayloadHandle) -> Result<(), CoordinationMailboxError> {
+    require_text(&handle.locator, "locator", MAX_PROVENANCE_LEN)?;
+    require_payload_digest(&handle.content_digest)?;
+    if handle.byte_len <= MAX_MAILBOX_BODY_BYTES as u64 {
+        return Err(CoordinationMailboxError::InvalidField {
+            field: "byte_len",
+            reason: "must exceed the inline admission bound",
+        });
+    }
+    Ok(())
+}
+
+/// Requires a lowercase SHA-256 hex digest, matching the artifact owner's
+/// digest shape without importing its error type.
+fn require_payload_digest(value: &str) -> Result<(), CoordinationMailboxError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(CoordinationMailboxError::InvalidField {
+            field: "content_digest",
+            reason: "must be a lowercase SHA-256 digest",
+        });
+    }
+    Ok(())
+}
