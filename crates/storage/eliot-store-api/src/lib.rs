@@ -255,7 +255,8 @@ pub use wire::{
     CAPABILITIES, CAPABILITY_APPLY, CAPABILITY_DREAMER_JOB_BEGIN_VERIFICATION,
     CAPABILITY_DREAMER_JOB_CHECKPOINT, CAPABILITY_DREAMER_JOB_LEASE_EXACT,
     CAPABILITY_DREAMER_JOB_LEASE_NEXT, CAPABILITY_DREAMER_JOB_PUBLISH,
-    CAPABILITY_DREAMER_JOB_RECONCILE, CAPABILITY_DREAMER_JOB_RENEW,
+    CAPABILITY_DREAMER_JOB_RECONCILE, CAPABILITY_DREAMER_JOB_RECORD_ADMISSION,
+    CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY, CAPABILITY_DREAMER_JOB_RENEW,
     CAPABILITY_DREAMER_JOB_REQUEST_CANCEL, CAPABILITY_DREAMER_JOB_RESUME,
     CAPABILITY_DREAMER_JOB_START, CAPABILITY_DREAMER_JOB_STATUS, CAPABILITY_DREAMER_JOB_SUBMIT,
     CAPABILITY_ERASURE_INTENT, CAPABILITY_HEALTH, CAPABILITY_INITIALIZE_GENESIS,
@@ -343,8 +344,8 @@ pub use operation_catalogue::{
     ACTIVATED_READ_OWNING_SECTION, EVIDENCE_PACK_MAX_RECORDS, GENESIS_OWNING_SECTION,
     MAX_AUDIT_RANGE_RECORDS, MINIMUM_COMPATIBLE_VERSION, OPERATION_CATALOGUE_PROFILE,
     OperationKind, READ_MAX_INPUT_BYTES, READ_MAX_OUTPUT_BYTES, READ_TIMEOUT_MS, SCOPE_KIND_NONE,
-    SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION, activated_read_operations,
-    generated_operation_manifests, operation_manifest_set_digest,
+    SCOPE_KIND_SCOPE, SINGLE_MANIFEST_OWNING_SECTION, activated_mutation_operations,
+    activated_read_operations, generated_operation_manifests, operation_manifest_set_digest,
 };
 
 pub use operation_parameters::{
@@ -6756,7 +6757,12 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-1")?],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            // #1927/#4781: this field is the receiving build's supported
+            // admission-contract identity, compared by content. The fixture
+            // binds the real derived digest so the duplicate-name refusal
+            // under test is reached instead of the earlier contract-set
+            // mismatch.
+            admission_contract_set_digest: supported_admission_contract_set_digest()?,
             operation_manifest_digest: OperationManifestDigest::new("manifest-1")?,
             admission_digest: "a".repeat(64),
             mutation_plan_digest: "b".repeat(64),
@@ -7077,7 +7083,17 @@ mod tests {
             first.requested_effect_ceiling,
             EffectClass::ReversibleMutation
         );
+        // #1927/#4781 replaced the earlier identity: `admission_contract_set_
+        // digest` is now the receiving build's supported admission-contract
+        // set (Store API + write-admission revisions + generated catalogue),
+        // derived independently of any single manifest. It is therefore no
+        // longer equal to the genesis manifest digest, and binding it to the
+        // real derived value is what `validate()` compares by content.
         assert_eq!(
+            first.admission_contract_set_digest,
+            supported_admission_contract_set_digest()?
+        );
+        assert_ne!(
             first.admission_contract_set_digest,
             first.operation_manifest_digest.as_str()
         );
@@ -7179,7 +7195,9 @@ mod tests {
             reason: "user requested deletion".to_owned(),
             requester: "user:alice".to_owned(),
             approval_refs: vec!["approval-18".to_owned()],
-            admission_contract_set_digest: "b".repeat(64),
+            // #1927/#4781: the erasure request binds the same receiving-build
+            // contract-set identity as `PreparedTransition::validate`.
+            admission_contract_set_digest: supported_admission_contract_set_digest()?,
             operation_manifest_digest: OperationManifestDigest::new("manifest-erasure-18")?,
             security: SecurityContext::default(),
             event_projection_relation_intents: EventProjectionRelationIntents {
@@ -7341,6 +7359,11 @@ mod tests {
                 CAPABILITY_DREAMER_JOB_STATUS,
                 CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
                 CAPABILITY_DREAMER_JOB_RECONCILE,
+                // #1680 (#4785) and #975 (#3785) extended the advertised
+                // baseline past the former `reconcile` tail.
+                CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY,
+                CAPABILITY_DREAMER_JOB_RECORD_ADMISSION,
+                CAPABILITY_STORE_BACKUP,
             ]
         );
     }

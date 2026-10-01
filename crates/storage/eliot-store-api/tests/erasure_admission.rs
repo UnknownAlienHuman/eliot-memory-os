@@ -17,7 +17,7 @@ use eliot_store_api::{
     OrderingScopeId, PolicyConfigSchemaVersions, Resubmission, ScopeId, SecurityContext,
     StoreError, TransitionClass, WriteReceipt, WriteReceiptStatus, admit_erasure_transition,
     decode_erasure_surfaces, encode_erasure_surfaces, generated_operation_manifests,
-    operation_manifest_set_digest,
+    operation_manifest_set_digest, supported_admission_contract_set_digest,
 };
 use serde_json::json;
 use std::num::NonZeroU64;
@@ -48,7 +48,9 @@ fn admission_request() -> ErasureAdmissionRequest {
         reason: "user requested deletion".to_owned(),
         requester: "user:alice".to_owned(),
         approval_refs: vec!["approval-user-1".to_owned()],
-        admission_contract_set_digest: "b".repeat(64),
+        // #1927/#4781: the receiving build's supported admission-contract
+        // identity, compared by content; a placeholder no longer validates.
+        admission_contract_set_digest: supported_admission_contract_set_digest().unwrap(),
         operation_manifest_digest: set_digest,
         security: SecurityContext::default(),
         event_projection_relation_intents: EventProjectionRelationIntents {

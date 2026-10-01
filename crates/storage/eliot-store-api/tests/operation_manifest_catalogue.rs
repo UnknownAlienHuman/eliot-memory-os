@@ -19,9 +19,10 @@ use eliot_store_api::{
     NamedReadRequest, OperationIdentity, OperationManifestDigest, OperationManifestSpec,
     OrderingScopeId, ReadConsistency, ScopeId, SecurityContext, StateFence, StoreError,
     StoreFailure, StoreFailureDisposition, StoreFailureIdentityContext, StoreGenesisRequest,
-    StoreMutationDisposition, TransitionClass, canonical_json_bytes, generated_operation_manifests,
+    StoreMutationDisposition, TransitionClass, activated_mutation_operations,
+    activated_read_operations, canonical_json_bytes, generated_operation_manifests,
     genesis_manifest, genesis_transition, named_read_operation_name, operation_manifest_set_digest,
-    sha256_hex,
+    sha256_hex, supported_admission_contract_set_digest,
 };
 use serde_json::{Value, json};
 
@@ -39,6 +40,18 @@ fn test_epoch(sequence: u64) -> EpochId {
 
 fn fence() -> StateFence {
     StateFence::new(test_epoch(1), ResourceGeneration::genesis())
+}
+
+/// The exact catalogue size the declaration tables admit.
+///
+/// Every activated read and mutation contributes one manifest entry and the
+/// genesis bootstrap entry contributes one more. Deriving the denominator from
+/// the two activated-operation tables (rather than a hardcoded literal) keeps
+/// the completeness check exact while it stays correct as operations are
+/// activated: a row added to either table without its manifest, or a manifest
+/// generated for an operation that is not activated, both fail here.
+fn catalogue_entry_count() -> usize {
+    activated_read_operations().len() + activated_mutation_operations().len() + 1
 }
 
 fn read_request(
@@ -71,7 +84,7 @@ fn evidence_pack_params() -> BTreeMap<String, Value> {
 #[test]
 fn activated_typed_reads_pass_catalogue_validation() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), catalogue_entry_count());
 
     // The closed name mapping is the single owner for code, manifests, wire.
     for operation in [
@@ -402,7 +415,8 @@ fn mutation_plan(set_digest: &OperationManifestDigest) -> eliot_store_api::Prepa
         ordering_scopes: vec![OrderingScopeId::new("scope-one").unwrap()],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        // #1927/#4781: bind the real receiving-build contract-set identity.
+        admission_contract_set_digest: supported_admission_contract_set_digest().unwrap(),
         operation_manifest_digest: set_digest.clone(),
         // Derived bindings, never placeholders; these catalogue fixtures
         // carry no expected heads, so no source revisions render.
@@ -547,7 +561,7 @@ fn approved_capture_plan_passes_and_stale_digest_fails_manifest_mismatch() {
 #[test]
 fn capture_observation_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), catalogue_entry_count());
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved owner-shaped subject params pass catalogue validation.
@@ -594,7 +608,7 @@ fn capture_observation_passes_whole_path() {
 #[test]
 fn append_audit_event_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), catalogue_entry_count());
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved receipt-bound audit params pass catalogue validation without bypass.
@@ -605,7 +619,7 @@ fn append_audit_event_passes_whole_path() {
 #[test]
 fn apply_lifecycle_policy_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), catalogue_entry_count());
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved lifecycle-policy params pass catalogue validation without bypass.
@@ -616,7 +630,7 @@ fn apply_lifecycle_policy_passes_whole_path() {
 #[test]
 fn reconcile_recovery_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), catalogue_entry_count());
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved problem-leg recovery params pass catalogue validation without bypass.
@@ -663,7 +677,7 @@ fn reconcile_recovery_passes_whole_path() {
 #[test]
 fn update_task_state_passes_whole_path() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), catalogue_entry_count());
     let set_digest = operation_manifest_set_digest(&entries).unwrap();
 
     // Approved task-control params pass catalogue validation without bypass.

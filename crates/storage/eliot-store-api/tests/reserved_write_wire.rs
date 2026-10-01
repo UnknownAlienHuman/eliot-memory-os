@@ -39,6 +39,7 @@ use eliot_store_api::{
     WriterEpochBinding, bind_issue18_digests, bind_issue18_receipt,
     bind_policy_config_schema_versions, decode_request_frame, decode_response_frame,
     issue_store_receipt_envelope, request_frame, response_frame,
+    supported_admission_contract_set_digest,
 };
 use serde_json::{Value, json};
 
@@ -76,7 +77,8 @@ fn transition() -> PreparedTransition {
         ordering_scopes: vec![OrderingScopeId::new("scope-991-1").unwrap()],
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        // #1927/#4781: bind the real receiving-build contract-set identity.
+        admission_contract_set_digest: supported_admission_contract_set_digest().unwrap(),
         operation_manifest_digest: OperationManifestDigest::new("manifest-991-1").unwrap(),
         // Derived bindings, never placeholders. The envelope path renders
         // the admitted expected heads (`rev-991-1@3`); the literal below is

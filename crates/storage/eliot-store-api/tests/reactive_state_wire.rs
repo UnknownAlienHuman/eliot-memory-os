@@ -13,14 +13,22 @@ use eliot_store_api::{
     EffectClass, NamedMutationOperation, NamedReadOperation, OperationKind,
     REACTIVE_LEDGER_CONTRACT_V1, REACTIVE_LEDGER_MUTATION_NAME, REACTIVE_LEDGER_READ_NAME,
     REACTIVE_STATE_SCHEMA_V1, RESOURCE_SNAPSHOT_MUTATION_NAME, RESOURCE_SNAPSHOT_READ_NAME,
-    StoreError, TransitionClass, decode_reactive_mutation, decode_resource_content,
-    encode_resource_content, generated_operation_manifests, named_mutation_operation_by_name,
-    named_mutation_operation_name, named_read_operation_by_name, named_read_operation_name,
-    reactive_ledger_mutation_request, reactive_ledger_read_request,
-    resource_snapshot_mutation_request, resource_snapshot_read_request,
-    validate_reactive_mutation_params, validate_resource_uri,
+    StoreError, TransitionClass, activated_mutation_operations, activated_read_operations,
+    decode_reactive_mutation, decode_resource_content, encode_resource_content,
+    generated_operation_manifests, named_mutation_operation_by_name, named_mutation_operation_name,
+    named_read_operation_by_name, named_read_operation_name, reactive_ledger_mutation_request,
+    reactive_ledger_read_request, resource_snapshot_mutation_request,
+    resource_snapshot_read_request, validate_reactive_mutation_params, validate_resource_uri,
 };
 use serde_json::{Value, json};
+
+/// The exact catalogue size the declaration tables admit: one manifest per
+/// activated read and mutation, plus the genesis bootstrap entry. Deriving the
+/// denominator from the two activated-operation tables keeps the completeness
+/// check exact as operations are activated.
+fn catalogue_entry_count() -> usize {
+    activated_read_operations().len() + activated_mutation_operations().len() + 1
+}
 
 fn ledger_json(items: u32) -> String {
     let items: Vec<Value> = (0..items)
@@ -89,7 +97,7 @@ fn wire_identity_is_stable_and_versioned() {
 #[test]
 fn catalogue_activates_all_four_reactive_operations() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), catalogue_entry_count());
     for name in [
         REACTIVE_LEDGER_MUTATION_NAME,
         RESOURCE_SNAPSHOT_MUTATION_NAME,

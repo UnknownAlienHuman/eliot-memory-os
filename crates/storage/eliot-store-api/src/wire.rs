@@ -1948,7 +1948,12 @@ mod tests {
             ordering_scopes: vec![OrderingScopeId::new("scope-authority").expect("ordering")],
             transition_class: TransitionClass::CaptureCandidate,
             requested_effect_ceiling: EffectClass::Candidate,
-            admission_contract_set_digest: "b".repeat(64),
+            // #1927/#4781: the receiving build's supported admission-contract
+            // identity, compared by content at `validate()`. Binding the real
+            // derived digest lets these fixtures reach the authority
+            // round-trip behaviour under test.
+            admission_contract_set_digest: crate::supported_admission_contract_set_digest()
+                .expect("supported admission contract set digest"),
             operation_manifest_digest: OperationManifestDigest::new("manifest-authority")
                 .expect("manifest digest"),
             // Derived bindings, never placeholders: the authority fixtures
@@ -2030,9 +2035,23 @@ mod tests {
             CAPABILITY_DREAMER_JOB_STATUS,
             CAPABILITY_DREAMER_JOB_REQUEST_CANCEL,
             CAPABILITY_DREAMER_JOB_RECONCILE,
+            // #1680 (#4785) added the requester-only applicability/admission
+            // operations; #975 (#3785) bound the closed backup operation to the
+            // production Surreal snapshot/isolated-restore ports. Both are part
+            // of the current advertised baseline.
+            CAPABILITY_DREAMER_JOB_RECORD_APPLICABILITY,
+            CAPABILITY_DREAMER_JOB_RECORD_ADMISSION,
+            CAPABILITY_STORE_BACKUP,
         ];
 
         assert_eq!(CAPABILITIES, EXPECTED);
+        // #991: `store.reserved_write` stays declared-but-unadvertised because
+        // only an adapter owning a concurrent execution generation can serve
+        // it, so it must not appear in the static baseline every store
+        // process hands the handshake and Kernel `ClientHello`.
+        assert!(!CAPABILITIES.contains(&CAPABILITY_RESERVED_WRITE));
+        // #688: the erasure intent gate is likewise not part of the baseline.
+        assert!(!CAPABILITIES.contains(&CAPABILITY_ERASURE_INTENT));
         assert!(CAPABILITIES
             .iter()
             .all(|capability| capability.starts_with("store.") && !capability.trim().is_empty()));

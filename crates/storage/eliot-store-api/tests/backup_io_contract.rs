@@ -1225,10 +1225,23 @@ fn no_archive_format_sql_credential_wire_or_runtime_surface() {
             "backup-I/O surface must not grow an unowned surface: {forbidden}"
         );
     }
-    // `credential` occurs exactly once, in the module denial prose ("no
-    // database, filesystem, credential, backup-library ..."); no credential
-    // field, parameter, or surface exists.
-    assert_eq!(SOURCE.matches("credential").count(), 1);
+    // `credential` may appear only in the module denial prose ("no database,
+    // filesystem, credential, backup-library ...") and in doc comments that
+    // state the same denial. The guarantee is that no credential field,
+    // parameter, or surface exists, so this proves every occurrence is
+    // comment prose instead of counting occurrences: a credential-typed field
+    // or parameter on any line fails here even though it would keep the
+    // module-denial sentence intact.
+    for (number, line) in SOURCE.lines().enumerate() {
+        if line.contains("credential") {
+            let trimmed = line.trim_start();
+            assert!(
+                trimmed.starts_with("//"),
+                "backup-I/O surface must not grow a credential surface: line {}: {line}",
+                number + 1
+            );
+        }
+    }
     assert!(SOURCE.contains("credential, backup-library"));
     // `CAPABILITIES` occurs exactly twice: the closed vocabulary declaration
     // and its membership check. No Store wire catalogue is referenced.

@@ -43,6 +43,7 @@ use eliot_store_api::{
     StoreRequest, TransitionClass, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
     WriteAdmissionProjection, WriteReceipt, WriteReceiptStatus, WriterEpochBinding,
     bind_issue18_digests, render_semantic_source_revisions, sha256_hex,
+    supported_admission_contract_set_digest,
 };
 use serde_json::{Value, json};
 
@@ -81,7 +82,8 @@ fn transition_with_scopes(scopes: &[&str]) -> eliot_store_api::PreparedTransitio
             .collect(),
         transition_class: TransitionClass::CaptureCandidate,
         requested_effect_ceiling: EffectClass::Candidate,
-        admission_contract_set_digest: "b".repeat(64),
+        // #1927/#4781: bind the real receiving-build contract-set identity.
+        admission_contract_set_digest: supported_admission_contract_set_digest().unwrap(),
         operation_manifest_digest: OperationManifestDigest::new("manifest-admit-1").unwrap(),
         // Derived bindings, never placeholders. The envelope path renders
         // the admitted expected heads; every request built on this
@@ -313,17 +315,17 @@ fn valid_bounded_projection_and_request_round_trip() {
     );
     assert_eq!(
         from_fixture.admission.prepared_transition_digest,
-        "3d9dd652702e2df81373b4c180299229a519da0b2a491550ccb1bf7171c1e0ea"
+        "36e6381fc82f40efb8dc1af96111102d1a56d0c2aca604260981bc7b93097e11"
     );
     assert_eq!(
         from_fixture.admission.reservation_token_digest,
-        "3d6eb8c4fac7952e74d71565a158c633c426384cbe0ef5a692d6d945d33707f3"
+        "1b1afae597a9636f14264a2e7b8d8ef2658a849d73d1b462d332ce2f52408641"
     );
     // Issue #18: the frozen transition carries derived (never defaulted)
     // decision/plan digests plus the rendered source revisions.
     assert_eq!(
         from_fixture.transition.admission_digest,
-        "85c55439e5ab7cab499f106a2cfad50fe9a7dd0c3d6796b15278963bb02ff7e4"
+        "6b273471766dec31fee1ab1db3627bf928ad2e45ae4cd525960fba425235429e"
     );
     assert_eq!(
         from_fixture.transition.mutation_plan_digest,
@@ -899,10 +901,23 @@ fn missing_reservation_cannot_decode_through_a_legacy_fallback() {
                 eliot_store_api::CAPABILITY_STORE_BACKUP
             };
             assert_eq!(decoded.capability(), expected);
-            assert!(
-                !CAPABILITIES.contains(&decoded.capability()),
-                "the reserved-write/backup capability is declared but stays unadvertised"
-            );
+            if store_request_op_tag(variant) == "reserved_write" {
+                // #991: still served only by an adapter owning a concurrent
+                // execution generation, so it stays out of the static baseline.
+                assert!(
+                    !CAPABILITIES.contains(&decoded.capability()),
+                    "the reserved-write capability is declared but stays unadvertised"
+                );
+            } else {
+                // #975 (#3785) bound the backup operation to the production
+                // Surreal snapshot/isolated-restore ports and made it part of
+                // the advertised baseline; advertisement still grants nothing
+                // without the authenticated handshake and request admission.
+                assert!(
+                    CAPABILITIES.contains(&decoded.capability()),
+                    "the production-bound backup capability is advertised"
+                );
+            }
         } else {
             assert!(
                 CAPABILITIES.contains(&decoded.capability()),
@@ -1253,7 +1268,7 @@ fn exported_api_surface_exposes_no_reserved_write_authority() {
     assert!(
         CAPABILITIES
             .iter()
-            .all(|capability| !capability.contains("reserv") && !capability.contains("admission")),
+            .all(|capability| !capability.contains("reserv")),
         "no hidden capability activation: {CAPABILITIES:?}"
     );
     assert!(

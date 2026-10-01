@@ -18,14 +18,23 @@ use eliot_store_api::{
     AUTOMATION_STATE_RETIRED, DecodedAutomationMutation, EffectClass, MAX_AUTOMATION_PAGE_RECORDS,
     NamedMutationOperation, NamedReadOperation, OperationKind, StoreError, TransitionClass,
     USER_AUTOMATION_MUTATION_NAME, USER_AUTOMATION_READ_NAME, USER_AUTOMATION_SCOPE,
-    USER_AUTOMATION_STATE_SCHEMA_V1, automation_create_params, automation_edit_params,
-    automation_mutation_request, automation_read_request, automation_run_now_params,
-    automation_state_transition_params, decode_automation_mutation, generated_operation_manifests,
-    is_configuration_state_wire, named_mutation_operation_by_name, named_mutation_operation_name,
-    named_read_operation_by_name, named_read_operation_name, validate_automation_mutation_params,
+    USER_AUTOMATION_STATE_SCHEMA_V1, activated_mutation_operations, activated_read_operations,
+    automation_create_params, automation_edit_params, automation_mutation_request,
+    automation_read_request, automation_run_now_params, automation_state_transition_params,
+    decode_automation_mutation, generated_operation_manifests, is_configuration_state_wire,
+    named_mutation_operation_by_name, named_mutation_operation_name, named_read_operation_by_name,
+    named_read_operation_name, validate_automation_mutation_params,
     validate_automation_read_params,
 };
 use serde_json::{Value, json};
+
+/// The exact catalogue size the declaration tables admit: one manifest per
+/// activated read and mutation, plus the genesis bootstrap entry. Deriving the
+/// denominator from the two activated-operation tables keeps the completeness
+/// check exact as operations are activated.
+fn catalogue_entry_count() -> usize {
+    activated_read_operations().len() + activated_mutation_operations().len() + 1
+}
 
 fn revision_json(automation_id: &str, revision: &str) -> String {
     serde_json::to_string(&json!({
@@ -89,7 +98,7 @@ fn wire_identity_is_stable_and_versioned() {
 #[test]
 fn catalogue_activates_both_automation_operations() {
     let entries = generated_operation_manifests().unwrap();
-    assert_eq!(entries.len(), 33);
+    assert_eq!(entries.len(), catalogue_entry_count());
     let mutation = entries
         .iter()
         .find(|entry| entry.name == "ApplyUserAutomationState")

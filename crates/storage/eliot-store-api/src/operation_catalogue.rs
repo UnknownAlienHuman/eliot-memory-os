@@ -434,6 +434,40 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
     ]
 }
 
+/// Returns the activated mutation operations in canonical declaration order.
+///
+/// This is the mutation-side counterpart of [`activated_read_operations`], so
+/// a caller can size the generated catalogue from the declaration tables
+/// themselves instead of a hardcoded entry count that silently goes stale as
+/// operations are activated.
+#[must_use]
+pub const fn activated_mutation_operations() -> [NamedMutationOperation; 22] {
+    [
+        ACTIVATED_MUTATIONS[0].operation,
+        ACTIVATED_MUTATIONS[1].operation,
+        ACTIVATED_MUTATIONS[2].operation,
+        ACTIVATED_MUTATIONS[3].operation,
+        ACTIVATED_MUTATIONS[4].operation,
+        ACTIVATED_MUTATIONS[5].operation,
+        ACTIVATED_MUTATIONS[6].operation,
+        ACTIVATED_MUTATIONS[7].operation,
+        ACTIVATED_MUTATIONS[8].operation,
+        ACTIVATED_MUTATIONS[9].operation,
+        ACTIVATED_MUTATIONS[10].operation,
+        ACTIVATED_MUTATIONS[11].operation,
+        ACTIVATED_MUTATIONS[12].operation,
+        ACTIVATED_MUTATIONS[13].operation,
+        ACTIVATED_MUTATIONS[14].operation,
+        ACTIVATED_MUTATIONS[15].operation,
+        ACTIVATED_MUTATIONS[16].operation,
+        ACTIVATED_MUTATIONS[17].operation,
+        ACTIVATED_MUTATIONS[18].operation,
+        ACTIVATED_MUTATIONS[19].operation,
+        ACTIVATED_MUTATIONS[20].operation,
+        ACTIVATED_MUTATIONS[21].operation,
+    ]
+}
+
 /// One activated mutation row of the declaration table.
 struct ActivatedMutationDescriptor {
     operation: NamedMutationOperation,
