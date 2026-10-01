@@ -1136,7 +1136,7 @@ mod tests {
             request_id: load(RequestId::new("start-claim-1")),
             trace_context: BTreeMap::from([("trace_id".to_owned(), "trace-claim-1".to_owned())]),
             deadline_unix_ms: 5_000,
-            artifact_manifest_digest: "facet-manifest-7".to_owned(),
+            artifact_manifest_digest: load(eliot_contracts::native_worker_resource_facet_ref_v1()),
             launch_nonce: "launch-nonce-slice-d-1".to_owned(),
             worker_generation: 1,
             authority_epoch: epoch(),
@@ -1193,7 +1193,7 @@ mod tests {
             adapter_id: eliot_native_worker::adapter_registry::CODEX_FACTORY_ID.to_owned(),
             adapter_revision: eliot_native_worker::adapter_registry::FACTORY_REVISION,
             config_digest: registration.worker_config_digest.clone(),
-            facet_manifest_ref: "facet-manifest-7".to_owned(),
+            facet_manifest_ref: load(eliot_contracts::native_worker_resource_facet_ref_v1()),
             capability_cell: load(eliot_contracts::CapabilityCellId::new("cell-test-1")),
             grant_graph_revision: 5,
             module_catalog_revision: 7,
@@ -1704,11 +1704,10 @@ mod tests {
     #[cfg(windows)]
     fn governed_drive_admits_enveloped_material_to_ready_with_provenance() {
         let (fence_json, epoch_json) = action_currency();
-        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts(
-                "governed-drive",
-                drive_carriers("scope-1", &fence_json, &epoch_json),
-            );
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "governed-drive",
+            drive_carriers("scope-1", &fence_json, &epoch_json),
+        );
         let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
             &mut lifecycle,
             &mut worker,
@@ -1820,11 +1819,10 @@ mod tests {
     #[cfg(windows)]
     fn governed_stdio_serves_only_with_valid_envelope() {
         let (fence_json, epoch_json) = action_currency();
-        let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts(
-                "governed-stdio",
-                drive_carriers("scope-1", &fence_json, &epoch_json),
-            );
+        let (mut worker, mut lifecycle, material, process, _bat, _staged) = governed_drive_parts(
+            "governed-stdio",
+            drive_carriers("scope-1", &fence_json, &epoch_json),
+        );
         // Refusal leaves the writer empty and the reader unconsumed: no
         // frame is read and no response is written without an envelope.
         let frame_bytes = encode_frame(&health_frame());
@@ -2006,7 +2004,7 @@ mod tests {
             "adapter_id": eliot_native_worker::adapter_registry::CODEX_FACTORY_ID,
             "adapter_revision": eliot_native_worker::adapter_registry::FACTORY_REVISION,
             "config_digest": "c".repeat(64),
-            "facet_manifest_ref": "facet-manifest-kernel-drive-1",
+            "facet_manifest_ref": load(eliot_contracts::native_worker_resource_facet_ref_v1()),
             "capability_cell": "native-worker-core",
             "grant_graph_revision": 5,
             "module_catalog_revision": 7,
