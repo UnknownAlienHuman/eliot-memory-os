@@ -88,6 +88,7 @@ pub(crate) async fn read_stream_chunk(
     gateway: &ProcessExecutionGateway,
     owner: &ProcessOwnerBinding,
     request: ProcessStreamReadRequest,
+    context: &tracing::Span,
 ) -> Result<ProcessStreamReadChunk, ProcessExecutionError> {
     request
         .validate()
@@ -101,7 +102,7 @@ pub(crate) async fn read_stream_chunk(
         .load_process_start(&operation_id)
         .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
         .ok_or(ProcessExecutionError::NotFound)?;
-    super::process_execution::authorize_process_owner(&record.owner, owner)?;
+    super::process_execution::authorize_process_owner_in_context(&record.owner, owner, context)?;
     if record.state != ProcessExecutionReplayState::Completed
         || record.receipt.as_ref() != Some(receipt)
     {
@@ -111,7 +112,22 @@ pub(crate) async fn read_stream_chunk(
     // Preserve the ordinary authenticated Inspect boundary: this API never
     // turns an in-flight process into a completed stream merely because a
     // byte prefix is currently available.
-    let view = gateway.inspect(owner, operation_id.clone()).await?;
+    let view = gateway
+        .inspect_inner(owner, operation_id.clone(), context)
+        .await?;
+    super::process_execution::record_process_context_field(
+        context,
+        "process_tree",
+        Some(view.binding().process_tree_id().as_str()),
+    );
+    super::process_execution::record_process_context_field(
+        context,
+        "state_fence",
+        view.binding()
+            .state_fence()
+            .canonical_epoch_digest()
+            .as_deref(),
+    );
     if view.operation_id() != &operation_id
         || view.binding() != receipt.binding()
         || !view.lifecycle().is_terminal()
@@ -122,7 +138,9 @@ pub(crate) async fn read_stream_chunk(
 
     // Reconcile through the same original P-03 owner so this read cannot
     // observe an unrelated caller-provided ProcessEvidence value.
-    let process_evidence = gateway.reconcile(owner, operation_id.clone()).await?;
+    let process_evidence = gateway
+        .reconcile_inner(owner, operation_id.clone(), context)
+        .await?;
     process_evidence.validate().map_err(|_| unknown())?;
     if process_evidence.operation_id() != &operation_id
         || process_evidence.binding() != receipt.binding()
