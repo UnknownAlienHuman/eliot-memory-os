@@ -132,3 +132,67 @@ pub struct ProjectUnderstandingModel {
     pub verifier_ref: String,
     pub stop_condition: String,
 }
+
+/// Named legacy `project-understanding` versions this build admits, each paired with the
+/// current version its bytes are read under.
+///
+/// Empty by evidence, not by omission: a repository-wide search finds exactly one
+/// `project-understanding-v*` literal, [`PROJECT_UNDERSTANDING_SCHEMA_VERSION`], and it
+/// is the only value `eliot-engine`'s `ProjectUnderstandingCompiler::compile` ever
+/// stamps. No legacy revision has ever been written, so there is no named migration to
+/// preserve here. A future supported legacy revision MUST be added to this table by name
+/// together with its migration; it MUST NOT be inferred from the presence of a
+/// `schema_version` string on decoded bytes.
+pub const PROJECT_UNDERSTANDING_NAMED_LEGACY_MIGRATIONS: &[(&str, &str)] = &[];
+
+/// A decoded `ProjectUnderstandingModel` whose declared `schema_version` this build does
+/// not read.
+///
+/// Refusing here means "no meaning as current project understanding". It never means
+/// "reinterpret these bytes under current field meanings".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectUnderstandingSchemaMismatch {
+    /// The version the decoded bytes declared.
+    pub declared_version: String,
+    /// The only version this build reads and interprets.
+    pub supported_version: &'static str,
+}
+
+impl std::fmt::Display for ProjectUnderstandingSchemaMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "project understanding declares schema_version {:?}; this build reads only {:?}",
+            self.declared_version, self.supported_version
+        )
+    }
+}
+
+impl std::error::Error for ProjectUnderstandingSchemaMismatch {}
+
+impl ProjectUnderstandingModel {
+    /// The single owner validation step for a decoded project-understanding model.
+    ///
+    /// Returns the version this build reads the model under, or refuses. This reuses the
+    /// existing [`PROJECT_UNDERSTANDING_SCHEMA_VERSION`] constant and the existing
+    /// [`PROJECT_UNDERSTANDING_NAMED_LEGACY_MIGRATIONS`] table, and adds no second
+    /// mechanism.
+    ///
+    /// Callers MUST apply this at the model's real deserialization/admission owner,
+    /// before the model may be consumed as current project proof.
+    /// `deny_unknown_fields` closes the shape; it never proved the version.
+    pub fn admission(&self) -> Result<&'static str, ProjectUnderstandingSchemaMismatch> {
+        let declared = self.schema_version.as_str();
+        if declared == PROJECT_UNDERSTANDING_SCHEMA_VERSION {
+            return Ok(PROJECT_UNDERSTANDING_SCHEMA_VERSION);
+        }
+        PROJECT_UNDERSTANDING_NAMED_LEGACY_MIGRATIONS
+            .iter()
+            .find(|(legacy, _)| *legacy == declared)
+            .map(|(_, admitted)| *admitted)
+            .ok_or_else(|| ProjectUnderstandingSchemaMismatch {
+                declared_version: declared.to_owned(),
+                supported_version: PROJECT_UNDERSTANDING_SCHEMA_VERSION,
+            })
+    }
+}

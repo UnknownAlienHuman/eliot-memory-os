@@ -1234,6 +1234,7 @@ fn read_active_packet_authority(
                 path.display()
             )
         })?;
+    require_packet_project_understanding_admission(&response_packet, "active packet authority")?;
     anyhow::ensure!(
         canonical_struct_hash(&response_packet)? == canonical_struct_hash(&authority.packet)?,
         "active packet authority packet/response mismatch at {}",
@@ -1464,6 +1465,32 @@ fn stage_packet_post_commit_outbox_at_root(
     Ok((stored, current))
 }
 
+/// Owner admission step for a decoded packet's project understanding.
+///
+/// `ContextPacketL3` derives `Deserialize` with `deny_unknown_fields`, which closes the
+/// SHAPE but proves nothing about semantic version selection: a
+/// `ProjectUnderstandingModel` carrying a foreign or future `schema_version` still
+/// deserializes into the current fields. This is the model's real deserialization
+/// admission owner, so version selection is checked here — before the model may be
+/// consumed as current project proof — rather than inferred from the presence of a
+/// `schema_version` string.
+///
+/// An ABSENT `project_understanding` is not refused: absence means the packet carries no
+/// understanding claim at all, which is `unknown`, not completeness.
+fn require_packet_project_understanding_admission(
+    packet: &ContextPacketL3,
+    origin: &str,
+) -> Result<()> {
+    if let Some(model) = packet.project_understanding.as_ref() {
+        model.admission().map_err(|mismatch| {
+            anyhow::anyhow!(
+                "{origin} carries a project understanding that is not admitted: {mismatch}"
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn validate_packet_post_commit_intent(intent: &PacketPostCommitIntent) -> Result<ContextPacketL3> {
     validate_packet_commit_material(&intent.material)?;
     anyhow::ensure!(
@@ -1472,6 +1499,7 @@ fn validate_packet_post_commit_intent(intent: &PacketPostCommitIntent) -> Result
     );
     let packet: ContextPacketL3 = serde_json::from_value(intent.response.clone())
         .context("packet post-commit response does not contain a ContextPacketL3")?;
+    require_packet_project_understanding_admission(&packet, "packet post-commit response")?;
     anyhow::ensure!(
         packet.project_id == intent.material.project_id
             && packet.task_id == intent.material.task_id
@@ -3045,6 +3073,7 @@ fn latest_task_packet(state: &McpState, task_id: TaskId) -> Result<Option<Contex
         return Ok(None);
     }
     let packet: ContextPacketL3 = serde_json::from_reader(std::fs::File::open(task_path)?)?;
+    require_packet_project_understanding_admission(&packet, "latest task packet")?;
     Ok((packet.task_id == task_id.to_string()).then_some(packet))
 }
 

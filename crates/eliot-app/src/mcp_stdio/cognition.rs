@@ -6,6 +6,9 @@
 //! not any one link in it.
 
 use super::*;
+use eliot_types::cognitive_run::{
+    CognitiveRunSchemaVersioned, require_current_cognitive_run_schema,
+};
 
 pub(super) fn cognitive_policy_snapshot_id(input: &CognitiveSealInput) -> Result<String> {
     sha256_json(&(
@@ -315,7 +318,31 @@ pub(super) fn cognitive_tool_observation_subject(run_id: &str, call_number: u8) 
     format!("{run_id}:call:{call_number}")
 }
 
-pub(super) async fn cognitive_record_by_revision<T: serde::de::DeserializeOwned>(
+/// Owner version-selection step for one decoded cognitive-run record.
+///
+/// This is the same single owner step the `eliot-engine` loaders use, applied here at
+/// the real decoding boundary. `deny_unknown_fields` closes the record's shape; only
+/// this step closes its declared `schema_version`.
+pub(super) fn require_cognitive_record_version<T: CognitiveRunSchemaVersioned>(
+    record: &CanonicalRecord<T>,
+) -> Result<()> {
+    require_current_cognitive_run_schema(&record.receipt_body)?;
+    Ok(())
+}
+
+/// The canonical revision decoder, bound to the single owner version-selection step.
+///
+/// `CanonicalStore::canonical_record_by_write_id<T>` only deserializes `T`, so a decoded
+/// record can carry ANY `schema_version` string. Every schema-bearing cognitive-run
+/// record is therefore read through here, which applies
+/// `require_cognitive_record_version` before the record may authorize candidate
+/// submission, terminal progression, shared-gate/disposition logic or tool evidence.
+///
+/// The bound `T: CognitiveRunSchemaVersioned` makes it impossible for a new
+/// schema-bearing record to be read through this decoder without an owner check.
+pub(super) async fn cognitive_record_by_revision<
+    T: serde::de::DeserializeOwned + CognitiveRunSchemaVersioned,
+>(
     state: &McpState,
     project_id: ProjectId,
     task_id: TaskId,
@@ -325,11 +352,64 @@ pub(super) async fn cognitive_record_by_revision<T: serde::de::DeserializeOwned>
 ) -> Result<Option<CanonicalRecord<T>>> {
     let key = cognitive_revision_key(run_id, revision);
     let write_id = deterministic_canonical_write_id(project_id, Some(task_id), kind, &key);
-    state
+    let record = state
         .store
         .canonical_record_by_write_id(project_id, Some(task_id), &[kind.as_str()], write_id)
-        .await
-        .map_err(Into::into)
+        .await?;
+    if let Some(record) = record.as_ref() {
+        require_cognitive_record_version(record)?;
+    }
+    Ok(record)
+}
+
+/// The subject-reference decoder, bound to the same single owner version-selection step.
+///
+/// `canonical_records_by_subject_ref<T>` only deserializes `T`, so every returned record
+/// is owner-checked here before it can be consumed as current data.
+async fn cognitive_records_by_subject_ref<
+    T: serde::de::DeserializeOwned + CognitiveRunSchemaVersioned,
+>(
+    state: &McpState,
+    project_id: ProjectId,
+    task_id: Option<TaskId>,
+    kind: CanonicalReceiptKind,
+    subject: &str,
+    limit: u16,
+) -> Result<Vec<CanonicalRecord<T>>> {
+    let records = state
+        .store
+        .canonical_records_by_subject_ref::<T>(
+            project_id,
+            task_id,
+            &[kind.as_str()],
+            subject,
+            limit,
+        )
+        .await?;
+    for record in &records {
+        require_cognitive_record_version(record)?;
+    }
+    Ok(records)
+}
+
+/// The write-id decoder, bound to the same single owner version-selection step.
+async fn cognitive_record_by_write_id<
+    T: serde::de::DeserializeOwned + CognitiveRunSchemaVersioned,
+>(
+    state: &McpState,
+    project_id: ProjectId,
+    task_id: Option<TaskId>,
+    kind: CanonicalReceiptKind,
+    write_id: WriteId,
+) -> Result<Option<CanonicalRecord<T>>> {
+    let record = state
+        .store
+        .canonical_record_by_write_id::<T>(project_id, task_id, &[kind.as_str()], write_id)
+        .await?;
+    if let Some(record) = record.as_ref() {
+        require_cognitive_record_version(record)?;
+    }
+    Ok(record)
 }
 
 pub(super) async fn cognitive_run_seal(
@@ -1001,16 +1081,15 @@ pub(super) async fn validate_cognitive_host_and_tools(
 
     let observation_subject =
         cognitive_tool_observation_subject(&contract.receipt_body.run_id, call.call_number);
-    let mut records = state
-        .store
-        .canonical_records_by_subject_ref::<CognitiveToolObservation>(
-            contract.receipt_body.project_id,
-            Some(contract.receipt_body.task_id),
-            &[CanonicalReceiptKind::CognitiveToolObservation.as_str()],
-            &observation_subject,
-            COGNITIVE_TOOL_OBSERVATION_QUERY_LIMIT,
-        )
-        .await?;
+    let mut records = cognitive_records_by_subject_ref::<CognitiveToolObservation>(
+        state,
+        contract.receipt_body.project_id,
+        Some(contract.receipt_body.task_id),
+        CanonicalReceiptKind::CognitiveToolObservation,
+        &observation_subject,
+        COGNITIVE_TOOL_OBSERVATION_QUERY_LIMIT,
+    )
+    .await?;
     if records.len() >= COGNITIVE_TOOL_OBSERVATION_MAX {
         anyhow::bail!("cognitive call exceeded its canonical tool-observation cap");
     }
@@ -1185,15 +1264,14 @@ pub(super) async fn ensure_cognitive_raw_verifier(
         passed: terminal.status == CognitiveRunCallStatus::Succeeded,
         verified_at: time::OffsetDateTime::now_utc(),
     };
-    if let Some(existing) = state
-        .store
-        .canonical_record_by_write_id::<CognitiveRawVerifierEvidence>(
-            project_id,
-            Some(task_id),
-            &[CanonicalReceiptKind::CognitiveRawVerifier.as_str()],
-            write_id,
-        )
-        .await?
+    if let Some(existing) = cognitive_record_by_write_id::<CognitiveRawVerifierEvidence>(
+        state,
+        project_id,
+        Some(task_id),
+        CanonicalReceiptKind::CognitiveRawVerifier,
+        write_id,
+    )
+    .await?
     {
         evidence.verified_at = existing.receipt_body.verified_at;
         if existing.receipt_body != evidence {
@@ -1451,32 +1529,30 @@ pub(super) async fn cognitive_run_status(state: &McpState, params: Value) -> Res
     state.ensure_schema().await?;
     let input: CognitiveStatusInput = serde_json::from_value(params)?;
     let contract = load_cognitive_contract(state, &input).await?;
-    let mut attempts = state
-        .store
-        .canonical_records_by_subject_ref::<CognitiveRunAttempt>(
-            input.project_id,
-            Some(input.task_id),
-            &[CanonicalReceiptKind::CognitiveRunAttempt.as_str()],
-            &input.run_id,
-            64,
-        )
-        .await?
-        .into_iter()
-        .filter(|record| record.receipt_body.run_id == input.run_id)
-        .collect::<Vec<_>>();
-    let mut terminals = state
-        .store
-        .canonical_records_by_subject_ref::<CognitiveRunTerminal>(
-            input.project_id,
-            Some(input.task_id),
-            &[CanonicalReceiptKind::CognitiveRunTerminal.as_str()],
-            &input.run_id,
-            64,
-        )
-        .await?
-        .into_iter()
-        .filter(|record| record.receipt_body.run_id == input.run_id)
-        .collect::<Vec<_>>();
+    let mut attempts = cognitive_records_by_subject_ref::<CognitiveRunAttempt>(
+        state,
+        input.project_id,
+        Some(input.task_id),
+        CanonicalReceiptKind::CognitiveRunAttempt,
+        &input.run_id,
+        64,
+    )
+    .await?
+    .into_iter()
+    .filter(|record| record.receipt_body.run_id == input.run_id)
+    .collect::<Vec<_>>();
+    let mut terminals = cognitive_records_by_subject_ref::<CognitiveRunTerminal>(
+        state,
+        input.project_id,
+        Some(input.task_id),
+        CanonicalReceiptKind::CognitiveRunTerminal,
+        &input.run_id,
+        64,
+    )
+    .await?
+    .into_iter()
+    .filter(|record| record.receipt_body.run_id == input.run_id)
+    .collect::<Vec<_>>();
     attempts.sort_by_key(|record| record.receipt_body.call_number);
     terminals.sort_by_key(|record| record.receipt_body.call_number);
     for (index, attempt) in attempts.iter().enumerate() {
@@ -1533,16 +1609,15 @@ pub(super) async fn cognitive_run_status(state: &McpState, params: Value) -> Res
                 .first()
                 .filter(|_| terminal.receipt_body.raw_verifier_receipts.len() == 1)
                 .context("cognitive status raw-verifier cardinality differs")?;
-            let raw = state
-                .store
-                .canonical_record_by_write_id::<CognitiveRawVerifierEvidence>(
-                    input.project_id,
-                    Some(input.task_id),
-                    &[CanonicalReceiptKind::CognitiveRawVerifier.as_str()],
-                    raw_receipt.write_id,
-                )
-                .await?
-                .context("cognitive status raw-verifier record disappeared")?;
+            let raw = cognitive_record_by_write_id::<CognitiveRawVerifierEvidence>(
+                state,
+                input.project_id,
+                Some(input.task_id),
+                CanonicalReceiptKind::CognitiveRawVerifier,
+                raw_receipt.write_id,
+            )
+            .await?
+            .context("cognitive status raw-verifier record disappeared")?;
             if raw.canonical_receipt != *raw_receipt
                 || raw.receipt_body.run_id != input.run_id
                 || raw.receipt_body.call_number != call_number
@@ -1727,16 +1802,15 @@ pub(super) async fn ensure_cognitive_tool_observation_capacity(
     capability: &CognitiveCandidateCapability,
 ) -> Result<()> {
     let subject = cognitive_tool_observation_subject(&capability.run_id, capability.call_number);
-    let visible = state
-        .store
-        .canonical_records_by_subject_ref::<CognitiveToolObservation>(
-            capability.project_id,
-            Some(capability.task_id),
-            &[CanonicalReceiptKind::CognitiveToolObservation.as_str()],
-            &subject,
-            COGNITIVE_TOOL_OBSERVATION_QUERY_LIMIT,
-        )
-        .await?;
+    let visible = cognitive_records_by_subject_ref::<CognitiveToolObservation>(
+        state,
+        capability.project_id,
+        Some(capability.task_id),
+        CanonicalReceiptKind::CognitiveToolObservation,
+        &subject,
+        COGNITIVE_TOOL_OBSERVATION_QUERY_LIMIT,
+    )
+    .await?;
     if visible.len() >= COGNITIVE_TOOL_OBSERVATION_MAX {
         anyhow::bail!("cognitive call exhausted its canonical tool-observation cap");
     }

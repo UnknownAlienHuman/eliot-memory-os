@@ -1,5 +1,8 @@
 use crate::EngineError;
 use eliot_store::{CanonicalClaimCard, CanonicalRecord, CanonicalStore};
+use eliot_types::cognitive_run::{
+    CognitiveRunSchemaVersioned, require_current_cognitive_run_schema,
+};
 use eliot_types::{
     AgentResultDispositionKind, AgentRole, AgentSessionId, CanonicalCaseDisposition, ClaimId,
     CognitiveRawVerifierEvidence, CognitiveRunAttempt, CognitiveRunCallPlan,
@@ -13,6 +16,23 @@ use time::OffsetDateTime;
 
 fn rejected(reason: impl Into<String>) -> EngineError {
     EngineError::WriteRejected(reason.into())
+}
+
+/// The single owner version-selection step for a decoded cognitive-run record, in the
+/// engine's own error vocabulary.
+///
+/// `CanonicalStore::canonical_record_by_write_id` /
+/// `canonical_records_by_subject_ref` only deserialize `T`, so a decoded record can
+/// carry any `schema_version` string. This applies the shared owner step at each real
+/// decoding boundary here, before a record's `Succeeded`, receipt-chain, verifier-count,
+/// shared-gate or candidate facts may be consumed as current authority. A refusal is a
+/// disposition rejection, never partial data.
+fn require_current_cognitive_record<T: CognitiveRunSchemaVersioned>(
+    record: &T,
+) -> Result<(), EngineError> {
+    require_current_cognitive_run_schema(record)
+        .map(|_| ())
+        .map_err(|mismatch| rejected(mismatch.to_string()))
 }
 
 fn string_list(value: Option<&Value>, field: &str) -> Result<Vec<String>, EngineError> {
@@ -183,6 +203,7 @@ async fn require_raw_verifiers(
             )
             .await?
             .ok_or_else(|| rejected("canonical raw verifier record is absent"))?;
+        require_current_cognitive_record(&verifier.receipt_body)?;
         if verifier.canonical_receipt != *verifier_receipt
             || !verifier.receipt_body.passed
             || verifier.receipt_body.run_id != contract.run_id
@@ -226,6 +247,7 @@ async fn canonical_source_candidate(
         )
         .await?
         .ok_or_else(|| rejected("source attempt is absent"))?;
+    require_current_cognitive_record(&attempt.receipt_body)?;
     if attempt.canonical_receipt != terminal.receipt_body.attempt_receipt
         || attempt.receipt_body.run_id != contract.run_id
         || attempt.receipt_body.call_id != call.call_id
@@ -425,6 +447,12 @@ pub async fn resolve_canonical_case_dispositions(
     contract_record: &CanonicalRecord<CognitiveRunContract>,
     now: OffsetDateTime,
 ) -> Result<Vec<CanonicalCaseDisposition>, EngineError> {
+    // The sealed contract selects the two source calls and stamps
+    // `source_commit`/`policy_snapshot_id` into every disposition it produces, so it is
+    // consumed as current authority here. One owner step covers every caller of this
+    // resolution: the `eliot-app` shared-gate and status paths, the operator
+    // disposition query and the `eliot-engine` writer gate.
+    require_current_cognitive_record(&contract_record.receipt_body)?;
     let contract = &contract_record.receipt_body;
     let mut terminals = store
         .canonical_records_by_subject_ref::<CognitiveRunTerminal>(
@@ -436,6 +464,11 @@ pub async fn resolve_canonical_case_dispositions(
         )
         .await?;
     terminals.retain(|record| record.receipt_body.run_id == contract.run_id);
+    // Every retained terminal's `Succeeded` status and its candidate receipt drive the
+    // disposition below, so version selection is checked before that use, not after.
+    for terminal in &terminals {
+        require_current_cognitive_record(&terminal.receipt_body)?;
+    }
     let mut dispositions = Vec::with_capacity(2);
     for source_call in [5_u8, 7_u8] {
         let terminal = terminals
