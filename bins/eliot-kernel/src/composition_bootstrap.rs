@@ -560,13 +560,21 @@ impl KernelComposition {
             observe_terminal_error(kernel_build_error_code(&mapped));
             mapped
         })?);
-        let ors_path = Self::ors_path_for_config(&config).inspect_err(|error| {
+        let (ors_path, protected_root) = Self::ors_path_for_config(&config).inspect_err(|error| {
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
                 "kernel.composition.build_failed",
             );
             observe_terminal_error(kernel_build_error_code(error));
         })?;
+        let scan_disclosure_storage =
+            Self::open_scan_disclosure_storage(&config, &ors_path, protected_root).inspect_err(|error| {
+                observe_entrypoint_with_detail(
+                    EntrypointStage::Composition,
+                    "kernel.composition.build_failed",
+                );
+                observe_terminal_error(kernel_build_error_code(error));
+            })?;
         let ors = Arc::new(
             Self::open_ors_for_config(&config, &ors_path).inspect_err(|error| {
                 observe_entrypoint_with_detail(
@@ -576,7 +584,7 @@ impl KernelComposition {
                 observe_terminal_error(kernel_build_error_code(error));
             })?,
         );
-        Self::assemble(config, ors, ors_path, None, platform).inspect_err(|error| {
+        Self::assemble(config, ors, ors_path, None, platform, scan_disclosure_storage).inspect_err(|error| {
             observe_entrypoint_with_detail(
                 EntrypointStage::Composition,
                 "kernel.composition.build_failed",
@@ -634,7 +642,13 @@ impl KernelComposition {
                 .map_err(KernelBuildError::Platform)
                 .map_err(&terminal)?,
         );
-        let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
+        let (ors_path, protected_root) = Self::ors_path_for_config(&config).map_err(&terminal)?;
+        let scan_disclosure_storage = Self::open_scan_disclosure_storage(
+            &config,
+            &ors_path,
+            protected_root,
+        )
+        .map_err(&terminal)?;
         let ors = Arc::new(Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?);
         if config.startup_mode.is_shadow_candidate() {
             // I14.16 steps 3-4: a shadow candidate never begins or consumes
@@ -645,7 +659,8 @@ impl KernelComposition {
                 EntrypointStage::Composition,
                 "kernel.composition.shadow_candidate_descriptor_skipped",
             );
-            return Self::assemble(config, ors, ors_path, None, platform).map_err(&terminal);
+            return Self::assemble(config, ors, ors_path, None, platform, scan_disclosure_storage)
+                .map_err(&terminal);
         }
         let prepared = Self::prepare_authority_descriptor_material(
             &platform,
@@ -665,7 +680,14 @@ impl KernelComposition {
         #[cfg(windows)]
         Self::adopt_descriptor_supervision_authority(&mut config, &prepared.descriptor)
             .map_err(&terminal)?;
-        Self::assemble_with_prepared_material(config, prepared, ors, ors_path, platform)
+        Self::assemble_with_prepared_material(
+            config,
+            prepared,
+            ors,
+            ors_path,
+            platform,
+            scan_disclosure_storage,
+        )
             .map_err(&terminal)
     }
 
@@ -727,6 +749,7 @@ impl KernelComposition {
         ors: Arc<RedbRecoveryStore>,
         ors_path: PathBuf,
         platform: Arc<WindowsPlatform>,
+        scan_disclosure_storage: Option<super::ScanDisclosureStorageLease>,
     ) -> Result<Self, KernelBuildError> {
         let snapshot_binding = AuthoritySnapshotBinding::from_wire(
             prepared.descriptor.snapshot_binding.clone(),
@@ -757,6 +780,7 @@ impl KernelComposition {
             ors,
             ors_path,
             platform,
+            scan_disclosure_storage,
         )
     }
 
@@ -795,9 +819,19 @@ impl KernelComposition {
                 .map_err(KernelBuildError::Platform)
                 .map_err(&terminal)?,
         );
-        let ors_path = Self::ors_path_for_config(&config).map_err(&terminal)?;
+        let (ors_path, protected_root) = Self::ors_path_for_config(&config).map_err(&terminal)?;
+        let scan_disclosure_storage =
+            Self::open_scan_disclosure_storage(&config, &ors_path, protected_root)
+                .map_err(&terminal)?;
         let ors = Arc::new(Self::open_ors_for_config(&config, &ors_path).map_err(&terminal)?);
-        Self::assemble_with_process_authority(config, authority_config, ors, ors_path, platform)
+        Self::assemble_with_process_authority(
+            config,
+            authority_config,
+            ors,
+            ors_path,
+            platform,
+            scan_disclosure_storage,
+        )
             .map_err(&terminal)
     }
 
@@ -1078,6 +1112,7 @@ impl KernelComposition {
         ors: Arc<RedbRecoveryStore>,
         ors_object_path: PathBuf,
         platform: Arc<WindowsPlatform>,
+        scan_disclosure_storage: Option<super::ScanDisclosureStorageLease>,
     ) -> Result<Self, KernelBuildError> {
         let authority_store: Arc<dyn OperationalRecoveryStore> = ors.clone();
         let controller = Arc::new(Mutex::new(
@@ -1097,6 +1132,7 @@ impl KernelComposition {
             ors,
             ors_object_path,
             platform,
+            scan_disclosure_storage,
         )
     }
 
@@ -1107,6 +1143,7 @@ impl KernelComposition {
         ors: Arc<RedbRecoveryStore>,
         ors_object_path: PathBuf,
         platform: Arc<WindowsPlatform>,
+        scan_disclosure_storage: Option<super::ScanDisclosureStorageLease>,
     ) -> Result<Self, KernelBuildError> {
         let path_admission = Arc::new(KernelPathAdmission::new(Arc::clone(&platform)));
         let gateway = Arc::new(ProcessExecutionGateway::new(
@@ -1115,7 +1152,14 @@ impl KernelComposition {
             snapshot_binding,
             path_admission,
         ));
-        Self::assemble(config, ors, ors_object_path, Some(gateway), platform)
+        Self::assemble(
+            config,
+            ors,
+            ors_object_path,
+            Some(gateway),
+            platform,
+            scan_disclosure_storage,
+        )
     }
 
     /// Reconciles the durable activation intent and replay snapshot before a
@@ -1479,7 +1523,7 @@ impl KernelComposition {
             RedbRecoveryStore::open_with_evidence(&ors_path, evidence)
                 .map_err(|error| KernelBuildError::Ors(error.to_string()))?,
         );
-        Self::assemble(config, ors, ors_path, None, platform)
+        Self::assemble(config, ors, ors_path, None, platform, None)
     }
 
     /// Keeps ordered generation, authority, and handoff construction in one
@@ -1492,7 +1536,10 @@ impl KernelComposition {
         ors_object_path: PathBuf,
         process_gateway: Option<Arc<ProcessExecutionGateway>>,
         platform: Arc<WindowsPlatform>,
+        scan_disclosure_storage: Option<super::ScanDisclosureStorageLease>,
     ) -> Result<Self, KernelBuildError> {
+        #[cfg(not(windows))]
+        let _ = scan_disclosure_storage;
         // F-LOG-KERNEL-2 (#899): assembly phases only; the public
         // constructors own the single terminal per failed build. Only fixed
         // phase labels plus numeric epoch/generation are emitted, never raw
@@ -1540,6 +1587,20 @@ impl KernelComposition {
                 ));
             }
         }
+        #[cfg(windows)]
+        let scan_disclosure_ors_generation = if let Some(binding) = &eliotd_receipt_binding {
+            let identity = ors
+                .installed_store_identity()
+                .map_err(|error| KernelBuildError::Ors(error.to_string()))?;
+            if identity.installation_id() != binding.installation_id() {
+                return Err(KernelBuildError::Service(
+                    "opened Kernel ORS identity changed during composition".to_owned(),
+                ));
+            }
+            Some(identity.ors_generation())
+        } else {
+            None
+        };
         observe_entrypoint_with_detail(
             EntrypointStage::Composition,
             "kernel.composition.dependencies_validated",
@@ -2139,6 +2200,10 @@ impl KernelComposition {
             // this path, so later path substitution cannot change that
             // handle's ORS identity or generation.
             ors_object_path,
+            #[cfg(windows)]
+            scan_disclosure_storage,
+            #[cfg(windows)]
+            scan_disclosure_ors_generation,
             work_root,
             runtime,
             platform,

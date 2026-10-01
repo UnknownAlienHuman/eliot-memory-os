@@ -267,12 +267,33 @@ pub enum ColdStartTriggerResult {
 const SCAN_DISCLOSURE_OWNER_OPERATION: &str = "scan_disclosure_owner";
 const SCAN_DISCLOSURE_OWNER_WIRE_VERSION: u16 = 1;
 
+/// Exact original accepted BIND_SCOPE proof carried through every initial
+/// scan/readiness owner call. It contains only the caller-retained envelope
+/// and evidence; Kernel revalidates both against the original accepted ticket.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialBindScopeOwnerProof {
+    evidence: AgentActivationBindScopeEvidence,
+    envelope: HostRequestEnvelope,
+}
+
+impl InitialBindScopeOwnerProof {
+    pub fn new(
+        evidence: AgentActivationBindScopeEvidence,
+        envelope: HostRequestEnvelope,
+    ) -> Self {
+        Self { evidence, envelope }
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ScanDisclosureOwnerRpcRequest<'a> {
     wire_version: u16,
     application_connection_id: &'a str,
     activation_ticket_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_bind_scope_proof: Option<&'a InitialBindScopeOwnerProof>,
     #[serde(flatten)]
     action: ScanDisclosureOwnerRpcAction<'a>,
 }
@@ -389,6 +410,8 @@ struct ColdStartReadinessOwnerRpcRequest<'a> {
     wire_version: u16,
     application_connection_id: &'a str,
     activation_ticket_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    initial_bind_scope_proof: Option<&'a InitialBindScopeOwnerProof>,
     #[serde(flatten)]
     action: ColdStartReadinessOwnerRpcAction<'a>,
 }
@@ -457,6 +480,7 @@ pub struct KernelScanDisclosureRecordOwner {
     application_connection_id: String,
     activation_ticket_id: String,
     binding: eliot_workscope::ScanDisclosureOwnerBinding,
+    initial_bind_scope_proof: Option<InitialBindScopeOwnerProof>,
 }
 
 impl KernelScanDisclosureRecordOwner {
@@ -471,6 +495,23 @@ impl KernelScanDisclosureRecordOwner {
             application_connection_id,
             activation_ticket_id,
             binding,
+            initial_bind_scope_proof: None,
+        }
+    }
+
+    pub fn new_initial(
+        kernel: Arc<super::DaemonKernelClient>,
+        application_connection_id: String,
+        activation_ticket_id: String,
+        binding: eliot_workscope::ScanDisclosureOwnerBinding,
+        proof: InitialBindScopeOwnerProof,
+    ) -> Self {
+        Self {
+            kernel,
+            application_connection_id,
+            activation_ticket_id,
+            binding,
+            initial_bind_scope_proof: Some(proof),
         }
     }
 
@@ -482,6 +523,7 @@ impl KernelScanDisclosureRecordOwner {
             wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
             application_connection_id: &self.application_connection_id,
             activation_ticket_id: &self.activation_ticket_id,
+            initial_bind_scope_proof: self.initial_bind_scope_proof.as_ref(),
             action,
         })
         .map_err(|error| OrsError::Contract(error.to_string()))?;
@@ -510,6 +552,7 @@ impl KernelScanDisclosureRecordOwner {
             wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
             application_connection_id,
             activation_ticket_id,
+            initial_bind_scope_proof: None,
             action: ScanDisclosureOwnerRpcAction::IssueContour,
         })
         .map_err(|error| OrsError::Contract(error.to_string()))?;
@@ -553,6 +596,87 @@ impl KernelScanDisclosureRecordOwner {
             wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
             application_connection_id,
             activation_ticket_id,
+            initial_bind_scope_proof: None,
+            action: ScanDisclosureOwnerRpcAction::IssueBinding,
+        })
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let value = kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let response: ScanDisclosureOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err(OrsError::Contract(
+                "unsupported scan-disclosure owner response version".to_owned(),
+            ));
+        }
+        match response.result {
+            ScanDisclosureOwnerRpcResult::Binding { binding } => Ok(binding),
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
+            _ => Err(OrsError::Contract(
+                "Kernel returned the wrong scan-disclosure owner result".to_owned(),
+            )),
+        }
+    }
+
+    /// Obtains an installation contour while carrying the original unresolved
+    /// BIND_SCOPE proof through the authenticated Kernel owner boundary.
+    pub(crate) fn issue_initial_contour(
+        kernel: &super::DaemonKernelClient,
+        application_connection_id: &str,
+        activation_ticket_id: &str,
+        proof: &InitialBindScopeOwnerProof,
+    ) -> Result<eliot_governor::InstallationScanContour, OrsError> {
+        let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id,
+            activation_ticket_id,
+            initial_bind_scope_proof: Some(proof),
+            action: ScanDisclosureOwnerRpcAction::IssueContour,
+        })
+        .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let value = kernel
+            .request_blocking(SCAN_DISCLOSURE_OWNER_OPERATION, payload)
+            .map_err(|error| OrsError::Contract(error.to_string()))?;
+        let response: ScanDisclosureOwnerRpcResponse =
+            serde_json::from_value(value).map_err(|error| OrsError::Contract(error.to_string()))?;
+        if response.wire_version != SCAN_DISCLOSURE_OWNER_WIRE_VERSION {
+            return Err(OrsError::Contract(
+                "unsupported scan-disclosure owner response version".to_owned(),
+            ));
+        }
+        match response.result {
+            ScanDisclosureOwnerRpcResult::Contour { contour } => {
+                eliot_governor::InstallationScanContour::bind(
+                    contour.installation_id,
+                    contour.ors_object_ref,
+                    contour.ors_generation,
+                )
+                .map_err(|error| OrsError::Contract(error.to_string()))
+            }
+            ScanDisclosureOwnerRpcResult::ReceiptReadFailure { failure } => {
+                Err(OrsError::ScanDisclosureReadFailure(failure))
+            }
+            _ => Err(OrsError::Contract(
+                "Kernel returned the wrong scan-disclosure owner result".to_owned(),
+            )),
+        }
+    }
+
+    /// Requests a Kernel-issued scan binding for the unresolved initial lane.
+    pub(crate) fn issue_initial_binding(
+        kernel: &super::DaemonKernelClient,
+        application_connection_id: &str,
+        activation_ticket_id: &str,
+        proof: &InitialBindScopeOwnerProof,
+    ) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, OrsError> {
+        let payload = serde_json::to_value(ScanDisclosureOwnerRpcRequest {
+            wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
+            application_connection_id,
+            activation_ticket_id,
+            initial_bind_scope_proof: Some(proof),
             action: ScanDisclosureOwnerRpcAction::IssueBinding,
         })
         .map_err(|error| OrsError::Contract(error.to_string()))?;
@@ -761,6 +885,7 @@ pub struct KernelColdStartReadinessRecordOwner {
     kernel: Arc<super::DaemonKernelClient>,
     application_connection_id: String,
     activation_ticket_id: String,
+    initial_bind_scope_proof: Option<InitialBindScopeOwnerProof>,
 }
 
 impl KernelColdStartReadinessRecordOwner {
@@ -773,6 +898,21 @@ impl KernelColdStartReadinessRecordOwner {
             kernel,
             application_connection_id,
             activation_ticket_id,
+            initial_bind_scope_proof: None,
+        }
+    }
+
+    pub fn new_initial(
+        kernel: Arc<super::DaemonKernelClient>,
+        application_connection_id: String,
+        activation_ticket_id: String,
+        proof: InitialBindScopeOwnerProof,
+    ) -> Self {
+        Self {
+            kernel,
+            application_connection_id,
+            activation_ticket_id,
+            initial_bind_scope_proof: Some(proof),
         }
     }
 
@@ -784,6 +924,7 @@ impl KernelColdStartReadinessRecordOwner {
             wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
             application_connection_id: &self.application_connection_id,
             activation_ticket_id: &self.activation_ticket_id,
+            initial_bind_scope_proof: self.initial_bind_scope_proof.as_ref(),
             action,
         })
         .map_err(|error| OrsError::Contract(error.to_string()))?;
@@ -913,6 +1054,36 @@ pub fn request_scan_disclosure_binding(
     )
 }
 
+/// Initial-lane contour request carrying the exact original accepted proof.
+pub fn request_initial_scan_disclosure_contour(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+    proof: &InitialBindScopeOwnerProof,
+) -> Result<eliot_governor::InstallationScanContour, OrsError> {
+    KernelScanDisclosureRecordOwner::issue_initial_contour(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+        proof,
+    )
+}
+
+/// Initial-lane binding request carrying the exact original accepted proof.
+pub fn request_initial_scan_disclosure_binding(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+    proof: &InitialBindScopeOwnerProof,
+) -> Result<eliot_workscope::ScanDisclosureOwnerBinding, OrsError> {
+    KernelScanDisclosureRecordOwner::issue_initial_binding(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+        proof,
+    )
+}
+
 /// Authenticates the first explicit BIND_SCOPE discovery against the original
 /// Kernel ticket and lifecycle-retained lease before the first WorkScope owner
 /// CAS. `envelope` and `evidence` are the exact values returned by the original
@@ -978,6 +1149,7 @@ pub fn prepare_initial_bind_scope_discovery(
         wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
         application_connection_id: &envelope.connection_id,
         activation_ticket_id: &evidence.ticket_id,
+        initial_bind_scope_proof: None,
         action: ScanDisclosureOwnerRpcAction::InitialBindScopeDiscovery {
             evidence,
             envelope,
@@ -1088,6 +1260,7 @@ async fn request_scan_work_scope_revision(
     kernel: &super::DaemonKernelClient,
     application_connection_id: &str,
     activation_ticket_id: &str,
+    initial_bind_scope_proof: Option<&InitialBindScopeOwnerProof>,
     action: ScanDisclosureOwnerRpcAction<'_>,
     expected_snapshot: &WorkScopeBindingSnapshot,
 ) -> Result<(), OrsError> {
@@ -1095,6 +1268,7 @@ async fn request_scan_work_scope_revision(
         wire_version: SCAN_DISCLOSURE_OWNER_WIRE_VERSION,
         application_connection_id,
         activation_ticket_id,
+        initial_bind_scope_proof,
         action,
     })
     .map_err(|error| OrsError::Contract(error.to_string()))?;
@@ -1145,6 +1319,7 @@ pub async fn retain_scan_discovery_lease_owner_revision(
         kernel,
         application_connection_id,
         activation_ticket_id,
+        None,
         ScanDisclosureOwnerRpcAction::RetainDiscoveryLease {
             expected_owner_revision,
             lease,
@@ -1172,6 +1347,64 @@ pub async fn retain_scan_evidence_owner_revision(
         kernel,
         application_connection_id,
         activation_ticket_id,
+        None,
+        ScanDisclosureOwnerRpcAction::RetainScanEvidence {
+            expected_owner_revision,
+            discovery_lease,
+            evidence,
+            binding,
+            receipt_handle,
+            snapshot,
+        },
+        snapshot,
+    )
+    .await
+}
+
+/// Initial-lane counterpart that carries the original accepted proof through
+/// the canonical owner CAS/readback.
+pub async fn retain_initial_scan_discovery_lease_owner_revision(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+    proof: &InitialBindScopeOwnerProof,
+    expected_owner_revision: u64,
+    lease: &DiscoveryReadLease,
+    snapshot: &WorkScopeBindingSnapshot,
+) -> Result<(), OrsError> {
+    request_scan_work_scope_revision(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+        Some(proof),
+        ScanDisclosureOwnerRpcAction::RetainDiscoveryLease {
+            expected_owner_revision,
+            lease,
+            snapshot,
+        },
+        snapshot,
+    )
+    .await
+}
+
+/// Initial-lane post-scan CAS/readback with the same original proof.
+pub async fn retain_initial_scan_evidence_owner_revision(
+    kernel: &super::DaemonKernelClient,
+    application_connection_id: &str,
+    activation_ticket_id: &str,
+    proof: &InitialBindScopeOwnerProof,
+    expected_owner_revision: u64,
+    discovery_lease: &DiscoveryReadLease,
+    evidence: &BootstrapScanEvidence,
+    binding: &eliot_workscope::ScanDisclosureOwnerBinding,
+    receipt_handle: &eliot_workscope::ScanReceiptHandle,
+    snapshot: &WorkScopeBindingSnapshot,
+) -> Result<(), OrsError> {
+    request_scan_work_scope_revision(
+        kernel,
+        application_connection_id,
+        activation_ticket_id,
+        Some(proof),
         ScanDisclosureOwnerRpcAction::RetainScanEvidence {
             expected_owner_revision,
             discovery_lease,
