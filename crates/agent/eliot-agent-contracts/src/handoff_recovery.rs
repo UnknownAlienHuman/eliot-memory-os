@@ -30,9 +30,10 @@
 //!   derived summary identity separate from original evidence;
 //! - [`HandoffRecoveryFinish`] binds the observed outcome to the existing
 //!   [`HandoffCausalLink`](crate::HandoffCausalLink) and the attempt-bound
-//!   intent only after the required checks, reconciling repeats instead of
-//!   launching another worker, and advances the intent to executed only when
-//!   the bound worker actually executes;
+//!   intent only after the required checks, cites the bound link on the
+//!   target attempt record, reconciling repeats instead of launching another
+//!   worker, and advances the intent to executed only when the bound worker
+//!   actually executes;
 //! - [`recover_handoff`] runs these owners in order so every helper has a
 //!   real caller: registry permit, evidence, gate, dispatcher, effect
 //!   reconciliation, rebuild request, and finish.
@@ -55,7 +56,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCaptureAcceptance,
+    AgentAttempt, AgentAttemptId, ContractError, HandoffAttemptIdentity, HandoffCaptureAcceptance,
     HandoffCaptureOperation, HandoffCausalLink, HandoffCheckpointError, HandoffCheckpointId,
     HandoffContinuity, HandoffEffectDisposition, HandoffEffectRecord,
     HandoffProviderCompactionCapability, HandoffProviderGap, HandoffResumeIntent,
@@ -1030,6 +1031,37 @@ impl HandoffRecoveryFinish {
         intent.advance(HandoffResumeStatus::ResumedExecution)?;
         Ok(())
     }
+
+    /// Cites the bound link's revalidation reference on the target attempt record.
+    ///
+    /// Only a link bound by [`Self::finish`] may be cited: its revalidation
+    /// reference proves the checkpoint, content, and authority checks ran, so
+    /// a link without one is refused with
+    /// [`HandoffRecoveryError::LinkRequired`]. The attempt must be the link's
+    /// own target; a crossed attempt is refused with
+    /// [`HandoffRecoveryError::TargetAttemptMismatch`] before any launch. A
+    /// repeated citation of the same bound link reconciles silently instead
+    /// of duplicating evidence. No lifecycle transition happens here:
+    /// launching and running the worker belong to the worker owner, which
+    /// reports actual execution through [`Self::mark_executed`]. Retained
+    /// data stays with its owners; nothing here releases it.
+    pub fn bind_attempt_record(
+        attempt: &mut AgentAttempt,
+        link: &HandoffCausalLink,
+    ) -> Result<(), HandoffRecoveryError> {
+        let revalidation = link
+            .post_resume_revalidation_ref
+            .as_ref()
+            .ok_or(HandoffRecoveryError::LinkRequired)?;
+        if attempt.attempt_id != link.target_attempt_id {
+            return Err(HandoffRecoveryError::TargetAttemptMismatch);
+        }
+        if !attempt.evidence_refs.contains(revalidation) {
+            attempt.evidence_refs.push(revalidation.clone());
+        }
+        attempt.validate()?;
+        Ok(())
+    }
 }
 
 /// Inputs to one recovery-handoff run.
@@ -1124,7 +1156,8 @@ fn advance_floor(
 
 /// Runs the recovery-handoff owners in order (I12.17, I7.15).
 ///
-/// The run gates destructive compaction on durable readback, consumes the
+/// The run gates destructive compaction on durable readback, refuses a resume
+/// whose own retained checkpoint lacks that readback, consumes the
 /// complete retained payload, admits the resume under fresh authority,
 /// dispatches the continuity branch, reconciles every in-flight operation
 /// without duplicating launch or tools, derives the rebuild request when a
@@ -1145,6 +1178,9 @@ pub fn recover_handoff(
         .registry
         .require_compaction_permit(inputs.capture_checkpoint_id)?;
     let retained = inputs.evidence.retained()?;
+    inputs
+        .registry
+        .require_compaction_permit(&retained.checkpoint.checkpoint_id)?;
     advance_floor(intent, HandoffResumeStatus::CompactionObserved)?;
     advance_floor(intent, HandoffResumeStatus::RevalidationPending)?;
     let admission = HandoffResumeGate::admit(inputs.evidence, inputs.observations, intent)?;
