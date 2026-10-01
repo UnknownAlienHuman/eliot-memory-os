@@ -45,6 +45,13 @@ pub mod export_driver;
 /// `watchdog-spool-batch-v1` intent route, and are never removed by compaction
 /// so the original Watchdog record stays linked to the Governor's decision.
 pub(crate) mod intent;
+/// Registered-scope filesystem journal replay (I8.2).
+///
+/// One spool-owned cursor record per journal/source and registered scope
+/// lineage, with bounded page reads, durable normalized evidence, and the
+/// cursor advance in the same owner transaction. See the module for the crash
+/// contract and the explicit-gap table.
+pub(crate) mod journal_replay;
 
 pub use backup::{
     CaptureFenceParams, SpoolCoverageDenominator, SpoolFenceEntryKind,
