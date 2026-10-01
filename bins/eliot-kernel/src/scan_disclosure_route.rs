@@ -2003,14 +2003,32 @@ impl KernelComposition {
             original_lease
                 .validate()
                 .map_err(|_| TransportError::SessionFenced)?;
-            let current_lease = cold_start_inputs
-                .discovery_lease
-                .as_ref()
-                .ok_or(TransportError::SessionFenced)?;
+            let current_lease = cold_start_inputs.discovery_lease.as_ref();
             let original_bootstrap = cold_start_inputs
                 .bootstrap_discovery_inputs
                 .as_ref()
                 .ok_or(TransportError::SessionFenced)?;
+            let current_lease_conflicts = current_lease.is_some_and(|lease| {
+                lease.lease_ref != original_lease.lease_ref
+                    || lease.proposer_ref != original_lease.proposer_ref
+                    || lease.session_ref != original_lease.session_ref
+                    || lease.host_ref != original_lease.host_ref
+                    || lease.root_filesystem_identity_ref
+                        != original_lease.root_filesystem_identity_ref
+                    || lease.candidate_root_ref != original_lease.candidate_root_ref
+                    || lease.allowed_reads != original_lease.allowed_reads
+                    || lease.deadline != original_lease.deadline
+                    || lease.consumption_limit != original_lease.consumption_limit
+                    || lease.consumed > original_lease.consumption_limit
+            });
+            let scan_lease_consumption_conflicts = cold_start_inputs
+                .scan_binding
+                .as_ref()
+                .is_some_and(|binding| {
+                    current_lease.is_none_or(|lease| {
+                        binding.lease_consumed != u64::from(lease.consumed)
+                    })
+                });
             if lifecycle.state != eliot_ors::ActivationLifecycleState::ResultAccepted
                 || lifecycle.ticket_id != current.ticket.ticket_id
                 || lifecycle.ticket_sha256 != current.ticket.ticket_sha256
@@ -2024,25 +2042,19 @@ impl KernelComposition {
                 || original_lease.host_ref != current.ticket.peer_admission_receipt_sha256
                 || original_lease.root_filesystem_identity_ref
                     != original_bootstrap.evidence.filesystem_identity_ref
+                || original_bootstrap.evidence.canonical_root_ref
+                    != original_lease.candidate_root_ref
                 || original_lease.candidate_root_ref != cold_start_inputs.explicit_root_identity
                 || original_lease.deadline != evidence.ticket_deadline_unix_ms
                 || original_lease.allowed_reads
                     != original_bootstrap.evidence.attested_reads
                 || original_lease.consumed != 0
-                || original_lease.lease_ref != current_lease.lease_ref
-                || original_lease.proposer_ref != current_lease.proposer_ref
-                || original_lease.session_ref != current_lease.session_ref
-                || original_lease.host_ref != current_lease.host_ref
-                || original_lease.root_filesystem_identity_ref
-                    != current_lease.root_filesystem_identity_ref
-                || original_lease.candidate_root_ref != current_lease.candidate_root_ref
-                || original_lease.allowed_reads != current_lease.allowed_reads
-                || original_lease.deadline != current_lease.deadline
-                || original_lease.consumption_limit != current_lease.consumption_limit
-                || current_lease.consumed > original_lease.consumption_limit
-                || cold_start_inputs.scan_binding.as_ref().is_some_and(|binding| {
-                    binding.lease_consumed != u64::from(current_lease.consumed)
-                })
+                || (require_discovery_lease && current_lease.is_none())
+                || current_lease_conflicts
+                || scan_lease_consumption_conflicts
+                || (current_lease.is_none()
+                    && (cold_start_inputs.scan_evidence.is_some()
+                        || cold_start_inputs.scan_receipt_handle.is_some()))
                 || cold_start_inputs.task_selection.acceptance_digest != evidence.acceptance_digest
                 || cold_start_inputs.task_selection.task_revision != evidence.task_revision
                 || cold_start_inputs.task_selection.task_ref != evidence.task_id
