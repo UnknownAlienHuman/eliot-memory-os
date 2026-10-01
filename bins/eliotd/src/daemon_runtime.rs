@@ -5658,7 +5658,16 @@ async fn complete_initial_task_scope_binding(
     .map_err(|error| format!("initial discovery owner worker: {error}"))?;
     let (ticket, mut discovery) = match authenticated {
         Ok(value) => value,
-        Err(_) => return task_controller_rejection(&claimed, "initial_discovery_not_admitted"),
+        Err(error) => {
+            return task_controller_result_body(
+                &claimed,
+                serde_json::json!({
+                    "status": "rejected",
+                    "reason": error.code(),
+                    "detail": error.detail(),
+                }),
+            );
+        }
     };
     let now = unix_ms(SystemTime::now())?;
     if now > claimed.attempt.expires_at_unix_ms || now > ticket.kernel_deadline_unix_ms {
