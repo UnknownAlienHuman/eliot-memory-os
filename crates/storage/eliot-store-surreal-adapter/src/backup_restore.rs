@@ -90,14 +90,13 @@ use std::sync::{Mutex, OnceLock};
 use eliot_store_api::{
     BACKUP_IO_CAPABILITY_ISOLATED_RESTORE, BACKUP_IO_RESTORE_SCHEMA_V1,
     BackupOperationReconciliation, BlobResidencyDomain, CanonicalRestoreBatch, ExactJsonBytes,
-    HISTORICAL_TRUNCATION_SIGNATURE, HistoricalRecordDisposition, HistoricalRecordProvenance,
-    IsolatedDestination, IsolatedDestinationReceipt, IsolatedRestorePort, IsolationEvidence,
-    MAX_RESTORE_MEMBERS, OperationId, OperationIdentity, OrderingHeadExpectation,
-    ReconciliationOutcome, RecoveryRecord, RequestMeta, RestoreValidationReceipt,
-    RetainedArchiveMember, RevisionHeadExpectation, SnapshotCompleteness, SnapshotMember,
-    SnapshotMemberType, SnapshotSourceIdentity, StateFence, StoreBackupRequest, StoreError,
-    StoreMutationDisposition, canonical_json_bytes, dispose_historical_record,
-    reconcile_same_operation, sha256_hex,
+    HistoricalRecordDisposition, HistoricalRecordProvenance, IsolatedDestination,
+    IsolatedDestinationReceipt, IsolatedRestorePort, IsolationEvidence, MAX_RESTORE_MEMBERS,
+    OperationId, OperationIdentity, OrderingHeadExpectation, ReconciliationOutcome, RecoveryRecord,
+    RequestMeta, RestoreValidationReceipt, RetainedArchiveMember, RevisionHeadExpectation,
+    SnapshotCompleteness, SnapshotMember, SnapshotMemberType, SnapshotSourceIdentity, StateFence,
+    StoreBackupRequest, StoreError, StoreMutationDisposition, canonical_json_bytes,
+    dispose_historical_record, reconcile_same_operation, sha256_hex,
 };
 use serde::{Deserialize, Serialize};
 
@@ -241,7 +240,7 @@ struct RestoreMemberRecord {
     /// label is by construction a member this operation refused before the
     /// commit, and the readback re-derives that refusal instead of reporting a
     /// successful import.
-#[serde(default)]
+    #[serde(default)]
     history: Option<MemberHistoryDisposition>,
 }
 
@@ -305,7 +304,11 @@ impl MemberHistoryDisposition {
     /// record, which is the conservative direction: it can only ever refuse an
     /// import, never enable one.
     const fn worse(self, other: Self) -> Self {
-        rank(self).max(rank(other))
+        if Self::rank(other) > Self::rank(self) {
+            other
+        } else {
+            self
+        }
     }
 
     /// Severity rank of this label; a higher rank is the stronger claim.
@@ -449,8 +452,7 @@ impl RestoreHistoryInventory {
             return Err(StoreError::InvalidReceipt);
         }
         if self.corrupted_stale_unreconstructable > 0
-            && self.corrupted_stale_signature
-                != eliot_store_api::HISTORICAL_TRUNCATION_SIGNATURE
+            && self.corrupted_stale_signature != eliot_store_api::HISTORICAL_TRUNCATION_SIGNATURE
         {
             return Err(StoreError::InvalidReceipt);
         }
@@ -3029,7 +3031,7 @@ async fn resolve_archive_members(
             class: carrier.class,
             record_id: carrier.record_id,
             payload: carrier.payload,
-            payload_digest,
+            payload_digest: payload_digest.clone(),
             history: dispose_resolved_member_history(batch, &payload_bytes, &payload_digest)?,
         }));
     }
@@ -3135,9 +3137,8 @@ fn written_before_record_coercion_fix(source_schema: &str) -> bool {
 /// Parses one exact source byte string into the value tree the historical
 /// predicate walks.
 fn source_bytes_value(source_bytes: &[u8]) -> Result<serde_json::Value, StoreError> {
-    serde_json::from_slice(source_bytes).map_err(|error| {
-        StoreError::Serialization(redact_serialization(&error.to_string()))
-    })
+    serde_json::from_slice(source_bytes)
+        .map_err(|error| StoreError::Serialization(redact_serialization(&error.to_string())))
 }
 
 /// Reports the strongest historical verdict present anywhere in one value tree.
@@ -3659,7 +3660,10 @@ fn observed_outcome(
         // A member marked corrupted/stale or unverified is quarantined by
         // construction: this path never imports one. A record that claims
         // otherwise is refused rather than reported ready.
-        if member.history.is_some_and(MemberHistoryDisposition::is_quarantine) {
+        if member
+            .history
+            .is_some_and(MemberHistoryDisposition::is_quarantine)
+        {
             return Err(StoreError::InvalidReceipt);
         }
         match member.disposition {
@@ -4939,7 +4943,8 @@ impl SurrealStoreAdapter {
         let history = RestoreHistoryInventory::from_members(
             &members,
             HistoricalRecordProvenance {
-                written_before_record_coercion_fix: document.history
+                written_before_record_coercion_fix: document
+                    .history
                     .written_before_record_coercion_fix,
                 exact_source_bytes_available: true,
             },
