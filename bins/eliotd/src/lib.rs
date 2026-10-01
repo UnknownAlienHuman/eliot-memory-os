@@ -201,8 +201,9 @@ pub use capability_admission::{
 };
 pub use capability_evidence_wiring::{
     CapabilityHydrationReport, EvidenceBridgeError, EvidenceRecordPage,
-    GovernorCapabilityAdmission, ObservedLifecycleSummary, ScopeChangeRestrictionReport,
-    commit_scope_change_restriction, drain_capability_evidence_records,
+    GovernorCapabilityAdmission, ObservedLifecycleSummary, ProductionObservationReport,
+    ScopeChangeRestrictionReport, commit_production_observation, commit_scope_change_restriction,
+    drain_capability_evidence_records, evidence_scope_for_observed_route,
 };
 pub use capability_outcome::{
     AttemptReceipt, CapabilityOutcome, CapabilityRegistryView, DegradationProjection,
