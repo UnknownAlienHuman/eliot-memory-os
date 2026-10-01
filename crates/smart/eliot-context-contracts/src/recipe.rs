@@ -1841,7 +1841,7 @@ impl ContextRecipePolicy {
         // It is now the one member of `RecipeExecutionSupport` this function reads
         // against a value derived from the policy's OWN layout scheme, and a
         // mismatch refuses by name.
-        if support.ordering_revision.as_str() != self.declared_ordering_revision() {
+        if support.ordering_revision.as_str() != Self::declared_ordering_revision() {
             return Err(unsupported("recipe_support.ordering_revision"));
         }
         // `layout.role_positions` needs no comparison here: the renderer APPLIES
@@ -1894,7 +1894,7 @@ impl ContextRecipePolicy {
     /// stamps a view (`executed_ordering_revision` in eliot-context-assembly), so
     /// the identity of two revisions with different declared orders still differs
     /// on the view while the SCHEME this contract authorises is one string.
-    fn declared_ordering_revision(&self) -> String {
+    fn declared_ordering_revision() -> String {
         EXECUTED_ORDERING_REVISION.to_owned()
     }
 
