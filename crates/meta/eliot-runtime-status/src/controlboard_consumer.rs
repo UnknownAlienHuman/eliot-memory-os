@@ -17,7 +17,12 @@
 //!   is in scope.
 //!
 //! Denominator: [`ControlBoardExpectedSet`] is frozen at construction (sorted,
-//! deduplicated, immutable). [`render_controlboard_status`] emits exactly one
+//! deduplicated, immutable) and those frozen invariants are re-established by
+//! [`ControlBoardExpectedSet::validate`] on every render, so a deserialized
+//! denominator cannot be unsorted or duplicated — a drifted order would
+//! otherwise defeat the sorted-order precondition that
+//! [`ControlBoardExpectedSet::contains`]'s binary search depends on.
+//! [`render_controlboard_status`] emits exactly one
 //! [`RenderedControlBoardRow`] per expected entry, in frozen order. An expected
 //! entry absent from the contour renders
 //! [`ControlBoardRowDisposition::Missing`]; it can never disappear. Observed
@@ -29,7 +34,11 @@
 //! projected view proves nothing about liveness, readiness, support, or product
 //! state — unless the operator supplies an explicit typed override selected
 //! from independent evidence. Overrides never apply to unobserved rows: an
-//! absent entry is always `Missing`, never resurrected by an override. There is
+//! absent entry is always `Missing`, never resurrected by an override. The
+//! asymmetry is also closed in the other direction, so one frozen denominator
+//! yields exactly one consistent reading: an override may not mark an observed
+//! row `Missing`, because that would make `observed_count`, `missing_count` and
+//! `was_observed()` disagree about the same row. There is
 //! intentionally no health predicate: no method here reports green, ready, or
 //! healthy, and disposition labels never collapse to a color or scalar.
 //! Dispositions are observation states only; they are never copied into
@@ -363,6 +372,14 @@ impl ControlBoardObservationContext {
 /// Entries are validated for shape, deduplicated, sorted, and then immutable:
 /// the denominator cannot drift between construction and render. An empty
 /// denominator is rejected — composition must name at least one expected row.
+///
+/// The frozen invariants are re-checked by [`Self::validate`] on every render,
+/// because this type is `Deserialize`-able: `#[serde(transparent)]` over the
+/// private vector reconstructs the inner entries without ever calling
+/// [`Self::new`], so a deserialized set could otherwise be unsorted or
+/// duplicated and silently defeat the sorted-order precondition that
+/// [`Self::contains`]'s binary search depends on. A sorted, deduplicated,
+/// bounded, non-empty set is the only value this type can hold.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ControlBoardExpectedSet {
@@ -370,6 +387,42 @@ pub struct ControlBoardExpectedSet {
 }
 
 impl ControlBoardExpectedSet {
+    /// Re-establishes the frozen invariants on every render so deserialized
+    /// denominators cannot bypass construction guards, exactly as
+    /// [`ControlBoardObservationContext::validate`] does for its four bindings.
+    ///
+    /// The check is deliberately not `Self::new(self.entries.clone())`: that
+    /// would re-sort a drifted set and *repair* it instead of refusing it,
+    /// letting a caller observe a denominator it never declared. Every
+    /// invariant is therefore compared against the stored value itself.
+    pub fn validate(&self) -> Result<(), ControlBoardConsumerError> {
+        if self.entries.is_empty() {
+            return Err(ControlBoardConsumerError::EmptyExpectedSet);
+        }
+        if self.entries.len() > MAX_CONSUMER_ROWS {
+            return Err(ControlBoardConsumerError::Oversized {
+                field: "expected_set",
+            });
+        }
+        for id in &self.entries {
+            bound_text(id, "expected_set.entry_id")?;
+        }
+        for pair in self.entries.windows(2) {
+            if pair[0] > pair[1] {
+                return Err(ControlBoardConsumerError::UnsortedExpectedSet {
+                    entry_id: pair[1].clone(),
+                    previous: pair[0].clone(),
+                });
+            }
+            if pair[0] == pair[1] {
+                return Err(ControlBoardConsumerError::DuplicateExpectedId {
+                    entry_id: pair[0].clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Freezes one denominator from caller-supplied entry identities.
     pub fn new(mut ids: Vec<String>) -> Result<Self, ControlBoardConsumerError> {
         if ids.is_empty() {
@@ -590,10 +643,33 @@ pub enum ControlBoardConsumerError {
         /// Colliding entry identity.
         entry_id: String,
     },
+    /// The denominator is not in the frozen sorted order that
+    /// [`ControlBoardExpectedSet::contains`]'s membership test requires.
+    ///
+    /// Only a `Deserialize`-reconstructed set can reach this: a set built by
+    /// [`ControlBoardExpectedSet::new`] is sorted before it is stored.
+    #[error("controlboard expected set is not frozen-sorted: {entry_id} follows {previous}")]
+    UnsortedExpectedSet {
+        /// The out-of-order entry identity.
+        entry_id: String,
+        /// The identity that must have sorted after it.
+        previous: String,
+    },
     /// An override names an entry outside the frozen denominator.
     #[error("controlboard disposition override outside denominator: {entry_id}")]
     OverrideOutsideDenominator {
         /// Override entry identity not present in the denominator.
+        entry_id: String,
+    },
+    /// An override tried to mark an OBSERVED row `Missing`.
+    ///
+    /// `Missing` is the reconciliation-set denominator-gap state; an override is
+    /// the operator's independent-evidence disposition for a row this read did
+    /// observe. Allowing the second to assert the first makes the board's own
+    /// counters and its own row labels disagree.
+    #[error("controlboard override may not mark an observed row missing: {entry_id}")]
+    MissingOverrideOnObservedRow {
+        /// The observed entry identity the override targeted.
         entry_id: String,
     },
     /// The observation time is the zero sentinel, never a real observation.
@@ -666,6 +742,9 @@ pub fn render_controlboard_status(
     overrides: &BTreeMap<String, ControlBoardRowDisposition>,
 ) -> Result<RenderedControlBoard, ControlBoardConsumerError> {
     context.validate()?;
+    // Both observer-supplied inputs are re-validated on every render, so a
+    // deserialized value cannot bypass a construction guard.
+    expected.validate()?;
     for key in overrides.keys() {
         if !expected.contains(key) {
             return Err(ControlBoardConsumerError::OverrideOutsideDenominator {
@@ -697,6 +776,17 @@ pub fn render_controlboard_status(
             .get(entry_id.as_str())
             .copied()
             .unwrap_or(ControlBoardRowDisposition::Unknown);
+        // `Missing` is set by reconciliation, never by override: an entry that
+        // WAS observed cannot be reported as never observed, because that makes
+        // `observed_count`, `missing_count` and `disposition.was_observed()`
+        // disagree about the same frozen denominator. The asymmetry stays one
+        // way — an unobserved entry is already `Missing` and is never offered
+        // an override at all.
+        if disposition == ControlBoardRowDisposition::Missing {
+            return Err(ControlBoardConsumerError::MissingOverrideOnObservedRow {
+                entry_id: entry_id.clone(),
+            });
+        }
         rows.push(rendered_row(
             entry_id,
             Some(observed),
