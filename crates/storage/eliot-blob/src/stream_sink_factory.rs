@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use eliot_blob_api::BlobStoreClient;
+use eliot_blob_api::{
+    BlobError, BlobProcessStreamReadbackRequest, BlobReadChunk, BlobReceiptContext, BlobRootLease,
+    BlobStoreClient,
+};
 use eliot_process::{
     ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
     ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
@@ -58,6 +61,33 @@ where
             max_sessions,
             sessions: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Borrows the one injected Blob service handle. Cloning this handle does
+    /// not claim a root or create another receipt issuer.
+    #[must_use]
+    pub const fn store_client(&self) -> &C {
+        &self.store
+    }
+
+    /// Resolves a previously committed process source using its original
+    /// owner-bound selector and a separately supplied current read authority.
+    /// This adapter deliberately accepts the exact typed current context and
+    /// root lease from the authority owner; it never derives either from the
+    /// source selector or stream identity.
+    pub async fn read_source_with_current_authority(
+        &self,
+        request: BlobProcessStreamReadbackRequest,
+        current_context: BlobReceiptContext,
+        current_root_lease: BlobRootLease,
+    ) -> Result<BlobReadChunk, BlobError> {
+        self.store
+            .read_process_stream_source_authorized_context(
+                request,
+                current_context,
+                current_root_lease,
+            )
+            .await
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<BlobStoreStreamSink<C>>>> {

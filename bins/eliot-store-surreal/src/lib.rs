@@ -18,7 +18,7 @@ use eliot_blob::{
 };
 use eliot_blob_api::wire::{
     BlobProcessStreamVerifiedOwnerFacts, ProcessStreamSourceReadbackRequest,
-    ProcessStreamSourceReadbackResponse,
+    ProcessStreamSourceReadbackReady, ProcessStreamSourceReadbackResponse,
 };
 use eliot_blob_api::{
     BlobHash, BlobProcessStreamReadbackRequest, BlobProcessStreamSourceBinding, BlobStoreClient,
@@ -358,6 +358,11 @@ pub struct StoreComposition {
     /// all request/session handles. No caller can substitute another root
     /// owner through this accessor.
     blob_service: Mutex<Option<Arc<dyn BlobStoreClient>>>,
+    /// Physical owner tuple/generation pinned by the first service install.
+    /// Per-operation request fences are checked separately by the resolver
+    /// and Blob receipt contexts; they must not silently replace this root
+    /// generation on later demands.
+    blob_service_root_lease: Mutex<Option<eliot_blob_api::BlobRootLease>>,
     blob_stream_sinks: tokio::sync::Mutex<BTreeMap<(String, String), RetainedBlobStreamSink>>,
     blob_stream_authority: Mutex<Option<Arc<dyn BlobStreamAuthorityResolver>>>,
     blob_root_path: PathBuf,
@@ -528,6 +533,7 @@ impl StoreComposition {
             store,
             blob,
             blob_service: Mutex::new(None),
+            blob_service_root_lease: Mutex::new(None),
             blob_stream_sinks: tokio::sync::Mutex::new(BTreeMap::new()),
             blob_stream_authority: Mutex::new(None),
             blob_root_path: PathBuf::from(config.blob_root.clone()),
@@ -577,11 +583,28 @@ impl StoreComposition {
         &self,
         lease: eliot_blob_api::BlobRootLease,
     ) -> Result<Arc<dyn BlobStoreClient>, String> {
+        lease
+            .validate()
+            .map_err(|error| format!("invalid Store-owned Blob root lease: {error}"))?;
         let mut retained = self
             .blob_service
             .lock()
             .map_err(|_| "Blob service composition lock poisoned".to_owned())?;
         if let Some(client) = retained.as_ref() {
+            let pinned = self
+                .blob_service_root_lease
+                .lock()
+                .map_err(|_| "Blob service root lease lock poisoned".to_owned())?;
+            let Some(pinned) = pinned.as_ref() else {
+                return Err("Blob service has no retained physical root binding".to_owned());
+            };
+            if pinned.root_id != lease.root_id
+                || pinned.owner_id != lease.owner_id
+                || pinned.lease_id != lease.lease_id
+                || pinned.root_generation != lease.root_generation
+            {
+                return Err("Blob demand changed the retained root owner or generation".to_owned());
+            }
             return Ok(Arc::clone(client));
         }
         let platform = WindowsBlobPlatformPort::new(self.blob_root_path.clone())
@@ -601,9 +624,23 @@ impl StoreComposition {
             live_sets: eliot_blob::UnavailableBlobLiveSetPort,
             issuer_anchor,
         };
+        let pinned_root_lease = lease.clone();
         let service = BlobStoreService::new_with_owner(&self.blob, lease, ports)
             .map_err(|error| format!("construct owner-bound Blob service: {error}"))?;
         let client: Arc<dyn BlobStoreClient> = Arc::new(service);
+        let pinned_lease = self
+            .blob_service_root_lease
+            .lock()
+            .map_err(|_| "Blob service root lease lock poisoned".to_owned())?;
+        if pinned_lease.is_some() {
+            return Err("Blob service root lease was already installed".to_owned());
+        }
+        drop(pinned_lease);
+        *self
+            .blob_service_root_lease
+            .lock()
+            .map_err(|_| "Blob service root lease lock poisoned".to_owned())? =
+            Some(pinned_root_lease);
         *retained = Some(Arc::clone(&client));
         Ok(client)
     }
@@ -1246,8 +1283,20 @@ impl StoreComposition {
         let observed_sha256 = format!("{:x}", Sha256::digest(&bytes));
         let observed_byte_length =
             u64::try_from(bytes.len()).map_err(|_| ProcessStreamSinkError::ProviderUnavailable)?;
+        let owner_facts_bytes = canonical_json_bytes(&request.owner_facts).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "blob_process_stream_owner_facts",
+                reason: error.to_string(),
+            }
+        })?;
+        let owner_facts_json = String::from_utf8(owner_facts_bytes.clone()).map_err(|error| {
+            ProcessStreamSinkError::Serialization {
+                field: "blob_process_stream_owner_facts",
+                reason: error.to_string(),
+            }
+        })?;
         Ok(ProcessStreamSourceReadbackResponse::Ready(Box::new(
-            eliot_blob_api::wire::ProcessStreamSourceReadbackReady {
+            ProcessStreamSourceReadbackReady {
                 bytes,
                 whole_source_sha256: readback.ready_receipt().plaintext_sha256().to_owned(),
                 whole_source_byte_length: readback.ready_receipt().plaintext_length(),
@@ -1259,6 +1308,21 @@ impl StoreComposition {
                 readback_receipt_id: readback.receipt().identity.receipt_id.to_string(),
                 observed_fence: identity.request.state_fence.clone(),
                 observed_at_unix_ms: current_unix_ms(),
+                owner_facts_sha256: sha256_hex(&owner_facts_bytes),
+                owner_facts_json,
+                module_catalog_owner_readback_json: request.module_catalog_owner_readback_json,
+                module_catalog_owner_readback_sha256: request
+                    .module_catalog_owner_readback_sha256,
+                generation_admission_json: request.generation_admission_json,
+                generation_admission_sha256: request.generation_admission_sha256,
+                process_source_admission_readback_json: request
+                    .process_source_admission_readback_json,
+                process_source_admission_readback_sha256: request
+                    .process_source_admission_readback_sha256,
+                source_admission_write_receipt_json: request
+                    .source_admission_write_receipt_json,
+                source_admission_write_receipt_sha256: request
+                    .source_admission_write_receipt_sha256,
             },
         )))
     }
