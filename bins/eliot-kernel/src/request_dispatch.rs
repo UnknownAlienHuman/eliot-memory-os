@@ -32,8 +32,11 @@
 //!   `KernelBackupCapture::capture` consumes a caller-issued
 //!   `CaptureCallerAuth`, a `PublicationPort` that publishes exactly once, and
 //!   an already-accepted `CaptureRequest` evidence bundle, and NEITHER the port
-//!   nor the bundle has a production producer on this tree (the port's only
-//!   implementation is `MemPublisher` inside
+//!   nor the bundle has a production producer on this tree (a production
+//!   `PublicationPort` implementation exists in
+//!   `crates/storage/eliot-blob/src/publication_owner.rs` but is never
+//!   constructed and `eliot-blob` is not a dependency of this crate; the only
+//!   implementation ever instantiated is `MemPublisher` inside
 //!   `bins/eliot-kernel/tests/backup_capture.rs`; `request_from_ports` and
 //!   `EbpCanonicalStoreClient::backup_begin`/`backup_page`/`backup_end` have no
 //!   production caller). Admitting capture here would invent authority, so the
@@ -653,10 +656,17 @@ fn invalid_reply(command: &str, idempotency_key: &str, field: &str, reason: &str
 /// rather than as a field-shape failure.
 ///
 /// State the limit honestly, because it decides how much this constant is
-/// worth: NO production owner can currently EMIT a cancellation.
-/// `KernelBackupCapture::verify_only` returns only `CaptureState::Complete` or
-/// `CaptureState::Incomplete`, and `KernelCaptureError::Cancelled` and
-/// `KernelCaptureError::Unsupported` are constructed nowhere in the tree. So
+/// worth: no production owner can currently EMIT a cancellation THROUGH THIS
+/// ROUTE. `KernelBackupCapture::verify_only` returns only `CaptureState::Complete`
+/// or `CaptureState::Incomplete`, and that is the only entry this route calls.
+/// Be precise about the narrower claim, because the broader one is false:
+/// `KernelCaptureError::Cancelled` IS constructed in production code, by
+/// `CaptureBudgets::check_duration` (`backup_capture_ports.rs`, reached from
+/// `KernelBackupCapture::capture` via `CaptureDuration::check`/`is_spent`), and
+/// `CaptureState::Cancelled` is built there by `cancelled_report`. Both live on
+/// the `capture` path, which has zero production callers.
+/// `KernelCaptureError::Unsupported` is genuinely constructed nowhere in the
+/// tree. So
 /// this is a correct and exhaustive mapping of the owner's PUBLISHED state
 /// vocabulary, not a demonstrated runtime event: no operator has yet seen a
 /// cancellation misreported, and this route does not pretend otherwise. What
@@ -765,9 +775,15 @@ fn cancellation_reply(idempotency_key: &str, owner_reason: &str) -> Value {
 ///    production caller, and the accepted read is ASYNC while
 ///    `KernelComposition::dispatch_backup_frame` is the synchronous frame
 ///    route.
-/// 2. a production `PublicationPort`. `capture` publishes exactly once through
-///    it and reconciles a lost response by operation identity through it; the
-///    only implementation in the repository is `MemPublisher` inside
+/// 2. a constructed, reachable `PublicationPort`. `capture` publishes exactly
+///    once through it and reconciles a lost response by operation identity
+///    through it. A production implementation DOES exist
+///    (`crates/storage/eliot-blob/src/publication_owner.rs`,
+///    `BlobArchivePublicationOwner`), so the missing leg is construction and
+///    binding rather than the implementation itself: that type has zero callers
+///    anywhere in the tree, and `eliot-blob` is not a dependency of
+///    `eliot-kernel`. The only implementation ever instantiated on this product
+///    is still the test-local `MemPublisher` in
 ///    `bins/eliot-kernel/tests/backup_capture.rs`.
 /// 3. a `FrozenCapturePlan` whose `build_digest` and `policy_digest` are
 ///    owner-ISSUED approved 64-hex digests. This route holds no such digest and
@@ -1041,8 +1057,8 @@ fn capture_error_reply(idempotency_key: &str, error: &KernelCaptureError) -> Val
 /// `backup_id` and `class` are text the archive declares about itself and the
 /// owner re-validates for internal consistency, and `archive_sha256` is computed by
 /// the archive format itself (`BackupBundle::bundle_sha256`) — none of the three is
-/// proved against a capture owner, because no production `impl PublicationPort`
-/// exists on this path and `verify_only` therefore always answers
+/// proved against a capture owner, because `verify_only` takes no
+/// `PublicationPort` at all and therefore always answers
 /// `StructurallyValidCandidate`. That is exactly why the surface reports a
 /// structurally valid archive as a `candidate` and never as `verified`.
 ///
@@ -1184,9 +1200,12 @@ fn verified_reply(
         );
     }
     // Explicitly null, never omitted: no retained-artifact owner issues a
-    // capture receipt on this path. The missing symbol is a production
-    // `impl PublicationPort`; the only implementation is `MemPublisher` inside
-    // `bins/eliot-kernel/tests/backup_capture.rs`.
+    // capture receipt on this path, because `verify_only` is handed no
+    // publisher. The missing leg is a constructed, reachable
+    // `PublicationPort`: the production implementation in
+    // `crates/storage/eliot-blob/src/publication_owner.rs` has zero callers,
+    // and the only implementation ever instantiated on this product is
+    // `MemPublisher` inside `bins/eliot-kernel/tests/backup_capture.rs`.
     let capture_receipt = projection
         .capture_receipt
         .clone()
@@ -1615,10 +1634,11 @@ fn backup_verify_admitted_identity(
         capture_receipt: None,
         // #2862: the three owner-evidence commitments. Absent here for the same
         // reason the eight terms above are empty, and the absence is
-        // load-bearing rather than a placeholder: no production
-        // `impl PublicationPort` resolves a retained handle on this path (the
-        // only implementation is `MemPublisher` in
-        // `bins/eliot-kernel/tests/backup_capture.rs`), and no
+        // load-bearing rather than a placeholder: no constructed, reachable
+        // `PublicationPort` resolves a retained handle on this path (the
+        // production implementation in `crates/storage/eliot-blob` is never
+        // constructed, and the only implementation ever instantiated is
+        // `MemPublisher` in `bins/eliot-kernel/tests/backup_capture.rs`), and no
         // `BackupRole::Verifier` session issues a capture receipt or an archive
         // validity attestation on this product at all. They are recorded as the
         // owner's own answer and are never filled from caller text; ORS

@@ -203,10 +203,14 @@ pub const BACKUP_STATE_UNKNOWN: &str = "unknown";
 /// backup existence from being recovery proof in any case.
 ///
 /// The same limit as on the Kernel side, stated here so neither projection can
-/// be read as a claim about an observed event: no production capture owner can
-/// currently emit a cancellation (`KernelBackupCapture::verify_only` returns
-/// only `Complete` or `Incomplete`), so this arm decodes a state the Kernel
-/// does not yet produce. It is a correct mapping of the published vocabulary,
+/// be read as a claim about an observed event: no cancellation reaches THIS
+/// wire vocabulary in production, because the only capture entry the production
+/// front door calls is `KernelBackupCapture::verify_only`, which returns just
+/// `Complete` or `Incomplete`. Be precise about the narrower claim — a
+/// cancellation state and a `KernelCaptureError::Cancelled` refusal ARE built in
+/// production code, on `KernelBackupCapture::capture`, which itself has zero
+/// production callers. So this arm decodes a state the Kernel does not yet
+/// produce over this route. It is a correct mapping of the published vocabulary,
 /// not a repaired incident.
 pub const BACKUP_STATE_CANCELLED: &str = "cancelled";
 

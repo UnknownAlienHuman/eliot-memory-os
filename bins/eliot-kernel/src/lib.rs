@@ -742,10 +742,10 @@ pub struct KernelComposition {
     backup_capture: KernelBackupCapture,
     /// The exact-owner backup channel clients bound in production assembly
     /// (issue #962). Held on the composition, not in process-global state: the
-    /// actual Host and Watchdog clients are constructed once here and every
-    /// requester reaches *these* clients through
-    /// [`KernelComposition::backup_owner_clients`], so a fresh or fake client
-    /// can never stand in for the bound pair.
+    /// actual Host and Watchdog clients are constructed once here, so a fresh or
+    /// fake client can never stand in for the bound pair. Whether any route
+    /// actually reaches them is a separate question this field does not answer —
+    /// see [`KernelComposition::backup_owner_clients`].
     backup_owner_clients: BackupOwnerClients,
     #[cfg(windows)]
     canonical_store_gateway: Mutex<Option<Arc<KernelStoreGateway>>>,
@@ -881,8 +881,11 @@ impl KernelComposition {
     /// (`request_dispatch.rs`, `handle_backup_verify`), so the object is
     /// reached on the production front door today. What is still absent is the
     /// *capture* side of it — `capture` and `request_from_ports` have no
-    /// production caller and no production [`PublicationPort`] provider, which
-    /// is the owner-blocked half this issue's `backup.create` leg refuses with
+    /// production caller, and no [`PublicationPort`] provider is ever
+    /// constructed for them (the production implementation in
+    /// `crates/storage/eliot-blob/src/publication_owner.rs` has zero callers,
+    /// and `eliot-blob` is not a dependency of this crate). That is the
+    /// owner-blocked half this issue's `backup.create` leg refuses with
     /// `plan_gap` naming #959.
     #[must_use]
     pub fn backup_capture(&self) -> &KernelBackupCapture {
@@ -894,10 +897,18 @@ impl KernelComposition {
     ///
     /// These are the actual bound clients, not freshly constructed ones: the
     /// composition owns them, so a caller cannot reach a differently-bound,
-    /// fake or no-op owner. Which owner serves a given operation is resolved by
-    /// [`BackupOwnerClients::route`] from the *authenticated* requester, never
-    /// from the payload, because `RestoreStatus` and `ReconcileRestore` are
-    /// served by both owners.
+    /// fake or no-op owner.
+    ///
+    /// What is NOT true today is the routing half. [`BackupOwnerClients::route`]
+    /// exists and is documented as resolving the serving owner from the
+    /// authenticated requester rather than from the payload, but it has ZERO
+    /// callers: `git grep` for `BackupOwnerClients` and for `.route(` on this
+    /// type matches only the type's own definition and its doc links. This
+    /// accessor itself likewise has zero production callers outside its own
+    /// definition. So the binding is real and the resolution is not wired: no
+    /// route resolves an owner through this value on the production front door
+    /// yet. Wiring it is #962's remaining leg, and the reason it is named here
+    /// is that a reader must not infer a live dispatch from a bound field.
     #[must_use]
     pub const fn backup_owner_clients(&self) -> &BackupOwnerClients {
         &self.backup_owner_clients

@@ -222,11 +222,20 @@ pub enum CaptureState {
 ///
 /// A [`StructurallyValidCandidate`] is never promoted to
 /// [`ProvenanceBoundCapture`] by this owner, because no retained-artifact owner
-/// exists in the repository today: there is no production
-/// `impl PublicationPort` (the only implementation is `MemPublisher` inside
-/// `bins/eliot-kernel/tests/backup_capture.rs`), and
-/// `KernelBackupCapture::capture` / `request_from_ports` have zero production
-/// callers. Nothing here may invent a capture receipt to cross that gap.
+/// reaches it in production today. The production `PublicationPort`
+/// implementation DOES exist —
+/// `eliot_blob::BlobArchivePublicationOwner` implements the trait in
+/// `crates/storage/eliot-blob/src/publication_owner.rs` — but it has ZERO
+/// production callers: `git grep BlobArchivePublicationOwner` matches only its
+/// own definition, its trait impl and the crate's own re-export, so nothing
+/// constructs it and nothing calls it. What is missing is therefore the
+/// CONSTRUCTION AND BINDING, not the implementation, and the same is true of the
+/// entry points: `KernelBackupCapture::capture` and `request_from_ports` have
+/// zero production callers (the only `.capture(` call sites on this type are in
+/// `bins/eliot-kernel/tests/backup_capture.rs`). Note also that `eliot-blob` is
+/// not a dependency of `eliot-kernel`, so that implementation is not even
+/// reachable from this crate without a new manifest edge. Nothing here may
+/// invent a capture receipt to cross that gap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureEvidenceLevel {
     /// Bytes that decode and validate internally; carries no retained capture
@@ -385,8 +394,11 @@ pub enum ArchiveFenceProof {
     /// validated, with no retained-capture provenance behind it. Structural
     /// validity plus a relation is still an untrusted candidate (I5.13: "Backup
     /// existence is not recovery proof"), and this variant is the ONLY value a
-    /// `verify_only` answer can carry today, because no production
-    /// `impl PublicationPort` issues a capture receipt on that path.
+    /// `verify_only` answer can carry today, because no `PublicationPort`
+    /// implementation issues a capture receipt on that path. `verify_only` takes
+    /// no publisher at all, so nothing could bind one here even if one were
+    /// reachable (see the `CaptureEvidenceLevel` doc: a production
+    /// implementation exists but is never constructed).
     StructuralOnly,
     /// Bound to the owner-issued publication receipt identity that proves this
     /// installation produced the archive. Only this variant licenses the words
@@ -480,7 +492,8 @@ pub fn archived_state_fence_digest(fence: &StateFence) -> Result<String, KernelC
 /// ARCHIVE declares about itself and this owner re-validates for internal
 /// consistency — the export fence is re-checked by the bundle's own `validate`,
 /// and the manifest's digest binding is re-computed — but they are NOT proved
-/// against a capture owner, because none exists on this path. Equal bytes
+/// against a capture owner, because this report type is produced on the
+/// verification-only path, which is handed no publisher. Equal bytes
 /// exported by a different owner, from a different installation, or under a
 /// different export fence are therefore a different request (I5.27: "archive
 /// SHA-256 alone is content integrity, not the source/capture operation
@@ -836,7 +849,9 @@ impl KernelBackupCapture {
             classify_archived_fence(&bundle.export_fence.state_fence, kernel_fence);
         // Nothing on this path authenticates the archive as produced by THIS
         // installation: no retained-artifact owner issues a capture receipt here
-        // (there is no production `impl PublicationPort`), so a relation computed
+        // (`verify_only` takes no publisher, and the one production
+        // `PublicationPort` implementation in the tree is never constructed), so a
+        // relation computed
         // from caller-presented bytes is unproven structural evidence whatever
         // the relation is. #2862 owns the producer that will change this.
         let archived_fence_proof = ArchiveFenceProof::StructuralOnly;
