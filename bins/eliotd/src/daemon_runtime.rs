@@ -46,6 +46,7 @@
 //! `eliotd::task_binding_admission`'s "Measured reachability" section.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -54,6 +55,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use eliot_contracts::{
+    ClockReading, ProductId, RequestId, RequestMetadata, SessionId, SourceId, StateFence, TaskId,
+    canonical_json_bytes, sha256_hex,
+};
 use eliot_governor::{KernelGenerationSnapshotProvider, KernelTransitionPort};
 use eliot_improvement::candidate_bounds::BoundedBacklog;
 use eliot_protocol::{
@@ -62,8 +67,14 @@ use eliot_protocol::{
     AgentActivationResolutionTicket, AgentActivationResultAck, AgentActivationResultAckOutcome,
     AgentActivationResultReconcile, host_request_operation_id,
 };
+use eliot_read::{
+    CurrentStateView, NamedParameters, ReadApi, ReadOrderingBinding, ReadService, StateRequest,
+};
 use eliot_runtime_contracts::DaemonProgressChannel;
-use eliot_store_api::{StoreHealth, StoreHealthStatus};
+use eliot_store_api::{
+    CanonicalReadClient, EVIDENCE_PACK_MAX_RECORDS, NamedReadOperation, ReadConsistency,
+    RevisionKey, ScopeId, StoreHealth, StoreHealthStatus,
+};
 use eliotd::diagnostics::RepeatedFailureGuard;
 use eliotd::startup_capability_bindings::{
     DeclaredStartupCapability, RetainedStartupBinding, StartupBindingDisposition,
@@ -493,6 +504,153 @@ fn decide_local_read_tick(flight: &LocalReadFlight) -> LocalReadTickDecision {
     match flight {
         LocalReadFlight::Idle => LocalReadTickDecision::StartPoll,
         LocalReadFlight::InFlight(_) => LocalReadTickDecision::SkipInFlight,
+    }
+}
+
+/// #2564 I4/AUD-S13: the closed local-read FORM discriminator for one claimed
+/// pair, resolved BEFORE any serving branch and never inferred from prose.
+///
+/// A pair's form is decided by exactly two independently-checked facts that
+/// must agree: the envelope's declared capability and the tool name the
+/// admitted envelope actually carries. When they disagree the form is
+/// [`Self::Refused`], not a guess — that is the shape
+/// `claim_local_read_pair_async` already rejects closed for a mismatched
+/// capability/tool name, and this enum keeps that refusal typed instead of
+/// letting an unmatched pair fall through to whichever branch happens to match
+/// first.
+///
+/// The variants are deliberately CLOSED and non-convertible. There is no
+/// `Query`-from-`eliot.state` coercion in either direction:
+/// [`Self::Query`] is only `eliot.query`, [`Self::State`] is only
+/// `eliot.state`, and [`Self::Skill`] is only the four Skill lifecycle names.
+/// A state pair therefore cannot reach the query serving branches (which are
+/// all gated on `Self::Query`), and a query pair cannot reach the state leg
+/// (gated on `Self::State`) without the daemon first observing the carrier
+/// hand it over as a state pair — which W-A's carrier-side discriminator owns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalReadForm {
+    Query,
+    State,
+    Skill,
+    /// The claimed pair's declared capability and its admitted tool name do
+    /// not agree, or name no form this daemon serves. Never dispatched.
+    Refused,
+}
+
+impl LocalReadForm {
+    /// Resolves the closed form of one claimed pair, refusing any
+    /// capability/tool-name disagreement instead of picking a branch.
+    fn of(envelope: &eliot_protocol::HostRequestEnvelope, tool: &serde_json::Value) -> Self {
+        let tool_name = tool.get("name").and_then(serde_json::Value::as_str);
+        match (envelope.identity.capability.as_str(), tool_name) {
+            ("eliot.query", Some("eliot.query")) => Self::Query,
+            // A state pair is recognizable by NAME alone. The carrier-side
+            // discriminator that W-A adds is the authority that a queued pair
+            // is really a state pair; this side refuses to serve a state pair
+            // as a query the moment the name says `eliot.state`, which is the
+            // capability confusion the audit calls worse than an honest
+            // refusal. A mismatched `name` value fails closed upstream in
+            // `claim_local_read_pair_async`, so both facts are re-checked here.
+            ("eliot.state", Some("eliot.state")) => Self::State,
+            (capability, Some(name))
+                if eliot_agent_bridge_core::skill_tool_kind(name).is_some()
+                    && capability == name =>
+            {
+                Self::Skill
+            }
+            _ => Self::Refused,
+        }
+    }
+
+    /// Names the form for the loop's own diagnostics record. Never a payload
+    /// byte and never a caller-supplied string.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::State => "state",
+            Self::Skill => "skill",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// #2564 I4/AUD-C3/AUD-S17: how ONE claimed state pair ended.
+///
+/// The four arms are a closed vocabulary over what this daemon actually did,
+/// and the names are the distinction the current code lacks: today a validated
+/// state pair never reaches this module at all, and the route that admits it
+/// records `state_carrier_refused` while discarding the enqueue disposition.
+/// `OwnerUnavailable` and `RetentionFailed` are BOTH visibly unresolved, but
+/// they are not the same thing and must not be collapsed:
+///
+/// - `OwnerUnavailable` — the OWNER did not answer. No preview bytes exist.
+/// - `RetentionFailed` — the owner DID answer and the preview bytes were
+///   produced, but the ORS correlation of that result to THIS operation could
+///   not be persisted. The effect occurred; the completion is not retained.
+///   That is strictly stronger than a missing owner answer and strictly weaker
+///   than success, and the issue's slice-3 rule (#20) forbids reporting it as
+///   a fresh handle that can be re-read.
+enum StateReadStep {
+    /// An empty claim: nothing pending, so back off to the next tick.
+    IdleBackoff,
+    /// The owner produced a bounded preview and Kernel retained the result
+    /// correlated to this exact operation.
+    Retained,
+    /// The owner did not answer. Visibly unresolved, never an empty result
+    /// and never a success.
+    OwnerUnavailable,
+    /// The owner answered and the preview was produced, but the result could
+    /// not be retained against this operation. Distinct from every other arm.
+    RetentionFailed,
+    /// The presented attempt is not the current fencing generation. Quarantined
+    /// exactly like the query leg's stale attempt; never retried.
+    StaleAttempt,
+}
+
+/// Completion of one in-flight state-read step. It is a SEPARATE type from
+/// [`LocalReadCompletion`] so a state step can never settle on the query
+/// flight's completion branch, and vice versa.
+enum StateReadCompletion {
+    Settled(Result<StateReadStep, String>),
+}
+
+/// Sole owner of state-read poll state in `run_loop`, mirroring
+/// [`LocalReadFlight`] but never sharing it. `Idle` means no state work is
+/// outstanding; `InFlight` holds the one pending state step.
+enum StateReadFlight {
+    Idle,
+    InFlight(StateReadFlightState),
+}
+
+struct StateReadFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = StateReadCompletion>>>,
+}
+
+/// Pure tick gate for the state flight, mirroring
+/// [`decide_local_read_tick`] exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateReadTickDecision {
+    StartPoll,
+    SkipInFlight,
+}
+
+fn decide_state_read_tick(flight: &StateReadFlight) -> StateReadTickDecision {
+    match flight {
+        StateReadFlight::Idle => StateReadTickDecision::StartPoll,
+        StateReadFlight::InFlight(_) => StateReadTickDecision::SkipInFlight,
+    }
+}
+
+/// Names one settled state-read step for the loop's own record, so a
+/// retention failure and a missing owner answer stay distinguishable in the
+/// daemon's own diagnostics rather than both reading as "not served".
+const fn state_read_step_name(step: &StateReadStep) -> &'static str {
+    match step {
+        StateReadStep::IdleBackoff => "idle_backoff",
+        StateReadStep::Retained => "retained",
+        StateReadStep::OwnerUnavailable => "owner_unavailable",
+        StateReadStep::RetentionFailed => "retention_failed",
+        StateReadStep::StaleAttempt => "stale_attempt",
     }
 }
 
@@ -1658,6 +1816,12 @@ async fn run_loop(
     // off until the next tick, while a claimed pair forwards through the
     // Kernel `local_read` leg and submits its result body before idling.
     let mut local_read_flight = LocalReadFlight::Idle;
+    // #2564 I4/AUD-C3: sole owner of STATE read poll state. It rides the same
+    // bounded cadence under its OWN gate and its OWN completion type, so a
+    // retained state pair can never settle on the query flight and a query
+    // pair can never settle here. The two claim the same wire operation but
+    // discriminate on the pair's form before serving.
+    let mut state_read_flight = StateReadFlight::Idle;
     // Sole owner of observe poll state (issue #2565). The same tick drives
     // it independently of every other flight: a null claim backs off until
     // the next tick, while a claimed observe pair serves through the closed
@@ -1786,6 +1950,7 @@ async fn run_loop(
                     &composition,
                     &mut flight,
                     &mut local_read_flight,
+                    &mut state_read_flight,
                     &mut observe_flight,
                     &mut testd_owner_flight,
                     &mut watchdog_export_drain_flight,
@@ -1833,6 +1998,11 @@ async fn run_loop(
                 // Campaign packets ride the same tick under their own gate and
                 // are never consumed by the query poller.
                 maybe_start_campaign_packet_poll(&kernel, &mut campaign_packet_flight);
+                // #2564 I4: the STATE leg rides the same tick under its own
+                // gate. A claim whose resolved form is not STATE fails the
+                // step closed rather than falling through to the query
+                // branches, so a state pair is never served as a query.
+                maybe_start_state_read_poll(&kernel, &composition, &mut state_read_flight);
                 // Task Controller uses a separate queue and attempt type;
                 // start it on the same cadence without sharing the local-read
                 // completion branch.
@@ -1923,6 +2093,13 @@ async fn run_loop(
             }
             observe_completion = next_observe_completion(&mut observe_flight) => {
                 settle_observe_completion(observe_completion, &mut observe_flight)?;
+            }
+            // #2564 I4/AUD-C3: the state leg settles on its OWN completion
+            // branch. Sharing the query branch would be exactly the capability
+            // confusion this leg removes: a retained state result must never be
+            // recorded as a query outcome and vice versa.
+            state_read_completion = next_state_read_completion(&mut state_read_flight) => {
+                settle_state_read_completion(state_read_completion, &mut state_read_flight)?;
             }
             watchdog_export_drain_completion =
                 next_watchdog_export_drain_completion(&mut watchdog_export_drain_flight) => {
@@ -3622,6 +3799,7 @@ async fn drain_flights_on_shutdown(
     composition: &SharedComposition,
     flight: &mut ActivationFlight,
     local_read_flight: &mut LocalReadFlight,
+    state_read_flight: &mut StateReadFlight,
     observe_flight: &mut ObserveFlight,
     testd_owner_flight: &mut TestdOwnerFlight,
     watchdog_export_drain_flight: &mut WatchdogExportDrainFlight,
@@ -3651,6 +3829,7 @@ async fn drain_flights_on_shutdown(
     loop {
         if matches!(flight, ActivationFlight::Idle)
             && matches!(local_read_flight, LocalReadFlight::Idle)
+            && matches!(state_read_flight, StateReadFlight::Idle)
             && matches!(observe_flight, ObserveFlight::Idle)
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
             && matches!(
@@ -3741,6 +3920,13 @@ async fn drain_flights_on_shutdown(
                 // capability is revoked on disconnect, mirroring the
                 // local-read drain.
                 settle_observe_completion(observe_completion, observe_flight)?;
+            }
+            // #2564 I4: the state drain settles on its own branch and owns no
+            // readiness state. An unsubmitted state pair's attempt capability
+            // is revoked on disconnect exactly like the local-read drain's, so
+            // an unfinished preview is never reported as served at shutdown.
+            state_read_completion = next_state_read_completion(state_read_flight) => {
+                settle_state_read_completion(state_read_completion, state_read_flight)?;
             }
             testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
@@ -4434,6 +4620,473 @@ fn local_delta_adoption_name(adoption: &LocalDeltaAdoption) -> &'static str {
     }
 }
 
+/// Starts one STATE read poll step for the outbound-only state poller (#2564
+/// I4/AUD-C3).
+///
+/// Owns the whole bounded step: claim one retained state pair, refuse any
+/// pair whose form is not STATE, drive the OWNER-backed preview, and submit
+/// the produced result body under that exact attempt. It is a separate future
+/// from [`start_local_read_poll`] and settles on its own completion type, so a
+/// state pair can never settle on the query flight and a query pair can never
+/// settle here.
+fn start_state_read_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Pin<Box<dyn std::future::Future<Output = StateReadCompletion>>> {
+    let kernel_clone = Arc::clone(kernel);
+    Box::pin(async move {
+        StateReadCompletion::Settled(run_state_read_poll(&kernel_clone, composition).await)
+    })
+}
+
+/// Starts the state-read poll step when its own flight is idle. Called from
+/// the same bounded cadence branch as the other flights, under its own gate.
+fn maybe_start_state_read_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut StateReadFlight,
+) {
+    if decide_state_read_tick(flight) == StateReadTickDecision::StartPoll {
+        *flight = StateReadFlight::InFlight(StateReadFlightState {
+            future: start_state_read_poll(kernel, Arc::clone(composition)),
+        });
+    }
+}
+
+/// Polls the one in-flight state step, pending forever while idle so health
+/// and shutdown stay pollable with no state step outstanding.
+async fn next_state_read_completion(flight: &mut StateReadFlight) -> StateReadCompletion {
+    match flight {
+        StateReadFlight::Idle => std::future::pending::<StateReadCompletion>().await,
+        StateReadFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed state-read step back to idle.
+///
+/// Every settled arm idles until the next tick, exactly like the query and
+/// packet settles: a missing owner answer, an unretained result and a stale
+/// attempt are all settled, visible, non-fatal dispositions, not daemon
+/// failures. Only a genuine step failure — an unbound pair, a moved fence, a
+/// state pair whose form the daemon refuses — fails the daemon closed, because
+/// those name a contract violation rather than an owner's answer.
+fn settle_state_read_completion(
+    completion: StateReadCompletion,
+    flight: &mut StateReadFlight,
+) -> Result<(), String> {
+    match completion {
+        StateReadCompletion::Settled(Ok(step)) => {
+            tracing::info!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.state_read_settled",
+                outcome = state_read_step_name(&step),
+            );
+            *flight = StateReadFlight::Idle;
+            Ok(())
+        }
+        StateReadCompletion::Settled(Err(error)) => Err(error),
+    }
+}
+
+/// Runs one STATE read poll step: `local_read_claim`, then the OWNER-backed
+/// state preview, then `local_read_result`.
+///
+/// The refusal discipline is the point of this leg:
+///
+/// - A claimed pair whose resolved [`LocalReadForm`] is not
+///   [`LocalReadForm::State`] is a typed step failure. The claim gate is the
+///   authority on what form the carrier retained, and serving a query or Skill
+///   pair here — or serving a state pair through the query branches — is the
+///   capability confusion the audit ranks above the honest refusal this leg
+///   replaces.
+/// - When the owner does not answer, the outcome is
+///   [`StateReadStep::OwnerUnavailable`]: a visibly UNRESOLVED pending state.
+///   Never an empty result, never a success, never a synthesized preview.
+/// - When the owner answers and the result cannot be retained against this
+///   operation, the outcome is [`StateReadStep::RetentionFailed`]. The effect
+///   occurred and the completion is not retained; that is its own visible arm
+///   and never reads back as served.
+async fn run_state_read_poll(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: SharedComposition,
+) -> Result<StateReadStep, String> {
+    // #2564 I4: receipt span over the claim/serve/submit state step. The pair's
+    // FORM and the settle disposition are named; payload bytes never are.
+    let _span = tracing::info_span!("eliotd.state_read_poll").entered();
+    let pair = kernel
+        .claim_local_read_pair_async()
+        .await
+        .map_err(|error| format!("Kernel state-read pair claim: {error}"))?;
+    let Some((envelope, tool, attempt)) = pair else {
+        // An empty claim observed nothing at all.
+        return Ok(StateReadStep::IdleBackoff);
+    };
+    let form = LocalReadForm::of(&envelope, &tool);
+    if form != LocalReadForm::State {
+        // A non-state pair arriving on the state leg is a carrier contract
+        // violation, not a step to serve. It fails closed instead of falling
+        // through to the query branches, so neither form can be answered as
+        // the other.
+        return Err(format!(
+            "state leg refused a {} pair; the carrier retained a non-state form",
+            form.name()
+        ));
+    }
+    let served = serve_admitted_state_pair(kernel, &composition, &envelope, &tool, &attempt).await;
+    let submission = match served {
+        // The owner produced bounded preview bytes and the body is bound to
+        // this exact operation/attempt. Submitting it is the retention step;
+        // only an accepted persist claims a retained result.
+        Ok(Some(body)) => submit_state_read_result_idempotent(kernel, &body).await?,
+        // The owner did not answer. Nothing was produced, so nothing is
+        // submitted and the pair reports visibly unresolved.
+        Ok(None) => return Ok(StateReadStep::OwnerUnavailable),
+        Err(error) => return Err(error),
+    };
+    Ok(match submission {
+        LocalReadSubmitOutcome::Accepted => StateReadStep::Retained,
+        // The deadline elapsed after the owner answered: the preview bytes
+        // existed but the operation can no longer be completed. Distinct from
+        // both a missing owner and a retained result.
+        LocalReadSubmitOutcome::Expired => StateReadStep::RetentionFailed,
+        LocalReadSubmitOutcome::StaleAttempt => StateReadStep::StaleAttempt,
+    })
+}
+
+/// Submits one state read result body, retrying once with the byte-identical
+/// body when the first submit fails — the exact twin of
+/// [`submit_local_read_result_idempotent`], kept separate so a state result is
+/// never resubmitted on the query leg's route or under its outcome.
+async fn submit_state_read_result_idempotent(
+    kernel: &DaemonKernelClient,
+    body: &eliot_protocol::HostRequestResultBody,
+) -> Result<LocalReadSubmitOutcome, String> {
+    match kernel.submit_local_state_result_async(body).await {
+        Ok(outcome) => Ok(outcome),
+        Err(first_error) => kernel
+            .submit_local_read_result_async(body)
+            .await
+            .map_err(|error| {
+                format!("Kernel state-read result submit: {first_error}; retry: {error}")
+            }),
+    }
+}
+
+/// Bounded per-field record bound the state owner reads under, taken from the
+/// store catalogue's own `EVIDENCE_PACK_MAX_RECORDS` cap rather than a value
+/// invented here. Only the bound travels; the owner chooses which records it
+/// returns and a short list is never read as a healthy empty preview.
+const STATE_PREVIEW_MAX_RECORDS: u32 = EVIDENCE_PACK_MAX_RECORDS;
+
+/// Closed form of the projection field list one `eliot.state` request asks for.
+///
+/// `StateInput.include` is a closed list of projection field names; an absent
+/// list means the default (whole bounded) projection. The daemon does not map
+/// those names onto owner operations — it carries them as the caller asked and
+/// lets the owner decide what it can satisfy, because inventing an
+/// include-to-operation table here would fabricate preview content.
+fn state_preview_include(tool: &serde_json::Value) -> Result<Vec<String>, String> {
+    let arguments = tool
+        .get("arguments")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "state request carries no arguments object".to_owned())?;
+    match arguments.get("include") {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut include = Vec::with_capacity(items.len());
+            for item in items {
+                let field = item
+                    .as_str()
+                    .filter(|field| {
+                        !field.trim().is_empty() && !field.chars().any(char::is_control)
+                    })
+                    .ok_or_else(|| {
+                        "state request include entry is not a usable field name".to_owned()
+                    })?;
+                if !seen.insert(field) {
+                    return Err("state request include repeats a field name".to_owned());
+                }
+                include.push(field.to_owned());
+            }
+            Ok(include)
+        }
+        Some(_) => Err("state request include is not an array".to_owned()),
+    }
+}
+
+/// Serves ONE retained `eliot.state` pair through the OWNER, never through the
+/// query path (#2564 I4/AUD-C3/AUD-S17).
+///
+/// `Ok(Some(body))` — the owner answered with bounded preview bytes and the
+/// result body is correlated to this exact operation and attempt. `Ok(None)` —
+/// the owner produced no usable preview, so the caller reports a visibly
+/// unresolved pending state; that is never an empty result and never a
+/// success. `Err` names a contract violation (unbound pair, moved fence,
+/// malformed request) and fails the step closed.
+///
+/// The owner interface is `eliot_read::ReadApi::bound_state` over a per-call
+/// `ReadService` wrapping the real `KernelContextReadClient` — the same
+/// Governor-owned consistency algorithm, source/schema resolution, observed-head
+/// closure and stale check that the sibling position leg uses
+/// (`experience_runtime::read_current_position`). It is deliberately NOT
+/// `LocalReadPort::evidence_query`: that is the query port, and using it here is
+/// exactly the state-as-query confusion this leg exists to remove.
+///
+/// Owner answers are not fabricated. Each read either returns the owner's own
+/// bounded payload, or fails closed and yields `Ok(None)`; there is no
+/// synthesized preview, no placeholder list and no all-passed default.
+async fn serve_admitted_state_pair(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    tool: &serde_json::Value,
+    attempt: &eliot_protocol::LocalReadAttempt,
+) -> Result<Option<eliot_protocol::HostRequestResultBody>, String> {
+    attempt
+        .validate()
+        .map_err(|_| "state pair attempt is not a bound shape".to_owned())?;
+    // The admitted fence must still be the retained Kernel fence, and the
+    // attempt must close over THIS request's operation, epoch, deadline and
+    // capability. A substituted identity is refused before any owner read.
+    let retained_fence = composition
+        .lock()
+        .await
+        .kernel_snapshot()
+        .state_fence()
+        .clone();
+    if envelope.state_fence != retained_fence {
+        return Err("state pair fence is no longer the retained Kernel fence".to_owned());
+    }
+    if attempt.operation_id != host_request_operation_id(envelope)
+        || attempt.authority_epoch != envelope.state_fence.authority_epoch
+        || attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+        || attempt.facet_method != envelope.identity.capability
+    {
+        return Err("state pair attempt does not bind the admitted request".to_owned());
+    }
+    let scope = reconstruction_borrow_scope(envelope)?;
+    if attempt.scope_id != scope.as_str() {
+        return Err("state pair attempt does not bind the admitted scope".to_owned());
+    }
+    let include = state_preview_include(tool)?;
+    let ctx = state_read_metadata(envelope, &retained_fence)?;
+
+    // The per-call read client is built under a SHORT guard and the guard is
+    // dropped before any owner read, so no composition lock is ever held across
+    // the owner's awaits. Readiness is checked inside `context_read_client`.
+    let client = composition
+        .lock()
+        .await
+        .context_read_client(kernel)
+        .map_err(|error| format!("state read client: {error}"))?;
+
+    // The scope revision head is OBSERVED from the store's own
+    // `GetRevisionHeads` read and becomes the declared minimum, exactly as the
+    // sibling position leg does. Nothing is synthesized: an absent, zero,
+    // duplicate or foreign-fence head is a typed refusal, not a default. The
+    // head is read through the `CanonicalReadClient` the read client already
+    // implements — the same catalogue-activated owner read the position leg
+    // uses, on the same authenticated `store_named` route under the same
+    // retained fence.
+    let scope_key = RevisionKey::new(format!("scope:{}", scope.as_str()))
+        .map_err(|error| format!("state read scope key: {error}"))?;
+    let observed = CanonicalReadClient::revision_heads(&client, vec![scope_key.clone()])
+        .await
+        .map_err(|error| format!("state read scope head: {error}"))?;
+    let mut matching = observed.into_iter().filter(|head| head.key == scope_key);
+    let head = matching
+        .next()
+        .ok_or_else(|| "state read observed no head for the admitted scope".to_owned())?;
+    if matching.next().is_some() || head.revision == 0 || head.state_fence != retained_fence {
+        return Err("state read scope head is ambiguous or bound to another fence".to_owned());
+    }
+    let mut dependency_revisions = BTreeMap::new();
+    dependency_revisions.insert(scope_key, head.revision);
+    let reads = ReadService::new(client);
+
+    // `GetTaskState` is the scope-bound owner read that answers the current
+    // task/scope state for this admitted scope. It is issued through the
+    // OWNER's own state read, which — unlike the query port — refuses a state
+    // operation that does not satisfy its state contract.
+    let request = StateRequest {
+        operation: NamedReadOperation::GetTaskState,
+        scope_id: Some(scope.clone()),
+        consistency: ReadConsistency::ExactFence,
+        dependency_revisions,
+        ordering: ReadOrderingBinding::without_order_dependency(),
+        parameters: NamedParameters::from_map(BTreeMap::from([
+            ("task_id".to_owned(), state_task_selector(envelope)),
+            (
+                "max_records".to_owned(),
+                serde_json::Value::String(STATE_PREVIEW_MAX_RECORDS.to_string()),
+            ),
+        ]))
+        .map_err(|error| format!("state read selectors: {error}"))?,
+        provenance_handles: Vec::new(),
+    };
+    let bound = match reads.bound_state(&ctx, request).await {
+        Ok(bound) => bound,
+        // The owner did not answer. This is the visibly unresolved pending
+        // state: no preview bytes are produced, nothing is submitted, and the
+        // caller reports `OwnerUnavailable`. An empty result or a success here
+        // would both be fabrications.
+        Err(error) => {
+            tracing::warn!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.state_owner_unavailable",
+                error = %error,
+            );
+            return Ok(None);
+        }
+    };
+    if bound.view.operation != NamedReadOperation::GetTaskState
+        || bound.view.state_fence != retained_fence
+    {
+        return Err("state owner answered a different operation or fence".to_owned());
+    }
+    state_preview_result_body(envelope, attempt, &scope, &bound.view, &include)
+}
+
+/// Builds the fence-bound `RequestMetadata` the owner read runs under.
+///
+/// Identical in shape to the reconstruction route's own context: the request
+/// id is derived from THIS operation, the session/task identities come from
+/// the admitted envelope (never an MCP argument), and the fence is the one the
+/// pair was admitted under. The task identity is OPTIONAL on purpose: the
+/// issue's slice-1 rule #6 requires authenticated discovery with no selected
+/// task to return the selection/intake state rather than be rejected for
+/// lacking a task binding, so a `None` task id here is an explicit selection
+/// state and not an error.
+fn state_read_metadata(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    fence: &StateFence,
+) -> Result<RequestMetadata, String> {
+    let operation = host_request_operation_id(envelope);
+    let context = RequestMetadata {
+        request_id: RequestId::new(format!("eliotd:state-read:{}", operation.as_str()))
+            .map_err(|error| format!("state read request id: {error}"))?,
+        session_id: envelope
+            .identity
+            .session_id
+            .as_deref()
+            .map(SessionId::new)
+            .transpose()
+            .map_err(|error| format!("state read session identity: {error}"))?,
+        task_id: envelope
+            .identity
+            .task_id
+            .as_deref()
+            .map(TaskId::new)
+            .transpose()
+            .map_err(|error| format!("state read task identity: {error}"))?,
+        product_id: ProductId::new(SERVICE_NAME)
+            .map_err(|error| format!("state read product identity: {error}"))?,
+        source_id: SourceId::new(SERVICE_NAME)
+            .map_err(|error| format!("state read source identity: {error}"))?,
+        state_fence: fence.clone(),
+        clock: ClockReading {
+            valid_time_ms: None,
+            known_time_ms: None,
+            transaction_sequence: None,
+            monotonic_ns: None,
+        },
+    };
+    context
+        .validate()
+        .map_err(|error| format!("state read metadata: {error}"))?;
+    Ok(context)
+}
+
+/// Selects the `task_id` the state owner read addresses.
+///
+/// With a selected task this is the admitted task identity. With NO selected
+/// task it is the explicit no-task selection token the authenticated discovery
+/// form requires — a named, closed value, never an empty string, never a
+/// fabricated task contract, and never a task invented to satisfy a selector.
+fn state_task_selector(envelope: &eliot_protocol::HostRequestEnvelope) -> serde_json::Value {
+    match envelope
+        .identity
+        .task_id
+        .as_deref()
+        .filter(|task| !task.trim().is_empty() && !task.chars().any(char::is_control))
+    {
+        Some(task) => serde_json::Value::String(task.to_owned()),
+        // The closed no-task discovery selector. A bounded read of "what is
+        // selected, if anything" is a real question with a real owner answer;
+        // refusing it for lacking a task binding is the failure mode the audit
+        // names, so this is a named value rather than a refusal.
+        None => serde_json::Value::String(STATE_NO_TASK_SELECTOR.to_owned()),
+    }
+}
+
+/// The closed `task_id` value that names authenticated discovery with no
+/// selected task, as opposed to a task that was never bound.
+const STATE_NO_TASK_SELECTOR: &str = "eliot.state:no-selected-task";
+
+/// Projects the owner's bounded state view into the host-request result body.
+///
+/// The response carries the owner's own payload verbatim, plus the exact
+/// identity it was read under: the admitted operation, the bound scope, the
+/// requested field list and the revision heads the owner observed. The digest
+/// is computed over exactly those canonical bytes and the body carries the
+/// attempt it was claimed under, so the retained result is correlated to this
+/// operation and Kernel can re-verify that binding on readback. The lineage
+/// declares `ExistingEvidenceRead`: this is a read of already-retained
+/// canonical state served with its actual revision and provenance, which
+/// creates no new semantic record and carries no semantic receipt.
+fn state_preview_result_body(
+    envelope: &eliot_protocol::HostRequestEnvelope,
+    attempt: &eliot_protocol::LocalReadAttempt,
+    scope: &ScopeId,
+    view: &CurrentStateView,
+    include: &[String],
+) -> Result<eliot_protocol::HostRequestResultBody, String> {
+    let response = serde_json::json!({
+        "operation": envelope.identity.capability,
+        "operation_id": attempt.operation_id,
+        "scope_id": scope.as_str(),
+        "state_fence": view.state_fence,
+        "include": include,
+        "revision_heads": view.revision_heads,
+        "consistency": view.consistency,
+        "state": view.payload,
+    });
+    let bytes = canonical_json_bytes(&response)
+        .map_err(|error| format!("state preview canonical bytes: {error}"))?;
+    let result_digest = sha256_hex(&bytes);
+    let body = eliot_protocol::HostRequestResultBody {
+        wire_id: eliot_protocol::HOST_REQUEST_RESULT_BODY_WIRE_ID.to_owned(),
+        wire_version: eliot_protocol::HostRequestResultBody::CONTRACT_VERSION,
+        operation_id: attempt.operation_id.clone(),
+        request_sha256: envelope.envelope_sha256.clone(),
+        result_digest: result_digest.clone(),
+        response,
+        attempt: Some(attempt.clone()),
+        lineage: Some(eliot_protocol::HostRequestResultLineage {
+            output_artifact_ref: None,
+            output_digest: result_digest,
+            producer_ref: None,
+            source_revisions: None,
+            source_state_fence: Some(view.state_fence.clone()),
+            input_refs: None,
+            transformation_lineage: None,
+            closure_refs: None,
+            policy_fence: None,
+            origin_evidence_refs: None,
+            semantic_receipt_ref: None,
+            result_class: eliot_protocol::HostRequestResultClass::ExistingEvidenceRead,
+            proof_ceiling: None,
+            influence_state: eliot_security_contracts::InfluenceState::Unknown,
+            instruction_taint: None,
+        }),
+        evidence: None,
+    };
+    body.validate()
+        .map_err(|_| "state preview result body is not a valid bound shape".to_owned())?;
+    Ok(body)
+}
+
 /// Derives the task-bound scope the reconstruction composition borrow pins
 /// for one admitted pair (#2564 I6/A1).
 ///
@@ -4493,6 +5146,19 @@ async fn run_local_read_poll(
             delta: None,
         });
     };
+    // #2564 I4/AUD-S13: this leg is QUERY-ONLY and refuses a state pair
+    // outright. The carrier hands both legs the same `local_read_claim`
+    // operation, so without this guard a retained state pair claimed by this
+    // poller would fall through to `forward_admitted_local_read` and be
+    // answered by the query-only store read — the exact capability confusion
+    // that is worse than the honest refusal the previous carrier enforced.
+    // Only the two forms this leg actually serves (query and Skill) pass;
+    // every other claimed pair, state included, is refused closed here.
+    if LocalReadForm::of(&envelope, &tool) == LocalReadForm::State {
+        return Err(
+            "query leg refused a state pair; eliot.state is served by the state leg".to_owned(),
+        );
+    }
     let step = |outcome: LocalReadPollOutcome, delta: Option<LocalReadinessDelta>| LocalReadStep {
         outcome,
         delta,
@@ -4808,7 +5474,7 @@ async fn submit_local_read_result_idempotent(
     kernel: &DaemonKernelClient,
     body: &eliot_protocol::HostRequestResultBody,
 ) -> Result<LocalReadSubmitOutcome, String> {
-    match kernel.submit_local_read_result_async(body).await {
+    match kernel.submit_local_state_result_async(body).await {
         Ok(outcome) => Ok(outcome),
         Err(first_error) => kernel
             .submit_local_read_result_async(body)
