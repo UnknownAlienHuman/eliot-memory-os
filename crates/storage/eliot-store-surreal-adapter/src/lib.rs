@@ -28,6 +28,7 @@ mod plan;
 mod readiness;
 mod schema;
 mod schema_inventory;
+mod surreal_mailbox;
 mod write_execution;
 mod write_scheduler;
 

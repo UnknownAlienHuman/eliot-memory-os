@@ -468,7 +468,10 @@ struct ActivatedMutationDescriptor {
 /// experience-bank/feedback rows with the closed experience typed
 /// contract); `ApplyBlackboardItem` persists `Candidate` through the same
 /// family (issue #1822: a Kernel-admitted typed candidate revision with its
-/// closed blackboard contract); `RecordLearningRecord` persists `Candidate`
+/// closed blackboard contract); `AdmitMailboxMessage` persists `Candidate`
+/// through the same family (issue #1820: a Kernel-admitted mailbox message
+/// with its stream-head compare-and-set and closed mailbox contract);
+/// `RecordLearningRecord` persists `Candidate`
 /// through the `CaptureCandidate` family (issue #1868, I12.24: Store-owned
 /// durable learning rows keyed `(record_kind, handle, record_digest)` with the
 /// closed learning typed contract; the only Kernel-owned learning surface, so
@@ -495,7 +498,7 @@ struct ActivatedMutationDescriptor {
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -629,6 +632,12 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
     },
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyBlackboardItem,
+        transition_classes: &[TransitionClass::CaptureCandidate],
+        maximum_effect: EffectClass::Candidate,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::AdmitMailboxMessage,
         transition_classes: &[TransitionClass::CaptureCandidate],
         maximum_effect: EffectClass::Candidate,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
@@ -978,6 +987,9 @@ pub fn validate_transition_against_catalogue(
             NamedMutationOperation::ApplyBlackboardItem => {
                 validate_blackboard_transition(transition, &command.parameters)?;
             }
+            NamedMutationOperation::AdmitMailboxMessage => {
+                validate_mailbox_transition(transition, &command.parameters)?;
+            }
             NamedMutationOperation::RecordLearningRecord => {
                 validate_typed_mutation_parameters(command.operation, &command.parameters)?;
                 crate::decode_learning_mutation(command.operation, &command.parameters)
@@ -1083,6 +1095,24 @@ fn validate_blackboard_transition(
     if transition.task_id.as_deref() != Some(revision.record.task_id.as_str()) {
         return Err(StoreError::InvalidField {
             field: "blackboard.task_id",
+            reason: "must match the prepared transition task",
+        });
+    }
+    Ok(())
+}
+
+fn validate_mailbox_transition(
+    transition: &PreparedTransition,
+    parameters: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<(), StoreError> {
+    let admission =
+        crate::decode_mailbox_item(NamedMutationOperation::AdmitMailboxMessage, parameters)?;
+    if admission.record.state_fence != transition.state_fence {
+        return Err(StoreError::FenceMismatch);
+    }
+    if transition.task_id.as_deref() != Some(admission.record.task_id.as_str()) {
+        return Err(StoreError::InvalidField {
+            field: "mailbox.task_id",
             reason: "must match the prepared transition task",
         });
     }
