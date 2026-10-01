@@ -868,12 +868,8 @@ fn live_behavioral_agreement(
     if let Err(error) = validate_operational_projection(profile, &projection) {
         return Err(match error {
             SemanticProfileError::ProjectionDisagreement { field, .. } => match field {
-                "projection.retry_safe" => {
-                    "live retry behavior disagrees with the semantic owner"
-                }
-                "projection.read_only" => {
-                    "live effect behavior disagrees with the semantic owner"
-                }
+                "projection.retry_safe" => "live retry behavior disagrees with the semantic owner",
+                "projection.read_only" => "live effect behavior disagrees with the semantic owner",
                 "projection.completion_ceiling" => {
                     "live completion ceiling disagrees with the semantic owner"
                 }
