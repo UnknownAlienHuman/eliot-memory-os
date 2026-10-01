@@ -4483,6 +4483,24 @@ impl<P: KernelDurableJobPort + ?Sized> GovernorOwners<P> {
             } else {
                 authority_snapshot
             };
+        // W6 (#1142): this is the SYNCHRONOUS Kernel recovery composition,
+        // and it is where a restore rehydrates the authority owner on the
+        // daemon's live recovery path. It holds no CURRENT durable
+        // revocation history: `recover_from_kernel` reads owner records
+        // through the sync `KernelRecoveryPort`, while the only durable
+        // revocation ledger is served by the async `GetAuthorityRevocationHistory`
+        // named read that `owner_closure_feed::synchronize_owner_feed`
+        // drives. So the constructor below is the fail-closed one: it
+        // restores the genesis authority owner and REFUSES any payload
+        // carrying grant lineage or effect authorizations, instead of
+        // reinstating a snapshot's own `revoked` list as if it were
+        // current. Restoring authority that could have been revoked since
+        // the backup is a revocation that never happened, and "this route
+        // could not read the ledger" is not "nothing was revoked." The
+        // non-empty owner is restored through
+        // `AuthorityOwner::from_snapshot_with_revocation_history`, which
+        // re-derives every closure against the current committed history
+        // before any grant becomes effective.
         let authority = AuthorityOwner::from_snapshot(&authority_snapshot, state_fence)?;
         let budget_read_revision = recovery.owner_read(RecoveryOwner::Budget)?.revision;
         let budget_snapshot: BudgetOwnerSnapshot =
