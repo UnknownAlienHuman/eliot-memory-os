@@ -1947,21 +1947,21 @@ pub fn drain_wire_result(
             .recovery_ref
             .as_deref()
             .is_some_and(|recovery| recovery == receipt.receiving_operation.as_str());
-        if recovery_matches {
-            if let Ok(disposition) = journal.check_receiving_owner_acceptance(key, receipt) {
-                match disposition {
-                    durable_host_event_ingest::ReceivingOwnerDisposition::Applied => {
-                        if result.disposition != ResultDisposition::CancelledObserved {
-                            result.disposition = ResultDisposition::CandidateSucceeded;
-                        }
+        if recovery_matches
+            && let Ok(disposition) = journal.check_receiving_owner_acceptance(key, receipt)
+        {
+            match disposition {
+                durable_host_event_ingest::ReceivingOwnerDisposition::Applied => {
+                    if result.disposition != ResultDisposition::CancelledObserved {
+                        result.disposition = ResultDisposition::CandidateSucceeded;
                     }
-                    durable_host_event_ingest::ReceivingOwnerDisposition::Rejected => {
-                        if result.disposition != ResultDisposition::CancelledObserved {
-                            result.disposition = ResultDisposition::FailedVerification;
-                        }
-                    }
-                    durable_host_event_ingest::ReceivingOwnerDisposition::Unknown => {}
                 }
+                durable_host_event_ingest::ReceivingOwnerDisposition::Rejected => {
+                    if result.disposition != ResultDisposition::CancelledObserved {
+                        result.disposition = ResultDisposition::FailedVerification;
+                    }
+                }
+                durable_host_event_ingest::ReceivingOwnerDisposition::Unknown => {}
             }
         }
     }
@@ -2252,8 +2252,7 @@ impl<T: AcpTransport> AcpWire<T> {
         }
         match self.receive().await? {
             AcpOutcome::Completed(message) => {
-                let result =
-                    drain_wire_result(&message, ids, route, binding, admission, None)?;
+                let result = drain_wire_result(&message, ids, route, binding, admission, None)?;
                 Ok(AcpOutcome::Completed(result))
             }
             AcpOutcome::Unknown(unknown) => Ok(AcpOutcome::Unknown(AcpUnknownOutcome {
