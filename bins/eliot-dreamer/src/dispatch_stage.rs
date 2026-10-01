@@ -304,24 +304,24 @@ pub(crate) fn dispatch_admitted(
     carriers: OwnerCarriers<'_>,
     job_class: JobClass,
     validated: Option<&ValidatedGroundingCandidate>,
-    /// The two records the Orientation composer joins, or `None` for every
-    /// class whose Orientation pipeline never runs.
-    ///
-    /// Optional for the same structural reason as `validated`, and because of
-    /// one owner rule: the A-05 gate rejects `JobClass::Curation`
-    /// unconditionally
-    /// (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
-    /// `validate_family` → `UnsupportedJobShape`, "Curation requires its
-    /// separate typed post-handler carrier"). A Curation job therefore never
-    /// produces a `ValidatedGroundingCandidate`, so this record is
-    /// **unconstructible** for it — there is nothing to hand over, not a value
-    /// that was merely left out. Requiring it would force a caller to
-    /// fabricate a receipt that the owner refuses to issue, which is why it is
-    /// `Option` here and why the Curation arm never reads it.
-    ///
-    /// The Curation arm deliberately does not inspect this value at all: it
-    /// never branches on `Some`/`None`, so `None` is not a new refusal there.
-    /// Only the Orientation arm consumes it.
+    // The two records the Orientation composer joins, or `None` for every
+    // class whose Orientation pipeline never runs.
+    //
+    // Optional for the same structural reason as `validated`, and because of
+    // one owner rule: the A-05 gate rejects `JobClass::Curation`
+    // unconditionally
+    // (`eliot-dreamer-candidate-validation/src/structured/validate.rs`,
+    // `validate_family` → `UnsupportedJobShape`, "Curation requires its
+    // separate typed post-handler carrier"). A Curation job therefore never
+    // produces a `ValidatedGroundingCandidate`, so this record is
+    // **unconstructible** for it — there is nothing to hand over, not a value
+    // that was merely left out. Requiring it would force a caller to
+    // fabricate a receipt that the owner refuses to issue, which is why it is
+    // `Option` here and why the Curation arm never reads it.
+    //
+    // The Curation arm deliberately does not inspect this value at all: it
+    // never branches on `Some`/`None`, so `None` is not a new refusal there.
+    // Only the Orientation arm consumes it.
     pipeline: Option<PipelineOrientationRecords<'_>>,
 ) -> Result<DreamResult, DreamerError> {
     verify_admitted_binding(admission, job)?;
@@ -2428,15 +2428,14 @@ mod slice_7_native_owner_tests {
             let admission = admission();
             let job = semantic_job(class);
             let (grounding, validated) = validated_for(&admission, &job);
-            let refused =
-                dispatch_admitted(
-                    &admission,
-                    &job,
-                    carriers(None, None, None),
-                    class,
-                    Some(&validated),
-                    Some(PipelineOrientationRecords::new(&grounding, &validated)),
-                );
+            let refused = dispatch_admitted(
+                &admission,
+                &job,
+                carriers(None, None, None),
+                class,
+                Some(&validated),
+                Some(PipelineOrientationRecords::new(&grounding, &validated)),
+            );
             assert!(
                 matches!(refused, Err(DreamerError::InvalidAdmission(got)) if got == reason),
                 "class {class:?} must name its governed input, got {refused:?}"

@@ -43,8 +43,7 @@ use crate::admitted_material::{admission_of, validation_input_for};
 use crate::controller::verify_admitted_binding;
 use crate::curation_screen_stage::{ScreenDecision, resolve_screen_inputs};
 use crate::dispatch_stage::{
-    CURATION_CARRIER_REFUSAL, CurationExecutionCarrier, OwnerCarriers,
-    PipelineOrientationRecords,
+    CURATION_CARRIER_REFUSAL, CurationExecutionCarrier, OwnerCarriers, PipelineOrientationRecords,
     curation_test_support::{
         CountingRoutingHandler, CurationTestHarness, test_batch_for, test_port_bindings,
     },
