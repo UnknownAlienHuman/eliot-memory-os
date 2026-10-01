@@ -32,6 +32,7 @@ pub use scip_cache::{
     CachedProjection, CachedScipItems, ScipIndexerProvenance, ScipProjectionCache,
 };
 
+use std::path::Path;
 use std::sync::Arc;
 
 use eliot_evidence::{
@@ -345,6 +346,20 @@ impl LspCommand {
         request.executable().eq_ignore_ascii_case(&self.executable)
             && request.working_directory() == self.working_directory
             && request.argv() == self.arguments
+    }
+
+    /// Renders the exact invocation identity for failure attribution.
+    ///
+    /// Carried on launch failures so a refused or failed dispatch reconciles
+    /// under its original identity instead of being retried as a new
+    /// operation.
+    fn describe(&self) -> String {
+        format!(
+            "{} {} @ {}",
+            self.executable,
+            self.arguments.join(" "),
+            self.working_directory
+        )
     }
 }
 
@@ -1523,6 +1538,200 @@ pub fn finalize_scip(
     }
 }
 
+// ---------------------------------------------------------------------------
+// I10.13 application obligations and the W5 pre-dispatch call gate
+// ---------------------------------------------------------------------------
+
+/// Exact first-argv tokens this bridge admits.
+///
+/// Single source for the `supported_operations` declaration below and the
+/// pre-dispatch gate: adding a token here without an [`LspCommand`]
+/// constructor that projects its argv changes nothing, and no other
+/// first-argv token can pass the gate.
+const LSP_ADMITTED_SUBCOMMANDS: &[&str] = &["diagnostics", "scip", "--version"];
+
+/// Denial-of-weirdness ceilings for one dispatch. Generous on purpose: every
+/// typed [`LspCommand`] projection carries at most seven short arguments, so
+/// anything beyond is refused before any process is launched.
+const LSP_ARGV_CAP: usize = 256;
+const LSP_ARG_BYTES_CAP: usize = 16_384;
+const LSP_ARGV_BYTES_CAP: usize = 262_144;
+
+/// I10.13 application obligations for the rust-analyzer
+/// professional-application bridge: exact supported artifacts/actions,
+/// API-versus-UI observation quality, side effects, undo/recovery scope,
+/// artifact verifier, representation loss, and the interactive Human/session
+/// requirement, resolved per application (the `rust-analyzer` executable
+/// bound to the executor port). There is no universal pipeline: these
+/// statements describe only what the typed operations in this crate do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LspApplicationObligations {
+    /// Exact admitted first-argv tokens.
+    pub supported_operations: &'static [&'static str],
+    /// Exact supported artifacts and actions.
+    pub supported_artifacts_actions: &'static str,
+    /// API versus UI observation quality.
+    pub observation_quality: &'static str,
+    /// Side effects of the admitted operations.
+    pub side_effects: &'static str,
+    /// Undo and recovery scope.
+    pub undo_recovery_scope: &'static str,
+    /// Artifact verifier carried on every receipt.
+    pub artifact_verifier: &'static str,
+    /// Representation loss in normalized output.
+    pub representation_loss: &'static str,
+    /// Interactive Human and session requirement.
+    pub human_session_requirement: &'static str,
+}
+
+/// Returns the I10.13 declaration for the analyzer application bridged here.
+///
+/// Consumed by the pre-dispatch gate on every launch (exact-operation
+/// check), so the declaration and the enforcement cannot drift apart.
+#[must_use]
+pub fn lsp_application_obligations() -> LspApplicationObligations {
+    LspApplicationObligations {
+        supported_operations: LSP_ADMITTED_SUBCOMMANDS,
+        supported_artifacts_actions: "Rust workspaces addressed by workspace_root; one-shot \
+            diagnostics observations, one-shot SCIP semantic navigation (definitions, references, \
+            symbols) and unapplied rename/edit candidates, plus the --version identity probe. \
+            Source-tree mutations do not exist here: the bridge never writes to source files and \
+            every rename candidate is unapplied",
+        observation_quality: "CLI/API capture only, no UI automation and no screenshots: exact \
+            exit code with full stdout hashed over the observed bytes; the diagnostics parser \
+            normalizes best-effort, skipping lines that do not match the expected porcelain shape \
+            rather than failing, and the version probe accepts only an exact rust-analyzer line",
+        side_effects: "Every admitted operation launches exactly one process and keeps no \
+            session; the bridge itself performs no filesystem writes. The analyzer writes only \
+            the bridge-named SCIP sidecar required by the scip path, and rename output is \
+            candidate-only, never applied",
+        undo_recovery_scope: "No bridge-local undo: there is nothing to revert (no source \
+            writes, no leases, no mutable bridge state). A stale or partial sidecar is \
+            regenerated by a new authorized run, never repaired in place; recovery is a new \
+            operation under its own identity, never restoration of old state",
+        artifact_verifier: "Every receipt carries the exact executable, the probed executable \
+            version when available, the deterministic configuration hash, the canonical \
+            candidate reference, invocation time, freshness, coverage, SHA-256 output handles \
+            over the complete observed bytes, the observed exit code and the failure disposition",
+        representation_loss: "Parsers skip non-conforming lines as an explicit observation \
+            limit, never as silent success; SCIP rename anchors are start positions only and \
+            applying them requires LSP range resolution the bridge never performs; over-bound \
+            output normalizes to a stale truncated receipt instead of a complete result",
+        human_session_requirement: "Every launch goes through the shared ProcessExecutor \
+            admission with its own operation identity and generation binding; a command/request \
+            or receipt/identity mismatch is refused and is never bypassed by cached credentials \
+            or another session",
+    }
+}
+
+/// Reports whether `executable` names the admitted analyzer route.
+///
+/// Explicit pinning (`C:/tools/rust-analyzer.exe`, `./rust-analyzer`) is
+/// admitted; a differently-named provider under the same operation is a
+/// route mismatch and is refused: no provider is ever substituted under
+/// the same operation.
+fn admitted_analyzer_executable(executable: &str) -> bool {
+    let base = executable.rsplit('/').next().unwrap_or(executable);
+    let base = base.rsplit('\\').next().unwrap_or(base);
+    base.eq_ignore_ascii_case(RUST_ANALYZER_EXECUTABLE)
+        || base.eq_ignore_ascii_case("rust-analyzer.exe")
+}
+
+/// Validates bounded input and the exact operation/route before the
+/// underlying call. Executor admission (operation identity, generation
+/// binding) stays in [`LspBridge::launch`]; this gate covers what admission
+/// cannot see: the concrete projection.
+///
+/// Refusals are typed and create no authority, no operation identity, no
+/// task decision and no permission. A refused call is never dispatched, so
+/// there is nothing to reconcile; retries repeat the same invocation
+/// identity and no provider is ever substituted under the same operation.
+///
+/// Deadline, cancellation and uncertain post-dispatch outcomes stay with
+/// their existing owners: expiry and cancellation surface as incomplete
+/// evidence reconciled under the original operation identity (a cancellation
+/// acknowledgement is not proof of process or descendant termination), and
+/// malformed output normalizes to a stale receipt disposition, never to a
+/// proven no-effect claim. Every admitted operation is read-only with
+/// respect to sources, so unlike a mutating bridge this gate needs no
+/// uncertain-effect error: post-dispatch unknowns travel on the receipt.
+fn gate_lsp_call(
+    obligations: &LspApplicationObligations,
+    analyzer: AnalyzerKind,
+    executable: &str,
+    arguments: &[String],
+    working_directory: &str,
+) -> Result<(), BridgeError> {
+    if !admitted_analyzer_executable(executable) {
+        return Err(BridgeError::RouteMismatch {
+            observed: executable.to_owned(),
+        });
+    }
+    if !Path::new(working_directory).is_absolute() {
+        return Err(BridgeError::CallOverBound {
+            what: "working directory must be absolute",
+        });
+    }
+    if working_directory.contains('\0') {
+        return Err(BridgeError::CallOverBound {
+            what: "working directory must not contain NUL bytes",
+        });
+    }
+    let Some(first) = arguments.first() else {
+        return Err(BridgeError::OperationNotAdmitted {
+            operation: "<empty argv>".to_owned(),
+        });
+    };
+    if !obligations
+        .supported_operations
+        .contains(&first.as_str())
+    {
+        return Err(BridgeError::OperationNotAdmitted {
+            operation: first.clone(),
+        });
+    }
+    // The analyzer path must serve the projected argv: `--version` is a
+    // RustAnalyzer probe; any other first token must be that analyzer's own
+    // subcommand. A crossed projection (Scip analyzer, diagnostics argv)
+    // cannot dispatch.
+    let served = match analyzer {
+        AnalyzerKind::RustAnalyzer => {
+            first.as_str() == "--version" || first.as_str() == analyzer.subcommand()
+        }
+        AnalyzerKind::Scip => first.as_str() == analyzer.subcommand(),
+    };
+    if !served {
+        return Err(BridgeError::OperationNotAdmitted {
+            operation: format!("{} via {analyzer:?}", first.as_str()),
+        });
+    }
+    if arguments.len() > LSP_ARGV_CAP {
+        return Err(BridgeError::CallOverBound {
+            what: "argv exceeds the admitted argument count",
+        });
+    }
+    let mut total = 0usize;
+    for arg in arguments {
+        if arg.contains('\0') {
+            return Err(BridgeError::CallOverBound {
+                what: "argv must not contain NUL bytes",
+            });
+        }
+        if arg.len() > LSP_ARG_BYTES_CAP {
+            return Err(BridgeError::CallOverBound {
+                what: "single argument exceeds the admitted byte length",
+            });
+        }
+        total += arg.len();
+    }
+    if total > LSP_ARGV_BYTES_CAP {
+        return Err(BridgeError::CallOverBound {
+            what: "argv exceeds the admitted total byte length",
+        });
+    }
+    Ok(())
+}
+
 /// Facade over the shared process contract for one-shot analyzer launches.
 ///
 /// The bridge holds only the executor handle: no child, session, or cache
@@ -1553,13 +1762,27 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
         request: ProcessRequest,
         sink: Arc<dyn ProcessEvidenceSink>,
     ) -> Result<ProcessStartReceipt, BridgeError> {
+        gate_lsp_call(
+            &lsp_application_obligations(),
+            command.analyzer,
+            &command.executable,
+            &command.arguments,
+            &command.working_directory,
+        )?;
         if !command.matches_request(&request) {
             return Err(BridgeError::CommandMismatch);
         }
         let operation_id = request.operation_id().clone();
         let request_digest = request.invocation_digest().to_owned();
         let generation = request.generation().get();
-        let receipt = self.executor.start(request, sink).await?;
+        let receipt = self
+            .executor
+            .start(request, sink)
+            .await
+            .map_err(|error| BridgeError::ProcessLaunch {
+                invocation: command.describe(),
+                error,
+            })?;
         if receipt.operation_id() != &operation_id
             || receipt.request_digest() != request_digest
             || receipt.accepted_generation().get() != generation
@@ -1578,6 +1801,12 @@ impl<E: ProcessExecutor + 'static> LspBridge<E> {
     }
 
     /// Requests cancellation using the process implementation's fence.
+    ///
+    /// The returned receipt is the executor's acknowledgement, not proof of
+    /// process or descendant termination and not a rollback: the outcome
+    /// stays unknown until [`LspBridge::reconcile`] reports evidence under
+    /// the original operation identity. A retry repeats the same admitted
+    /// command; no provider is substituted under the same operation.
     pub async fn cancel(
         &self,
         operation: &OperationId,
@@ -1653,6 +1882,30 @@ pub enum BridgeError {
     /// Process receipt does not bind to the admitted request.
     #[error("process receipt does not bind to the admitted request")]
     ReceiptMismatch,
+    /// The requested first-argv token or analyzer pairing is outside the
+    /// declared supported set: the bridge serves a closed, already-admitted
+    /// operation list and creates no task policy to accommodate anything
+    /// else (capability outcome, pre-dispatch).
+    #[error("operation not admitted by the lsp bridge: {operation}")]
+    OperationNotAdmitted {
+        /// Observed first-argv token or analyzer pairing.
+        operation: String,
+    },
+    /// The call did not target the admitted analyzer route. No provider is
+    /// substituted under the same operation (identity/route outcome,
+    /// pre-dispatch).
+    #[error("route mismatch: bridge serves the admitted rust-analyzer executable, observed '{observed}'")]
+    RouteMismatch {
+        /// Observed executable.
+        observed: String,
+    },
+    /// Bounded-input violation: non-absolute working directory, NUL byte, or
+    /// over-long argv (protocol outcome, pre-dispatch).
+    #[error("call over bound: {what}")]
+    CallOverBound {
+        /// Stable bound description.
+        what: &'static str,
+    },
     /// Operation is not served by the selected analyzer path.
     #[error("operation is not served by the selected analyzer path")]
     UnsupportedOperation,
@@ -1683,6 +1936,18 @@ pub enum BridgeError {
     /// SCIP index bytes failed to decode.
     #[error("SCIP index failed to decode: {0}")]
     ScipDecode(String),
+    /// The shared executor refused or failed a launch. The attempted
+    /// invocation is retained so the failure reconciles under its original
+    /// identity instead of being retried as a new operation (identity
+    /// outcome: no analyzer output exists for this call).
+    #[error("analyzer launch failed for '{invocation}': {error}")]
+    ProcessLaunch {
+        /// Exact attempted invocation (`executable argv… @ cwd`).
+        invocation: String,
+        /// Executor refusal or failure.
+        #[source]
+        error: ProcessExecutionError,
+    },
     /// Shared process layer failed.
     #[error(transparent)]
     Process(#[from] ProcessExecutionError),
