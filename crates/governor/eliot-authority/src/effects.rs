@@ -603,6 +603,15 @@ impl EffectAuthorizer {
             authorized.proposal.operation.idempotency_key.clone(),
             authorized.clone(),
         );
+        // Persist-before-admission proof (I6.6 seq 3, I6.8): the stored
+        // authorization is proven retained in the exact snapshot payload the
+        // cross-process durable write persists before the authorization is
+        // returned. A ledger that cannot even serialize this record refuses
+        // here, so incomplete input or authorization can never become
+        // executable acceptance. The durable write of the snapshot itself
+        // stays cross-process (STITCH seam: the semantic write path owned
+        // outside this crate); per I6.10 no cross-store atomicity is claimed.
+        self.snapshot().map(|_| ())?;
         // I12.20 propagation on the production authorization path: contest
         // current dependent justifications/plans/pending effects without
         // touching history. Empty or absent revoked sets are a no-op.
@@ -626,6 +635,15 @@ impl EffectAuthorizer {
     /// The same logical request returns its original decision (idempotent
     /// replay). A changed payload, owner namespace, executor or incompatible
     /// binding conflicts rather than silently using the old record.
+    ///
+    /// Caller seam (issue #1793 A1): this is the Governor admission entry
+    /// point, so its production caller lives in the Governor admission lane
+    /// (outside this file) and its sealed output is consumed by the
+    /// reservation/dispatch lane (#1678/#1701). Every authorization it stores
+    /// is proven snapshot-retainable before return (see
+    /// [`Self::authorize_with_revoked_roots`]); the cross-process durable
+    /// write of that snapshot stays an explicit asymmetric handoff with no
+    /// claimed cross-store atomicity (I6.10).
     #[allow(clippy::too_many_arguments)]
     pub fn compile_effectful_action(
         &mut self,

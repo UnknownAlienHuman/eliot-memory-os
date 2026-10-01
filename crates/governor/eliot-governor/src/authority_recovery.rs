@@ -560,6 +560,21 @@ impl AuthorityOwnerSnapshot {
 }
 
 /// Authority owner retaining only restored, pure authority state.
+///
+/// Issue #1793 seq 1 per-path effect boundary map (Governor-owned entries;
+/// cross-issue spans name their exact STITCH seam instead of inventing a
+/// third representation):
+///
+/// | effectful path | proposal producer | governing contract | authorization owner | exact executor | persisted intent/result | recovery reader |
+/// |---|---|---|---|---|---|---|
+/// | Governor effect admission | Governor admission caller presenting contract + lease (STITCH seam: caller of `EffectAuthorizer::compile_effectful_action`, `eliot-authority/src/effects.rs`) | `eliot-authority::ActionContract` (I6.6 action frame) | `EffectAuthorizer` ledger keyed by idempotency identity | sealed-dispatch consumer via `admit_effect_execution` (STITCH seam: reservation/dispatch owned by #1678/#1701) | `AuthorityOwnerSnapshot.effect_authorizer` staged by `snapshot()`; durable write is the cross-process semantic write path (STITCH) | `from_snapshot_with_revocation_history` + `rebuild_effect_obligations` (this file; production-called from the Governor restore path) |
+/// | native-worker external-adapter ops (`register`, `claim`, `reconcile`, `start_claimed`, `serve_stdio`) | `ActionEnvelope` presenter, validated by `require_governed_op` (`bins/eliot-native-worker/src/governed_action.rs`) | envelope + derived impact; full `ActionContract` join is Governor-side (STITCH) | Kernel admission contour + Governor lease; currentness stays with Kernel | adapter closure via `run_governed_external_op`, runs iff the envelope validates | `RecordedEffect` via `record_effect`; durable write owned by the caller contour | STITCH seam: dependent dispatch/replay owned by #1678/#1701 |
+/// | Kernel process dispatch | `ProcessIntent` | `DispatchPermitAuthority` issuance (`eliot-process`) | `ProcessDispatchAuthorityController` (`eliot-kernel-core/src/authority_controller.rs`) | validated-dispatch consumer via `validate_and_consume` | ORS replay snapshot via `persist_snapshot` + `ProcessExecutionReplayStore` | `restore()` (same file) |
+/// | agent-API trio (#228) | provider `proposed_effects` (`eliot-agent-api`) | agent-local candidate projection, not authority | authoritative owner stays `eliot-authority::EffectReceipt` with `CanonicalEffectReceipt` obligations | Governor/Kernel join above, never the provider | canonical receipt owned by the effect layer | lossless conversion/unification is a governor-lane contract change (STITCH; no `*effect*` mapping file exists under `eliot-agent-api/src`) |
+///
+/// Governor owns substantive action admissibility; Kernel enforces current
+/// mechanically compiled authority and ordering; the existing
+/// process/adapter/Store owner observes its actual effect (I6.6/I6.10).
 #[derive(Clone, Debug)]
 pub struct AuthorityOwner {
     /// Exact Governor recovery fence retained with the restored authority state.
@@ -643,7 +658,10 @@ impl AuthorityOwner {
     /// unknown (invalid, unordered, or non-revoked closure) evidence refuse
     /// likewise. A revoked origin and its dependent grants stay suppressed
     /// in the restored owner; unrelated valid grants restore exactly as the
-    /// snapshot carries them, with the exact suppressed set reported.
+    /// snapshot carries them, with the exact suppressed set reported. Effect
+    /// obligations are rebuilt from the restored ledger before return (issue
+    /// #1793 seq 6): dependent dispatch consults retained obligations derived
+    /// here, never an empty map.
     ///
     /// The legacy [`from_snapshot`](Self::from_snapshot) preserves its
     /// exact prior behavior for previously-admitted callers.
@@ -727,16 +745,24 @@ impl AuthorityOwner {
             .flat_map(|suppressed| [suppressed.grant_id.clone(), suppressed.closure_id.clone()])
             .collect();
         effects.contest_dependent_effects(&revoked_roots);
+        let mut owner = Self {
+            state_fence: snapshot.state_fence.clone(),
+            effects,
+            grants: outcome.graph,
+            owner_hydrations: snapshot.owner_hydrations.clone(),
+            effect_obligations: BTreeMap::new(),
+            effect_obligations_rebuilt: false,
+            last_revocation_source_revision: Some(evidence.source_revision),
+        };
+        // Issue #1793 seq 6: derive recovery-side obligations from the
+        // restored ledger inside restore itself, before any dependent
+        // dispatch can consult the fences. A history-bound restore previously
+        // returned with an empty obligation map and relied on a future caller
+        // to rebuild; expiry or loss of a local queue entry never releases
+        // these obligations, so the owner derives them here.
+        owner.rebuild_effect_obligations()?;
         Ok(AuthorityRestoreOutcome {
-            owner: Self {
-                state_fence: snapshot.state_fence.clone(),
-                effects,
-                grants: outcome.graph,
-                owner_hydrations: snapshot.owner_hydrations.clone(),
-                effect_obligations: BTreeMap::new(),
-                effect_obligations_rebuilt: false,
-                last_revocation_source_revision: Some(evidence.source_revision),
-            },
+            owner,
             suppressed: outcome.suppressed,
         })
     }

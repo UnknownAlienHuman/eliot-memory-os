@@ -15,6 +15,17 @@
 //! condition) and refuses fail-closed with a standardized rejection before
 //! any adapter closure runs. Kernel admission, the executable join, and the
 //! dispatch grant stay with the existing admitted contour.
+//!
+//! Issue #1793 seq 1 boundary entry (this contour's row): the proposal
+//! producer is the `ActionEnvelope` presenter for one declared
+//! external-adapter operation; the governing contract is this envelope plus
+//! the Governor-derived impact (the full `ActionContract` join lives
+//! Governor-side); the authorization owner is the Kernel admission contour
+//! plus the Governor lease, whose currentness stays with Kernel; the exact
+//! executor is the adapter closure, which runs if and only if the envelope
+//! validates; the persisted result is the `RecordedEffect` projection (its
+//! durable write is owned by the caller contour); recovery-side
+//! dependent-dispatch fencing spans #1678/#1701 (STITCH seam).
 
 #![forbid(unsafe_code)]
 

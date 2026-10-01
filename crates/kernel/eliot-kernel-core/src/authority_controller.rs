@@ -9,6 +9,17 @@
 //! is the object-safe P-01/platform seam that knows how to seal and resolve the
 //! payload.  P-07 never implements substitute crypto, stores plaintext in ORS,
 //! exposes a key, or lets a caller mint a recovery capability.
+//!
+//! Issue #1793 seq 1 boundary entry (this controller's row): the proposal
+//! producer is the `ProcessIntent` presenter; the permit issuance contract is
+//! the P-03 `DispatchPermitAuthority`; the authorization owner is this
+//! controller; the exact executor is the validated-dispatch consumer reached
+//! through [`ProcessDispatchAuthorityController::validate_and_consume`];
+//! persisted intent/result is the ORS replay snapshot journaled by every
+//! issue/consume transition; the recovery reader is
+//! [`ProcessDispatchAuthorityController::restore`]. Kernel enforces current
+//! mechanically compiled authority and ordering here; substantive action
+//! admissibility stays with Governor.
 
 use std::sync::Arc;
 
