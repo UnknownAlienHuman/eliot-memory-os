@@ -37307,8 +37307,9 @@ mod process_start_abort_tests {
 )]
 mod host_request_result_tests {
     use super::*;
+    use crate::model::{BackupVerifyRequestIdentity, BackupVerifySuccessionGrant};
     use crate::{HostRequestKind, HostRequestState, OpaqueLabel, OperationIdentity};
-    use eliot_contracts::{EpochId, EpochLineageId};
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
     use serde_json::json;
 
     const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -37536,6 +37537,176 @@ mod host_request_result_tests {
         drop(store);
         let _ = std::fs::remove_file(path);
         Ok(())
+    }
+
+    /// Builds a stored backup-verification row carrying one succession grant, so
+    /// the store-side grant tests can exercise consumption without a live
+    /// session (#2883).
+    ///
+    /// Every field is one the record's own `validate()` demands: the four
+    /// `BACKUP_VERIFY_*` profile constants are the real ones, every digest is 64
+    /// lowercase hex, and the flat answer fields repeat the nested identity
+    /// values they are drift-checked against. The grant is NOT part of the
+    /// identity, so the durable key is identical whether the row carries a grant
+    /// or not, which is exactly what makes a grant consumable on a row that is
+    /// already committed under its own identity.
+    fn grant_row(grant: Option<BackupVerifySuccessionGrant>) -> BackupVerificationResultRecord {
+        let archive_sha256 = "a".repeat(64);
+        let identity = BackupVerifyRequestIdentity {
+            profile_id: crate::model::BACKUP_VERIFY_PROFILE_ID.to_owned(),
+            profile_version: crate::model::BACKUP_VERIFY_PROFILE_VERSION,
+            domain_separator: "eliot.kernel.backup-verify.request".to_owned(),
+            idempotency_namespace: format!(
+                "{}/v{}",
+                crate::model::BACKUP_VERIFY_PROFILE_ID,
+                crate::model::BACKUP_VERIFY_PROFILE_VERSION
+            ),
+            canonical_encoding_version: 1,
+            semantic_command_kind: "backup.verify".to_owned(),
+            principal: "S-1-5-21-1001".to_owned(),
+            session_id: "4294967312".to_owned(),
+            capability: "backup.restore.v1".to_owned(),
+            scope_id: "scope-a".to_owned(),
+            resource_generation: ResourceGeneration::new(1).expect("nonzero test generation"),
+            authority_epoch: test_epoch(),
+            operation_id: "op-1".to_owned(),
+            archive_sha256: archive_sha256.clone(),
+            archive_owner_contract: "eliot.backup-capture/v1".to_owned(),
+            archive_source_installation: "install-a".to_owned(),
+            archive_export_fence_digest: "b".repeat(64),
+            archived_fence_digest: "c".repeat(64),
+            observed_fence_digest: "d".repeat(64),
+            evidenced_class: "full_recovery".to_owned(),
+            capture_receipt: None,
+            archive_handle: None,
+            capture_receipt_digest: None,
+            validity_attestation_digest: None,
+            retention_and_collision_window: crate::model::BACKUP_VERIFY_RETENTION_WINDOW.to_owned(),
+            identity_digest: String::new(),
+        }
+        .with_computed_digest()
+        .expect("test identity digest must compute");
+        BackupVerificationResultRecord {
+            contract_version: crate::CONTRACT_VERSION,
+            request_digest: identity.identity_digest.clone(),
+            archive_sha256,
+            backup_id: "backup-1".to_owned(),
+            class: "full_recovery".to_owned(),
+            class_ceiling: "full_recovery".to_owned(),
+            verification_level: "owner_attested".to_owned(),
+            archive_fence_relation: "exact_match".to_owned(),
+            archive_fence_proof: "structural-only".to_owned(),
+            archive_fence_restrictions: Vec::new(),
+            archive_fence_relation_contract_version: 1,
+            target_compatibility: None,
+            event_count: 1,
+            receipt_count: 1,
+            blob_count: 1,
+            capture_receipt: None,
+            archive_handle: None,
+            capture_receipt_digest: None,
+            validity_attestation_digest: None,
+            reply_digest: "e".repeat(64),
+            succession_grant: grant,
+            identity,
+        }
+    }
+
+    /// A live grant is consumed exactly once, and the marker is durable (#2883).
+    #[test]
+    fn succession_grant_is_consumed_exactly_once_and_persists() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let now = 1_000_000_000_u64;
+        let grant = BackupVerifySuccessionGrant {
+            grant_id: "1".repeat(64),
+            principal: "S-1-5-21-1001".to_owned(),
+            scope_id: "scope-a".to_owned(),
+            authority_lineage_id: TEST_LINEAGE.to_owned(),
+            issued_at_unix_ms: now - 1,
+            not_before_unix_ms: now,
+            expires_at_unix_ms: now + 300_000,
+            consumed_at_unix_ms: None,
+        };
+        grant
+            .validate()
+            .expect("a fresh grant inside its own window must validate");
+        let key = grant_row(None).record_key()?;
+        store.stage_backup_verification_result(&grant_row(Some(grant)))?;
+
+        assert!(
+            store.consume_backup_verification_succession_grant(&key, now)?,
+            "the first reconciliation consumes the grant"
+        );
+        assert!(
+            !store.consume_backup_verification_succession_grant(&key, now + 1)?,
+            "a replay of the same grant must NOT be consumable a second time"
+        );
+
+        drop(store);
+        let reopened = RedbRecoveryStore::open(&path).expect("store reopens");
+        let stored = reopened
+            .load_backup_verification_result(&key)?
+            .expect("the row is still stored");
+        assert!(
+            stored
+                .succession_grant
+                .is_some_and(|grant| grant.is_consumed()),
+            "the consumed marker is durable across a reopen, not in-memory only"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// A row whose grant could not be issued stays unreconcilable: consuming
+    /// against it must fail closed rather than fall back to any other authority
+    /// (#2883 instruction 4 - the entropy-unavailable path).
+    #[test]
+    fn succession_grant_absent_row_is_not_consumable() -> Result<(), OrsError> {
+        let (store, path) = temp_store();
+        let row = grant_row(None);
+        let key = row.record_key()?;
+        store.stage_backup_verification_result(&row)?;
+        assert!(
+            !store.consume_backup_verification_succession_grant(&key, 1_000_000_000_u64)?,
+            "a row carrying no grant must never be consumable"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    /// A consumption marker outside the grant's own window is refused, so a
+    /// spent grant cannot be made to look live by an out-of-range marker.
+    #[test]
+    fn succession_grant_rejects_consumption_outside_its_window() {
+        let now = 1_000_000_000_u64;
+        let base = BackupVerifySuccessionGrant {
+            grant_id: "1".repeat(64),
+            principal: "S-1-5-21-1001".to_owned(),
+            scope_id: "scope-a".to_owned(),
+            authority_lineage_id: TEST_LINEAGE.to_owned(),
+            issued_at_unix_ms: now - 1,
+            not_before_unix_ms: now,
+            expires_at_unix_ms: now + 300_000,
+            consumed_at_unix_ms: None,
+        };
+        let before_window = BackupVerifySuccessionGrant {
+            consumed_at_unix_ms: Some(now - 1),
+            ..base.clone()
+        };
+        let after_window = BackupVerifySuccessionGrant {
+            consumed_at_unix_ms: Some(now + 300_000),
+            ..base
+        };
+        assert!(
+            before_window.validate().is_err(),
+            "consumption before the window opens is refused"
+        );
+        assert!(
+            after_window.validate().is_err(),
+            "consumption at or after expiry is refused"
+        );
     }
 }
 
