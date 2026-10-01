@@ -1317,7 +1317,8 @@ mod tests {
     }
 
     fn encode_frame(frame: &WorkerFrame) -> Vec<u8> {
-        let body = serde_json::to_vec(frame).expect("frame");
+        let frame = frame.to_ebp_frame().expect("valid EBP frame");
+        let body = serde_json::to_vec(&frame).expect("frame");
         let mut out = u32::try_from(body.len())
             .expect("len")
             .to_le_bytes()
@@ -1566,13 +1567,14 @@ mod tests {
     fn governed_carrier(
         carrier_op: &str,
         envelope_op: &str,
+        scope_ref: &str,
         fence_json: &serde_json::Value,
         epoch_json: &serde_json::Value,
     ) -> ActionEnvelopeCarrier {
         let envelope = ActionEnvelope {
             operation: envelope_op.to_owned(),
             intent: format!("execute governed {envelope_op}"),
-            scope_ref: "scope-1911".to_owned(),
+            scope_ref: scope_ref.to_owned(),
             preconditions: "claim admitted; fence live".to_owned(),
             expected_effect: format!("bounded {envelope_op} effect"),
             invariants: "no ambient effects".to_owned(),
@@ -1594,12 +1596,15 @@ mod tests {
     }
 
     fn drive_carriers(
+        scope_ref: &str,
         fence_json: &serde_json::Value,
         epoch_json: &serde_json::Value,
     ) -> Vec<ActionEnvelopeCarrier> {
         ["register", "claim", "reconcile", "start_claimed"]
             .iter()
-            .map(|operation| governed_carrier(operation, operation, fence_json, epoch_json))
+            .map(|operation| {
+                governed_carrier(operation, operation, scope_ref, fence_json, epoch_json)
+            })
             .collect()
     }
 
@@ -1700,7 +1705,10 @@ mod tests {
     fn governed_drive_admits_enveloped_material_to_ready_with_provenance() {
         let (fence_json, epoch_json) = action_currency();
         let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts("governed-drive", drive_carriers(&fence_json, &epoch_json));
+            governed_drive_parts(
+                "governed-drive",
+                drive_carriers("scope-1", &fence_json, &epoch_json),
+            );
         let (actions, ready) = block_on(eliot_native_worker::drive_governed_material(
             &mut lifecycle,
             &mut worker,
@@ -1756,6 +1764,7 @@ mod tests {
             vec![governed_carrier(
                 "register",
                 "claim",
+                "scope-1",
                 &fence_json,
                 &epoch_json,
             )],
@@ -1785,6 +1794,7 @@ mod tests {
             vec![governed_carrier(
                 "register",
                 "register",
+                "scope-1",
                 &stale_fence,
                 &epoch_json,
             )],
@@ -1811,7 +1821,10 @@ mod tests {
     fn governed_stdio_serves_only_with_valid_envelope() {
         let (fence_json, epoch_json) = action_currency();
         let (mut worker, mut lifecycle, material, process, _bat, _staged) =
-            governed_drive_parts("governed-stdio", drive_carriers(&fence_json, &epoch_json));
+            governed_drive_parts(
+                "governed-stdio",
+                drive_carriers("scope-1", &fence_json, &epoch_json),
+            );
         // Refusal leaves the writer empty and the reader unconsumed: no
         // frame is read and no response is written without an envelope.
         let frame_bytes = encode_frame(&health_frame());
@@ -1849,6 +1862,7 @@ mod tests {
         let serve = vec![governed_carrier(
             "serve_stdio",
             "serve_stdio",
+            "scope-1",
             &fence_json,
             &epoch_json,
         )];
@@ -1909,6 +1923,12 @@ mod tests {
         now_ms: u64,
         owner_issue: bool,
     ) -> (String, String, String) {
+        // This is the canonical digest of Kernel's generated #13 registry
+        // value in `bins/eliot-kernel/src/composition_bootstrap.rs`. Keep the
+        // fixture on that owner-produced cell identity instead of inventing a
+        // syntactically valid registry digest for a fixture-only cell.
+        const NATIVE_WORKER_CELL_REGISTRY_DIGEST: &str =
+            "f2133066d189376ebe0f46aaf7a9b79cb37e1acafc60fce5989b05e3db7ae26f";
         let claim_id = "claim-kernel-drive-1";
         let operation_id = "operation-kernel-drive-1";
         let worker_generation = 1_u64;
@@ -1987,9 +2007,10 @@ mod tests {
             "adapter_revision": eliot_native_worker::adapter_registry::FACTORY_REVISION,
             "config_digest": "c".repeat(64),
             "facet_manifest_ref": "facet-manifest-kernel-drive-1",
-            "capability_cell": "cell-test-1",
+            "capability_cell": "native-worker-core",
             "grant_graph_revision": 5,
             "module_catalog_revision": 7,
+            "capability_cell_registry_digest": NATIVE_WORKER_CELL_REGISTRY_DIGEST,
             "replay_stream_id": "claim-kernel-drive-1/gen-1",
             "launch_nonce": join_nonce,
             "process_invocation_digest": invocation_digest.clone(),
