@@ -7168,16 +7168,11 @@ impl RedbRecoveryStore {
         let mut table = write
             .open_table(SCAN_DISCLOSURE_QUARANTINE)
             .map_err(storage)?;
-        if let Some(raw) = table
-            .get(record.quarantine_key.as_str())
-            .map_err(storage)?
-        {
+        if let Some(raw) = table.get(record.quarantine_key.as_str()).map_err(storage)? {
             let existing: crate::ScanDisclosureQuarantineRecord = decode(raw.value())?;
             existing.validate()?;
             validate_scan_disclosure_quarantine_installation(&existing, &store_identity)?;
-            if existing.quarantine_key != record.quarantine_key
-                || !existing.same_binding(record)
-            {
+            if existing.quarantine_key != record.quarantine_key || !existing.same_binding(record) {
                 return Err(OrsError::IntegrityProblem {
                     record_type: crate::SCAN_DISCLOSURE_QUARANTINE_RECORD_TYPE,
                     reason: "existing quarantine key binds different source bytes".to_owned(),
@@ -28081,11 +28076,7 @@ impl RedbRecoveryStore {
         // helper as every other base table, so a fresh store materializes it
         // before `validate_activation_lifecycle_table` reads it.
         drop(write.open_table(ACTIVATION_LIFECYCLES).map_err(storage)?);
-        drop(
-            write
-                .open_table(SCAN_DISCLOSURE_RECORDS)
-                .map_err(storage)?,
-        );
+        drop(write.open_table(SCAN_DISCLOSURE_RECORDS).map_err(storage)?);
         drop(
             write
                 .open_table(SCAN_DISCLOSURE_QUARANTINE)

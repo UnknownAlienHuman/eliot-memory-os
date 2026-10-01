@@ -8,7 +8,10 @@
 
 use std::path::Path;
 
-use eliot_governor::{InstallationScanDisclosureStore, ScanDisclosureQuarantineHandle};
+use crate::DaemonError;
+use eliot_governor::{
+    GovernorComposition, InstallationScanDisclosureStore, ScanDisclosureQuarantineHandle,
+};
 use eliot_platform_windows::ProtectedRootLease;
 
 /// Reads and durably quarantines every bounded legacy capture from the exact
@@ -29,17 +32,14 @@ use eliot_platform_windows::ProtectedRootLease;
 pub fn quarantine_loose_scan_disclosures(
     canonical_state_root: &Path,
     store: &InstallationScanDisclosureStore,
-) -> Result<Vec<ScanDisclosureQuarantineHandle>, String> {
-    let root = ProtectedRootLease::open_existing(canonical_state_root)
-        .map_err(|error| format!("protected state root could not be pinned: {error}"))?;
-    let captures = root
-        .read_loose_scan_disclosure_captures()
-        .map_err(|error| format!("protected loose-capture read failed: {error}"))?;
+) -> Result<Vec<ScanDisclosureQuarantineHandle>, DaemonError> {
+    let root = ProtectedRootLease::open_existing(canonical_state_root)?;
+    let captures = root.read_loose_scan_disclosure_captures()?;
     let mut retained = Vec::with_capacity(captures.len());
     for (file_name, bytes) in captures {
-        let handle = store
-            .quarantine_loose_capture(&file_name, &bytes)
-            .map_err(|error| format!("durable loose-capture quarantine failed: {error}"))?;
+        let handle = GovernorComposition::<dyn eliot_governor::KernelGenerationPort>::quarantine_loose_scan_disclosure_capture(
+            store, &file_name, &bytes,
+        )?;
         retained.push(handle);
     }
     Ok(retained)

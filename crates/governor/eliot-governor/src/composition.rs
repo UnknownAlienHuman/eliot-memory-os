@@ -125,12 +125,12 @@ use eliot_workscope::{
     BootstrapScanner, ColdStartController, ColdStartOwnerInputs, ColdStartTrigger,
     DiscoveryLeaseKey, DiscoveryReadLease, GenerationEvidence, GoverningSourceAdmission,
     GoverningSourceCandidate, GoverningSourceSet, GuardTrigger, GuardVerdict, IdentityEvidence,
-    IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
-    MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
-    PrecedenceDeclaration, PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord,
-    ReadinessLifecycle, RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication,
-    ResolutionRequest, ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle,
-    ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity,
+    IdentityLegOutcome, LeaseJoin, MaterialAdmission, MaterialReadinessDirective,
+    MaterialReadinessInputs, ObservedScopeResources, OnboardingLease, PrecedenceDeclaration,
+    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
+    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
+    ScanDisclosureOwnerBinding, ScanDisclosureStore, ScanReceiptHandle, ScannerResolverInputs,
+    ScopeBinding, ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity,
     ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, SourceCandidateOrigin,
     TaskBindingInput, TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired,
     TriggerAdmission, TriggerReport, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
@@ -9348,14 +9348,14 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// not owner provenance, so even well-formed bytes stay quarantined for
     /// the migration owner instead of becoming readable evidence.
     ///
-    /// Live status: no production caller. No attach/onboarding ingress hands
-    /// over a loose capture today. Whether the migration owner calls this or the
-    /// entry is retired is an owner decision.
+    /// Called by the daemon's protected-state migration pass after the exact
+    /// installation scan owner has been bound. The returned handle identifies
+    /// only the durable quarantine row, never admissible scan evidence.
     pub fn quarantine_loose_scan_disclosure_capture(
         store: &InstallationScanDisclosureStore,
         file_name: &str,
         bytes: &[u8],
-    ) -> Result<LooseScanQuarantine, CompositionError> {
+    ) -> Result<crate::ScanDisclosureQuarantineHandle, CompositionError> {
         store
             .quarantine_loose_capture(file_name, bytes)
             .map_err(CompositionError::ScanDisclosure)

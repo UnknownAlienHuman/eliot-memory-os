@@ -143,6 +143,7 @@ pub mod provider_transport_policy;
 mod reactive_feed;
 mod route_execution_identity;
 mod route_receipts;
+pub mod scan_disclosure_migration;
 pub mod semantic_revision_store;
 mod skill_acceptance_read;
 mod skill_bridge_adapter;
