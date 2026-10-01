@@ -2131,8 +2131,7 @@ pub(crate) fn verify_mechanical_subset_against_current_grant_record(
         .map_err(|error| CompositionError::Recovery(error.to_string()))?;
     if intent.mechanical_subset_commitment != subset.content_commitment {
         return Err(CompositionError::Recovery(
-            "admitted mechanical subset disagrees with its recorded content commitment"
-                .to_owned(),
+            "admitted mechanical subset disagrees with its recorded content commitment".to_owned(),
         ));
     }
     if subset.grant_id != intent.grant_id
@@ -2157,8 +2156,7 @@ pub(crate) fn verify_mechanical_subset_against_current_grant_record(
         || subset.source.source_grant_id != record.grant_id
     {
         return Err(CompositionError::Recovery(
-            "admitted mechanical subset is not a subset of the current canonical grant"
-                .to_owned(),
+            "admitted mechanical subset is not a subset of the current canonical grant".to_owned(),
         ));
     }
     if subset.source.source_grant_commitment != canonical_grant_record_commitment(record)? {

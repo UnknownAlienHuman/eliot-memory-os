@@ -5259,7 +5259,9 @@ impl MemoryStore {
             return Err(StoreError::FenceMismatch);
         }
         if current == &request.owner_record {
-            return Ok(StoreWorkScopeOwnerResponse { record: current.clone() });
+            return Ok(StoreWorkScopeOwnerResponse {
+                record: current.clone(),
+            });
         }
         if current.revision != request.expected_owner_revision
             || current.namespace != request.owner_record.namespace
@@ -5268,7 +5270,9 @@ impl MemoryStore {
         {
             return Err(StoreError::IdentityConflict);
         }
-        state.recovery_records.insert(key, request.owner_record.clone());
+        state
+            .recovery_records
+            .insert(key, request.owner_record.clone());
         let readback = state
             .recovery_records
             .get(&request.owner_record.record_key())

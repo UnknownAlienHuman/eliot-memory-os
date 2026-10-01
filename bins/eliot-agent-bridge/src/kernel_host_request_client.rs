@@ -722,7 +722,6 @@ impl KernelHostRequestClient {
             .exchange_host_request_frame(frame)
     }
 
-
     /// Records that the Kernel settled one exact host operation through this
     /// client (issue #77 W8).
     ///
@@ -772,9 +771,7 @@ impl KernelHostRequestClient {
             return false;
         };
         owner.replay_cache.values().any(|entry| entry.owner_settled)
-
     }
-
 
     /// Submits one explicit initial WorkScope binding under the owner proof
     /// retained from this connection's exact `ScopeSelectionRequired`
@@ -1010,7 +1007,6 @@ impl KernelHostRequestClient {
             .exchange(&frame)
             .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
         decode_rehydrated_reply(&reply, envelope).ok_or_else(|| unknown_outcome(&digest))
-
     }
 
     /// Captures owner-verified source-result and attach facts for a resource

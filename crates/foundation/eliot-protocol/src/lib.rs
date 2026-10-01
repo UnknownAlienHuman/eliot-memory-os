@@ -4624,8 +4624,7 @@ pub const LOCAL_READ_ATTEMPT_WIRE_VERSION: u16 = 1;
 /// name must equal the envelope capability and the canonical digest over the
 /// tool bytes must equal the envelope payload digest; anything else is
 /// rejected before any read. The tool value is opaque here (no MCP edge from
-/// the wire crate): it must be a JSON object carrying a non-blank 
-ame`.
+/// the wire crate): it must be a JSON object carrying a non-blank `name`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostRequestInvokeReadPayload {
@@ -5440,8 +5439,7 @@ pub struct LocalReadExecutionEvidence {
     pub input_handle: Option<String>,
     /// Immutable output handle: the canonical result digest.
     pub output_handle: Option<String>,
-    /// Observed side-effect declaration: 
-one` for executions with no
+    /// Observed side-effect declaration: `none` for executions with no
     /// external effect, otherwise an immutable effect/digest reference.
     pub side_effects: Option<String>,
 }

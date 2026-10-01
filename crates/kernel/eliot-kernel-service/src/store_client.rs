@@ -26,10 +26,10 @@ use eliot_store_api::{
     RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
     ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse,
-    StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, StoreWireError,
-    WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
+    StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, WriteReceipt, dreamer_job_capability,
+    map_durable_error, validate_genesis_receipt_envelope, verify_canonical_request_hash,
+    verify_ordering_scope_binding,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -891,9 +891,12 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
                         match snapshot.owner_records.as_slice() {
                             [record]
                                 if record == &requested_record
-                                    && record.revision == request.expected_owner_revision.saturating_add(1) =>
+                                    && record.revision
+                                        == request.expected_owner_revision.saturating_add(1) =>
                             {
-                                Ok(StoreWorkScopeOwnerResponse { record: record.clone() })
+                                Ok(StoreWorkScopeOwnerResponse {
+                                    record: record.clone(),
+                                })
                             }
                             _ => Err(StoreError::UnknownOutcome {
                                 operation_id: request.operation_id.clone(),

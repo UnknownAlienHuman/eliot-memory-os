@@ -29,8 +29,7 @@ use eliot_store_api::{
     RequestMeta, ReservedWriteRequest, RevisionHead, RevisionHeadExpectation, RevisionKey,
     StateFence, StoreError, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
     StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, TransitionClass, WriteReceipt,
-    decode_erasure_surfaces, generated_operation_manifests,
-    operation_manifest_set_digest,
+    decode_erasure_surfaces, generated_operation_manifests, operation_manifest_set_digest,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -99,7 +98,9 @@ pub(crate) async fn write_work_scope_owner(
     context: &RequestMeta,
     request: StoreWorkScopeOwnerRequest,
 ) -> Result<StoreWorkScopeOwnerResponse, AdapterError> {
-    request.validate_for_context(context).map_err(AdapterError::Store)?;
+    request
+        .validate_for_context(context)
+        .map_err(AdapterError::Store)?;
     let _admission = adapter.exclusive_admission.exclusive_operation().await;
     let Some(execution) = adapter.execution_handle() else {
         return write_work_scope_owner_direct(adapter, context, request).await;
@@ -121,7 +122,9 @@ async fn write_work_scope_owner_direct(
     context: &RequestMeta,
     request: StoreWorkScopeOwnerRequest,
 ) -> Result<StoreWorkScopeOwnerResponse, AdapterError> {
-    request.validate_for_context(context).map_err(AdapterError::Store)?;
+    request
+        .validate_for_context(context)
+        .map_err(AdapterError::Store)?;
     let db = client(adapter).await?;
     ensure_ready(adapter, db).await?;
     let key = request.owner_record.record_key();
@@ -140,7 +143,9 @@ async fn write_work_scope_owner_direct(
         .ok_or(AdapterError::PartialOutcome)?;
     if current == request.owner_record {
         let response = StoreWorkScopeOwnerResponse { record: current };
-        response.validate_for_request(&request).map_err(AdapterError::Store)?;
+        response
+            .validate_for_request(&request)
+            .map_err(AdapterError::Store)?;
         return Ok(response);
     }
     current.validate().map_err(AdapterError::Store)?;
@@ -171,24 +176,39 @@ async fn write_work_scope_owner_direct(
     })
     .as_object()
     .cloned()
-    .ok_or_else(|| AdapterError::Serialization("WorkScope owner bindings are not an object".to_owned()))?;
-    let write_result = client::query(db, &adapter.config, "work_scope.owner.cas", statement, bindings)
-        .await
-        .and_then(|mut response| {
-            let errors = response.take_errors();
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(atomic_write::classify_transaction_errors(&errors, "work_scope.owner.cas"))
-            }
-        });
+    .ok_or_else(|| {
+        AdapterError::Serialization("WorkScope owner bindings are not an object".to_owned())
+    })?;
+    let write_result = client::query(
+        db,
+        &adapter.config,
+        "work_scope.owner.cas",
+        statement,
+        bindings,
+    )
+    .await
+    .and_then(|mut response| {
+        let errors = response.take_errors();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(atomic_write::classify_transaction_errors(
+                &errors,
+                "work_scope.owner.cas",
+            ))
+        }
+    });
     let readback = recovery(adapter, read_request).await;
     if let Ok(snapshot) = &readback
         && let Some(record) = snapshot.owner_records.first()
         && record == &request.owner_record
     {
-        let response = StoreWorkScopeOwnerResponse { record: record.clone() };
-        response.validate_for_request(&request).map_err(AdapterError::Store)?;
+        let response = StoreWorkScopeOwnerResponse {
+            record: record.clone(),
+        };
+        response
+            .validate_for_request(&request)
+            .map_err(AdapterError::Store)?;
         return Ok(response);
     }
     write_result?;

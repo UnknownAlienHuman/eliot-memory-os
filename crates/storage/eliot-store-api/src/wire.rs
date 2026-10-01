@@ -26,8 +26,8 @@ use crate::{
     RevisionKey, ScopeId, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
     SnapshotPage, StateFence, StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest,
     StoreRecoverySnapshot, StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, WriteReceipt,
-    canonical_json_bytes, dreamer_job::map_durable_error,
-    json_shape_name, reconcile_same_operation, sha256_hex, verify_canonical_request_hash,
+    canonical_json_bytes, dreamer_job::map_durable_error, json_shape_name,
+    reconcile_same_operation, sha256_hex, verify_canonical_request_hash,
 };
 use schemars::JsonSchema;
 
@@ -373,9 +373,7 @@ impl StoreRequest {
                 }
                 Ok(())
             }
-            Self::WriteWorkScopeOwner { context, request } => {
-                request.validate_for_context(context)
-            }
+            Self::WriteWorkScopeOwner { context, request } => request.validate_for_context(context),
             Self::Apply {
                 context,
                 transition,
@@ -1331,9 +1329,7 @@ impl StoreResponse {
                 snapshot.validate().map_err(StoreWireError::Store)
             }
             Self::Recovery { snapshot } => snapshot.validate().map_err(StoreWireError::Store),
-            Self::WorkScopeOwner { response } => response
-                .validate()
-                .map_err(StoreWireError::Store),
+            Self::WorkScopeOwner { response } => response.validate().map_err(StoreWireError::Store),
             Self::DreamerJob { response } => response
                 .validate()
                 .map_err(|error| StoreWireError::Store(map_durable_error(error))),

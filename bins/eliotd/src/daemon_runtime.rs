@@ -7700,16 +7700,12 @@ fn scan_owner_error(error: eliot_ors::OrsError) -> ColdStartIngressError {
 fn cold_start_refusal(error: ColdStartIngressError) -> serde_json::Value {
     use eliot_workscope::WorkScopeError as Failure;
     let code = match &error {
-        ColdStartIngressError::WorkScope(Failure::ScanReceiptMissing) => {
-            "SCAN_RECEIPT_MISSING"
-        }
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptMissing) => "SCAN_RECEIPT_MISSING",
         ColdStartIngressError::WorkScope(Failure::ScanReceiptInaccessible) => {
             "SCAN_RECEIPT_INACCESSIBLE"
         }
         ColdStartIngressError::WorkScope(Failure::ScanReceiptCorrupt) => "SCAN_RECEIPT_CORRUPT",
-        ColdStartIngressError::WorkScope(Failure::ScanReceiptReplaced) => {
-            "SCAN_RECEIPT_REPLACED"
-        }
+        ColdStartIngressError::WorkScope(Failure::ScanReceiptReplaced) => "SCAN_RECEIPT_REPLACED",
         ColdStartIngressError::WorkScope(Failure::ScanReceiptStale) => "SCAN_RECEIPT_STALE",
         ColdStartIngressError::WorkScope(Failure::ScanReceiptInvalidated) => {
             "SCAN_RECEIPT_INVALIDATED"

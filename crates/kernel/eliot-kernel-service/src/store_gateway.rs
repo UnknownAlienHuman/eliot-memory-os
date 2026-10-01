@@ -7371,7 +7371,10 @@ impl KernelStoreGateway {
         context: &RequestMeta,
         request: StoreWorkScopeOwnerRequest,
     ) -> Result<StoreWorkScopeOwnerResponse, NamedReadGatewayError> {
-        let _flight = self.flight.enter().map_err(NamedReadGatewayError::GatewayRefusal)?;
+        let _flight = self
+            .flight
+            .enter()
+            .map_err(NamedReadGatewayError::GatewayRefusal)?;
         if self.is_fenced() {
             return Err(NamedReadGatewayError::GatewayRefusal(
                 "canonical-store gateway is fenced for rebind".to_owned(),
@@ -7391,12 +7394,13 @@ impl KernelStoreGateway {
         self.validate_active_route(&context.state_fence)
             .map_err(NamedReadGatewayError::GatewayRefusal)?;
         let lease = {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| NamedReadGatewayError::GatewayRefusal("Kernel service lock poisoned".to_owned()))?;
+            let service = self.service.lock().map_err(|_| {
+                NamedReadGatewayError::GatewayRefusal("Kernel service lock poisoned".to_owned())
+            })?;
             if service.generation_fenced() {
-                return Err(NamedReadGatewayError::GatewayRefusal("Kernel generation is fenced".to_owned()));
+                return Err(NamedReadGatewayError::GatewayRefusal(
+                    "Kernel generation is fenced".to_owned(),
+                ));
             }
             let lease = service
                 .acquire_admission()
@@ -7413,10 +7417,7 @@ impl KernelStoreGateway {
                 "canonical-store gateway is fenced for rebind".to_owned(),
             ));
         }
-        let response = self
-            .store
-            .write_work_scope_owner(context, request)
-            .await?;
+        let response = self.store.write_work_scope_owner(context, request).await?;
         let readback = self
             .store
             .recovery(StoreRecoveryRequest {
