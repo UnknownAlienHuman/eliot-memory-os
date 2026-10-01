@@ -192,6 +192,7 @@ fn receipt_for(request: &ReservedWriteRequest) -> WriteReceipt {
             scope: OrderingScopeId::new("scope-991-1").unwrap(),
             sequence: 7,
             state_fence: fence(),
+            committed_receipt_sha256: None,
         }],
         revision_before_after: Vec::new(),
         applied_command_ids: vec!["capture-observation".to_owned()],

@@ -407,6 +407,12 @@ pub(crate) fn plan_apply_with_payload_authority(
             scope,
             sequence,
             state_fence: transition.state_fence.clone(),
+            // Issue #1925: the plan runs before the commit's receipt envelope
+            // exists, so it cannot know which receipt will advance this scope
+            // and does not guess. `build_apply_statements` stamps the ONE
+            // issued receipt digest onto the stored `ordering_head` record in
+            // the same CAS-guarded statement that advances the head.
+            committed_receipt_sha256: None,
         });
     }
 

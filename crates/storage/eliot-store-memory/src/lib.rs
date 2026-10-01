@@ -418,13 +418,7 @@ impl MemoryStore {
         // one receipt, recoverable replay without duplicate work. Any other
         // class is a no-op in this hook.
         dispatch_apply_erasure(&mut state, &transition)?;
-        Ok(commit_transaction(
-            &mut state,
-            transition,
-            operation_key,
-            plan,
-            receipt,
-        ))
+        commit_transaction(&mut state, transition, operation_key, plan, receipt)
     }
 }
 
@@ -4034,6 +4028,12 @@ fn transaction_plan(
             scope,
             sequence,
             state_fence: transition.state_fence.clone(),
+            // Issue #1925: the binding to the receipt that advanced this scope
+            // is stamped in `commit_transaction`, from the one envelope
+            // `transaction_receipt` issues for this very commit. The plan runs
+            // before the receipt exists, so it cannot know the digest and does
+            // not invent one.
+            committed_receipt_sha256: None,
         });
     }
 
@@ -4133,13 +4133,27 @@ fn commit_transaction(
     operation_key: String,
     plan: TransactionPlan,
     receipt: WriteReceipt,
-) -> WriteReceipt {
+) -> Result<WriteReceipt, StoreError> {
+    // Issue #1925: each ordering head is bound to the ONE receipt digest that
+    // advanced it, copied verbatim from the envelope `transaction_receipt`
+    // issued for this commit. This is the recorded value the head read returns;
+    // it is never recomputed by a reader. The binding is resolved BEFORE any
+    // state is mutated, so a receipt with no reconciliation envelope leaves the
+    // whole commit unapplied rather than half-applied.
+    let committed_receipt_sha256 = Some(
+        receipt
+            .require_reconciliation_envelope()?
+            .identity
+            .canonical_sha256
+            .clone(),
+    );
     for head in plan.next_revision_heads {
         state
             .revision_heads
             .insert(head.key.as_str().to_owned(), head);
     }
-    for head in plan.next_ordering_heads {
+    for mut head in plan.next_ordering_heads {
+        head.committed_receipt_sha256 = committed_receipt_sha256.clone();
         state
             .ordering_heads
             .insert(head.scope.as_str().to_owned(), head);
@@ -4183,7 +4197,7 @@ fn commit_transaction(
     state
         .receipts_by_operation
         .insert(operation_key, receipt.clone());
-    receipt
+    Ok(receipt)
 }
 
 impl MemoryStore {
@@ -6789,6 +6803,7 @@ mod tests {
                     scope,
                     sequence: u64::MAX,
                     state_fence: state_fence.clone(),
+                    committed_receipt_sha256: None,
                 },
             );
         }

@@ -262,6 +262,7 @@ fn commit_receipt(attempt: &ExecutableAttempt) -> WriteReceipt {
                 scope: head.scope.clone(),
                 sequence: head.expected_sequence,
                 state_fence: head.state_fence.clone(),
+                committed_receipt_sha256: None,
             })
             .collect(),
         revision_before_after: Vec::new(),

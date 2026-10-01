@@ -12932,6 +12932,7 @@ mod tests {
                 scope: OrderingScopeId::new("scope:governor").expect("ordering scope"),
                 sequence: ordering_sequence,
                 state_fence: fence.clone(),
+                committed_receipt_sha256: None,
             }],
             state_fence: fence.clone(),
         }

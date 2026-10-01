@@ -2430,6 +2430,7 @@ mod tests {
                 scope: scope.scope,
                 sequence: scope.reserved_sequence,
                 state_fence: request.context.state_fence.clone(),
+                committed_receipt_sha256: None,
             }],
             revision_before_after: Vec::new(),
             applied_command_ids: vec!["capture-observation".to_owned()],

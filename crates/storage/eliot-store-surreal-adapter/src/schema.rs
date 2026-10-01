@@ -750,8 +750,18 @@ pub(crate) const TX_UPSERT_FENCE: &str = "LET $fence_cas = (UPDATE type::record(
 pub(crate) const TX_CREATE_FENCE: &str = "LET $fence_create = (CREATE type::record($fence_table, $fence_key) CONTENT $fence RETURN AFTER); IF array::len($fence_create ?? []) != 1 { THROW 'canonical_fence_create_conflict'; };";
 /// Verify one independently declared revision dependency inside the canonical transaction.
 pub(crate) const TX_VERIFY_EXPECTED_REVISION: &str = "LET $expected_revision_head{i} = (SELECT VALUE { revision: body.revision, state_fence: body.state_fence } FROM ONLY type::record($expected_revision_table{i}, $expected_revision_key{i})); IF type::is_object($expected_revision_head{i}) { IF $expected_revision_head{i}.revision != $expected_revision_value{i} OR $expected_revision_head{i}.state_fence != $expected_revision_fence{i} { THROW 'revision_head_cas_conflict'; }; } ELSE { IF $expected_revision_value{i} != 1 { THROW 'revision_head_cas_conflict'; }; };";
-/// Verify one independently declared ordering dependency and its original chain tip.
-pub(crate) const TX_VERIFY_EXPECTED_ORDERING: &str = "LET $expected_ordering_head{i} = (SELECT VALUE { sequence: body.sequence, state_fence: body.state_fence, event_hash: event_hash ?? $ordering_genesis_hash{i} } FROM ONLY type::record($expected_ordering_table{i}, $expected_ordering_scope{i})); IF type::is_object($expected_ordering_head{i}) { IF $expected_ordering_head{i}.sequence != $expected_ordering_sequence{i} OR $expected_ordering_head{i}.state_fence != $expected_ordering_fence{i} OR $expected_ordering_head{i}.event_hash != $expected_ordering_hash{i} { THROW 'ordering_head_cas_conflict'; }; } ELSE { IF $expected_ordering_sequence{i} != 1 OR $expected_ordering_hash{i} != $ordering_genesis_hash{i} { THROW 'ordering_head_cas_conflict'; }; };";
+/// Verify one independently declared ordering dependency, its original chain
+/// tip, and the receipt digest the stored head records (issue #1925).
+///
+/// `committed_receipt_sha256` is compared as a RECORDED value: the transaction
+/// reads the stored sibling and requires it to equal the digest the caller's
+/// independently declared expectation carries. The store never recomputes it
+/// and never compares a recomputation against itself, so a head can only be
+/// advanced from the exact receipt that last advanced it. A row with no
+/// recorded digest (written before per-scope receipt digests existed) reads as
+/// `NONE` and is accepted only by an expectation that likewise states no
+/// digest, so such a row cannot silently acquire one.
+pub(crate) const TX_VERIFY_EXPECTED_ORDERING: &str = "LET $expected_ordering_head{i} = (SELECT VALUE { sequence: body.sequence, state_fence: body.state_fence, event_hash: event_hash ?? $ordering_genesis_hash{i}, committed_receipt_sha256: committed_receipt_sha256 ?? NONE } FROM ONLY type::record($expected_ordering_table{i}, $expected_ordering_scope{i})); IF type::is_object($expected_ordering_head{i}) { IF $expected_ordering_head{i}.sequence != $expected_ordering_sequence{i} OR $expected_ordering_head{i}.state_fence != $expected_ordering_fence{i} OR $expected_ordering_head{i}.event_hash != $expected_ordering_hash{i} OR $expected_ordering_head{i}.committed_receipt_sha256 != $expected_ordering_receipt_sha256{i} { THROW 'ordering_head_cas_conflict'; }; } ELSE { IF $expected_ordering_sequence{i} != 1 OR $expected_ordering_hash{i} != $ordering_genesis_hash{i} { THROW 'ordering_head_cas_conflict'; }; };";
 /// Compare-and-set update of one revision head. Exactly one revision key exists per transition.
 pub(crate) const TX_UPSERT_REVISION: &str = "LET $revision_cas = (UPDATE type::record($revision_table, $revision_key) CONTENT $revision_record WHERE body.revision = $expected_revision AND body.state_fence = $expected_state_fence RETURN AFTER); IF array::len($revision_cas ?? []) != 1 { THROW 'revision_head_cas_conflict'; };";
 pub(crate) const TX_CREATE_REVISION: &str = "LET $revision_create = (CREATE type::record($revision_table, $revision_key) CONTENT $revision_record RETURN AFTER); IF array::len($revision_create ?? []) != 1 { THROW 'revision_head_create_conflict'; };";
@@ -944,8 +954,18 @@ SELECT VALUE body FROM write_receipt WHERE idempotency_key = $idempotency_key LI
 pub(crate) const READ_REVISION_HEADS_BY_KEYS: &str =
     "SELECT VALUE body FROM revision_head WHERE revision_key IN $keys;";
 
+/// Reads Ordering Heads by scope, including the recorded receipt digest.
+///
+/// `committed_receipt_sha256` is a sibling field on the schemaless
+/// `ordering_head` record, invisible to a `SELECT VALUE body` projection, so
+/// the head read projects it out explicitly alongside the three body members
+/// (issue #1925). The digest is returned exactly as the transaction recorded
+/// it; the read never recomputes it and never compares a recomputation against
+/// itself. `?? NONE` keeps a row written before per-scope receipt digests
+/// readable as "no recorded digest" instead of failing closed on a field the
+/// row never had.
 pub(crate) const READ_ORDERING_HEADS_BY_SCOPES: &str =
-    "SELECT VALUE body FROM ordering_head WHERE ordering_scope IN $scopes;";
+    "SELECT VALUE { scope: body.scope, sequence: body.sequence, state_fence: body.state_fence, committed_receipt_sha256: committed_receipt_sha256 ?? NONE } FROM ordering_head WHERE ordering_scope IN $scopes;";
 
 /// Reads each Ordering Scope's own chain tip, the `previous_event_hash`/
 /// `event_hash` siblings the closed `SELECT VALUE body` head read cannot see
@@ -966,7 +986,12 @@ pub(crate) const READ_PROJECTION_GENERATIONS_BY_KINDS: &str = "SELECT VALUE { pr
 
 pub(crate) const READ_ALL_REVISION_HEADS: &str = "SELECT VALUE body FROM revision_head;";
 
-pub(crate) const READ_ALL_ORDERING_HEADS: &str = "SELECT VALUE body FROM ordering_head;";
+/// Reads every Ordering Head, including each recorded receipt digest.
+///
+/// Same projection and same recorded-value rule as
+/// [`READ_ORDERING_HEADS_BY_SCOPES`]; see that constant for why the digest is
+/// selected beside the body rather than through it (issue #1925).
+pub(crate) const READ_ALL_ORDERING_HEADS: &str = "SELECT VALUE { scope: body.scope, sequence: body.sequence, state_fence: body.state_fence, committed_receipt_sha256: committed_receipt_sha256 ?? NONE } FROM ordering_head;";
 
 /// Closed evidence-pack read: one row per receipt with its durable capture
 /// order and recoverable evidence array (T11.1, #19).

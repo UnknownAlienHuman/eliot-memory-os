@@ -348,6 +348,21 @@ pub struct ObservedHead {
     /// must equal the admitted expectation for the scope.
     pub expected_sequence: u64,
     /// Digest of the exact observed canonical head bytes (lowercase SHA-256).
+    ///
+    /// Issue #1925: for an ordering head this is
+    /// `ReceiptEnvelope::identity::canonical_sha256` of the receipt whose
+    /// commit last advanced the scope, as recorded by the Store and read back
+    /// verbatim by
+    /// [`KernelStoreGateway::observed_ordering_heads`](crate::store_gateway::KernelStoreGateway::observed_ordering_heads).
+    /// It is the value ORS compares against
+    /// `observed.committed_head_sha256 == receipt.identity.canonical_sha256`
+    /// and then records as the scope's next canonical head, so the next
+    /// reservation for this scope must state this same digest.
+    ///
+    /// A scope with no prior commit has no recorded receipt digest, and that
+    /// producer refuses rather than supplying a placeholder;
+    /// `ORDERING_LINK_GENESIS_HASH` is the ordering chain-link's genesis prior
+    /// and is never restated here as a receipt digest.
     pub expected_head_digest: String,
     /// Owner revision-head observation, if any.
     pub revision_head: Option<String>,

@@ -116,7 +116,7 @@ use crate::commit_recovery::{
 };
 use crate::store_client::DreamerCommitEvidence;
 use crate::store_write_reservation::{
-    CompositionReservation, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
+    CompositionReservation, ObservedHead, ReservationSeed, ReservedSubmission, ResolvedSendOutcome,
     StagedWriteRecovery, begin_execute_after_send, cancel_before_send, ensure_eligible,
     finalize_reservation, mark_unknown_outcome, reconcile_receipt, reserve_for_transition,
     retain_unsupported_prepared_plan, writer_epoch_for_fence_from_epoch,
@@ -2561,6 +2561,80 @@ impl KernelStoreGateway {
         operation_id: OperationId,
     ) -> Result<Option<WriteReceipt>, String> {
         store_receipt_gateway::receipt(self, state_fence, operation_id).await
+    }
+
+    /// Reads the live ordering heads for `scopes` through the active Kernel
+    /// generation route and projects them into the reservation evidence
+    /// [`reserve_for_transition`](crate::store_write_reservation::reserve_for_transition)
+    /// requires (issue #1925, fact 3 of the reserved-route audit).
+    ///
+    /// This is the production source of
+    /// [`ObservedHead::expected_head_digest`](crate::store_write_reservation::ObservedHead):
+    /// the value is the `ReceiptEnvelope::identity::canonical_sha256` the Store
+    /// recorded on the head when the commit that last advanced that scope
+    /// landed, read back verbatim through
+    /// [`Self::ordering_heads`](CanonicalStoreClient::ordering_heads). The
+    /// Kernel never recomputes it, and it is exactly the value ORS compares
+    /// against `receipt.identity.canonical_sha256` and then records as the
+    /// scope's next canonical head.
+    ///
+    /// Genesis is a TYPED REFUSAL, never a placeholder. An Ordering Scope with
+    /// no prior commit has no `ordering_head` row and therefore no recorded
+    /// receipt digest; a row written before per-scope receipt digests existed
+    /// carries none either. There is no honest 64-hex value to publish in
+    /// either case, so this refuses and names the scope.
+    /// `ORDERING_LINK_GENESIS_HASH` is the ordering chain-link's genesis prior
+    /// and is a different digest; it is never restated here as a receipt
+    /// digest, and no zero/constant digest is substituted.
+    ///
+    /// The returned set covers exactly the requested scopes: completeness is
+    /// checked against the caller's own scope list, so a scope the Store did
+    /// not return is caught here instead of silently dropping out of the
+    /// reservation evidence.
+    pub async fn observed_ordering_heads(
+        &self,
+        state_fence: &StateFence,
+        scopes: &[OrderingScopeId],
+    ) -> Result<Vec<ObservedHead>, String> {
+        if scopes.is_empty() {
+            return Err("observed ordering heads require at least one scope".to_owned());
+        }
+        let heads = BorrowedCanonicalStoreClient::new(self)
+            .ordering_heads(scopes.to_vec())
+            .await
+            .map_err(|error| format!("ordering head read refused: {error}"))?;
+        let mut observed: Vec<ObservedHead> = Vec::with_capacity(scopes.len());
+        for scope in scopes {
+            let head = heads
+                .iter()
+                .find(|head| head.scope == *scope)
+                .ok_or_else(|| {
+                    format!(
+                        "ordering scope {} has no observed head; its canonical head cannot be read",
+                        scope.as_str()
+                    )
+                })?;
+            if head.state_fence != *state_fence {
+                return Err(format!(
+                    "ordering scope {} head fence does not match the active fence",
+                    scope.as_str()
+                ));
+            }
+            let digest = head.committed_receipt_sha256.as_ref().ok_or_else(|| {
+                format!(
+                    "ordering scope {} records no receipt digest; there is no prior commit to \
+                     name and no digest may be invented",
+                    scope.as_str()
+                )
+            })?;
+            observed.push(ObservedHead {
+                scope: scope.as_str().to_owned(),
+                expected_sequence: head.sequence,
+                expected_head_digest: digest.clone(),
+                revision_head: None,
+            });
+        }
+        Ok(observed)
     }
 
     /// Executes one closed named read through the active Kernel generation
