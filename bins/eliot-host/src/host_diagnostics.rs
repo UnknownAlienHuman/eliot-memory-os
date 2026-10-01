@@ -598,23 +598,128 @@ pub fn observe_entrypoint_with_detail(stage: EntrypointStage, detail: &str) {
     );
 }
 
+/// Immutable nonsecret operation correlation carried by one terminal record
+/// (F-LOG-HOST-2, #893 D1).
+///
+/// This is the typed terminal projection binding a terminal failure to the
+/// operation whose subordinate phases already carry the identities: the
+/// owner-issued transaction, effect, and request handles rendered by the
+/// subordinate records as the exact shared `tx`/`effect`/`req` fields
+/// (`ActivationObservation`, `PhaseBObservation`, `CredentialObservation`).
+/// Two interleaved operations ending in the same frozen terminal code stay
+/// distinguishable through these shared fields, never through record order
+/// (I13.11: timeline **and** correlation, not adjacency inference).
+///
+/// Immutable by construction: built once at the operation boundary from
+/// handles the semantic owner already produced, retained unchanged by the
+/// terminal guard, and rendered on the single terminal emission. It is never
+/// a dedup cache (no global state, no second evaluation), never a lifecycle
+/// (I14.20: diagnostics project owner states, never a second lifecycle), and
+/// never secret-bearing: callers must pass only the nonsecret
+/// digest/handle identities, never credential values, paths, payloads, or
+/// arbitrary error text (I15.4). Absent identities stay explicitly missing,
+/// never guessed or order-inferred.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostTerminalCorrelation {
+    transaction: Option<BoundedField>,
+    effect: Option<BoundedField>,
+    request: Option<BoundedField>,
+}
+
+impl HostTerminalCorrelation {
+    /// Binds the owner-issued operation identities this terminal record is
+    /// about: the transaction, effect, and request handles the subordinate
+    /// records of the same operation already carry. Each handle is bounded
+    /// with truncation honesty. Pass only handles the owner already
+    /// produced at the guard-arming site; nothing is probed, looked up, or
+    /// synthesized here.
+    #[must_use]
+    pub fn bound(transaction: &str, effect: &str, request: &str) -> Self {
+        Self {
+            transaction: Some(bound_field(transaction)),
+            effect: Some(bound_field(effect)),
+            request: Some(bound_field(request)),
+        }
+    }
+
+    /// Explicitly uncorrelated: no operation identity exists yet at this
+    /// boundary (pre-subject failure, e.g. a malformed request that never
+    /// yielded a transaction). The terminal record then says correlation is
+    /// unavailable instead of relying on stage order.
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            transaction: None,
+            effect: None,
+            request: None,
+        }
+    }
+
+    /// Whether this projection binds an operation identity. Readers must
+    /// check this (or the per-slot `*_missing` flags on the record) before
+    /// treating any slot value as meaningful.
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        self.transaction.is_some() && self.effect.is_some() && self.request.is_some()
+    }
+}
+
 /// Records the single terminal error boundary with its exact typed code.
 ///
 /// One underlying failed operation yields exactly one terminal record here;
-/// lower-phase entrypoint observations correlate by stage order, not by a
-/// dedup cache. The code is bounded defensively; the HOST-0 reference call
-/// site passes [`HOST_TERMINAL_CODE_CONSOLE_FAILED`], which projects
+/// lower-phase entrypoint observations carry the operation identities but
+/// are not duplicate failure claims, and there is no dedup cache. The code
+/// is bounded defensively; the HOST-0 reference call site passes
+/// [`HOST_TERMINAL_CODE_CONSOLE_FAILED`], which projects
 /// `HostStopCode::ConsoleFailed` without duplicating its lifecycle ownership
 /// (I07.20, I14.20). Terminal receipt framing (capsule, SCM status, console
 /// exit code) is untouched and still owns the process exit.
+///
+/// Pre-subject failures carry no operation identity yet, so this spells the
+/// terminal explicitly uncorrelated
+/// ([`HostTerminalCorrelation::unavailable`]); correlation is never inferred
+/// from record order. Where the failing operation's identity exists, call
+/// [`observe_terminal_error_with_correlation`] instead so the terminal and
+/// its subordinate records share the exact `tx`/`effect`/`req` token.
 pub fn observe_terminal_error(code: &str) {
+    observe_terminal_error_with_correlation(code, &HostTerminalCorrelation::unavailable());
+}
+
+/// Records the single terminal error boundary with its exact typed code and
+/// the immutable operation correlation.
+///
+/// Observation only: the code and the correlation were already decided or
+/// produced by their owners before this call. Emits exactly one
+/// `host.terminal_error` record — never a second terminal — carrying the
+/// same `tx`/`effect`/`req` field spellings the subordinate records use, so
+/// interleaved operations sharing one frozen code remain distinguishable.
+/// An unavailable correlation renders every slot explicitly missing with
+/// `correlation_available = false`. All macro arguments are precomputed pure
+/// values, so a disabled event evaluates no extra effectful operation.
+pub fn observe_terminal_error_with_correlation(code: &str, correlation: &HostTerminalCorrelation) {
     let bounded = bound_field(code);
+    let transaction = correlation.transaction.as_ref();
+    let effect = correlation.effect.as_ref();
+    let request = correlation.request.as_ref();
     tracing::error!(
         target: HOST_DIAGNOSTICS_TARGET,
         event = "host.terminal_error",
         code = bounded.text(),
         code_bytes = bounded.original_bytes(),
         code_truncated = bounded.truncated(),
+        correlation_available = correlation.is_available(),
+        tx = transaction.map_or("", BoundedField::text),
+        tx_bytes = transaction.map_or(0, BoundedField::original_bytes),
+        tx_truncated = transaction.is_some_and(BoundedField::truncated),
+        tx_missing = transaction.is_none(),
+        effect = effect.map_or("", BoundedField::text),
+        effect_bytes = effect.map_or(0, BoundedField::original_bytes),
+        effect_truncated = effect.is_some_and(BoundedField::truncated),
+        effect_missing = effect.is_none(),
+        req = request.map_or("", BoundedField::text),
+        req_bytes = request.map_or(0, BoundedField::original_bytes),
+        req_truncated = request.is_some_and(BoundedField::truncated),
+        req_missing = request.is_none(),
         "host terminal error"
     );
 }
