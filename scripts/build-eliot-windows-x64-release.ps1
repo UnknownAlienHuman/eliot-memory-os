@@ -3841,6 +3841,53 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval, 
         }
         Assert-WindowsX64Pe $candidate $relative
     }
+    $declaredSymbols = @($runtimeManifest.symbol_artifacts)
+    $releaseSymbols = @($release.symbol_artifacts)
+    if ($declaredSymbols.Count -ne 2 -or $releaseSymbols.Count -ne 2) {
+        throw 'runtime/release manifests must carry exactly the Host and Kernel symbol artifacts'
+    }
+    foreach ($expectedSymbol in $runtimeSymbolPlan) {
+        $symbolRecord = @($declaredSymbols | Where-Object {
+                [string]$_.role -ceq [string]$expectedSymbol.role
+            })
+        $releaseRecord = @($releaseSymbols | Where-Object {
+                [string]$_.role -ceq [string]$expectedSymbol.role
+            })
+        if ($symbolRecord.Count -ne 1 -or $releaseRecord.Count -ne 1) {
+            throw "runtime/release symbol role is missing or duplicated: $($expectedSymbol.role)"
+        }
+        $symbolRecord = $symbolRecord[0]
+        $releaseRecord = $releaseRecord[0]
+        $exeRecord = @($declaredRuntime | Where-Object {
+                [string]$_.package -ceq [string]$expectedSymbol.package -and
+                [string]$_.binary -ceq [string]$expectedSymbol.binary
+            })
+        $symbolRef = [string]$symbolRecord.artifact_ref
+        if ($exeRecord.Count -ne 1 -or
+            [string]$symbolRecord.package -cne [string]$expectedSymbol.package -or
+            [string]$symbolRecord.binary -cne [string]$expectedSymbol.binary -or
+            [string]$symbolRecord.executable_path -cne [string]$exeRecord[0].path -or
+            [string]$symbolRecord.executable_sha256 -cne [string]$exeRecord[0].sha256 -or
+            [string]$symbolRecord.build_fingerprint -cne [string]$runtimeManifest.source_commit -or
+            [string]$symbolRecord.build_profile -cne 'release' -or
+            $symbolRef -cne [string]$expectedSymbol.relative_path -or
+            [string]$symbolRecord.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [int64]$symbolRecord.bytes -le 0 -or
+            [string]$symbolRecord.retention_reference -cne 'SHA256SUMS.json') {
+            throw "runtime symbol record does not bind the exact release executable and retained PDB: $($expectedSymbol.role)"
+        }
+        foreach ($field in @('package', 'binary', 'role', 'executable_path', 'executable_sha256', 'build_fingerprint', 'build_profile', 'artifact_ref', 'sha256', 'bytes', 'retention_reference')) {
+            if ([string]$releaseRecord.$field -cne [string]$symbolRecord.$field) {
+                throw "RELEASE.json symbol binding differs from RUNTIME_ARTIFACTS.json for $($expectedSymbol.role): $field"
+            }
+        }
+        $symbolPath = Join-Path $resolved $symbolRef
+        $symbolEvidence = Read-VerifiedResidentFile $symbolPath "$($expectedSymbol.role) retained release PDB"
+        if ($symbolEvidence.sha256 -cne [string]$symbolRecord.sha256 -or
+            $symbolEvidence.length -ne [int64]$symbolRecord.bytes) {
+            throw "retained release PDB digest mismatch: $symbolRef"
+        }
+    }
     $surrealEntries = @($declaredRuntime | Where-Object {
             [string]$_.package -eq 'surrealdb' -and [string]$_.binary -eq 'surreal'
         })
@@ -4242,6 +4289,24 @@ if ($LASTEXITCODE -ne 0 -or -not $cargoMetadata.target_directory) {
     throw 'failed to resolve the Cargo target directory'
 }
 $runtimeArtifactPlan = Get-RuntimeArtifactPlan $cargoMetadata
+$runtimeSymbolPlan = @(
+    [pscustomobject]@{
+        package = 'eliot-host'
+        binary = 'eliot-host'
+        role = 'host'
+        executable_path = (Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-host.exe')
+        source_path = (Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-host.pdb')
+        relative_path = 'symbols/host/eliot-host.pdb'
+    }
+    [pscustomobject]@{
+        package = 'eliot-kernel'
+        binary = 'eliot-kernel'
+        role = 'kernel'
+        executable_path = (Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-kernel.exe')
+        source_path = (Join-Path ([string]$cargoMetadata.target_directory) 'release\eliot-kernel.pdb')
+        relative_path = 'symbols/kernel/eliot-kernel.pdb'
+    }
+)
 $frontDoorBridgePlan = Get-FrontDoorBridgePlan $cargoMetadata $ClaudeCodeFrontDoor
 # Issue #2968: the retirement decision is resolved BEFORE any bundle content
 # is decided, and only from an explicit detached approval input. The input is
@@ -4632,6 +4697,38 @@ try {
         }
     }
     $verifiedRuntimeArtifacts = @(Get-VerifiedRuntimeArtifacts $runtimeArtifactPlan $Version)
+    $verifiedRuntimeSymbols = foreach ($symbol in $runtimeSymbolPlan) {
+        $executable = @($verifiedRuntimeArtifacts | Where-Object {
+                [string]$_.package -ceq [string]$symbol.package -and
+                [string]$_.binary -ceq [string]$symbol.binary -and
+                [string]$_.role -ceq [string]$symbol.role
+            })
+        if ($executable.Count -ne 1 -or
+            [string]$executable[0].path -cne "runtime/$($symbol.binary).exe") {
+            throw "release symbol source has no unique exact executable binding: $($symbol.role)"
+        }
+        if (-not (Test-Path -LiteralPath $symbol.source_path -PathType Leaf)) {
+            throw "release build did not emit required $($symbol.role) PDB: $($symbol.source_path)"
+        }
+        $pdb = Read-VerifiedResidentFile $symbol.source_path "$($symbol.role) release PDB"
+        if ($pdb.length -le 0) {
+            throw "release build emitted an empty $($symbol.role) PDB"
+        }
+        [pscustomobject]@{
+            package = [string]$symbol.package
+            binary = [string]$symbol.binary
+            role = [string]$symbol.role
+            executable_path = [string]$executable[0].path
+            executable_sha256 = [string]$executable[0].sha256
+            build_fingerprint = [string]$sourceCommit
+            build_profile = 'release'
+            artifact_ref = [string]$symbol.relative_path
+            sha256 = [string]$pdb.sha256
+            bytes = [int64]$pdb.length
+            retention_reference = 'SHA256SUMS.json'
+            source_bytes = [byte[]]$pdb.bytes
+        }
+    }
     $peLinkerVersions = @(@($verifiedRuntimeArtifacts | ForEach-Object { [string]$_.linker_version }) | Sort-Object -Unique)
     $verifiedGovernorArtifact = $null
     if ($legacyGovernorPresent) {
@@ -4709,6 +4806,16 @@ try {
     New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
     foreach ($artifact in $runtimeArtifactPlan) {
         Copy-Item -LiteralPath $artifact.path -Destination (Join-Path $bundle $artifact.relative_path)
+    }
+    foreach ($symbol in $verifiedRuntimeSymbols) {
+        $symbolDestination = Join-Path $bundle ([string]$symbol.artifact_ref)
+        $symbolParent = Split-Path -Parent $symbolDestination
+        New-Item -ItemType Directory -Path $symbolParent -Force | Out-Null
+        $writtenSymbol = Write-VerifiedResidentFile $symbolDestination ([byte[]]$symbol.source_bytes) "$($symbol.role) release PDB"
+        if ([string]$writtenSymbol.sha256 -cne [string]$symbol.sha256 -or
+            [int64]$writtenSymbol.length -ne [int64]$symbol.bytes) {
+            throw "staged $($symbol.role) PDB differs from its exact Cargo release output"
+        }
     }
     # Issue #22 W1: the module contract bytes come from the exact constructor
     # the live daemon handshake uses. The exported manifest is bound to the
@@ -4909,6 +5016,21 @@ try {
         surreal_version = $verifiedPinnedSurreal.version
         module_build_provenance = $moduleBuildProvenance
         artifacts = @($verifiedRuntimeArtifacts + $verifiedPinnedSurreal)
+        symbol_artifacts = @($verifiedRuntimeSymbols | ForEach-Object {
+                [ordered]@{
+                    package = [string]$_.package
+                    binary = [string]$_.binary
+                    role = [string]$_.role
+                    executable_path = [string]$_.executable_path
+                    executable_sha256 = [string]$_.executable_sha256
+                    build_fingerprint = [string]$_.build_fingerprint
+                    build_profile = [string]$_.build_profile
+                    artifact_ref = [string]$_.artifact_ref
+                    sha256 = [string]$_.sha256
+                    bytes = [int64]$_.bytes
+                    retention_reference = [string]$_.retention_reference
+                }
+            })
         bundle_signing_artifacts = @($bundleSigningArtifacts)
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'RUNTIME_ARTIFACTS.json') -Encoding utf8
     if ($legacyGovernorPresent) {
@@ -5092,6 +5214,21 @@ try {
                     provisioner = $_.provisioner
                     provisioning_receipt_input_path = $_.provisioning_receipt_input_path
                     provisioning_receipt_sha256 = $_.provisioning_receipt_sha256
+                }
+            })
+        symbol_artifacts = @($verifiedRuntimeSymbols | ForEach-Object {
+                [ordered]@{
+                    package = [string]$_.package
+                    binary = [string]$_.binary
+                    role = [string]$_.role
+                    executable_path = [string]$_.executable_path
+                    executable_sha256 = [string]$_.executable_sha256
+                    build_fingerprint = [string]$_.build_fingerprint
+                    build_profile = [string]$_.build_profile
+                    artifact_ref = [string]$_.artifact_ref
+                    sha256 = [string]$_.sha256
+                    bytes = [int64]$_.bytes
+                    retention_reference = [string]$_.retention_reference
                 }
             })
         selected_release_dependency_policy = if ($selectedSurrealPolicyReceipt) {

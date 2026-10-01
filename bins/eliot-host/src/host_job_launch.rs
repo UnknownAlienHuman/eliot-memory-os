@@ -19,7 +19,8 @@ use eliot_host_service::{
 use eliot_host_state::HostInstallationEpoch;
 #[cfg(windows)]
 use eliot_installation::{
-    InstallationProfile, RuntimeLaunchDescriptor, verify_file_digest_with_lease,
+    AdmittedSymbolBinding, InstallationProfile, RuntimeLaunchDescriptor,
+    verify_file_digest_with_lease,
     verify_file_digest_with_user_lease,
 };
 #[cfg(windows)]
@@ -639,6 +640,7 @@ impl HostJobBranches {
         arguments: &[eliot_platform::PlatformHandle],
         working_directory: &Path,
         kernel_launch_binding: Option<&KernelLaunchBinding>,
+        symbol_binding: Option<&AdmittedSymbolBinding>,
         receipt_binding: Option<(&Path, &Path, &Path, &PlatformHandle)>,
         installation_profile: Option<InstallationProfile>,
         profile_root_binding: Option<(&ProfileRootRequest, &ProfileSelectionReceipt)>,
@@ -724,6 +726,21 @@ impl HostJobBranches {
             kernel_launch_binding,
             receipt_binding,
         );
+        environment.retain(|(key, _)| {
+            !key.to_string_lossy()
+                .eq_ignore_ascii_case("ELIOT_KERNEL_ADMITTED_SYMBOL_BINDING")
+        });
+        if let Some(binding) = symbol_binding {
+            let serialized = serde_json::to_string(binding).map_err(|error| {
+                HostError::ProcessContour(format!(
+                    "serialize admitted Kernel symbol binding: {error}"
+                ))
+            })?;
+            environment.push((
+                OsString::from("ELIOT_KERNEL_ADMITTED_SYMBOL_BINDING"),
+                OsString::from(serialized),
+            ));
+        }
         if let Some(profile) = installation_profile {
             let profile_name = match profile {
                 InstallationProfile::SystemService => "system_service",
@@ -1293,6 +1310,7 @@ impl HostJobBranches {
                     None,
                     None,
                     None,
+                    None,
                 )
             },
             |store| -> Result<(), StoreLivenessEvidence> {
@@ -1338,6 +1356,7 @@ impl HostJobBranches {
                     &kernel_arguments,
                     &kernel_working_directory,
                     self.kernel_launch_binding.as_ref(),
+                    launch.kernel_symbol_binding.as_ref(),
                     Some((
                         Path::new(launch.runtime_state_roots.host_state_root.as_str()),
                         Path::new(launch.runtime_state_roots.kernel_ors_root.as_str()),

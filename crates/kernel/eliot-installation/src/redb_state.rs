@@ -27,6 +27,7 @@ use super::canary_removal::{
 use super::package_planner::{
     MODULE_BUILD_PROVENANCE_ROLES as SOURCE_BUNDLE_MODULE_PROVENANCE_ROLES,
     REQUIRED_PACKAGE_ROLES as SOURCE_BUNDLE_REQUIRED_ROLES, package_inventory_roles,
+    release_symbols_present,
 };
 use super::{
     ActivationCommitReceipt, GenerationPackagePlanner, INSTALLATION_TRANSACTION_WIRE_VERSION,
@@ -526,7 +527,7 @@ pub struct SourceBundlePublicationJournal {
     pub profile_governed_roots: InstallationRoots,
     /// Canonical package manifest digest.
     pub manifest_digest: PlatformHandle,
-    /// Complete twelve-role artifact evidence digest.
+    /// Complete legacy or symbol-bearing package artifact evidence digest.
     pub evidence_digest: PlatformHandle,
     /// Digest of the complete typed precommit role inventory.
     pub precommit_digest: PlatformHandle,
@@ -555,7 +556,7 @@ pub struct SourceBundlePublicationJournal {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceBundlePublicationRole {
-    /// Canonical twelve-role relative path.
+    /// Canonical package artifact relative path.
     pub relative_path: String,
     /// Whether this role is an executable PE.
     pub executable: bool,
@@ -2704,7 +2705,13 @@ fn validate_publication_journal(
     if has_module_manifest != has_module_provenance {
         return Err(InstallationError::IdentityConflict);
     }
-    let expected_roles = package_inventory_roles(has_module_manifest);
+    let has_release_symbols = release_symbols_present(
+        journal
+            .precommit_files
+            .iter()
+            .map(|role| role.relative_path.clone()),
+    )?;
+    let expected_roles = package_inventory_roles(has_module_manifest, has_release_symbols);
     if journal.precommit_files.len() != expected_roles.len() {
         return Err(InstallationError::InvalidField {
             field: "publication.precommit_files".to_owned(),

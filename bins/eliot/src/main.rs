@@ -419,8 +419,9 @@ enum InstallationCommand {
         #[arg(long)]
         removal_transaction_id: String,
     },
-    /// Materialize an exact fifteen-role Phase-A source bundle and feed it through
-    /// the publication-bound generation planner. `--store` is required because
+    /// Materialize an exact Phase-A source bundle, optionally carrying the
+    /// symbols from a finalized release receipt, and feed it through the
+    /// publication-bound generation planner. `--store` is required because
     /// the durable transaction store is the sole authority for a generated plan.
     MaterializeSourceBundle {
         #[arg(long, value_parser = absolute_path)]
@@ -449,6 +450,11 @@ enum InstallationCommand {
         /// Release per-user `eliot-notify.exe` adapter path (I1.3/I1.4).
         #[arg(long, value_parser = absolute_path)]
         eliot_notify: PathBuf,
+        /// Optional absolute finalized release bundle root containing the
+        /// exact release receipts and retained Host/Kernel PDBs. Omission
+        /// preserves the legacy generation with no admitted symbol binding.
+        #[arg(long, value_parser = absolute_path)]
+        release_bundle_root: Option<PathBuf>,
         /// Optional explicit external agent-bridge executable source. Must be
         /// supplied together with `--agent-bridge-account`.
         #[arg(long, value_parser = absolute_path)]
@@ -2338,6 +2344,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_wasm_host,
             eliot_user_broker,
             eliot_notify,
+            release_bundle_root,
             agent_bridge_exe,
             agent_bridge_account,
             output_bundle,
@@ -2370,6 +2377,7 @@ fn run_installation(command: InstallationCommand) -> Result<i32> {
             eliot_wasm_host,
             eliot_user_broker,
             eliot_notify,
+            release_bundle_root,
             output_bundle,
             output,
             store,
@@ -2907,6 +2915,7 @@ fn run_installation_materialize_source_bundle(
     eliot_wasm_host: PathBuf,
     eliot_user_broker: PathBuf,
     eliot_notify: PathBuf,
+    release_bundle_root: Option<PathBuf>,
     output_bundle: PathBuf,
     output: PathBuf,
     store: PathBuf,
@@ -2951,6 +2960,7 @@ fn run_installation_materialize_source_bundle(
         eliot_wasm_host_exe: eliot_wasm_host,
         eliot_user_broker_exe: eliot_user_broker,
         eliot_notify_exe: eliot_notify,
+        release_bundle_root,
         agent_bridge_exe,
         agent_bridge_account,
         output_bundle: output_bundle.clone(),

@@ -78,14 +78,37 @@ pub(crate) const MODULE_BUILD_PROVENANCE_ROLES: [(&str, bool); 2] = [
     ("module.eliotd.provenance.json", false),
 ];
 
+/// Optional non-executable symbols retained with an admitted Host/Kernel
+/// generation. They are present only as a pair and never enter signing roles.
+pub(crate) const RELEASE_SYMBOL_ROLES: [(&str, bool); 2] = [
+    ("symbols/host/eliot-host.pdb", false),
+    ("symbols/kernel/eliot-kernel.pdb", false),
+];
+
 pub(crate) fn package_inventory_roles(
     include_module_provenance: bool,
+    include_release_symbols: bool,
 ) -> Vec<(&'static str, bool)> {
     let mut roles = REQUIRED_PACKAGE_ROLES.to_vec();
     if include_module_provenance {
         roles.extend(MODULE_BUILD_PROVENANCE_ROLES);
     }
+    if include_release_symbols {
+        roles.extend(RELEASE_SYMBOL_ROLES);
+    }
     roles
+}
+
+fn release_symbols_present(
+    names: impl IntoIterator<Item = String>,
+) -> Result<bool, InstallationError> {
+    let names = names.into_iter().collect::<BTreeSet<_>>();
+    let host = names.contains(RELEASE_SYMBOL_ROLES[0].0);
+    let kernel = names.contains(RELEASE_SYMBOL_ROLES[1].0);
+    if host != kernel {
+        return Err(InstallationError::IdentityConflict);
+    }
+    Ok(host)
 }
 
 fn module_provenance_present(
@@ -105,7 +128,10 @@ fn package_roles_for_manifest(
 ) -> Result<Vec<(&'static str, bool)>, InstallationError> {
     let include_module_provenance =
         module_provenance_present(manifest.files.iter().map(|file| file.relative_path.clone()))?;
-    let roles = package_inventory_roles(include_module_provenance);
+    let include_symbols = release_symbols_present(
+        manifest.files.iter().map(|file| file.relative_path.clone()),
+    )?;
+    let roles = package_inventory_roles(include_module_provenance, include_symbols);
     if manifest.files.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
             "package manifest must contain the complete approved runtime inventory".to_owned(),
@@ -934,6 +960,32 @@ pub(crate) fn validate_exact_candidate_package_binding(
             return Err(InstallationError::IdentityConflict);
         }
     }
+    let host_symbols = candidate.runtime_launch.host_symbol_binding.as_ref();
+    let kernel_symbols = candidate.runtime_launch.kernel_symbol_binding.as_ref();
+    if host_symbols.is_some() != kernel_symbols.is_some() {
+        return Err(InstallationError::IdentityConflict);
+    }
+    for (binding, (name, executable)) in [
+        (host_symbols, RELEASE_SYMBOL_ROLES[0]),
+        (kernel_symbols, RELEASE_SYMBOL_ROLES[1]),
+    ] {
+        if let Some(binding) = binding {
+            if binding.symbol_artifact_ref.as_str() != name {
+                return Err(InstallationError::IdentityConflict);
+            }
+            let spec = manifest
+                .files
+                .iter()
+                .find(|spec| spec.relative_path == name)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if spec.executable != executable
+                || spec.expected_size == 0
+                || !expected_names.insert(name.to_ascii_lowercase())
+            {
+                return Err(InstallationError::IdentityConflict);
+            }
+        }
+    }
     let mut manifest_names = BTreeSet::new();
     for spec in &manifest.files {
         if spec.relative_path == NOTIFY_STAGED_ROLE {
@@ -1032,6 +1084,30 @@ pub(crate) fn validate_exact_expected_file_digests(
                 return Err(InstallationError::IdentityConflict);
             }
             crate::sha256_handle(&item.sha256, "expected module proof digest")?;
+            continue;
+        }
+        if RELEASE_SYMBOL_ROLES
+            .iter()
+            .any(|(name, _)| *name == item.relative_path)
+        {
+            let spec = manifest
+                .files
+                .iter()
+                .find(|spec| spec.relative_path == item.relative_path)
+                .ok_or(InstallationError::IdentityConflict)?;
+            if spec.executable || item.expected_size == 0 || item.expected_size != spec.expected_size {
+                return Err(InstallationError::IdentityConflict);
+            }
+            crate::sha256_handle(&item.sha256, "expected symbol artifact digest")?;
+            let binding = if item.relative_path == RELEASE_SYMBOL_ROLES[0].0 {
+                candidate.runtime_launch.host_symbol_binding.as_ref()
+            } else {
+                candidate.runtime_launch.kernel_symbol_binding.as_ref()
+            }
+            .ok_or(InstallationError::IdentityConflict)?;
+            if item.sha256 != binding.symbol_artifact_sha256 {
+                return Err(InstallationError::IdentityConflict);
+            }
             continue;
         }
         if item.relative_path == USER_BROKER_STAGED_ROLE {
@@ -1690,7 +1766,11 @@ impl GenerationPackagePlanner {
         let include_module_provenance = module_provenance_present(
             observed.files.iter().map(|file| file.relative_path.clone()),
         )?;
-        let package_roles = package_inventory_roles(include_module_provenance);
+        let include_release_symbols = release_symbols_present(
+            observed.files.iter().map(|file| file.relative_path.clone()),
+        )?;
+        let package_roles =
+            package_inventory_roles(include_module_provenance, include_release_symbols);
         let governor_lease = source
             .retain_file("eliotd-governor.json")
             .map_err(|error| {
@@ -1723,6 +1803,19 @@ impl GenerationPackagePlanner {
         } else {
             None
         };
+        if let Some((_, config)) = source_store_config.as_ref() {
+            let has_host_binding = config.runtime_launch.host_symbol_binding.is_some();
+            let has_kernel_binding = config.runtime_launch.kernel_symbol_binding.is_some();
+            if has_host_binding != has_kernel_binding || has_host_binding != include_release_symbols {
+                return Err(InstallationError::IdentityConflict);
+            }
+        } else if include_release_symbols {
+            return Err(InstallationError::InvalidField {
+                field: "generation.symbol_binding".to_owned(),
+                reason: "symbol-bearing package requires the authenticated generation launch descriptor"
+                    .to_owned(),
+            });
+        }
 
         let files = package_roles
             .iter()
@@ -2045,6 +2138,9 @@ impl GenerationPackagePlanner {
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: kernel_digest.clone(),
+            kernel_symbol_binding: source_store_config
+                .as_ref()
+                .and_then(|(_, config)| config.runtime_launch.kernel_symbol_binding.clone()),
             eliotd_executable_path: eliotd_path,
             eliotd_artifact_digest: eliotd_digest,
             eliotd_config_path,
@@ -2066,6 +2162,9 @@ impl GenerationPackagePlanner {
             canonical_store_arguments,
             host_executable_path: host_path.clone(),
             host_artifact_digest: host_digest.clone(),
+            host_symbol_binding: source_store_config
+                .as_ref()
+                .and_then(|(_, config)| config.runtime_launch.host_symbol_binding.clone()),
             watchdog_executable_path: watchdog_path.clone(),
             watchdog_artifact_digest: watchdog_digest.clone(),
             doctor_artifact_digest: doctor_digest.clone(),
@@ -2169,6 +2268,21 @@ impl GenerationPackagePlanner {
                 // The full artifact evidence digest binds these exact files.
                 // Host later parses the per-module source proof and joins it
                 // to the admitted contract and active launch fence.
+                continue;
+            }
+            if RELEASE_SYMBOL_ROLES
+                .iter()
+                .any(|(name, _)| *name == digest.relative_path)
+            {
+                let binding = if digest.relative_path == RELEASE_SYMBOL_ROLES[0].0 {
+                    candidate.runtime_launch.host_symbol_binding.as_ref()
+                } else {
+                    candidate.runtime_launch.kernel_symbol_binding.as_ref()
+                }
+                .ok_or(InstallationError::IdentityConflict)?;
+                if digest.sha256 != binding.symbol_artifact_sha256 {
+                    return Err(InstallationError::IdentityConflict);
+                }
                 continue;
             }
             if digest.relative_path == USER_BROKER_STAGED_ROLE {
@@ -2633,7 +2747,9 @@ fn validate_exact_source_inventory(
 ) -> Result<(), InstallationError> {
     let include_module_provenance =
         module_provenance_present(observed.files.iter().map(|file| file.relative_path.clone()))?;
-    let roles = package_inventory_roles(include_module_provenance);
+    let include_symbols =
+        release_symbols_present(observed.files.iter().map(|file| file.relative_path.clone()))?;
+    let roles = package_inventory_roles(include_module_provenance, include_symbols);
     if observed.files.len() != roles.len() {
         return Err(InstallationError::IncompleteObservation(
             "trusted source must contain the complete approved runtime inventory".to_owned(),
@@ -3280,6 +3396,7 @@ mod tests {
             runtime_state_roots: roots.clone(),
             kernel_work_root: roots.kernel_work_root.clone(),
             kernel_artifact_digest: kernel_artifact_digest.clone(),
+            kernel_symbol_binding: None,
             eliotd_executable_path: test_path(portable_root.as_str(), "eliotd.exe"),
             eliotd_artifact_digest: h("8".repeat(64)),
             eliotd_config_path: test_path(portable_root.as_str(), "eliotd-governor.json"),
@@ -3323,6 +3440,7 @@ mod tests {
             ],
             host_executable_path: test_path(portable_root.as_str(), "eliot-host.exe"),
             host_artifact_digest: h("8".repeat(64)),
+            host_symbol_binding: None,
             watchdog_executable_path: test_path(portable_root.as_str(), "eliot-watchdog.exe"),
             watchdog_artifact_digest: h("4".repeat(64)),
             doctor_artifact_digest: h("b".repeat(64)),

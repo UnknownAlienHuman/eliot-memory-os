@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use eliot_contracts::sha256_hex;
 #[cfg(windows)]
+use eliot_installation::{AdmittedSymbolBinding, SymbolExecutableRole};
+#[cfg(windows)]
 use eliot_installation::InstallationProfile;
 use eliot_kernel::AuthorityDescriptorContour;
 #[cfg(windows)]
@@ -46,6 +48,7 @@ pub(crate) struct KernelStartupBinding {
     pub(crate) installation_id: String,
     pub(crate) approved_generation: String,
     installation_profile: String,
+    admitted_symbol_binding: Option<AdmittedSymbolBinding>,
     profile_root_request: Option<ProfileRootRequest>,
     profile_root_selection: Option<ProfileSelectionReceipt>,
 }
@@ -70,6 +73,27 @@ impl KernelStartupBinding {
             std::env::var("ELIOT_INSTALLATION_PROFILE").map_err(|_| {
                 "Host launch context did not inject the installation profile".to_owned()
             })?;
+        binding.admitted_symbol_binding = match std::env::var("ELIOT_KERNEL_ADMITTED_SYMBOL_BINDING")
+        {
+            Ok(value) => {
+                let admitted: AdmittedSymbolBinding = serde_json::from_str(&value).map_err(|error| {
+                    format!("Host launch context symbol binding is invalid: {error}")
+                })?;
+                if admitted.role != SymbolExecutableRole::Kernel
+                    || admitted.retention_id.as_str() != binding.approved_generation
+                {
+                    return Err(
+                        "Host launch context symbol binding differs from the admitted Kernel generation"
+                            .to_owned(),
+                    );
+                }
+                Some(admitted)
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("Host launch context symbol binding is not Unicode".to_owned());
+            }
+        };
         match binding.installation_profile.as_str() {
             "system_service" => {
                 if std::env::var_os("ELIOT_PROFILE_ROOT_REQUEST").is_some()
@@ -207,6 +231,7 @@ impl KernelStartupBinding {
             installation_id,
             approved_generation,
             installation_profile: String::new(),
+            admitted_symbol_binding: None,
             profile_root_request: None,
             profile_root_selection: None,
         })
@@ -235,6 +260,12 @@ impl KernelStartupBinding {
     /// This is not descriptor ownership or supervision admission evidence.
     pub(crate) fn is_system_service(&self) -> bool {
         self.installation_profile == "system_service"
+    }
+
+    /// Returns the exact optional symbol record forwarded by the admitted Host
+    /// launch context. Absence denotes a legacy install with no symbol record.
+    pub(crate) fn admitted_symbol_binding(&self) -> Option<&AdmittedSymbolBinding> {
+        self.admitted_symbol_binding.as_ref()
     }
 
     pub(crate) fn supervision_profile_binding(
