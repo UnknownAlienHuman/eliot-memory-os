@@ -3223,6 +3223,12 @@ fn stage_pending_native_worker_process_start(
 /// `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`, or `UNREADABLE:<tag>` — and
 /// never a bare "launch denied". It is returned BEFORE the gateway, so a
 /// non-admissible reservation cannot spawn a child.
+///
+/// Once a launch NAMES a reservation binding, the owner's `MISSING` disposition
+/// is one of those refusals: a contour that cannot have its named reservation
+/// read back is refused by name like every other non-`Active` state, not passed
+/// as "nothing staged here". Only a contour that named no binding at all takes
+/// the ungated no-op above.
 fn require_dispatch_launch_reservation(
     kernel: &KernelComposition,
     inputs: &SpawnInputs<'_>,
@@ -3280,21 +3286,48 @@ fn require_dispatch_launch_reservation(
             "launch gate clock is not a positive millisecond value".to_owned(),
         )
     })?;
-    super::admission_reservation_saga::require_bound_admission_reservation_launch(
+    // #1678 W8: `Ok(None)` is the owner's `MISSING` disposition, NOT a permit.
+    // The gate returns `Ok(None)` only when the owner's own durable enumeration
+    // found NO reservation binding this exact work item and proposed attempt
+    // (`admission_reservation.rs::verify_admission_reservation_launch_prerequisite`
+    // produces the same `Missing` at its own line for a row that is absent). So
+    // a contour that PRESENTS a complete claim binding here can reach the spawn
+    // with a staged-but-unreadable, deleted, never-written or mismatched
+    // reservation and no refusal name at all. The three arms are therefore
+    // matched explicitly: the sealed `Active` value passes, and every other
+    // outcome — including the absence of any resolvable row — is refused BY NAME
+    // through the SAME `AdmissionReservationLaunchRefusal::from_prerequisite`
+    // constructor the owner-backed refusals use, so the discriminant stays the
+    // owner's spelling rather than a route-local label that could drift from the
+    // nine-state set.
+    match super::admission_reservation_saga::require_bound_admission_reservation_launch(
         kernel.generation_gateway.ors.as_ref(),
         &work_item,
         &proposed_attempt,
         &authority_epoch,
         &fence_snapshot,
         now_unix_ms,
-    )
-    .map(|_| ())
-    .map_err(|refusal| {
-        // The refusal names the owner's own state; `Inconsistent` keeps it typed
-        // and surfaces the discriminant through `Display` so the launch caller
-        // can tell a `STAGED` reservation from a `RELEASED` one.
-        DispatchLaunchError::Inconsistent(refusal.to_string())
-    })
+    ) {
+        Ok(Some(_)) => Ok(()),
+        // A reservation that cannot be found for a launch that NAMED one is the
+        // owner's own `MISSING` state. It is built from the owner's variant, not
+        // from a string, so this is the same refusal the verifier would have
+        // produced had the row loaded.
+        Ok(None) => Err(DispatchLaunchError::Inconsistent(
+            super::admission_reservation_saga::AdmissionReservationLaunchRefusal::from_prerequisite(
+                &work_item,
+                &eliot_ors::AdmissionReservationLaunchPrerequisite::Missing {
+                    work_item_id: work_item.clone(),
+                    proposed_attempt_id: proposed_attempt.clone(),
+                },
+            )
+            .to_string(),
+        )),
+        // Every other refusal already names the owner's own state; `Inconsistent`
+        // keeps it typed and surfaces the discriminant through `Display` so the
+        // launch caller can tell a `STAGED` reservation from a `RELEASED` one.
+        Err(refusal) => Err(DispatchLaunchError::Inconsistent(refusal.to_string())),
+    }
 }
 
 /// Spawns one prepared child through the admitted process gateway.

@@ -461,16 +461,44 @@ impl KernelComposition {
                 .map_err(|error| KernelBuildError::Service(error.to_string()))?;
         let now_unix_ms = i64::try_from(unix_ms())
             .map_err(|_| KernelBuildError::Service("eliotd launch clock is unusable".to_owned()))?;
-        super::admission_reservation_saga::require_bound_admission_reservation_launch(
+        // #1678 W8: `Ok(None)` is the owner's `MISSING` disposition, NOT a
+        // permit. The gate returns `Ok(None)` only when the owner's own durable
+        // enumeration found no reservation binding this exact work item and
+        // proposed attempt — the same condition under which
+        // `verify_admission_reservation_launch_prerequisite` produces its own
+        // `Missing` variant for an absent row. Mapping it onto a pass would let
+        // an `eliotd` start whose own operation identity names a reservation
+        // that cannot be read back (staged-but-unreadable, deleted,
+        // never-written, or bound to a different attempt) reach the gateway with
+        // no refusal name at all, while I14.6 admits only `active`. It is
+        // therefore refused as the owner's own `MISSING` state, built through the
+        // SAME `AdmissionReservationLaunchRefusal::from_prerequisite`
+        // constructor the owner-backed refusals use so the discriminant stays the
+        // owner's spelling.
+        //
+        // This is strictly strengthening: it adds a refusal where there was
+        // none, and weakens no existing one.
+        match super::admission_reservation_saga::require_bound_admission_reservation_launch(
             self.generation_gateway.ors.as_ref(),
             &work_item,
             &proposed_attempt,
             &lineage,
             &fence_snapshot,
             now_unix_ms,
-        )
-        .map(|_| ())
-        .map_err(|refusal| KernelBuildError::Service(refusal.to_string()))
+        ) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(KernelBuildError::Service(
+                super::admission_reservation_saga::AdmissionReservationLaunchRefusal::from_prerequisite(
+                    &work_item,
+                    &eliot_ors::AdmissionReservationLaunchPrerequisite::Missing {
+                        work_item_id: work_item.clone(),
+                        proposed_attempt_id: proposed_attempt.clone(),
+                    },
+                )
+                .to_string(),
+            )),
+            Err(refusal) => Err(KernelBuildError::Service(refusal.to_string())),
+        }
     }
 
     #[cfg(windows)]
