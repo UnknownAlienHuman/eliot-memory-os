@@ -629,6 +629,14 @@ fn zero_digest() -> TestResult<LowercaseSha256> {
     ))?)
 }
 
+fn start_request_digest(
+    binding: &ProviderExecutionBinding,
+) -> TestResult<LowercaseSha256> {
+    Ok(serde_json::from_value(serde_json::json!(
+        binding.start_request_sha256.clone()
+    ))?)
+}
+
 fn stored_admission_digest(lane: &AdmittedLaneReceipt) -> TestResult<LowercaseSha256> {
     // S5 linkage: the observation must reference the stored admission's
     // self_digest. Legacy lanes without stored admission fall back to the
@@ -664,7 +672,7 @@ fn matched_observation(
         route_state: RouteObservationState::Matched,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::Observed,
-        request_digest: binding.start_request_sha256.clone(),
+        request_digest: start_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -713,7 +721,7 @@ fn unknown_observation(
         route_state: RouteObservationState::Matched,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::UnknownOutcome,
-        request_digest: binding.start_request_sha256.clone(),
+        request_digest: start_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -2235,7 +2243,7 @@ fn use_result_binding(
     binding: &ProviderExecutionBinding,
 ) -> TestResult<()> {
     submission.result.actual_route.binding = binding.clone();
-    submission.result.actual_route.request_digest = binding.start_request_sha256.clone();
+    submission.result.actual_route.request_digest = start_request_digest(binding)?;
     submission.result.actual_route.self_digest = submission.result.actual_route.compute_digest()?;
     Ok(())
 }
@@ -2509,7 +2517,7 @@ fn diverged_observation(
         route_state: RouteObservationState::Diverged,
         diverged_fields: diverged,
         execution_outcome: ExecutionOutcome::Observed,
-        request_digest: binding.start_request_sha256.clone(),
+        request_digest: start_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
@@ -2560,7 +2568,7 @@ fn unobserved_observation(
         route_state: RouteObservationState::Unobserved,
         diverged_fields: Vec::new(),
         execution_outcome: ExecutionOutcome::UnknownOutcome,
-        request_digest: binding.start_request_sha256.clone(),
+        request_digest: start_request_digest(binding)?,
         translation_digest: None,
         raw_evidence_digest: None,
         raw_evidence_ref: None,
