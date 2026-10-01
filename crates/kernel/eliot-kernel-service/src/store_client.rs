@@ -79,6 +79,11 @@ pub enum StoreClientError {
     /// The store handshake or response violated the closed contract.
     #[error("store EBP contract: {0}")]
     Contract(String),
+    /// Blob process-stream exchange crossed the send boundary without an
+    /// exact typed result; the original operation must be reconciled by its
+    /// retained token and must never be blindly repeated.
+    #[error("Blob process-stream outcome is unknown")]
+    BlobProcessStreamUnknownOutcome,
     /// The store returned an application-level failure.
     #[error("store contract: {0}")]
     Store(#[from] StoreError),

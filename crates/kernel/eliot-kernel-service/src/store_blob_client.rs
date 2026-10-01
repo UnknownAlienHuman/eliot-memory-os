@@ -81,23 +81,22 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
         match transport.send_frame(&frame, self.limits).await {
             Ok(DeliveryOutcome::Delivered) => {}
             Ok(DeliveryOutcome::UnknownOutcome) | Err(_) => {
-                return Err(StoreClientError::Transport(
-                    "Blob process-stream exchange outcome is unknown".to_owned(),
-                ));
+                return Err(StoreClientError::BlobProcessStreamUnknownOutcome);
             }
         }
         let response = transport.receive_frame(self.limits).await.map_err(|_| {
-            StoreClientError::Transport("Blob process-stream reply is unknown".to_owned())
+            StoreClientError::BlobProcessStreamUnknownOutcome
         })?;
         let decoded = decode_blob_frame_response(
             &response,
             self.requirement.connection_id.as_str(),
             self.protocol_version,
             &request_id,
-        )?;
+        )
+        .map_err(|_| StoreClientError::BlobProcessStreamUnknownOutcome)?;
         decoded
             .validate()
-            .map_err(|error| StoreClientError::Contract(error.to_string()))?;
+            .map_err(|_| StoreClientError::BlobProcessStreamUnknownOutcome)?;
         let expected_family_matches = matches!(
             (&request.operation, &decoded.operation),
             (
@@ -109,9 +108,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             )
         );
         if !expected_family_matches {
-            return Err(StoreClientError::Contract(
-                "Blob process-stream response operation differs from its request".to_owned(),
-            ));
+            return Err(StoreClientError::BlobProcessStreamUnknownOutcome);
         }
         Ok(decoded)
     }
@@ -138,7 +135,7 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             .await;
         let response = match response {
             Ok(response) => response,
-            Err(StoreClientError::Transport(_)) => {
+            Err(StoreClientError::BlobProcessStreamUnknownOutcome) => {
                 return Ok(ProcessStreamSinkWireResponse::Unknown);
             }
             Err(error) => return Err(error),
