@@ -21,20 +21,20 @@ use eliot_contracts::{
     BridgeEventCapacityPressure, BridgeTransportBackpressure, EpochId, HostCorrelationDomain,
     HostCorrelationProjection,
 };
+#[cfg(test)]
+use eliot_mcp::HostCancellationPortOutcome;
 use eliot_mcp::{
     HostCancellationOutcome, HostCancellationRequest, HostCancellationResult,
-    HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationRequest,
-    HostInvocationResult, HostOperationHandle, HostRequestGateway, JsonRpcId,
-    KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ToolRequest, WIRE_INTERNAL_ERROR,
-    WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND, WIRE_REQUEST_CANCELLED,
-    build_host_cancellation, build_host_invocation, decode_cancel_notification,
-    decode_initialize_version, decode_resource_uri, decode_tools_call, decode_wire_request,
-    gateway_error_to_wire, initialize_result, negotiate_wire_version, render_accepted_result,
-    render_error, render_rejected_result, render_rejection, render_responded_result, render_result,
-    tools_list_result,
+    HostCorrelationReceipt, HostGatewayError, HostInvocationOutcome, HostInvocationPortOutcome,
+    HostInvocationRequest, HostInvocationResult, HostOperationHandle, HostRequestGateway,
+    JsonRpcId, KernelHostRequestPort, NegotiatedWireVersion, PortFailure, ToolRequest,
+    WIRE_INTERNAL_ERROR, WIRE_INVALID_PARAMS, WIRE_INVALID_REQUEST, WIRE_METHOD_NOT_FOUND,
+    WIRE_REQUEST_CANCELLED, build_host_cancellation, build_host_invocation,
+    decode_cancel_notification, decode_initialize_version, decode_resource_uri, decode_tools_call,
+    decode_wire_request, gateway_error_to_wire, initialize_result, negotiate_wire_version,
+    render_accepted_result, render_error, render_rejected_result, render_rejection,
+    render_responded_result, render_result, tools_list_result,
 };
-#[cfg(test)]
-use eliot_mcp::{HostCancellationPortOutcome, HostInvocationPortOutcome};
 use eliot_protocol::{
     AckPhase, AgentActivationResolutionDisposition, EventDisposition, EventEnvelope,
     HARD_STRUCTURED_RESPONSE_BYTES,
@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, Read, Write};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const INVALID_ARGUMENT_EXIT: i32 = 2;
 const PROVIDER_PORT_EXIT: i32 = 69;
@@ -2870,11 +2870,14 @@ fn emit_framed_bytes(framed: Vec<u8>) -> StdioWriteReceipt {
 /// the `eliot-mcp` wire adapter and every response renders as a negotiated
 /// JSON-RPC envelope echoing the exact request identity.
 ///
-/// Single-threaded by construction: the trusted port borrows a process-local
-/// shared transport, so dispatch owns the port for the whole process.
-/// Cancellation therefore targets the exact admitted operation handle
-/// retained per correlation: a cancel that lands before its call refuses the
-/// dispatch, a cancel that lands after admission cancels that exact operation
+/// One loop thread owns the gateway, the trusted port, the runner, and
+/// stdout: the port borrows a process-local shared transport, so dispatch
+/// owns it for the whole process. A bounded stdin reader thread parses
+/// records into separate data and reserved control queues but never touches
+/// the Kernel transport, the runner, or stdout. Cancellation therefore targets
+/// the exact admitted operation handle retained per correlation: a cancel
+/// that lands before its call refuses the dispatch, a cancel that lands
+/// mid-wait is parsed from the control queue and cancels that exact operation
 /// with the owner's real disposition, and an unknown target reconciles
 /// without executing anything new. Cancel dispositions travel on stderr
 /// (diagnostics stay off protocol stdout); `tools/call` results carry the
@@ -2897,6 +2900,28 @@ const MCP_DEMAND_ID: &str = "mcp-stdio-demand";
 /// Connection identity minted for the MCP attach: one stdio process carries
 /// exactly one connection, so the identity is fixed for the process lifetime.
 const MCP_CONNECTION_ID: &str = "mcp-stdio-1";
+
+/// Bounded stdin data queue: ordinary JSON-RPC frames awaiting dispatch.
+///
+/// The loop admits one ordinary call at a time, so depth only smooths
+/// reader/loop interleaving. A full data queue backpressures the reader
+/// thread alone; the reserved control queue stays independently drainable.
+const MAX_QUEUED_DATA_RECORDS: usize = 8;
+/// Reserved control queue: notifications stay admissible while the single
+/// ordinary-call slot is occupied. Sized above the data queue so a burst of
+/// cancellations is never head-blocked behind ordinary traffic.
+const MAX_QUEUED_CONTROL_RECORDS: usize = 32;
+/// Intake quantum: the loop waits at most this long for the next record on an
+/// idle queue before driving poll deadlines and control again.
+const MCP_INTAKE_QUANTUM: Duration = Duration::from_millis(50);
+/// Status-poll cadence for one pending owner operation. Readback is a short
+/// lookup-only exchange, paced so the loop keeps alternating intake/control.
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Maximum status polls before one pending call stops holding the
+/// ordinary-call slot. The operation stays owner-held under its exact
+/// retained handle with the reconcile directive; only the JSON-RPC wait ends,
+/// never with an invented owner outcome.
+const MAX_PENDING_POLLS: u32 = 300;
 
 /// Live MCP front-door session: negotiated version plus bounded retention.
 ///
@@ -3034,6 +3059,438 @@ struct McpFrameOutcome {
     dispatched: bool,
 }
 
+/// One stdin record after bounded framing, classified for the two queues.
+enum McpQueuedIntake {
+    /// One framed record awaiting dispatch.
+    Record(String),
+    /// A framing failure shaped as a JSON-RPC rejection for emission.
+    Reject(Value),
+    /// Clean end of intake on this queue.
+    End,
+}
+
+/// Bounded stdin reader for the MCP front door (issue #2562 M1).
+///
+/// Owns stdin for the process lifetime and parses records into the separate
+/// bounded data and reserved control queues. It never touches the Kernel
+/// transport, the runner, or stdout: classification is pure wire decode
+/// (notifications without an id ride the control queue; everything else rides
+/// data, including undecodable bytes the loop counts as invalid), and framing
+/// failures ride as shaped rejections for the loop to emit with its
+/// consecutive-invalid accounting. A full data queue backpressures this
+/// thread only; control stays independently drainable by the loop. Returns
+/// `None` when the reader cannot be spawned, in which case the front door
+/// fails closed without consuming stdin.
+fn spawn_mcp_stdin_reader(
+    data_sender: mpsc::SyncSender<McpQueuedIntake>,
+    control_sender: mpsc::SyncSender<McpQueuedIntake>,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("eliot-bridge-mcp-stdin".to_owned())
+        .spawn(move || {
+            let stdin = io::stdin();
+            let mut guard = stdin.lock();
+            let mut total_records: u64 = 0;
+            loop {
+                match read_mcp_record(&mut guard, &mut total_records) {
+                    McpIntake::Skip => {}
+                    McpIntake::Text(text) => {
+                        let control = matches!(
+                            decode_wire_request(&text),
+                            Ok(request)
+                                if request.id.is_none()
+                                    && request.method.starts_with("notifications/")
+                        );
+                        let message = McpQueuedIntake::Record(text);
+                        let sent = if control {
+                            control_sender.send(message)
+                        } else {
+                            data_sender.send(message)
+                        };
+                        if sent.is_err() {
+                            return;
+                        }
+                    }
+                    McpIntake::Reject(frame) => {
+                        if data_sender.send(McpQueuedIntake::Reject(frame)).is_err() {
+                            return;
+                        }
+                    }
+                    McpIntake::EmitAndEnd(frame) => {
+                        let _ = data_sender.send(McpQueuedIntake::Reject(frame));
+                        let _ = control_sender.send(McpQueuedIntake::End);
+                        let _ = data_sender.send(McpQueuedIntake::End);
+                        return;
+                    }
+                    McpIntake::End => {
+                        let _ = control_sender.send(McpQueuedIntake::End);
+                        let _ = data_sender.send(McpQueuedIntake::End);
+                        return;
+                    }
+                }
+            }
+        })
+        .ok()
+}
+
+/// One ordinary-call slot of the MCP front door (issue #2562 M1).
+///
+/// The JSON-RPC call stays open after owner acceptance: the typed correlation
+/// binds the exact admitted operation handle at accept time, before any
+/// terminal wait, and the loop drives short status exchanges until the owner
+/// reports a terminal disposition — or the poll budget ends the wait without
+/// inventing one. Exactly one terminal response is emitted for the original
+/// id; cancellation notifications never receive one. A pre-accept
+/// cancellation mark refuses dispatch (no kernel effect is ever issued for
+/// it); a mid-wait mark rides the existing retention and is applied by the
+/// owner's cancel path against this exact handle.
+struct McpPendingCall {
+    /// Original wire identity, echoed verbatim in the terminal response.
+    id: JsonRpcId,
+    /// Typed request correlation: the pending identity and the
+    /// cancellation-mark identity. Never display text.
+    correlation: String,
+    /// Canonical tool name, for owner-result decode on readback.
+    tool_name: String,
+    /// Exact original record bytes, for the emission observation.
+    request_text: String,
+    /// Current drive state.
+    state: McpPendingState,
+}
+
+/// Drive state of one pending call.
+///
+/// `Submitting` and `Cancelling` are loop-owned short exchanges, not stored
+/// states: submission runs once when `Prepared` is driven, and the owner's
+/// cancel path runs at the control drain against the retained handle. What
+/// persists across iterations is validation (`Prepared`) and the accepted
+/// wait (`Pending`); `Terminal` is the single emission that clears the slot,
+/// and `Unknown/Reconcile` is the poll-unknown path that retries readback
+/// within the poll budget, then ends the wait with the reconcile directive.
+enum McpPendingState {
+    /// Validated and awaiting its single owner submission exchange. Boxed:
+    /// the request is the large variant beside the small pending projection.
+    Prepared { request: Box<HostInvocationRequest> },
+    /// Owner accepted; awaiting terminal readback with poll deadlines.
+    Pending {
+        operation_handle: HostOperationHandle,
+        polls: u32,
+        next_poll: Instant,
+        receipt: HostCorrelationReceipt,
+    },
+}
+
+/// One validated MCP tools/call ready for its owner submission exchange.
+///
+/// Carries the exact JSON-RPC identity, its typed correlation, and the
+/// canonical tool name for later readback decode. A `Value` error is already
+/// the terminal refusal to emit (including the pre-dispatch cancellation
+/// refusal, which issues no kernel effect).
+struct PreparedToolsCall {
+    id: JsonRpcId,
+    correlation: String,
+    tool_name: String,
+    request: HostInvocationRequest,
+}
+
+/// Validates one `tools/call` without issuing any kernel effect.
+///
+/// The wire name plus arguments become one inert `HostInvocationRequest`;
+/// the JSON-RPC identity is retained under its type-qualified correlation
+/// for the host request, handle lookup, and cancellation marks. This is the
+/// shared validation half of the blocking tools/call path and the pending
+/// machine's submit step: both refuse a pre-accept cancellation mark before
+/// any dispatch.
+fn prepare_mcp_tools_call(
+    state: &McpFrontDoor,
+    version: NegotiatedWireVersion,
+    id: &JsonRpcId,
+    params: &Value,
+) -> Result<PreparedToolsCall, Value> {
+    let correlation = id.correlation_text(HostCorrelationDomain::Request);
+    if state.is_cancelled(&correlation) {
+        return Err(render_error(
+            Some(id),
+            WIRE_REQUEST_CANCELLED,
+            "request was cancelled before dispatch; no kernel effect was issued",
+            Value::Null,
+        ));
+    }
+    let (name, arguments) = match decode_tools_call(params) {
+        Ok(call) => call,
+        Err(rejection) => return Err(render_rejection(Some(id), &rejection)),
+    };
+    match build_host_invocation(version, id, name, arguments) {
+        Ok(request) => Ok(PreparedToolsCall {
+            id: id.clone(),
+            correlation,
+            tool_name: name.to_owned(),
+            request,
+        }),
+        Err(rejection) => Err(render_rejection(Some(id), &rejection)),
+    }
+}
+
+/// Drives one pending call with short owner exchanges (issue #2562 M1).
+///
+/// Returns the call's single terminal response with its original record
+/// bytes, or `None` while the call stays pending in the slot. Submission is
+/// one short exchange: owner acceptance binds the exact handle to the typed
+/// correlation immediately and pends the call, while any other outcome
+/// renders exactly like the blocking path. Readback is one short
+/// lookup-only exchange per drive once the poll deadline passes — sooner when
+/// a cancellation mark is retained, so the fresh parent disposition is
+/// observed instead of waited out. Owner-typed answers render the terminal
+/// response; transport-layer failures keep polling within the poll budget so
+/// a blip never invents an owner outcome. The budget ends the JSON-RPC wait
+/// with the exact handle and the reconcile directive; the operation stays
+/// owner-held and the retained handle keeps targeting it.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one drive step per pending-call state: submit exchange plus poll exchange with their terminal mappings"
+)]
+fn drive_mcp_pending_call(
+    gateway: HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    slot: &mut Option<McpPendingCall>,
+) -> Option<(Value, String)> {
+    let mut call = slot.take()?;
+    match call.state {
+        McpPendingState::Prepared { request } => {
+            if state.is_cancelled(&call.correlation) {
+                let response = render_error(
+                    Some(&call.id),
+                    WIRE_REQUEST_CANCELLED,
+                    "request was cancelled before dispatch; no kernel effect was issued",
+                    Value::Null,
+                );
+                return Some((response, call.request_text));
+            }
+            match gateway.invoke_with_receipt(port, &request) {
+                Ok((result, receipt)) => match result.outcome() {
+                    HostInvocationOutcome::Accepted { operation_handle } => {
+                        state.retain_handle(&call.correlation, operation_handle.clone());
+                        call.state = McpPendingState::Pending {
+                            operation_handle: operation_handle.clone(),
+                            polls: 0,
+                            next_poll: Instant::now() + PENDING_POLL_INTERVAL,
+                            receipt,
+                        };
+                        *slot = Some(call);
+                        None
+                    }
+                    _ => {
+                        let response = render_mcp_invocation(
+                            port,
+                            runner,
+                            state,
+                            &call.id,
+                            call.correlation.as_str(),
+                            result.outcome(),
+                            &receipt,
+                        );
+                        Some((response, call.request_text))
+                    }
+                },
+                Err(error) => {
+                    let (code, message) = gateway_error_to_wire(&error);
+                    emit_error("MCP_CALL_GATEWAY_REJECTED", &error.to_string());
+                    let response = render_error(
+                        Some(&call.id),
+                        code,
+                        message,
+                        serde_json::json!({ "detail": error.to_string() }),
+                    );
+                    Some((response, call.request_text))
+                }
+            }
+        }
+        McpPendingState::Pending {
+            operation_handle,
+            polls,
+            next_poll,
+            receipt,
+        } => {
+            let urgent = state.is_cancelled(&call.correlation);
+            if !urgent && Instant::now() < next_poll {
+                call.state = McpPendingState::Pending {
+                    operation_handle,
+                    polls,
+                    next_poll,
+                    receipt,
+                };
+                *slot = Some(call);
+                return None;
+            }
+            match port.poll_operation_status(&operation_handle, call.tool_name.as_str()) {
+                Ok(HostInvocationPortOutcome::Accepted { .. }) => {
+                    let polls = polls.saturating_add(1);
+                    if polls > MAX_PENDING_POLLS {
+                        emit_error(
+                            "MCP_PENDING_POLL_BUDGET_EXHAUSTED",
+                            &format!(
+                                "pending call for correlation {correlation:?} exceeded its poll budget; the operation stays owner-held under its exact handle",
+                                correlation = call.correlation,
+                            ),
+                        );
+                        let response = render_pending_wait_exhausted(&call.id, &operation_handle);
+                        return Some((response, call.request_text));
+                    }
+                    call.state = McpPendingState::Pending {
+                        operation_handle,
+                        polls,
+                        next_poll: Instant::now() + PENDING_POLL_INTERVAL,
+                        receipt,
+                    };
+                    *slot = Some(call);
+                    None
+                }
+                Ok(HostInvocationPortOutcome::Responded {
+                    operation_handle: confirmed,
+                    response,
+                }) => {
+                    state.retain_handle(&call.correlation, confirmed.clone());
+                    let outcome = HostInvocationOutcome::Responded {
+                        operation_handle: confirmed,
+                        response,
+                    };
+                    let response = render_mcp_invocation(
+                        port,
+                        runner,
+                        state,
+                        &call.id,
+                        call.correlation.as_str(),
+                        &outcome,
+                        &receipt,
+                    );
+                    Some((response, call.request_text))
+                }
+                Err(PortFailure::TransportBindingRejected { .. }) => {
+                    let polls = polls.saturating_add(1);
+                    if polls > MAX_PENDING_POLLS {
+                        emit_error(
+                            "MCP_PENDING_POLL_BUDGET_EXHAUSTED",
+                            &format!(
+                                "pending call for correlation {correlation:?} exceeded its poll budget; the operation stays owner-held under its exact handle",
+                                correlation = call.correlation,
+                            ),
+                        );
+                        let response = render_pending_wait_exhausted(&call.id, &operation_handle);
+                        return Some((response, call.request_text));
+                    }
+                    emit_error(
+                        "MCP_PENDING_POLL_TRANSPORT",
+                        &format!(
+                            "pending poll for correlation {correlation:?} left an unknown outcome; retrying within budget",
+                            correlation = call.correlation,
+                        ),
+                    );
+                    call.state = McpPendingState::Pending {
+                        operation_handle,
+                        polls,
+                        next_poll: Instant::now() + PENDING_POLL_INTERVAL,
+                        receipt,
+                    };
+                    *slot = Some(call);
+                    None
+                }
+                Err(failure) => {
+                    let response = render_rejected_result(call.correlation.as_str(), &failure);
+                    Some((response, call.request_text))
+                }
+            }
+        }
+    }
+}
+
+/// Renders the bridge-side end of a pending wait (issue #2562 M1).
+///
+/// The poll budget ended the JSON-RPC wait, not the operation: it stays
+/// owner-held under its exact retained handle with the durable reconcile
+/// directive. No owner outcome is invented; a later cancel or readback still
+/// targets the exact handle.
+fn render_pending_wait_exhausted(id: &JsonRpcId, operation_handle: &HostOperationHandle) -> Value {
+    render_error(
+        Some(id),
+        WIRE_INTERNAL_ERROR,
+        "pending call exceeded its poll budget; the operation stays owner-held under its exact handle — reconcile it instead of retrying",
+        serde_json::json!({
+            "operation_handle": operation_handle.as_str(),
+            "recovery": "reconnect-and-reconcile",
+        }),
+    )
+}
+
+/// Emits one dispatched MCP response with the emission observation and the
+/// shared bounded stdout discipline.
+///
+/// The observation is produced from the exact bytes this process placed on
+/// stdout, then submitted to the owner's admitted route; it declares no host
+/// terminal fact. Returns true when the loop must stop emitting afterwards
+/// (zero bytes placed, unflushed, oversize, or slow consumer), exactly like
+/// the private emission receipt contract.
+fn emit_mcp_response(runner: &mut BridgeRunner, request_text: &str, response: Value) -> bool {
+    // #2899: the emission observation is produced from the exact bytes
+    // this process placed on stdout, then submitted to the OWNER's
+    // admitted route. This declares no host terminal fact: it records
+    // only that ELIOT emitted, and a later admitted host event is what
+    // can resolve the correlation.
+    let receipt = write_mcp_frame(&response);
+    if let Ok(request) = serde_json::from_str::<Value>(request_text) {
+        let observed = eliot_agent_bridge::mcp_correlation::StdioEmissionOutcome {
+            bytes: receipt.bytes,
+            flushed: receipt.flushed,
+            emitted: matches!(receipt.cause, StdioBreakCause::Emitted),
+        };
+        if let Err(error) = eliot_agent_bridge::mcp_correlation::observe_mcp_emission(
+            runner,
+            &request,
+            request.get("method").and_then(Value::as_str).unwrap_or(""),
+            None,
+            observed,
+            None,
+        ) {
+            emit_error("MCP_EMISSION_OBSERVATION_REFUSED", &error.to_string());
+        }
+    }
+    receipt.bytes_written() == 0 || receipt.should_break()
+}
+
+/// Emits one framing-failure rejection and folds it into the
+/// consecutive-invalid discipline. Returns true when intake must stop (broken
+/// pipe or the invalid ceiling).
+fn note_mcp_reject(frame: &Value, consecutive_invalid: &mut u32) -> bool {
+    let break_after = emit_mcp_frame(frame);
+    *consecutive_invalid = consecutive_invalid.saturating_add(1);
+    break_after || *consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
+}
+
+/// Processes one reserved-control record: notifications stay admissible while
+/// the single ordinary-call slot is occupied. Every control outcome is a
+/// well-formed exchange with no response; a shaped rejection can only arrive
+/// defensively and is emitted with the shared discipline.
+fn handle_mcp_control_record(
+    gateway: HostRequestGateway,
+    port: &mut KernelHostRequestClient,
+    runner: &mut BridgeRunner,
+    state: &mut McpFrontDoor,
+    provider_failure: &mut bool,
+    consecutive_invalid: &mut u32,
+    text: &str,
+) {
+    let outcome = handle_mcp_frame(gateway, port, runner, state, text, provider_failure);
+    if let Some(response) = outcome.response {
+        emit_mcp_frame(&response);
+    }
+    if outcome.dispatched {
+        *consecutive_invalid = 0;
+    } else {
+        *consecutive_invalid = consecutive_invalid.saturating_add(1);
+    }
+}
+
 /// Serves the MCP front door on stdio until EOF or a fail-closed break.
 ///
 /// Framing, record bounds, request ceilings, and the consecutive-invalid
@@ -3051,68 +3508,184 @@ fn run_mcp_front_door(
 ) -> i32 {
     let mut state = McpFrontDoor::new();
     let mut provider_failure = false;
-    let mut stdin_lock = io::stdin().lock();
-    let mut total_records: u64 = 0;
+    let (data_sender, data_receiver) = mpsc::sync_channel(MAX_QUEUED_DATA_RECORDS);
+    let (control_sender, control_receiver) = mpsc::sync_channel(MAX_QUEUED_CONTROL_RECORDS);
+    if spawn_mcp_stdin_reader(data_sender, control_sender).is_none() {
+        emit_error(
+            "MCP_STDIN_READER_SPAWN_FAILED",
+            "bounded stdin reader could not be spawned; failing closed without consuming stdin",
+        );
+        return PROVIDER_PORT_EXIT;
+    }
+    let mut slot: Option<McpPendingCall> = None;
+    let mut data_ended = false;
+    let mut control_ended = false;
+    let mut stdout_broken = false;
+    // Invalid ceiling reached: no new calls are admitted, and the loop breaks
+    // as soon as the pending slot resolves. Control keeps draining so a
+    // mid-wait cancellation still lands against the retained handle.
+    let mut intake_poisoned = false;
     let mut consecutive_invalid: u32 = 0;
     loop {
-        let text = match read_mcp_record(&mut stdin_lock, &mut total_records) {
-            McpIntake::End => break,
-            McpIntake::Skip => continue,
-            McpIntake::Reject(frame) => {
-                let break_after = emit_mcp_frame(&frame);
-                consecutive_invalid = consecutive_invalid.saturating_add(1);
-                if break_after
-                    || consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
-                {
-                    break;
+        // Reserved control first: cancellations stay admissible while the
+        // single ordinary-call slot is occupied.
+        while !control_ended {
+            match control_receiver.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    control_ended = true;
                 }
-                continue;
-            }
-            McpIntake::Text(text) => text,
-        };
-        let outcome = handle_mcp_frame(
-            gateway,
-            port,
-            runner,
-            &mut state,
-            &text,
-            &mut provider_failure,
-        );
-        if outcome.dispatched {
-            consecutive_invalid = 0;
-        } else {
-            consecutive_invalid = consecutive_invalid.saturating_add(1);
-            if consecutive_invalid >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records {
-                break;
+                Ok(McpQueuedIntake::End) => {
+                    control_ended = true;
+                }
+                Ok(McpQueuedIntake::Reject(frame)) => {
+                    if note_mcp_reject(&frame, &mut consecutive_invalid) {
+                        data_ended = true;
+                        intake_poisoned = true;
+                    }
+                }
+                Ok(McpQueuedIntake::Record(text)) => {
+                    handle_mcp_control_record(
+                        gateway,
+                        port,
+                        runner,
+                        &mut state,
+                        &mut provider_failure,
+                        &mut consecutive_invalid,
+                        &text,
+                    );
+                }
             }
         }
-        if let Some(response) = outcome.response {
-            // #2899: the emission observation is produced from the exact bytes
-            // this process placed on stdout, then submitted to the OWNER's
-            // admitted route. This declares no host terminal fact: it records
-            // only that ELIOT emitted, and a later admitted host event is what
-            // can resolve the correlation.
-            let receipt = write_mcp_frame(&response);
-            if let Ok(request) = serde_json::from_str::<Value>(&text) {
-                let observed = eliot_agent_bridge::mcp_correlation::StdioEmissionOutcome {
-                    bytes: receipt.bytes,
-                    flushed: receipt.flushed,
-                    emitted: matches!(receipt.cause, StdioBreakCause::Emitted),
-                };
-                if let Err(error) = eliot_agent_bridge::mcp_correlation::observe_mcp_emission(
-                    runner,
-                    &request,
-                    request.get("method").and_then(Value::as_str).unwrap_or(""),
-                    None,
-                    observed,
-                    None,
-                ) {
-                    emit_error("MCP_EMISSION_OBSERVATION_REFUSED", &error.to_string());
+        // Drive the single ordinary-call slot with short exchanges.
+        if let Some((response, request_text)) =
+            drive_mcp_pending_call(gateway, port, runner, &mut state, &mut slot)
+        {
+            consecutive_invalid = 0;
+            if emit_mcp_response(runner, &request_text, response) {
+                stdout_broken = true;
+            }
+        }
+        // Ordinary admit: exactly one call slot.
+        if slot.is_none() && !data_ended {
+            match data_receiver.recv_timeout(MCP_INTAKE_QUANTUM) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    data_ended = true;
+                }
+                Ok(McpQueuedIntake::End) => {
+                    data_ended = true;
+                }
+                Ok(McpQueuedIntake::Reject(frame)) => {
+                    if note_mcp_reject(&frame, &mut consecutive_invalid) {
+                        data_ended = true;
+                        intake_poisoned = true;
+                    }
+                }
+                Ok(McpQueuedIntake::Record(text)) => match decode_wire_request(&text) {
+                    Err(error) => {
+                        if emit_mcp_response(runner, &text, error.render()) {
+                            stdout_broken = true;
+                        }
+                        consecutive_invalid = consecutive_invalid.saturating_add(1);
+                        if consecutive_invalid
+                            >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
+                        {
+                            data_ended = true;
+                            intake_poisoned = true;
+                        }
+                    }
+                    Ok(request) => match (request.id.as_ref(), request.method.as_str()) {
+                        (Some(id), "tools/call") if state.initialized => {
+                            match prepare_mcp_tools_call(&state, state.version, id, &request.params)
+                            {
+                                Ok(prepared) => {
+                                    slot = Some(McpPendingCall {
+                                        id: prepared.id,
+                                        correlation: prepared.correlation,
+                                        tool_name: prepared.tool_name,
+                                        request_text: text,
+                                        state: McpPendingState::Prepared {
+                                            request: Box::new(prepared.request),
+                                        },
+                                    });
+                                    consecutive_invalid = 0;
+                                }
+                                Err(refusal) => {
+                                    if emit_mcp_response(runner, &text, refusal) {
+                                        stdout_broken = true;
+                                    }
+                                    consecutive_invalid = 0;
+                                }
+                            }
+                        }
+                        _ => {
+                            let outcome = handle_mcp_frame(
+                                gateway,
+                                port,
+                                runner,
+                                &mut state,
+                                &text,
+                                &mut provider_failure,
+                            );
+                            if outcome.dispatched {
+                                consecutive_invalid = 0;
+                            } else {
+                                consecutive_invalid = consecutive_invalid.saturating_add(1);
+                                if consecutive_invalid
+                                    >= REQUEST_INPUT_PROFILE.max_consecutive_invalid_records
+                                {
+                                    data_ended = true;
+                                    intake_poisoned = true;
+                                }
+                            }
+                            if let Some(response) = outcome.response
+                                && emit_mcp_response(runner, &text, response)
+                            {
+                                stdout_broken = true;
+                            }
+                        }
+                    },
+                },
+            }
+        } else if slot.is_some() {
+            // The slot is occupied: pace on the reserved control queue so a
+            // mid-wait cancellation wakes the loop instead of spinning it.
+            let pace = match slot.as_ref().map(|call| &call.state) {
+                Some(McpPendingState::Pending { next_poll, .. }) => next_poll
+                    .saturating_duration_since(Instant::now())
+                    .min(MCP_INTAKE_QUANTUM),
+                _ => MCP_INTAKE_QUANTUM,
+            };
+            match control_receiver.recv_timeout(pace) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    control_ended = true;
+                }
+                Ok(McpQueuedIntake::End) => {
+                    control_ended = true;
+                }
+                Ok(McpQueuedIntake::Reject(frame)) => {
+                    if note_mcp_reject(&frame, &mut consecutive_invalid) {
+                        data_ended = true;
+                        intake_poisoned = true;
+                    }
+                }
+                Ok(McpQueuedIntake::Record(text)) => {
+                    handle_mcp_control_record(
+                        gateway,
+                        port,
+                        runner,
+                        &mut state,
+                        &mut provider_failure,
+                        &mut consecutive_invalid,
+                        &text,
+                    );
                 }
             }
-            if receipt.bytes_written() == 0 || receipt.should_break() {
-                break;
-            }
+        }
+        if stdout_broken || (slot.is_none() && (intake_poisoned || (data_ended && control_ended))) {
+            break;
         }
     }
     if provider_failure {
@@ -3501,6 +4074,8 @@ enum McpIntake {
     Skip,
     /// A shaped JSON-RPC rejection frame to emit (framing failure).
     Reject(Value),
+    /// A shaped rejection to emit before breaking: framing is lost.
+    EmitAndEnd(Value),
     /// EOF, request ceiling, or an unrecoverable intake failure: break.
     End,
 }
@@ -3540,11 +4115,10 @@ fn read_mcp_record(stdin: &mut io::StdinLock<'_>, total_records: &mut u64) -> Mc
                     "discarded_bytes": discarded_bytes,
                 }),
             );
-            // Without a terminator the stream lost framing: the private loop
-            // breaks here too, after emitting the rejection.
+            // Without a terminator the stream lost framing: the loop emits
+            // the rejection, then breaks.
             if !found_terminator {
-                let _ = emit_mcp_frame(&frame);
-                return McpIntake::End;
+                return McpIntake::EmitAndEnd(frame);
             }
             return McpIntake::Reject(frame);
         }
@@ -3822,27 +4396,20 @@ fn handle_mcp_tools_call(
     id: &JsonRpcId,
     params: &Value,
 ) -> Value {
-    let correlation = id.correlation_text(eliot_contracts::HostCorrelationDomain::Request);
-    if state.is_cancelled(&correlation) {
-        return render_error(
-            Some(id),
-            WIRE_REQUEST_CANCELLED,
-            "request was cancelled before dispatch; no kernel effect was issued",
-            Value::Null,
-        );
-    }
-    let (name, arguments) = match decode_tools_call(params) {
-        Ok(call) => call,
-        Err(rejection) => return render_rejection(Some(id), &rejection),
+    let prepared = match prepare_mcp_tools_call(state, state.version, id, params) {
+        Ok(prepared) => prepared,
+        Err(refusal) => return refusal,
     };
-    let request = match build_host_invocation(state.version, id, name, arguments) {
-        Ok(request) => request,
-        Err(rejection) => return render_rejection(Some(id), &rejection),
-    };
-    match gateway.invoke_with_receipt(port, &request) {
-        Ok((result, receipt)) => {
-            render_mcp_invocation(port, runner, state, id, &correlation, &result, &receipt)
-        }
+    match gateway.invoke_with_receipt(port, &prepared.request) {
+        Ok((result, receipt)) => render_mcp_invocation(
+            port,
+            runner,
+            state,
+            &prepared.id,
+            prepared.correlation.as_str(),
+            result.outcome(),
+            &receipt,
+        ),
         Err(error) => {
             let (code, message) = gateway_error_to_wire(&error);
             emit_error("MCP_CALL_GATEWAY_REJECTED", &error.to_string());
@@ -3865,10 +4432,10 @@ fn render_mcp_invocation(
     state: &mut McpFrontDoor,
     id: &JsonRpcId,
     correlation: &str,
-    result: &HostInvocationResult,
+    outcome: &HostInvocationOutcome,
     receipt: &HostCorrelationReceipt,
 ) -> Value {
-    match result.outcome() {
+    match outcome {
         HostInvocationOutcome::Accepted { operation_handle } => {
             state.retain_handle(correlation, operation_handle.clone());
             match render_accepted_result(operation_handle, receipt) {
@@ -3881,7 +4448,7 @@ fn render_mcp_invocation(
             response,
         } => {
             state.retain_handle(correlation, operation_handle.clone());
-            let evidence = record_mcp_delivery(port, runner, state, result.outcome());
+            let evidence = record_mcp_delivery(port, runner, state, outcome);
             if evidence.is_none()
                 && matches!(
                     response.kind,

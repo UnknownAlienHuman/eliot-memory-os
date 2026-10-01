@@ -3876,6 +3876,69 @@ impl KernelHostRequestClient {
         decode_preview_reply(&reply, &envelope, request, &facts).ok_or_else(request_failure)
     }
 
+    /// Observation-only status readback of one exact admitted operation
+    /// (issue #2562 M1: pending-call cancellation).
+    ///
+    /// Lookup-only resolve entry over the current transport facts: it never
+    /// stages, submits, cancels, or reconciles anything new. The owner record
+    /// maps exactly like the submit path ([`submit_outcome_for_resolved`]):
+    /// pending states stay `Accepted` with the exact handle, received results
+    /// decode against the original admission, and owner expiry and
+    /// cancellation surface typed. Absent, conflicting, legacy, and
+    /// unavailable answers are typed limitations keyed by the exact handle —
+    /// never a guessed outcome and never a second execution.
+    pub fn poll_operation_status(
+        &mut self,
+        operation_handle: &HostOperationHandle,
+        tool_name: &str,
+    ) -> Result<HostInvocationPortOutcome, PortFailure> {
+        let handle = operation_handle.as_str();
+        let digest = parse_operation_handle(handle)?;
+        let facts = self
+            .shared
+            .try_borrow()
+            .map_err(|_| request_failure())?
+            .snapshot();
+        let session = facts.session.clone().ok_or_else(plan_gap_no_session)?;
+        let now_ms = unix_ms()?;
+        let resolve_envelope = build_resolve_envelope(
+            &resolve_request_label(&digest),
+            Some(handle),
+            &facts,
+            &session,
+            RESOLVE_HANDLE_CAPABILITY_FILLER,
+            RESOLVE_HANDLE_PAYLOAD_FILLER,
+            now_ms,
+        )?;
+        let query = resolve_handle_query(handle);
+        let frame = host_request_resolve_frame(&query, &resolve_envelope, &facts)?;
+        let reply = self
+            .exchange(&frame)
+            .map_err(|error| retain_agent_response(error, unknown_outcome(&digest)))?;
+        match decode_resolve_reply(
+            &reply,
+            &resolve_envelope,
+            &ResolveQuery::OperationHandle {
+                handle: handle.to_owned(),
+            },
+        ) {
+            LogicalOwnerOutcome::Resolved(record) => {
+                if record.operation_id != handle || record.request_digest.is_none() {
+                    return Err(unknown_outcome(&digest));
+                }
+                let occurrence = record
+                    .request_id
+                    .clone()
+                    .unwrap_or_else(|| handle.to_owned());
+                submit_outcome_for_resolved(&record, occurrence.as_str(), tool_name, handle)
+            }
+            LogicalOwnerOutcome::LegacyUnresolved => Err(PortFailure::LegacyCorrelationUnresolved),
+            LogicalOwnerOutcome::Absent
+            | LogicalOwnerOutcome::Conflict
+            | LogicalOwnerOutcome::Unavailable => Err(unknown_outcome(&digest)),
+        }
+    }
+
     /// Sends one observation-only reconcile probe for an invocation whose
     /// delivery is unknown, settling existence as admission.
     ///
