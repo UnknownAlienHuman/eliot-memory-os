@@ -23,6 +23,7 @@ pub mod build_projection;
 pub mod cache_lane;
 pub mod capsule_binding;
 mod dev_fast;
+pub mod git_source_snapshot_profile;
 pub mod package_disposition;
 pub mod process_owner;
 pub mod profile;
@@ -41,6 +42,11 @@ pub use build_projection::{
     CleanupDecision, DeclaredWorkItem, FlightResolution, HeldLease, LiveClaim, PreemptionClass,
     ProducerClaim, ProducerCompletion, ProducerOutcome, ProjectedBuild, QuarantinedArtifact,
     TargetClass, TargetRootBuildCoordinator, restrict_agent_argv,
+};
+pub use git_source_snapshot_profile::{
+    GitSourceSnapshotCommand, GitSourceSnapshotProcessProfile,
+    GitSourceSnapshotProfileError, prepare_current_git_source_snapshot_profile,
+    validate_git_source_snapshot_admission,
 };
 pub use cache_lane::{CacheLane, CacheLaneAttestations, CacheLaneError, LaneOutcome};
 pub use capsule_binding::{
