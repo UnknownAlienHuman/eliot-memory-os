@@ -36,11 +36,7 @@ use host_request_route::{LocalReadPairKind, LocalReadSubmitDisposition, StaleLoc
 fn claim_query_pair(
     kernel: &KernelComposition,
     session: &Session,
-) -> (
-    HostRequestEnvelope,
-    serde_json::Value,
-    LocalReadAttempt,
-) {
+) -> (HostRequestEnvelope, serde_json::Value, LocalReadAttempt) {
     let claimed = kernel
         .claim_local_read_pair(session)
         .expect("claim must not fail")
@@ -265,8 +261,7 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
     enqueue_query_pair(&kernel, &envelope, &tool);
     enqueue_query_pair(&kernel, &envelope, &tool);
 
-    let (claimed_envelope, claimed_tool, attempt) =
-        claim_query_pair(&kernel, &daemon_session);
+    let (claimed_envelope, claimed_tool, attempt) = claim_query_pair(&kernel, &daemon_session);
     assert_eq!(
         claimed_envelope.envelope_sha256, envelope.envelope_sha256,
         "the claim returns the exact admitted envelope"
