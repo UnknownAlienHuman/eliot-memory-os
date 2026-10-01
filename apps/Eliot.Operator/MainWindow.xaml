@@ -188,6 +188,7 @@
                     <TextBox Grid.Column="3" Header="Manual nonce" Text="{Binding UserAutomationNonce, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                              AutomationProperties.Name="UserAutomation explicit manual nonce" />
                     <Button Grid.Column="4" Content="Send typed operation" Click="ExecuteUserAutomation_OnClick"
+                            IsEnabled="{Binding CanRunUserAutomation}"
                             VerticalAlignment="Bottom" AutomationProperties.Name="Send typed UserAutomation operation" />
                     <TextBox Grid.Row="1" Grid.Column="0" Header="Occurrences to normalize (1–256)"
                              Text="{Binding UserAutomationOccurrenceCount, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
