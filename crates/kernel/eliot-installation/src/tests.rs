@@ -1264,7 +1264,7 @@ fn v21_and_missing_secret_proof_require_explicit_migration() {
     assert!(matches!(
         validate_installation_transaction_json(&legacy_bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("21.0.0") && reason.contains("25.0.0")
+            if reason.contains("21.0.0") && reason.contains("26.0.0")
     ));
 
     let mut missing = serde_json::to_value(&transaction).unwrap_or_else(|_| unreachable!());
@@ -1911,18 +1911,43 @@ fn registering_transaction() -> InstallationTransaction {
 fn system_registration_transaction() -> InstallationTransaction {
     let portable = registering_transaction();
     let program_data = must(protected_program_data_root());
+    let installation_key = "b".repeat(64);
     let roots = must(RuntimeStateRoots::derive_profiled(
         InstallationProfile::SystemService,
         test_handle(program_data.to_string_lossy().into_owned()),
-        &"b".repeat(64),
+        &installation_key,
     ));
     let system_path =
         |name: &str| test_handle(format!(r"{}\{name}", roots.installation_root.as_str()));
 
     let mut descriptor = portable.candidate_manifest.runtime_launch.clone();
     descriptor.profile = InstallationProfile::SystemService;
+    descriptor.profile_installation_key = Some(test_handle(installation_key));
     descriptor.portable_root = None;
     descriptor.runtime_state_roots = roots.clone();
+    let anchors = ProfileRootAnchors {
+        program_files: Some(test_handle(
+            must(eliot_platform_windows::program_files_root())
+                .to_string_lossy()
+                .into_owned(),
+        )),
+        program_data: Some(test_handle(program_data.to_string_lossy().into_owned())),
+        local_app_data: test_handle(
+            must(eliot_platform_windows::current_user_local_app_data_root())
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        repository_root: None,
+    };
+    let governed_roots = must(select_profile_roots(
+        descriptor.profile,
+        descriptor.profile_component.as_str(),
+        descriptor.profile_version.as_str(),
+        None,
+        &anchors,
+    ));
+    descriptor.profile_governed_roots =
+        must(governed_roots.into_installation_roots(roots.clone()));
     descriptor.kernel_work_root = roots.kernel_work_root.clone();
     descriptor.authority_descriptor_path = system_path("authority.json");
     descriptor.eliotd_executable_path = system_path("eliotd.exe");
@@ -5516,7 +5541,7 @@ fn v8_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("requires explicit migration to 25.0.0")
+            if reason.contains("requires explicit migration to 26.0.0")
     ));
 }
 
@@ -5565,7 +5590,7 @@ fn v9_transaction_json_requires_explicit_migration_without_start_synthesis() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("wire 9.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 9.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
@@ -5611,7 +5636,7 @@ fn v10_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 10.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 10.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
@@ -5627,7 +5652,7 @@ fn v13_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 13.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 13.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
@@ -5643,7 +5668,7 @@ fn v14_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 14.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 14.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
@@ -5655,7 +5680,7 @@ fn v15_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 15.0.0 requires explicit migration to 25.0.0")
+            if reason.contains("wire 15.0.0 requires explicit migration to 26.0.0")
     ));
 }
 
@@ -5667,7 +5692,7 @@ fn v16_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 16.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 16.0.0") && reason.contains("26.0.0")
     ));
 }
 
@@ -5688,7 +5713,7 @@ fn v17_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 17.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 17.0.0") && reason.contains("26.0.0")
     ));
 }
 
@@ -5703,7 +5728,7 @@ fn v18_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         error,
         InstallationError::MigrationRequired { reason }
-            if reason.contains("wire 18.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 18.0.0") && reason.contains("26.0.0")
     ));
 }
 
@@ -5715,7 +5740,7 @@ fn v20_transaction_json_requires_explicit_migration_to_v25() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 20.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 20.0.0") && reason.contains("26.0.0")
     ));
 }
 
@@ -5730,7 +5755,7 @@ fn v22_transaction_json_is_rejected_before_payload_authority() {
     assert!(matches!(
         decode_installation_transaction_json(&bytes),
         Err(InstallationError::MigrationRequired { reason })
-            if reason.contains("wire 22.0.0") && reason.contains("25.0.0")
+            if reason.contains("wire 22.0.0") && reason.contains("26.0.0")
     ));
 }
 
@@ -7217,6 +7242,10 @@ fn v1_registry_value() -> serde_json::Value {
     object.remove("revision");
     object.remove("service_registration_approvals");
     object.remove("pending_activation");
+    // Reconstruct v1 rather than serializing current registry defaults as legacy data.
+    object.remove("last_terminal_activation");
+    object.remove("aborted_activation_receipts");
+    object.remove("active_phase_b_rebind");
     let Some(runtime) = legacy["generations"][0]["manifest"]["runtime_launch"].as_object_mut()
     else {
         panic!("legacy fixture runtime launch");
@@ -7921,7 +7950,7 @@ fn staging_new_generation_clears_active_phase_b_rebind_before_commit() {
     );
 
     let mut upgrade = first.candidate_manifest.clone();
-    upgrade.generation = test_handle("generation:after-active-rebind");
+    upgrade.generation = test_handle("generation-after-active-rebind");
     upgrade.runtime_launch.generation = upgrade.generation.clone();
     upgrade.runtime_launch.descriptor_digest =
         test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
@@ -7975,7 +8004,7 @@ fn registry_rejects_pending_and_active_coexistence_via_validate_and_both_orders(
         .and_then(|fence| fence.phase_b_live_binding.clone())
         .unwrap_or_else(|| unreachable!());
     let mut upgrade = first.candidate_manifest.clone();
-    upgrade.generation = test_handle("generation:coexist-pending-upgrade");
+    upgrade.generation = test_handle("generation-coexist-pending-upgrade");
     upgrade.runtime_launch.generation = upgrade.generation.clone();
     upgrade.runtime_launch.descriptor_digest =
         test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
@@ -8043,7 +8072,7 @@ fn registry_rejects_active_rebind_while_pending_is_active() {
         &test_commit_fence(&transaction.candidate_manifest),
     ));
     let mut pending = registering_transaction();
-    pending.candidate_manifest.generation = test_handle("generation:pending-blocks-active");
+    pending.candidate_manifest.generation = test_handle("generation-pending-blocks-active");
     pending.candidate_manifest.runtime_launch.generation =
         pending.candidate_manifest.generation.clone();
     pending.candidate_manifest.runtime_launch.descriptor_digest = test_handle(sha256_hex(&must(
@@ -8502,7 +8531,7 @@ fn upgrade_failure_preserves_prior_active_and_rejects_binding_substitution() {
     ));
 
     let mut upgrade = first.candidate_manifest.clone();
-    upgrade.generation = test_handle("generation:upgrade");
+    upgrade.generation = test_handle("generation-upgrade");
     upgrade.runtime_launch.generation = upgrade.generation.clone();
     upgrade.runtime_launch.descriptor_digest =
         test_handle(sha256_hex(&must(upgrade.runtime_launch.unsigned_bytes())));
