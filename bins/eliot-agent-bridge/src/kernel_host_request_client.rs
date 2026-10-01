@@ -200,13 +200,13 @@ pub(super) struct TransportFacts {
 /// Owner-confirmed outcome of the original BIND_SCOPE operation. An admitted
 /// envelope is never promoted to a successful binding: only its retained
 /// result body can produce `owner_result` and a fresh admitted connection.
-pub(crate) struct BindScopeReadback {
-    pub(crate) receipt: HostRequestAdmissionReceipt,
-    pub(crate) durable_state: String,
-    pub(crate) owner_result: Option<serde_json::Value>,
-    pub(crate) owner_result_digest: Option<String>,
-    pub(crate) new_connection_id: Option<String>,
-    pub(crate) recovery: Option<PortFailure>,
+pub struct BindScopeReadback {
+    pub receipt: HostRequestAdmissionReceipt,
+    pub durable_state: String,
+    pub owner_result: Option<serde_json::Value>,
+    pub owner_result_digest: Option<String>,
+    pub new_connection_id: Option<String>,
+    pub recovery: Option<PortFailure>,
 }
 
 /// Exact owner-derived facts retained beside one bridge-local resource URI.
