@@ -1722,6 +1722,11 @@ async fn run_loop(
     // submits finish candidates, and acknowledges terminals, all through
     // the Kernel owner routes.
     let mut testd_owner_flight = TestdOwnerFlight::Idle;
+    // Issue #2899: sole owner of the Watchdog spool-drain state. This is the
+    // production consumer of the Watchdog's live export pass: it claims each
+    // durable drain window Kernel admitted over the authenticated front door and
+    // admits it through the Governor's canonical observation path.
+    let mut watchdog_export_drain_flight = WatchdogExportDrainFlight::Idle;
     // Issue #1867 W1: sole owner of the improvement-intake dispatch state. The
     // same tick drives it: a real maintenance observation is turned into an
     // owner-actionable improvement artifact and committed durably through the
@@ -1783,6 +1788,7 @@ async fn run_loop(
                     &mut local_read_flight,
                     &mut observe_flight,
                     &mut testd_owner_flight,
+                    &mut watchdog_export_drain_flight,
                     &mut owner_feed_flight,
                     &mut owner_feed,
                     &mut governor_authority_flight,
@@ -1821,6 +1827,7 @@ async fn run_loop(
                     &mut local_read_flight,
                     &mut observe_flight,
                     &mut testd_owner_flight,
+                    &mut watchdog_export_drain_flight,
                     &mut flight,
                 );
                 // Campaign packets ride the same tick under their own gate and
@@ -1913,6 +1920,13 @@ async fn run_loop(
             observe_completion = next_observe_completion(&mut observe_flight) => {
                 settle_observe_completion(observe_completion, &mut observe_flight)?;
             }
+            watchdog_export_drain_completion =
+                next_watchdog_export_drain_completion(&mut watchdog_export_drain_flight) => {
+                    settle_watchdog_export_drain_completion(
+                        watchdog_export_drain_completion,
+                        &mut watchdog_export_drain_flight,
+                    );
+                }
             campaign_packet_completion =
                 next_campaign_packet_completion(&mut campaign_packet_flight) =>
             {
@@ -2170,11 +2184,13 @@ fn start_tick_work(
     local_read_flight: &mut LocalReadFlight,
     observe_flight: &mut ObserveFlight,
     testd_owner_flight: &mut TestdOwnerFlight,
+    watchdog_export_drain_flight: &mut WatchdogExportDrainFlight,
     flight: &mut ActivationFlight,
 ) {
     maybe_start_local_read_poll(kernel, composition, startup_readiness, local_read_flight);
     maybe_start_observe_poll(kernel, observe_flight);
     maybe_start_testd_owner_drain(kernel, composition, testd_owner_flight);
+    maybe_start_watchdog_export_drain(kernel, composition, watchdog_export_drain_flight);
     if decide_activation_tick(flight) == ActivationTickDecision::StartClaim {
         *flight = ActivationFlight::InFlight(ActivationFlightState {
             // #1115: the claim reads the daemon's current named dependency
@@ -3596,6 +3612,7 @@ async fn drain_flights_on_shutdown(
     local_read_flight: &mut LocalReadFlight,
     observe_flight: &mut ObserveFlight,
     testd_owner_flight: &mut TestdOwnerFlight,
+    watchdog_export_drain_flight: &mut WatchdogExportDrainFlight,
     owner_feed_flight: &mut OwnerFeedFlight,
     owner_feed: &mut Option<eliotd::OwnerFeedTrigger>,
     governor_authority_flight: &mut GovernorAuthorityFlight,
@@ -3624,6 +3641,10 @@ async fn drain_flights_on_shutdown(
             && matches!(local_read_flight, LocalReadFlight::Idle)
             && matches!(observe_flight, ObserveFlight::Idle)
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
+            && matches!(
+                watchdog_export_drain_flight,
+                WatchdogExportDrainFlight::Idle
+            )
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
             && matches!(governor_authority_flight, GovernorAuthorityFlight::Idle)
             && matches!(maintenance_flight, MaintenanceFlight::Idle)
@@ -3712,6 +3733,17 @@ async fn drain_flights_on_shutdown(
             testd_owner_completion = next_testd_owner_completion(testd_owner_flight) => {
                 settle_testd_owner_completion(testd_owner_completion, testd_owner_flight)?;
             }
+            watchdog_export_drain_completion =
+                next_watchdog_export_drain_completion(watchdog_export_drain_flight) => {
+                    // A claimed window whose admission did not complete before
+                    // shutdown stays pending: the Watchdog keeps its records and
+                    // replays the identical window, so nothing is lost by
+                    // dropping this step here.
+                    settle_watchdog_export_drain_completion(
+                        watchdog_export_drain_completion,
+                        watchdog_export_drain_flight,
+                    );
+                }
             owner_feed_trigger = next_owner_feed_completion(owner_feed_flight) => {
                 settle_owner_feed_completion(
                     owner_feed_trigger,
@@ -3783,6 +3815,7 @@ async fn drain_flights_on_shutdown(
                 *local_read_flight = LocalReadFlight::Idle;
                 *observe_flight = ObserveFlight::Idle;
                 *testd_owner_flight = TestdOwnerFlight::Idle;
+                *watchdog_export_drain_flight = WatchdogExportDrainFlight::Idle;
                 *owner_feed_flight = OwnerFeedFlight::Idle;
                 *governor_authority_flight = GovernorAuthorityFlight::Idle;
                 *maintenance_flight = MaintenanceFlight::Idle;
@@ -6667,13 +6700,161 @@ fn start_testd_owner_drain(
 ) -> Pin<Box<dyn std::future::Future<Output = TestdOwnerCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
     Box::pin(async move {
-        // Boxed: the phase-split drain future exceeds the inline bound, and
-        // keeping it on the stack would push this flight future past the
-        // large-future threshold. Same future, same step.
-        TestdOwnerCompletion::Settled(
-            Box::pin(run_testd_owner_drain(&kernel_clone, composition)).await,
-        )
+        TestdOwnerCompletion::Settled(run_testd_owner_drain(&kernel_clone, composition).await)
     })
+}
+
+/// Completion of one in-flight Watchdog spool-drain step.
+///
+/// `Idle` is a null poll: Kernel answered that no drain window is pending, so
+/// the next tick backs off. `Recorded` names only what the Governor decided —
+/// the admitted entry count and how many of those reached a terminal
+/// disposition. A window with fewer terminal entries than admitted entries left
+/// the rest pending by construction, so the Watchdog's cursor stays exactly where
+/// its own owner left it until the next pass decides them.
+enum WatchdogExportDrainCompletion {
+    /// No drain window was pending.
+    Idle,
+    /// One claimed window was admitted and its terminal outcomes recorded.
+    Recorded { entries: usize, terminal: usize },
+}
+
+struct WatchdogExportDrainFlightState {
+    future: Pin<Box<dyn std::future::Future<Output = WatchdogExportDrainCompletion>>>,
+}
+
+/// Sole owner of the Watchdog spool-drain state in `run_loop` (issue #2899).
+///
+/// `Idle` means no drain step is outstanding; `InFlight` holds the one pending
+/// bounded step. No second owner and no second concurrent drain step exist, so
+/// the Governor cannot admit two windows of one spool owner at the same time.
+enum WatchdogExportDrainFlight {
+    Idle,
+    InFlight(WatchdogExportDrainFlightState),
+}
+
+/// Pure tick gate: the drain timer starts work only when the flight is idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogExportDrainTickDecision {
+    StartDrain,
+    SkipInFlight,
+}
+
+fn decide_watchdog_export_drain_tick(
+    flight: &WatchdogExportDrainFlight,
+) -> WatchdogExportDrainTickDecision {
+    match flight {
+        WatchdogExportDrainFlight::Idle => WatchdogExportDrainTickDecision::StartDrain,
+        WatchdogExportDrainFlight::InFlight(_) => WatchdogExportDrainTickDecision::SkipInFlight,
+    }
+}
+
+/// Drains one claimed Watchdog spool export window through the Governor.
+///
+/// Two phases, matching the phase split the other owner drains already use: the
+/// Kernel claim runs with no composition guard held, and only the admission
+/// itself runs under it. The admission and the result recording are the
+/// library's [`eliotd::DaemonComposition::admit_and_record_watchdog_export`];
+/// this flight owns the one-in-flight decision and nothing else.
+async fn run_watchdog_export_drain(
+    kernel: &DaemonKernelClient,
+    composition: SharedComposition,
+) -> Result<WatchdogExportDrainCompletion, String> {
+    // #740-style receipt span over the claim/admit/record step. Counts are
+    // named; digests and payload bytes never are.
+    let _span = tracing::info_span!("eliotd.watchdog_export_drain").entered();
+    // Phase (b): no composition guard. A null poll backs the tick off until the
+    // Watchdog submits the next window.
+    let Some(batch) = kernel
+        .claim_watchdog_export_batch_async()
+        .await
+        .map_err(|error| format!("Watchdog spool drain claim: {error}"))?
+    else {
+        return Ok(WatchdogExportDrainCompletion::Idle);
+    };
+    // Phase (c): guard held for the admission and the result recording only.
+    let step = {
+        let guard = composition.lock().await;
+        guard
+            .admit_and_record_watchdog_export(kernel, &batch)
+            .await?
+    };
+    if step.terminal == 0 {
+        // No terminal outcome means the Governor decided nothing yet. Nothing
+        // was submitted, so the window stays pending and the Watchdog's cursor
+        // does not move; the next tick re-claims it and the admission replays
+        // the same receipts.
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.watchdog_export_drain_pending",
+            entries = step.entries,
+            "the Governor admitted the drain window but decided no terminal entry; the window stays pending"
+        );
+    } else {
+        tracing::info!(
+            target: "eliotd::diagnostics",
+            event = "eliotd.watchdog_export_drain_recorded",
+            entries = step.entries,
+            terminal = step.terminal,
+            "the Governor recorded terminal dispositions for the claimed Watchdog spool drain window"
+        );
+    }
+    Ok(WatchdogExportDrainCompletion::Recorded {
+        entries: step.entries,
+        terminal: step.terminal,
+    })
+}
+
+/// Starts one Watchdog spool-drain step when its flight is idle. Checked on the
+/// same tick as the other pollers so the Watchdog's spool stays live while an
+/// activation or a local read is in flight.
+fn maybe_start_watchdog_export_drain(
+    kernel: &Arc<DaemonKernelClient>,
+    composition: &SharedComposition,
+    flight: &mut WatchdogExportDrainFlight,
+) {
+    if decide_watchdog_export_drain_tick(flight) == WatchdogExportDrainTickDecision::StartDrain {
+        let kernel_clone = Arc::clone(kernel);
+        let composition_clone = Arc::clone(composition);
+        *flight = WatchdogExportDrainFlight::InFlight(WatchdogExportDrainFlightState {
+            future: Box::pin(async move {
+                match run_watchdog_export_drain(&kernel_clone, composition_clone).await {
+                    Ok(completion) => completion,
+                    Err(reason) => {
+                        tracing::warn!(
+                            target: "eliotd::diagnostics",
+                            event = "eliotd.watchdog_export_drain_failed",
+                            %reason,
+                            "the Watchdog spool drain step did not complete; the claimed window stays pending and replays"
+                        );
+                        WatchdogExportDrainCompletion::Idle
+                    }
+                }
+            }),
+        });
+    }
+}
+
+/// Polls the one in-flight drain step, pending forever while idle so health and
+/// shutdown stay pollable with no step outstanding.
+async fn next_watchdog_export_drain_completion(
+    flight: &mut WatchdogExportDrainFlight,
+) -> WatchdogExportDrainCompletion {
+    match flight {
+        WatchdogExportDrainFlight::Idle => {
+            std::future::pending::<WatchdogExportDrainCompletion>().await
+        }
+        WatchdogExportDrainFlight::InFlight(state) => (&mut state.future).await,
+    }
+}
+
+/// Settles one completed drain step and returns the flight to `Idle`.
+fn settle_watchdog_export_drain_completion(
+    completion: WatchdogExportDrainCompletion,
+    flight: &mut WatchdogExportDrainFlight,
+) {
+    let _ = completion;
+    *flight = WatchdogExportDrainFlight::Idle;
 }
 
 /// Starts the `TestD` owner drain step when its flight is idle. Checked on

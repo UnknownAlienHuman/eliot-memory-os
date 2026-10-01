@@ -32,6 +32,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use eliot_contracts::{OperationId, canonical_json_bytes, sha256_hex};
@@ -216,15 +217,22 @@ impl DaemonComposition {
         // a transported fence claim is not a current observation.
         let state_fence = self.governor.kernel_snapshot().state_fence().clone();
         let scope_ref = scope_ref_for(&state_fence);
-        // The trigger identity is the catalog's canonical deduplication key,
-        // so the identity that duplicate suppression compares states which
-        // family, event, scope, subset and generation it is, and
-        // `MaintenanceController::admit`'s job identity inherits it. The board
-        // lookup and the job lookup both consume this same key. This daemon
-        // observes no subset identity, so a `FamilyScopeAndSubset` trigger
-        // fails closed here rather than coalescing work across subsets it
+        // The trigger identity is the catalog's canonical deduplication key
+        // plus the evidence commitment and the selected policy revision, so
+        // the identity states which family, event, scope, subset and
+        // generation it is AND which observed evidence and policy generation
+        // it answers. The bare dedup key stays the active-job dedup key: the
+        // board lookup and the job lookup both compare it (see
+        // `MaintenanceDedupScope::key_parts`), so an exact event replay
+        // reuses the decision while a new event — different observed evidence
+        // — reevaluates without becoming the same historical decision. Two
+        // distinct observations can no longer receive the same trigger ID.
+        // `MaintenanceController::admit`'s job identity inherits the trigger
+        // ID, so the same separation holds for jobs. This daemon observes no
+        // subset identity, so a `FamilyScopeAndSubset` trigger still fails
+        // closed in `dedup_key` rather than coalescing work across subsets it
         // cannot distinguish.
-        let trigger_id = entry.dedup.dedup_key(
+        let dedup_key = entry.dedup.dedup_key(
             &crate::maintenance_family_catalog::MaintenanceDedupIdentity {
                 family: observation.family,
                 origin: observation.origin.as_str(),
@@ -263,6 +271,15 @@ impl DaemonComposition {
             let schedule = MaintenanceScheduleEvidence::unpublished();
             let broker = MaintenanceBrokerEvidence::owner_query_unavailable();
             let safety = MaintenanceSafetyEvidence::unpublished();
+            // The immutable decision identity for this exact observation: the
+            // active-job dedup key plus the evidence commitment plus the
+            // selected policy revision. Built from the real owner evidence
+            // above, never restated beside it.
+            let trigger_id = evidence_committed_trigger_id(
+                &dedup_key,
+                &observation.evidence_refs,
+                policy.revision,
+            )?;
             let input = MaintenanceTriggerInput {
                 trigger_id,
                 evidence_refs: observation.evidence_refs,
@@ -679,6 +696,81 @@ impl DaemonComposition {
             )
             .map_err(|error| MaintenanceResultPublishError::Daemon(DaemonError::Composition(error)))
     }
+}
+
+/// Derives the immutable trigger/decision identity from the active-job
+/// deduplication key, the evidence actually observed, and the selected policy
+/// revision (I14.22, issue #1688 W3/A1).
+///
+/// The dedup key alone cannot be the decision identity: it carries no source
+/// event identity, no evidence commitment and no subset value, so two distinct
+/// observations of one family, origin, scope and generation would receive the
+/// same trigger ID. The returned identity is `{dedup_key}:ev{commitment}:pol{policy}`,
+///
+/// * `dedup_key` is the catalog's canonical key from
+///   [`MaintenanceDedupScope::dedup_key`](crate::maintenance_family_catalog::MaintenanceDedupScope::dedup_key),
+///   built from [`MaintenanceDedupScope::key_parts`](crate::maintenance_family_catalog::MaintenanceDedupScope::key_parts).
+///   It stays the active-job dedup key the board lookup and the job lookup
+///   compare; this function never rebuilds it, so the dedup scope cannot drift
+///   from the catalog that owns it.
+/// * `commitment` is the SHA-256 over the length-framed, sorted observed
+///   evidence references. Sorting keeps the identity independent of arrival
+///   order; framing keeps `["ab", "c"]` distinct from `["a", "bc"]`. An exact
+///   event replay — same evidence — reuses the decision and, through
+///   [`maintenance_decision_ref`](eliot_maintenance::maintenance_decision_ref),
+///   the same decision reference, so replay creates no second
+///   job/recommendation; a new event reevaluates without colliding with the
+///   historical decision.
+/// * `policy` is `rev{revision}` from the selected
+///   [`MaintenancePolicyEvidence`](eliot_maintenance::MaintenancePolicyEvidence),
+///   or `unpublished` while no Human policy publisher exists. The marker is
+///   the owner's own revision value, never a defaulted one, so a future
+///   publisher enters the identity with no format change.
+///
+/// What this closes on the derived record: the trigger evidence binding (the
+/// commitment plus the verbatim observed references the family decision binds
+/// beside it) and the applicable policy generation. What it does not supply,
+/// and still fails closed elsewhere: the optional intelligent job (#1693), the
+/// route/budget/session owners behind the gates (#1692), the Human attention
+/// reference (#1692), and the expiry/outcome receipt (#1694). Those stay
+/// explicit-absent on the record rather than invented here.
+///
+/// # Errors
+///
+/// Returns the Governor owner's own [`MaintenanceError`]: [`Empty`](eliot_maintenance::MaintenanceError::Empty)
+/// when no evidence was observed, [`InvalidField`](eliot_maintenance::MaintenanceError::InvalidField)
+/// when the dedup key or an evidence reference is blank. Uniqueness of the
+/// evidence set stays with [`MaintenanceTriggerInput::validate`], the single
+/// owner of that check.
+fn evidence_committed_trigger_id(
+    dedup_key: &str,
+    evidence_refs: &[String],
+    policy_revision: Option<u64>,
+) -> Result<String, MaintenanceError> {
+    if dedup_key.is_empty() {
+        return Err(MaintenanceError::InvalidField("dedup.key"));
+    }
+    if evidence_refs.is_empty() {
+        return Err(MaintenanceError::Empty("evidence_refs"));
+    }
+    for reference in evidence_refs {
+        if reference.is_empty() {
+            return Err(MaintenanceError::InvalidField("evidence_refs"));
+        }
+    }
+    let mut ordered = evidence_refs.to_vec();
+    ordered.sort();
+    let mut framed = String::new();
+    for reference in &ordered {
+        let len = reference.len();
+        let _ = writeln!(framed, "{len}:{reference}");
+    }
+    let commitment = sha256_hex(framed.as_bytes());
+    let policy = match policy_revision {
+        Some(revision) => format!("rev{revision}"),
+        None => "unpublished".to_owned(),
+    };
+    Ok(format!("{dedup_key}:ev{commitment}:pol{policy}"))
 }
 
 /// Builds the affected-scope identity from the live admitted fence.

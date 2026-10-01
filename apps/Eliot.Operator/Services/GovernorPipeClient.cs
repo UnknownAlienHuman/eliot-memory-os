@@ -189,10 +189,14 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
         CancellationToken cancellationToken = default)
     {
         // The caller supplies the one prepared request, so the transmitted
-        // identity is the retained identity. Only its shape is checked here:
-        // re-deriving the key would rewrite a pending request's identity to
-        // match today's serializer instead of honouring the retained one.
-        request.Validate();
+        // identity is the retained identity. Its binding is checked here:
+        // the key must be the digest of these exact operation bytes, so a
+        // corrupted or edited journal entry cannot travel under an identity
+        // that names a different operation. The key is checked, never
+        // re-derived into the request: rewriting it would rename a pending
+        // request's identity to match today's serializer instead of
+        // honouring the retained one.
+        request.ValidateCurrentIdentity();
         using var budget = new OperationBudget($"automation:{request.IdempotencyKey}", cancellationToken, _closing.Token);
         // Kernel/Host authenticates this route and supplies RequestMetadata,
         // principal, State Fence and OperationIdentity. Reusing the generic

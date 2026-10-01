@@ -63,7 +63,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use eliot_contracts::{AuthorityEpoch, ResourceGeneration};
+use eliot_contracts::{EpochId, ResourceGeneration};
 use eliot_receipts::ProofCeiling;
 
 use crate::RouteScope;
@@ -161,9 +161,9 @@ struct PartitionedInner {
     /// Restart seal flag: while set, every acquisition fails closed with its
     /// typed exhaustion disposition and unknown held capacity stays excluded.
     restart_sealed: AtomicBool,
-    /// Epoch observed at the restart seal; unsealing requires the epoch to
-    /// have advanced past it (stale ownership fenced).
-    sealed_epoch: Mutex<Option<AuthorityEpoch>>,
+    /// Epoch tuple observed at the restart seal; unsealing requires the fence
+    /// to have moved past it (stale ownership fenced).
+    sealed_epoch: Mutex<Option<EpochId>>,
     /// Owner-minted permit sequence; never reset, including across restarts,
     /// so two issuances never share a permit identity.
     permit_sequence: AtomicU64,
@@ -184,7 +184,7 @@ pub struct ControlPermit {
     operation: PermitOperation,
     operation_id: String,
     owner: String,
-    epoch: AuthorityEpoch,
+    epoch: EpochId,
 }
 
 /// Exactly-once release evidence for one [`ControlPermit`].
@@ -199,7 +199,7 @@ pub struct ControlReleaseEvidence {
     operation_label: String,
     operation_id: String,
     owner: String,
-    epoch: AuthorityEpoch,
+    epoch: EpochId,
 }
 
 impl ControlReleaseEvidence {
@@ -233,10 +233,10 @@ impl ControlReleaseEvidence {
         &self.owner
     }
 
-    /// Returns the epoch recorded at acquisition.
+    /// Returns the epoch tuple recorded at acquisition.
     #[must_use]
-    pub const fn epoch(&self) -> AuthorityEpoch {
-        self.epoch
+    pub fn epoch(&self) -> EpochId {
+        self.epoch.clone()
     }
 
     /// Returns `true` only when every binding matches the live permit:
@@ -284,18 +284,18 @@ impl ControlPermit {
         &self.owner
     }
 
-    /// Returns the front-door epoch bound at acquisition.
+    /// Returns the front-door epoch tuple bound at acquisition.
     #[must_use]
-    pub const fn epoch(&self) -> AuthorityEpoch {
-        self.epoch
+    pub fn epoch(&self) -> EpochId {
+        self.epoch.clone()
     }
 
     /// Returns `true` only when every presented binding matches the recorded
-    /// evidence: same operation identity, same owner and same epoch. Changed
-    /// content never matches; it conflicts instead of replaying.
+    /// evidence: same operation identity, same owner and same epoch tuple.
+    /// Changed content never matches; it conflicts instead of replaying.
     #[must_use]
-    pub fn binding_matches(&self, operation_id: &str, owner: &str, epoch: AuthorityEpoch) -> bool {
-        self.operation_id == operation_id && self.owner == owner && self.epoch == epoch
+    pub fn binding_matches(&self, operation_id: &str, owner: &str, epoch: &EpochId) -> bool {
+        self.operation_id == operation_id && self.owner == owner && self.epoch == *epoch
     }
 
     /// Releases the held slot exactly once, returning bound evidence.
@@ -311,7 +311,7 @@ impl ControlPermit {
             operation_label: self.operation.contract_label().to_owned(),
             operation_id: self.operation_id.clone(),
             owner: self.owner.clone(),
-            epoch: self.epoch,
+            epoch: self.epoch.clone(),
         };
         if let Some(inner) = self.inner.take() {
             let slot = match self.class {
@@ -467,11 +467,12 @@ impl ControlReserve {
     ///
     /// Every in-flight counter is pinned to its full partition capacity, so
     /// no new acquisition can succeed on the back of a zeroed counter, and
-    /// the sealing epoch is recorded. Unknown held capacity stays excluded
-    /// until [`Self::unseal_after_epoch_advance`] observes an advanced epoch
-    /// (stale ownership fenced). The embedding owner calls this exactly once
-    /// when it detects an unclean restart before admitting new work (STITCH).
-    pub fn seal_after_restart(&self, epoch: AuthorityEpoch) {
+    /// the sealing epoch tuple is recorded. Unknown held capacity stays
+    /// excluded until [`Self::unseal_after_epoch_advance`] observes a fence
+    /// that has moved past the seal (stale ownership fenced). The embedding
+    /// owner calls this exactly once when it detects an unclean restart
+    /// before admitting new work (STITCH).
+    pub fn seal_after_restart(&self, epoch: EpochId) {
         self.inner
             .normal_in_flight
             .fetch_max(self.inner.normal_capacity, Ordering::AcqRel);
@@ -492,41 +493,44 @@ impl ControlReserve {
     /// Reconciles the restart seal after the durable recovery epoch is
     /// established.
     ///
-    /// Succeeds only when the current epoch has advanced past the sealing
-    /// epoch: the advance fences the stale ownership, so the pinned counters
-    /// can be released to zero and the seal lifted. Refuses otherwise, so
-    /// held capacity is never restored while stale ownership is unfenced.
-    /// The caller must have synchronized the front-door fence to the durable
+    /// Succeeds only when the fence has moved past the sealing tuple: the
+    /// move fences the stale ownership, so the pinned counters can be
+    /// released to zero and the seal lifted. Refuses otherwise, so held
+    /// capacity is never restored while stale ownership is unfenced. The
+    /// caller must have synchronized the front-door fence to the durable
     /// recovery epoch first (STITCH).
     ///
     /// # Errors
     ///
     /// Returns [`KernelError::InvalidField`] when no restart seal is held, or
-    /// when the epoch has not advanced past the seal.
-    pub fn unseal_after_epoch_advance(&self, current: AuthorityEpoch) -> Result<(), KernelError> {
+    /// when the fence has not moved past the seal.
+    pub fn unseal_after_epoch_advance(&self, current: &EpochId) -> Result<(), KernelError> {
         let mut sealed = self
             .inner
             .sealed_epoch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *sealed {
-            None => Err(KernelError::InvalidField {
-                field: "control_reserve.restart_seal",
-                reason: "no restart seal is held; nothing to reconcile",
-            }),
-            Some(sealed_epoch) if sealed_epoch == current => Err(KernelError::InvalidField {
-                field: "control_reserve.restart_seal",
-                reason: "epoch has not advanced; stale ownership is not fenced, held capacity stays excluded",
-            }),
-            Some(_) => {
-                self.inner.normal_in_flight.store(0, Ordering::Release);
-                self.inner.protected_in_flight.store(0, Ordering::Release);
-                self.inner.emergency_in_flight.store(0, Ordering::Release);
-                *sealed = None;
-                self.inner.restart_sealed.store(false, Ordering::Release);
-                Ok(())
+        match &*sealed {
+            None => {
+                return Err(KernelError::InvalidField {
+                    field: "control_reserve.restart_seal",
+                    reason: "no restart seal is held; nothing to reconcile",
+                });
             }
+            Some(sealed_epoch) if sealed_epoch == current => {
+                return Err(KernelError::InvalidField {
+                    field: "control_reserve.restart_seal",
+                    reason: "epoch has not advanced; stale ownership is not fenced, held capacity stays excluded",
+                });
+            }
+            Some(_) => {}
         }
+        self.inner.normal_in_flight.store(0, Ordering::Release);
+        self.inner.protected_in_flight.store(0, Ordering::Release);
+        self.inner.emergency_in_flight.store(0, Ordering::Release);
+        *sealed = None;
+        self.inner.restart_sealed.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Attempts to acquire one normal-workload permit without blocking.
@@ -545,7 +549,7 @@ impl ControlReserve {
         work: NormalWorkClass,
         owner: &str,
         operation_id: &str,
-        epoch: AuthorityEpoch,
+        epoch: EpochId,
     ) -> Result<ControlPermit, KernelError> {
         validate_id(owner, "control_permit.owner")?;
         validate_id(operation_id, "control_permit.operation_id")?;
@@ -595,7 +599,7 @@ impl ControlReserve {
         operation: ControlOperationClass,
         owner: &str,
         operation_id: &str,
-        epoch: AuthorityEpoch,
+        epoch: EpochId,
     ) -> Result<ControlPermit, KernelError> {
         validate_id(owner, "control_permit.owner")?;
         validate_id(operation_id, "control_permit.operation_id")?;
@@ -648,7 +652,7 @@ impl ControlReserve {
         operation: EmergencyOperationClass,
         owner: &str,
         operation_id: &str,
-        epoch: AuthorityEpoch,
+        epoch: EpochId,
     ) -> Result<ControlPermit, KernelError> {
         validate_id(owner, "control_permit.owner")?;
         validate_id(operation_id, "control_permit.operation_id")?;
@@ -696,7 +700,7 @@ impl ControlReserve {
     /// The current-epoch lineage is honestly recorded as unattributed
     /// ([`PermitOperation::LegacyControl`]); the operation itself stays unnamed
     /// rather than borrowing a real control-operation label.
-    pub(crate) fn acquire_legacy_protected(&self, epoch: AuthorityEpoch) -> Option<ControlPermit> {
+    pub(crate) fn acquire_legacy_protected(&self, epoch: EpochId) -> Option<ControlPermit> {
         if self.inner.restart_sealed.load(Ordering::Acquire) {
             return None;
         }
@@ -819,7 +823,7 @@ pub enum IdempotencyDisposition {
 pub struct PermitLedgerBinding {
     operation_id: String,
     owner: String,
-    epoch: AuthorityEpoch,
+    epoch: EpochId,
     profile_revision: String,
 }
 
@@ -833,7 +837,7 @@ impl PermitLedgerBinding {
     pub fn new(
         operation_id: &str,
         owner: &str,
-        epoch: AuthorityEpoch,
+        epoch: EpochId,
         profile_revision: &str,
     ) -> Result<Self, KernelError> {
         validate_id(operation_id, "permit_binding.operation_id")?;
@@ -859,10 +863,10 @@ impl PermitLedgerBinding {
         &self.owner
     }
 
-    /// Returns the bound Authority Epoch.
+    /// Returns the bound Authority Epoch tuple.
     #[must_use]
-    pub const fn epoch(&self) -> AuthorityEpoch {
-        self.epoch
+    pub fn epoch(&self) -> EpochId {
+        self.epoch.clone()
     }
 
     /// Returns the bound profile revision.
@@ -1067,9 +1071,9 @@ impl FrontDoor {
         })
     }
 
-    /// Returns the current authority epoch.
+    /// Returns the current authority epoch tuple.
     #[must_use]
-    pub const fn epoch(&self) -> eliot_contracts::AuthorityEpoch {
+    pub fn epoch(&self) -> EpochId {
         self.authority.current_epoch()
     }
 
@@ -1163,9 +1167,11 @@ impl FrontDoor {
             Err(KernelError::ForgedReceipt) => AuthorityDecision::Denied {
                 reason: DecisionDenialReason::ForgedReceipt,
             },
-            Err(KernelError::StaleEpoch { .. }) => AuthorityDecision::Denied {
-                reason: DecisionDenialReason::StaleEpoch,
-            },
+            Err(KernelError::StaleEpoch { .. } | KernelError::StaleEpochTuple { .. }) => {
+                AuthorityDecision::Denied {
+                    reason: DecisionDenialReason::StaleEpoch,
+                }
+            }
             Err(KernelError::RouteMismatch) => AuthorityDecision::Denied {
                 reason: DecisionDenialReason::RouteMismatch,
             },
@@ -1275,20 +1281,22 @@ impl FrontDoor {
             .try_acquire_emergency(operation, owner, operation_id, epoch)
     }
 
-    /// Raises the front-door epoch and fences all previously issued receipts.
+    /// Raises the front-door epoch tuple and fences all previously issued receipts.
+    ///
+    /// The fence advances by exactly one sequence in the active lineage.
     ///
     /// # Errors
     ///
-    /// Returns an error when the epoch counter cannot advance.
-    pub fn advance_epoch(&mut self) -> Result<eliot_contracts::AuthorityEpoch, KernelError> {
+    /// Returns an error when the sequence counter cannot advance.
+    pub fn advance_epoch(&mut self) -> Result<EpochId, KernelError> {
         self.authority.advance_epoch()
     }
 
-    /// Fast-forwards the front-door fence to the durable recovery epoch.
-    pub fn synchronize_epoch(
-        &mut self,
-        target: eliot_contracts::AuthorityEpoch,
-    ) -> Result<eliot_contracts::AuthorityEpoch, KernelError> {
+    /// Fast-forwards the front-door fence to the durable recovery epoch tuple.
+    ///
+    /// The target must be the current tuple or a same-lineage forward
+    /// adoption; a regression or a cross-lineage target fails closed.
+    pub fn synchronize_epoch(&mut self, target: EpochId) -> Result<EpochId, KernelError> {
         self.authority.synchronize_epoch(target)
     }
 
@@ -1335,8 +1343,10 @@ impl FrontDoor {
     /// [`KernelError::InvalidField`] when the request names another owner's
     /// bottleneck or an amount other than one slot (this owner issues
     /// single-slot permits; larger holdings need one permit per slot),
-    /// [`KernelError::StaleEpoch`] when the request epoch sequence differs
-    /// from the current fence, or the tagged saturation disposition
+    /// [`KernelError::StaleEpochTuple`] when the request epoch tuple is from
+    /// another lineage, [`KernelError::StaleEpoch`] when the request sequence
+    /// differs within the active lineage, or the tagged saturation
+    /// disposition
     /// ([`KernelError::NormalCapacityExhausted`],
     /// [`KernelError::ProtectedReserveExhausted`],
     /// [`KernelError::EmergencySlotUnavailable`]/
@@ -1355,10 +1365,16 @@ impl FrontDoor {
             });
         }
         let current = self.authority.current_epoch();
-        if request.authority_epoch_ref.sequence.get() != current.value() {
+        if !request.authority_epoch_ref.is_same_authority(&current) {
+            if request.authority_epoch_ref.lineage_id != current.lineage_id {
+                return Err(KernelError::StaleEpochTuple {
+                    observed: request.authority_epoch_ref.clone(),
+                    active: current,
+                });
+            }
             return Err(KernelError::StaleEpoch {
                 observed: request.authority_epoch_ref.sequence.get(),
-                active: current.value(),
+                active: current.sequence.get(),
             });
         }
         if request.requested_limit.quantity.get() != 1 {
@@ -1466,7 +1482,7 @@ impl FrontDoor {
     /// when the epoch has not advanced past the seal.
     pub fn reconcile_after_epoch_advance(&self) -> Result<(), KernelError> {
         let current = self.authority.current_epoch();
-        self.reserve.unseal_after_epoch_advance(current)
+        self.reserve.unseal_after_epoch_advance(&current)
     }
 
     /// Returns whether a grant permits an effect without overclaiming proof.
@@ -1490,8 +1506,19 @@ impl FrontDoor {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration};
+    use eliot_contracts::{ContractId, EpochId, EpochLineageId, ResourceGeneration};
     use eliot_receipts::EffectClass;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn genesis_epoch() -> EpochId {
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::MIN,
+        )
+        .expect("valid test epoch")
+    }
 
     fn receipt(authority: &KernelAuthority) -> Result<AuthorityReceipt, KernelError> {
         authority.issue(crate::authority::AuthorityGrantRequest::new(
@@ -1509,13 +1536,13 @@ mod tests {
     #[test]
     fn control_reserve_is_bounded_and_auto_releases() -> Result<(), KernelError> {
         let reserve = ControlReserve::partitioned(2, 2)?;
-        let epoch = AuthorityEpoch::genesis();
+        let epoch = genesis_epoch();
         let a = reserve
             .try_acquire_protected(
                 ControlOperationClass::CancelOperation,
                 "test-owner",
                 "op-a",
-                epoch,
+                epoch.clone(),
             )
             .expect("first permit");
         let b = reserve
@@ -1523,7 +1550,7 @@ mod tests {
                 ControlOperationClass::CancelOperation,
                 "test-owner",
                 "op-b",
-                epoch,
+                epoch.clone(),
             )
             .expect("second permit");
         assert!(matches!(
@@ -1531,7 +1558,7 @@ mod tests {
                 ControlOperationClass::CancelOperation,
                 "test-owner",
                 "op-c",
-                epoch
+                epoch.clone()
             ),
             Err(KernelError::ProtectedReserveExhausted { .. })
         ));
@@ -1555,7 +1582,7 @@ mod tests {
     fn front_door_grants_valid_and_denies_tampered() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([3u8; 32]),
-            AuthorityEpoch::genesis(),
+            genesis_epoch(),
         );
         let front_door = FrontDoor::new(authority.clone(), 2, 8)?;
         let route = RouteScope::new("daemon")?;
@@ -1582,7 +1609,7 @@ mod tests {
     fn idempotent_replay_and_conflict_are_separate() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([3u8; 32]),
-            AuthorityEpoch::genesis(),
+            genesis_epoch(),
         );
         let front_door = FrontDoor::new(authority.clone(), 2, 8)?;
         let route = RouteScope::new("daemon")?;
@@ -1603,7 +1630,7 @@ mod tests {
     fn control_reserve_exhaustion_fails_closed() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([3u8; 32]),
-            AuthorityEpoch::genesis(),
+            genesis_epoch(),
         );
         let front_door = FrontDoor::new(authority.clone(), 1, 8)?;
         let route = RouteScope::new("daemon")?;
@@ -1627,7 +1654,7 @@ mod tests {
     fn normal_saturation_leaves_protected_control_available() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([7u8; 32]),
-            AuthorityEpoch::genesis(),
+            genesis_epoch(),
         );
         let front_door = FrontDoor::partitioned(authority, 1, 1, 8)?;
 
@@ -1663,7 +1690,7 @@ mod tests {
                 assert_eq!(work_class, NormalWorkClass::Interactive);
                 assert_eq!(operation_id, "op-named-read-1");
                 assert_eq!(owner, "agent-admission");
-                assert_eq!(epoch, AuthorityEpoch::genesis());
+                assert_eq!(epoch, genesis_epoch());
             }
             other => panic!("expected typed normal exhaustion, got {other:?}"),
         }
@@ -1692,7 +1719,7 @@ mod tests {
     fn protected_and_emergency_permits_are_owner_and_epoch_bound() -> Result<(), KernelError> {
         let authority = KernelAuthority::new(
             crate::authority::KernelAuthorityKey::from_bytes([9u8; 32]),
-            AuthorityEpoch::genesis(),
+            genesis_epoch(),
         );
         let front_door = FrontDoor::partitioned(authority, 1, 2, 8)?;
         let epoch = front_door.epoch();

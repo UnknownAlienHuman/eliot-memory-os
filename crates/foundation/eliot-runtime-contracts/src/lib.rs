@@ -26,6 +26,7 @@ mod hot_path_profile;
 mod i14_backpressure;
 mod installation_activation;
 mod module_graph;
+mod module_io;
 mod module_manifest;
 mod restart_policy;
 mod runtime_live;
@@ -114,6 +115,7 @@ pub use module_graph::{
     CapabilityRole, ExternalCapabilityBinding, RequiredCapabilityEdge, RequiredCapabilityGraph,
     UnresolvedCapability, resolve_required_capability_graph,
 };
+pub use module_io::{ModuleIoBinding, ModuleProtocolRanges, ProtocolRangeDeclaration};
 pub use module_manifest::{
     AdmittedModuleManifest, MODULE_MANIFEST_FILE_STEM, MODULE_MANIFEST_SCHEMA_VERSION,
     ModuleManifest, admit_module_manifest, admitted_manifest_path, compare_published_projection,
@@ -997,6 +999,9 @@ impl KernelAuthoritySnapshot {
     /// [`StateFence::is_compatible_with`] admits one-way revision wildcards and
     /// is deliberately not used as an authority equality test, and
     /// `is_same_authority` keeps two lineages at the same sequence unrelated.
+    /// Each listed generation record is reconciled the same way: a generation
+    /// whose own fence was captured under another tuple is not part of this
+    /// projection, even when its individual shape validates.
     pub fn validate(&self) -> Result<(), RuntimeContractError> {
         text(&self.snapshot_id, "snapshot_id")?;
         self.state_fence.validate()?;
@@ -1015,6 +1020,16 @@ impl KernelAuthoritySnapshot {
                 return Err(RuntimeContractError::InvalidField {
                     field: "active_generations",
                     reason: "snapshot entries must be ACTIVE generations",
+                });
+            }
+            if !generation
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&self.authority_epoch)
+            {
+                return Err(RuntimeContractError::InvalidField {
+                    field: "active_generations",
+                    reason: "generation fence epoch must equal the snapshot authority tuple",
                 });
             }
         }
@@ -1171,10 +1186,25 @@ impl RuntimeLease {
     }
 
     /// Validates the non-semantic lease binding.
+    ///
+    /// I6.10 "Leases" binds each lease to one State Fence and one Authority
+    /// Epoch for its exact scope. The two must be the same authority tuple
+    /// ([`EpochId::is_same_authority`]): a lease whose epoch and bound fence
+    /// disagree is not an owner-issued continuation for its scope, and no
+    /// sequence ordering across the two values can repair it.
     pub fn validate(&self) -> Result<(), RuntimeContractError> {
         text(&self.lease_id, "lease_id")?;
         text(&self.scope_ref, "scope_ref")?;
         self.state_fence.validate()?;
+        if !self
+            .authority_epoch
+            .is_same_authority(&self.state_fence.authority_epoch)
+        {
+            return Err(RuntimeContractError::InvalidField {
+                field: "authority_epoch",
+                reason: "must be the same authority as the bound state fence",
+            });
+        }
         if self.expires_at_ms == 0 {
             return Err(RuntimeContractError::InvalidField {
                 field: "expires_at_ms",

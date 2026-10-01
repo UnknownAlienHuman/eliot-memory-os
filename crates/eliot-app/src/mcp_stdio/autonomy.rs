@@ -271,7 +271,17 @@ pub(super) fn autonomy_run_projection(
         model_invocations_used: runtime.ledger.model_invocations,
         tool_calls_used: runtime.ledger.tool_calls,
         wall_time_used_seconds: runtime.ledger.wall_time_seconds,
-        cost_or_tokens_used: Some(runtime.ledger.cost_or_token_units.to_string()),
+        // 783/17: `cost_or_token_units` is a recorded ledger accumulator of
+        // caller-declared units, not a measured payload. The string form is
+        // where W13 lives for this field: it names the unit and the status on
+        // the value itself, so a reader cannot take a bare number here for a
+        // token count without reading the discriminator first. The figure is
+        // republished verbatim - never re-derived, never converted, and never
+        // divided by a character or byte ratio.
+        cost_or_tokens_used: Some(format!(
+            "unit=declared_cost_or_token_units; status=declared; measured=false; value={}",
+            runtime.ledger.cost_or_token_units
+        )),
         pause_resume_reassignment_refs,
         completion_proof: loaded.graph.completion_proof.clone(),
         finish_status: if loaded.integrity_status.starts_with("degraded_") {
@@ -280,6 +290,20 @@ pub(super) fn autonomy_run_projection(
             format!("{:?}", runtime.contract.state).to_ascii_lowercase()
         },
     }
+}
+
+/// The qualified companion to `AutonomyRunView::cost_or_tokens_used`.
+///
+/// 783/17. The view field is an `Option<String>` owned by `eliot-types`, so the
+/// structured qualifier lives here and is published beside the view by the
+/// callers. It is built from the same recorded ledger value, so the two cannot
+/// disagree, and it exists so a consumer that parses JSON can read the unit and
+/// status as fields rather than as prose inside a string.
+pub(super) fn autonomy_cost_measurement(loaded: &LoadedAutonomyRuntime) -> Value {
+    recorded_planning_wire(
+        "declared_cost_or_token_units",
+        Some(loaded.runtime.ledger.cost_or_token_units),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -973,7 +997,8 @@ pub(super) fn autonomy_action_response(
         "runtime_revision": loaded.runtime.runtime_revision,
         "action_result": action_result,
         "canonical_receipts": canonical_receipts,
-        "run": autonomy_run_projection(loaded)
+        "run": autonomy_run_projection(loaded),
+        "cost_measurement": autonomy_cost_measurement(loaded),
     })
 }
 
@@ -991,7 +1016,8 @@ pub(super) fn autonomy_action_denied_response(
         "runtime_revision": loaded.runtime.runtime_revision,
         "canonical_receipts": [],
         "authoritative_aggregate_receipt": Value::Null,
-        "run": autonomy_run_projection(loaded)
+        "run": autonomy_run_projection(loaded),
+        "cost_measurement": autonomy_cost_measurement(loaded),
     })
 }
 
@@ -1632,6 +1658,14 @@ pub(super) async fn dispatch_autonomy_runtime_action_locked(
                 || intent.project_id != item.project_id
                 || intent.work_items_started != 0
                 || intent.active_agents != loaded.runtime.ledger.active_agents
+                // 783/19: the all-zero check is a check that this step
+                // *declares* no usage at all, not a claim that a measured
+                // quantity is zero. `cost_or_token_units` is a
+                // caller-declared accumulator in the engine's own unit, so
+                // zero here means "not declared" and the step is rejected; it
+                // never stands in for a measured token count, and a declared
+                // figure is never compared against, divided by, or converted
+                // to a payload measurement here.
                 || (intent.model_invocations == 0
                     && intent.tool_calls == 0
                     && intent.wall_time_seconds == 0

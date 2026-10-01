@@ -322,42 +322,61 @@ impl DurableRequestIdentity {
     }
 }
 
+/// Canonical mutation-digest payload for `SUBMIT_JOB`.
+///
+/// Split out of [`canonical_operation_payload`] so the Submit arm's own
+/// projection is one named concern rather than the first of thirteen. The
+/// seven always-present keys and the two conditional ones keep their exact
+/// spelling and insertion order, because this map IS the canonical bytes a
+/// mutation digest is computed over.
+///
+/// The two conditional keys are omitted, not nulled, when the submission
+/// carries neither. That is what keeps an unchanged submission's
+/// `canonical_request_hash` byte-identical to the one it already had: the key
+/// is absent from the map entirely, so the canonical encoding is unchanged. A
+/// submission that DOES publish one gets the key bound into its digest, so it
+/// cannot be replayed under a digest computed without it.
+fn canonical_submit_payload(submission: &JobSubmission) -> serde_json::Value {
+    let mut payload = serde_json::Map::from_iter([
+        ("operation".to_owned(), serde_json::json!("SUBMIT_JOB")),
+        ("job_id".to_owned(), serde_json::json!(submission.job_id)),
+        (
+            "attempt_id".to_owned(),
+            serde_json::json!(submission.attempt_id),
+        ),
+        (
+            "work_scope".to_owned(),
+            serde_json::json!(submission.work_scope),
+        ),
+        (
+            "semantic_input".to_owned(),
+            serde_json::json!(submission.semantic_input),
+        ),
+        (
+            "output_contract".to_owned(),
+            serde_json::json!(submission.output_contract),
+        ),
+        (
+            "admission".to_owned(),
+            serde_json::json!(submission.admission),
+        ),
+        (
+            "cancellation_id".to_owned(),
+            serde_json::json!(submission.cancellation_id),
+        ),
+    ]);
+    if let Some(bytes) = &submission.semantic_input_bytes {
+        payload.insert("semantic_input_bytes".to_owned(), serde_json::json!(bytes));
+    }
+    if let Some(owner_record) = &submission.owner_record {
+        payload.insert("owner_record".to_owned(), serde_json::json!(owner_record));
+    }
+    serde_json::Value::Object(payload)
+}
+
 fn canonical_operation_payload(operation: &JobOperation) -> serde_json::Value {
     match operation {
-        JobOperation::Submit { submission } => {
-            let mut payload = serde_json::Map::from_iter([
-                ("operation".to_owned(), serde_json::json!("SUBMIT_JOB")),
-                ("job_id".to_owned(), serde_json::json!(submission.job_id)),
-                (
-                    "attempt_id".to_owned(),
-                    serde_json::json!(submission.attempt_id),
-                ),
-                (
-                    "work_scope".to_owned(),
-                    serde_json::json!(submission.work_scope),
-                ),
-                (
-                    "semantic_input".to_owned(),
-                    serde_json::json!(submission.semantic_input),
-                ),
-                (
-                    "output_contract".to_owned(),
-                    serde_json::json!(submission.output_contract),
-                ),
-                (
-                    "admission".to_owned(),
-                    serde_json::json!(submission.admission),
-                ),
-                (
-                    "cancellation_id".to_owned(),
-                    serde_json::json!(submission.cancellation_id),
-                ),
-            ]);
-            if let Some(bytes) = &submission.semantic_input_bytes {
-                payload.insert("semantic_input_bytes".to_owned(), serde_json::json!(bytes));
-            }
-            serde_json::Value::Object(payload)
-        }
+        JobOperation::Submit { submission } => canonical_submit_payload(submission),
         JobOperation::LeaseNext { selector } => {
             serde_json::json!({ "operation": "LEASE_NEXT", "selector": selector })
         }
@@ -511,6 +530,22 @@ pub struct JobSubmission {
     pub output_contract: OpaqueContentRef,
     pub admission: AdmissionRef,
     pub cancellation_id: String,
+    /// Content-addressed owner record published beside this submission.
+    ///
+    /// The record travels OPAQUE: this module binds its content identity (the
+    /// owner's own contract, revision, digest, byte length and artifact handle)
+    /// and never interprets its content, never knows which owner's record it
+    /// is, and never substitutes a value for its absence. The producing owner
+    /// computes the digest and the byte length; every reader re-proves them
+    /// against this RECORDED reference through
+    /// [`OpaqueContentRef::validate`] instead of recomputing them, so a
+    /// re-issued or substituted record cannot pass as the original one.
+    ///
+    /// Absence stays explicit. An owner that published no record keeps
+    /// publishing `None`, and no consumer may read `None` as an empty record,
+    /// a zero length, or permission to mint one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_record: Option<OpaqueContentRef>,
 }
 
 impl JobSubmission {
@@ -518,6 +553,9 @@ impl JobSubmission {
         self.semantic_input.validate("semantic_input.sha256")?;
         if let Some(bytes) = &self.semantic_input_bytes {
             self.semantic_input.validate_semantic_input_bytes(bytes)?;
+        }
+        if let Some(owner_record) = &self.owner_record {
+            owner_record.validate("owner_record.sha256")?;
         }
         self.output_contract.validate("output_contract.sha256")?;
         self.admission.validate()?;
@@ -1624,6 +1662,22 @@ pub struct DurableJobResponse {
     /// supplied them. Absence remains explicit for legacy/non-inline jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Content-addressed owner record the durable owner retains for this job.
+    ///
+    /// This is the same opaque, content-addressed reference
+    /// [`JobSubmission::owner_record`] carries, projected by the durable owner
+    /// so a reader that only ever observes the job (the managed worker) can
+    /// still see the record the job was submitted with. It is projected from
+    /// the retained [`DurableJobRecord`], never recomputed on the answering
+    /// side: the digest and the byte length are the ones the producing owner
+    /// recorded, and a reader re-proves them with [`OpaqueContentRef::validate`]
+    /// against this recorded value.
+    ///
+    /// Absence remains an explicit `None` for owners and legacy jobs that
+    /// published no record. It never means an empty record and never licenses
+    /// a consumer to mint one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_record: Option<OpaqueContentRef>,
     /// Exact record revision observed for this response.
     pub revision: u64,
     /// Semantic lifecycle state, separate from the mutation disposition.
@@ -1685,6 +1739,9 @@ impl DurableJobResponse {
                 .as_ref()
                 .ok_or(DurableJobError::SemanticInputUnavailable)?;
             semantic_input.validate_semantic_input_bytes(bytes)?;
+        }
+        if let Some(owner_record) = &self.owner_record {
+            owner_record.validate("owner_record.sha256")?;
         }
         if self.revision == 0 {
             return Err(DurableJobError::InvalidField {
@@ -1831,29 +1888,46 @@ impl DurableJobResponse {
 
     /// Binds response content to one closed operation: job/scope/revision,
     /// published outcome, reconciled disposition, and selection coverage.
+    /// Binds this answer to the `SUBMIT_JOB` that produced it.
+    ///
+    /// Split out of [`Self::validate_response_operation`] so the Submit
+    /// arm's own answer-binding is one named concern. Every check keeps its
+    /// own typed failure, in the same order: job/attempt identity, scope,
+    /// the semantic input reference and its bytes, then the owner record.
+    ///
+    /// The owner record check is deliberately last and separately typed. The
+    /// durable owner projects it, it is never re-derived here, and a
+    /// substituted or dropped record is a mismatch rather than an accepted
+    /// answer — which is the fact this whole channel exists to detect.
+    ///
+    /// Any positive revision is admitted: an idempotent resubmit may return
+    /// the already-advanced record.
+    fn validate_response_submit(&self, submission: &JobSubmission) -> Result<(), DurableJobError> {
+        if self.job_id != submission.job_id || self.attempt_id != submission.attempt_id {
+            return Err(DurableJobError::OperationMismatch);
+        }
+        if self.scope != submission.work_scope {
+            return Err(DurableJobError::FenceMismatch);
+        }
+        let semantic_input = self
+            .semantic_input
+            .as_ref()
+            .ok_or(DurableJobError::SemanticInputUnavailable)?;
+        if semantic_input != &submission.semantic_input {
+            return Err(DurableJobError::SemanticInputMismatch);
+        }
+        if self.semantic_input_bytes != submission.semantic_input_bytes {
+            return Err(DurableJobError::SemanticInputMismatch);
+        }
+        if self.owner_record != submission.owner_record {
+            return Err(DurableJobError::OwnerRecordMismatch);
+        }
+        Ok(())
+    }
+
     fn validate_response_operation(&self, operation: &JobOperation) -> Result<(), DurableJobError> {
         match operation {
-            JobOperation::Submit { submission } => {
-                if self.job_id != submission.job_id || self.attempt_id != submission.attempt_id {
-                    return Err(DurableJobError::OperationMismatch);
-                }
-                if self.scope != submission.work_scope {
-                    return Err(DurableJobError::FenceMismatch);
-                }
-                let semantic_input = self
-                    .semantic_input
-                    .as_ref()
-                    .ok_or(DurableJobError::SemanticInputUnavailable)?;
-                if semantic_input != &submission.semantic_input {
-                    return Err(DurableJobError::SemanticInputMismatch);
-                }
-                if self.semantic_input_bytes != submission.semantic_input_bytes {
-                    return Err(DurableJobError::SemanticInputMismatch);
-                }
-                // Any positive revision is admitted: an idempotent resubmit
-                // may return the already-advanced record.
-                Ok(())
-            }
+            JobOperation::Submit { submission } => self.validate_response_submit(submission),
             JobOperation::LeaseNext { selector } => {
                 if self.scope.scope_id != selector.scope_id {
                     return Err(DurableJobError::OperationMismatch);
@@ -2012,6 +2086,8 @@ pub enum DurableJobError {
     SemanticInputUnavailable,
     #[error("semantic input reference or supplied bytes differ from the original owner record")]
     SemanticInputMismatch,
+    #[error("owner record reference differs from the original owner record")]
+    OwnerRecordMismatch,
     #[error("role does not have the requested capability")]
     CapabilityDenied,
     #[error("invalid or expired active lease")]

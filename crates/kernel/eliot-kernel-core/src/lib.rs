@@ -195,6 +195,23 @@ pub fn contract_identity() -> Result<ContractIdentity, KernelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    fn test_genesis_epoch() -> Result<eliot_contracts::EpochId, KernelError> {
+        let lineage_id = eliot_contracts::EpochLineageId::new(
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        .map_err(|_| KernelError::InvalidField {
+            field: "lineage_id",
+            reason: "must be a canonical UUID lineage",
+        })?;
+        eliot_contracts::EpochId::new(lineage_id, NonZeroU64::MIN).map_err(|_| {
+            KernelError::InvalidField {
+                field: "epoch_id",
+                reason: "invalid canonical epoch",
+            }
+        })
+    }
 
     #[test]
     fn contract_identity_is_stable_and_present() -> Result<(), KernelError> {
@@ -207,7 +224,7 @@ mod tests {
     #[test]
     fn authority_and_front_door_compose_end_to_end() -> Result<(), KernelError> {
         let key = KernelAuthorityKey::from_bytes([11u8; 32]);
-        let authority = KernelAuthority::new(key, eliot_contracts::AuthorityEpoch::genesis());
+        let authority = KernelAuthority::new(key, test_genesis_epoch()?);
         let receipt = authority.issue(AuthorityGrantRequest::new(
             eliot_contracts::ContractId::new("authority-1")?,
             "kernel",

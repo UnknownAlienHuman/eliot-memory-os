@@ -68,6 +68,7 @@ fn submission() -> eliot_protocol::JobSubmission {
         semantic_input: content_ref("input"),
         semantic_input_bytes: None,
         output_contract: content_ref("output"),
+        owner_record: None,
         admission: AdmissionRef {
             authority: AuthorityBinding {
                 authority_id: ContractId::new("kernel").expect("authority"),
@@ -181,6 +182,10 @@ fn base_response(request: &DurableJobRequest, bound_scope: WorkScopeBinding) -> 
         },
         semantic_input_bytes: match &request.operation {
             JobOperation::Submit { submission } => submission.semantic_input_bytes.clone(),
+            _ => None,
+        },
+        owner_record: match &request.operation {
+            JobOperation::Submit { submission } => submission.owner_record.clone(),
             _ => None,
         },
         revision: 1,

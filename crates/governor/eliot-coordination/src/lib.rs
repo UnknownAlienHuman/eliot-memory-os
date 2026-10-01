@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod handoff_persistence;
+mod handoff_resume;
 mod integration_candidate;
 mod peer_communication;
 mod swarm_plan_attachment;
@@ -25,6 +26,8 @@ pub use handoff_persistence::{
     HandoffPersistenceError, capture_handoff_checkpoint, handoff_checkpoint_ref_text,
     reconcile_handoff_capture,
 };
+
+pub use handoff_resume::resume_from_retained_handoff;
 
 pub use integration_candidate::{
     IntegrationCandidate, IntegrationCandidateDraft, IntegrationCandidateReceipt,

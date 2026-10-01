@@ -17,7 +17,7 @@ use crate::{
     ContextOutcome, ContextRecipe, DecisionContextIncomplete, DecisionRevision,
     DecisionSafetyFloor, ExpansionHandle, LearningAdmissionTicket, LossPolicy,
     NonRecoverableReason, OmissionRecord, RepresentationKind, StuEstimate, TokenizerObservation,
-    canonical_digest, validate_digest, validate_text,
+    canonical_digest, canonical_render_serializer, validate_digest, validate_text,
 };
 
 /// Closed unit used by an admission cost.  A unit is never inferred from a
@@ -114,6 +114,31 @@ impl MeasurementCompositionProfile {
     pub fn canonical_digest(&self) -> Result<String, ContextError> {
         self.validate()?;
         canonical_digest(self)
+    }
+
+    /// Require that this profile's serializer identity is the render owner's.
+    ///
+    /// I2.16 places `serializer_id_version_and_options` on the record every
+    /// admission measurement is compared against, and `:163` requires that
+    /// qualification use "the exact bytes that the selected route will
+    /// receive". Those bytes are produced by the codec
+    /// [`canonical_render_serializer`] publishes, so the profile's own three
+    /// recorded values are compared against that owner record here. Both sides
+    /// are compared as recorded: nothing is recomputed to stand in for the
+    /// profile, and no value is defaulted or substituted here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidField`] when the owner record does not
+    /// satisfy its own closed contract, and [`ContextError::IdentityConflict`]
+    /// when this profile names another serializer, another revision or another
+    /// options digest.
+    pub fn binds_canonical_render_serializer(&self) -> Result<(), ContextError> {
+        canonical_render_serializer()?.binds(
+            &self.serializer_id,
+            &self.serializer_version,
+            &self.serializer_options_digest,
+        )
     }
 }
 

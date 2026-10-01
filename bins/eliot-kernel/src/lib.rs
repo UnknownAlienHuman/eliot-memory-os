@@ -310,6 +310,7 @@ use eliot_kernel_core::{
 };
 
 mod activation_lifecycle;
+mod admission_reservation_saga;
 mod daemon_live_receipt;
 #[cfg(windows)]
 mod daemon_process_launch;
@@ -320,6 +321,7 @@ mod daemon_supervision;
 mod dispatch_launch;
 mod doctor_recovery_ledger;
 mod dreamer_job_dispatch;
+mod dreamer_owner_record;
 mod frame_dispatch;
 mod front_door_listener;
 mod front_door_session;
@@ -364,6 +366,8 @@ use generation_recovery::OrsGenerationCoordinator;
 use generation_recovery::update_handshake_policy;
 #[cfg(windows)]
 use host_request_route::HostRequestOperationRef;
+#[cfg(windows)]
+use host_request_route::WATCHDOG_EXPORT_SUBMIT_OPERATION;
 #[cfg(windows)]
 use host_request_route::WATCHDOG_INTENT_SUBMIT_OPERATION;
 use runtime_identity::stable_owner_principal_digest;
@@ -850,6 +854,18 @@ pub struct KernelComposition {
     /// `Unknown` without enumerating the store.
     #[cfg(windows)]
     host_request_connection_index: Mutex<BTreeMap<String, Vec<HostRequestOperationRef>>>,
+    /// Bounded Kernel-owned queue of admitted Watchdog spool export windows
+    /// awaiting the daemon's canonical admission (#2899).
+    ///
+    /// The durable owner of one export entry is its ORS `Reconciliation`
+    /// record; this queue only carries the exact submitted window bytes the
+    /// daemon poller serves from and re-proves against those rows. It is
+    /// process-local: a Kernel restart empties it, and the Watchdog resubmits
+    /// the identical window because its own cursor has not advanced, which
+    /// re-stages the same durable records under the same derived keys. It fails
+    /// closed at its ceiling instead of dropping a window.
+    #[cfg(windows)]
+    watchdog_export_drain: Mutex<VecDeque<eliot_protocol::WatchdogSpoolExportBatchPayload>>,
     /// The live I12.14 hot-spine binding and the queue capacity it enforces
     /// (issue #1733). Bound once during composition assembly against the
     /// running build's real registered settings, so a composition that exists
@@ -1637,7 +1653,13 @@ pub enum KernelFrameAction {
     Fence(Frame),
 }
 
-fn unix_ms() -> u64 {
+/// Milliseconds since the Unix epoch, saturating at the `u64` boundary.
+///
+/// Shared crate-wide so the #1678 admission-reservation saga, the dispatch
+/// launch gates and the daemon request routes all read the SAME clock; a second
+/// clock read in one of them would make a recorded timestamp disagree with the
+/// one the owner admitted it under.
+pub(crate) fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -4962,9 +4984,46 @@ impl KernelComposition {
                 return Err(DrainHalt::new(reason));
             }
         }
+        // StoreUnknownOutcome: unreconciled `UNKNOWN_OUTCOME` store failures
+        // and still-open unknown-commit records stay fenced and keep the drain
+        // incomplete (#1686 item 5; I14.21). Only exact owner evidence — a
+        // bound `reconciled_receipt`, a terminal store disposition, or a
+        // resolved unknown-commit record — clears an obligation through the
+        // `StoreUnknownOutcome` family observation; the remainder halts the
+        // drain for the incomplete-shutdown terminal instead of clearing
+        // because a task stopped.
+        let mut seen_unknown_commits: BTreeSet<String> = BTreeSet::new();
+        let unknown_scanned = self
+            .pending_unknown_outcome_receipts(&mut seen_unknown_commits)
+            .map_err(|_| DrainHalt::new("ors-unknown-outcome-scan-failed"))?;
+        for identity in unknown_scanned
+            .pending
+            .iter()
+            .map(ReceiptOwnerEvidence::identity)
+        {
+            coordinator
+                .register_pending_receipt(identity)
+                .map_err(|_| DrainHalt::new("durable-pending-receipt-unavailable"))?;
+        }
+        match coordinator
+            .reconcile_pending_observation(
+                DRAIN_RECEIPT_DEADLINE,
+                ReceiptOwnerFamily::StoreUnknownOutcome,
+                |_| self.pending_unknown_outcome_receipts(&mut seen_unknown_commits),
+            )
+            .await
+        {
+            ReceiptReconciliation::Reconciled => {}
+            ReceiptReconciliation::Incomplete { pending, reason } => {
+                return Err(DrainHalt::with_pending(reason, pending));
+            }
+            ReceiptReconciliation::Unavailable { reason } => {
+                return Err(DrainHalt::new(reason));
+            }
+        }
         record(
             ShutdownPhase::CanonicalDrainReceiptsReconciled,
-            "store-rebind-pending-reconciled-empty;supervision-lease-staging-owned-by-lease-authority-handoff;host-request-staging-owned-by-governor-handoff"
+            "store-rebind-pending-reconciled-empty;store-unknown-outcome-reconciled-empty;supervision-lease-staging-owned-by-lease-authority-handoff;host-request-staging-owned-by-governor-handoff"
                 .to_owned(),
         )?;
 
@@ -5389,6 +5448,123 @@ impl KernelComposition {
             complete,
             absence_resolves: false,
             revision,
+            pending,
+            resolved,
+        })
+    }
+
+    /// Reads the ORS unknown-outcome family as one typed observation for the
+    /// drain gate (#1686 item 5; I14.21). Read-only: shutdown never mutates
+    /// retained failures or unknown-commit rows.
+    ///
+    /// The family is the unreconciled `UNKNOWN_OUTCOME` store failures from
+    /// `load_all_store_failures` plus the still-open unknown-commit records
+    /// from `list_open_unknown_commits`, each listed record re-proved still
+    /// open by `load_unknown_commit` under its exact idempotency key. A bound
+    /// `reconciled_receipt`, a terminal store disposition, or a now-resolved
+    /// unknown-commit record is resolved evidence for the exact binding read;
+    /// absence never resolves, so a remainder keeps the drain incomplete
+    /// rather than clearing because a task stopped.
+    ///
+    /// `seen_unknown_commits` carries the open unknown-commit keys across the
+    /// bounded wait's ticks: a record that resolves between ticks is observed
+    /// as resolved through its key instead of vanishing silently, while a key
+    /// that vanishes without resolution stays retained (absence never
+    /// resolves). Both owner tables are read in full, so the observation is
+    /// complete; the family carries no owner revision, so it reports zero.
+    fn pending_unknown_outcome_receipts(
+        &self,
+        seen_unknown_commits: &mut BTreeSet<String>,
+    ) -> Result<ReceiptRescanObservation, String> {
+        let mut pending = Vec::new();
+        let mut resolved = Vec::new();
+        for record in self
+            .generation_gateway
+            .ors
+            .load_all_store_failures()
+            .map_err(|_| "ors-unknown-outcome-scan-failed".to_owned())?
+        {
+            let evidence = ReceiptOwnerEvidence::new(
+                format!("store-unknown-outcome:{}", record.record_key()),
+                record.request_digest.clone(),
+                0,
+                0,
+            );
+            if record.failure.disposition
+                == eliot_store_api::StoreFailureDisposition::UnknownOutcome
+                && record.reconciled_receipt.is_none()
+            {
+                pending.push(evidence);
+            } else {
+                resolved.push(evidence);
+            }
+        }
+        let mut still_open: BTreeSet<String> = BTreeSet::new();
+        for listed in self
+            .generation_gateway
+            .ors
+            .list_open_unknown_commits()
+            .map_err(|_| "ors-unknown-outcome-scan-failed".to_owned())?
+        {
+            let key = listed.record_key();
+            let confirmed = self
+                .generation_gateway
+                .ors
+                .load_unknown_commit(key.as_str())
+                .map_err(|_| "ors-unknown-outcome-scan-failed".to_owned())?;
+            let Some(confirmed) = confirmed else {
+                continue;
+            };
+            let evidence = ReceiptOwnerEvidence::new(
+                format!("unknown-commit:{}", confirmed.record_key()),
+                confirmed.canonical_request_hash.clone(),
+                0,
+                0,
+            );
+            if confirmed.is_open() {
+                still_open.insert(confirmed.record_key());
+                pending.push(evidence);
+            } else {
+                resolved.push(evidence);
+            }
+        }
+        for key in seen_unknown_commits.iter().cloned().collect::<Vec<_>>() {
+            if still_open.contains(&key) {
+                continue;
+            }
+            match self
+                .generation_gateway
+                .ors
+                .load_unknown_commit(key.as_str())
+                .map_err(|_| "ors-unknown-outcome-scan-failed".to_owned())?
+            {
+                Some(record) if !record.is_open() => resolved.push(ReceiptOwnerEvidence::new(
+                    format!("unknown-commit:{}", record.record_key()),
+                    record.canonical_request_hash.clone(),
+                    0,
+                    0,
+                )),
+                Some(record) => {
+                    still_open.insert(record.record_key());
+                    pending.push(ReceiptOwnerEvidence::new(
+                        format!("unknown-commit:{}", record.record_key()),
+                        record.canonical_request_hash.clone(),
+                        0,
+                        0,
+                    ));
+                }
+                // A key that vanishes without resolution stays retained:
+                // absence never resolves, so nothing is reported and the
+                // registered obligation is kept by retention.
+                None => {}
+            }
+        }
+        *seen_unknown_commits = still_open;
+        Ok(ReceiptRescanObservation {
+            family: ReceiptOwnerFamily::StoreUnknownOutcome,
+            complete: true,
+            absence_resolves: false,
+            revision: 0,
             pending,
             resolved,
         })

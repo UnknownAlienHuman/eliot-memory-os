@@ -17,8 +17,8 @@
 //! | Build the `GroundingRequest` | `grounding_stage::resolve_grounding_inputs` over the same admitted pair | wired |
 //! | Ground the admitted draft | `grounding_stage::ground_admitted_draft` | wired |
 //! | Validate the grounded draft | `validation_stage::validate_admitted_draft` (`ValidatedGroundingCandidate`) | wired |
-//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | wired |
-//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | wired |
+//! | Read/build the exact `CanonicalProjectionSet` from Governor/canonical owners | `eliot_governor::canonical_projections::emit_canonical_projection_set`, delivered over [`OrientationSupply`] | NOT REACHABLE IN PRODUCTION: the producer has no production caller, and the supply seam itself sits behind two upstream gates that refuse unconditionally |
+//! | Acquire the remaining mandatory stages' owner input/receipt | Governor owner records over the same [`OrientationSupply`] channel | NOT REACHABLE IN PRODUCTION: no owner publishes these records to this binary, and the seam that would read them is unreachable |
 //! | Invoke the pure composer | [`compose_production_result`] below (this module) | wired |
 //! | Publish the typed result | `dispatch_stage::dispatch_orientation` as `DreamResult::Orientation` | wired |
 //!
@@ -30,6 +30,64 @@
 //! hypothesis pair enters beside them as explicit parameters, because
 //! `dispatch_orientation` is what derived and validated that pair. Only values
 //! a Governor/canonical owner publishes travel over [`OrientationSupply`].
+//!
+//! The last two owner-channel rows are measured, not aspirational, and the
+//! measurement is stronger than "the owner published nothing". Three separate
+//! facts each independently keep this carrier unfilled in production, and each
+//! is a property of the tree rather than of a missing adapter.
+//!
+//! **1. The Governor's producer has no production caller.**
+//! `eliot_governor::composition::GovernorComposition::canonical_projections`
+//! (crates/governor/eliot-governor/src/composition.rs:6166) is the documented
+//! producer, and it composes the real owner set from the retained `task`,
+//! `session`, `work_scope` and `observation` owners. It has zero callers
+//! tree-wide: `git grep "canonical_projections("` matches only its own
+//! definition and the internal `compose_canonical_projections` call. Nothing in
+//! `eliotd` ever asks the composition for a projection set.
+//!
+//! **2. The supply seam is unreachable from the production `submit` path.**
+//! [`AuthenticatedKernelJobPort::submit`](crate::AuthenticatedKernelJobPort::submit)
+//! calls [`resolve_orientation_supply`](crate::AuthenticatedKernelJobPort::resolve_orientation_supply)
+//! at lib.rs:791, but only after two gates that refuse unconditionally:
+//! `controller::resolve_cycle_inputs` (controller.rs:78-82) and
+//! `bundle_stage::resolve_bundle_request` (bundle_stage.rs:31-35) both end in a
+//! bare `Err`. An `Ok(None)` from the owner channel is therefore not merely the
+//! current answer — on today's tree `resolve_supply` is never called at all on
+//! any production path. The crate's own
+//! `submit_orientation_stops_at_controller_gate` proof
+//! (`pipeline_e2e.rs:806`) asserts exactly this: an Orientation `submit` stops at
+//! the controller gate. The blocked disposition published downstream is reached
+//! today only from the unit-level pipeline proofs, not from `main.rs`.
+//!
+//! **3. The record that does travel is an address, not the member.**
+//! The opaque owner record channel is real: `KernelComposition::execute_dreamer_request`
+//! publishes the content-addressed reference on
+//! `JobSubmission::owner_record`, the durable owner projects it onto
+//! `DurableJobResponse::owner_record`, and
+//! `kernel_port::validate_owner_response_binding` re-proves the ORIGINAL
+//! recorded digest and byte length against the owner's own reference rather
+//! than recomputing them. But `owner_record` is an [`OpaqueContentRef`] — a
+//! digest, a byte length and an artifact handle. It carries no member, and this
+//! binary holds no capability that could resolve one: there is no blob/artifact
+//! read anywhere under `bins/eliot-dreamer/src` (`git grep -i blob` over that
+//! tree returns nothing). So even a fully published record could not fill the
+//! carrier here without a new content-retrieval capability.
+//!
+//! [`resolve_production_inputs`] therefore keeps returning the
+//! [`OrientationDisposition::Blocked`] result from [`supply_missing_blocked`]
+//! whenever it is reached at all, carrying no packet, `CC004_MISSING` on the
+//! CC-004 boundary record, and `missing_owners` naming the canonical projection
+//! owner plus every stage owner. The carrier is not relaxed, no member is
+//! defaulted, no lookalike value is synthesized, and no check is skipped to make
+//! a stage fire.
+//!
+//! What a future attempt must supply is therefore not one adapter but all three
+//! of: a production caller for the Governor producer, Governor-resolved
+//! controller and bundle material so `submit` reaches this seam at all, and a
+//! content-retrieval capability that turns the record's address into a typed
+//! member. Naming the missing dependency edge is the honest deliverable here;
+//! manufacturing a value to cross it would be the self-issued authority the
+//! carrier's own contract refuses.
 //!
 //! A missing adapter is implementation work, never substituted with local
 //! data: the v1 hypothesis pair derived in dispatch is reported only as the

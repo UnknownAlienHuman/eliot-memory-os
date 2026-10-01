@@ -217,6 +217,73 @@ impl ReadinessReceipt {
     }
 }
 
+/// One independently probed semantic dimension of the canonical store.
+///
+/// I1.9: a version/schema/transaction verdict is a store-bridge observation.
+/// It never substitutes for Host-managed process liveness, and Host liveness
+/// never substitutes for it. Each dimension is reported separately so a
+/// front-door or recovery status can name the dimension that failed instead
+/// of reducing the result to one "store healthy" boolean.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDimension {
+    /// The dimension was probed and passed.
+    Compatible,
+    /// The dimension was probed and did not pass.
+    Incompatible,
+    /// The dimension could not be observed.
+    Unavailable,
+}
+
+/// The store bridge's current semantic readiness, reporting version
+/// compatibility, schema compatibility and transaction execution viability as
+/// three separate results.
+///
+/// The three fields are never reduced into one another and never inferred
+/// from each other: a caller that must name the dimension that failed reads
+/// the failing field. [`ReadinessReceipt::status`] remains the schema
+/// projection only.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreSemanticReadiness {
+    /// Version compatibility of the live authenticated provider session.
+    pub version: SemanticDimension,
+    /// Schema compatibility of the database against the configured generation.
+    pub schema: SemanticDimension,
+    /// Viability of executing a real transaction against the database.
+    pub transaction: SemanticDimension,
+}
+
+impl StoreSemanticReadiness {
+    /// The exact report a caller records when it ran no probe at all.
+    #[must_use]
+    pub const fn unobserved() -> Self {
+        Self {
+            version: SemanticDimension::Unavailable,
+            schema: SemanticDimension::Unavailable,
+            transaction: SemanticDimension::Unavailable,
+        }
+    }
+
+    /// The exact report for a session whose three probes all passed.
+    #[must_use]
+    pub const fn compatible() -> Self {
+        Self {
+            version: SemanticDimension::Compatible,
+            schema: SemanticDimension::Compatible,
+            transaction: SemanticDimension::Compatible,
+        }
+    }
+
+    /// Reports whether all three probed dimensions passed.
+    #[must_use]
+    pub const fn is_ready(&self) -> bool {
+        matches!(self.version, SemanticDimension::Compatible)
+            && matches!(self.schema, SemanticDimension::Compatible)
+            && matches!(self.transaction, SemanticDimension::Compatible)
+    }
+}
+
 /// Closed semantic store request catalogue.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]

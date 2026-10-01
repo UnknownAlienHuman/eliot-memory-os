@@ -10,6 +10,25 @@ mod protocol_v1;
 
 pub use protocol_v1::*;
 
+// The Watchdog spool-export wire contract is re-exported by name, exactly as
+// every durable module below is, rather than left to the `protocol_v1` glob
+// above. The glob is explicitly a temporary compatibility surface (see the
+// `#[allow]` on the module), and this contract is not temporary: the Kernel
+// front-door route, the Watchdog sink, and the daemon claim/result client all
+// name these items across the crate boundary, so their reachability is pinned
+// here instead of depending on a glob that is slated for retirement. Nothing
+// changes shape or visibility — every item is already `pub` in `lib.rs`; this
+// only makes the crate-root path explicit. The reconciliation-key domain prefix
+// stays private: it is an implementation detail of the single-owner derivation
+// and no consumer may substitute its own scheme.
+pub use protocol_v1::{
+    MAX_WATCHDOG_SPOOL_EXPORT_ENTRIES, WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID,
+    WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_VERSION, WATCHDOG_SPOOL_EXPORT_ROUTE, WatchdogSpoolEntryKind,
+    WatchdogSpoolEntryOutcome, WatchdogSpoolExportBatchPayload,
+    WatchdogSpoolExportOutcomeSubmission, WatchdogSpoolExportResultPayload,
+    WatchdogSpoolExportSubmission, watchdog_export_reconciliation_idempotency_key,
+};
+
 mod maintenance_trigger;
 pub use maintenance_trigger::{
     MAINTENANCE_TRIGGER_ACK_WIRE_ID, MAINTENANCE_TRIGGER_ACK_WIRE_VERSION,

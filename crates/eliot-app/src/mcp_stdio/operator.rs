@@ -1126,6 +1126,26 @@ fn operator_l0_feature_fields(
         operator_field("known_decision_delta", score.known_decision_delta, false),
         operator_field("prior_beneficial_use", score.prior_beneficial_use, false),
         operator_field("verification_value", score.verification_value, false),
+        // 783/20: `L0FeatureScore::context_cost` is a ranking score, not a
+        // context measurement, so it is deliberately published bare.
+        //
+        // The value is `i32` (crates/eliot-types/src/memory.rs) and is
+        // computed in crates/eliot-store/src/canonical_store/recall_ranking.rs
+        // as `-ceil(preview.len() / 64)`, clamped to -40: a negative penalty
+        // on a 64-character bucket of the preview text, added straight into
+        // `total` alongside every other feature and compared against the
+        // ranking threshold. It is not a byte count, not an STU, not a token
+        // count, and not a cost derived from any measured payload, so there
+        // is no canonical measurement owner behind it to republish.
+        //
+        // Wrapping it in a measurement envelope would be the exact relabelling
+        // this migration forbids: it would publish a bucketed ranking penalty
+        // under `unit`/`status` as though it were an observed quantity, and a
+        // reader could not tell a -40 penalty from an unavailable measurement.
+        // Renaming or rescaling it would change ranking, admission and
+        // delivery, which this migration must not do. It is therefore left
+        // exactly as it is: one feature label among twenty-five, in the same
+        // shape as its sibling ranking features.
         operator_field("context_cost", score.context_cost, false),
         operator_field("stale_penalty", score.stale_penalty, false),
         operator_field("contradiction_penalty", score.contradiction_penalty, false),

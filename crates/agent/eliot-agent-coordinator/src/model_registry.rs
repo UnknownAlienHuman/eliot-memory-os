@@ -1582,7 +1582,7 @@ pub(crate) fn compile_model_selection(
 fn preference_rank_selector(entry: &ModelCatalogueEntry, selectors: &[ModelSelector]) -> usize {
     selectors
         .iter()
-        .position(|selector| selector.matches(entry))
+        .position(|selector| super::model_selector_matches(selector, entry))
         .unwrap_or(usize::MAX)
 }
 

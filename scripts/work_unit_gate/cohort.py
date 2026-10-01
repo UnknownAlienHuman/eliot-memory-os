@@ -134,23 +134,96 @@ def is_restricted_root_path(path: str) -> bool:
     return False
 
 
-def is_integration_owner(unit: c.WorkUnitIdentity, issue: Optional[c.IssueIdentity] = None) -> bool:
-    """Determine whether a work-unit identity is an authorized integration owner."""
-    val = unit.value.lower()
-    return (
-        val.startswith("d-int")
-        or val.startswith("d-wu-final")
-        or "integration" in val
-        or (issue is not None and issue.number in (837, 907, 915))
-    )
+class OwnerRole(str, Enum):
+    """Typed work-unit owner role.
+
+    Authority comes only from the accepted catalogue/snapshot classification
+    carried by an IntegrationOwnerProfile. Unit-name spelling is identity,
+    never authority.
+    """
+    LEAF = "leaf"
+    INTEGRATION_OWNER = "integration-owner"
 
 
-def validate_descriptor_scope(desc: c.WorkUnitDescriptor) -> None:
-    """Verify descriptor path safety, root claims, case floor, and identity bindings."""
+@dataclass(frozen=True)
+class IntegrationOwnerEntry:
+    """One exact accepted integration-owner binding: issue plus unit."""
+
+    issue: c.IssueIdentity
+    unit: c.WorkUnitIdentity
+
+
+@dataclass(frozen=True)
+class IntegrationOwnerProfile:
+    """Explicit typed integration-owner authority bound by the accepted catalogue/snapshot.
+
+    Built by the snapshot/catalogue owner from accepted classification rows.
+    Only a listed (issue, unit) pair holds the INTEGRATION_OWNER role; every
+    other identity is LEAF. Name prefixes, substrings and bare issue numbers
+    never confer authority.
+    """
+
+    owners: Tuple[IntegrationOwnerEntry, ...] = ()
+
+    def __post_init__(self) -> None:
+        entries = self.owners
+        if type(entries) is not tuple:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "integration owners must be a tuple")
+        for entry in entries:
+            if type(entry) is not IntegrationOwnerEntry:
+                raise CohortError(CohortProblem.INTERNAL_ERROR, "integration owner entry mistyped")
+        pairs = tuple((entry.issue, entry.unit) for entry in entries)
+        if len(set(pairs)) != len(pairs):
+            raise CohortError(CohortProblem.DUPLICATE_UNIT, "duplicate integration owner entry")
+        object.__setattr__(self, "owners", tuple(sorted(entries, key=lambda e: (e.issue, e.unit))))
+
+    def role_of(self, unit: c.WorkUnitIdentity, issue: Optional[c.IssueIdentity] = None) -> OwnerRole:
+        """Return the typed role for an identity under this profile."""
+        if type(unit) is not c.WorkUnitIdentity:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "owner lookup unit mistyped")
+        if issue is not None and type(issue) is not c.IssueIdentity:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "owner lookup issue mistyped")
+        for entry in self.owners:
+            if entry.unit == unit and (issue is None or entry.issue == issue):
+                return OwnerRole.INTEGRATION_OWNER
+        return OwnerRole.LEAF
+
+
+def is_integration_owner(
+    unit: c.WorkUnitIdentity,
+    issue: Optional[c.IssueIdentity] = None,
+    *,
+    profile: Optional[IntegrationOwnerProfile] = None,
+) -> bool:
+    """Determine whether a work-unit identity is an authorized integration owner.
+
+    Typed authority only: True exactly when the (unit, issue) pair is a member
+    of the supplied accepted profile. Without a profile there is no authority
+    (False); spelling heuristics and magic issue numbers never apply.
+    """
+    if type(unit) is not c.WorkUnitIdentity:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "integration owner unit mistyped")
+    if profile is None:
+        return False
+    if type(profile) is not IntegrationOwnerProfile:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "integration owner profile mistyped")
+    return profile.role_of(unit, issue) is OwnerRole.INTEGRATION_OWNER
+
+
+def validate_descriptor_scope(
+    desc: c.WorkUnitDescriptor,
+    *,
+    integration_owners: Optional[IntegrationOwnerProfile] = None,
+) -> None:
+    """Verify descriptor path safety, root claims, case floor, and identity bindings.
+
+    Restricted-root claims are allowed only for the exact typed integration
+    owner bound by the supplied accepted profile.
+    """
     # Check paths
     for root in desc.source_roots:
         norm = validate_path_safety(root.value)
-        if is_restricted_root_path(norm) and not is_integration_owner(desc.unit, desc.issue):
+        if is_restricted_root_path(norm) and not is_integration_owner(desc.unit, desc.issue, profile=integration_owners):
             raise CohortError(
                 CohortProblem.SHARED_ROOT_CLAIM_REJECTED,
                 f"ordinary leaf {desc.unit.value} cannot claim restricted root {norm}"
@@ -192,18 +265,108 @@ def check_dispatch_readiness(desc: c.WorkUnitDescriptor) -> bool:
     return True
 
 
+class PackageSharingKind(str, Enum):
+    """Explicit typed package-sharing mode.
+
+    DISJOINT: finite disjoint ownership with no overlapping mutable scopes.
+    SERIALIZED: overlapping scopes ordered by a typed prerequisite edge with
+    exactly one integration owner on the edge.
+    """
+
+    DISJOINT = "disjoint"
+    SERIALIZED = "serialized"
+
+
+@dataclass(frozen=True)
+class PackageSharingEdge:
+    """One explicit typed package-sharing declaration between finite parties.
+
+    Covers the exact sharing parties for one package; order labels alone never
+    suffice, and validation always re-checks scopes and order together.
+    """
+
+    package: c.PackageIdentity
+    issues: Tuple[c.IssueIdentity, ...]
+    kind: PackageSharingKind
+
+    def __post_init__(self) -> None:
+        if type(self.package) is not c.PackageIdentity:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "package sharing package mistyped")
+        if type(self.kind) is not PackageSharingKind:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "package sharing kind mistyped")
+        issues = self.issues
+        if type(issues) is not tuple or len(issues) < 2:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "package sharing needs at least two issues")
+        for ident in issues:
+            if type(ident) is not c.IssueIdentity:
+                raise CohortError(CohortProblem.MALFORMED_FIELD, "package sharing issue mistyped")
+        if len(set(issues)) != len(issues):
+            raise CohortError(CohortProblem.DUPLICATE_ISSUE, "duplicate issue in package sharing edge")
+        if len({ident.repository for ident in issues}) != 1:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "package sharing crosses repositories")
+        object.__setattr__(self, "issues", tuple(sorted(issues)))
+
+
+def _require_package_sharing(
+    package_name: str,
+    first: c.WorkUnitDescriptor,
+    second: c.WorkUnitDescriptor,
+    sharing: Tuple[PackageSharingEdge, ...],
+    prereq_map: Dict[int, Set[int]],
+    integration_owners: Optional[IntegrationOwnerProfile],
+) -> None:
+    """Allow one same-package pair only through a validated explicit edge.
+
+    DISJOINT requires no overlapping mutable (source) scopes. SERIALIZED
+    requires a typed prerequisite edge in one direction plus exactly one
+    typed integration owner on the pair. Test roots are read scopes and may
+    stay shared. Without a covering validated edge the pair stays a conflict.
+    """
+    pair = {first.issue, second.issue}
+    for edge in sharing:
+        if edge.package.name != package_name or not pair.issubset(set(edge.issues)):
+            continue
+        if edge.kind is PackageSharingKind.DISJOINT:
+            if not check_write_scope_overlap(first, second):
+                return
+        elif edge.kind is PackageSharingKind.SERIALIZED:
+            is_serialized = (
+                first.issue.number in prereq_map.get(second.issue.number, set())
+                or second.issue.number in prereq_map.get(first.issue.number, set())
+            )
+            if not is_serialized:
+                continue
+            owner_count = sum(
+                1 for desc in (first, second)
+                if integration_owners is not None
+                and is_integration_owner(desc.unit, desc.issue, profile=integration_owners)
+            )
+            if owner_count == 1:
+                return
+    raise CohortError(
+        CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP,
+        f"conflicting ownership of package '{package_name}' between {first.unit.value} and {second.unit.value}"
+    )
+
+
 def materialize_catalogue(
     rows: Sequence[c.CatalogueRow],
     expected_issues: Sequence[c.IssueIdentity],
     expected_cases: Optional[int] = None,
     allow_overlapping_prereqs: bool = True,
+    *,
+    integration_owners: Optional[IntegrationOwnerProfile] = None,
+    package_sharing: Sequence[PackageSharingEdge] = (),
 ) -> c.CatalogueIntegrityReceipt:
     """Materialize an immutable CatalogueIntegrityReceipt from validated rows.
 
     Enforces:
     - exact row count and issue identity denominator matching expected_issues
     - unique issues and unique units across active rows
-    - package ownership exclusivity unless explicit decomposition
+    - package ownership exclusivity unless a validated explicit PackageSharingEdge
+      (finite disjoint ownership or a typed serialization edge with one
+      integration owner from the supplied accepted profile)
+    - restricted-root claims only for the exact typed integration owner
     - descriptor validation and assignment mirror consistency
     - aggregate arithmetic validation against expected_cases
     - concurrent write-scope overlap checks among independent assigned rows
@@ -231,20 +394,35 @@ def materialize_catalogue(
     if len(set(active_units)) != len(active_units):
         raise CohortError(CohortProblem.DUPLICATE_UNIT, "duplicate unit across active catalogue rows")
 
-    # Check package ownership conflicts
-    packages: Dict[str, c.WorkUnitDescriptor] = {}
+    if integration_owners is not None and type(integration_owners) is not IntegrationOwnerProfile:
+        raise CohortError(CohortProblem.MALFORMED_FIELD, "integration owners profile mistyped")
+    if type(package_sharing) is tuple:
+        sharing: Tuple[PackageSharingEdge, ...] = package_sharing
+    else:
+        try:
+            sharing = tuple(package_sharing)
+        except Exception:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "package sharing declaration unreadable") from None
+    for edge in sharing:
+        if type(edge) is not PackageSharingEdge:
+            raise CohortError(CohortProblem.MALFORMED_FIELD, "package sharing edge mistyped")
+
+    # Prerequisite order map, shared by the package-sharing check (typed
+    # serialization edges) and the concurrent write-scope check below.
+    prereq_map: Dict[int, Set[int]] = {r.issue.number: set(p.number for p in r.prerequisites) for r in rows}
+
+    # Check package ownership conflicts. A pair sharing one package is valid
+    # only through a covering validated explicit edge; otherwise it conflicts.
+    holders_by_package: Dict[str, List[c.WorkUnitDescriptor]] = {}
     for r in rows:
         if r.descriptor is not None and r.descriptor.package is not None:
-            pkg_name = r.descriptor.package.name
-            if pkg_name in packages:
-                existing = packages[pkg_name]
-                if existing.issue != r.issue and existing.unit != r.unit:
-                    raise CohortError(
-                        CohortProblem.CONFLICTING_PACKAGE_OWNERSHIP,
-                        f"conflicting ownership of package '{pkg_name}' between {existing.unit.value} and {r.unit.value}"
-                    )
-            else:
-                packages[pkg_name] = r.descriptor
+            holders_by_package.setdefault(r.descriptor.package.name, []).append(r.descriptor)
+    for package_name, holders in holders_by_package.items():
+        for i, first in enumerate(holders):
+            for second in holders[i + 1:]:
+                if (first.issue, first.unit) == (second.issue, second.unit):
+                    continue
+                _require_package_sharing(package_name, first, second, sharing, prereq_map, integration_owners)
 
     # Check descriptor requirements and write scope overlaps
     assigned_descriptors: List[c.WorkUnitDescriptor] = []
@@ -252,11 +430,11 @@ def materialize_catalogue(
         if r.disposition is c.CatalogueDisposition.ASSIGNED:
             if r.descriptor is None:
                 raise CohortError(CohortProblem.MISSING_DESCRIPTOR, f"assigned row #{r.issue.number} missing descriptor")
-            validate_descriptor_scope(r.descriptor)
+            validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
             assigned_descriptors.append(r.descriptor)
         elif r.disposition is c.CatalogueDisposition.PLANNED:
             if r.descriptor is not None:
-                validate_descriptor_scope(r.descriptor)
+                validate_descriptor_scope(r.descriptor, integration_owners=integration_owners)
         elif r.disposition is c.CatalogueDisposition.SUPERSEDED and r.descriptor is not None:
             # A superseded historical row is a terminal record: #843 accepts no
             # implementation evidence ("Superseded source donor only") and #859
@@ -272,7 +450,6 @@ def materialize_catalogue(
 
     # Check concurrent write scope overlap among assigned descriptors
     # Overlap is permitted only if one is explicitly declared as a prerequisite of the other
-    prereq_map: Dict[int, Set[int]] = {r.issue.number: set(p.number for p in r.prerequisites) for r in rows}
     for i, d1 in enumerate(assigned_descriptors):
         for d2 in assigned_descriptors[i + 1:]:
             if check_write_scope_overlap(d1, d2):
@@ -359,40 +536,119 @@ def materialize_cohort_receipt(
     return receipt
 
 
+# Closed named-inventory class under .github/work-units: artifacts that are
+# never parsed as numeric executable descriptors. Any other non-numeric TOML
+# artifact is unexpected and fails closed.
+ALLOWED_NAMED_INVENTORY = frozenset({
+    "context-measurement-inventory.toml",
+    "context-measurement-owner-map.toml",
+    "long-lived-collection-inventory.toml",
+})
+
+
+class DescriptorDiscoveryStatus(str, Enum):
+    """Typed discovery outcome. Only OBSERVED (even when empty) may validate
+    against a lock; MISSING and UNREADABLE are distinct non-evidence."""
+
+    OBSERVED = "observed"
+    MISSING = "missing"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class DescriptorDiscovery:
+    """Single closed discovery rule result for the work-units directory."""
+
+    status: DescriptorDiscoveryStatus
+    files: Tuple[Tuple[int, str], ...] = ()
+
+
+def discover_work_units(work_units_dir: Path | str) -> DescriptorDiscovery:
+    """Discover the work-units directory under one closed rule.
+
+    Returns OBSERVED with the exact numeric descriptor class (sorted
+    (issue_number, filename) pairs, possibly empty for an observed-empty
+    directory), or MISSING/UNREADABLE when the directory cannot be listed.
+    Rejects unknown extra TOML artifacts, noncanonical numeric names and
+    duplicate numeric identities; named inventory artifacts in
+    ALLOWED_NAMED_INVENTORY are accepted as non-members. Pure (no network,
+    subprocess or mutation); unreadable entries fail closed as UNREADABLE.
+    """
+    base = work_units_dir if isinstance(work_units_dir, Path) else Path(work_units_dir)
+    try:
+        if not os.path.lexists(base):
+            return DescriptorDiscovery(DescriptorDiscoveryStatus.MISSING)
+    except (OSError, ValueError):
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "work-units discovery unavailable") from None
+    try:
+        children = sorted(base.iterdir(), key=lambda p: p.name)
+    except OSError:
+        try:
+            if not os.path.lexists(base):
+                return DescriptorDiscovery(DescriptorDiscoveryStatus.MISSING)
+        except (OSError, ValueError):
+            pass
+        return DescriptorDiscovery(DescriptorDiscoveryStatus.UNREADABLE)
+    found: List[Tuple[int, str]] = []
+    seen: Set[int] = set()
+    for child in children:
+        try:
+            if not child.is_file() or child.suffix != ".toml":
+                continue
+        except OSError:
+            return DescriptorDiscovery(DescriptorDiscoveryStatus.UNREADABLE)
+        stem = child.stem
+        if stem in ALLOWED_NAMED_INVENTORY:
+            continue
+        if _RE_NUMERIC_STEM.fullmatch(stem) is None:
+            raise CohortError(
+                CohortProblem.UNEXPECTED_DESCRIPTOR,
+                f"unknown work-units artifact: {child.name}",
+            )
+        try:
+            num = int(stem)
+        except Exception:
+            raise CohortError(
+                CohortProblem.FILENAME_MISMATCH,
+                f"noncanonical numeric descriptor name: {child.name}",
+            ) from None
+        if num <= 0 or str(num) != stem:
+            raise CohortError(
+                CohortProblem.FILENAME_MISMATCH,
+                f"noncanonical numeric descriptor name: {child.name}",
+            )
+        if num in seen:
+            raise CohortError(
+                CohortProblem.DUPLICATE_ISSUE,
+                f"duplicate numeric descriptor identity: {num}",
+            )
+        seen.add(num)
+        found.append((num, child.name))
+    return DescriptorDiscovery(DescriptorDiscoveryStatus.OBSERVED, tuple(found))
+
+
 def discover_numeric_descriptor_files(work_units_dir: Path | str) -> Tuple[Tuple[int, str], ...]:
     """Discover the exact numeric descriptor class under .github/work-units.
 
     Closed rule, single owner (#852): only regular files named <number>.toml
-    whose stem is all digits decoding to a positive issue number are members.
+    whose stem is the canonical decimal of a positive issue number are members.
     Named inventory artifacts and any other spelling are never members.
     Returns (issue_number, filename) pairs sorted by filename.
 
-    A missing or unreadable directory yields the empty class; discovery alone
-    claims no integrity. The verdict always comes from comparing this class
-    (and the recomputed aggregate digest) against the committed lock in
-    verify_cohort_lock, which fails closed on any mismatch.
+    Only an OBSERVED directory (even when empty) yields a class. A missing or
+    unreadable directory raises INCOMPLETE_SNAPSHOT: an observed-empty
+    directory, a missing directory and an unreadable directory are not the
+    same evidence, and none of the latter two may validate as an empty class.
+    The verdict always comes from comparing this class (and the recomputed
+    aggregate digest) against the committed lock in verify_cohort_lock, which
+    fails closed on any mismatch.
     """
-    try:
-        base = work_units_dir if isinstance(work_units_dir, Path) else Path(work_units_dir)
-        if not base.is_dir():
-            return ()
-        found: List[Tuple[int, str]] = []
-        for child in sorted(base.iterdir(), key=lambda p: p.name):
-            if not child.is_file() or child.suffix != ".toml":
-                continue
-            stem = child.stem
-            if _RE_NUMERIC_STEM.fullmatch(stem) is None:
-                continue
-            try:
-                num = int(stem)
-            except Exception:
-                continue
-            if num <= 0:
-                continue
-            found.append((num, child.name))
-        return tuple(found)
-    except Exception:
-        return ()
+    discovery = discover_work_units(work_units_dir)
+    if discovery.status is DescriptorDiscoveryStatus.OBSERVED:
+        return discovery.files
+    if discovery.status is DescriptorDiscoveryStatus.MISSING:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "work-units directory is missing")
+    raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "work-units directory is unreadable")
 
 
 # Closed lock shape (.github/work-unit-cohort.toml). Unknown tables or keys
@@ -444,6 +700,16 @@ class CohortLock:
     repository_name: str
     rows: Tuple[CohortLockRow, ...]
     aggregate: CohortLockAggregate
+    # Retained authoritative snapshot identity: exact base/source revision,
+    # acquisition receipt and coverage/movement context. Provenance stays
+    # outside the hashed aggregate payload (canonical serialization unchanged),
+    # but verification binds it via verify_lock_currency instead of discarding it.
+    base_commit: str
+    acquired_at: str
+    acquisition: str
+    note: str
+    acquired_at_historical: Optional[str] = None
+    acquisition_historical: Optional[str] = None
 
 
 def _lock_int(value: object, field: str, *, minimum: int = 0) -> int:
@@ -551,6 +817,15 @@ def read_cohort_lock(lock_path: Path | str) -> CohortLock:
     base_commit = _lock_text(provenance["base_commit"], "provenance.base_commit")
     if _RE_GIT_SHA.fullmatch(base_commit) is None:
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock base commit is not a git SHA")
+    acquired_at = _lock_text(provenance["acquired_at"], "provenance.acquired_at")
+    acquisition = _lock_text(provenance["acquisition"], "provenance.acquisition")
+    note = _lock_text(provenance["note"], "provenance.note")
+    acquired_at_historical = provenance.get("acquired_at_historical")
+    if acquired_at_historical is not None:
+        acquired_at_historical = _lock_text(acquired_at_historical, "provenance.acquired_at_historical")
+    acquisition_historical = provenance.get("acquisition_historical")
+    if acquisition_historical is not None:
+        acquisition_historical = _lock_text(acquisition_historical, "provenance.acquisition_historical")
     for key in ("acquired_at", "acquisition", "note", "acquired_at_historical", "acquisition_historical"):
         if key in provenance:
             _lock_text(provenance[key], f"provenance.{key}")
@@ -560,6 +835,12 @@ def read_cohort_lock(lock_path: Path | str) -> CohortLock:
         repository_owner=repo.owner,
         repository_name=repo.name,
         rows=tuple(rows),
+        base_commit=base_commit,
+        acquired_at=acquired_at,
+        acquisition=acquisition,
+        note=note,
+        acquired_at_historical=acquired_at_historical,
+        acquisition_historical=acquisition_historical,
         aggregate=CohortLockAggregate(
             issues=issues_t,
             numeric_descriptors=numeric_t,
@@ -575,6 +856,92 @@ def read_cohort_lock(lock_path: Path | str) -> CohortLock:
     )
 
 
+def verify_lock_currency(
+    lock: CohortLock,
+    *,
+    expected_base_commit: Optional[str] = None,
+    expected_repository: Optional[c.RepositoryIdentity] = None,
+) -> bool:
+    """Verify the retained authoritative snapshot identity of a cohort lock.
+
+    Compares the lock's exact base/source revision and repository against the
+    caller-supplied current values. A stale base or a moved source is
+    invalidation (INVALID_AGGREGATE_LOCK), never a valid self-consistent
+    catalogue: issue bodies, matrices, dispositions, predecessors and accepted
+    replacements may have moved while the lock stayed internally consistent.
+    Only supplied expectations are checked; unsupplied dimensions are not
+    assumed. Pure: no network, subprocess or mutation.
+    """
+    if type(lock) is not CohortLock:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "cohort lock mistyped")
+    if expected_base_commit is not None:
+        if type(expected_base_commit) is not str or _RE_GIT_SHA.fullmatch(expected_base_commit) is None:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "expected base commit is not a git SHA")
+        if lock.base_commit != expected_base_commit:
+            raise CohortError(
+                CohortProblem.INVALID_AGGREGATE_LOCK,
+                f"stale lock base {lock.base_commit} is not current {expected_base_commit}",
+            )
+    if expected_repository is not None:
+        if type(expected_repository) is not c.RepositoryIdentity:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "expected repository mistyped")
+        if lock.repository_owner != expected_repository.owner or lock.repository_name != expected_repository.name:
+            raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock repository moved")
+    return True
+
+
+def verify_assignment_binding(
+    lock: CohortLock,
+    assigned_descriptors: Optional[Mapping[int, c.WorkUnitDescriptor]] = None,
+    assignment_receipts: Optional[Mapping[int, c.AssignmentSourceReceipt]] = None,
+) -> bool:
+    """Rebind every lock row to its live or explicitly admitted offline receipt.
+
+    Compares the retained row identity (issue, unit, body digest) against the
+    caller-supplied AssignmentSourceReceipt for that issue, and additionally
+    the matrix digest/count through the bound typed descriptor when one is
+    supplied. Any row meaning change fails with STALE_MIRROR_BINDING. An
+    assigned row with no receipt, when receipts were admitted for this
+    verification, is incomplete (INCOMPLETE_SNAPSHOT), not valid. Rows without
+    a supplied receipt are left to lock-internal verification; absence of an
+    admitted receipt set never fabricates one. Pure: no network, subprocess
+    or mutation.
+    """
+    if type(lock) is not CohortLock:
+        raise CohortError(CohortProblem.INTERNAL_ERROR, "cohort lock mistyped")
+    supplied = dict(assigned_descriptors) if assigned_descriptors else {}
+    receipts = dict(assignment_receipts) if assignment_receipts else {}
+    for entry in lock.rows:
+        descriptor = supplied.get(entry.issue)
+        if descriptor is not None and type(descriptor) is not c.WorkUnitDescriptor:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "supplied assigned descriptor mistyped")
+        receipt = receipts.get(entry.issue)
+        if receipt is not None and type(receipt) is not c.AssignmentSourceReceipt:
+            raise CohortError(CohortProblem.INTERNAL_ERROR, "supplied assignment receipt mistyped")
+        if receipt is None:
+            if entry.disposition == c.CatalogueDisposition.ASSIGNED.value and receipts:
+                raise CohortError(
+                    CohortProblem.INCOMPLETE_SNAPSHOT,
+                    f"assigned row #{entry.issue} has no assignment receipt",
+                )
+            continue
+        if (receipt.issue.number != entry.issue or receipt.unit.value != entry.unit
+                or receipt.body_sha256 != entry.body_sha256):
+            raise CohortError(
+                CohortProblem.STALE_MIRROR_BINDING,
+                f"lock row #{entry.issue} moved against its assignment receipt",
+            )
+        if descriptor is not None and (
+            descriptor.matrix_sha256 != receipt.matrix_sha256
+            or descriptor.matrix_cases != receipt.matrix_cases
+        ):
+            raise CohortError(
+                CohortProblem.STALE_MIRROR_BINDING,
+                f"lock row #{entry.issue} matrix moved against its assignment receipt",
+            )
+    return True
+
+
 def locked_catalogue_rows(
     lock_path: Path | str,
     discovered: Optional[Mapping[int, c.WorkUnitDescriptor]] = None,
@@ -587,16 +954,30 @@ def locked_catalogue_rows(
     actually declares, bound to the caller's freshly decoded descriptor when
     one exists for that issue.
 
-    Without a lock the projection is empty: a root that ships no lock has
-    declared no row, no disposition and no prerequisite edge, and the caller
-    keeps its own discovered denominator unchanged. Prerequisite edges are
-    never dropped here; a row that declares a prerequisite keeps it so the
-    selected plan can demand the matching accepted evidence.
+    A missing lock declares nothing and projects to the empty mapping: a root
+    that ships no lock has declared no row, no disposition and no prerequisite
+    edge, and the caller keeps its own discovered denominator unchanged. An
+    existing lock that is malformed, unreadable or digest-invalid instead
+    propagates INVALID_AGGREGATE_LOCK; it never becomes `{}`. Present-but-
+    unusable paths (directory, broken link, special file) are invalid, not
+    missing. Prerequisite edges are never dropped here; a row that declares a
+    prerequisite keeps it so the selected plan can demand the matching
+    accepted evidence.
     """
+    path = lock_path if isinstance(lock_path, Path) else Path(lock_path)
     try:
-        lock = read_cohort_lock(lock_path)
+        if not path.is_file():
+            if os.path.lexists(path):
+                raise CohortError(
+                    CohortProblem.INVALID_AGGREGATE_LOCK,
+                    "cohort lock path is present but not a regular file",
+                )
+            return {}
     except CohortError:
-        return {}
+        raise
+    except (OSError, ValueError):
+        raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock stat failed") from None
+    lock = read_cohort_lock(path)
     supplied = dict(discovered) if discovered else {}
     rows: Dict[int, c.CatalogueRow] = {}
     try:
@@ -624,19 +1005,33 @@ def verify_cohort_lock(
     lock_path: Path | str,
     work_units_dir: Path | str,
     assigned_descriptors: Optional[Mapping[int, c.WorkUnitDescriptor]] = None,
+    *,
+    expected_base_commit: Optional[str] = None,
+    expected_repository: Optional[c.RepositoryIdentity] = None,
+    assignment_receipts: Optional[Mapping[int, c.AssignmentSourceReceipt]] = None,
 ) -> c.CatalogueIntegrityReceipt:
     """Verify the committed aggregate lock against freshly discovered state.
 
     Re-discovers the exact numeric descriptor class from the work-units
-    directory, rebuilds every catalogue row (assigned rows bound to the
-    caller-supplied typed descriptors), re-materializes the catalogue, and
-    compares the recomputed aggregate sha256 against the lock's [aggregate]
-    sha256. Any mismatch fails closed with INVALID_AGGREGATE_LOCK (or the
-    precise structural problem); the lock is never trusted on its own bytes.
+    directory (missing/unreadable fails closed with INCOMPLETE_SNAPSHOT, never
+    validates as empty), rebinds every catalogue row to the caller-supplied
+    typed descriptors and assignment receipts, re-materializes the catalogue,
+    and compares the recomputed aggregate sha256 against the lock's
+    [aggregate] sha256. When a current base commit or repository is supplied,
+    the retained lock provenance must match it: a stale base or moved source
+    is invalidation, even when the lock is internally self-consistent. Any
+    mismatch fails closed with INVALID_AGGREGATE_LOCK (or the precise
+    structural problem); the lock is never trusted on its own bytes.
     """
     lock = read_cohort_lock(lock_path)
     if lock.schema_version != SCHEMA_REVISION:
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, "cohort lock schema revision mismatch")
+    if expected_base_commit is not None or expected_repository is not None:
+        verify_lock_currency(
+            lock,
+            expected_base_commit=expected_base_commit,
+            expected_repository=expected_repository,
+        )
     discovered = sorted(num for num, _ in discover_numeric_descriptor_files(work_units_dir))
     if discovered != list(lock.aggregate.numeric_descriptors):
         raise CohortError(
@@ -668,6 +1063,8 @@ def verify_cohort_lock(
         raise
     except c.ContractViolation as exc:
         raise CohortError(CohortProblem.INVALID_AGGREGATE_LOCK, str(exc)) from exc
+    if assignment_receipts is not None:
+        verify_assignment_binding(lock, supplied, assignment_receipts)
     receipt = materialize_catalogue(rows, expected, expected_cases=lock.aggregate.matrix_cases)
 
     counted = {"assigned": 0, "blocked": 0, "planned": 0, "nonexecutable": 0,
@@ -686,7 +1083,18 @@ def verify_cohort_lock(
 
 
 def validate_snapshot_completeness(snapshot: dict) -> None:
-    """Verify that an assignment snapshot is complete and non-truncated."""
+    """Verify that an assignment snapshot is complete and non-truncated.
+
+    Beyond the header completeness flag and missing sections, a snapshot that
+    claims completeness must bind the repository identity, the exact
+    base/source revision, and an acquisition receipt, and must carry
+    coverage/pagination evidence with no reported movement or inconsistency.
+    Declared counts must match their observed object lists. Unresolved
+    coverage is incomplete, not zero findings. Pure: no network, subprocess
+    or mutation.
+    """
+    if type(snapshot) is not dict:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot is not a mapping")
     header = snapshot.get("header")
     if not isinstance(header, dict):
         raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "missing snapshot header")
@@ -697,6 +1105,27 @@ def validate_snapshot_completeness(snapshot: dict) -> None:
             CohortProblem.INCOMPLETE_SNAPSHOT,
             f"snapshot has missing sections: {header.get('missing_sections')}"
         )
+    repository = header.get("repository")
+    if type(repository) is not str or not repository:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot lacks repository identity")
+    base_revision = header.get("base_revision", header.get("base_commit"))
+    if type(base_revision) is not str or _RE_GIT_SHA.fullmatch(base_revision) is None:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot lacks exact base revision")
+    if not header.get("acquisition") and not header.get("acquired_at"):
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot lacks acquisition receipt")
+    if header.get("moved") is True or header.get("inconsistent") is True:
+        raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot reports movement or inconsistency")
+    pagination = header.get("pagination")
+    if pagination is not None:
+        if type(pagination) is not dict or pagination.get("complete") is not True:
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot pagination incomplete")
+    for count_key, items_key in (("issue_count", "issues"), ("object_count", "objects")):
+        count = header.get(count_key)
+        items = header.get(items_key)
+        if count is None and items is None:
+            continue
+        if type(count) is not int or count < 0 or type(items) is not list or len(items) != count:
+            raise CohortError(CohortProblem.INCOMPLETE_SNAPSHOT, "snapshot coverage and count mismatch")
 
 
 def is_real_repository_root(candidate: Path) -> bool:

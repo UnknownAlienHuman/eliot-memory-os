@@ -230,26 +230,37 @@ enum CampaignPacketGapCode {
     ///   copy in the recipe body. The missing owner is the admission-rule record
     ///   I12.13's `admission_and_suppression_policy` names as "owner
     ///   references, not copies"; no such record is read or published here.
-    /// - `MeasurementCompositionProfile` — ABSENT. It needs a serializer
-    ///   identity and version, a serializer-options digest, a route id and a
-    ///   model id. I2.16 places those on `SerializedContextMeasurement`, whose
-    ///   own inputs are caller-owned `MeasurementParams`; no route in this tree
-    ///   issues that record, and the Context owner body carries none of these
-    ///   fields.
+    /// - `MeasurementCompositionProfile` — STILL ABSENT, and now for a narrower
+    ///   reason. Its serializer identity, serializer version and
+    ///   serializer-options digest are no longer missing: they are owner-issued
+    ///   by `eliot_context_contracts::canonical_render_serializer`, the Context
+    ///   contracts crate that owns the canonical rendered payload and
+    ///   `CONTEXT_CONTRACT_VERSION`, and it names the codec this lane really
+    ///   measures with — `eliot_contracts::canonical_json_bytes` over that
+    ///   payload — not a frame codec. What is still absent is the rest of the
+    ///   record: `profile_id`, `route_id`, `model_id`, the aggregation mode, the
+    ///   qualification identity and the capacity envelope have no owner on this
+    ///   route, so the profile still has zero production construction sites.
+    ///   `PacketAdmissionBundle::build` now refuses any profile whose identity
+    ///   half is not that owner record, which makes the admission cell's
+    ///   serializer equality a statement about a real codec instead of two
+    ///   caller strings.
     /// - `AdmissionMeasurement` (per candidate atom/representation) — ABSENT.
     ///   `AdmissionInput::validate` forces these to equal the candidate atom set
     ///   exactly, and each names the candidate's own subject and measurement
     ///   digests, so no record can exist before the candidate stage produces
     ///   that set. None of the seven role projections has a production owner on
     ///   this route, so the set they would be keyed by does not exist.
-    /// - `AssemblyPolicy` — ABSENT, for the same missing serializer/route/model
-    ///   identity as the measurement profile, plus a route byte ceiling no owner
-    ///   publishes for this packet.
+    /// - `AssemblyPolicy` — STILL ABSENT. Its serializer triple is bound to the
+    ///   same owner record before any byte is rendered, but its route identity,
+    ///   model identity and route byte ceiling still have no owner on this
+    ///   route, so the policy itself has zero production construction sites.
     /// - the twelve-dimension `QualityScorecard`, the seven-role
     ///   `SevenRoleInputs`, the `CandidatePolicy` and the measurement callback —
-    ///   ABSENT for the same reason: each needs owner evidence (per-dimension
-    ///   rule revision and observed evidence, role acquisitions, a route
-    ///   serializer identity) that has no producer on this route.
+    ///   ABSENT. `CandidatePolicy::serializer` is now bound to the same owner
+    ///   record too, but the policy's own bounds have no producer here, and the
+    ///   card still needs owner evidence (per-dimension rule revision and
+    ///   observed evidence) that has no producer on this route.
     ///
     /// The composition's own shape is no longer part of the obstacle:
     /// `KernelContextReadClient::compile_context_packet` now takes the

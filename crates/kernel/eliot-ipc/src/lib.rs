@@ -440,6 +440,68 @@ pub fn lifecycle_event_envelope(frame: &Frame) -> Result<EventEnvelope, Transpor
     }
 }
 
+/// Outcome of dispatching one lifecycle `Event` frame against the
+/// receiver's event-identity ledger.
+///
+/// Both variants carry the validated envelope under its original identity:
+/// a duplicate re-emits the standing acknowledgement without minting a new
+/// logical event and must never trigger a second canonical application.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LifecycleEventDispatch {
+    /// First receipt of this event identity. The durable owner persists
+    /// identity, sequence, disposition, source handle, retry route and
+    /// causal linkage before advancing any cursor.
+    New(EventEnvelope),
+    /// The same identity, sequence and content was already observed: an
+    /// idempotent duplicate, not a second event.
+    Duplicate(EventEnvelope),
+}
+
+/// Routes one lifecycle `Event` frame through the `EventEnvelope`
+/// replay/ack contract (I7.2 frame envelope, I7.4 lifecycle `Event`).
+///
+/// The frame must carry the envelope via [`lifecycle_event_envelope`]: a
+/// non-`Event` kind/message or a payload that is not an envelope is rejected
+/// explicitly and never interpreted as a generic command. An envelope whose
+/// payload type no known producer mints is rejected via
+/// [`EventEnvelope::require_known_payload_type`] without minting a new event
+/// identity. An already-observed identity, sequence and content reports
+/// [`LifecycleEventDispatch::Duplicate`]; nothing is staged twice.
+///
+/// The returned envelope is validated but not staged: persistence, receipt
+/// phases and cursor advancement remain owned by the receiver's durable
+/// owner, which also retains the presented identity, source handle and
+/// retry route for rejected events.
+///
+/// # Errors
+///
+/// Returns a protocol error for invalid frames, for JSON that does not
+/// encode an `EventEnvelope`, for non-lifecycle-`Event` frames, for unknown
+/// payload types, and for an identity conflict under a previously observed
+/// event identity.
+pub fn dispatch_lifecycle_event(
+    frame: &Frame,
+    seen: &mut eliot_protocol::ReplayLedger,
+) -> Result<LifecycleEventDispatch, TransportError> {
+    let envelope = lifecycle_event_envelope(frame)?;
+    envelope.require_known_payload_type()?;
+    match seen.observe(&envelope)? {
+        eliot_protocol::EventDisposition::Accepted => Ok(LifecycleEventDispatch::New(envelope)),
+        eliot_protocol::EventDisposition::Duplicate => {
+            Ok(LifecycleEventDispatch::Duplicate(envelope))
+        }
+        // `observe` surfaces a same-identity content mismatch as
+        // `ReplayConflict`; this arm only fires if the ledger's reported
+        // disposition set widens, and refuses it as a conflict rather than
+        // a second application.
+        eliot_protocol::EventDisposition::Conflict | eliot_protocol::EventDisposition::Rejected => {
+            Err(TransportError::Protocol(
+                eliot_protocol::ProtocolError::ReplayConflict,
+            ))
+        }
+    }
+}
+
 /// Transport failures are deliberately distinct from application outcomes.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransportError {
@@ -1893,11 +1955,16 @@ impl ReplayLedger {
     }
 }
 
-/// Cancellation state is explicit and reapable; it never revives a fenced work item.
+/// Cancellation state is explicit and reapable; the first terminal wins and
+/// never revives a fenced work item. `Cancelled` records an explicit
+/// `Cancel`; `Expired` records a deadline expiry. Entries persist until
+/// `reap`/`reap_bound`, so the recorded disposition survives retries and
+/// reconnects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CancellationState {
     Active,
     Cancelled,
+    Expired,
     Reaped,
 }
 
@@ -1939,16 +2006,57 @@ impl CancellationRegistry {
     }
     pub fn reap(&mut self, id: &str) -> Result<(), TransportError> {
         match self.entries.get_mut(id) {
-            Some(state @ CancellationState::Cancelled) => {
+            Some(state @ (CancellationState::Cancelled | CancellationState::Expired)) => {
                 *state = CancellationState::Reaped;
                 Ok(())
             }
             _ => Err(TransportError::UnknownRequest),
         }
     }
+    /// Idempotent application point for an incoming lifecycle `Cancel` frame
+    /// keyed by its `RequestIdentity.cancellation_id` (lifecycle dispatcher
+    /// caller). Unlike [`Self::cancel`], a retried `Cancel` observes the
+    /// recorded terminal as [`CancellationDisposition::Duplicate`] instead of
+    /// an error, and an unregistered identity reports
+    /// [`CancellationDisposition::Unknown`] without minting state, so the
+    /// disposition is stable across retries and reconnects.
+    pub fn cancel_stable(&mut self, id: &str) -> CancellationDisposition {
+        match self.entries.get_mut(id) {
+            Some(state @ CancellationState::Active) => {
+                *state = CancellationState::Cancelled;
+                CancellationDisposition::New
+            }
+            Some(_) => CancellationDisposition::Duplicate,
+            None => CancellationDisposition::Unknown,
+        }
+    }
+    /// Records a deadline expiry for a registered identity as the terminal
+    /// [`CancellationState::Expired`] outcome (deadline watcher caller). The
+    /// first terminal wins: an explicitly cancelled or already expired entry
+    /// keeps its recorded state and reports
+    /// [`CancellationDisposition::Duplicate`], so a deadline-expired request
+    /// stays distinguishable from an explicit cancellation across retries.
+    pub fn expire(&mut self, id: &str) -> CancellationDisposition {
+        match self.entries.get_mut(id) {
+            Some(state @ CancellationState::Active) => {
+                *state = CancellationState::Expired;
+                CancellationDisposition::New
+            }
+            Some(_) => CancellationDisposition::Duplicate,
+            None => CancellationDisposition::Unknown,
+        }
+    }
     #[must_use]
     pub fn state(&self, id: &str) -> Option<CancellationState> {
         self.entries.get(id).copied()
+    }
+    /// Non-mutating observer for a bound entry's recorded disposition
+    /// (lifecycle dispatcher caller). Observing never advances state, so
+    /// retries and reconnects read back the same terminal recorded by
+    /// `cancel_bound`/`expire_bound` until an explicit `reap_bound`.
+    #[must_use]
+    pub fn state_bound(&self, identity: &BoundIdentity) -> Option<CancellationState> {
+        self.bound_entries.get(identity).map(|(_, state)| *state)
     }
 
     fn capacity(&self) -> usize {
@@ -2001,16 +2109,41 @@ impl CancellationRegistry {
                 *state = CancellationState::Cancelled;
                 CancellationDisposition::New
             }
-            Some((_, CancellationState::Cancelled | CancellationState::Reaped)) => {
-                CancellationDisposition::Duplicate
+            Some((
+                _,
+                CancellationState::Cancelled
+                | CancellationState::Expired
+                | CancellationState::Reaped,
+            )) => CancellationDisposition::Duplicate,
+            None => CancellationDisposition::Unknown,
+        }
+    }
+
+    /// Records a deadline expiry for a bound identity as the terminal
+    /// [`CancellationState::Expired`] outcome (deadline watcher caller). The
+    /// first terminal wins: an explicitly cancelled or already expired entry
+    /// keeps its recorded state and reports
+    /// [`CancellationDisposition::Duplicate`], so a deadline-expired request
+    /// stays distinguishable from an explicit cancellation across retries.
+    pub fn expire_bound(&mut self, identity: &BoundIdentity) -> CancellationDisposition {
+        match self.bound_entries.get_mut(identity) {
+            Some((_, state @ CancellationState::Active)) => {
+                *state = CancellationState::Expired;
+                CancellationDisposition::New
             }
+            Some((
+                _,
+                CancellationState::Cancelled
+                | CancellationState::Expired
+                | CancellationState::Reaped,
+            )) => CancellationDisposition::Duplicate,
             None => CancellationDisposition::Unknown,
         }
     }
 
     pub fn reap_bound(&mut self, identity: &BoundIdentity) -> CancellationDisposition {
         match self.bound_entries.get_mut(identity) {
-            Some((_, state @ CancellationState::Cancelled)) => {
+            Some((_, state @ (CancellationState::Cancelled | CancellationState::Expired))) => {
                 *state = CancellationState::Reaped;
                 CancellationDisposition::New
             }

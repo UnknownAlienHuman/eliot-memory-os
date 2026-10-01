@@ -90,7 +90,7 @@ use eliot_context_contracts::{
     ContextRecipe, DecisionContextIncomplete, DownstreamHeadroomRequest, DownstreamHeadroomResult,
     HeadroomAllocationLedger, MeasurementCompositionProfile, PriorityPolicyIdentity, ProviderId,
     QualityRefusal, QualityScorecard, SafetyFloorIdentity, SerializedContextMeasurement,
-    SuppliedOmissionBinding,
+    SuppliedOmissionBinding, canonical_render_serializer,
 };
 use eliot_contracts::{
     ArtifactId, ClockReading, ProductId, RequestId, RequestMetadata, SourceId, StateFence,
@@ -736,15 +736,31 @@ impl KernelContextReadClient {
     /// plan — travels end to end: per-role provider failures become
     /// per-role dispositions inside [`SevenRoleInputs`], while a bad request,
     /// a missing closure, or observed source churn fails the whole call as
-    /// [`ContextInputsError`]. The daemon state/packet dispatch invokes this
-    /// edge with the admitted pair's fence, scope, and selectors; this
-    /// function performs no admission decision and no consistency algorithm
-    /// of its own.
+    /// [`ContextInputsError`]. Before any role is acquired, the read owner's
+    /// own declared surface is resolved once
+    /// (`eliot_read::owner_inventory::read_owner_inventory`), so an owner
+    /// whose Store-dependency inventory no longer resolves fails the whole call
+    /// as [`ContextInputsError::ReadOwnerSurfaceUnresolved`] instead of
+    /// serving reads under an unverified declared surface. The daemon
+    /// state/packet dispatch invokes this edge with the admitted pair's fence,
+    /// scope, and selectors; this function performs no admission decision and
+    /// no consistency algorithm of its own.
     pub async fn reconstruct_context_inputs(
         &self,
         ctx: &RequestMetadata,
         request: &ContextReconstructionRequest,
     ) -> Result<SevenRoleInputs, ContextInputsError> {
+        // The read owner's declared surface is resolved BEFORE any role is
+        // acquired, once per reconstruction rather than once per read. This is
+        // the only place the aggregate inventory is resolved, and it is
+        // deliberately on the production edge: the Store-dependency set in it
+        // is derived from the owner's own import surface, so a dependency the
+        // owner gained (or a row it kept after losing one) fails this call with
+        // the symbol's name instead of being reported as a complete inventory
+        // that nothing ever checks. It creates no state and no freshness; it
+        // is still not evidence that any read executed.
+        eliot_read::owner_inventory::read_owner_inventory()
+            .map_err(|error| ContextInputsError::ReadOwnerSurfaceUnresolved(error.to_string()))?;
         let service = ReadService::new(Self {
             kernel: Arc::clone(&self.kernel),
         });
@@ -1508,6 +1524,16 @@ impl PacketAdmissionBundle {
         measurement_profile
             .validate()
             .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
+        // The admission cell compares every `AdmissionMeasurementBinding`'s
+        // serializer triple against this profile's own. That comparison is
+        // only a real check when the profile names the codec the Context render
+        // owner published, so the identity half is bound to that owner record
+        // here, where the profile enters the composition. Neither side is
+        // defaulted or substituted: a profile naming any other codec is refused
+        // with the owner's typed `ContextError`.
+        measurement_profile
+            .binds_canonical_render_serializer()
+            .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
         if floor.decision.decision_id != binding.decision_id
             || priority.decision.decision_id != binding.decision_id
             || rule.decision.decision_id != binding.decision_id
@@ -1764,6 +1790,16 @@ impl KernelContextReadClient {
             now_ms: observed_now_ms,
         };
         validate_composition_inputs(request, recipe, policy, floor)?;
+        // `measurement::verify` compares the injected measurement's serializer
+        // triple against this policy's own, so the policy is bound to the codec
+        // the Context render owner published before any byte is rendered. The
+        // check is the owner's own and adds a relation; it removes none.
+        require_context_render_codec(
+            &assembly.serializer_id,
+            &assembly.serializer_version,
+            &assembly.serializer_options_digest,
+        )
+        .map_err(|error| PacketCompositionError::Assembly(Box::new(AssemblyError::from(error))))?;
         Self::require_campaign_view_for_admission(
             request,
             campaign_view,
@@ -1859,6 +1895,14 @@ impl KernelContextReadClient {
 /// candidate request, recipe, candidate policy, then the admission floor. Each
 /// failure crosses as the same typed variant its owner raised, so no input is
 /// validated later than it was and none is skipped.
+///
+/// The candidate cell compares every supplied `MeasurementRef::serializer`
+/// against `CandidatePolicy::serializer`, and the admission closure then forces
+/// each `AdmissionMeasurementBinding`'s serializer identity to equal the
+/// profile's, so those two declarations already have to name one another. This
+/// function binds both of them to the codec the Context render owner published,
+/// which is what makes that agreement a statement about a real codec instead of
+/// two caller strings agreeing with each other.
 fn validate_composition_inputs(
     request: &CandidateRequest,
     recipe: &ContextRecipe,
@@ -1874,10 +1918,42 @@ fn validate_composition_inputs(
     policy
         .validate()
         .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
+    require_context_render_codec_id(&policy.serializer)
+        .map_err(|error| PacketCompositionError::Candidates(Box::new(error)))?;
     floor
         .validate()
         .map_err(|error| PacketCompositionError::Admission(Box::new(error)))?;
     Ok(())
+}
+
+/// Require one declaration to name the codec the Context render owner published.
+///
+/// The owner record is the Context contracts' own
+/// `canonical_render_serializer`: it names `eliot_contracts::canonical_json_bytes`
+/// over the canonical rendered payload under `CONTEXT_CONTRACT_VERSION`, which
+/// is the codec `eliot-context-assembly` actually runs to produce the bytes
+/// `measure_exact_utf8` measures and `measurement::verify` compares. Both sides
+/// are compared as recorded and nothing is defaulted here.
+fn require_context_render_codec_id(serializer_id: &str) -> Result<(), ContextError> {
+    let owner = canonical_render_serializer()?;
+    owner.binds(
+        serializer_id,
+        owner.serializer_version(),
+        owner.serializer_options_digest(),
+    )
+}
+
+/// Require one serializer triple to be the owner-issued canonical render codec.
+fn require_context_render_codec(
+    serializer_id: &str,
+    serializer_version: &str,
+    serializer_options_digest: &str,
+) -> Result<(), ContextError> {
+    canonical_render_serializer()?.binds(
+        serializer_id,
+        serializer_version,
+        serializer_options_digest,
+    )
 }
 
 /// Rechecks the assembled packet against the reservation it was compiled under.

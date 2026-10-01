@@ -218,11 +218,12 @@ pub enum InquiryError {
     /// proves is blocked. A debt that is resolved, or one whose claim class
     /// this disposition does not name, does not raise this error.
     ///
-    /// MEASURED REACHABILITY, stated so this is not mistaken for live
-    /// enforcement: on the `InquiryGovernance::record` path this error CANNOT
-    /// fire today, and the reason is structural rather than accidental. The
-    /// only disposition `terminal_disposition` can return that any debt
-    /// refuses is `ANSWERED_WITH_SUPPORTED_RESULT`, and reaching it requires
+    /// MEASURED REACHABILITY **at this site**, stated so it is not mistaken for
+    /// the whole of the I21.12 enforcement: at the terminal disposition this
+    /// error CANNOT fire on the `InquiryGovernance::record` path, and the reason
+    /// is structural rather than accidental. The only disposition
+    /// `terminal_disposition` can return that any debt refuses is
+    /// `ANSWERED_WITH_SUPPORTED_RESULT`, and reaching it requires
     /// `outcome == Completed` with an intact denominator. A completed run
     /// contributes no `provider_degradation` (so no `Verification` debt) and
     /// leaves no open member (so no `Coverage` debt); `Replication` and
@@ -230,6 +231,15 @@ pub enum InquiryError {
     /// registered. The guard is kept because it is the correct invariant and
     /// because `bind` is public: a caller that binds a record directly can
     /// reach it today. It is a bound, not a fired, check.
+    ///
+    /// **WHERE THE SAME TABLE IS ENFORCED LIVE:** at the consumer that promotes
+    /// the claim, [`InquiryGovernance::release_gate`], which refuses the
+    /// supported release while an open debt refuses
+    /// `ANSWERED_WITH_SUPPORTED_RESULT`. That is the use-time check I21.12's
+    /// item 4 asks for ("check at use time"), and it is reached on every real
+    /// run by `eliot-mod-research`. A reader must not conclude from the
+    /// paragraph above that the restriction table is unenforced: it is
+    /// unenforced *here* and enforced there.
     DebtRestrictedDisposition {
         /// Failing field path.
         field: &'static str,
@@ -289,12 +299,17 @@ pub enum InquiryError {
     /// I21.8 item 6 forbids a `SUPPORTED` promotion while a required chain,
     /// excerpt or audit dimension fails or is unknown, and the issue's
     /// acceptance requires an omitted material claim to block a complete-audit
-    /// claim. The two gates refuse for different reasons, so the gate that
-    /// refused and the specific member that refused it are both carried: a
+    /// claim. The gates refuse for different reasons, so the gate that refused
+    /// and the specific member or condition it refused on are both carried: a
     /// consumer that only learns "blocked" would have to re-derive which
     /// requirement failed.
+    ///
+    /// `gate` names which one refused: `research_debt` for the I21.12 open-debt
+    /// restriction, `claim_coverage` for the material-claim roster, `claim_audit`
+    /// for a per-claim verdict and `released_wording` for the delivered text.
     ReleaseGateRefused {
-        /// Which gate refused: `claim_coverage` or `claim_audit`.
+        /// Which gate refused: `research_debt`, `claim_coverage`, `claim_audit`
+        /// or `released_wording`.
         gate: &'static str,
         /// The specific member or condition the gate refused on.
         detail: String,
@@ -4178,6 +4193,37 @@ impl ResearchDebtKind {
             Self::Replication | Self::Fidelity | Self::Provenance => false,
         }
     }
+
+    /// What the result of this obligation's probe does to the affected decision.
+    ///
+    /// Appendix G's `decision_unblocked_narrowed_or_rejected_by_result` field. It
+    /// is projected from the same
+    /// [`blocks_disposition`](Self::blocks_disposition) function the gate status
+    /// and the release gate use, so the sentence a reader reads cannot claim an
+    /// effect the enforcement does not have:
+    ///
+    /// - a kind that refuses BOTH closing dispositions REJECTS the dependent
+    ///   promotion;
+    /// - a kind that refuses the positive closure only NARROWS it to the scoped
+    ///   negative claim;
+    /// - a kind that refuses neither narrows only the claim class I21.12 names
+    ///   for it (a generalization, a decision confidence, an audit), which is why
+    ///   the sentence says "named claim class" rather than naming a disposition
+    ///   that does not exist for it.
+    #[must_use]
+    pub const fn result_effect(self) -> &'static str {
+        match self {
+            Self::Verification | Self::Coverage | Self::Authority => {
+                "rejected: the dependent promotion cannot be promoted while the obligation is unmet"
+            }
+            Self::Epistemic | Self::Contradiction => {
+                "narrowed: a unified conclusion is refused while the obligation is unmet"
+            }
+            Self::Replication | Self::Fidelity | Self::Provenance => {
+                "narrowed: the named claim class stays out of scope while the obligation is unmet"
+            }
+        }
+    }
 }
 
 /// One registered research debt (I21.12).
@@ -4205,6 +4251,30 @@ pub struct ResearchDebt {
     pub expires_at_ms: Option<i64>,
     /// What this debt blocks.
     pub blocks: String,
+    /// The exact competent artifact or probe whose retention discharges this
+    /// debt.
+    ///
+    /// Issue item 1 names `resolution evidence/discriminator` as a bound field and
+    /// item 5 requires that "resolution requires the named competent
+    /// artifact/probe and owner-validated decision". A review condition states
+    /// WHEN the debt is reviewed; this names WHAT closes it, which is the
+    /// difference between an obligation a reader can discharge and one that can
+    /// only be declared satisfied. Appendix G's
+    /// `exact_artifact_experiment_or_reproduction_required` reads it directly.
+    ///
+    /// It is inside [`Self::digest`], so a debt whose named artifact was edited
+    /// cannot re-prove as the debt that was registered.
+    pub resolution_evidence: String,
+    /// What result of the probe decides this debt either way.
+    ///
+    /// Appendix G's `discriminator_or_decision_boundary`: the boundary that
+    /// separates "the obligation is met" from "the obligation still holds". I21.13
+    /// requires exactly this for an unresolved contradiction, and I21.5 requires
+    /// that a gate rejection mean an authorized finding that the gate is
+    /// inapplicable rather than rejection of inconvenient evidence — a debt
+    /// without a discriminator has no such boundary and could be discharged by
+    /// any outcome at all.
+    pub discriminator: String,
     /// State Fence the debt was registered under.
     pub state_fence: StateFence,
     /// Always true while the debt is open.
@@ -4231,6 +4301,8 @@ impl ResearchDebt {
         summary: &str,
         owner: &str,
         review_condition: &str,
+        resolution_evidence: &str,
+        discriminator: &str,
         expires_at_ms: Option<i64>,
     ) -> Result<Self, InquiryError> {
         require_text(debt_id, "debt.debt_id")?;
@@ -4238,6 +4310,8 @@ impl ResearchDebt {
         require_text(summary, "debt.summary")?;
         require_text(owner, "debt.owner")?;
         require_text(review_condition, "debt.review_condition")?;
+        require_text(resolution_evidence, "debt.resolution_evidence")?;
+        require_text(discriminator, "debt.discriminator")?;
         let mut debt = Self {
             debt_id: debt_id.to_owned(),
             inquiry_id: inquiry_id.to_owned(),
@@ -4248,6 +4322,8 @@ impl ResearchDebt {
             review_condition: review_condition.to_owned(),
             expires_at_ms,
             blocks: kind.blocks().to_owned(),
+            resolution_evidence: resolution_evidence.to_owned(),
+            discriminator: discriminator.to_owned(),
             state_fence: profile.state_fence.clone(),
             open: true,
             canonical: false,
@@ -4270,6 +4346,12 @@ impl ResearchDebt {
             push_field(&mut preimage, "expires_at_ms", &expiry.to_string());
         }
         push_field(&mut preimage, "blocks", &self.blocks);
+        push_field(
+            &mut preimage,
+            "resolution_evidence",
+            &self.resolution_evidence,
+        );
+        push_field(&mut preimage, "discriminator", &self.discriminator);
         freeze(&preimage)
     }
 }
@@ -4475,6 +4557,617 @@ impl ResearchDebtRestriction {
                 field: "debt_restriction.digest",
             })
         }
+    }
+}
+
+/// The Appendix G activation family every gate this domain generates carries.
+///
+/// Appendix G is a **scope** table, not a question bank: "A family is not a
+/// single giant gate. Activation compiles one narrow question for one decision,
+/// owner, budget and expiry." The only obligations this domain registers are
+/// research obligations decided over admitted evidence, and Appendix G places
+/// "code/build/verifier graphs, external corpora, Researcher and donor pilots"
+/// in `RGF-CODE-RESEARCH`, so that is the one family a gate compiled here can
+/// honestly claim.
+///
+/// It is a named constant rather than a thirteen-member closed enum because no
+/// other family has a producer on this path, and a closed enum with twelve
+/// unreachable members is exactly the "declared, given restriction text, and
+/// unreachable" shape I21.12's own table was corrected for. A reader can
+/// therefore tell a real activation from an invented one by reading this
+/// constant instead of matching on a vocabulary that does not discriminate.
+pub const RESEARCH_GATE_FAMILY: &str = "RGF-CODE-RESEARCH";
+
+/// Status of one narrow research gate (Appendix G).
+///
+/// Appendix G's vocabulary is `INACTIVE | ACTIVE | BLOCKING | RESOLVED |
+/// REJECTED | STALE`, and the document's own rule is: "Only `ACTIVE` and
+/// `BLOCKING` gates are shown to the current agent or may block the dependent
+/// promotion. `INACTIVE` backlog material creates no obligation."
+///
+/// This enum carries exactly the two members the derivation below can produce,
+/// and that is deliberate rather than convenient. The other four are lifecycle
+/// states reached through an activation, rejection, invalidation or expiry
+/// **event**, and this crate receives no such event: the gate lifecycle's owner is
+/// the Problem Registry (I13.9) and its escalation is `eliot-problem`'s. Declaring
+/// four members no producer can reach would repeat the defect the audit measured
+/// on this very table. Every gate generated here is therefore active-or-blocking
+/// **by construction**, which is why
+/// [`ResearchGateStatus::appears_in_current_context`] holds for all of them today
+/// and starts holding for a subset the moment a lifecycle status is added —
+/// without any other function being edited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResearchGateStatus {
+    /// The obligation is unmet and narrows what may be generalized, how confident
+    /// a decision may be or whether it may be audited, without refusing a closing
+    /// disposition on its own.
+    Active,
+    /// The obligation is unmet and refuses a closing disposition outright.
+    Blocking,
+}
+
+impl ResearchGateStatus {
+    /// Stable wire spelling of this gate status.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Blocking => "blocking",
+        }
+    }
+
+    /// Whether a gate in this status may block the dependent promotion or appear
+    /// in current required context (Appendix G).
+    ///
+    /// This is the document's rule read off the status each gate was compiled
+    /// with, not assumed from it. It is the single place a lifecycle status has
+    /// to be classified, so a future `RESOLVED` or `STALE` member cannot appear in
+    /// current required context by omission.
+    #[must_use]
+    pub const fn appears_in_current_context(self) -> bool {
+        matches!(self, Self::Active | Self::Blocking)
+    }
+
+    /// The status one open debt of the given kind compiles to.
+    ///
+    /// Read off [`ResearchDebtKind::blocks_disposition`], the same projection the
+    /// release gate and [`ResearchDebtRestriction`] use, so a gate's status
+    /// cannot claim an effect the enforcement does not have: a debt that refuses
+    /// the supported release is a `BLOCKING` gate and a debt that narrows only
+    /// its named claim class is an `ACTIVE` one.
+    #[must_use]
+    pub const fn of_debt_kind(kind: ResearchDebtKind) -> Self {
+        if kind.blocks_disposition(CompletionDisposition::AnsweredWithSupportedResult) {
+            Self::Blocking
+        } else {
+            Self::Active
+        }
+    }
+}
+
+/// One generated narrow research gate (Appendix G).
+///
+/// Every field Appendix G's `ResearchGateRecord` names is carried here, and every
+/// one of them is DERIVED from material the same record already holds: the debt
+/// that raised the obligation, the profile revision the obligation was registered
+/// under, and the coverage receipt, portfolio and precision residue the debt was
+/// decided from. No field is supplied by a caller and none is invented, which is
+/// what makes the issue's "do not activate every family on task startup, and do
+/// not generate one giant project-wide research gate" observable rather than
+/// promised: exactly one gate exists per currently open registered debt, and none
+/// exists for a debt that is not open.
+///
+/// A gate that is not generated is not erased: its debt stays in
+/// [`InquiryGovernance::research_debts`] and in the evidence freeze's debt roster
+/// at its own revision, which is where the history lives, and a re-observer of the
+/// same obligation recompiles the same `gate_id` from the same `debt_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResearchGateRecord {
+    /// `gate_id_and_family`: the stable gate identity, family carried beside it.
+    pub gate_id: String,
+    /// `gate_id_and_family`: the Appendix G activation family.
+    pub family: String,
+    /// `owner_and_affected_decision`: the owner accountable for the obligation.
+    pub owner: String,
+    /// `owner_and_affected_decision`: the Kernel-admitted decision or artifact
+    /// this inquiry's answer must serve, read off the profile revision the debt
+    /// was registered under rather than restated by the gate.
+    pub affected_decision: String,
+    /// `status`: the Appendix G gate status this obligation compiles to.
+    pub status: ResearchGateStatus,
+    /// `activation_condition_and_current_gap`: the exact revision-scoped
+    /// condition under which the gate is active.
+    ///
+    /// It names the profile identity, revision and revision digest plus the
+    /// evidence set, so applicability is a per-revision question: a later
+    /// revision that re-decides the obligation either recompiles this gate or
+    /// does not, and a stale gate cannot be read as the current one.
+    pub activation_condition: String,
+    /// `activation_condition_and_current_gap`: the observed unmet obligation.
+    pub current_gap: String,
+    /// `exact_artifact_experiment_or_reproduction_required`: the named competent
+    /// artifact whose retention discharges the obligation.
+    pub required_artifact: String,
+    /// `discriminator_or_decision_boundary`: what result decides the obligation
+    /// either way.
+    pub discriminator: String,
+    /// `budget_time_expiry_and_stop_condition`: the admitted budget ceiling.
+    pub budget_units: u64,
+    /// `budget_time_expiry_and_stop_condition`: the admitted deadline ceiling.
+    pub deadline_ms: i64,
+    /// `budget_time_expiry_and_stop_condition`: the obligation's own expiry.
+    pub expires_at_ms: Option<i64>,
+    /// `budget_time_expiry_and_stop_condition`: the admitted stop rule.
+    pub stop_condition: String,
+    /// `support_and_invalidation_refs`: the digests that support the gap.
+    ///
+    /// The debt's own digest first, then the coverage receipt, portfolio and
+    /// precision residue the debt was decided from — in that order, so a reader
+    /// can tell which commitment the gap rests on without re-deriving it.
+    pub support_refs: Vec<String>,
+    /// `support_and_invalidation_refs`: the digests whose change makes the gate
+    /// inapplicable.
+    ///
+    /// The profile revision digest and the run-bound reference-manifest digest,
+    /// because those are the two commitments a re-observation would have to
+    /// reproduce for the same obligation to hold.
+    pub invalidation_refs: Vec<String>,
+    /// `decision_unblocked_narrowed_or_rejected_by_result`: what the probe's
+    /// result does to the affected decision.
+    pub decision_changed_by_result: String,
+    /// The debt identity this gate is the obligation of.
+    pub debt_id: String,
+    /// The exact debt revision this gate was compiled from.
+    ///
+    /// The gate is anchored to the debt's CONTENT digest rather than to its
+    /// identity alone, so a delayed event carrying a superseded debt revision
+    /// cannot be read as the current gate, and a successor revision recompiles a
+    /// gate anchored to itself.
+    pub debt_digest: String,
+    /// Digest over the whole gate shape.
+    pub digest: String,
+}
+
+impl ResearchGateRecord {
+    /// Compiles the one narrow gate an open research debt obliges (Appendix G).
+    ///
+    /// Returns `None` for a debt that is not open. That is the whole of I2's
+    /// "only one narrow gate when applicable" rule expressed in code: a resolved
+    /// obligation stops being a current gate, and because the debt itself is
+    /// retained on [`InquiryGovernance::research_debts`] and in the freeze's debt
+    /// roster, stopping is not erasing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::Blank`] when the profile carries no admitted
+    /// decision or artifact for the gate to affect, when the debt names no
+    /// accountable owner, or when it names no competent artifact and no
+    /// discriminator — a gate with an empty budget identity, an empty obligation
+    /// or an open-ended discriminator is the "optional caveat" I21.12 forbids, so
+    /// it is refused rather than defaulted.
+    pub fn activate(
+        debt: &ResearchDebt,
+        profile: &InquiryProtocolProfile,
+        evidence_set_id: &str,
+        coverage_receipt: &CoverageReceipt,
+        portfolio: &SourcePortfolio,
+        precision: &EvidenceSetPrecision,
+    ) -> Result<Option<Self>, InquiryError> {
+        if !debt.open {
+            return Ok(None);
+        }
+        require_text(
+            &profile.intended_decision_or_artifact,
+            "research_gate.affected_decision",
+        )?;
+        require_text(&debt.owner, "research_gate.owner")?;
+        require_text(&debt.resolution_evidence, "research_gate.required_artifact")?;
+        require_text(&debt.discriminator, "research_gate.discriminator")?;
+        let mut gate = Self {
+            gate_id: format!("gate-{}", debt.debt_id),
+            family: RESEARCH_GATE_FAMILY.to_owned(),
+            owner: debt.owner.clone(),
+            affected_decision: profile.intended_decision_or_artifact.clone(),
+            status: ResearchGateStatus::of_debt_kind(debt.kind),
+            activation_condition: format!(
+                "the {} obligation is unmet for evidence set {} under profile {}@{} ({})",
+                debt.kind.wire_name(),
+                evidence_set_id,
+                profile.profile_id,
+                profile.revision,
+                profile.integrity_digest
+            ),
+            current_gap: debt.summary.clone(),
+            required_artifact: debt.resolution_evidence.clone(),
+            discriminator: debt.discriminator.clone(),
+            budget_units: profile.stop_rule.budget_units,
+            deadline_ms: profile.stop_rule.deadline_ms,
+            expires_at_ms: debt.expires_at_ms,
+            stop_condition: profile.stop_rule.stop_rule.wire_name().to_owned(),
+            support_refs: vec![
+                debt.digest.clone(),
+                coverage_receipt.digest.clone(),
+                portfolio.digest.clone(),
+                precision.digest.clone(),
+            ],
+            invalidation_refs: vec![
+                profile.integrity_digest.clone(),
+                profile.reference_manifest_digest.clone(),
+            ],
+            decision_changed_by_result: debt.kind.result_effect().to_owned(),
+            debt_id: debt.debt_id.clone(),
+            debt_digest: debt.digest.clone(),
+            digest: String::new(),
+        };
+        gate.digest = gate.compute_digest();
+        Ok(Some(gate))
+    }
+
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from("research-gate-record/v1;");
+        push_field(&mut preimage, "gate_id", &self.gate_id);
+        push_field(&mut preimage, "family", &self.family);
+        push_field(&mut preimage, "owner", &self.owner);
+        push_field(&mut preimage, "affected_decision", &self.affected_decision);
+        push_field(&mut preimage, "status", self.status.wire_name());
+        push_field(
+            &mut preimage,
+            "activation_condition",
+            &self.activation_condition,
+        );
+        push_field(&mut preimage, "current_gap", &self.current_gap);
+        push_field(&mut preimage, "required_artifact", &self.required_artifact);
+        push_field(&mut preimage, "discriminator", &self.discriminator);
+        push_field(
+            &mut preimage,
+            "budget_units",
+            &self.budget_units.to_string(),
+        );
+        push_field(&mut preimage, "deadline_ms", &self.deadline_ms.to_string());
+        // The expiry is inside the preimage as a DECLARED state, not as a
+        // sentinel: "the obligation never expires" and "the obligation expires at
+        // an empty value" must not be the same bytes.
+        if let Some(expiry) = self.expires_at_ms {
+            push_field(&mut preimage, "expires_at_ms", "declared");
+            push_field(&mut preimage, "expires_at_ms_value", &expiry.to_string());
+        } else {
+            push_field(&mut preimage, "expires_at_ms", "absent");
+        }
+        push_field(&mut preimage, "stop_condition", &self.stop_condition);
+        push_count(&mut preimage, "support_refs", self.support_refs.len());
+        for reference in &self.support_refs {
+            push_field(&mut preimage, "support_ref", reference);
+        }
+        push_count(
+            &mut preimage,
+            "invalidation_refs",
+            self.invalidation_refs.len(),
+        );
+        for reference in &self.invalidation_refs {
+            push_field(&mut preimage, "invalidation_ref", reference);
+        }
+        push_field(
+            &mut preimage,
+            "decision_changed_by_result",
+            &self.decision_changed_by_result,
+        );
+        push_field(&mut preimage, "debt_id", &self.debt_id);
+        push_field(&mut preimage, "debt_digest", &self.debt_digest);
+        freeze(&preimage)
+    }
+
+    /// Re-proves this gate's own digest over the bytes actually present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
+    /// disagrees with the stored one.
+    pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.compute_digest() == self.digest {
+            Ok(())
+        } else {
+            Err(InquiryError::IntegrityMismatch {
+                field: "research_gate.digest",
+            })
+        }
+    }
+}
+
+/// Governor-facing handoff intent that registers one research debt as a Problem.
+///
+/// I21.12: "Debts are registered in the Problem Registry (I13.9) with owner,
+/// review condition and expiry." This request is the Researcher half of that
+/// registration and nothing more. It is deliberately **not** a registration:
+///
+/// - the Problem Registry's durable half — the Governor `PreparedTransition` and
+///   the named Store transaction — does not exist in this repository, so the
+///   issue's own fallback applies verbatim: "otherwise retain a replay-safe
+///   handoff intent and reconcile";
+/// - `crates/research/AGENTS.md` gives this subtree no canonical-store write
+///   authority, so nothing here can commit the registry entry even in principle;
+/// - a locally constructed `Problem`, or a transport acknowledgement, would be
+///   the fabricated registration the issue forbids. There is therefore **no**
+///   owner-commit-receipt field: a placeholder for it would be a false proof
+///   claim under A0.3, and this crate's sibling
+///   [`GovernorSourceTransitionRequest`] already declines to carry one.
+///
+/// The consequence is stated rather than defaulted, and it is enforced:
+/// `canonical_write_authorized` is `false` on every one of these requests, so
+/// while a debt's registration is uncommitted the affected strong claim cannot
+/// be authorized. That is I3's sentence — "Failed persistence leaves explicit
+/// pending/unknown status and cannot authorize an affected strong claim merely
+/// because the registry read is empty" — enforced in
+/// [`InquiryGovernance::refused_by_research_debt`] rather than left as a note.
+///
+/// **Replay safety.** `obligation_id` and `operation_id` are DERIVED from the
+/// debt identity, so a duplicate observation of the same obligation, or a lost
+/// commit response replayed by the owner, re-derives the SAME two identities
+/// rather than registering a second blocker. That is I3's "duplicate
+/// observation/commit-response loss reuses the same obligation, not another
+/// blocker" as a property of the identity function itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResearchDebtRegistrationRequest {
+    /// Closed request-kind discriminator.
+    pub request_kind: String,
+    /// Stable Problem-obligation identity this debt registers as.
+    pub obligation_id: String,
+    /// Stable operation identity the owner submits under.
+    pub operation_id: String,
+    /// Inquiry identity the obligation belongs to.
+    pub inquiry_id: String,
+    /// Evidence-set identity the obligation was observed under.
+    pub evidence_set_id: String,
+    /// Profile identity the obligation was registered under.
+    pub profile_id: String,
+    /// Profile revision the obligation was registered under.
+    pub profile_revision: u64,
+    /// Exact profile revision digest.
+    pub profile_digest: String,
+    /// Debt identity being registered.
+    pub debt_id: String,
+    /// Expected debt revision, as the debt's own content digest.
+    pub debt_digest: String,
+    /// I21.12 kind of the debt.
+    pub debt_kind: ResearchDebtKind,
+    /// Exact claim class the debt blocks.
+    pub blocked_claim: String,
+    /// Owner accountable for resolving the obligation.
+    pub owner: String,
+    /// Condition under which the obligation is reviewed.
+    pub review_condition: String,
+    /// The named competent artifact whose retention discharges the obligation.
+    pub required_resolution_evidence: String,
+    /// What result decides the obligation either way.
+    pub discriminator: String,
+    /// Expiry in Unix milliseconds, when the obligation expires.
+    pub expires_at_ms: Option<i64>,
+    /// The narrow Appendix G gate this obligation activated.
+    pub gate_id: String,
+    /// The activation family of that gate.
+    pub gate_family: String,
+    /// Expected gate revision, as the gate's own content digest.
+    pub gate_digest: String,
+    /// State Fence the obligation was registered under.
+    pub state_fence: StateFence,
+    /// Always true: the request stays candidate-only.
+    pub candidate_only: bool,
+    /// Always false: this domain never authorizes a canonical registry write, and
+    /// while this is false the registration is pending, not complete.
+    pub canonical_write_authorized: bool,
+    /// Digest over every field above, and over the State Fence through the
+    /// crate's single canonical fence encoding.
+    pub request_digest: String,
+}
+
+impl ResearchDebtRegistrationRequest {
+    /// Closed request-kind discriminator for a research-debt registration.
+    pub const REQUEST_KIND: &'static str = "inquiry_research_debt_registration";
+
+    /// Declared identity domain of this request.
+    ///
+    /// A named constant rather than an inline literal, so a receiving authority
+    /// can name the domain it must accept instead of matching on a string buried
+    /// in a function body, and so a later change of the bound field set is a
+    /// visible domain bump rather than a silent rehash.
+    pub const REQUEST_DIGEST_DOMAIN: &'static str = "inquiry-research-debt-registration/v1";
+
+    /// Proposes the registration of one open debt and the gate it activated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::Blank`] when the debt carries no identity or no
+    /// accountable owner, and [`InquiryError::IntegrityMismatch`] when `gate` is
+    /// not the gate this exact debt revision activated. That second refusal is
+    /// what makes the debt→Problem→gate relationship a checked relationship: a
+    /// request cannot name a foreign or superseded gate and still be a valid
+    /// registration of this obligation.
+    pub fn propose(
+        observation: &InquiryObservation,
+        profile: &InquiryProtocolProfile,
+        debt: &ResearchDebt,
+        gate: &ResearchGateRecord,
+    ) -> Result<Self, InquiryError> {
+        require_text(&debt.debt_id, "debt_registration.debt_id")?;
+        require_text(&debt.owner, "debt_registration.owner")?;
+        if gate.debt_id != debt.debt_id || gate.debt_digest != debt.digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "debt_registration.gate_binding",
+            });
+        }
+        // Derived, never assigned: a duplicate observation of the same debt for
+        // the same inquiry re-derives these two identities exactly.
+        let obligation_id = format!("research-debt-{}", debt.debt_id);
+        // Built from a BORROW of `obligation_id`, before that value is moved into
+        // the record below. Formatting borrows its arguments, so the borrow ends
+        // with this statement and `obligation_id` is still owned and still
+        // unmoved when the record literal consumes it. One of the two identities
+        // is therefore derived from the other by value rather than either being a
+        // copy of the other, and neither spelling is duplicated anywhere.
+        let operation_id = format!("register-{obligation_id}");
+        let mut request = Self {
+            request_kind: Self::REQUEST_KIND.to_owned(),
+            obligation_id,
+            operation_id,
+            inquiry_id: observation.inquiry_id.clone(),
+            evidence_set_id: observation.evidence_set_id.clone(),
+            profile_id: profile.profile_id.clone(),
+            profile_revision: profile.revision,
+            profile_digest: profile.integrity_digest.clone(),
+            debt_id: debt.debt_id.clone(),
+            debt_digest: debt.digest.clone(),
+            debt_kind: debt.kind,
+            blocked_claim: debt.blocks.clone(),
+            owner: debt.owner.clone(),
+            review_condition: debt.review_condition.clone(),
+            required_resolution_evidence: debt.resolution_evidence.clone(),
+            discriminator: debt.discriminator.clone(),
+            expires_at_ms: debt.expires_at_ms,
+            gate_id: gate.gate_id.clone(),
+            gate_family: gate.family.clone(),
+            gate_digest: gate.digest.clone(),
+            state_fence: profile.state_fence.clone(),
+            candidate_only: true,
+            canonical_write_authorized: false,
+            request_digest: String::new(),
+        };
+        request.request_digest = request.compute_digest();
+        Ok(request)
+    }
+
+    /// Whether this debt's registration is still pending rather than committed.
+    ///
+    /// True by construction: the owner commit receipt is the Problem Registry's
+    /// and this crate has none to carry, so every request it emits is a pending
+    /// handoff. The method exists so the pending state is read from the record
+    /// rather than asserted at the refusal site, and so a future owner receipt
+    /// changes this one predicate instead of every reader of it.
+    #[must_use]
+    pub const fn is_pending(&self) -> bool {
+        !self.canonical_write_authorized
+    }
+
+    /// Canonical digest over the whole request shape.
+    ///
+    /// The field list is hand-written and therefore coupled to the struct above
+    /// by hand rather than by the compiler, exactly as
+    /// [`GovernorSourceTransitionRequest::compute_digest`] states for itself: a
+    /// field added to the struct without a line in this preimage would be
+    /// published beside a digest that does not cover it.
+    fn compute_digest(&self) -> String {
+        let mut preimage = String::from(Self::REQUEST_DIGEST_DOMAIN);
+        preimage.push(';');
+        push_field(&mut preimage, "request_kind", &self.request_kind);
+        push_field(&mut preimage, "obligation_id", &self.obligation_id);
+        push_field(&mut preimage, "operation_id", &self.operation_id);
+        push_field(&mut preimage, "inquiry_id", &self.inquiry_id);
+        push_field(&mut preimage, "evidence_set_id", &self.evidence_set_id);
+        push_field(&mut preimage, "profile_id", &self.profile_id);
+        push_field(
+            &mut preimage,
+            "profile_revision",
+            &self.profile_revision.to_string(),
+        );
+        push_field(&mut preimage, "profile_digest", &self.profile_digest);
+        push_field(&mut preimage, "debt_id", &self.debt_id);
+        push_field(&mut preimage, "debt_digest", &self.debt_digest);
+        push_field(&mut preimage, "debt_kind", self.debt_kind.wire_name());
+        push_field(&mut preimage, "blocked_claim", &self.blocked_claim);
+        push_field(&mut preimage, "owner", &self.owner);
+        push_field(&mut preimage, "review_condition", &self.review_condition);
+        push_field(
+            &mut preimage,
+            "required_resolution_evidence",
+            &self.required_resolution_evidence,
+        );
+        push_field(&mut preimage, "discriminator", &self.discriminator);
+        if let Some(expiry) = self.expires_at_ms {
+            push_field(&mut preimage, "expires_at_ms", "declared");
+            push_field(&mut preimage, "expires_at_ms_value", &expiry.to_string());
+        } else {
+            push_field(&mut preimage, "expires_at_ms", "absent");
+        }
+        push_field(&mut preimage, "gate_id", &self.gate_id);
+        push_field(&mut preimage, "gate_family", &self.gate_family);
+        push_field(&mut preimage, "gate_digest", &self.gate_digest);
+        push_field(
+            &mut preimage,
+            "state_fence",
+            &fence_preimage(&self.state_fence),
+        );
+        push_field(
+            &mut preimage,
+            "candidate_only",
+            bool_text(self.candidate_only),
+        );
+        push_field(
+            &mut preimage,
+            "canonical_write_authorized",
+            bool_text(self.canonical_write_authorized),
+        );
+        freeze(&preimage)
+    }
+
+    /// Re-proves this request's own digest over the bytes actually present.
+    ///
+    /// A request reloaded or relayed after the fact still has individually
+    /// well-formed fields — a rewritten owner, a rewritten review condition, a
+    /// rewritten gate digest and a rewritten fence are all individually legal
+    /// values — and only recomputing the commitment over the bytes present can
+    /// say that it is no longer the request that was made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when the recomputed digest
+    /// disagrees with the stored one, or [`InquiryError::Blank`] /
+    /// [`InquiryError::BadDigest`] when a carried field is not nameable.
+    pub fn validate_integrity(&self) -> Result<(), InquiryError> {
+        if self.compute_digest() != self.request_digest {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "debt_registration.request_digest",
+            });
+        }
+        for (value, field) in [
+            (self.request_kind.as_str(), "debt_registration.request_kind"),
+            (
+                self.obligation_id.as_str(),
+                "debt_registration.obligation_id",
+            ),
+            (self.operation_id.as_str(), "debt_registration.operation_id"),
+            (self.inquiry_id.as_str(), "debt_registration.inquiry_id"),
+            (self.debt_id.as_str(), "debt_registration.debt_id"),
+            (
+                self.blocked_claim.as_str(),
+                "debt_registration.blocked_claim",
+            ),
+            (self.owner.as_str(), "debt_registration.owner"),
+            (
+                self.review_condition.as_str(),
+                "debt_registration.review_condition",
+            ),
+            (
+                self.required_resolution_evidence.as_str(),
+                "debt_registration.required_resolution_evidence",
+            ),
+            (
+                self.discriminator.as_str(),
+                "debt_registration.discriminator",
+            ),
+            (self.gate_id.as_str(), "debt_registration.gate_id"),
+            (self.gate_family.as_str(), "debt_registration.gate_family"),
+        ] {
+            require_text(value, field)?;
+        }
+        for (value, field) in [
+            (
+                self.profile_digest.as_str(),
+                "debt_registration.profile_digest",
+            ),
+            (self.debt_digest.as_str(), "debt_registration.debt_digest"),
+            (self.gate_digest.as_str(), "debt_registration.gate_digest"),
+        ] {
+            require_digest(value, field)?;
+        }
+        Ok(())
     }
 }
 
@@ -6043,6 +6736,27 @@ pub struct InquiryGovernance {
     pub synthesis_input: crate::synthesis_input::SynthesisInputPack,
     /// Registered research debts.
     pub research_debts: Vec<ResearchDebt>,
+    /// The narrow Appendix G research gates the currently open debts oblige.
+    ///
+    /// I21.2: "Activate one narrow gate only when applicable." Carried whole
+    /// rather than as a count, because every Appendix G field the document names
+    /// is derived here and a consumer that could see only the count could not
+    /// check that the gate names the decision it affects, the artifact that would
+    /// discharge it or the owner accountable for it. The set is exactly the gates
+    /// [`ResearchGateRecord::activate`] compiles from this record's own open
+    /// debts, and `validate_integrity` re-derives that expectation independently —
+    /// see [`Self::validate_research_gate_coverage`].
+    pub research_gate_records: Vec<ResearchGateRecord>,
+    /// The replay-safe handoff intents that register each current research debt
+    /// as a Problem in the registry (I21.12, I3).
+    ///
+    /// Carried whole rather than as a count, because the pending state is the
+    /// point: a request whose `canonical_write_authorized` is `false` says the
+    /// obligation exists and has NOT been registered, and a reader that could see
+    /// only a count could not tell an unregistered obligation from a registered
+    /// one. There is no owner-commit-receipt field beside them, and the reason is
+    /// stated on [`ResearchDebtRegistrationRequest`].
+    pub research_debt_registrations: Vec<ResearchDebtRegistrationRequest>,
     /// Lane class the lane discipline decided for this run.
     ///
     /// I21.2 keeps grade and status orthogonal, so the class is the only thing
@@ -6222,21 +6936,18 @@ impl InquiryGovernance {
             &observation.evidence_set_id,
             &obligations,
         )?;
-        let research_debts = research_debts(
+        let FrozenDebtProjection {
+            research_debts,
+            research_gate_records,
+            research_debt_registrations,
+            freeze,
+        } = frozen_debt_projection(
             &observation,
             &profile,
             &portfolio,
             &coverage_receipt,
             &precision,
             &admissibility,
-        )?;
-        let freeze = evidence_freeze(
-            &observation,
-            &profile,
-            &portfolio,
-            &coverage_receipt,
-            &admissibility,
-            &research_debts,
         )?;
         // The per-claim audit now has a production producer. `claim_audit_for_run`
         // derives the audited claims from the admitted material this record already
@@ -6298,6 +7009,8 @@ impl InquiryGovernance {
             committed_freeze,
             synthesis_input,
             research_debts,
+            research_gate_records,
+            research_debt_registrations,
             lane_discipline,
             terminal,
             compilation_inputs,
@@ -6348,9 +7061,27 @@ impl InquiryGovernance {
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] naming the first gate that
     /// refuses, or [`InquiryError::ReleaseGateRefused`] naming
-    /// `released_wording` and the offending claim, so a consumer reads WHICH
-    /// requirement failed rather than only that the release is blocked.
+    /// `research_debt`, `released_wording` and the offending claim, so a
+    /// consumer reads WHICH requirement failed rather than only that the
+    /// release is blocked.
     pub fn release_gate(&self, delivered: &BTreeMap<String, String>) -> Result<(), InquiryError> {
+        // I21.12, checked HERE and not only inside the terminal record. This is
+        // the use-time consumer the issue's item 4 names: "Release/Context/
+        // swarm/final-decision consumers revalidate applicability and current
+        // authority; a stale clean freeze cannot ignore a newly active applicable
+        // debt." `releasable_as_supported` is the claim this gate authorizes, so
+        // the disposition an open debt refuses is the one whose release is being
+        // asked for here, and the restriction is re-read off this record's own
+        // registered debts rather than off a flag.
+        //
+        // It runs FIRST so the most fundamental refusal is the one a consumer is
+        // told: I21.12's sentence is "A release that carries open debts states
+        // them; it does not describe them as minor limitations", and a consumer
+        // that reads only `claim_coverage` would read a narrower reason than the
+        // one that actually applies.
+        if let Some(refusal) = self.refused_by_research_debt() {
+            return Err(refusal);
+        }
         if let Some(prior) =
             crate::evidence_portfolio::require_complete_claim_coverage(&self.claim_coverage).err()
         {
@@ -6420,6 +7151,178 @@ impl InquiryGovernance {
         Ok(())
     }
 
+    /// The I21.12 use-time refusal this record's open research debts place on the
+    /// supported release, if any.
+    ///
+    /// The disposition consulted is
+    /// [`CompletionDisposition::AnsweredWithSupportedResult`] because that is the
+    /// claim this gate authorizes: `releasable_as_supported` is what a consumer
+    /// gets back from the gates above it, so a debt that refuses it refuses the
+    /// release. The refusal is derived from
+    /// [`ResearchDebtRestriction`], which is itself derived from
+    /// [`Self::research_debts`] rather than restated, so a debt the producer
+    /// registered and the restriction a consumer reads cannot disagree.
+    ///
+    /// The detail carries the debt statement — id, I21.12 kind, blocked claim
+    /// class, accountable owner and review condition — together with the pending
+    /// Problem-registry registrations this record proposes, so the consumer learns
+    /// WHICH obligation refused AND that the obligation has not been registered
+    /// rather than assumed away.
+    fn refused_by_research_debt(&self) -> Option<InquiryError> {
+        let disposition = CompletionDisposition::AnsweredWithSupportedResult;
+        let restriction = &self.terminal.debt_restriction;
+        if !restriction.refuses(disposition) {
+            return None;
+        }
+        debug_assert!(
+            restriction.restricted,
+            "a refused disposition is derived only from open debts, so the restriction is set",
+        );
+        let pending = self
+            .research_debt_registrations
+            .iter()
+            .filter(|registration| registration.is_pending())
+            .count();
+        restriction
+            .statement()
+            .map(|debts| InquiryError::ReleaseGateRefused {
+                gate: "research_debt",
+                detail: format!(
+                    "{debts}; refuses {}; {pending} Problem Registry registration(s) pending and \
+                     uncommitted",
+                    disposition_wire(disposition)
+                ),
+            })
+    }
+
+    /// The research gates that may appear in current required context (Appendix
+    /// G).
+    ///
+    /// Appendix G: "Only `ACTIVE` and `BLOCKING` gates are shown to the current
+    /// agent or may block the dependent promotion. `INACTIVE` backlog material
+    /// creates no obligation." The filter is the rule, not a comment about it: it
+    /// reads the status each gate was compiled with through
+    /// [`ResearchGateStatus::appears_in_current_context`] rather than assuming it,
+    /// so a lifecycle status that is neither active nor blocking leaves the
+    /// current context the moment one exists, without this function being edited
+    /// and without the obligation's history being erased.
+    #[must_use]
+    pub fn current_research_gates(&self) -> Vec<&ResearchGateRecord> {
+        self.research_gate_records
+            .iter()
+            .filter(|gate| gate.status.appears_in_current_context())
+            .collect()
+    }
+
+    /// Re-proves that the generated gate set is exactly the gate set this
+    /// record's currently open registered debts imply.
+    ///
+    /// The two sides are produced from different inputs on purpose, which is the
+    /// property that makes this a check rather than a tautology:
+    ///
+    /// - `expected` reads [`Self::research_debts`] and keeps the content digest
+    ///   of every OPEN debt. It never looks at a gate.
+    /// - `recorded` reads [`Self::research_gate_records`] and keeps the debt
+    ///   revision each gate was compiled from. It never looks at the builder.
+    ///
+    /// A new debt, a dropped debt or a debt that stopped being open therefore
+    /// fails here with nobody editing a table, and a gate compiled from a
+    /// superseded debt revision cannot stand in for the current one because the
+    /// comparison is over the debt's own content digest rather than its identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] naming
+    /// `inquiry.research_gate_records` when the two rosters disagree.
+    fn validate_research_gate_coverage(&self) -> Result<(), InquiryError> {
+        let mut expected: Vec<&str> = self
+            .research_debts
+            .iter()
+            .filter(|debt| debt.open)
+            .map(|debt| debt.digest.as_str())
+            .collect();
+        expected.sort_unstable();
+        let mut recorded: Vec<&str> = self
+            .research_gate_records
+            .iter()
+            .map(|gate| gate.debt_digest.as_str())
+            .collect();
+        recorded.sort_unstable();
+        if recorded != expected {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.research_gate_records",
+            });
+        }
+        Ok(())
+    }
+
+    /// Re-proves that the handoff intents are exactly one per open debt and that
+    /// each names the gate its own debt revision activated.
+    ///
+    /// The roster is derived independently in the same shape as
+    /// [`Self::validate_research_gate_coverage`]: the expected side reads
+    /// [`Self::research_debts`] and keeps the content digest of every OPEN debt,
+    /// the recorded side reads [`Self::research_debt_registrations`] and keeps the
+    /// debt revision each request binds. So a new obligation, a dropped obligation
+    /// or one that stopped being open is noticed here with nobody editing a table.
+    ///
+    /// The per-request binding check is what makes "update the projections with
+    /// expected revisions" true rather than asserted: the gate a request names is
+    /// found by identity and then compared by **content**, and the request must
+    /// also agree with this record on inquiry, evidence set, profile revision
+    /// digest and State Fence. A delayed owner-expiry or delivery
+    /// acknowledgement carrying a superseded debt revision therefore cannot clear
+    /// or revive the current obligation, because the revision it would have to
+    /// name is not the one the live debt has.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InquiryError::IntegrityMismatch`] when a roster disagrees, or
+    /// when a request's inquiry, evidence set, profile digest or fence differs
+    /// from this record's, and [`InquiryError::UnknownHandle`] when a request
+    /// names a gate this record does not carry.
+    fn validate_research_debt_registration_coverage(&self) -> Result<(), InquiryError> {
+        let mut expected: Vec<&str> = self
+            .research_debts
+            .iter()
+            .filter(|debt| debt.open)
+            .map(|debt| debt.digest.as_str())
+            .collect();
+        expected.sort_unstable();
+        let mut recorded: Vec<&str> = self
+            .research_debt_registrations
+            .iter()
+            .map(|registration| registration.debt_digest.as_str())
+            .collect();
+        recorded.sort_unstable();
+        if recorded != expected {
+            return Err(InquiryError::IntegrityMismatch {
+                field: "inquiry.research_debt_registrations",
+            });
+        }
+        for registration in &self.research_debt_registrations {
+            let gate = self
+                .research_gate_records
+                .iter()
+                .find(|gate| gate.gate_id == registration.gate_id)
+                .ok_or(InquiryError::UnknownHandle {
+                    field: "debt_registration.gate_id",
+                })?;
+            if gate.debt_digest != registration.debt_digest
+                || gate.digest != registration.gate_digest
+                || registration.inquiry_id != self.inquiry_id
+                || registration.evidence_set_id != self.evidence_set_id
+                || registration.profile_digest != self.profile.integrity_digest
+                || registration.state_fence != self.profile.state_fence
+            {
+                return Err(InquiryError::IntegrityMismatch {
+                    field: "debt_registration.binding",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Re-proves every digest this record publishes and every binding between
     /// the profile, the portfolio, the manifest, the State Fence and the
     /// terminal disposition.
@@ -6449,6 +7352,20 @@ impl InquiryGovernance {
                 });
             }
         }
+        // Appendix G: every generated gate re-proves its own digest over the
+        // bytes present, and the set re-proves against an independently derived
+        // expectation. A gate whose activation condition, affected decision,
+        // required artifact or discriminator was edited after compilation fails
+        // on its own digest; a gate that was added or dropped beside a debt fails
+        // on the roster.
+        for gate in &self.research_gate_records {
+            gate.validate_integrity()?;
+        }
+        self.validate_research_gate_coverage()?;
+        for registration in &self.research_debt_registrations {
+            registration.validate_integrity()?;
+        }
+        self.validate_research_debt_registration_coverage()?;
         self.validate_compilation_input_binding()?;
         self.validate_run_reference_manifest()?;
         if !self
@@ -7027,7 +7944,7 @@ impl std::fmt::Display for InquiryGovernance {
              lane_delivered_handles={} lane_discipline={} \
              terminal_freeze={} terminal_claim_audit={} terminal_precision_residue={} \
              claim_audits={} claim_coverage={} \
-             debts={} debt_kinds={} {} \
+             {} \
              {} \
              source_admission_owner_receipt=none",
             self.inquiry_id,
@@ -7091,11 +8008,7 @@ impl std::fmt::Display for InquiryGovernance {
                 map: &self.claim_coverage,
                 unaccounted: &self.claim_coverage_unaccounted,
             },
-            self.research_debts.len(),
-            debt_kinds_wire(&self.research_debts),
-            DebtRestrictionProjection {
-                restriction: &terminal.debt_restriction,
-            },
+            ResearchDebtProjection { record: self },
             TerminalDispositionProjection {
                 terminal,
                 source_admission_requests: &self.source_admission_requests,
@@ -9110,6 +10023,12 @@ fn research_debts(
             ),
             "researcher",
             "a source record is admitted for every frozen reference member",
+            &format!(
+                "one admitted source record carrying a disposition for each of: {}",
+                coverage_receipt.open_members.join(",")
+            ),
+            "a frozen reference member that receives an admitted disposition from material inside \
+             the frozen scope; a candidate observed outside it closes none of them",
             None,
         )?);
     }
@@ -9122,6 +10041,10 @@ fn research_debts(
             &independence_shortfall(&portfolio.independence),
             "researcher",
             "independent lineages meet the declared minimum with no unknown lineage",
+            "one admitted source record from a further independent failure domain, with its \
+             lineage root and provider family established",
+            "one additional independent lineage raising the observed count to the declared \
+             minimum; no re-observation of a lineage already counted changes it",
             None,
         )?);
     }
@@ -9134,6 +10057,11 @@ fn research_debts(
             "retained material supports no anchor at the precision the manifest admits",
             "researcher",
             "an admitted source record supports the cited anchors",
+            "one admitted excerpt whose occurrence reproduces the cited anchor inside the frozen \
+             scope, or the raw artifact behind it",
+            "an anchor-supporting excerpt that reproduces under the run-bound manifest; retained \
+             material that supports a coarser anchor resolves the residue at its own precision \
+             instead",
             None,
         )?);
     }
@@ -9160,6 +10088,11 @@ fn research_debts(
             ),
             "researcher",
             "a non-degraded acquisition admits a candidate with an independently verified source",
+            "one admitted candidate whose source record carries an independent verifier over the \
+             retained bytes, inside the frozen scope",
+            "a verifier that reproduces the retained artifact on a source record this run admits; \
+             a candidate whose acquisition merely completed without degrading is not such a \
+             verifier",
             None,
         )?);
     }
@@ -9169,6 +10102,86 @@ fn research_debts(
         "a populated counterevidence set changes the I21.12 debt set; re-derive the producers",
     );
     Ok(debts)
+}
+
+/// Compiles the narrow research gates the registered debts oblige (Appendix G).
+///
+/// One gate per currently open debt and no gate at all for a debt that is not
+/// open. That is the whole of I2's activation rule in one place: the gate set is
+/// derived from the obligations this run actually registered, so there is no
+/// project-wide bank to activate, no family switched on at task startup, and no
+/// path by which a legacy `RG-01…RG-67` alias — which Appendix G keeps as cold
+/// lineage in an external backlog — becomes a current obligation.
+///
+/// Activation is derived from the current task/profile/claim obligation through
+/// the debt's own accountable owner, which is the only authorized owner this
+/// crate has: the debt is registered under the profile revision's State Fence and
+/// names the owner that must resolve it. Where that owner is unknown or lost the
+/// debt is refused at registration rather than given a substitute principal.
+fn research_gate_records(
+    observation: &InquiryObservation,
+    profile: &InquiryProtocolProfile,
+    coverage_receipt: &CoverageReceipt,
+    portfolio: &SourcePortfolio,
+    precision: &EvidenceSetPrecision,
+    registered_debts: &[ResearchDebt],
+) -> Result<Vec<ResearchGateRecord>, InquiryError> {
+    let mut compiled = Vec::new();
+    for debt in registered_debts {
+        if let Some(gate) = ResearchGateRecord::activate(
+            debt,
+            profile,
+            &observation.evidence_set_id,
+            coverage_receipt,
+            portfolio,
+            precision,
+        )? {
+            compiled.push(gate);
+        }
+    }
+    Ok(compiled)
+}
+
+/// Proposes the Problem-registry registration of every current research gate.
+///
+/// One request per gate, and the gate is what supplies the obligation identity,
+/// so a request cannot exist without the gate it registers. The debt each gate
+/// was compiled from is found by CONTENT — its own digest — rather than by
+/// position, so a gate anchored to a superseded debt revision is refused here
+/// instead of being registered against whatever debt happens to share its id.
+///
+/// Only currently open obligations are proposed: an obligation that is not open
+/// keeps its record on [`InquiryGovernance::research_debts`] and in the freeze's
+/// debt roster, so stopping is not erasing (I21.12 / I6).
+///
+/// # Errors
+///
+/// Returns [`InquiryError::UnknownHandle`] when a gate names a debt revision this
+/// record does not carry, and every refusal of
+/// [`ResearchDebtRegistrationRequest::propose`] — which includes the refusal of a
+/// gate that is not the gate this exact debt revision activated.
+fn research_debt_registrations(
+    observation: &InquiryObservation,
+    profile: &InquiryProtocolProfile,
+    registered_debts: &[ResearchDebt],
+    compiled_gate_records: &[ResearchGateRecord],
+) -> Result<Vec<ResearchDebtRegistrationRequest>, InquiryError> {
+    let mut proposed = Vec::new();
+    for gate in compiled_gate_records {
+        let debt = registered_debts
+            .iter()
+            .find(|candidate| candidate.digest == gate.debt_digest)
+            .ok_or(InquiryError::UnknownHandle {
+                field: "debt_registration.debt_digest",
+            })?;
+        proposed.push(ResearchDebtRegistrationRequest::propose(
+            observation,
+            profile,
+            debt,
+            gate,
+        )?);
+    }
+    Ok(proposed)
 }
 
 /// The admitted sources recorded as counterevidence of another admitted source.
@@ -9269,6 +10282,108 @@ fn commit_freeze_through_source_admission(
         retained_revisions.insert(record.record.handle.clone(), retained.clone());
     }
     Ok((requests, retained_revisions))
+}
+
+/// The frozen evidence revision together with the I21.12 obligations bound to it.
+///
+/// These four values are one unit rather than four independent `let` bindings,
+/// and the reason is a real relationship rather than tidiness: the freeze
+/// publishes the registered debt identities in its own
+/// `open_research_debts` roster, the Appendix G gates are compiled only from the
+/// debts that are currently open, and the Problem-registration handoff intents
+/// are proposed only from those gates. A reader that could see one of the four
+/// without the others could not tell whether the freeze carried the obligations
+/// it claims, and carrying them in one value is what makes that question
+/// answerable from the record itself.
+///
+/// Owned rather than borrowed because every field moves into
+/// [`InquiryGovernance`] exactly once, at the record assembly.
+struct FrozenDebtProjection {
+    /// The I21.12 debts this run registered.
+    research_debts: Vec<ResearchDebt>,
+    /// The narrow Appendix G gates the currently open debts oblige.
+    research_gate_records: Vec<ResearchGateRecord>,
+    /// The replay-safe Problem-registry handoff intents for those gates.
+    research_debt_registrations: Vec<ResearchDebtRegistrationRequest>,
+    /// The frozen evidence revision the debts are bound into.
+    freeze: EvidenceFreeze,
+}
+
+/// Derives the frozen evidence revision and everything I21.12 hangs off it.
+///
+/// The four steps stay in this order and stay in one function, because the order
+/// is the guarantee rather than a convention:
+///
+/// 1. the debts are registered from the observed residue of this run;
+/// 2. the Appendix G gates are compiled from those debts, so an activation is a
+///    derivation of an observed obligation and never a configuration a caller
+///    switched on;
+/// 3. the Problem-registration handoff intents are proposed from those gates, so
+///    the debt -> Problem -> gate relationship is ONE derivation rather than
+///    three parallel lists a reader has to reconcile;
+/// 4. the evidence freeze is built last, carrying the registered debt identities
+///    into `open_research_debts`.
+///
+/// The single caller is [`InquiryGovernance::record`], so this is not a helper
+/// anybody may call instead of the real path: it IS the real path.
+///
+/// # Errors
+///
+/// Returns every refusal of the four steps it sequences, unchanged: a debt that
+/// carries no accountable owner or no competent artifact, a gate that cannot name
+/// an affected decision, a registration whose gate is not the gate this debt
+/// revision activated, and an evidence freeze whose own binding does not re-prove.
+fn frozen_debt_projection(
+    observation: &InquiryObservation,
+    profile: &InquiryProtocolProfile,
+    portfolio: &SourcePortfolio,
+    coverage_receipt: &CoverageReceipt,
+    precision: &EvidenceSetPrecision,
+    admissibility: &[SourceAdmissibilityRecord],
+) -> Result<FrozenDebtProjection, InquiryError> {
+    let research_debts = research_debts(
+        observation,
+        profile,
+        portfolio,
+        coverage_receipt,
+        precision,
+        admissibility,
+    )?;
+    // I21.12 / Appendix G: the gates are compiled from the debts this run
+    // registered, right here, so the activation is a derivation of the
+    // observed obligation rather than a configuration a caller switched on.
+    let research_gate_records = research_gate_records(
+        observation,
+        profile,
+        coverage_receipt,
+        portfolio,
+        precision,
+        &research_debts,
+    )?;
+    // I21.12's "Debts are registered in the Problem Registry (I13.9)": the
+    // handoff intent is proposed here, from the gates just compiled, so the
+    // debt -> Problem -> gate relationship is one derivation rather than
+    // three parallel lists a reader has to reconcile.
+    let research_debt_registrations = research_debt_registrations(
+        observation,
+        profile,
+        &research_debts,
+        &research_gate_records,
+    )?;
+    let freeze = evidence_freeze(
+        observation,
+        profile,
+        portfolio,
+        coverage_receipt,
+        admissibility,
+        &research_debts,
+    )?;
+    Ok(FrozenDebtProjection {
+        research_debts,
+        research_gate_records,
+        research_debt_registrations,
+        freeze,
+    })
 }
 
 /// The admitted source records of one run, keyed by handle.
@@ -9650,12 +10765,15 @@ fn terminal_record(
     // to be the one reported. The debt statement below keeps the specific
     // reason, so the downgrade loses nothing a reader needs.
     //
-    // MEASURED: on this path the downgrade is currently INERT. No debt kind
+    // MEASURED: at THIS site the downgrade is currently INERT. No debt kind
     // that refuses a disposition can coexist with a disposition this function
     // produces - see the reachability note on
     // `InquiryError::DebtRestrictedDisposition` for the proof. The branch is
     // kept because it is the correct invariant and because it costs nothing,
-    // but nothing should be read into it as live enforcement today.
+    // but nothing should be read into it as live enforcement today: the live
+    // enforcement of the same I21.12 table is at
+    // `InquiryGovernance::release_gate`, which a release consumer asks on every
+    // run and which refuses the supported release while an open debt refuses it.
     let disposition = if debt_restriction.refuses(derived) {
         CompletionDisposition::IncompleteCoverage
     } else {
@@ -9902,6 +11020,33 @@ fn debt_kinds_wire(debts: &[ResearchDebt]) -> String {
     kinds.join(",")
 }
 
+/// Stable wire spelling of the Appendix G statuses the generated gate set
+/// carries, deduplicated and ordered.
+///
+/// The gate set publishes its statuses beside its size so a reader can see
+/// whether any gate is `BLOCKING` — the one status that may refuse the dependent
+/// promotion — without a second query. Rendered as closed wire names only; no
+/// obligation text, owner prose or provider material is reproduced.
+fn gate_statuses_wire(gates: &[ResearchGateRecord]) -> String {
+    let mut statuses: Vec<&str> = gates.iter().map(|gate| gate.status.wire_name()).collect();
+    statuses.sort_unstable();
+    statuses.dedup();
+    statuses.join(",")
+}
+
+/// Stable wire spelling of the Appendix G activation families the generated gate
+/// set carries, deduplicated and ordered.
+///
+/// Published beside the gate size because Appendix G's rule is about activation
+/// and a reader has to be able to check which families this record activated.
+/// Only the closed family wire names appear.
+fn gate_families_wire(gates: &[ResearchGateRecord]) -> String {
+    let mut families: Vec<&str> = gates.iter().map(|gate| gate.family.as_str()).collect();
+    families.sort_unstable();
+    families.dedup();
+    families.join(",")
+}
+
 /// Renders an already-canonical member list for the terminal receipt line.
 ///
 /// The A3 coverage map publishes three rosters — the independently derived
@@ -9989,30 +11134,82 @@ fn str_members(members: &[String]) -> Vec<&str> {
     members.iter().map(String::as_str).collect()
 }
 
-/// The `debt_restricted=` and `debt_restriction_refused=` values on the receipt
-/// line.
+/// The whole I21.12 research-debt projection on the receipt line.
 ///
-/// I21.12 makes a debt a typed object that states what it blocks, so the line
-/// publishes the restriction boolean beside the closed wire names of the
-/// dispositions the debts actually refuse. Rendering both from one owner means
-/// the boolean and the list cannot disagree about which debt kinds are present.
-struct DebtRestrictionProjection<'a> {
-    /// The restriction the registered debts imply.
-    restriction: &'a ResearchDebtRestriction,
+/// One projection rather than six inline format arguments, for the same reason the
+/// narrower restriction-only projection it replaces existed and one better reason
+/// on top of it: the four values it publishes describe ONE obligation — the
+/// registered debt, the restriction that debt places on the claim, the Appendix G
+/// gate the debt activated and the Problem-registry registration that gate still
+/// owes. Rendering them apart let a reader compare a count of debts against a list
+/// of gate statuses without any of them naming the debt they belonged to.
+///
+/// What each value is, kept from the projections this one replaces:
+///
+/// - `debts`/`debt_kinds`: I21.12 makes a debt a typed object that states what it
+///   blocks, so the kind reaches the boundary as a closed wire name rather than
+///   only as a count.
+/// - `debt_restricted`/`debt_restriction_refused`: the restriction boolean beside
+///   the closed wire names of the dispositions the debts actually refuse.
+///   Rendering both from one owner means the boolean and the list cannot disagree
+///   about which debt kinds are present.
+/// - `research_gate_current`: the count of gates that may appear in current
+///   required context, read through
+///   [`ResearchGateStatus::appears_in_current_context`] rather than assumed.
+/// - `debt_registration_pending` and `debt_registration_obligation_ids`: which
+///   obligations this record proposes registering and how many of those proposals
+///   are still uncommitted.
+/// - `debt_registration_owner_receipt=none`: the Problem Registry's commit
+///   receipt is the registry's, `crates/research/AGENTS.md` gives this subtree no
+///   canonical-store write authority, and a line implying a receipt would be a
+///   false proof claim under A0.3 — the same reason the sibling
+///   `source_admission_owner_receipt=none` is spelled.
+///
+/// Only identities, closed wire names and counts are rendered: no debt summary,
+/// no owner prose, no provider material, no credential.
+struct ResearchDebtProjection<'a> {
+    /// The record whose registered debts, restriction, gates and registrations
+    /// are rendered here.
+    record: &'a InquiryGovernance,
 }
 
-impl std::fmt::Display for DebtRestrictionProjection<'_> {
+impl std::fmt::Display for ResearchDebtProjection<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let record = self.record;
+        let restriction = &record.terminal.debt_restriction;
+        let pending = record
+            .research_debt_registrations
+            .iter()
+            .filter(|registration| registration.is_pending())
+            .count();
         write!(
             formatter,
-            "debt_restricted={} debt_restriction_refused={}",
-            bool_text(self.restriction.restricted),
-            self.restriction
+            "debts={} debt_kinds={} debt_restricted={} debt_restriction_refused={} \
+             research_gates={} research_gate_current={} research_gate_statuses={} \
+             research_gate_families={} debt_registrations={} debt_registration_pending={} \
+             debt_registration_obligation_ids={} debt_registration_owner_receipt=none",
+            record.research_debts.len(),
+            debt_kinds_wire(&record.research_debts),
+            bool_text(restriction.restricted),
+            restriction
                 .refused_dispositions
                 .iter()
                 .map(|disposition| disposition_wire(*disposition))
                 .collect::<Vec<&str>>()
                 .join(","),
+            record.research_gate_records.len(),
+            record.current_research_gates().len(),
+            gate_statuses_wire(&record.research_gate_records),
+            gate_families_wire(&record.research_gate_records),
+            record.research_debt_registrations.len(),
+            pending,
+            member_list_wire(
+                &record
+                    .research_debt_registrations
+                    .iter()
+                    .map(|registration| registration.obligation_id.as_str())
+                    .collect::<Vec<&str>>(),
+            ),
         )
     }
 }

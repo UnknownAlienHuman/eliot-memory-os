@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use eliot_agent_coordinator::OwnerLoadedClaimRow;
 #[cfg(windows)]
 use eliot_contracts::{ArtifactId, ContractId};
 use eliot_contracts::{
@@ -46,6 +47,7 @@ use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
 use eliot_learning_contracts::LearningStateViewRecipe;
+use eliot_ors::OperationIdentity;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
     AgentActivationResolutionResult, AgentActivationResultAck, AgentActivationResultReconcile,
@@ -87,6 +89,20 @@ use super::{
 
 const PROVIDER_CAPABILITY_VERIFY_OPERATION: &str = "native_worker.provider_capability.verify";
 
+/// Reads the sealed durable claim-row projection bound to one exact claim
+/// identity (issue #1108, A4/A5 daemon row source).
+///
+/// Daemon-target operation of the Kernel claim-row read arm
+/// (`bins/eliot-kernel/src/provider_capability_route.rs::handle_provider_capability_claim_row_read`):
+/// the request carries only `wire_version` plus `claim_id`, and every
+/// projected field is loaded from the Kernel-held ORS row, never echoed from
+/// presented values.
+const PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION: &str =
+    "native_worker.provider_capability.claim_row.read";
+
+/// Expected `kind` of the sealed claim-row read reply body (issue #1108).
+const PROVIDER_CAPABILITY_CLAIM_ROW_KIND: &str = "native_worker_provider_capability_claim_row";
+
 /// Renders the release builder's `eliotd` manifest from the exact contract
 /// constructor used by the live Kernel handshake.
 ///
@@ -125,6 +141,32 @@ struct ProviderCapabilityReceiptWire {
     worker_generation: u64,
     fence_digest: String,
     verified_at_unix_ms: u64,
+    receipt_digest: String,
+}
+
+/// Sealed durable claim-row projection for one exact claim identity (issue
+/// #1108, A4/A5 daemon row source).
+///
+/// Mirrors the Kernel claim-row read reply body
+/// (`bins/eliot-kernel/src/provider_capability_route.rs::ProviderCapabilityContext::read_claim_row`,
+/// sealed by `seal_capability_receipt`): the `kind` discriminator, the
+/// capability wire version, the exact durable fields shaped for
+/// [`OwnerLoadedClaimRow::new`], the read timestamp, and the seal digest.
+/// `deny_unknown_fields` keeps a widened reply a typed failure, never a
+/// silently accepted row.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderClaimRowReadWire {
+    kind: String,
+    wire_version: String,
+    claim_id: String,
+    attempt_id: String,
+    operation_id: String,
+    binding_digest: String,
+    executable_binding_digest: String,
+    worker_generation: u64,
+    fence_digest: String,
+    read_at_unix_ms: u64,
     receipt_digest: String,
 }
 
@@ -1146,6 +1188,169 @@ pub fn parse_observe_submit_outcome(
     Err("Kernel semantic_observe_result answer is neither accepted, expired, nor stale".to_owned())
 }
 
+/// Parses one unwrapped `watchdog_export_claim` answer into the owner-neutral
+/// export window the Watchdog submitted.
+///
+/// The value arrives already unwrapped from the shared `{status, value,
+/// recovery}` outcome envelope, so this reads exactly the `batch` member the
+/// Kernel arm writes, matching [`parse_observe_claimed_pair`]'s shape. The
+/// batch decodes as the exact typed closed payload the Kernel admitted, is
+/// re-validated against its own contract here, and is projected onto the
+/// owner-neutral batch the Governor admission consumes. Every field is the
+/// Watchdog's own recorded value: nothing is defaulted, synthesized, or
+/// recomputed, so the admission runs against the same digests, ranges, and
+/// freshness window the spool owner exported. A null `batch` is an empty-queue
+/// backoff, not a failure.
+pub fn parse_watchdog_export_claimed_batch(
+    value: &serde_json::Value,
+) -> Result<Option<eliot_watchdog_core::WatchdogSpoolExportBatch>, String> {
+    use eliot_protocol::{WatchdogSpoolEntryKind, WatchdogSpoolExportBatchPayload};
+    let _span = tracing::info_span!("eliotd.watchdog_export_claim").entered();
+    let batch = match value.get("batch") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(batch) => batch.clone(),
+    };
+    let payload: WatchdogSpoolExportBatchPayload = serde_json::from_value(batch)
+        .map_err(|error| format!("Kernel watchdog export claim does not decode: {error}"))?;
+    payload.validate().map_err(|error| {
+        format!("Kernel watchdog export claim is not the admitted contract: {error}")
+    })?;
+    let entries = payload
+        .entries
+        .iter()
+        .map(|entry| eliot_watchdog_core::WatchdogSpoolExportEntry {
+            sequence: entry.sequence,
+            schema_version: entry.schema_version,
+            observed_at_ms: entry.observed_at_ms,
+            payload_kind: match entry.entry_kind {
+                WatchdogSpoolEntryKind::Heartbeat => {
+                    eliot_watchdog_core::WatchdogSpoolPayloadKind::Heartbeat
+                }
+                WatchdogSpoolEntryKind::Gap => eliot_watchdog_core::WatchdogSpoolPayloadKind::Gap,
+                WatchdogSpoolEntryKind::Recovery => {
+                    eliot_watchdog_core::WatchdogSpoolPayloadKind::Recovery
+                }
+            },
+            payload_digest: entry.payload_digest.clone(),
+            record_digest: entry.record_digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(eliot_watchdog_core::WatchdogSpoolExportBatch {
+        schema_version: payload.schema_version,
+        batch_id: payload.batch_id.clone(),
+        installation_id: payload.installation_id.clone(),
+        watchdog_generation: payload.watchdog_generation,
+        watchdog_epoch: payload.watchdog_epoch,
+        predecessor_cursor: eliot_watchdog_core::WatchdogSpoolCursor {
+            schema_version: payload.schema_version,
+            acknowledged_sequence: payload.predecessor_sequence,
+            watchdog_generation: payload.watchdog_generation,
+            watchdog_epoch: payload.watchdog_epoch,
+            installation_id: payload.installation_id.clone(),
+            sink_id: payload.sink_id.clone(),
+        },
+        first_sequence: payload.first_sequence,
+        last_sequence: payload.last_sequence,
+        high_water_sequence: payload.high_water_sequence,
+        item_count: entries.len(),
+        byte_size: payload.byte_size,
+        entries,
+        batch_digest: payload.batch_digest.clone(),
+        is_empty_batch: false,
+        created_at_ms: payload.created_at_ms,
+        expires_at_ms: payload.expires_at_ms,
+    }))
+}
+
+/// Builds the typed terminal-disposition result for one admitted drain window.
+///
+/// Only a disposition that actually terminates an entry appears: a receipt-less
+/// or otherwise undecided entry is simply absent, because the closed result
+/// vocabulary has no "not yet" value. That absence is what keeps the Watchdog's
+/// cursor exactly where the spool owner left it instead of letting an undecided
+/// entry be counted as applied.
+pub fn watchdog_export_result_for_acknowledgement(
+    batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
+    acknowledgement: &eliot_watchdog_core::WatchdogSpoolAcknowledgement,
+) -> Result<Option<eliot_protocol::WatchdogSpoolExportResultPayload>, String> {
+    use eliot_protocol::{
+        WatchdogSpoolEntryOutcome, WatchdogSpoolExportOutcomeSubmission,
+        WatchdogSpoolExportResultPayload, watchdog_export_reconciliation_idempotency_key,
+    };
+    let _span = tracing::info_span!("eliotd.watchdog_export_result").entered();
+    // The acknowledgement must answer this exact window before any of its
+    // dispositions can be projected onto a result: a sink that echoed a
+    // different batch identity would otherwise bind decisions to foreign
+    // records.
+    if acknowledgement.batch_id != batch.batch_id
+        || acknowledgement.batch_digest != batch.batch_digest
+        || acknowledgement.predecessor_sequence != batch.predecessor_cursor.acknowledged_sequence
+        || acknowledgement.first_sequence != batch.first_sequence
+        || acknowledgement.last_sequence != batch.last_sequence
+        || acknowledgement.installation_id != batch.installation_id
+        || acknowledgement.sink_id != batch.predecessor_cursor.sink_id
+        || acknowledgement.dispositions.len() != batch.entries.len()
+    {
+        return Err(
+            "Watchdog export acknowledgement does not answer the claimed drain window".to_owned(),
+        );
+    }
+    let mut outcomes = Vec::with_capacity(acknowledgement.dispositions.len());
+    for (entry, line) in batch.entries.iter().zip(&acknowledgement.dispositions) {
+        if line.sequence != entry.sequence || line.record_digest != entry.record_digest {
+            return Err(
+                "Watchdog export acknowledgement does not answer the exact retained record"
+                    .to_owned(),
+            );
+        }
+        let outcome = match &line.disposition {
+            eliot_watchdog_core::WatchdogSpoolSinkDisposition::Applied => {
+                WatchdogSpoolEntryOutcome::Applied
+            }
+            eliot_watchdog_core::WatchdogSpoolSinkDisposition::Rejected { reason } => {
+                WatchdogSpoolEntryOutcome::Rejected {
+                    reason: reason.clone(),
+                }
+            }
+            eliot_watchdog_core::WatchdogSpoolSinkDisposition::GapRequiresRecovery => {
+                WatchdogSpoolEntryOutcome::GapRequiresRecovery
+            }
+            // No terminal disposition: the Governor has not decided this entry,
+            // so it stays pending and is deliberately not submitted.
+            eliot_watchdog_core::WatchdogSpoolSinkDisposition::Received
+            | eliot_watchdog_core::WatchdogSpoolSinkDisposition::Durable
+            | eliot_watchdog_core::WatchdogSpoolSinkDisposition::AdmittedCandidate
+            | eliot_watchdog_core::WatchdogSpoolSinkDisposition::Unknown => continue,
+        };
+        outcomes.push(WatchdogSpoolExportOutcomeSubmission {
+            sequence: entry.sequence,
+            record_digest: entry.record_digest.clone(),
+            idempotency_key: watchdog_export_reconciliation_idempotency_key(
+                &batch.installation_id,
+                entry.sequence,
+                &entry.record_digest,
+            ),
+            outcome,
+        });
+    }
+    if outcomes.is_empty() {
+        return Ok(None);
+    }
+    WatchdogSpoolExportResultPayload {
+        wire_id: eliot_protocol::WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID.to_owned(),
+        wire_version: WatchdogSpoolExportResultPayload::CONTRACT_VERSION,
+        route: eliot_protocol::WATCHDOG_SPOOL_EXPORT_ROUTE.to_owned(),
+        installation_id: batch.installation_id.clone(),
+        batch_id: batch.batch_id.clone(),
+        batch_digest: batch.batch_digest.clone(),
+        outcomes,
+        payload_sha256: String::new(),
+    }
+    .with_computed_digest()
+    .map(Some)
+    .map_err(|error| format!("Watchdog export result is not the closed contract: {error}"))
+}
+
 /// Parses one unwrapped `semantic_observe_deferred` answer value into the
 /// typed defer outcome.
 ///
@@ -1680,6 +1885,97 @@ impl DaemonKernelClient {
             ));
         }
         Ok(())
+    }
+
+    /// Loads the sealed durable claim row bound to one exact claim identity
+    /// (issue #1108, A4/A5 daemon row source).
+    ///
+    /// Sends [`PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION`] with only
+    /// `wire_version` plus `claim_id` over the existing [`transact_async`](Self::transact_async)
+    /// path, then parses the sealed reply into the seven
+    /// [`OwnerLoadedClaimRow::new`] arguments (claim, attempt, operation,
+    /// binding and executable digests, claiming-worker generation, fence
+    /// digest). The claim identity is validated pre-transport with the same
+    /// owner the Kernel read arm enforces (`eliot_ors::OperationIdentity`),
+    /// and the call requires an already-validated Kernel owner session, so a
+    /// row never loads without live session evidence. The transport identity
+    /// minted inside `transact_async` already binds the live State Fence, so
+    /// no fence bytes travel in the payload.
+    ///
+    /// Fail-closed, never synthesized: a missing or invalid seal digest, a
+    /// reply that does not decode under `deny_unknown_fields`, a wrong kind
+    /// or wire version, a claim echo that does not equal the requested lookup
+    /// key, a zero read timestamp, or loaded fields that fail
+    /// [`OwnerLoadedClaimRow::new`] shape validation all return typed
+    /// [`KernelClientError`] failures. No row is invented from presented
+    /// values — this method takes none — and no freshness or generation gate
+    /// is applied here: the Kernel returns the row verbatim and those gates
+    /// stay with the verifier and the downstream
+    /// `AdmittedProviderFactory`, which fail closed on the exact loaded
+    /// evidence.
+    ///
+    /// Production callers: the drive seam
+    /// (`DaemonComposition::agent_fabric_new_verified_async`) and the async
+    /// restore seam (`DaemonComposition::agent_fabric_restore_verified_async`)
+    /// via `build_production_provider_capability` into
+    /// `crate::provider_capability::admit_provider_capability`, which feeds
+    /// the loaded row to `AdmittedProviderFactory::new`.
+    pub(super) async fn load_provider_claim_row_async(
+        &self,
+        claim_id: &str,
+    ) -> Result<OwnerLoadedClaimRow, KernelClientError> {
+        let claim = OperationIdentity::new(claim_id)
+            .map_err(|error| KernelClientError::Contract(error.to_string()))?;
+        self.owner_session_facts().ok_or_else(|| {
+            KernelClientError::Contract(
+                "provider claim-row read requires an already validated Kernel owner session"
+                    .to_owned(),
+            )
+        })?;
+        let payload = serde_json::json!({
+            "wire_version": PROVIDER_CAPABILITY_WIRE_VERSION,
+            "claim_id": claim.as_str(),
+        });
+        let response = self
+            .transact_async(PROVIDER_CAPABILITY_CLAIM_ROW_READ_OPERATION, payload)
+            .await?;
+        let mut body = response.clone();
+        let receipt_digest = body
+            .as_object_mut()
+            .and_then(|object| object.remove("receipt_digest"))
+            .and_then(|digest| digest.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                KernelClientError::Unknown("Kernel claim-row reply has no sealed digest".to_owned())
+            })?;
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if sha256_hex(&body_bytes) != receipt_digest {
+            return Err(KernelClientError::Unknown(
+                "Kernel claim-row reply digest is invalid".to_owned(),
+            ));
+        }
+        let row: ProviderClaimRowReadWire = serde_json::from_value(response)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))?;
+        if row.kind != PROVIDER_CAPABILITY_CLAIM_ROW_KIND
+            || row.wire_version != PROVIDER_CAPABILITY_WIRE_VERSION
+            || row.receipt_digest != receipt_digest
+            || row.claim_id != claim.as_str()
+            || row.read_at_unix_ms == 0
+        {
+            return Err(KernelClientError::Unknown(
+                "Kernel claim-row reply does not bind the requested claim".to_owned(),
+            ));
+        }
+        OwnerLoadedClaimRow::new(
+            row.claim_id,
+            row.attempt_id,
+            row.operation_id,
+            row.binding_digest,
+            row.executable_binding_digest,
+            row.worker_generation,
+            row.fence_digest,
+        )
+        .map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
 
     /// Clones the retained validated binding string, if any. A poisoned slot
@@ -2483,6 +2779,60 @@ impl DaemonKernelClient {
             .emit();
         }
         Ok(pair)
+    }
+
+    /// Claims the next Watchdog spool export window this Kernel admitted
+    /// through the authenticated `watchdog_export_submit` front-door route
+    /// (issue #2899).
+    ///
+    /// Mirrors [`claim_observe_pair_async`](Self::claim_observe_pair_async): the
+    /// call travels as the single-`operation`-key `"watchdog_export_claim"`
+    /// payload and a null `batch` is the empty-queue backoff signal, not an
+    /// error. The claimed window carries the Watchdog's own submitted content
+    /// and every entry was re-proved against its own durable ORS row by Kernel
+    /// before it was served, so `None` means "nothing pending" and never "nothing
+    /// to admit".
+    #[cfg(windows)]
+    pub async fn claim_watchdog_export_batch_async(
+        &self,
+    ) -> Result<Option<eliot_watchdog_core::WatchdogSpoolExportBatch>, super::DaemonError> {
+        let value = self
+            .transact_async(
+                "watchdog_export_claim",
+                serde_json::json!({ "operation": "watchdog_export_claim" }),
+            )
+            .await
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        parse_watchdog_export_claimed_batch(&value).map_err(super::DaemonError::Kernel)
+    }
+
+    /// Records the Governor's own terminal dispositions for one claimed Watchdog
+    /// spool export window (issue #2899).
+    ///
+    /// The result travels as the single-`result`-key `"watchdog_export_result"`
+    /// payload and Kernel persists it through the owner's ORS result path: an
+    /// identical resubmission replays to the same durable record, and a changed
+    /// disposition under the same identity conflicts instead of writing a second
+    /// decision. Only terminal dispositions can be submitted at all, so an
+    /// undecided entry is never reported as applied.
+    #[cfg(windows)]
+    pub async fn submit_watchdog_export_result_async(
+        &self,
+        result: &eliot_protocol::WatchdogSpoolExportResultPayload,
+    ) -> Result<(), super::DaemonError> {
+        result
+            .validate()
+            .map_err(|error| super::DaemonError::Kernel(error.to_string()))?;
+        self.transact_async(
+            "watchdog_export_result",
+            serde_json::json!({
+                "operation": "watchdog_export_result",
+                "export_result": result,
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| super::DaemonError::Kernel(error.to_string()))
     }
 
     /// Submits one daemon-produced observe result body for its waiting host

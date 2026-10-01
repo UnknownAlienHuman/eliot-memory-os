@@ -529,7 +529,13 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
         try
         {
-            retained.Request.Validate();
+            // Current-shape only: the superseded shape returned above. The
+            // derived key, the retained key and the journal OperationId must
+            // all name the same operation — the retained-key equality was
+            // checked above, and this checks the derived key against the
+            // retained bytes — so a replacement operation kept under an old
+            // identity is refused before transport.
+            retained.Request.ValidateCurrentIdentity();
         }
         catch (InvalidOperationException error)
         {
@@ -676,7 +682,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 var read = await _client.UserAutomationAsync(
                     readRequest,
                     _requestCancellation?.Token ?? CancellationToken.None);
-                ShowUserAutomationResult(action, read, readRequest);
+                ShowUserAutomationResult(action, read, readRequest, readRequest.IdempotencyKey);
             }
             catch (Exception error)
             {
@@ -718,7 +724,9 @@ public sealed class MainViewModel : INotifyPropertyChanged
         // so the retained identity and the wire identity cannot diverge and
         // the key is minted exactly once.
         var request = UserAutomationOperatorRequest.Create(operation);
-        request.Validate();
+        // Fresh output of `Create` carries the digest of its own bytes; the
+        // current-identity check pins that binding at mint time.
+        request.ValidateCurrentIdentity();
         var pending = new OperatorPendingOperation(
             request.IdempotencyKey,
             OperatorMutationRoute.UserAutomation,
@@ -769,7 +777,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             var answer = await _client.UserAutomationAsync(
                 request,
                 _requestCancellation?.Token ?? CancellationToken.None);
-            ShowUserAutomationResult(action, answer, request);
+            ShowUserAutomationResult(action, answer, request, pending.OperationId);
             // A typed attempt refusal can prove that this attempt stopped before
             // Store, but it does not settle an earlier attempt of the same
             // retained identity. Preserve an already-unknown phase; a first
@@ -795,7 +803,7 @@ public sealed class MainViewModel : INotifyPropertyChanged
             // Only then is the local cleanup limitation reported, under the
             // same identity. The record stays reconcilable, but the answer is
             // processed, never discarded and never rewritten as unknown.
-            ShowUserAutomationResult(action, cleanup.OwnerAnswer, request);
+            ShowUserAutomationResult(action, cleanup.OwnerAnswer, request, pending.OperationId);
             ReplacePending(pending.OperationId, unresolvedPhase);
             RefreshPendingState();
             SetBanner(
@@ -870,13 +878,32 @@ public sealed class MainViewModel : INotifyPropertyChanged
     /// alone never proves fresh owner normalization; it is reported as UNVERIFIED
     /// with a warning. The original bounded response remains available for exact
     /// inspection.
+    /// The answer is decoded only against the durably retained submitted
+    /// operation identity carried alongside the transmitted request
+    /// (<paramref name="retainedOperationId"/>): the Operator never possesses
+    /// the submitted State Fence, so the retained idempotency key is the one
+    /// request-correlation handle this side can hold, and a request that no
+    /// longer binds it is never rendered as its result.
     /// </remarks>
     private void ShowUserAutomationResult(
         string action,
         JsonElement answer,
-        UserAutomationOperatorRequest request)
+        UserAutomationOperatorRequest request,
+        string retainedOperationId)
     {
         ResultPayloadText = OperatorProjectionGuard.BoundRetainedResult(answer) ?? string.Empty;
+        if (!string.Equals(request.IdempotencyKey, retainedOperationId, StringComparison.Ordinal))
+        {
+            // Fail closed without touching the pending record: the answer is
+            // kept for exact inspection, but it is not decoded as the retained
+            // operation's result and authorizes nothing.
+            ResultSummary = $"{action}: the owner answer was not decoded because the request being displayed no longer binds the retained submitted operation; the record stays reconciling under its own identity.";
+            SetBanner(
+                "UserAutomation result not bound to the submitted operation",
+                ResultSummary,
+                OperatorBannerSeverity.Warning);
+            return;
+        }
         var validationContext = UserAutomationResultValidationContext.FromRequest(request);
         var outcome = UserAutomationOutcomeClassifier.Read(action, answer, validationContext);
         ResultSummary = outcome.Detail;

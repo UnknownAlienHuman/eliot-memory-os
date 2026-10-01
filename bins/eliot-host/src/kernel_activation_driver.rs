@@ -85,6 +85,20 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // WORK_UNIT_CASE: 978/7 — candidate bind requested; handshake/auth
         // material is distinct from nonce/activation, no secrets observed.
         kernel_activation_observe("host.kernel-activation bind requested");
+        // I14.16 step 7 (issue #1953 W6): the candidate generation must be
+        // the strict direct child of the retired contour's generation. The
+        // journal reducer pins this on first bind, but a same-activation
+        // rebind consults only the disposition binding, so the driver
+        // refuses a forked lineage here, before any nonce can be issued for
+        // it. Rollback is a newer activation, never a reused generation.
+        if let PriorKernelDisposition::Terminated(source) = &prior_kernel_disposition
+            && !kernel_generation.advances(&source.generation.current)
+        {
+            return Err(HostError::ProcessContour(
+                "candidate Kernel generation must directly advance the terminated prior contour"
+                    .to_owned(),
+            ));
+        }
         let current = KernelRecord {
             fence: record_fence(host, activation_id, activation_generation),
             operation: operation("kernel-candidate-shadow")?,

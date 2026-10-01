@@ -348,7 +348,7 @@ impl ChannelCapability {
 /// `Wired`/`MissingAdapter` is the measured state of this crate at
 /// `SENSOR_MAP_REVISION`, from `git grep` over `bins/eliot-watchdog/src` for a
 /// production runtime caller of each channel's source — not a design intent.
-/// Three channels are wired; the other eight are measured missing adapters and
+/// Four channels are wired; the other seven are measured missing adapters and
 /// are the named gaps that keep a full-coverage claim unavailable.
 pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
     ChannelCapability {
@@ -454,13 +454,17 @@ pub const SENSOR_CHANNEL_MAP: [ChannelCapability; ObservationChannel::COUNT] = [
         ],
         mechanism: SensorMechanism::LiveRead,
         privilege_profile: PlatformPrivilegeProfile::WatchdogLocalService,
-        coverage_limitation: "The approved Host image path identity is verified through a \
-             `ProtectedPathLease`, but no artifact or configuration hash is computed or recorded, \
-             so neither supported class is actually produced and this interval is blind.",
-        wiring: ChannelWiring::MissingAdapter {
-            reason: "`git grep -n 'sha256_hex\\|digest' -- bins/eliot-watchdog/src` finds only \
-                 spool/backup and admission digests; no module artifact or installation \
-                 configuration hash is produced by a runtime caller",
+        coverage_limitation: "The approved Host image digest is read live through the retained \
+             no-follow lease (bounded, identity-verified before and after the read; bytes \
+             hashed, never retained), but no installation configuration identity is read, so \
+             only ArtifactDigest is produced and this channel is PARTIAL, never CONTINUOUS, \
+             until a config-identity probe lands.",
+        wiring: ChannelWiring::Wired {
+            runtime_caller: "watchdog_composition::WatchdogComposition::start_with_shutdown_and_host_and_heartbeat \
+                 -> HostObservationSource::observe_approved_artifact -> \
+                 host_identity_observation::HostIdentityMonitor::observe_approved_artifact -> \
+                 independent_sensor::observe_approved_artifact_digest -> \
+                 ProtectedPathLease::read_bounded",
         },
     },
     ChannelCapability {
@@ -865,7 +869,7 @@ impl IntervalCoverageReport {
     /// required. There is no `any` term, no early exit that skips an
     /// unexamined channel, and no per-channel shortcut: a report whose
     /// `Host` and `Kernel` records are both `CONTINUOUS` still returns `false`
-    /// while any of the eight measured missing adapters is `BLIND`. `false` is
+    /// while any of the seven measured missing adapters is `BLIND`. `false` is
     /// also returned when no interval has been observed at all, because the
     /// report itself is then absent rather than empty-and-complete.
     #[must_use]

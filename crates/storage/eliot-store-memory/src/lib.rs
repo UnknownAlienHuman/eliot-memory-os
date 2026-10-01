@@ -2457,8 +2457,9 @@ fn experience_range_payload(
             matched_total,
             truncated,
             next_cursor,
+            state_fence: fence.clone(),
         }
-        .payload(fence),
+        .payload(),
     )
 }
 
@@ -2560,8 +2561,9 @@ fn learning_range_payload(
             matched_total,
             truncated,
             next_cursor,
+            state_fence: fence.clone(),
         }
-        .payload(fence),
+        .payload(),
     )
     .map_err(|error| StoreError::Serialization(error.to_string()))
 }

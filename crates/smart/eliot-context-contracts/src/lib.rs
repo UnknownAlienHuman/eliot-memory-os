@@ -27,6 +27,7 @@ mod reactive_input;
 mod reactive_session;
 mod readback;
 mod recipe;
+mod render_serializer;
 mod view;
 
 pub use admission::{
@@ -132,6 +133,7 @@ pub use recipe::{
     RecipeRevocationRecord, RecipeRolePosition, RecipeStage, RecipeSupersession,
     ResolvedContextRecipe,
 };
+pub use render_serializer::{ContextRenderSerializer, canonical_render_serializer};
 pub use view::{ActiveUnderstandingView, RenderedAtom, SelectionIntegrityProof};
 
 /// Compatibility spelling for a provider-produced whole atom.

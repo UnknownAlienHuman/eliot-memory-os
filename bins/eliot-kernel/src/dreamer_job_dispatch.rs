@@ -35,6 +35,7 @@
 use super::dispatch_launch::dreamer_dispatch_launch::{
     DREAMER_MODULE_ID, dreamer_launch_permits_lease,
 };
+use super::dreamer_owner_record::publish_owner_record;
 use super::*;
 use eliot_kernel_service::{DreamerCommitUncertain, DreamerJobGatewayError};
 use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse, JobOperation, JobRole};
@@ -490,7 +491,15 @@ impl KernelComposition {
             .dreamer_job(&envelope.context, envelope.request.clone())
             .await
         {
-            Ok(response) => {
+            Ok(mut response) => {
+                // The Kernel front door is where the owner record this Kernel
+                // holds is published onto the live seam: the owner's own
+                // recorded digest and byte length are re-proved against the
+                // original recorded value, never recomputed here, and the
+                // published reference is what travels to the managed worker.
+                // The answer binding below then re-proves the published record
+                // against the submission that carried it.
+                publish_owner_record(&envelope.request, &mut response)?;
                 response
                     .validate_for(&envelope.request)
                     .map_err(|_| TransportError::SessionFenced)?;

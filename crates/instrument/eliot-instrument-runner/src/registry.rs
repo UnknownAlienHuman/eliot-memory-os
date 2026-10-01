@@ -1026,13 +1026,17 @@ impl ProviderRegistry {
     /// Kind lists are sorted and deduplicated so iteration and matching stay
     /// deterministic regardless of caller order. Entry generations are
     /// preserved: an entry whose generation differs from `generation` resolves
-    /// as [`RegistryError::Stale`], never as a successful binding.
+    /// as [`RegistryError::Stale`], never as a successful binding. Before an
+    /// entry is published in the registry, its retained profile identity slots
+    /// must be complete and agree with the entry fields they duplicate.
     ///
     /// # Errors
     ///
     /// Returns [`RegistryError::Duplicate`] when two entries claim the same
-    /// instrument/adapter pair, or [`RegistryError::Contract`] when an entry
-    /// identity is invalid.
+    /// instrument/adapter pair, [`RegistryError::IdentitySlotBlank`] when a
+    /// required profile identity slot is blank, or
+    /// [`RegistryError::IdentitySlotDrift`] when a retained identity differs
+    /// from its corresponding entry field.
     pub fn build(
         entries: Vec<RegistryEntry>,
         generation: u64,
@@ -1042,6 +1046,7 @@ impl ProviderRegistry {
         for mut entry in entries {
             entry.kinds.sort_by_key(|kind| kind_rank(*kind));
             entry.kinds.dedup();
+            entry.verify_profile_identities()?;
             let instrument = entry.instrument.as_str().to_owned();
             let key = (instrument.clone(), entry.adapter.clone());
             if map.insert(key, entry).is_some() {

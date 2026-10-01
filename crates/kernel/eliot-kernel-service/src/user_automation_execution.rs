@@ -481,6 +481,10 @@ impl UserAutomationDurableJobMaterial {
             work_scope: work_scope.clone(),
             semantic_input,
             semantic_input_bytes: Some(semantic_input_bytes),
+            // This owner publishes no separate owner record for the job. The
+            // absence is explicit and typed: nothing downstream may read it as
+            // an empty record or mint one in its place.
+            owner_record: None,
             output_contract: output_envelope,
             admission: admitted_job_ref(admission, &work_scope, budget_units, deadline_unix_ms)?,
             cancellation_id: format!("user-automation:{occurrence_id}:cancellation"),

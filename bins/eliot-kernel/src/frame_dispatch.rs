@@ -10,6 +10,7 @@
 //! Forbidden authority: must not fabricate execution success, must not accept peer-owned shutdown authority, must not bypass `ServerHandshakePolicy`, generation poison, or state-fence compatibility.
 //! Ordinary module: I2.23 Capability-family topology and crate extraction decisions — ordinary single-file extraction (<10k LOC) owning only `KernelComposition::dispatch_frame` plus inseparable dispatch-only helpers with zero external users.
 
+use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
 use super::daemon_request_dispatch::{
     DAEMON_STARTUP_EVIDENCE_OPERATION, NOTIFICATION_STATE_MUTATION_OPERATION,
     NOTIFICATION_STATE_READ_OPERATION, USER_AUTOMATION_OPERATOR_OPERATION,
@@ -1116,6 +1117,39 @@ impl KernelComposition {
                 return self.dispatch_watchdog_intent_frame(session, frame);
             }
             #[cfg(windows)]
+            if super::host_request_route::is_watchdog_export_operation(native_operation) {
+                // I8.1 fenced Watchdog spool drain (Implements #2899). A
+                // Watchdog export window is a bounded observation intake over
+                // the retained spool, a sibling of the intent route rather than
+                // part of it, so it keeps its own closed operation, payload,
+                // envelope validation, and durable record. `Ready` is required
+                // for the same reason the intent route requires it: a degraded
+                // service must not admit a new durable drain projection. Peer,
+                // correlation, and fence joins mirror the intent gate; the typed
+                // payload decode, the mechanical window validation, and the named
+                // export mutation live in `dispatch_watchdog_export_frame`.
+                // Stale or unauthenticated sessions fence and are never granted
+                // protected input.
+                if frame.kind != FrameKind::Request || frame.message_type != MessageType::Execute {
+                    return Err(TransportError::SessionFenced);
+                }
+                if self
+                    .service_state()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    != KernelServiceState::Ready
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                session
+                    .peer
+                    .validate()
+                    .map_err(|_| TransportError::PeerIdentityUnavailable)?;
+                if frame.request_id.is_none() || frame.request_identity.is_none() {
+                    return Err(TransportError::SessionFenced);
+                }
+                return self.dispatch_watchdog_export_frame(session, frame);
+            }
+            #[cfg(windows)]
             if is_wasm_port_grant_operation(native_operation) {
                 // #1780 D3 WASM port-grant issuance rides the same admitted
                 // bridge transport as the host-request route above. Issuance
@@ -1564,6 +1598,15 @@ fn is_daemon_operation(operation: &str) -> bool {
             // `ProcessExecutionRequest` decode, and fenced the session.
             | NOTIFICATION_STATE_MUTATION_OPERATION
             | NOTIFICATION_STATE_READ_OPERATION
+            // Issue #1678 (W3/W5, REQ4, REQ6, A3, A4, A7): the admit +
+            // activate leg of the admission-reservation saga. Without this
+            // entry the frame fell through every predicate here, failed the
+            // `ProcessExecutionRequest` decode, and fenced the session before
+            // the coordinator arm was ever entered. This entry only lets the
+            // frame reach it: the arm still proves the live session fence and
+            // reads the canonical owner's own `WriteReceipt` for the original
+            // operation identity, so the frame admits nothing.
+            | ADMISSION_RESERVATION_ADMIT_OPERATION
             // #1862: the Task Controller claim/result legs and the dedicated
             // campaign-packet claim/result legs are separate admitted operations
             // with their own queues and attempt types, so the frame must reach

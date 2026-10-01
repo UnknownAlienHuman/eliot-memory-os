@@ -598,6 +598,7 @@ fn submit_material(job_id: &str) -> ValidatedDreamerMaterial {
         revision: 1,
         semantic_input: None,
         semantic_input_bytes: None,
+        owner_record: None,
         scope_id: SCOPE_E2E.to_owned(),
         fence: StateFence::new(epoch.clone(), ResourceGeneration::genesis()),
         epoch: epoch.clone(),

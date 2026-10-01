@@ -8,6 +8,10 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use eliot_context_measurement::{MAX_MEASUREMENT_BYTES, stu_for_bytes, validate_envelope};
+// W13/W14: the measurement unit/status discriminator is the canonical #704
+// owner type, not an app-local label, so the six qualifications stay
+// owner-distinguished on the wire.
+use eliot_context_contracts::MeasurementStatus;
 use eliot_engine::host::ActiveRoleAuthorityCheck;
 use eliot_engine::{
     AdapterMemoryWriter, AdapterObservationBridge, AdapterObservationReport, AdapterRegistry,
@@ -316,6 +320,13 @@ pub(crate) fn part_e_surface_report(profile: &str) -> Result<Value> {
         entries.push(json!({
             "name": name,
             "description_ul_tokens": measurement.stu_estimate,
+            // W13: the unit and the measurement state travel ON the record, in
+            // this object, so a reader cannot mistake the number above for an
+            // actual token count and cannot tell estimate from observation
+            // without reading the source comment. The state also carries the
+            // exact byte length, so the aggregate and the per-tool figures
+            // share one serialized basis.
+            "description_measurement": measurement_wire(&measurement),
             // A21/W9: the pre-#783 wire form is published beside the current
             // one as its own explicitly legacy object, never as a renamed or
             // reinterpreted copy of `description_ul_tokens`. It carries its own
@@ -344,10 +355,91 @@ pub(crate) fn part_e_surface_report(profile: &str) -> Result<Value> {
         "profile": profile.as_str(),
         "tool_count": tools.len(),
         "combined_description_ul_tokens": combined_ul_tokens,
+        "combined_description_measurement": measurement_wire(&combined),
         "combined_description_legacy_measurement": combined_legacy_description_measurement,
         "combined_description_legacy_estimate_units": combined_legacy_description_estimate_units,
         "tools": entries,
     }))
+}
+
+/// Publish one canonical measurement with its unit and state discriminator on
+/// the record. W13.
+///
+/// This is the single way an `eliot-app` MCP measurement reaches the wire. The
+/// returned object always carries `unit` and `state` beside the number, so
+/// "STU estimate" and "actual tokens" are distinguished structurally: a reader
+/// inspects the record, not the source doc comment. W14 follows from the same
+/// object - `status` is the canonical
+/// [`eliot_context_contracts::MeasurementStatus`] rather than an app-local
+/// label, so not-attempted, invalid, unavailable, stale, estimated and actual
+/// stay six distinct owner-owned wire values and none of them can be spelled as
+/// a bare number. The app seam has no route tokenizer, so the only status it
+/// can ever publish is [`MeasurementStatus::ConservativeStu`] and the actual
+/// count stays [`MeasurementStatus::ExactTokenizer`]-unreachable.
+fn measurement_wire(measurement: &CanonicalMeasurement) -> Value {
+    json!({
+        "unit": measurement.unit(),
+        "status": measurement.status(),
+        "actual_tokens": Value::Null,
+    })
+}
+
+/// Republish an engine-owned planning figure with its unit and status, without
+/// recomputing it. Rows 783/15, 783/16, 783/17, 783/19, 783/20.
+///
+/// The engine already owns and computes these numbers: `estimated_tokens` is
+/// `PacketBudgetDecision::estimated_tokens`, the per-section figures come from
+/// `packet_section_accounting`, and `cost_or_token_units` is a ledger
+/// accumulator. The app never re-derives any of them, and it never applies a
+/// `/4` ratio, a character count or a minimum-one rule of its own. What the app
+/// did do was publish them under token-named fields with no discriminator, so a
+/// reader could not tell an unvalidated planning estimate from an observed token
+/// count.
+///
+/// This closes that gap on the record: `unit` names the basis and `status` is
+/// the canonical owner [`MeasurementStatus`], so the qualification is read off
+/// the record rather than from a comment. The legacy bare fields are kept beside
+/// it for wire compatibility, but they can no longer be read as a token
+/// observation because the qualifier is right there in the same object. W14: an
+/// unmeasured figure is [`MeasurementStatus::Unavailable`] with a `null` value,
+/// never `0` and never a fallback estimate, and a present figure is
+/// [`MeasurementStatus::ConservativeStu`] - never
+/// [`MeasurementStatus::ExactTokenizer`], which this seam cannot produce.
+pub(crate) fn recorded_planning_wire(unit: &str, value: Option<u64>) -> Value {
+    match value {
+        Some(value) => json!({
+            "unit": unit,
+            "status": MeasurementStatus::ConservativeStu,
+            "empirical": false,
+            "value": value,
+        }),
+        None => json!({
+            "unit": unit,
+            "status": MeasurementStatus::Unavailable,
+            "empirical": false,
+            "value": Value::Null,
+        }),
+    }
+}
+
+/// Republish a named map of engine-owned per-section planning figures.
+///
+/// Rows 783/16. The section figures are the engine's own
+/// `section_tokens` accounting over exact serialized bytes; the app neither sums
+/// nor re-rounds them, so a per-section figure can never drift from the aggregate
+/// the same operation recorded.
+fn recorded_section_wire(section_tokens: &BTreeMap<String, usize>) -> Value {
+    let mut sections = serde_json::Map::new();
+    for (name, value) in section_tokens {
+        sections.insert(
+            name.clone(),
+            recorded_planning_wire(
+                "stu_estimate",
+                Some(u64::try_from(*value).unwrap_or(u64::MAX)),
+            ),
+        );
+    }
+    Value::Object(sections)
 }
 
 /// Synthetic record reference used by the combined legacy description figure.
@@ -2260,13 +2352,63 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The unit a published measurement number is actually denominated in.
+///
+/// W13: this is a discriminating type, not a label. It is on the record, so
+/// nothing downstream - and no reader of the wire - can tell an STU estimate
+/// from an actual token count by reading a doc comment, and an `ActualTokens`
+/// unit cannot be constructed for a payload that has no route tokenizer bound
+/// to it because the constructor below only ever sets [`Self::StuEstimate`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CanonicalMeasurementUnit {
+    /// `ceil(UTF-8 bytes / 3)`: the normative unvalidated #704 planning unit.
+    /// Never an observed token count and never proof of route fit.
+    StuEstimate,
+}
+
+/// W14: the six measurement states stay separate on the wire.
+///
+/// This is the canonical owner status, not an app-local enum:
+/// [`eliot_context_contracts::MeasurementStatus`] already names the six
+/// independent qualifications (ExactUtf8, ConservativeStu, ExactTokenizer,
+/// Unknown, Unavailable) that must not be collapsed into one optional number,
+/// so reusing it is what keeps not-attempted, invalid, unavailable, stale,
+/// estimated and actual distinguishable by the owner rather than by this seam's
+/// label. The app seam reaches only
+/// [`MeasurementStatus::ConservativeStu`]: it has no route tokenizer, so it can
+/// never spell [`MeasurementStatus::ExactTokenizer`], and every other state
+/// reaches the caller as a typed `Err` instead of degrading to zero, one or a
+/// character count.
+
 /// Exact measurement evidence for one final serialized UTF-8 payload.
 ///
 /// `byte_len` is the exact serialized length; `stu_estimate` is the
 /// normative unvalidated #704 planning estimate over exactly those bytes.
+/// W13: both are reached only through [`CanonicalMeasurement::status`], which
+/// carries the unit and the owner status discriminator on the record itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CanonicalMeasurement {
     byte_len: u64,
     stu_estimate: u64,
+}
+
+impl CanonicalMeasurement {
+    /// The unit this record's numbers are denominated in, read off the record.
+    const fn unit(&self) -> CanonicalMeasurementUnit {
+        CanonicalMeasurementUnit::StuEstimate
+    }
+
+    /// The owner-owned measurement status, read off the record rather than from
+    /// a comment.
+    ///
+    /// This is the only way the app seam publishes a measurement number: a
+    /// caller that wants a number must go through the status, so a bare
+    /// `stu_estimate` on the wire is never possible without the discriminator
+    /// beside it.
+    const fn status(&self) -> MeasurementStatus {
+        MeasurementStatus::ConservativeStu
+    }
 }
 
 /// The single #704 measurement owner for every `eliot-app` MCP measurement

@@ -130,6 +130,11 @@ pub enum DreamerMaterialError {
     SemanticInputUnavailable,
     /// The retained Store owner response carries a malformed semantic input.
     SemanticInputStale,
+    /// The retained owner record does not carry the owner's OWN recorded
+    /// digest, byte length and artifact handle. Kept distinct from
+    /// [`Self::SemanticInputStale`] so a stale owner record is never read as a
+    /// stale semantic input, or the reverse.
+    OwnerRecordStale,
     /// A mechanical gate failed (lock poison, serialization, live authority
     /// unavailable).
     Gate(String),
@@ -151,6 +156,9 @@ impl std::fmt::Display for DreamerMaterialError {
             }
             Self::SemanticInputStale => {
                 f.write_str("the durable Dreamer semantic input reference or bytes are stale")
+            }
+            Self::OwnerRecordStale => {
+                f.write_str("the durable Dreamer owner record is not the owner's recorded value")
             }
             Self::Gate(detail) => write!(f, "dreamer launch gate failed: {detail}"),
             Self::Io(detail) => write!(f, "dreamer material file failed: {detail}"),
@@ -190,6 +198,11 @@ pub struct DreamerDispatchedEnvelope {
     /// Kernel carries these bytes without interpreting their meaning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Opaque, content-addressed owner record the durable owner published for
+    /// this job. The Kernel copies the owner's own recorded reference; it
+    /// never mints one and never recomputes its digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_record: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job (never caller bytes).
     pub scope_id: String,
     /// Fence the ledger bound to this job (never caller bytes).
@@ -230,6 +243,8 @@ pub struct ValidatedDreamerMaterial {
     /// Original inline bytes mechanically bound to `semantic_input`, when
     /// supplied by the durable owner.
     pub semantic_input_bytes: Option<Vec<u8>>,
+    /// Opaque, content-addressed owner record the durable owner published.
+    pub owner_record: Option<OpaqueContentRef>,
     /// Scope the ledger bound to this job.
     pub scope_id: String,
     /// Fence the ledger bound to this job.
@@ -684,6 +699,14 @@ pub(crate) fn validate_dreamer_material(
             .validate_semantic_input_bytes(bytes)
             .map_err(|_| DreamerMaterialError::SemanticInputStale)?;
     }
+    // The owner record is opaque: the Kernel re-proves the owner's ORIGINAL
+    // recorded digest, byte length and artifact handle through the existing
+    // `validate`, and never recomputes the digest or interprets the content.
+    if let Some(owner_record) = &envelope.owner_record {
+        owner_record
+            .validate("owner_record.sha256")
+            .map_err(|_| DreamerMaterialError::OwnerRecordStale)?;
+    }
     envelope
         .fence
         .validate()
@@ -727,6 +750,7 @@ pub(crate) fn validate_dreamer_material(
         revision: envelope.revision,
         semantic_input: envelope.semantic_input.clone(),
         semantic_input_bytes: envelope.semantic_input_bytes.clone(),
+        owner_record: envelope.owner_record.clone(),
         scope_id: envelope.scope_id.clone(),
         fence: envelope.fence.clone(),
         epoch: envelope.epoch.clone(),
@@ -1050,6 +1074,7 @@ mod dreamer_dispatch_launch_tests {
             revision: 1,
             semantic_input: None,
             semantic_input_bytes: None,
+            owner_record: None,
             scope_id: "scope-t12-09".to_owned(),
             fence: test_fence(),
             epoch: epoch.clone(),

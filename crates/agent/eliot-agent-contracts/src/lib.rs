@@ -16,6 +16,8 @@ mod handoff_checkpoint;
 pub use handoff_checkpoint::*;
 mod handoff_recovery;
 pub use handoff_recovery::*;
+mod model_preference;
+pub use model_preference::*;
 
 use std::collections::BTreeSet;
 

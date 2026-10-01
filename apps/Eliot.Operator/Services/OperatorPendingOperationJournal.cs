@@ -495,7 +495,24 @@ public sealed class OperatorPendingOperationJournal : IDisposable
                         // rewritten: an incompatible record stays in the
                         // journal instead of emptying it or being dropped.
                         var automation = UserAutomationRetainedRequest.Read(operation.EnvelopeJson);
-                        automation.Request.Validate();
+                        if (automation.CarriesSupersededLocalClassifier)
+                        {
+                            // A superseded-shape record keeps its exact
+                            // historical key and stays unsendable: its key
+                            // was derived from bytes that included the old
+                            // local classifier, so today's digest must not
+                            // be recomputed over it.
+                            automation.Request.Validate();
+                        }
+                        else
+                        {
+                            // A current-shape record is sendable only when
+                            // its retained key is exactly the digest of its
+                            // retained operation bytes; otherwise the
+                            // journal metadata and the request disagree
+                            // about which operation the identity names.
+                            automation.Request.ValidateCurrentIdentity();
+                        }
                         if (!string.Equals(automation.Request.IdempotencyKey, operation.OperationId, StringComparison.Ordinal)
                             || operation.ExpectedRevision is not null
                             || !automation.Request.Operation.IsEffect())

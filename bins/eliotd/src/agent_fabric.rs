@@ -72,7 +72,7 @@ use eliot_agent_coordinator::{
 };
 #[cfg(test)]
 use eliot_agent_coordinator::{OwnerCurrentness, PresentedClaimMaterial};
-use eliot_contracts::{EpochId, StateFence, fences_match_exact};
+use eliot_contracts::{EpochId, StateFence, fences_match_exact, sha256_hex};
 use eliot_kernel_service::ProviderCapabilityExpectation;
 use eliot_store_api::{StoreError, SwarmOwnerRevision, WriteReceipt, WriteReceiptStatus};
 use serde::{Deserialize, Serialize};
@@ -4443,4 +4443,215 @@ pub struct AgentFabricDescriptor {
     pub authority_epoch: u64,
     /// Coordinator capacity identity threaded for this composition.
     pub capacity_identity: String,
+}
+
+/// Selected solo route freeze and admitted coordinate consumer (issue #2567
+/// I1/I2, audit 5857087693 repairs 1-2; owner-method freeze AUD2 below).
+///
+/// I1/AUD1 — the one existing supported task-bound solo route this
+/// composition consumes is `eliot.coordinate { operation: delegate }` under
+/// the first I10.15 built-in recipe `SoloVerified`
+/// (`crate::solo_agent_driver::SOLO_RECIPE_ID`, `solo-verified-v1`): one
+/// capable agent, then a deterministic verifier, with optional narrow review.
+/// The frozen shape, verified field for field against the current contracts
+/// on this base, is:
+///
+/// ```text
+/// MCP schema      crates/surfaces/eliot-mcp/src/contract.rs::DelegateRequest
+///                 { goal, owned_resources, expected_result } with
+///                 `CoordinateInput::Delegate` as the `operation: delegate`
+///                 discriminator; non-blank goal/result, at least one unique
+///                 non-blank owned resource.
+/// task/scope      intake plan carries the Task Controller-authored
+/// /fence          `StaffingPlanRequest` (`launch.task_id`, `task_revision`,
+///                 `state_fence`), which binds the task and fence; every
+///                 fabric step revalidates the live fence and epoch before
+///                 adoption.
+/// immutable       `SoloDelegateBody { goal, owned_resources,
+/// inputs          expected_result, source_bytes, source_digest }`: the three
+///                 MCP fields mirrored byte-for-byte plus the ORIGINAL
+///                 canonical delegate bytes with their SHA-256 digest
+///                 (content compare on readback; digest drift is
+///                 `IdentityConflict`).
+/// staffing/route  single lane, `max_fanout == 1`, the solo recipe identity
+/// policy          (`guard_solo_plan` in the solo driver); the staffing
+///                 receipt from `plan_coordinator_staffing` is the only
+///                 authority on which routes the plan may use, and an
+///                 unavailable route carries a typed defer/escalate
+///                 disposition, never a silent substitute.
+/// output/result   `DispatchAck { retained }` proves retention only;
+/// shape           `WorkerAck` is acknowledgement, never success;
+///                 `AttemptResultRecord` is candidate evidence, never task
+///                 Finish; worker output can never satisfy task Finish.
+/// limits          one live solo slot, `SOLO_QUEUE_MAX_LEN` (16) bounded
+///                 queue with backpressure, `SOLO_PROJECTION_MAX_BYTES`
+///                 persisted projections under the daemon state root.
+/// ```
+///
+/// I2 — live composition at admitted use. The consumer below binds one
+/// admitted coordinate/delegate envelope to one fully formed
+/// `SoloDelegateIntake` and hands it to the runtime solo queue
+/// (`crate::solo_agent_driver::solo_enqueue`, driven on the tick by
+/// `solo_poll_queue_async` through
+/// `DaemonComposition::agent_fabric_new_verified_async`). The two other I2
+/// legs already exist and are referenced, not rebuilt: the owner-resolved
+/// capability (`agent_fabric_new_verified_async` resolves the session halves
+/// over the live authenticated session and verifies the binding through
+/// `DaemonKernelClient::verify_provider_binding_async` before
+/// `AgentFabric::new_with_admitted_provider`), and one coordinator per
+/// boundary (`AgentFabric::new` / `new_with_admitted_provider` construct
+/// exactly one `AgentCoordinator`; this consumer constructs none and holds
+/// no coordinator across the enqueue).
+///
+/// AUD2 — frozen current owner methods per leg, verified against this base.
+/// Bound legs name the exact method the composition calls; missing legs name
+/// the absent owner method as STITCH (no fake port stands in):
+///
+/// ```text
+/// provider/route  DaemonKernelClient::verify_provider_binding_async
+/// evidence        (bins/eliotd/src/daemon_kernel_client.rs): binding probe
+///                 only — route/capacity currentness stays presented, never
+///                 promoted; plus DaemonComposition::require_admitted_model_route
+///                 -> AgentFabric::require_model_route over the daemon-held
+///                 Governor capability view, and plan_coordinator_staffing /
+///                 verify_receipt_digest / enforce_plan_receipt plus
+///                 build_admitted_provider_capability (this module) projecting
+///                 already verified material only.
+/// reservation /   STITCH: the Kernel ORS solo-stage arm and the Governor
+/// admission       solo-admission seal have no accepted interface revision;
+///                 the solo and production admission ports report
+///                 PortBindingState::Missing and stage/commit refuse typed.
+/// Kernel          STITCH: B-ACTIVATION-PROJECTION #839 has no accepted
+/// activation      interface revision; the activation port reports Missing
+///                 and activation refuses typed.
+/// admitted        STITCH: the executor-daemon bind (#874) plus the
+/// dispatch        native-worker executable-binding digest owner
+///                 (presented-against-retained comparison in
+///                 crates/kernel/eliot-kernel-service/src/protocol/native_worker_claim.rs);
+///                 the dispatch egress port reports Missing and emission
+///                 refuses typed. A caller-claimed digest is never evidence.
+/// status/result / AgentFabric::attempt_of / cancellation_of (retained
+/// cancel/         attempt reads), submit_attempt_result /
+/// reconcile       observe_worker_result / observe_tool_result (candidate
+///                 evidence only), request_cancellation /
+///                 reconcile_terminal_cancellation (exact admitted attempt,
+///                 uncertain effects stay reconciling), restore_verified /
+///                 restore_with_admitted_provider (same-request continuity;
+///                 changed material conflicts or takes a separately admitted
+///                 revision).
+/// ```
+///
+/// `caller: STITCH`. The admitted Task Controller operation that supplies
+/// the envelope plus the Task Controller-authored plan and the
+/// operation-presented claimed halves is not wired into `eliotd` yet (same
+/// producer named on `AgentFabric::define_and_plan`); nothing here invents
+/// the plan, the halves, or the envelope, and no coordinator, port, or
+/// executor is constructed to manufacture a caller.
+///
+/// I7.6 operation discriminator the solo slice consumes. Any other
+/// coordinate discriminator refuses typed at the consumer below; wider work
+/// needs the swarm path, never a silent reinterpretation as solo delegate.
+pub const SOLO_ROUTE_OPERATION: &str = "delegate";
+
+/// One admitted solo coordinate/delegate envelope: the task-bound request
+/// the missing producer must present alongside the full drive intake.
+///
+/// Every field binds against the intake it accompanies (see
+/// [`consume_admitted_solo_coordinate`]); the envelope carries no plan, no
+/// claim halves, and no route of its own, so it cannot substitute material
+/// the owners have not supplied.
+#[derive(Clone, Debug)]
+pub struct AdmittedSoloCoordinateRequest {
+    /// I7.6 operation discriminator; the solo slice admits `delegate` only.
+    pub operation: String,
+    /// ORIGINAL canonical delegate bytes; must digest to the intake body's
+    /// `source_digest`.
+    pub delegate_bytes: Vec<u8>,
+    /// Task the delegate is bound to; must equal the intake plan task.
+    pub task_id: String,
+    /// Fence the delegate was admitted under; must match the intake plan
+    /// fence exactly.
+    pub fence: StateFence,
+    /// Claim deadline in Unix milliseconds; must equal the intake deadline.
+    pub deadline_unix_ms: u64,
+    /// Whether the admitted request was already cancelled upstream; a
+    /// cancelled envelope never enqueues.
+    pub cancelled: bool,
+    /// Authenticated principal presenting the request; must be non-blank.
+    /// Principal authentication stays with the ingress owner — this consumer
+    /// checks presence, never mints authority.
+    pub principal: String,
+}
+
+/// Consumes one admitted `eliot.coordinate { operation: delegate }` request
+/// into the runtime solo queue (issue #2567 I2 consumer).
+///
+/// The envelope-to-intake binding is checked field for field — operation
+/// discriminator, cancellation, principal presence, ORIGINAL delegate bytes
+/// against the intake body digest, task identity, fence, and deadline — then
+/// the intake is handed to
+/// [`solo_enqueue`](crate::solo_agent_driver::solo_enqueue),
+/// which re-validates the intake shape, the solo plan guard, readiness, and
+/// the queue bound. Non-delegate coordinate operations (`audit`, `compare`,
+/// `wait`, `inspect`, `cancel`, `send`) refuse here with a typed contract
+/// rejection: they need their own owner paths and are never reinterpreted
+/// as solo delegate work. No coordinator is constructed, no port is
+/// touched, and no peer/swarm behavior is consulted on this path.
+///
+/// # Errors
+///
+/// Returns [`FabricError::Contract`] (via the typed provider-admission
+/// mapping) when the envelope is cancelled, names a non-delegate
+/// operation, carries a blank principal, or disagrees with the intake on
+/// task or deadline; [`FabricError::IdentityConflict`] when the delegate
+/// bytes do not digest to the intake body; [`FabricError::StaleFence`]
+/// when the envelope fence moved under the intake plan; or the
+/// `solo_enqueue` readiness/validation/queue-bound rejection unchanged.
+pub fn consume_admitted_solo_coordinate(
+    composition: &crate::DaemonComposition,
+    request: &AdmittedSoloCoordinateRequest,
+    intake: crate::solo_agent_driver::SoloDelegateIntake,
+    now_unix_ms: u64,
+) -> Result<(), crate::DaemonError> {
+    if request.cancelled {
+        return Err(FabricError::Contract(
+            "admitted solo coordinate arrives cancelled; nothing is enqueued".to_owned(),
+        )
+        .into());
+    }
+    if request.operation != SOLO_ROUTE_OPERATION {
+        return Err(FabricError::Contract(format!(
+            "solo slice consumes `{SOLO_ROUTE_OPERATION}` only; coordinate operation `{}` needs its own owner path",
+            request.operation,
+        ))
+        .into());
+    }
+    validate_text(&request.principal, "coordinate principal")?;
+    let delegate_digest = sha256_hex(&request.delegate_bytes);
+    if delegate_digest != intake.delegate.source_digest {
+        return Err(FabricError::IdentityConflict(
+            "admitted solo coordinate bytes do not match the intake delegate digest".to_owned(),
+        )
+        .into());
+    }
+    if request.task_id != intake.plan.launch.task_id.as_str() {
+        return Err(FabricError::IdentityConflict(
+            "admitted solo coordinate binds a different task than the intake plan".to_owned(),
+        )
+        .into());
+    }
+    if !fences_match_exact(&request.fence, &intake.plan.state_fence) {
+        return Err(FabricError::StaleFence(
+            "admitted solo coordinate fence moved under the intake plan".to_owned(),
+        )
+        .into());
+    }
+    if request.deadline_unix_ms != intake.deadline_unix_ms {
+        return Err(FabricError::Contract(
+            "admitted solo coordinate deadline disagrees with the intake deadline".to_owned(),
+        )
+        .into());
+    }
+    crate::solo_agent_driver::solo_enqueue(composition, intake, now_unix_ms)?;
+    Ok(())
 }

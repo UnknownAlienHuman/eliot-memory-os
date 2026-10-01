@@ -8,10 +8,16 @@
 //! The tag is a Blake3 keyed hash over the canonical bytes of the unsigned
 //! receipt. Because the key stays inside the Kernel process, a consumer may
 //! verify a receipt (through the Kernel) but may never forge one.
+//!
+//! The bound epoch is the lineage-aware [`EpochId`] tuple (I6.10), never a
+//! bare sequence counter: the MAC payload carries both `lineage_id` and
+//! `sequence`, so two receipts minted at equal sequences under different
+//! lineages have different tags and never authorize each other.
 
 use std::fmt;
+use std::num::NonZeroU64;
 
-use eliot_contracts::{AuthorityEpoch, ContractId, ResourceGeneration, canonical_json_bytes};
+use eliot_contracts::{ContractId, EpochId, ResourceGeneration, canonical_json_bytes};
 use eliot_receipts::{EffectClass, ProofCeiling};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -58,11 +64,15 @@ impl fmt::Debug for KernelAuthorityKey {
 }
 
 /// The unsigned, canonical payload over which an authority receipt is keyed.
+///
+/// The payload binds the exact lineage-aware epoch tuple: `lineage_id` and
+/// `sequence` both enter the canonical bytes, so the MAC tag distinguishes
+/// lineages that happen to share a sequence number.
 #[derive(Serialize)]
 struct UnsignedAuthorityReceipt<'a> {
     authority_id: &'a ContractId,
     authority_owner: &'a str,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: &'a EpochId,
     route_scope: &'a RouteScope,
     resource_generation: ResourceGeneration,
     allowed_effect: EffectClass,
@@ -81,7 +91,7 @@ struct UnsignedAuthorityReceipt<'a> {
 pub struct AuthorityReceipt {
     authority_id: ContractId,
     authority_owner: String,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     route_scope: RouteScope,
     resource_generation: ResourceGeneration,
     allowed_effect: EffectClass,
@@ -112,7 +122,7 @@ impl AuthorityReceipt {
         let unsigned = UnsignedAuthorityReceipt {
             authority_id: &self.authority_id,
             authority_owner: &self.authority_owner,
-            authority_epoch: self.authority_epoch,
+            authority_epoch: &self.authority_epoch,
             route_scope: &self.route_scope,
             resource_generation: self.resource_generation,
             allowed_effect: self.allowed_effect,
@@ -141,10 +151,10 @@ impl AuthorityReceipt {
         &self.authority_owner
     }
 
-    /// Returns the bound authority epoch.
+    /// Returns the bound authority epoch tuple.
     #[must_use]
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.authority_epoch
+    pub fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
     }
 
     /// Returns the exact route this receipt covers.
@@ -253,7 +263,7 @@ impl AuthorityGrantRequest {
 pub struct AuthorityGrant {
     authority_id: ContractId,
     authority_owner: String,
-    authority_epoch: AuthorityEpoch,
+    authority_epoch: EpochId,
     route_scope: RouteScope,
     resource_generation: ResourceGeneration,
     allowed_effect: EffectClass,
@@ -274,10 +284,10 @@ impl AuthorityGrant {
         &self.authority_owner
     }
 
-    /// Returns the bound authority epoch.
+    /// Returns the bound authority epoch tuple.
     #[must_use]
-    pub const fn authority_epoch(&self) -> AuthorityEpoch {
-        self.authority_epoch
+    pub fn authority_epoch(&self) -> &EpochId {
+        &self.authority_epoch
     }
 
     /// Returns the exact route this grant covers.
@@ -324,23 +334,27 @@ impl AuthorityGrant {
 #[derive(Clone)]
 pub struct KernelAuthority {
     key: KernelAuthorityKey,
-    current_epoch: AuthorityEpoch,
+    current_epoch: EpochId,
 }
 
 impl KernelAuthority {
-    /// Creates the Kernel authority holder at a given epoch.
+    /// Creates the Kernel authority holder at a given lineage-aware epoch.
     #[must_use]
-    pub const fn new(key: KernelAuthorityKey, current_epoch: AuthorityEpoch) -> Self {
+    pub fn new(key: KernelAuthorityKey, current_epoch: EpochId) -> Self {
         Self { key, current_epoch }
     }
 
-    /// Returns the epoch currently being fenced.
+    /// Returns the epoch tuple currently being fenced.
     #[must_use]
-    pub const fn current_epoch(&self) -> AuthorityEpoch {
-        self.current_epoch
+    pub fn current_epoch(&self) -> EpochId {
+        self.current_epoch.clone()
     }
 
-    /// Issues a non-forgeable authority receipt at the current epoch.
+    /// Issues a non-forgeable authority receipt at the current epoch tuple.
+    ///
+    /// The receipt binds the exact `(lineage_id, sequence)` tuple into the
+    /// MAC payload: a receipt minted under one lineage never verifies as
+    /// current under another, even at an equal sequence.
     ///
     /// # Errors
     ///
@@ -350,7 +364,7 @@ impl KernelAuthority {
         let receipt = AuthorityReceipt {
             authority_id: request.authority_id,
             authority_owner: request.authority_owner,
-            authority_epoch: self.current_epoch,
+            authority_epoch: self.current_epoch.clone(),
             route_scope: request.route_scope,
             resource_generation: request.resource_generation,
             allowed_effect: request.allowed_effect,
@@ -366,11 +380,17 @@ impl KernelAuthority {
     /// Consumes a receipt, returning verified authority only when it is
     /// authentic, current, route-exact and unexpired.
     ///
+    /// Exact tuple equality is the currency rule: a receipt from another
+    /// lineage is [`KernelError::StaleEpochTuple`] carrying both complete
+    /// tuples, whether its sequence is smaller, equal or larger — it is
+    /// unrelated, never merely out of order. A receipt from the active
+    /// lineage at a different sequence is [`KernelError::StaleEpoch`].
+    ///
     /// # Errors
     ///
-    /// Returns [`KernelError::ForgedReceipt`], [`KernelError::StaleEpoch`],
-    /// [`KernelError::RouteMismatch`] or [`KernelError::Expired`] as the first
-    /// applicable rejection.
+    /// Returns [`KernelError::ForgedReceipt`], [`KernelError::StaleEpochTuple`],
+    /// [`KernelError::StaleEpoch`], [`KernelError::RouteMismatch`] or
+    /// [`KernelError::Expired`] as the first applicable rejection.
     pub fn consume(
         &self,
         receipt: &AuthorityReceipt,
@@ -378,10 +398,19 @@ impl KernelAuthority {
         now_ms: i64,
     ) -> Result<AuthorityGrant, KernelError> {
         receipt.verify_tag(&self.key)?;
-        if receipt.authority_epoch.value() != self.current_epoch.value() {
+        if !receipt
+            .authority_epoch
+            .is_same_authority(&self.current_epoch)
+        {
+            if receipt.authority_epoch.lineage_id != self.current_epoch.lineage_id {
+                return Err(KernelError::StaleEpochTuple {
+                    observed: receipt.authority_epoch.clone(),
+                    active: self.current_epoch.clone(),
+                });
+            }
             return Err(KernelError::StaleEpoch {
-                observed: receipt.authority_epoch.value(),
-                active: self.current_epoch.value(),
+                observed: receipt.authority_epoch.sequence.get(),
+                active: self.current_epoch.sequence.get(),
             });
         }
         if receipt.route_scope() != expected_route {
@@ -397,7 +426,7 @@ impl KernelAuthority {
         Ok(AuthorityGrant {
             authority_id: receipt.authority_id.clone(),
             authority_owner: receipt.authority_owner.clone(),
-            authority_epoch: receipt.authority_epoch,
+            authority_epoch: receipt.authority_epoch.clone(),
             route_scope: receipt.route_scope.clone(),
             resource_generation: receipt.resource_generation,
             allowed_effect: receipt.allowed_effect,
@@ -406,36 +435,66 @@ impl KernelAuthority {
         })
     }
 
-    /// Fences the current epoch and raises a strictly greater one.
+    /// Fences the current epoch and raises the next sequence in the same
+    /// lineage.
     ///
     /// After this call, every previously issued receipt becomes stale and can
-    /// no longer be consumed.
+    /// no longer be consumed. Cross-lineage advancement is impossible by
+    /// construction: the new tuple keeps the fenced lineage.
     ///
     /// # Errors
     ///
-    /// Returns an error when the epoch counter cannot advance.
-    pub fn advance_epoch(&mut self) -> Result<AuthorityEpoch, KernelError> {
-        let next = self.current_epoch.next().map_err(KernelError::from)?;
-        self.current_epoch = next;
+    /// Returns an error when the sequence counter cannot advance.
+    pub fn advance_epoch(&mut self) -> Result<EpochId, KernelError> {
+        let next_sequence =
+            self.current_epoch
+                .sequence
+                .get()
+                .checked_add(1)
+                .ok_or(KernelError::InvalidField {
+                    field: "authority_epoch",
+                    reason: "sequence overflow",
+                })?;
+        let next = EpochId::new(
+            self.current_epoch.lineage_id.clone(),
+            NonZeroU64::new(next_sequence).ok_or(KernelError::InvalidField {
+                field: "authority_epoch",
+                reason: "sequence overflow",
+            })?,
+        )
+        .map_err(|_| KernelError::InvalidField {
+            field: "authority_epoch",
+            reason: "invalid canonical epoch",
+        })?;
+        self.current_epoch = next.clone();
         Ok(next)
     }
 
-    /// Fast-forwards the authority fence to a validated durable epoch.
+    /// Fast-forwards the authority fence to a validated durable epoch tuple.
     ///
     /// Recovery must not replay one in-memory increment per persisted epoch:
     /// the durable epoch is already the linearized value, so synchronizing to
-    /// it directly is both bounded and equivalent for receipt fencing.
-    pub fn synchronize_epoch(
-        &mut self,
-        target: AuthorityEpoch,
-    ) -> Result<AuthorityEpoch, KernelError> {
-        if target.value() < self.current_epoch.value() {
-            return Err(KernelError::StaleEpoch {
-                observed: target.value(),
-                active: self.current_epoch.value(),
+    /// it directly is both bounded and equivalent for receipt fencing. The
+    /// target must be the current tuple or a same-lineage forward adoption;
+    /// a regression is [`KernelError::StaleEpoch`] and a cross-lineage target
+    /// is [`KernelError::StaleEpochTuple`], never an implicit lineage switch.
+    pub fn synchronize_epoch(&mut self, target: EpochId) -> Result<EpochId, KernelError> {
+        if target.is_same_authority(&self.current_epoch) {
+            return Ok(target);
+        }
+        if target.lineage_id != self.current_epoch.lineage_id {
+            return Err(KernelError::StaleEpochTuple {
+                observed: target,
+                active: self.current_epoch.clone(),
             });
         }
-        self.current_epoch = target;
+        if target.sequence.get() < self.current_epoch.sequence.get() {
+            return Err(KernelError::StaleEpoch {
+                observed: target.sequence.get(),
+                active: self.current_epoch.sequence.get(),
+            });
+        }
+        self.current_epoch = target.clone();
         Ok(target)
     }
 }
@@ -499,6 +558,22 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_contracts::EpochLineageId;
+    use std::num::NonZeroU64;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn genesis_epoch() -> Result<EpochId, KernelError> {
+        let lineage_id =
+            EpochLineageId::new(TEST_LINEAGE).map_err(|_| KernelError::InvalidField {
+                field: "lineage_id",
+                reason: "must be a canonical UUID lineage",
+            })?;
+        EpochId::new(lineage_id, NonZeroU64::MIN).map_err(|_| KernelError::InvalidField {
+            field: "epoch_id",
+            reason: "invalid canonical epoch",
+        })
+    }
 
     fn key() -> KernelAuthorityKey {
         KernelAuthorityKey::from_bytes([7u8; 32])
@@ -519,11 +594,11 @@ mod tests {
 
     #[test]
     fn issued_receipt_consumes_to_the_same_grant() -> Result<(), KernelError> {
-        let authority = KernelAuthority::new(key(), AuthorityEpoch::genesis());
+        let authority = KernelAuthority::new(key(), genesis_epoch()?);
         let receipt = authority.issue(request()?)?;
         let route = RouteScope::new("daemon")?;
         let grant = authority.consume(&receipt, &route, 500)?;
-        assert_eq!(grant.authority_epoch(), AuthorityEpoch::genesis());
+        assert_eq!(grant.authority_epoch(), &genesis_epoch()?);
         assert_eq!(grant.route_scope(), &route);
         assert!(grant.permits(
             EffectClass::ReversibleMutation,
@@ -538,7 +613,7 @@ mod tests {
 
     #[test]
     fn tampered_receipt_is_forged() -> Result<(), KernelError> {
-        let authority = KernelAuthority::new(key(), AuthorityEpoch::genesis());
+        let authority = KernelAuthority::new(key(), genesis_epoch()?);
         let mut receipt = authority.issue(request()?)?;
         receipt.allowed_effect = EffectClass::ExternalEffect;
         let route = RouteScope::new("daemon")?;
@@ -551,12 +626,10 @@ mod tests {
 
     #[test]
     fn a_different_key_cannot_consume_the_receipt() -> Result<(), KernelError> {
-        let issuer = KernelAuthority::new(key(), AuthorityEpoch::genesis());
+        let issuer = KernelAuthority::new(key(), genesis_epoch()?);
         let receipt = issuer.issue(request()?)?;
-        let other = KernelAuthority::new(
-            KernelAuthorityKey::from_bytes([9u8; 32]),
-            AuthorityEpoch::genesis(),
-        );
+        let other =
+            KernelAuthority::new(KernelAuthorityKey::from_bytes([9u8; 32]), genesis_epoch()?);
         let route = RouteScope::new("daemon")?;
         assert!(matches!(
             other.consume(&receipt, &route, 500),
@@ -567,7 +640,7 @@ mod tests {
 
     #[test]
     fn stale_epoch_and_wrong_route_are_rejected() -> Result<(), KernelError> {
-        let mut authority = KernelAuthority::new(key(), AuthorityEpoch::genesis());
+        let mut authority = KernelAuthority::new(key(), genesis_epoch()?);
         let receipt = authority.issue(request()?)?;
         authority.advance_epoch()?;
         let route = RouteScope::new("daemon")?;
@@ -576,7 +649,7 @@ mod tests {
             Err(KernelError::StaleEpoch { .. })
         ));
 
-        let authority = KernelAuthority::new(key(), AuthorityEpoch::genesis());
+        let authority = KernelAuthority::new(key(), genesis_epoch()?);
         let receipt = authority.issue(request()?)?;
         let wrong_route = RouteScope::new("store_bridge")?;
         assert!(matches!(
@@ -588,7 +661,7 @@ mod tests {
 
     #[test]
     fn expired_receipt_is_rejected() -> Result<(), KernelError> {
-        let authority = KernelAuthority::new(key(), AuthorityEpoch::genesis());
+        let authority = KernelAuthority::new(key(), genesis_epoch()?);
         let receipt = authority.issue(request()?)?;
         let route = RouteScope::new("daemon")?;
         assert!(matches!(

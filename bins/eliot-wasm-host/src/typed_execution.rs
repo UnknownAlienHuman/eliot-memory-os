@@ -2288,6 +2288,274 @@ fn bound_context_candidate(
     bound_provider_role(&value.provider_role, bound)?;
     bound_atom_representation(&value.representation, bound)?;
     bound_measurement_ref(&value.measurement, bound)?;
+    bound.texts(&value.dependencies)?;
+    if let Some(learning) = value.learning.as_ref() {
+        bound_learning_provenance(learning, bound)?;
+    }
+    Ok(())
+}
+
+fn bound_learning_provenance(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::LearningProvenance,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.campaign_id)?;
+    if let Some(overlay) = value.overlay_id.as_ref() {
+        bound.text(overlay)?;
+    }
+    if let Some(candidate) = value.candidate_id.as_ref() {
+        bound.text(candidate)?;
+    }
+    if let Some(closure) = value.closure_ref.as_ref() {
+        bound.text(closure)?;
+    }
+    if let Some(owner) = value.owner.as_ref() {
+        bound.text(owner)?;
+    }
+    bound.text(&value.permit_digest)?;
+    Ok(())
+}
+
+fn bound_context_binding(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::ContextBinding,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.task_id)?;
+    bound.text(&value.attempt_id)?;
+    bound.text(&value.scope_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.decision_id)?;
+    if let Some(operation) = value.operation_id.as_ref() {
+        bound.text(operation)?;
+    }
+    Ok(())
+}
+
+fn bound_decision_revision(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::DecisionRevision,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.decision_id)?;
+    bound.text(&value.recipe_revision)?;
+    bound.text(&value.policy_sha256)?;
+    Ok(())
+}
+
+fn bound_provider_disposition(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::ProviderDisposition,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound_provider_role(&value.slot, bound)
+}
+
+fn bound_provider_denominator(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::ProviderDenominator,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.list(&value.requested)?;
+    for slot in &value.requested {
+        bound_provider_role(slot, bound)?;
+    }
+    bound.list(&value.dispositions)?;
+    for disposition in &value.dispositions {
+        bound_provider_disposition(disposition, bound)?;
+    }
+    Ok(())
+}
+
+fn bound_safety_floor_member(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::SafetyFloorMember,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.atom_id)?;
+    if let Some(measurement) = value.measurement.as_ref() {
+        bound_measurement_ref(measurement, bound)?;
+    }
+    bound.texts(&value.required_dependencies)?;
+    Ok(())
+}
+
+fn bound_safety_floor(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::SafetyFloor,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound_context_binding(&value.binding, bound)?;
+    bound.texts(&value.mandatory_atoms)?;
+    bound.list(&value.mandatory_roles)?;
+    bound_provider_denominator(&value.providers, bound)?;
+    bound.list(&value.members)?;
+    for member in &value.members {
+        bound_safety_floor_member(member, bound)?;
+    }
+    bound.texts(&value.interpretation_dependencies)?;
+    bound.text(&value.rule_evidence)?;
+    Ok(())
+}
+
+fn bound_safety_floor_identity(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::SafetyFloorIdentity,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.floor_id)?;
+    bound_decision_revision(&value.decision, bound)?;
+    bound_safety_floor(&value.floor, bound)?;
+    Ok(())
+}
+
+fn bound_candidate_priority(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::CandidatePriority,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.atom_id)?;
+    Ok(())
+}
+
+fn bound_priority_policy(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::PriorityPolicy,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.policy_id)?;
+    bound_decision_revision(&value.decision, bound)?;
+    bound.list(&value.priorities)?;
+    for priority in &value.priorities {
+        bound_candidate_priority(priority, bound)?;
+    }
+    Ok(())
+}
+
+fn bound_admission_rule(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionRule,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.rule_id)?;
+    bound_decision_revision(&value.decision, bound)?;
+    bound.text(&value.rule_sha256)?;
+    Ok(())
+}
+
+fn bound_measurement_composition_profile(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::MeasurementCompositionProfile,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.profile_id)?;
+    bound.text(&value.serializer_id)?;
+    bound.text(&value.serializer_version)?;
+    bound.text(&value.serializer_options_digest)?;
+    bound.text(&value.route_id)?;
+    bound.text(&value.model_id)?;
+    bound.text(&value.qualification)?;
+    Ok(())
+}
+
+fn bound_tokenizer_observation(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::TokenizerObservation,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.tokenizer_id)?;
+    bound.text(&value.tokenizer_version)?;
+    bound.text(&value.tokenizer_hash)?;
+    Ok(())
+}
+
+fn bound_measured_cost(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::MeasuredCost,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    use crate::typed_bindings::context_admission::exports::eliot::current::admission::MeasuredCost as C;
+    // Exact bytes, the conservative estimate descriptor and the unknown /
+    // unavailable markers carry no heap leaves; only a tokenizer observation
+    // carries bounded strings. Zero stays the exact-bytes zero, never a
+    // marker: the variants are distinct here exactly as in native
+    // `AdmissionMeasuredCost`.
+    match value {
+        C::ExactUtf8Bytes(_) | C::ConservativeStu(_) | C::Unknown | C::Unavailable => Ok(()),
+        C::ExactTokenizer(observation) => bound_tokenizer_observation(observation, bound),
+    }
+}
+
+fn bound_measurement_binding(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::MeasurementBinding,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound_context_binding(&value.context, bound)?;
+    bound.text(&value.subject_digest)?;
+    bound.text(&value.input_digest)?;
+    bound.text(&value.output_digest)?;
+    bound.text(&value.serializer_id)?;
+    bound.text(&value.serializer_version)?;
+    bound.text(&value.serializer_options_digest)?;
+    bound.text(&value.route_id)?;
+    bound.text(&value.model_id)?;
+    Ok(())
+}
+
+fn bound_admission_measurement(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::AdmissionMeasurement,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.measurement_id)?;
+    bound.text(&value.atom_id)?;
+    bound_measurement_binding(&value.binding, bound)?;
+    bound_measured_cost(&value.cost, bound)?;
+    if let Some(observation) = value.observation.as_ref() {
+        bound_measured_cost(observation, bound)?;
+    }
+    Ok(())
+}
+
+fn bound_expansion_handle(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::ExpansionHandle,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.atom_id)?;
+    bound.text(&value.decision_digest)?;
+    bound.text(&value.task_id)?;
+    bound.text(&value.scope_id)?;
+    bound.text(&value.fence_epoch)?;
+    bound.text(&value.source_revision)?;
+    bound.text(&value.handle)?;
+    Ok(())
+}
+
+fn bound_supplied_omission_binding(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::SuppliedOmissionBinding,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.atom_id)?;
+    if let Some(expansion) = value.expansion.as_ref() {
+        bound_expansion_handle(expansion, bound)?;
+    }
+    bound.text(&value.authorization_requirement)?;
+    bound.text(&value.privacy_requirement)?;
+    bound.text(&value.proof_requirement)?;
+    if let Some(expires) = value.expires.as_ref() {
+        bound.text(expires)?;
+    }
+    if let Some(invalidation) = value.invalidation.as_ref() {
+        bound.text(invalidation)?;
+    }
+    Ok(())
+}
+
+fn bound_learning_ticket(
+    value: &crate::typed_bindings::context_admission::exports::eliot::current::admission::LearningTicket,
+    bound: &mut TypedBound,
+) -> Result<(), TypedExecutionError> {
+    bound.text(&value.source_campaign_id)?;
+    bound.text(&value.target_task_id)?;
+    bound.text(&value.fence_epoch)?;
+    if let Some(overlay) = value.overlay_id.as_ref() {
+        bound.text(overlay)?;
+    }
+    if let Some(candidate) = value.candidate_id.as_ref() {
+        bound.text(candidate)?;
+    }
+    bound.text(&value.scope_ref)?;
+    bound.text(&value.authority_ref)?;
+    bound.text(&value.retention_ref)?;
+    bound.text(&value.evaluator_ref)?;
+    bound.text(&value.rollback_ref)?;
+    bound.text(&value.digest)?;
     Ok(())
 }
 
@@ -2725,25 +2993,38 @@ fn bound_admission_request(
     bound.text(&value.attempt_id)?;
     bound.text(&value.scope_id)?;
     bound.text(&value.fence_epoch)?;
+    bound_context_binding(&value.binding, bound)?;
+    bound.list(&value.candidates)?;
+    for candidate in &value.candidates {
+        bound_context_candidate(candidate, bound)?;
+    }
     bound.text(&value.recipe_digest)?;
     bound.text(&value.recipe_revision)?;
+    bound.list(&value.provider_denominator)?;
+    for slot in &value.provider_denominator {
+        bound_provider_role(slot, bound)?;
+    }
+    bound_safety_floor_identity(&value.floor, bound)?;
+    bound_priority_policy(&value.priority, bound)?;
+    bound_admission_rule(&value.rule, bound)?;
+    bound_measurement_composition_profile(&value.measurement_profile, bound)?;
+    bound.list(&value.supplied_omissions)?;
+    for supplied in &value.supplied_omissions {
+        bound_supplied_omission_binding(supplied, bound)?;
+    }
+    bound.list(&value.measurements)?;
+    for measurement in &value.measurements {
+        bound_admission_measurement(measurement, bound)?;
+    }
+    bound.list(&value.learning_tickets)?;
+    for ticket in &value.learning_tickets {
+        bound_learning_ticket(ticket, bound)?;
+    }
     if let Some(digest) = value.predecessor_digest.as_ref() {
         bound.text(digest)?;
     }
     if let Some(note) = value.invalidation.as_ref() {
         bound.text(note)?;
-    }
-    bound.list(&value.candidates)?;
-    for candidate in &value.candidates {
-        bound_context_candidate(candidate, bound)?;
-    }
-    bound.list(&value.provider_denominator)?;
-    for slot in &value.provider_denominator {
-        bound_provider_role(slot, bound)?;
-    }
-    bound.list(&value.measurements)?;
-    for measurement in &value.measurements {
-        bound_measurement_ref(measurement, bound)?;
     }
     Ok(())
 }

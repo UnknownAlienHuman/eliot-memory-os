@@ -63,6 +63,8 @@ mod diagnostics;
 mod health_projection;
 mod heartbeat_transport;
 mod host_identity_observation;
+mod independent_sensor;
+mod observation_attribution;
 mod observation_coverage;
 mod runtime_manifest_selection;
 mod scm_launch;
@@ -92,6 +94,14 @@ pub use host_identity_observation::{
     HostIdentityMonitor, HostObservation, HostObservationSource, HostObservationState,
     LiveHostObservationSource,
 };
+pub use independent_sensor::{
+    ApprovedSensorBinding, ArtifactDigestObservation, MAX_APPROVED_ARTIFACT_DIGEST_BYTES,
+    SensorBindingError, SensorProbeError, SensorReadiness, observe_approved_artifact_digest,
+};
+pub use observation_attribution::{
+    AttributionError, EventOrigin, FileChangeEvidence, RegisteredScope, ScopeMembership,
+    TaskAttribution, resolve_scope_membership,
+};
 use watchdog_publication_readback::{
     observe_watchdog_publication, read_manifest_selected_ors_current, scan_watchdog_publications,
     verify_against_durable_current,
@@ -103,10 +113,10 @@ use watchdog_publication_readback::{
 /// every call. The module itself is `pub(crate)`, so this adds no public API.
 pub(crate) use watchdog_spool::episode;
 pub use watchdog_spool::export_driver::{
-    KernelFrontDoorWatchdogIntentSink, WatchdogEntryView, WatchdogExportSink,
-    WatchdogIntentAcknowledgement, WatchdogIntentExportBatch, WatchdogIntentReconciliation,
-    WatchdogIntentSink, WatchdogIntentWindowBlock, export_once, reconcile_watchdog_intents,
-    watchdog_entry_views, watchog_entry_views,
+    KernelFrontDoorWatchdogExportSink, KernelFrontDoorWatchdogIntentSink, WatchdogEntryView,
+    WatchdogExportSink, WatchdogIntentAcknowledgement, WatchdogIntentExportBatch,
+    WatchdogIntentReconciliation, WatchdogIntentSink, WatchdogIntentWindowBlock, export_once,
+    reconcile_watchdog_intents, watchdog_entry_views, watchog_entry_views,
 };
 pub(crate) use watchdog_spool::intent::{
     GovernorIntentOutcome, GovernorUnavailability, IntentLineage, WatchdogIntentSubmission,
@@ -616,6 +626,47 @@ impl IndependentKernelSensor {
         sink_id: &str,
         limits: WatchdogSpoolExportLimits,
     ) -> Result<(WatchdogSpoolExportBatch, Vec<Vec<u8>>), SpoolError> {
+        let (predecessor, high_water) = self.export_window_predecessor(sink_id)?;
+        self.spool.export_batch(&predecessor, high_water, limits)
+    }
+
+    /// Exports the owner-generated window the fenced intent route reconciles.
+    ///
+    /// Identities are built exactly as in
+    /// [`Self::export_spool_batch_with_raws`]: the installation id and
+    /// watchdog generation come from the retained binding, the watchdog
+    /// epoch from the epoch retained at sensor construction, and only the
+    /// sink id arrives as a parameter. Unlike the export window, this read
+    /// tolerates a stored cursor the sibling export contour already bound
+    /// to its own sink: the intent window never advances the cursor, so
+    /// the stored sink binding must not fence it. There is no semantic
+    /// interpretation here and no canonical store write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// [`Self::export_spool_batch_with_raws`].
+    pub fn export_intent_window_batch(
+        &self,
+        sink_id: &str,
+        limits: WatchdogSpoolExportLimits,
+    ) -> Result<WatchdogSpoolExportBatch, SpoolError> {
+        let (predecessor, high_water) = self.export_window_predecessor(sink_id)?;
+        self.spool
+            .export_batch_for_intent_window(&predecessor, high_water, limits)
+            .map(|(batch, _raw_entry_bytes)| batch)
+    }
+
+    /// Builds the caller-bound predecessor cursor and live high-water one
+    /// export window is read from.
+    ///
+    /// Shared by the export and intent windows so both contours bind the
+    /// same owner-issued installation, generation, and epoch. Only the
+    /// sink id differs per contour.
+    fn export_window_predecessor(
+        &self,
+        sink_id: &str,
+    ) -> Result<(eliot_watchdog_core::WatchdogSpoolCursor, u64), SpoolError> {
         let installation_id = self.installation_id.clone();
         let watchdog_generation = self.watchdog_generation;
         let watchdog_epoch = self
@@ -644,7 +695,7 @@ impl IndependentKernelSensor {
             sink_id: sink_id.to_owned(),
         };
         let high_water = self.spool.high_water_sequence()?;
-        self.spool.export_batch(&predecessor, high_water, limits)
+        Ok((predecessor, high_water))
     }
 
     /// Applies an exact authenticated sink acknowledgement to the export
@@ -1436,6 +1487,33 @@ impl KernelWatchdogPort for IndependentKernelSensor {
             corpus,
         })
     }
+
+    fn export_spool(
+        self: Arc<Self>,
+        lease: VerifiedSupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, SpoolError>> + Send>> {
+        Box::pin(async move {
+            let lease_id = lease.lease().lease_id.clone();
+            let sink = KernelFrontDoorWatchdogExportSink::new(lease, self.epoch_lineage.as_str());
+            tokio::task::spawn_blocking(move || {
+                // The export contour is bound to the lease this tick actually
+                // verified, never to a lease a caller could present: a sensor
+                // that admitted a different lease since fails closed here instead
+                // of exporting under a stale supervision lineage.
+                if self.verified_supervision_lease_id().as_deref() != Some(lease_id.as_str()) {
+                    return Err(SpoolError::InvalidLease(
+                        "watchdog spool export requires the currently verified supervision lease; a different lease was admitted"
+                            .to_owned(),
+                    ));
+                }
+                export_once(&self, &sink, WatchdogSpoolExportLimits::default())
+            })
+            .await
+            .map_err(|error| {
+                SpoolError::Corrupt(format!("Kernel spool export worker failed: {error}"))
+            })?
+        })
+    }
 }
 
 /// Closed observation-source label for an admission-reload rejection.
@@ -1522,6 +1600,20 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
         Box::pin(async {
             Err(SpoolError::Corrupt(
                 "KernelWatchdogPort has no Watchdog intent spool owner".to_owned(),
+            ))
+        })
+    }
+
+    /// Starts one bounded owner-spool export pass through the authenticated
+    /// Kernel front door. Implementations without the Watchdog-owned spool fail
+    /// closed; they never synthesize an acknowledgement.
+    fn export_spool(
+        self: Arc<Self>,
+        _lease: VerifiedSupervisionLease,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, SpoolError>> + Send>> {
+        Box::pin(async {
+            Err(SpoolError::Corrupt(
+                "KernelWatchdogPort has no Watchdog spool export owner".to_owned(),
             ))
         })
     }

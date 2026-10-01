@@ -30,26 +30,57 @@
 //! * Staged plaintext is dropped when a terminal lands; only counts and the
 //!   incremental transport digest survive for readback/replay.
 //!
+//! Finalization is a bounded phase machine, never a permanently reserved
+//! flag (issue #297 external audit `5881604166`). The one terminal command of
+//! a session owns exactly one [`FinalizeReservation`] whose phase is
+//! `Reserved` (validated, nothing handed to the blob owner),
+//! `StageOutcomeUnknown` (the exact stage request may or may not have taken
+//! effect) or `ReadbackPending` (the owner returned a real
+//! [`BlobReadyReceipt`], the readback is outstanding). The reservation is
+//! bookkeeping bound to the same session, the same terminal command digest
+//! and the same blob stage operation identity — it is not a second external
+//! operation id, a second plaintext copy or a second blob root.
+//!
+//! * The real ready receipt and its exact byte commitment are retained
+//!   immediately after `stage` returns and before the next await, so a failed
+//!   readback resumes the read and never stages again.
+//! * A failure whose effect provably cannot have occurred (stale/revoked
+//!   admission, unclaimed key, invalid contract) releases the handoff back to
+//!   `Reserved`; every other failure retains `StageOutcomeUnknown` so a lost
+//!   response or a dropped future stays `UnknownOutcome` until owner evidence
+//!   settles it.
+//! * `reconcile` resolves the *original* stage identity against the injected
+//!   owner. The owner is idempotent under its own operation identity, so an
+//!   exact replay returns the same object and never a second one; a cache miss
+//!   is not proof of non-publication.
+//! * A local finalize owner is released only for its own incarnation, only
+//!   while `Reserved`, and never across an await. There is no RPC in `Drop`,
+//!   no detached task, and no reset to `Open` to bypass a possible effect.
+//!
 //! Governing fragments: I5.12 (single-owner CAS, BYTES-only durability),
 //! I10.8.5 (bounded preview, append-only temporary evidence, final
 //! BlobRef+digest), I5.27 (exact operation/session identity, no blind
-//! retry), I7.2 (idempotent replay under an exact fence, no second object).
+//! retry), I7.2 (idempotent replay under an exact fence, no second object),
+//! I14.21 (unknown commit recovery under the original idempotency key).
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use serde::Serialize;
 
 use eliot_blob_api::{
     BlobError, BlobHash, BlobPolicyBinding, BlobReadRequest, BlobReadyReceipt, BlobReceiptContext,
     BlobRootLease, BlobStageRequest, BlobStoreClient, ObjectResidencyKey, VersionedContentDigest,
 };
 use eliot_process::{
-    DurableProcessStreamSource, DurableStreamLocatorKind, ProcessStreamEvidence,
-    ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest,
-    ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient,
-    ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture,
-    ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback, ProcessStreamSinkSession,
-    ProcessStreamSinkSessionView, ProcessStreamSinkState, ProcessStreamSinkTerminal,
-    ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkUnknownOutcome, StreamEvidenceGap,
-    StreamPersistenceStatus, StreamPreviewRepresentation, StreamTransportStatus,
+    DurableProcessStreamSource, DurableStreamLocatorKind, PROCESS_STREAM_SINK_SCHEMA_VERSION,
+    ProcessStreamEvidence, ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
+    ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
+    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
+    ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
+    ProcessStreamSinkSession, ProcessStreamSinkSessionView, ProcessStreamSinkState,
+    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamSinkUnknownOutcome, StreamEvidenceGap, StreamPersistenceStatus,
+    StreamPreviewRepresentation, StreamTransportStatus,
 };
 use eliot_receipts::EffectClass;
 use sha2::{Digest, Sha256};
@@ -146,7 +177,11 @@ struct SinkState {
     next_offset: u64,
     terminal: Option<ProcessStreamSinkTerminal>,
     terminal_command: Option<ProcessStreamSinkTerminalCommandIdentity>,
-    finalizing: Option<ProcessStreamSinkTerminalCommandIdentity>,
+    /// The one bounded phase record of the one reserved terminal command.
+    finalization: Option<FinalizeReservation>,
+    /// Monotonic local incarnation counter. A stale finalizer that outlived
+    /// its reservation can never release the successor's reservation.
+    finalization_incarnation: u64,
 }
 
 struct AdmittedChunk {
@@ -156,24 +191,108 @@ struct AdmittedChunk {
     sha256: String,
 }
 
-enum FinalizeKind {
-    Publish {
-        staged: Vec<u8>,
-        admitted_sha256: String,
-    },
-    Withheld {
-        state: ProcessStreamSinkState,
-        admitted_sha256: String,
-    },
+/// Bounded phase record for the one terminal command of one session.
+///
+/// Exactly one record exists per session, so it is bounded by the session's
+/// own limits (the retained request's preview is already capped by
+/// `max_preview_bytes` and its gaps by the protocol ceiling). The staged
+/// plaintext lives in [`SinkState::staged`] and is dropped as soon as the
+/// owner's ready receipt carries the same byte commitment.
+struct FinalizeReservation {
+    identity: ProcessStreamSinkTerminalCommandIdentity,
+    incarnation: u64,
+    /// The retained original finalize command, so `reconcile` can drive the
+    /// same exact command without minting a second terminal request.
+    request: ProcessStreamSinkFinalizeRequest,
+    next_sequence: u64,
+    next_offset: u64,
+    admitted_sha256: String,
+    stage_operation_id: String,
+    stage_idempotency_key: String,
+    phase: FinalizePhase,
 }
 
-struct FinalizePlan {
+enum FinalizePhase {
+    /// Validated and reserved; nothing has been handed to the blob owner.
+    Reserved,
+    /// The exact stage request may or may not have taken effect. Only owner
+    /// evidence settles it.
+    StageOutcomeUnknown,
+    /// The owner returned a real ready receipt; the readback is outstanding.
+    ReadbackPending { ready: Box<BlobReadyReceipt> },
+}
+
+impl FinalizeReservation {
+    /// True once an external effect became possible for this command.
+    fn effect_possible(&self) -> bool {
+        !matches!(self.phase, FinalizePhase::Reserved)
+    }
+
+    fn ready(&self) -> Option<&BlobReadyReceipt> {
+        match &self.phase {
+            FinalizePhase::ReadbackPending { ready } => Some(ready.as_ref()),
+            FinalizePhase::Reserved | FinalizePhase::StageOutcomeUnknown => None,
+        }
+    }
+}
+
+/// What the next durable publication step must be for one reserved command.
+enum PublishStep {
+    /// Hand the exact admitted bytes to the one blob owner under the bound
+    /// stage operation identity.
+    Stage { staged: Vec<u8> },
+    /// The owner already returned a real ready receipt; resume the readback
+    /// only. `stage` must not be called again for this command.
+    Readback { ready: Box<BlobReadyReceipt> },
+}
+
+struct PublishTicket {
+    session: ProcessStreamSinkSession,
+    request: ProcessStreamSinkFinalizeRequest,
+    identity: ProcessStreamSinkTerminalCommandIdentity,
+    incarnation: u64,
+    next_sequence: u64,
+    next_offset: u64,
+    admitted_sha256: String,
+    step: PublishStep,
+}
+
+struct WithheldTicket {
     session: ProcessStreamSinkSession,
     request: ProcessStreamSinkFinalizeRequest,
     identity: ProcessStreamSinkTerminalCommandIdentity,
     next_sequence: u64,
     next_offset: u64,
-    kind: FinalizeKind,
+    admitted_sha256: String,
+    state: ProcessStreamSinkState,
+}
+
+enum FinalizePlan {
+    /// The one terminal for this exact command already landed.
+    Recorded(Box<ProcessStreamSinkTerminal>),
+    /// Nothing durable is authorized: mint the withheld terminal locally.
+    Withheld(Box<WithheldTicket>),
+    /// A durable publication is reserved (or resumable) for this command.
+    Publish(Box<PublishTicket>),
+}
+
+/// Canonical, deterministic description of the uncertain blob effect a
+/// reservation may have caused. It binds the session, the exact terminal
+/// command digest, the bound blob stage operation identity and the exact
+/// admitted byte commitment, so a caller can only present the uncertainty
+/// this exact reservation produced.
+#[derive(Serialize)]
+struct FinalizeUncertainty<'a> {
+    schema_version: &'a str,
+    session_id: &'a str,
+    terminal_id: &'a str,
+    open_request_sha256: &'a str,
+    command_sha256: &'a str,
+    stage_operation_id: &'a str,
+    stage_idempotency_key: &'a str,
+    admitted_sha256: &'a str,
+    final_sequence: u64,
+    final_offset: u64,
 }
 
 impl SinkState {
@@ -187,7 +306,8 @@ impl SinkState {
             next_offset: 0,
             terminal: None,
             terminal_command: None,
-            finalizing: None,
+            finalization: None,
+            finalization_incarnation: 0,
         }
     }
 
@@ -306,6 +426,37 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Ok(())
     }
 
+    /// The canonical uncertainty identity a reservation may present, bound to
+    /// the same session, terminal command and blob stage operation.
+    fn reservation_uncertainty(
+        session: &ProcessStreamSinkSession,
+        reservation: &FinalizeReservation,
+    ) -> Result<ProcessStreamSinkUnknownOutcome, ProcessStreamSinkError> {
+        let wire = FinalizeUncertainty {
+            schema_version: PROCESS_STREAM_SINK_SCHEMA_VERSION,
+            session_id: session.session_id().as_str(),
+            terminal_id: reservation.identity.terminal_id().as_str(),
+            open_request_sha256: session.open_request_sha256(),
+            command_sha256: reservation.identity.request_sha256(),
+            stage_operation_id: &reservation.stage_operation_id,
+            stage_idempotency_key: &reservation.stage_idempotency_key,
+            admitted_sha256: &reservation.admitted_sha256,
+            final_sequence: reservation.next_sequence,
+            final_offset: reservation.next_offset,
+        };
+        let bytes =
+            serde_json::to_vec(&wire).map_err(|error| ProcessStreamSinkError::Serialization {
+                field: "finalize_uncertainty",
+                reason: error.to_string(),
+            })?;
+        ProcessStreamSinkUnknownOutcome::new(
+            session.session_id().clone(),
+            session.terminal_id().clone(),
+            session.open_request_sha256().to_owned(),
+            format!("{:x}", Sha256::digest(&bytes)),
+        )
+    }
+
     fn session_view(
         session: &ProcessStreamSinkSession,
         state: &SinkState,
@@ -314,7 +465,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             session.session_id().clone(),
             session.source_id().clone(),
             session.terminal_id().clone(),
-            if state.finalizing.is_some() {
+            if state.finalization.is_some() {
                 ProcessStreamSinkState::Finalizing
             } else {
                 ProcessStreamSinkState::Open
@@ -336,7 +487,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         session: &ProcessStreamSinkSession,
         request: &ProcessStreamSinkAppend,
     ) -> Result<ProcessStreamSinkAppendDisposition, ProcessStreamSinkError> {
-        if state.finalizing.is_some() {
+        if state.finalization.is_some() {
             return Err(ProcessStreamSinkError::AppendAfterFinalizing);
         }
         if let Some(terminal) = &state.terminal {
@@ -440,7 +591,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 Err(ProcessStreamSinkError::TerminalIdentityConflict)
             };
         }
-        if state.finalizing.is_some() {
+        // An abort never competes with a reserved publish. While a reservation exists
+        // the durable effect of its command may already have happened, so no
+        // non-publishing terminal may be minted for the same terminal id.
+        if state.finalization.is_some() {
             return Err(ProcessStreamSinkError::TerminalIdentityConflict);
         }
         existing.validate_abort(&request)?;
@@ -478,15 +632,13 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Self::record_locked(state, identity, terminal)
     }
 
-    /// Stages the exact admitted bytes, verifies the ready receipt, and reads
-    /// the object back. Any failure leaves the reserved command unresolved;
-    /// it must not be blindly staged again.
-    async fn publish_complete_source(
-        &self,
-        staged: Vec<u8>,
-    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
+    /// Builds the one exact stage request for these bytes under the bound root
+    /// lease, policy and stage operation identity. Deriving it twice from the
+    /// same bytes reproduces the same canonical request, so an exact replay is
+    /// an owner-side resolution of one operation, not a new command.
+    fn stage_request(&self, staged: &[u8]) -> Result<BlobStageRequest, ProcessStreamSinkError> {
         let template = self.binding.residency();
-        let digest = BlobHash::new(blake3::hash(&staged).to_hex().to_string())
+        let digest = BlobHash::new(blake3::hash(staged).to_hex().to_string())
             .map_err(|error| map_blob_error(&error))?;
         let residency = ObjectResidencyKey {
             scope_domain_id: template.scope_domain_id.clone(),
@@ -501,29 +653,127 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 digest,
             },
         };
-        let ready = self
-            .store
-            .stage(BlobStageRequest {
-                context: self.binding.stage_context().clone(),
-                root_lease: self.binding.root_lease().clone(),
-                bytes: staged.clone(),
-                policy: self.binding.policy().clone(),
-                residency,
-            })
-            .await
-            .map_err(|error| map_blob_error(&error))?;
+        let request = BlobStageRequest {
+            context: self.binding.stage_context().clone(),
+            root_lease: self.binding.root_lease().clone(),
+            bytes: staged.to_vec(),
+            policy: self.binding.policy().clone(),
+            residency,
+        };
+        request.validate().map_err(|error| map_blob_error(&error))?;
+        Ok(request)
+    }
+
+    /// Hands the exact bytes to the one owner for the first time under this
+    /// reservation, after marking the outcome as possibly having taken effect.
+    /// The mark happens before the await so a dropped future stays unknown.
+    async fn stage_once(
+        &self,
+        identity: &ProcessStreamSinkTerminalCommandIdentity,
+        incarnation: u64,
+        staged: &[u8],
+    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
+        self.mark_stage_handoff(identity, incarnation)?;
+        let request = self.stage_request(staged)?;
+        match self.store.stage(request).await {
+            Ok(ready) => self.retain_ready(identity, incarnation, staged, ready),
+            Err(error) => {
+                // Only a provably pre-effect refusal may clear the handoff
+                // mark. Every other outcome keeps the possible effect, so the
+                // reservation stays reconcilable instead of becoming a
+                // permanently reserved command.
+                if !possible_blob_effect(&error) {
+                    self.clear_stage_handoff(identity, incarnation);
+                }
+                Err(map_blob_error(&error))
+            }
+        }
+    }
+
+    /// Records that the exact stage request may or may not have taken effect.
+    fn mark_stage_handoff(
+        &self,
+        identity: &ProcessStreamSinkTerminalCommandIdentity,
+        incarnation: u64,
+    ) -> Result<(), ProcessStreamSinkError> {
+        let mut state = self.lock();
+        let Some(reservation) = state.finalization.as_mut() else {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        };
+        if reservation.identity != *identity || reservation.incarnation != incarnation {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        if !matches!(reservation.phase, FinalizePhase::Reserved) {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        reservation.phase = FinalizePhase::StageOutcomeUnknown;
+        Ok(())
+    }
+
+    /// Clears a handoff mark that provably never reached a durable effect,
+    /// returning the reservation to its resumable reserved phase.
+    fn clear_stage_handoff(
+        &self,
+        identity: &ProcessStreamSinkTerminalCommandIdentity,
+        incarnation: u64,
+    ) {
+        let mut state = self.lock();
+        if let Some(reservation) = state.finalization.as_mut()
+            && reservation.identity == *identity
+            && reservation.incarnation == incarnation
+            && matches!(reservation.phase, FinalizePhase::StageOutcomeUnknown)
+        {
+            reservation.phase = FinalizePhase::Reserved;
+        }
+    }
+
+    /// Retains the real ready receipt and its exact byte commitment
+    /// immediately after `stage` returned, before any further await. The
+    /// staged plaintext is then dropped: the receipt carries the same
+    /// commitment, so a resumed readback needs no second plaintext copy.
+    fn retain_ready(
+        &self,
+        identity: &ProcessStreamSinkTerminalCommandIdentity,
+        incarnation: u64,
+        staged: &[u8],
+        ready: BlobReadyReceipt,
+    ) -> Result<BlobReadyReceipt, ProcessStreamSinkError> {
         ready.validate().map_err(|error| map_blob_error(&error))?;
-        let admitted_sha256 = format!("{:x}", Sha256::digest(&staged));
         let staged_length =
             u64::try_from(staged.len()).map_err(|_| ProcessStreamSinkError::EvidenceInvariant {
                 reason: "staged length does not fit the session counters".to_owned(),
             })?;
-        if ready.plaintext_sha256() != admitted_sha256 || ready.plaintext_length() != staged_length
+        if ready.plaintext_sha256() != sha256_hex(staged)
+            || ready.plaintext_length() != staged_length
         {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
                 reason: "blob ready receipt does not describe the staged bytes".to_owned(),
             });
         }
+        let mut state = self.lock();
+        let Some(reservation) = state.finalization.as_mut() else {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        };
+        if reservation.identity != *identity || reservation.incarnation != incarnation {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        if matches!(reservation.phase, FinalizePhase::Reserved) {
+            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+        }
+        reservation.phase = FinalizePhase::ReadbackPending {
+            ready: Box::new(ready.clone()),
+        };
+        state.staged = Vec::new();
+        Ok(ready)
+    }
+
+    /// Reads the retained object back and proves it is the very object the
+    /// ready receipt commits to. A zero-byte complete source verifies as a
+    /// real immutable object with the same exact rules.
+    async fn verify_readback(
+        &self,
+        ready: &BlobReadyReceipt,
+    ) -> Result<(), ProcessStreamSinkError> {
         let chunk = self
             .store
             .read(BlobReadRequest {
@@ -537,12 +787,22 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             .await
             .map_err(|error| map_blob_error(&error))?;
         chunk.validate().map_err(|error| map_blob_error(&error))?;
-        if chunk.bytes() != staged.as_slice() {
+        let readback_length = u64::try_from(chunk.bytes().len()).map_err(|_| {
+            ProcessStreamSinkError::EvidenceInvariant {
+                reason: "readback length does not fit the session counters".to_owned(),
+            }
+        })?;
+        // The retained receipt was already proven against the admitted bytes,
+        // so verifying the readback against the same commitment closes the
+        // chain without retaining another plaintext copy.
+        if readback_length != ready.plaintext_length()
+            || sha256_hex(chunk.bytes()) != ready.plaintext_sha256()
+        {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "blob readback does not match the staged bytes".to_owned(),
+                reason: "blob readback does not match the retained ready receipt".to_owned(),
             });
         }
-        Ok(ready)
+        Ok(())
     }
 
     fn complete_source(
@@ -578,20 +838,13 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         &self,
         session: &ProcessStreamSinkSession,
         request: &ProcessStreamSinkFinalizeRequest,
-    ) -> Result<Option<FinalizePlan>, ProcessStreamSinkError> {
+    ) -> Result<FinalizePlan, ProcessStreamSinkError> {
         let mut state = self.lock();
         let existing = Self::check_session(&state, session)?;
         let identity = request.command_identity()?;
-        if state.terminal.is_some() {
+        if let Some(terminal) = &state.terminal {
             return if state.terminal_command.as_ref() == Some(&identity) {
-                Ok(None)
-            } else {
-                Err(ProcessStreamSinkError::TerminalIdentityConflict)
-            };
-        }
-        if let Some(finalizing) = &state.finalizing {
-            return if finalizing == &identity {
-                Ok(None)
+                Ok(FinalizePlan::Recorded(Box::new(terminal.clone())))
             } else {
                 Err(ProcessStreamSinkError::TerminalIdentityConflict)
             };
@@ -603,55 +856,144 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request.expected_final_offset(),
         )?;
         Self::check_observed(&state, request.observed_sha256(), request.observed_bytes())?;
-        if request.transformation().is_some() {
-            return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "adapter stages exact transport bytes only".to_owned(),
-            });
+        let publishes =
+            request.gaps().is_empty() && request.transport() == StreamTransportStatus::Complete;
+        if publishes {
+            if request.transformation().is_some() {
+                return Err(ProcessStreamSinkError::EvidenceInvariant {
+                    reason: "adapter stages exact transport bytes only".to_owned(),
+                });
+            }
+            Self::check_preview(&state, request.preview())?;
         }
-        Self::check_preview(&state, request.preview())?;
-        let reserved_identity = identity.clone();
-        let plan = if request.gaps().is_empty()
-            && request.transport() == StreamTransportStatus::Complete
-        {
-            FinalizePlan {
-                session: existing,
-                request: request.clone(),
-                identity,
-                next_sequence: state.next_sequence,
-                next_offset: state.next_offset,
-                kind: FinalizeKind::Publish {
+        let admitted_sha256 = state.admitted_sha256();
+
+        // An existing reservation for this exact command is resumed, never
+        // re-reserved: the same terminal id can never drive a second stage.
+        // A reservation for a different command is a conflict, not a race.
+        if let Some(reservation) = state.finalization.as_ref() {
+            if reservation.identity != identity {
+                return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+            }
+            let step = match reservation.ready() {
+                Some(ready) => PublishStep::Readback {
+                    ready: Box::new(ready.clone()),
+                },
+                None => PublishStep::Stage {
                     staged: state.staged.clone(),
-                    admitted_sha256: state.admitted_sha256(),
                 },
-            }
-        } else {
-            // No durable publication except for the complete-source path: a
-            // gapped, policy-prohibited, or failed-redaction finalize must
-            // not stage raw bytes as a second object.
-            let withheld = if request
-                .gaps()
-                .contains(&StreamEvidenceGap::PolicyProhibited)
-            {
-                ProcessStreamSinkState::PolicyProhibited
-            } else if request.gaps().contains(&StreamEvidenceGap::RedactionFailed) {
-                ProcessStreamSinkState::RedactionFailed
-            } else {
-                ProcessStreamSinkState::SourceUnavailable
             };
-            FinalizePlan {
+            return Ok(FinalizePlan::Publish(Box::new(PublishTicket {
                 session: existing,
                 request: request.clone(),
+                identity: reservation.identity.clone(),
+                incarnation: reservation.incarnation,
+                next_sequence: reservation.next_sequence,
+                next_offset: reservation.next_offset,
+                admitted_sha256: reservation.admitted_sha256.clone(),
+                step,
+            })));
+        }
+
+        if !publishes {
+            return Ok(Self::withheld_plan(
+                &state,
+                existing,
+                request,
                 identity,
-                next_sequence: state.next_sequence,
-                next_offset: state.next_offset,
-                kind: FinalizeKind::Withheld {
-                    state: withheld,
-                    admitted_sha256: state.admitted_sha256(),
-                },
-            }
+                admitted_sha256,
+            ));
+        }
+
+        // One reservation per session: bound to this session, this exact
+        // command digest and the one bound blob stage operation.
+        Ok(self.reserve_publish(&mut state, existing, request, identity, admitted_sha256))
+    }
+
+    /// Builds the never-published terminal plan for a non-publishing
+    /// finalize.
+    ///
+    /// No durable publication except for the complete-source path: a gapped,
+    /// policy-prohibited, or failed-redaction finalize must not stage raw
+    /// bytes as a second object. This step cannot fail, so it mints no error
+    /// and reserves nothing.
+    fn withheld_plan(
+        state: &SinkState,
+        session: ProcessStreamSinkSession,
+        request: &ProcessStreamSinkFinalizeRequest,
+        identity: ProcessStreamSinkTerminalCommandIdentity,
+        admitted_sha256: String,
+    ) -> FinalizePlan {
+        let withheld = if request
+            .gaps()
+            .contains(&StreamEvidenceGap::PolicyProhibited)
+        {
+            ProcessStreamSinkState::PolicyProhibited
+        } else if request.gaps().contains(&StreamEvidenceGap::RedactionFailed) {
+            ProcessStreamSinkState::RedactionFailed
+        } else {
+            ProcessStreamSinkState::SourceUnavailable
         };
-        state.finalizing = Some(reserved_identity);
-        Ok(Some(plan))
+        FinalizePlan::Withheld(Box::new(WithheldTicket {
+            session,
+            request: request.clone(),
+            identity,
+            next_sequence: state.next_sequence,
+            next_offset: state.next_offset,
+            admitted_sha256,
+            state: withheld,
+        }))
+    }
+
+    /// Creates the one reservation of this session and its publish plan.
+    ///
+    /// One reservation per session, bound to this session, this exact command
+    /// digest and the one bound blob stage operation. The phase starts
+    /// `Reserved`: nothing has been handed to the blob owner yet.
+    fn reserve_publish(
+        &self,
+        state: &mut SinkState,
+        session: ProcessStreamSinkSession,
+        request: &ProcessStreamSinkFinalizeRequest,
+        identity: ProcessStreamSinkTerminalCommandIdentity,
+        admitted_sha256: String,
+    ) -> FinalizePlan {
+        let incarnation = state.finalization_incarnation.saturating_add(1);
+        state.finalization_incarnation = incarnation;
+        state.finalization = Some(FinalizeReservation {
+            identity: identity.clone(),
+            incarnation,
+            request: request.clone(),
+            next_sequence: state.next_sequence,
+            next_offset: state.next_offset,
+            admitted_sha256: admitted_sha256.clone(),
+            stage_operation_id: self
+                .binding
+                .stage_context()
+                .operation
+                .operation_id
+                .as_str()
+                .to_owned(),
+            stage_idempotency_key: self
+                .binding
+                .stage_context()
+                .operation
+                .idempotency_key
+                .clone(),
+            phase: FinalizePhase::Reserved,
+        });
+        FinalizePlan::Publish(Box::new(PublishTicket {
+            session,
+            request: request.clone(),
+            identity,
+            incarnation,
+            next_sequence: state.next_sequence,
+            next_offset: state.next_offset,
+            admitted_sha256,
+            step: PublishStep::Stage {
+                staged: state.staged.clone(),
+            },
+        }))
     }
 
     /// Records the terminal exactly once under the command identity, drops
@@ -670,17 +1012,81 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             };
         }
         if state
-            .finalizing
+            .finalization
             .as_ref()
-            .is_some_and(|finalizing| finalizing != &identity)
+            .is_some_and(|reservation| reservation.identity != identity)
         {
             return Err(ProcessStreamSinkError::TerminalIdentityConflict);
         }
         state.terminal_command = Some(identity);
-        state.finalizing = None;
+        state.finalization = None;
         state.staged = Vec::new();
         state.terminal = Some(terminal.clone());
         Ok(terminal)
+    }
+
+    /// Publishes the reserved complete source: at most one stage under the
+    /// original identity, then the readback, then the `CompleteSource`
+    /// terminal. A failure leaves the phase advanced, never a bare flag.
+    async fn publish_reserved(
+        &self,
+        ticket: PublishTicket,
+        _hold: FinalizeHold<'_, C>,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        let ready = match ticket.step {
+            PublishStep::Readback { ready } => *ready,
+            PublishStep::Stage { staged } => {
+                self.stage_once(&ticket.identity, ticket.incarnation, &staged)
+                    .await?
+            }
+        };
+        self.verify_readback(&ready).await?;
+        let evidence = Self::complete_source(
+            &ticket.session,
+            &ticket.request,
+            &ticket.admitted_sha256,
+            &ready,
+        )?;
+        let terminal = ProcessStreamSinkTerminal::from_finalize(
+            ticket.session,
+            ticket.request,
+            ProcessStreamSinkState::CompleteSource,
+            ticket.next_sequence,
+            ticket.next_offset,
+            ticket.admitted_sha256,
+            evidence,
+        )?;
+        Self::record_locked(&mut self.lock(), ticket.identity, terminal)
+    }
+
+    /// Mints the withheld (never-published) terminal for a gapped,
+    /// policy-prohibited or failed-redaction finalize.
+    fn withhold_reserved(
+        &self,
+        ticket: WithheldTicket,
+    ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
+        let evidence = ProcessStreamEvidence::new_raw(
+            ticket.session.binding().clone(),
+            ticket.session.stream(),
+            ticket.session.policy().clone(),
+            ticket.request.transport(),
+            StreamPersistenceStatus::SourceUnavailable,
+            ticket.request.observed_sha256().to_owned(),
+            ticket.request.observed_bytes(),
+            ticket.request.preview().clone(),
+            None,
+            ticket.request.gaps().to_vec(),
+        )?;
+        let terminal = ProcessStreamSinkTerminal::from_finalize(
+            ticket.session,
+            ticket.request,
+            ticket.state,
+            ticket.next_sequence,
+            ticket.next_offset,
+            ticket.admitted_sha256,
+            evidence,
+        )?;
+        Self::record_locked(&mut self.lock(), ticket.identity, terminal)
     }
 
     async fn finalize_async(
@@ -688,85 +1094,155 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         session: ProcessStreamSinkSession,
         request: ProcessStreamSinkFinalizeRequest,
     ) -> Result<ProcessStreamSinkTerminal, ProcessStreamSinkError> {
-        let Some(plan) = self.plan_finalize(&session, &request)? else {
-            let state = self.lock();
-            return state
-                .terminal
-                .clone()
-                .ok_or(ProcessStreamSinkError::ProviderUnavailable);
-        };
+        let plan = self.plan_finalize(&session, &request)?;
         match plan {
-            FinalizePlan {
-                session,
-                request,
-                identity,
-                next_sequence,
-                next_offset,
-                kind:
-                    FinalizeKind::Publish {
-                        staged,
-                        admitted_sha256,
-                    },
-            } => {
-                let ready = self.publish_complete_source(staged).await?;
-                let evidence = Self::complete_source(&session, &request, &admitted_sha256, &ready)?;
-                let terminal = ProcessStreamSinkTerminal::from_finalize(
-                    session,
-                    request,
-                    ProcessStreamSinkState::CompleteSource,
-                    next_sequence,
-                    next_offset,
-                    admitted_sha256,
-                    evidence,
-                )?;
-                Self::record_locked(&mut self.lock(), identity, terminal)
+            FinalizePlan::Recorded(terminal) => Ok(*terminal),
+            FinalizePlan::Withheld(ticket) => self.withhold_reserved(*ticket),
+            FinalizePlan::Publish(ticket) => {
+                let hold = FinalizeHold {
+                    sink: self,
+                    identity: ticket.identity.clone(),
+                    incarnation: ticket.incarnation,
+                };
+                self.publish_reserved(*ticket, hold).await
             }
-            FinalizePlan {
-                session,
-                request,
-                identity,
-                next_sequence,
-                next_offset,
-                kind:
-                    FinalizeKind::Withheld {
-                        state,
-                        admitted_sha256,
-                    },
-            } => {
-                let evidence = ProcessStreamEvidence::new_raw(
-                    session.binding().clone(),
-                    session.stream(),
-                    session.policy().clone(),
-                    request.transport(),
-                    StreamPersistenceStatus::SourceUnavailable,
-                    request.observed_sha256().to_owned(),
-                    request.observed_bytes(),
-                    request.preview().clone(),
-                    None,
-                    request.gaps().to_vec(),
-                )?;
-                let terminal = ProcessStreamSinkTerminal::from_finalize(
-                    session,
-                    request,
-                    state,
-                    next_sequence,
-                    next_offset,
-                    admitted_sha256,
-                    evidence,
-                )?;
-                Self::record_locked(&mut self.lock(), identity, terminal)
+        }
+    }
+
+    /// Reconciles an uncertain provider effect under the original stage
+    /// identity. Existing publication evidence is resolved first: a retained
+    /// ready receipt resumes the readback without a second stage, and an
+    /// unsettled handoff re-issues the exact original stage request, which the
+    /// single owner resolves under its own idempotency identity. A cache miss
+    /// is never treated as proof of non-publication.
+    async fn reconcile_async(
+        &self,
+        session: ProcessStreamSinkSession,
+        outcome: ProcessStreamSinkUnknownOutcome,
+    ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+        let request = {
+            let state = self.lock();
+            let existing = Self::check_session(&state, &session)?;
+            outcome.validate_against_session(&existing)?;
+            if let Some(terminal) = &state.terminal {
+                return Ok(ProcessStreamSinkReadback::Terminal {
+                    terminal: terminal.clone(),
+                });
             }
+            let Some(reservation) = state.finalization.as_ref() else {
+                return Err(ProcessStreamSinkError::ProviderUnavailable);
+            };
+            if !reservation.effect_possible() {
+                // The command never became uncertain for this session.
+                return Err(ProcessStreamSinkError::ProviderUnavailable);
+            }
+            if Self::reservation_uncertainty(&existing, reservation)? != outcome {
+                return Err(ProcessStreamSinkError::ProviderUnavailable);
+            }
+            reservation.request.clone()
+        };
+        // The retained command is re-driven, not replaced: the reservation it
+        // owns decides whether only the readback or the exact stage follows.
+        match self.finalize_async(session.clone(), request).await {
+            Ok(terminal) => Ok(ProcessStreamSinkReadback::Terminal { terminal }),
+            Err(_) => self.unsettled_readback(&session),
+        }
+    }
+
+    /// Reports the retained phase of an unresolved effect instead of
+    /// inventing a terminal. A `Reserved` phase released its provably absent
+    /// handoff, so the command is simply not settled and stays retryable.
+    fn unsettled_readback(
+        &self,
+        session: &ProcessStreamSinkSession,
+    ) -> Result<ProcessStreamSinkReadback, ProcessStreamSinkError> {
+        let state = self.lock();
+        let existing = Self::check_session(&state, session)?;
+        if let Some(terminal) = &state.terminal {
+            return Ok(ProcessStreamSinkReadback::Terminal {
+                terminal: terminal.clone(),
+            });
+        }
+        match state.finalization.as_ref() {
+            Some(reservation) if reservation.effect_possible() => {
+                Ok(ProcessStreamSinkReadback::UnknownOutcome {
+                    outcome: Self::reservation_uncertainty(&existing, reservation)?,
+                })
+            }
+            _ => Err(ProcessStreamSinkError::ProviderUnavailable),
         }
     }
 }
 
+/// Cancellation-safe local owner of one reserved finalize command.
+///
+/// `Drop` releases only this incarnation of a reservation that was never
+/// handed to the blob owner. A reservation whose external effect became
+/// possible keeps its phase, so a dropped future stays reconcilable instead of
+/// silently reopening the session. There is no RPC in `Drop`, no detached
+/// task, and no reset to `Open`.
+struct FinalizeHold<'a, C: BlobStoreClient> {
+    sink: &'a BlobStoreStreamSink<C>,
+    identity: ProcessStreamSinkTerminalCommandIdentity,
+    incarnation: u64,
+}
+
+impl<C: BlobStoreClient> Drop for FinalizeHold<'_, C> {
+    fn drop(&mut self) {
+        let mut state = self.sink.lock();
+        let releasable = state.finalization.as_ref().is_some_and(|reservation| {
+            reservation.identity == self.identity
+                && reservation.incarnation == self.incarnation
+                && matches!(reservation.phase, FinalizePhase::Reserved)
+        });
+        if releasable {
+            state.finalization = None;
+            state.finalization_incarnation = state.finalization_incarnation.saturating_add(1);
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Whether a blob failure leaves an effect that must stay unresolved until
+/// owner evidence settles it.
+///
+/// A stale/revoked root lease, a root owned elsewhere, contract rejection and
+/// an unavailable key are all decided before any durable transition, so they
+/// cannot have published anything and the reservation may be retried. Every
+/// other outcome — unknown publish outcome, capacity exhaustion at or after a
+/// journal write, transport loss, integrity failure, plan gap — keeps its
+/// possible effect and is recovered only through `reconcile`.
+fn possible_blob_effect(error: &BlobError) -> bool {
+    !matches!(
+        error,
+        BlobError::InvalidField { .. }
+            | BlobError::InvalidContract(_)
+            | BlobError::AuthorityRequired(_)
+            | BlobError::StaleFence
+            | BlobError::OwnerConflict
+            | BlobError::NotFound
+            | BlobError::KeyUnavailable { .. }
+    )
+}
+
 /// Maps a blob-layer failure onto the sink contract.
 ///
-/// Integrity and metadata/payload-coherence failures are evidence failures;
-/// every other provider failure (transport, capacity, key, fence, unknown
-/// outcome, incomplete publish) is the contract's typed provider-unavailable
-/// signal. Both forms refuse a `COMPLETE_SOURCE` terminal by construction:
-/// they return `Err` before any terminal exists.
+/// The mapping keeps the two vocabulary axes the contract already separates.
+///
+/// * Integrity and metadata/payload-coherence failures are evidence failures
+///   (`EvidenceInvariant`); they are never retried and never a `CompleteSource`.
+/// * Every other provider failure (transport, capacity, key, fence, unknown
+///   outcome, incomplete publish) is the contract's typed provider-unavailable
+///   signal. It is deliberately *not* widened into "safe to retry": the
+///   recoverable distinction is carried by the retained reservation phase,
+///   which `readback` exposes as `UnknownOutcome` for a possible effect and
+///   as a resumable `Finalizing` session view for a provably absent one.
+///
+/// Both forms refuse a `COMPLETE_SOURCE` terminal by construction: they
+/// return `Err` before any terminal exists.
 fn map_blob_error(error: &BlobError) -> ProcessStreamSinkError {
     match error {
         BlobError::IntegrityMismatch | BlobError::MetadataPayloadMismatch => {
@@ -815,6 +1291,16 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
         Box::pin(async move { self.finalize_async(session, request).await })
     }
 
+    /// Reconciles an uncertain provider effect for the one session this
+    /// adapter serves.
+    fn reconcile(
+        &self,
+        session: ProcessStreamSinkSession,
+        outcome: ProcessStreamSinkUnknownOutcome,
+    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
+        Box::pin(async move { self.reconcile_async(session, outcome).await })
+    }
+
     fn abort(
         &self,
         session: ProcessStreamSinkSession,
@@ -836,28 +1322,18 @@ impl<C: BlobStoreClient> ProcessStreamSinkClient for BlobStoreStreamSink<C> {
                     terminal: terminal.clone(),
                 });
             }
-            Self::session_view(&existing, &state)
-        });
-        Self::ready(result)
-    }
-
-    fn reconcile(
-        &self,
-        session: ProcessStreamSinkSession,
-        outcome: ProcessStreamSinkUnknownOutcome,
-    ) -> ProcessStreamSinkFuture<'_, ProcessStreamSinkReadback> {
-        let state = self.lock();
-        let result = Self::check_session(&state, &session).and_then(|existing| {
-            outcome.validate_against_session(&existing)?;
-            if let Some(terminal) = &state.terminal {
-                return Ok(ProcessStreamSinkReadback::Terminal {
-                    terminal: terminal.clone(),
+            // A reservation whose external effect became possible is exposed
+            // as the retained unknown outcome, never as an open session and
+            // never as a success. A `Reserved` phase (nothing handed off) is
+            // the only resumable nonterminal state.
+            if let Some(reservation) = &state.finalization
+                && reservation.effect_possible()
+            {
+                return Ok(ProcessStreamSinkReadback::UnknownOutcome {
+                    outcome: Self::reservation_uncertainty(&existing, reservation)?,
                 });
             }
-            // The adapter has no durable provider reconciliation query. An
-            // unresolved external effect remains nonterminal and unavailable;
-            // cleanup or replay cannot convert it into success or restage it.
-            Err(ProcessStreamSinkError::ProviderUnavailable)
+            Self::session_view(&existing, &state)
         });
         Self::ready(result)
     }

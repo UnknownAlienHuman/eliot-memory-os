@@ -542,8 +542,15 @@ fn fenced_activation_generation(
 /// work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReceiptOwnerFamily {
-    /// ORS store-rebind replay rows, the family the drain gate registers today.
+    /// ORS store-rebind replay rows.
     StoreRebind,
+    /// ORS unknown-outcome rows: unreconciled `UNKNOWN_OUTCOME` store
+    /// failures and still-open unknown-commit records. Observed through the
+    /// Store receipt gateway with `absence_resolves: false`: only exact owner
+    /// evidence (a bound `reconciled_receipt`, a terminal store disposition,
+    /// or a resolved unknown-commit record) clears an obligation, and any
+    /// remainder keeps the drain incomplete.
+    StoreUnknownOutcome,
 }
 
 /// One obligation exactly as its owner recorded it.

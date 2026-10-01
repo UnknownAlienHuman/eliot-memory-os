@@ -532,17 +532,35 @@ pub struct ExperienceRangePage {
     /// like the audit range.
     #[serde(default)]
     pub next_cursor: Option<String>,
+    /// Exact fence this page was projected under.
+    ///
+    /// The projector publishes this member ([`EXPERIENCE_PAGE_STATE_FENCE`])
+    /// on every page it produces, so it is declared here: a decoding struct
+    /// that forbids the member the Store emits describes a shape no page has.
+    /// It is a REQUIRED member, not a defaulted one, because its whole
+    /// purpose is to be checked — a consumer must be able to refuse a page
+    /// that states no fence at all, and a default would make that
+    /// indistinguishable from a page that states the bound one.
+    pub state_fence: StateFence,
 }
 
 impl ExperienceRangePage {
     /// Builds the closed page object bound into read payloads.
-    pub fn payload(&self, state_fence: &StateFence) -> serde_json::Value {
+    ///
+    /// The published fence is the page's OWN fence ([`Self::state_fence`]),
+    /// never one supplied at projection time: a page cannot be published
+    /// under a fence other than the one it was read at, so the envelope a
+    /// consumer decodes and the fence it checks are one value rather than two
+    /// that can disagree. Every backend projector therefore builds the page
+    /// with the fence it read under and calls this with no argument.
+    #[must_use]
+    pub fn payload(&self) -> serde_json::Value {
         serde_json::json!({
             EXPERIENCE_PAGE_RECORDS: self.records,
             EXPERIENCE_PAGE_MATCHED_TOTAL: self.matched_total,
             EXPERIENCE_PAGE_TRUNCATED: self.truncated,
             EXPERIENCE_PAGE_NEXT_CURSOR: self.next_cursor,
-            EXPERIENCE_PAGE_STATE_FENCE: state_fence,
+            EXPERIENCE_PAGE_STATE_FENCE: &self.state_fence,
         })
     }
 }

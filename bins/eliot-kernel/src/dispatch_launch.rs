@@ -115,7 +115,7 @@ use eliot_kernel_service::{
 };
 use eliot_ors::{
     DoctorAttemptRecord, DoctorEffectRecord, DoctorLedgerError, DoctorRecoveryLedger,
-    NativeWorkerClaimRecord, OperationIdentity,
+    NativeWorkerClaimRecord, OperationIdentity, StateFenceSnapshot, epoch_lineage_for,
 };
 use eliot_process::{OperationId, ProcessRequest};
 use eliot_protocol::dreamer_job::{DurableJobResponse, JobState};
@@ -2991,6 +2991,8 @@ pub async fn start_ready_doctor_launch(
             kind: DispatchedWorkerKind::Doctor,
             operation_id: &ready.operation_id,
             native_worker_claim_id: None,
+            native_worker_attempt_id: None,
+            native_worker_state_fence: None,
             executable: &ready.executable,
             executable_sha256: &ready.executable_sha256,
             working_directory: &ready.working_directory,
@@ -3062,6 +3064,21 @@ struct SpawnInputs<'a> {
     kind: DispatchedWorkerKind,
     operation_id: &'a OperationId,
     native_worker_claim_id: Option<&'a str>,
+    /// The admitted native-worker claim's proposed-attempt identity. It is the
+    /// `proposed_attempt_id` half of the admission-reservation launch
+    /// prerequisite, present only when this launch carries an ORS claim
+    /// reservation; `None` for the Doctor/testd/Dreamer contours, which never
+    /// stage one. Together with `native_worker_claim_id` (the reservation's
+    /// `work_item_id`) it binds the launch to the exact durable reservation the
+    /// claim route staged, so the W8 gate reads the owner's own row rather than
+    /// guessing from the launch identity.
+    native_worker_attempt_id: Option<&'a str>,
+    /// The EXACT State Fence the admitted native-worker claim was staged under.
+    /// The launch gate presents it to the ORS owner so the reservation is
+    /// verified against the claim's OWN original recorded fence — the fence the
+    /// claim route validated and the reservation was staged under — not a fence
+    /// recomputed here. `None` for the contours that stage no reservation.
+    native_worker_state_fence: Option<&'a StateFence>,
     executable: &'a Path,
     executable_sha256: &'a str,
     working_directory: &'a Path,
@@ -3178,6 +3195,108 @@ fn stage_pending_native_worker_process_start(
     Ok(Some(pending))
 }
 
+/// Applies the #1678 admission-reservation launch gate to one dispatch child
+/// start (W8).
+///
+/// This is the production caller of
+/// [`admission_reservation_saga::require_bound_admission_reservation_launch`]
+/// for the dispatch contour. It runs BEFORE the child admission is built, so a
+/// refused launch has produced no process intent, no material write and no
+/// gateway contact.
+///
+/// What it decides:
+///
+/// * A contour that stages no admission reservation (Doctor, testd, Dreamer)
+///   has no `work_item_id`/`attempt` pair to verify, so the gate is a no-op
+///   pass — the gate resolves no reservation and returns `Ok(None)`. It never
+///   stages one, because a second reservation scheme is exactly what #1678
+///   forbids.
+/// * A contour that DOES carry one (the native-worker claim, whose reservation
+///   binds `work_item_id = claim_id` and `proposed_attempt_id = attempt_id`)
+///   must clear the owner's verifier. The gate resolves the reservation by that
+///   exact work-item/attempt pair, reads it back, and requires the owner's
+///   sealed `Active` typestate.
+///
+/// A refusal is surfaced as [`DispatchLaunchError::Inconsistent`] carrying the
+/// owner's own state discriminant, so the launch caller sees WHICH state blocked
+/// the launch — `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`, `STALE_FENCE`,
+/// `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING`, or `UNREADABLE:<tag>` — and
+/// never a bare "launch denied". It is returned BEFORE the gateway, so a
+/// non-admissible reservation cannot spawn a child.
+fn require_dispatch_launch_reservation(
+    kernel: &KernelComposition,
+    inputs: &SpawnInputs<'_>,
+) -> Result<(), DispatchLaunchError> {
+    // A contour that stages no admission reservation carries none of the three
+    // binding fields and is not gated; staging one here would be a second
+    // reservation scheme. A contour that carries SOME of them must carry all
+    // three: a partial binding is refused rather than treated as an ungated
+    // contour, so a reservation can never be skipped by dropping one field.
+    if inputs.native_worker_claim_id.is_none()
+        && inputs.native_worker_attempt_id.is_none()
+        && inputs.native_worker_state_fence.is_none()
+    {
+        return Ok(());
+    }
+    let (Some(work_item_id), Some(attempt_id), Some(state_fence)) = (
+        inputs.native_worker_claim_id,
+        inputs.native_worker_attempt_id,
+        inputs.native_worker_state_fence,
+    ) else {
+        return Err(DispatchLaunchError::Inconsistent(
+            "dispatch launch carries an incomplete admission reservation binding".to_owned(),
+        ));
+    };
+    let work_item = OperationIdentity::new(work_item_id)
+        .map_err(|error| DispatchLaunchError::Inconsistent(error.to_string()))?;
+    let proposed_attempt = OperationIdentity::new(attempt_id)
+        .map_err(|error| DispatchLaunchError::Inconsistent(error.to_string()))?;
+    // The Authority Epoch lineage is derived from the claim's own epoch by the
+    // ORS owner's own function, so the gate compares the reservation against the
+    // SAME lineage the claim route staged it under rather than a value
+    // recomputed here.
+    let authority_epoch = epoch_lineage_for(inputs.authority_epoch, None).map_err(|error| {
+        DispatchLaunchError::Inconsistent(format!(
+            "launch gate authority epoch is not usable: {error}"
+        ))
+    })?;
+    // The State Fence snapshot is captured from the claim's OWN recorded fence
+    // with the epoch's sequence and then validated by the ORS owner against that
+    // epoch, so the ORIGINAL recorded fence is verified rather than recomputed.
+    let fence_snapshot =
+        StateFenceSnapshot::capture(state_fence, inputs.authority_epoch.sequence.get())
+            .and_then(|snapshot| {
+                snapshot
+                    .validate_against_epoch(inputs.authority_epoch)
+                    .map(|()| snapshot)
+            })
+            .map_err(|error| {
+                DispatchLaunchError::Inconsistent(format!(
+                    "launch gate state fence is not usable: {error}"
+                ))
+            })?;
+    let now_unix_ms = i64::try_from(super::unix_ms()).map_err(|_| {
+        DispatchLaunchError::Inconsistent(
+            "launch gate clock is not a positive millisecond value".to_owned(),
+        )
+    })?;
+    super::admission_reservation_saga::require_bound_admission_reservation_launch(
+        kernel.generation_gateway.ors.as_ref(),
+        &work_item,
+        &proposed_attempt,
+        &authority_epoch,
+        &fence_snapshot,
+        now_unix_ms,
+    )
+    .map(|_| ())
+    .map_err(|refusal| {
+        // The refusal names the owner's own state; `Inconsistent` keeps it typed
+        // and surfaces the discriminant through `Display` so the launch caller
+        // can tell a `STAGED` reservation from a `RELEASED` one.
+        DispatchLaunchError::Inconsistent(refusal.to_string())
+    })
+}
+
 /// Spawns one prepared child through the admitted process gateway.
 ///
 /// Shared contour for Doctor and testd: the child admission always carries
@@ -3192,6 +3311,18 @@ async fn spawn_ready_child(
 ) -> Result<SpawnOutcome, DispatchLaunchError> {
     let kind = inputs.kind;
     let operation_id = inputs.operation_id;
+    // #1678 W8: the launch gate. Every dispatch child start passes the ONE
+    // admission-reservation gate before any child effect. When this launch
+    // carries an ORS claim reservation (the native-worker contour), the gate
+    // resolves the reservation that binds THIS claim's work item and proposed
+    // attempt and refuses unless the owner verifier returns its sealed `Active`
+    // typestate — naming `STAGED`, `RELEASED`, `EXPIRED`, `RECONCILING`,
+    // `STALE_FENCE`, `FOREIGN_OWNER`, `IDENTITY_CONFLICT`, `MISSING` or an
+    // unreadable row by the owner's own discriminant. The Doctor/testd/Dreamer
+    // contours stage no reservation, so the gate resolves none and the launch
+    // proceeds exactly as before; it never stages one here, because a second
+    // reservation scheme is exactly what this issue forbids.
+    require_dispatch_launch_reservation(kernel, inputs)?;
     let admission = child_process_admission(inputs)?;
     // Fail closed fast when no admitted executor is configured: nothing is
     // spawned, and the caller reaps the prepared material and releases the
@@ -4566,6 +4697,8 @@ pub async fn start_ready_testd_launch(
             kind: DispatchedWorkerKind::Testd,
             operation_id: &ready.operation_id,
             native_worker_claim_id: None,
+            native_worker_attempt_id: None,
+            native_worker_state_fence: None,
             executable: &ready.executable,
             executable_sha256: &ready.executable_sha256,
             working_directory: &ready.working_directory,
@@ -5191,6 +5324,11 @@ pub async fn start_ready_native_worker_launch(
             kind: DispatchedWorkerKind::NativeWorker,
             operation_id: &ready.operation_id,
             native_worker_claim_id: Some(&ready.receipt.claim_id),
+            // #1678 W8: the claim's OWN admitted attempt and State Fence, so the
+            // launch gate verifies the durable reservation against the exact
+            // binding the claim route staged it under.
+            native_worker_attempt_id: Some(&ready.receipt.attempt_id),
+            native_worker_state_fence: Some(&ready.receipt.state_fence),
             executable: &ready.executable,
             executable_sha256: &ready.executable_sha256,
             working_directory: &ready.working_directory,
@@ -5794,6 +5932,10 @@ pub fn prepare_dreamer_launch(
         revision,
         semantic_input: Some(semantic_input.clone()),
         semantic_input_bytes: material.queued.semantic_input_bytes.clone(),
+        // The opaque owner record the durable owner published for this job,
+        // carried verbatim. Absence stays explicit `None`: the Kernel neither
+        // mints a record nor turns an absent one into an empty one.
+        owner_record: material.queued.owner_record.clone(),
         scope_id,
         fence,
         epoch: authority_epoch.clone(),
@@ -5874,6 +6016,8 @@ pub async fn start_ready_dreamer_launch(
             kind: DispatchedWorkerKind::Dreamer,
             operation_id: &ready.operation_id,
             native_worker_claim_id: None,
+            native_worker_attempt_id: None,
+            native_worker_state_fence: None,
             executable: &ready.executable,
             executable_sha256: &ready.executable_sha256,
             working_directory: &ready.working_directory,

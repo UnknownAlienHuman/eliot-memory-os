@@ -68,6 +68,20 @@ impl RenderedAtom {
     }
 }
 
+/// The exact serialized member set of `CanonicalRenderedPayload`.
+///
+/// This list is the render's own declaration of what the codec encodes, and it
+/// lives beside the struct so a member cannot be added or removed without the
+/// declaration being updated in the same edit. It is the shape half the codec
+/// identity digests: see [`crate::canonical_render_serializer`].
+pub(crate) const CANONICAL_RENDERED_PAYLOAD_FIELDS: [&str; 5] = [
+    "schema_version",
+    "binding",
+    "recipe_digest",
+    "fence_digest",
+    "rendered",
+];
+
 #[derive(Serialize)]
 struct CanonicalRenderedPayload<'a> {
     schema_version: ContractVersion,

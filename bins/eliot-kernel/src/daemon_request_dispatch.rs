@@ -74,6 +74,7 @@ use eliot_store_api::{
 };
 use serde::Deserialize;
 
+use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
     ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
@@ -316,6 +317,21 @@ pub(crate) const STORAGE_REPLACEMENT_ROLLBACK_OPERATION: &str =
 /// unreachable from the front door until
 /// `frame_dispatch::is_daemon_operation` lists it.
 pub(crate) const MAINTENANCE_TRIGGER_INTAKE_OPERATION: &str = "maintenance_trigger_intake";
+
+/// Authenticated daemon operation carrying one historical v1 activation
+/// decision document for explicit import inspection (issue #1115 W6/A10).
+///
+/// This operation is the one production caller of
+/// `eliot_protocol::activation_resolution_v1::decode_activation_resolution_v1_import`:
+/// the arm below decodes and validates the presented v1 bytes as an immutable
+/// artifact and projects only its exact ticket/decision identity. It never
+/// adopts the artifact as a v2 result, creates no Session or authority, and
+/// never runs on the v2 submit path; v2 material (a `result` key) fails closed
+/// here, exactly as v1 material (`decision`) fails closed on
+/// `agent_activation_submit`, so each envelope version decodes on exactly one
+/// operation. The frame reaches the arm once
+/// `frame_dispatch::is_daemon_operation` lists this marker.
+pub(crate) const AGENT_ACTIVATION_V1_IMPORT_OPERATION: &str = "agent_activation_v1_import";
 
 const STARTUP_EVIDENCE_FIELDS: [&str; 8] = [
     "transport_binding",
@@ -633,6 +649,13 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "store_named" => "store_named",
         NOTIFICATION_STATE_MUTATION_OPERATION => NOTIFICATION_STATE_MUTATION_OPERATION,
         NOTIFICATION_STATE_READ_OPERATION => NOTIFICATION_STATE_READ_OPERATION,
+        // Issue #1678 W3/W5 (REQ4, REQ6, A3, A4): the admitted daemon-channel
+        // coordinator that drives the canonical `ADMITTED` readback, its
+        // launch-outbox intent proof, and the one activation of the exact
+        // staged reservation. It is served on this channel because the
+        // canonical owner receipt it must read is live `KernelStoreGateway`
+        // IO, which the synchronous claim route structurally cannot reach.
+        ADMISSION_RESERVATION_ADMIT_OPERATION => ADMISSION_RESERVATION_ADMIT_OPERATION,
         "local_read" => "local_read",
         "daemon_degraded" => "daemon_degraded",
         "daemon_fatal" => "daemon_fatal",
@@ -640,11 +663,14 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "agent_activation_claim" => "agent_activation_claim",
         "agent_activation_submit" => "agent_activation_submit",
         "agent_activation_reconcile" => "agent_activation_reconcile",
+        AGENT_ACTIVATION_V1_IMPORT_OPERATION => AGENT_ACTIVATION_V1_IMPORT_OPERATION,
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
+        "watchdog_export_claim" => "watchdog_export_claim",
+        "watchdog_export_result" => "watchdog_export_result",
         "campaign_packet_claim" => "campaign_packet_claim",
         "campaign_packet_result" => "campaign_packet_result",
         "task_controller_claim" => "task_controller_claim",
@@ -698,7 +724,12 @@ struct StoreNamedOperation {
 /// application data: it is already bound to the dispatched `operation` string,
 /// so removing it cannot lose or invent a request field, and a body that is
 /// not an object still fails closed exactly as before.
-fn without_daemon_routing_key(
+///
+/// Shared with the #1678 admission-reservation admit/activate coordinator
+/// (`admission_reservation_saga`), so the routing key is removed by ONE
+/// implementation: a second spelling would risk decoding a body the
+/// dispatcher did not route.
+pub(crate) fn without_daemon_routing_key(
     payload: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     match payload {
@@ -3341,6 +3372,17 @@ impl KernelComposition {
             NOTIFICATION_STATE_READ_OPERATION => {
                 Box::pin(self.notification_state_read_operation(session, payload.clone())).await
             }
+            // Issue #1678 W3/W5/REQ4/REQ6/A3/A4/A7: the admit + activate leg of
+            // the normative admission-reservation saga. The arm never mints an
+            // admission: it reads the canonical owner's OWN committed
+            // `WriteReceipt` for the ORIGINAL operation identity through the
+            // retained production gateway, proves the exact launch-outbox row
+            // from that receipt, and activates the staged reservation under
+            // the reservation-bound activation identity. Every non-committed
+            // outcome keeps the reservation inactive and launch blocked.
+            ADMISSION_RESERVATION_ADMIT_OPERATION => {
+                Box::pin(self.admission_reservation_admit_operation(session, payload.clone())).await
+            }
             "receipt" => {
                 // F-LOG-KERNEL-1 (#897 T20): only a dispatch failure carries
                 // the subordinate designated terminal, so only that leg
@@ -3568,6 +3610,51 @@ impl KernelComposition {
                     Err(TransportError::SessionFenced)
                 }
             }
+            AGENT_ACTIVATION_V1_IMPORT_OPERATION => {
+                #[cfg(windows)]
+                {
+                    // Issue #1115 W6/A10: the explicit v1 import boundary and
+                    // the one production caller of the closed v1 import
+                    // decoder. The operation carries exactly one historical v1
+                    // decision document under `decision`; the decoder validates
+                    // the original bytes and digest, and the arm projects only
+                    // the exact ticket/decision identity. Nothing is adopted:
+                    // no Session, no authority, no v2 result write, and no
+                    // fallback into the submit path. A `result` key (v2
+                    // material) fails closed here, mirroring the `decision`
+                    // rejection on `agent_activation_submit`, so each envelope
+                    // version decodes on exactly one operation.
+                    let object = payload.as_object().ok_or(TransportError::SessionFenced)?;
+                    if object.contains_key("result") {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    if object.len() != 2
+                        || object.get("operation").and_then(serde_json::Value::as_str)
+                            != Some(AGENT_ACTIVATION_V1_IMPORT_OPERATION)
+                        || !object.contains_key("decision")
+                    {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    Self::validate_activation_submitter(session, request_identity)?;
+                    let decision_bytes = serde_json::to_vec(
+                        object
+                            .get("decision")
+                            .ok_or(TransportError::SessionFenced)?,
+                    )
+                    .map_err(|_| TransportError::SessionFenced)?;
+                    let artifact =
+                        eliot_protocol::activation_resolution_v1::decode_activation_resolution_v1_import(
+                            &decision_bytes,
+                        )
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    Ok(Self::v1_import_observed_daemon_response(&artifact))
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
             "local_read_claim" => {
                 // Outbound-only eliotd poller for admitted `eliot.query` pairs
                 // (Implements #18): mirrors `agent_activation_claim` —
@@ -3674,6 +3761,75 @@ impl KernelComposition {
                             "recovery": null,
                         }),
                     })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "watchdog_export_claim" => {
+                // Outbound-only eliotd spool-drain poller (#2899): claims the
+                // next Watchdog spool export window this Kernel admitted through
+                // the authenticated `watchdog_export_submit` front-door route,
+                // so the daemon can admit it through the Governor. It mirrors
+                // `semantic_observe_claim`: same dispatcher-head session/auth/
+                // ready/fence gates, same single-`operation`-key payload shape,
+                // same null poll (not error) when empty. The claimed window
+                // carries the exact submitted bytes and every entry was
+                // re-proved against its own durable ORS row, so the daemon never
+                // admits a window the durable owner cannot prove.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    // Every arm of this dispatch match answers with
+                    // `Result<serde_json::Value, TransportError>`, so the
+                    // claim's own refusal is mapped through rather than
+                    // unwrapped: the null poll and the transport refusal keep
+                    // the same decided error type the neighbouring operations
+                    // propagate.
+                    self.claim_watchdog_export_batch(session)
+                        .map(|batch| match batch {
+                            Some(batch) => serde_json::json!({
+                                "status": "known",
+                                "value": { "batch": batch },
+                                "recovery": null,
+                            }),
+                            None => serde_json::json!({
+                                "status": "known",
+                                "value": { "batch": null },
+                                "recovery": null,
+                            }),
+                        })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "watchdog_export_result" => {
+                // Daemon outcome leg for the claimed Watchdog spool drain
+                // window (#2899): records the Governor's OWN terminal
+                // per-entry dispositions against the durable drain projections
+                // this Kernel already staged. It mirrors `semantic_observe_result`:
+                // same dispatcher-head session/auth/ready/fence gates, same
+                // single-`operation`-key payload shape. The Kernel writes no
+                // disposition of its own; it only persists the submitted ones
+                // through the owner's ORS result path, after proving each one
+                // answers the exact retained record the drain projected.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    let result = host_request_route::watchdog_export_result_from_payload(payload)?;
+                    let projections = self.record_watchdog_export_outcomes(session, &result)?;
+                    Ok(host_request_route::watchdog_export_result_response(
+                        &projections,
+                    ))
                 }
                 #[cfg(not(windows))]
                 {
@@ -8697,6 +8853,28 @@ impl KernelComposition {
         })
     }
 
+    /// Typed projection of one validated historical v1 import (issue #1115
+    /// W6/A10): the artifact decoded under the closed v1 shape and is observed
+    /// only. `accepted` is false because nothing is adopted as an activation
+    /// result; `import_observed` carries the completed validation, and the two
+    /// identities name the exact historical record so migration tooling can
+    /// cite it without parsing diagnostics. No Session, authority, capability,
+    /// or result state is created.
+    fn v1_import_observed_daemon_response(
+        artifact: &eliot_protocol::activation_resolution_v1::AgentActivationResolutionDecision,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": false,
+                "import_observed": true,
+                "ticket_id": artifact.ticket_id,
+                "decision_sha256": artifact.decision_sha256,
+            },
+            "recovery": null,
+        })
+    }
+
     #[cfg(windows)]
     async fn store_recovery_operation(
         &self,
@@ -10981,8 +11159,15 @@ impl KernelComposition {
         Err(TransportError::SessionFenced)
     }
 
+    /// Returns the retained production canonical-store gateway.
+    ///
+    /// Shared with the #1678 admission-reservation admit/activate coordinator
+    /// (`admission_reservation_saga`) so the #1678 owner-receipt readback
+    /// reaches the canonical owner through the SAME retained generation-routed
+    /// gateway every other canonical write on this channel uses, rather than
+    /// opening a second client or a second store route.
     #[cfg(windows)]
-    fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
+    pub(crate) fn retained_store_gateway(&self) -> Result<Arc<KernelStoreGateway>, TransportError> {
         self.canonical_store_gateway
             .lock()
             .map_err(|_| TransportError::SessionFenced)?
@@ -11948,7 +12133,12 @@ fn notification_state_read_selectors(
     })
 }
 
-fn validate_store_session_fence(
+/// Proves the presented session and State Fence are the same live binding.
+///
+/// Shared with the #1678 admission-reservation admit/activate coordinator so
+/// its canonical owner-receipt readback is admitted by the SAME session-fence
+/// check as every other canonical read on this channel.
+pub(crate) fn validate_store_session_fence(
     session: &Session,
     state_fence: &StateFence,
 ) -> Result<(), TransportError> {
