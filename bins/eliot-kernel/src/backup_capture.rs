@@ -1108,8 +1108,7 @@ impl KernelBackupCapture {
         // later. Both ends are strictly ordered, which is what the grant's own
         // `validate` requires and what makes a zero-length window impossible.
         let not_before_unix_ms = issued_at_unix_ms.saturating_add(1);
-        let expires_at_unix_ms =
-            not_before_unix_ms.saturating_add(SUCCESSION_GRANT_HORIZON_MS);
+        let expires_at_unix_ms = not_before_unix_ms.saturating_add(SUCCESSION_GRANT_HORIZON_MS);
         Ok(eliot_ors::BackupVerifySuccessionGrant {
             grant_id: nonce.as_str().to_owned(),
             principal: caller.principal.clone(),
