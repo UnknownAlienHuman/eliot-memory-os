@@ -209,7 +209,7 @@ pub enum OwnerAdvanceOutcome {
         /// The single active lease for the target.
         lease: IntegrationOwnerLease,
         /// Head record transitioned to `Integrating` with its history entry.
-        integrating: IntegrationCandidate,
+        integrating: Box<IntegrationCandidate>,
         /// Pressure observed at advance time.
         pressure: IntegrationPressure,
     },
@@ -219,7 +219,7 @@ pub enum OwnerAdvanceOutcome {
         /// Candidate holding the target's active lease.
         holder_candidate_id: String,
         /// Queue head that remains queued behind the active lease.
-        queued_head: IntegrationCandidate,
+        queued_head: Box<IntegrationCandidate>,
         /// Pressure observed at advance time.
         pressure: IntegrationPressure,
     },
@@ -233,7 +233,7 @@ pub enum OwnerAdvanceOutcome {
     /// never apply.
     StaleRecorded {
         /// Head record transitioned to `Stale` with its history entry.
-        stale: IntegrationCandidate,
+        stale: Box<IntegrationCandidate>,
         /// Pressure observed at advance time.
         pressure: IntegrationPressure,
     },
@@ -352,7 +352,7 @@ pub fn advance_integration_owner(
     match acquire_integration_lease(candidates, active_leases, &lease_request) {
         Ok(lease) => Ok(OwnerAdvanceOutcome::LeaseGranted {
             lease,
-            integrating: transition_to_integrating(head, request.observed_at_unix_ms),
+            integrating: Box::new(transition_to_integrating(head, request.observed_at_unix_ms)),
             pressure,
         }),
         Err(IntegrationLeaseError::LeaseHeld {
@@ -360,12 +360,12 @@ pub fn advance_integration_owner(
             ..
         }) => Ok(OwnerAdvanceOutcome::TargetHeld {
             holder_candidate_id,
-            queued_head: head.clone(),
+            queued_head: Box::new(head.clone()),
             pressure,
         }),
         Err(IntegrationLeaseError::StaleMarked { stale }) => {
             Ok(OwnerAdvanceOutcome::StaleRecorded {
-                stale: *stale,
+                stale,
                 pressure,
             })
         }
@@ -393,7 +393,7 @@ pub fn serve_integration_owner_request(
         } => Ok(IntegrationOwnerResponse {
             outcome: IntegrationOwnerOutcomeKind::LeaseGranted,
             lease: Some(lease),
-            persist_candidates: vec![integrating],
+            persist_candidates: vec![*integrating],
             pressure,
         }),
         OwnerAdvanceOutcome::TargetHeld { pressure, .. } => Ok(IntegrationOwnerResponse {
@@ -408,14 +408,12 @@ pub fn serve_integration_owner_request(
             persist_candidates: Vec::new(),
             pressure,
         }),
-        OwnerAdvanceOutcome::StaleRecorded { stale, pressure } => {
-            Ok(IntegrationOwnerResponse {
-                outcome: IntegrationOwnerOutcomeKind::StaleRecorded,
-                lease: None,
-                persist_candidates: vec![stale],
-                pressure,
-            })
-        }
+        OwnerAdvanceOutcome::StaleRecorded { stale, pressure } => Ok(IntegrationOwnerResponse {
+            outcome: IntegrationOwnerOutcomeKind::StaleRecorded,
+            lease: None,
+            persist_candidates: vec![*stale],
+            pressure,
+        }),
     }
 }
 
