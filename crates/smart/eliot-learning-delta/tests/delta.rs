@@ -1654,10 +1654,7 @@ fn omission_fixture(
 /// Re-bind the slot payload digests a view carries in its source manifest after
 /// the fixture mutated a payload, keeping the view's own bindings consistent.
 fn rebind_slot_digest(view: &mut eliot_learning_contracts::CampaignLearningStateView) {
-    let bound: Vec<(
-        eliot_learning_contracts::SlotId,
-        String,
-    )> = view
+    let bound: Vec<(eliot_learning_contracts::SlotId, String)> = view
         .slots
         .iter()
         .map(|slot| {
