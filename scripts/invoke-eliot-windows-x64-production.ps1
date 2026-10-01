@@ -1415,6 +1415,7 @@ function New-ProductionMaterializeArguments([object]$Contract, [object[]]$RolePi
             '--eliot-native-worker', [string]$nativeWorker.path,
             '--eliot-wasm-host', [string]$wasmHost.path,
             '--eliot-notify', [string]$notifyRole.path,
+            '--release-bundle-root', [string]$Contract.signed_bundle,
             '--output-bundle', [string]$Contract.output_bundle,
             '--output', [string]$Contract.output,
             '--store', [string]$Contract.store,
