@@ -37008,8 +37008,7 @@ fn reconciliation_matches(
             || observed.prior_head != reserved.expected_head
             || observed.committed_link.ordering_scope.as_str() != reserved.scope.as_str()
             || observed.committed_link.ordering_sequence != reserved.reserved_sequence
-            || observed.committed_link.previous_event_hash
-                != reserved.expected_head.head_sha256
+            || observed.committed_link.previous_event_hash != reserved.expected_head.head_sha256
             || observed.receipt_id.as_str() != receipt.identity.receipt_id.as_str()
         {
             return Err(OrsError::ReconciliationMismatch);
