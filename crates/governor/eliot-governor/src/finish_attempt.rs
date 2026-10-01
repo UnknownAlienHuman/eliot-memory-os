@@ -379,8 +379,9 @@ pub fn parse_kernel_change_transfer(
     }
     if document.projection != KERNEL_CHANGE_TRANSFER_PROJECTION {
         return Err(recovery_refusal(format!(
-            "kernel change transfer projection '{document.projection}' is not the Kernel \
-             change-ledger projection"
+            "kernel change transfer projection '{}' is not the Kernel \
+             change-ledger projection",
+            document.projection
         )));
     }
     Ok(document)
@@ -477,8 +478,9 @@ fn hydrate_transfer_hints(
             // the hydration refuses and finish stays blocked instead.
             KernelTransferHintOrigin::PollReconcile => {
                 return Err(recovery_refusal(format!(
-                    "kernel change transfer hint '{hint.hint_id}' uses a poll-reconcile route, \
+                    "kernel change transfer hint '{}' uses a poll-reconcile route, \
                      which cannot confirm a host/filesystem hint",
+                    hint.hint_id
                 )));
             }
         };
@@ -497,7 +499,8 @@ fn hydrate_transfer_hints(
             },
             Err(error) => {
                 return Err(recovery_refusal(format!(
-                    "kernel change transfer hint '{hint.hint_id}' is not admittable: {error}",
+                    "kernel change transfer hint '{}' is not admittable: {error}",
+                    hint.hint_id
                 )));
             }
         }
@@ -517,8 +520,9 @@ fn hydrate_transfer_governed(
         let observation = governed_transfer_observation(fence, original)?;
         if let Err(error) = observation.validate() {
             return Err(recovery_refusal(format!(
-                "kernel change transfer governed original '{original.change_id}' is malformed: \
+                "kernel change transfer governed original '{}' is malformed: \
                  {error}",
+                original.change_id
             )));
         }
         match monitor.ingest_governed_tool_mutation(observation) {
@@ -541,7 +545,8 @@ fn hydrate_transfer_governed(
             Err(error) => {
                 return Err(recovery_refusal(format!(
                     "kernel change transfer governed original \
-                     '{original.change_id}' cannot be projected: {error}",
+                     '{}' cannot be projected: {error}",
+                    original.change_id
                 )));
             }
         }
@@ -587,7 +592,8 @@ fn governed_transfer_observation(
         (None, None) => {
             return Err(recovery_refusal(format!(
                 "kernel change transfer governed original \
-                 '{original.change_id}' carries neither a before nor an after revision",
+                 '{}' carries neither a before nor an after revision",
+                original.change_id
             )));
         }
         (None, Some(_)) => ChangeKind::Created,
@@ -654,8 +660,9 @@ fn hydrate_transfer_reconciliations(
                 .reconcile_unknown_change(&link.unknown_change_id, &link.evidence_change_id)
                 .map_err(|error| {
                     recovery_refusal(format!(
-                        "kernel change transfer reconciliation '{link.unknown_change_id}' <- \
-                         '{link.evidence_change_id}' is invalid: {error}",
+                        "kernel change transfer reconciliation '{}' <- \
+                         '{}' is invalid: {error}",
+                        link.unknown_change_id, link.evidence_change_id
                     ))
                 })?;
             hydration.reconciliations_applied += 1;
@@ -670,8 +677,9 @@ fn hydrate_transfer_reconciliations(
             hydration.reconciliations_owner_resolved += 1;
         } else {
             return Err(recovery_refusal(format!(
-                "kernel change transfer reconciliation '{link.unknown_change_id}' <- \
-                 '{link.evidence_change_id}' names observations this owner has not projected",
+                "kernel change transfer reconciliation '{}' <- \
+                 '{}' names observations this owner has not projected",
+                link.unknown_change_id, link.evidence_change_id
             )));
         }
     }
@@ -708,7 +716,8 @@ fn hydrate_transfer_unknowns(
             // instead of guessing which half to trust.
             return Err(recovery_refusal(format!(
                 "kernel change transfer unknown change \
-                 '{unknown.change_id}' is both reconciled and unreconciled",
+                 '{}' is both reconciled and unreconciled",
+                unknown.change_id
             )));
         }
         if reconciled {
