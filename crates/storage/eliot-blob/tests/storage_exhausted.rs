@@ -1219,7 +1219,10 @@ fn retry_disposition_requires_revalidation_never_blind_transient() {
     for operation in ["retry-op-a", "retry-op-b"] {
         let writes_before = platform.lock().write_new_calls;
         platform.lock().fail_write_new_on = Some(writes_before + 2);
-        let error = match block_on(store.stage(stage_request(operation, b"payload", &root))) {
+        let request = stage_request(operation, b"payload", &root);
+        let expected_context = request.context.clone();
+        let expected_locator = locator_for(b"payload");
+        let error = match block_on(store.stage(request)) {
             Ok(_) => panic!("the injected payload fault must fail stage {operation}"),
             Err(error) => error,
         };
@@ -1232,16 +1235,11 @@ fn retry_disposition_requires_revalidation_never_blind_transient() {
             failure.recovery,
             BlobCapacityRecovery::CapacityRevalidationRequired
         );
-        let BlobCapacityIdentity::Journal {
-            operation_id,
-            idempotency_key,
-            ..
-        } = &failure.identity
-        else {
+        let BlobCapacityIdentity::Operation { context, locator } = &failure.identity else {
             panic!("capacity failure must retain the stage's original operation identity");
         };
-        assert_eq!(operation_id, operation);
-        assert_eq!(idempotency_key, "idem-1");
+        assert_eq!(context.as_ref(), &expected_context);
+        assert_eq!(locator.as_ref(), Some(&expected_locator));
         assert!(failure.validate().is_ok());
         assert!(!has_suffix(&platform, ".commit"));
         assert_eq!(
