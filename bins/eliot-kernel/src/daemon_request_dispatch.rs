@@ -5526,7 +5526,20 @@ impl KernelComposition {
             eliot_kernel_core::UserAutomationOperation::NormalizeSchedule { .. }
                 | eliot_kernel_core::UserAutomationOperation::MigrateLegacySchedule { .. }
         ) {
-            return Self::user_automation_normalization_response(&request);
+            let gateway = match self.retained_store_gateway() {
+                Ok(gateway) => gateway,
+                Err(_) => {
+                    return Self::bind_user_automation_operator_response(
+                        &request,
+                        &Self::user_automation_runtime_error_response(
+                            UserAutomationRuntimeError::Unavailable(
+                                "canonical UserAutomation Store owner is unavailable".to_owned(),
+                            ),
+                        ),
+                    );
+                }
+            };
+            return Self::user_automation_normalization_response(&gateway, &request).await;
         }
         let transition = match self
             .dispatch_user_automation_operator_transition(session, &request)
@@ -5570,13 +5583,12 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
-    fn user_automation_normalization_response(
+    async fn user_automation_normalization_response(
+        gateway: &eliot_kernel_service::KernelStoreGateway,
         request: &eliot_kernel_service::UserAutomationServiceRequest,
     ) -> Result<serde_json::Value, TransportError> {
-        let (revision, normalization_receipt_envelope) =
-            match eliot_kernel_service::KernelStoreGateway::normalize_user_automation_schedule(
-                request,
-            ) {
+        let (original_request, revision, normalization_receipt_envelope) =
+            match gateway.normalize_user_automation_schedule(request).await {
                 Ok(result) => result,
                 Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
                     return Self::bind_user_automation_operator_response(
@@ -5597,7 +5609,7 @@ impl KernelComposition {
             };
         let envelope =
             eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_normalized_schedule(
-                request,
+                &original_request,
                 revision,
                 normalization_receipt_envelope,
             )
