@@ -3397,7 +3397,11 @@ fn drive_mcp_pending_call(
                     None
                 }
                 Err(failure) => {
-                    let response = render_rejected_result(call.correlation.as_str(), &failure);
+                    let rejected = render_rejected_result(call.correlation.as_str(), &failure);
+                    let response = match rejected {
+                        Ok(result) => render_result(&call.id, result),
+                        Err(rejection) => render_rejection(Some(&call.id), &rejection),
+                    };
                     Some((response, call.request_text))
                 }
             }
