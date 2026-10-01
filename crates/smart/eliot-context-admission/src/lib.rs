@@ -24,6 +24,17 @@
 //! `AdmissionInput::validate_contract` states about it. It re-derives that join
 //! from this cell's own binding and inherits no other cell's verdict. The
 //! #40-frozen `eliot_context::ContextCompiler` decides nothing on this route.
+//!
+//! Issue #1724 W5 adds the approved-revision binding this cell also owns:
+//! [`bind_admission_policy_revision`] resolves the approved reusable
+//! `ContextRecipePolicy` revision a compilation-bound instance was issued under
+//! and returns that revision's own identity. It exists because the
+//! `ContextEconomyReceipt` this crate produces has to name the approved policy
+//! CONTENT rather than the instance's own recorded claim about it, and
+//! `AdmissionInput` carries the instance but not the approved policy — so the
+//! caller that holds the owner catalogue brings the approved content here, and
+//! the resolution is the contract owner's `ContextRecipePolicy::binds_recipe`
+//! rather than a second rule in this crate.
 
 #![forbid(unsafe_code)]
 
@@ -66,9 +77,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use eliot_context_contracts::{
     AdmissionDisposition, AdmissionInput, AdmissionMeasuredCost, AdmissionRecord, AdmissionResult,
     AdmittedAtom, AdmittedContextSet, AtomAvailability, ContextBinding, ContextEconomyReceipt,
-    ContextError, ContextOutcome, DecisionContextIncomplete, DownstreamHeadroomRequest,
-    DownstreamHeadroomResult, EconomyAllocations, HeadroomAllocationLedger, HeadroomDimension,
-    HeadroomRefusal, MeasurementRef, OmissionReason, OmissionRecord, RepresentationKind,
+    ContextError, ContextOutcome, ContextRecipe, ContextRecipePolicy, DecisionContextIncomplete,
+    DownstreamHeadroomRequest, DownstreamHeadroomResult, EconomyAllocations,
+    HeadroomAllocationLedger, HeadroomDimension, HeadroomRefusal, MeasurementRef, OmissionReason,
+    OmissionRecord, RecipePolicyIdentity, RepresentationKind,
 };
 use eliot_receipts::ProofCeiling;
 
@@ -88,6 +100,53 @@ const UNKNOWN_AVAILABILITY_CONSTRAINT: &str =
 pub fn admit_context(input: &AdmissionInput) -> Result<AdmissionResult, ContextError> {
     refuse_ungoverned_learning(input)?;
     admit_context_inner(input)
+}
+
+/// Bind one compilation-bound recipe instance to the approved reusable policy
+/// revision it was issued under, and return that approved revision's identity.
+///
+/// #1724 W5. `ContextEconomyReceipt::policy_sha256` names the approved
+/// reusable policy revision an admission ran under, and the only fact that can
+/// carry it INDEPENDENTLY of the instance is the approved revision's own
+/// recorded content digest. `AdmissionInput` carries the compilation-bound
+/// instance and the four admission-closure identities; it does not carry the
+/// approved policy content, so this cell is where that content resolution is
+/// made — by the caller that holds the owner catalogue — and where the instance
+/// is checked against it. Reading `policy_sha256` off the instance alone (as
+/// `assemble_admitted_set` does, because nothing else is in its input closure)
+/// certifies the instance's own claim about itself, not the approved content.
+///
+/// The resolution is the contract owner's own
+/// [`ContextRecipePolicy::binds_recipe`], not a second comparison written here:
+///
+/// - the approved revision's own `validate` re-derives its `policy_sha256` from
+///   its content in the policy digest domain, so an altered or re-hashed
+///   approved record refuses here instead of reading as a valid revision;
+/// - the instance's own `validate` re-derives its `recipe_sha256`, and its
+///   recorded `DecisionRevision::policy_sha256` is compared with the approved
+///   revision's OWN recorded digest, so an instance issued under a different,
+///   stale or substituted revision is `IdentityConflict`;
+/// - the approved revision may not make itself applicable by dropping a
+///   mandatory role the instance declares, admitting a role the revision does
+///   not configure, or declaring a mandatory role suppressible; those are
+///   `MissingField`/`MissingFloor` from that same owner call.
+///
+/// The returned `policy_sha256` is read from the approved record and never from
+/// the instance: the instance's recorded value is the COMPARED value here, not
+/// the source of the answer. A consumer of this identity therefore resolves the
+/// approved revision from owner content rather than reading the instance's own
+/// claim back to itself, and the same value is what any
+/// `ContextEconomyReceipt` produced for a bound instance must carry.
+pub fn bind_admission_policy_revision(
+    policy: &ContextRecipePolicy,
+    recipe: &ContextRecipe,
+) -> Result<RecipePolicyIdentity, ContextError> {
+    policy.binds_recipe(recipe)?;
+    Ok(RecipePolicyIdentity {
+        policy_id: policy.policy_id.clone(),
+        policy_revision: policy.policy_revision,
+        policy_sha256: policy.policy_sha256.clone(),
+    })
 }
 
 fn refuse_ungoverned_learning(input: &AdmissionInput) -> Result<(), ContextError> {
@@ -1029,14 +1088,31 @@ fn assemble_admitted_set(
         applied_rule: input.rule.rule_id.clone(),
         allocations,
         recipe_digest: input.recipe.recipe_sha256.clone(),
-        // #1724 W5: the approved reusable policy revision this admission ran
-        // under, read unchanged from the instance's own recorded
-        // `DecisionRevision` after `validate_admission_contract` has run that
-        // instance through the contract owner's own `ContextRecipe::validate`.
-        // It is the value `ContextRecipePolicy::binds_recipe` compares with the
-        // approved revision's `policy_sha256`, so the receipt is identifiable
-        // from the approved policy alone and the View can be cross-compared
-        // against this value rather than each record hashing itself.
+        // #1724 W5, measured residual. The approved reusable policy revision
+        // this admission ran under is named here, and it is read from the
+        // instance's own recorded `DecisionRevision::policy_sha256`.
+        //
+        // That is an ECHO, not a content resolution, and it is stated as one
+        // rather than described as a binding. `AdmissionInput` carries the
+        // compilation-bound instance and the four admission-closure identities
+        // (`SafetyFloorIdentity`, `PriorityPolicyIdentity`,
+        // `AdmissionRuleIdentity`, `MeasurementCompositionProfile`) and no
+        // approved `ContextRecipePolicy` content, so there is nothing else in
+        // this function's input closure to resolve the approved revision from.
+        // The independent resolution is
+        // [`bind_admission_policy_revision`], which the caller that holds the
+        // owner catalogue runs against the approved content and which returns
+        // exactly the value the approved revision's own
+        // `ContextRecipePolicy::validate` re-derived from those bytes; the
+        // instance's recorded value is the value that resolution COMPARES
+        // against, not the source of the answer.
+        //
+        // Closing the echo itself needs one contracts decision outside this
+        // crate: `AdmissionInput` must carry the resolved approved revision (or
+        // a caller-supplied binding of this admission to one) so this field can
+        // be written from owner content. Until that exists, this line remains a
+        // self-hash and `ContextEconomyReceipt::validate` cannot tell the two
+        // apart; no local edit may invent the missing field.
         policy_sha256: input.recipe.decision.policy_sha256.clone(),
         receipt_digest: "0".repeat(64),
     };
