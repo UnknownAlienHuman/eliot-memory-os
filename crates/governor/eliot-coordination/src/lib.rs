@@ -41,7 +41,7 @@ pub use peer_communication::{
     BoardAnchor, BoardCompactionPolicy, BoardCompactionReceipt, BoardEntry, BoardEntryReceipt,
     BoardEntrySummary, BoardOmission, BoardPage, BoardTombstone, ConflictCandidate,
     ConflictCandidateDraft, CorrectPeerReviewAnchor, EmbeddedMarker, EmbeddedMarkerDraft,
-    EmbeddedMarkerKind, EnqueuePeerMessage, ExternalResolutionReceipt,
+    EmbeddedMarkerKind, EnqueuePeerMessage, EscalateReviewBlocker, ExternalResolutionReceipt,
     LIVE_PEER_REJECTION_PLAN_MISMATCH, LiveDeltaKind, LivePeerHelpfulnessObservation,
     LivePeerHelpfulnessReceipt, LivePeerObligation, LivePeerObligationKind, LivePeerRejection,
     LivePeerUseObservation, LivePeerUseReceipt, MAX_BOARD_ENTRIES_PER_SCOPE, MAX_BOARD_PAGE_SIZE,
@@ -55,11 +55,13 @@ pub use peer_communication::{
     PeerDurabilityAttestation, PeerDurabilityPort, PeerEndpointLossReport, PeerEnqueueReceipt,
     PeerEnvelopeHeader, PeerMessage, PeerMessageDiagnostic, PeerMessageKind, PeerMessageState,
     PeerReconnectReport, PeerReviewAckReceipt, PeerReviewAdvance, PeerReviewBatch,
-    PeerReviewCorrection, PeerReviewCorrectionReceipt, PeerReviewDenominator, PeerReviewLifecycle,
-    PeerReviewObligation, PeerReviewReceipt, PeerReviewStanding, PeerSafeBoundaryPort,
-    PeerStreamHead, PeerStreamId, PostBoardEntry, PrivacyClass, REQUIRED_PEER_ENVELOPE_FIELDS,
-    RawField, RecordPeerConflict, ReviewCompleteness, ReviewKind, ReviewRecommendation,
+    PeerReviewBatchReceipt, PeerReviewCorrection, PeerReviewCorrectionReceipt,
+    PeerReviewDenominator, PeerReviewLifecycle, PeerReviewObligation, PeerReviewReceipt,
+    PeerReviewStanding, PeerSafeBoundaryPort, PeerStreamHead, PeerStreamId, PostBoardEntry,
+    PrivacyClass, REQUIRED_PEER_ENVELOPE_FIELDS, RawField, RecordPeerConflict,
+    ReviewBlockerEscalationReceipt, ReviewCompleteness, ReviewKind, ReviewRecommendation,
     ReviewTargetKind, ReviseBoardEntry, SubmitPeerReview, decode_peer_envelope, peer_digest_hex,
+    review_is_blocker,
 };
 
 pub use eliot_contracts::{BoardEntryState, PeerBoardKind};
@@ -608,6 +610,13 @@ pub struct CoordinationOwner {
     peer_review_requests: BTreeMap<String, String>,
     #[serde(default)]
     peer_review_expectations: BTreeMap<String, u64>,
+    /// Retained resolver verdicts per review: non-attaching resolution
+    /// statuses recorded without touching the immutable original anchor
+    /// (issue #1823 A2). Only `ambiguous`, `stale`, `deleted` and
+    /// `unavailable` are ever recorded here; attaching verdicts stay with
+    /// the digest-bound derivation and the correction path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    peer_review_resolutions: BTreeMap<String, peer_communication::AnchorResolution>,
     #[serde(default)]
     peer_artifact_heads: BTreeMap<String, peer_communication::PeerArtifactHead>,
     #[serde(default)]
@@ -680,6 +689,17 @@ impl CoordinationOwner {
                     .as_deref()
                     .is_none_or(|reason| reason.trim().is_empty())
         }) {
+            return Err(CoordinationError::InvalidState);
+        }
+        if snapshot
+            .peer_review_resolutions
+            .values()
+            .any(AnchorResolution::satisfies_required_review)
+            || snapshot
+                .peer_review_resolutions
+                .keys()
+                .any(|review_id| !snapshot.peer_reviews.contains_key(review_id))
+        {
             return Err(CoordinationError::InvalidState);
         }
         snapshot.validate_active_bindings()?;
@@ -2089,6 +2109,56 @@ impl CoordinationOwner {
             return Err(CoordinationError::InvalidState);
         }
         self.submit_integration_candidate(draft)
+    }
+
+    /// Submits a retained requested change's effects through the normal
+    /// effect owner (issue #1823 A4; I10.18 anchored review items).
+    ///
+    /// A review never writes: there is deliberately no direct-write
+    /// conversion on this path. Effects flow only through
+    /// [`Self::acquire_integration`] — the same single-writer lease seam
+    /// every other change uses — and only when the retained review is an
+    /// answered `RequestedChange` whose routed candidate already carries
+    /// verifier evidence (`verification_refs` is non-empty). Any other
+    /// review kind, any unanswered or disposed review, and any candidate
+    /// without verifier evidence is refused with a typed
+    /// [`CoordinationError`], so a requested change produces no direct
+    /// write until the normal effect owner accepts (lease claim) and
+    /// verifies it. The review record itself is read, never mutated.
+    /// STITCH (#1823 A4): the future live caller is the session/work-item
+    /// integration driver holding a real [`IntegrationLeaseRequest`] for
+    /// the routed candidate plus admitted verifier evidence; BLOCKED-BY
+    /// that driver (no live lease producer exists). Forbidden: lease
+    /// material built from fabricated or test-only input to manufacture a
+    /// caller.
+    pub fn submit_review_effects(
+        &mut self,
+        review_id: &str,
+        req: IntegrationLeaseRequest,
+    ) -> Result<IntegrationLeaseDecision, CoordinationError> {
+        text(review_id, "review_id")?;
+        let (kind, lifecycle) = self
+            .peer_reviews
+            .get(review_id)
+            .map(|review| (review.kind, review.lifecycle))
+            .ok_or_else(|| CoordinationError::NotFound {
+                kind: "peer_review",
+                id: review_id.to_owned(),
+            })?;
+        if kind != ReviewKind::RequestedChange {
+            return Err(CoordinationError::InvalidState);
+        }
+        if lifecycle != PeerReviewLifecycle::Answered {
+            return Err(CoordinationError::InvalidState);
+        }
+        let verified = self
+            .integration_candidates
+            .get(&req.candidate_id)
+            .is_some_and(|candidate| !candidate.verification_refs.is_empty());
+        if !verified {
+            return Err(CoordinationError::InvalidState);
+        }
+        self.acquire_integration(req)
     }
 
     /// Acquires the single integration writer for a target scope.

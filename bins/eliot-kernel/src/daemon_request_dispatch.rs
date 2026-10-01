@@ -75,10 +75,22 @@ use eliot_store_api::{
 use serde::Deserialize;
 
 use super::admission_reservation_saga::ADMISSION_RESERVATION_ADMIT_OPERATION;
+use super::anchored_review_bridge::{
+    ANCHORED_REVIEW_ACCEPT_OPERATION, ANCHORED_REVIEW_ADVANCE_OPERATION,
+    ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION, ANCHORED_REVIEW_ESCALATE_OPERATION,
+    ANCHORED_REVIEW_OBSERVE_OPERATION, ANCHORED_REVIEW_ROUTE_OPERATION,
+    ANCHORED_REVIEW_SUBMIT_OPERATION,
+};
 use super::generation_control::{
     ACTIVE_GENERATION_REGISTRY_QUERY_OPERATION, ActiveGenerationRegistryProjection,
     ActiveGenerationRegistryQuery, GENERATION_CUTOVER_OPERATION, GenerationCutoverRequest,
 };
+use super::integration_bridge::{
+    BridgeApplyRequest, INTEGRATION_BRIDGE_APPLY_NAME, IntegrationBridgeError,
+    apply_integration_candidate,
+};
+use super::integration_candidate::IntegrationCandidate;
+use super::integration_lease::{IntegrationLeaseError, IntegrationOwnerLease};
 
 /// Governor's existing authenticated publish operation. The semantic
 /// `EliotdStartupEvidence` carrier remains bin-owned; Kernel consumes its
@@ -639,6 +651,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         STORAGE_REPLACEMENT_RESUME_OPERATION => STORAGE_REPLACEMENT_RESUME_OPERATION,
         STORAGE_REPLACEMENT_ROLLBACK_OPERATION => STORAGE_REPLACEMENT_ROLLBACK_OPERATION,
         MAINTENANCE_TRIGGER_INTAKE_OPERATION => MAINTENANCE_TRIGGER_INTAKE_OPERATION,
+        INTEGRATION_BRIDGE_APPLY_NAME => INTEGRATION_BRIDGE_APPLY_NAME,
         DAEMON_STARTUP_EVIDENCE_OPERATION => DAEMON_STARTUP_EVIDENCE_OPERATION,
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
@@ -649,6 +662,17 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "store_named" => "store_named",
         NOTIFICATION_STATE_MUTATION_OPERATION => NOTIFICATION_STATE_MUTATION_OPERATION,
         NOTIFICATION_STATE_READ_OPERATION => NOTIFICATION_STATE_READ_OPERATION,
+        // Issue #1823 (I10.18/I10.21): the anchored-review Store-bridge legs.
+        // Each marker is the slice-A stable name the bridge registered, so the
+        // admitted transport vocabulary and the Kernel surface are the same
+        // strings and cannot drift apart.
+        ANCHORED_REVIEW_SUBMIT_OPERATION => ANCHORED_REVIEW_SUBMIT_OPERATION,
+        ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION => ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION,
+        ANCHORED_REVIEW_OBSERVE_OPERATION => ANCHORED_REVIEW_OBSERVE_OPERATION,
+        ANCHORED_REVIEW_ADVANCE_OPERATION => ANCHORED_REVIEW_ADVANCE_OPERATION,
+        ANCHORED_REVIEW_ROUTE_OPERATION => ANCHORED_REVIEW_ROUTE_OPERATION,
+        ANCHORED_REVIEW_ACCEPT_OPERATION => ANCHORED_REVIEW_ACCEPT_OPERATION,
+        ANCHORED_REVIEW_ESCALATE_OPERATION => ANCHORED_REVIEW_ESCALATE_OPERATION,
         // Issue #1678 W3/W5 (REQ4, REQ6, A3, A4): the admitted daemon-channel
         // coordinator that drives the canonical `ADMITTED` readback, its
         // launch-outbox intent proof, and the one activation of the exact
@@ -666,6 +690,14 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         AGENT_ACTIVATION_V1_IMPORT_OPERATION => AGENT_ACTIVATION_V1_IMPORT_OPERATION,
         "local_read_claim" => "local_read_claim",
         "local_read_result" => "local_read_result",
+        // Issue #2564: the owner-backed `eliot.state` result travels under its
+        // OWN operation so the Kernel can bind it to the State carrier form.
+        // Reusing `local_read_result` here would let a state result complete a
+        // query claim, which is the capability confusion the form binding on
+        // the carrier exists to prevent. The claim needs its own name for the
+        // same reason: a state claim must not be metered as a query claim.
+        "local_state_claim" => "local_state_claim",
+        "local_state_result" => "local_state_result",
         "semantic_observe_claim" => "semantic_observe_claim",
         "semantic_observe_result" => "semantic_observe_result",
         "semantic_observe_deferred" => "semantic_observe_deferred",
@@ -2049,7 +2081,36 @@ struct UserAutomationOperatorRoute {
     operation: String,
     /// Front-door-authenticated request identity copied by the frame router.
     request_identity: RequestIdentity,
+    /// Independent fence witness acquired through a fresh `get_context` read.
+    /// Omitted only for that read-only handshake operation.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_user_automation_expected_state_fence"
+    )]
+    expected_state_fence: UserAutomationExpectedStateFence,
     payload: UserAutomationOperatorIntent,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+enum UserAutomationExpectedStateFence {
+    #[default]
+    Missing,
+    Null,
+    Witness(StateFence),
+}
+
+#[cfg(windows)]
+fn deserialize_user_automation_expected_state_fence<'de, D>(
+    deserializer: D,
+) -> Result<UserAutomationExpectedStateFence, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<StateFence>::deserialize(deserializer).map(|witness| match witness {
+        Some(witness) => UserAutomationExpectedStateFence::Witness(witness),
+        None => UserAutomationExpectedStateFence::Null,
+    })
 }
 
 #[cfg(windows)]
@@ -2910,6 +2971,130 @@ impl KernelComposition {
     }
 }
 
+/// Closed bridge-apply envelope for one `ApplyIntegrationCandidateBridge`
+/// daemon request (issue #1818 W3).
+///
+/// The daemon caller presents the exact views it read back through its Store
+/// bridge (`candidates`, `active_leases`) plus the typed bridge input whose
+/// live sets it proved against the live target. The transport routing key is
+/// already stripped by [`without_daemon_routing_key`], so this carrier
+/// declares only application data.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationBridgeApplyEnvelope {
+    candidates: Vec<IntegrationCandidate>,
+    active_leases: Vec<IntegrationOwnerLease>,
+    request: BridgeApplyRequest,
+}
+
+/// The ONE stable diagnostic code for one refused bridge apply. A code is
+/// present only when the bridge refused; success carries `None` beside the
+/// transitioned candidate and its `OutcomeReceipt`.
+fn integration_bridge_apply_terminal_code(error: &IntegrationBridgeError) -> &'static str {
+    match error {
+        IntegrationBridgeError::InvalidField { .. } => "BRIDGE_APPLY_REJECTED",
+        IntegrationBridgeError::Candidate(_) => "BRIDGE_CANDIDATE_REFUSED",
+        IntegrationBridgeError::Lease(error) => match error.as_ref() {
+            IntegrationLeaseError::StaleMarked { .. } => "BRIDGE_CANDIDATE_STALE",
+            IntegrationLeaseError::LeaseHeld { .. } => "BRIDGE_LEASE_HELD",
+            _ => "BRIDGE_LEASE_REFUSED",
+        },
+        IntegrationBridgeError::LeaseMismatch { .. } => "BRIDGE_LEASE_MISMATCH",
+        IntegrationBridgeError::EnvironmentMismatch { .. } => "BRIDGE_ENVIRONMENT_MISMATCH",
+        IntegrationBridgeError::VerifierFailed { .. } => "BRIDGE_VERIFIER_FAILED",
+        IntegrationBridgeError::ApplyScopeMismatch => "BRIDGE_SCOPE_MISMATCH",
+        IntegrationBridgeError::DirtyHumanChanges { .. } => "BRIDGE_DIRTY_OVERLAP",
+        IntegrationBridgeError::RollbackMissing { .. } => "BRIDGE_ROLLBACK_MISSING",
+    }
+}
+
+/// Answers one bridge apply in the closed envelope every other arm on this
+/// channel uses. A refused apply carries its terminal code and the typed
+/// refusal; a pre-apply verifier failure additionally carries the
+/// `OutcomeReceipt` that records the failure while the candidate and its
+/// history stay intact. Nothing is applied on any refusal path.
+fn integration_bridge_apply_answer(
+    terminal_code: Option<&'static str>,
+    body: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": "known",
+        "value": {
+            "terminal_code": terminal_code,
+            "bridge": body,
+        },
+        "recovery": null,
+    })
+}
+
+/// Answers one refused bridge apply. The refusal echoes only what the caller
+/// presented (identities, paths, handles) plus, on the pre-apply verifier
+/// failure, the receipt that records the failure and any
+/// rollback/compensation result.
+fn integration_bridge_apply_refusal(
+    error: &IntegrationBridgeError,
+) -> Result<serde_json::Value, TransportError> {
+    let receipt = match error {
+        IntegrationBridgeError::VerifierFailed { receipt } => Some(
+            serde_json::to_value(receipt.as_ref()).map_err(|_| TransportError::SessionFenced)?,
+        ),
+        _ => None,
+    };
+    Ok(integration_bridge_apply_answer(
+        Some(integration_bridge_apply_terminal_code(error)),
+        &serde_json::json!({
+            "reason": error.to_string(),
+            "receipt": receipt,
+        }),
+    ))
+}
+
+impl KernelComposition {
+    /// Drives one governed bridge apply for the presenting daemon caller
+    /// (issue #1818 W3).
+    ///
+    /// The production caller of [`apply_integration_candidate`]: it decodes
+    /// the caller-read-back views plus the typed bridge input and routes them
+    /// through the existing owner path (W1 read, W2 lease acquire first —
+    /// refuse-before-apply). The I10.16 order holds inside the bridge: the
+    /// declared verifier runs bound to the candidate environment before
+    /// apply, the write set must equal the candidate manifest, the post-apply
+    /// verifier is recorded in the `OutcomeReceipt`, and a failure carries
+    /// its executed rollback/compensation evidence while the
+    /// candidate/history stays intact. A malformed envelope is fenced at the
+    /// transport; every typed bridge refusal is answered, so the caller keeps
+    /// its retry identity and persists nothing on refusal. Persisting the
+    /// returned transitioned candidate and receipt stays with the Store
+    /// bridge slice.
+    fn integration_bridge_apply_operation(
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let envelope: IntegrationBridgeApplyEnvelope =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        match apply_integration_candidate(
+            &envelope.candidates,
+            &envelope.active_leases,
+            &envelope.request,
+        ) {
+            Ok(success) => {
+                let candidate = serde_json::to_value(&success.candidate)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                let receipt = serde_json::to_value(&success.receipt)
+                    .map_err(|_| TransportError::SessionFenced)?;
+                Ok(integration_bridge_apply_answer(
+                    None,
+                    &serde_json::json!({
+                        "candidate": candidate,
+                        "receipt": receipt,
+                    }),
+                ))
+            }
+            Err(error) => integration_bridge_apply_refusal(&error),
+        }
+    }
+}
+
 impl KernelComposition {
     /// Executes one authenticated daemon lifecycle request.  Only the
     /// narrow handshake/health dispositions are handled here; semantic
@@ -3372,6 +3557,56 @@ impl KernelComposition {
             NOTIFICATION_STATE_READ_OPERATION => {
                 Box::pin(self.notification_state_read_operation(session, payload.clone())).await
             }
+            // Issue #1823 (I10.18/I10.21): the anchored-review Store-bridge
+            // legs. Each arm admits exactly one registered slice-A name,
+            // proves the live session fence, and routes to the one
+            // Kernel-mechanical entry point that name owns; the computed
+            // record or row returns for the existing coordination Store
+            // owner to persist. No arm mints identity, stores rows, or
+            // reaches any other operation: unrelated traffic still falls
+            // through to the typed refusal below.
+            ANCHORED_REVIEW_SUBMIT_OPERATION => {
+                anchored_review_bridge::anchored_review_submit_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_BATCH_SUBMIT_OPERATION => {
+                anchored_review_bridge::anchored_review_batch_submit_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_OBSERVE_OPERATION => {
+                anchored_review_bridge::anchored_review_observe_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_ADVANCE_OPERATION => {
+                anchored_review_bridge::anchored_review_advance_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_ROUTE_OPERATION => {
+                anchored_review_bridge::anchored_review_route_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_ACCEPT_OPERATION => {
+                anchored_review_bridge::anchored_review_accept_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
+            ANCHORED_REVIEW_ESCALATE_OPERATION => {
+                anchored_review_bridge::anchored_review_escalate_operation(
+                    &session.module_generation.state_fence,
+                    payload.clone(),
+                )
+            }
             // Issue #1678 W3/W5/REQ4/REQ6/A3/A4/A7: the admit + activate leg of
             // the normative admission-reservation saga. The arm never mints an
             // admission: it reads the canonical owner's OWN committed
@@ -3664,15 +3899,64 @@ impl KernelComposition {
                 // claimed pair carries the Kernel-minted fenced attempt
                 // capability the daemon must present back on the read leg and
                 // the submit leg; no time lease is involved.
+                //
+                // #2564: the answer also carries the retained carrier FORM.
+                // This arm admits only the `query` form, so `form` is `query`
+                // here by construction; a State pair is claimed on
+                // `local_state_claim` and never appears in this answer.
                 #[cfg(windows)]
                 {
                     if payload.as_object().is_none_or(|object| object.len() != 1) {
                         return Err(TransportError::SessionFenced);
                     }
                     self.claim_local_read_pair(session).map(|pair| match pair {
-                        Some((envelope, tool, attempt)) => serde_json::json!({
+                        Some(read) => serde_json::json!({
                             "status": "known",
-                            "value": { "pair": { "envelope": envelope, "tool": tool, "attempt": attempt } },
+                            "value": { "pair": {
+                                "form": read.form.as_str(),
+                                "envelope": read.envelope,
+                                "tool": read.tool,
+                                "attempt": read.attempt,
+                            } },
+                            "recovery": null,
+                        }),
+                        None => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": null },
+                            "recovery": null,
+                        }),
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            "local_state_claim" => {
+                // #2564: the closed State poller entry for retained
+                // `eliot.state` pairs. Same session/auth/ready/fence gates, same
+                // single-`operation`-key payload shape and same null poll as
+                // `local_read_claim`, but a SEPARATE claim over the State form
+                // of the same bounded carrier: a query or Skill pair is not
+                // claimable here and a State pair is not claimable on the query
+                // claim. The answer carries the same four fields — `form` (here
+                // always `state`), the exact admitted envelope, the exact
+                // retained tool bytes, and the Kernel-minted fenced attempt.
+                #[cfg(windows)]
+                {
+                    if payload.as_object().is_none_or(|object| object.len() != 1) {
+                        return Err(TransportError::SessionFenced);
+                    }
+                    self.claim_local_state_pair(session).map(|pair| match pair {
+                        Some(read) => serde_json::json!({
+                            "status": "known",
+                            "value": { "pair": {
+                                "form": read.form.as_str(),
+                                "envelope": read.envelope,
+                                "tool": read.tool,
+                                "attempt": read.attempt,
+                            } },
                             "recovery": null,
                         }),
                         None => serde_json::json!({
@@ -3721,6 +4005,41 @@ impl KernelComposition {
                             // possible work stays `unknown` in the diagnostic
                             // stream alongside the folded expired response.
                             // Observation only.
+                            observe_daemon_request("kernel.daemon_response_unknown", "unknown");
+                            Ok(Self::expired_activation_daemon_response())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = payload;
+                    Err(TransportError::SessionFenced)
+                }
+            }
+            // Issue #2564: the owner-backed `eliot.state` result. Deliberately a
+            // separate arm from `local_read_result` so the submitted result is bound
+            // to the STATE carrier form. A state result arriving on the query arm (or
+            // a query result on this one) is refused by the carrier form check inside
+            // `submit_local_state_result`, which is what keeps the two lanes from
+            // completing each other's claims.
+            "local_state_result" => {
+                #[cfg(windows)]
+                {
+                    let result_value = payload
+                        .get("result")
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?;
+                    let body: HostRequestResultBody = serde_json::from_value(result_value)
+                        .map_err(|_| TransportError::SessionFenced)?;
+                    match self.submit_local_state_result(session, &body) {
+                        Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
+                            Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
+                            observation,
+                        )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Err(TransportError::Timeout) => {
                             observe_daemon_request("kernel.daemon_response_unknown", "unknown");
                             Ok(Self::expired_activation_daemon_response())
                         }
@@ -4721,6 +5040,19 @@ impl KernelComposition {
             "bind_operator_session_token" => {
                 self.operator_session_token_operation(session, payload.clone())
             }
+            // Issue #1818 W3: the governed bridge-apply ingress. The arm is
+            // the production caller of the Kernel-mechanical bridge: it
+            // routes the caller-read-back views plus the typed bridge input
+            // through the existing owner path (W1 read, W2 lease first), so
+            // every lease, verifier, scope, dirty-overlap, or rollback
+            // refusal answers typed with nothing applied. The arm is
+            // recognized here and unreachable from the front door until
+            // `frame_dispatch::is_daemon_operation` lists the marker (same
+            // caveat as the resume arm above); persisting the returned
+            // records stays with the Store bridge slice.
+            INTEGRATION_BRIDGE_APPLY_NAME => {
+                Self::integration_bridge_apply_operation(payload.clone())
+            }
             _ => return Err(TransportError::SessionFenced),
         };
         // Typed refusal propagation (`#1110`): the arm already decided the
@@ -5601,7 +5933,8 @@ impl KernelComposition {
         request_id: RequestId,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        let request = Self::build_user_automation_operator_request(session, &request_id, payload)?;
+        let (request, expected_state_fence) =
+            Self::build_user_automation_operator_request(session, &request_id, payload)?;
         match eliot_kernel_service::KernelStoreGateway::validate_user_automation_request(&request) {
             Ok(()) => {}
             Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
@@ -5620,6 +5953,52 @@ impl KernelComposition {
                     ),
                 );
             }
+        }
+        let is_context = matches!(
+            &request.intent.operation,
+            eliot_kernel_core::UserAutomationOperation::GetContext
+        );
+        if is_context {
+            if !matches!(
+                &expected_state_fence,
+                UserAutomationExpectedStateFence::Missing
+            ) {
+                return Err(TransportError::SessionFenced);
+            }
+            let envelope =
+                eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_context(&request)
+                    .map_err(|_| TransportError::SessionFenced)?;
+            return serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced);
+        }
+        if !matches!(
+            &expected_state_fence,
+            UserAutomationExpectedStateFence::Witness(witness)
+                if witness == &session.module_generation.state_fence
+        ) {
+            return Self::bind_user_automation_operator_response(
+                &request,
+                &Self::user_automation_state_fence_mismatch_response(&request),
+            );
+        }
+        if matches!(
+            &request.intent.operation,
+            eliot_kernel_core::UserAutomationOperation::NormalizeSchedule { .. }
+                | eliot_kernel_core::UserAutomationOperation::MigrateLegacySchedule { .. }
+        ) {
+            let Ok(gateway) = self.retained_store_gateway() else {
+                return Self::bind_user_automation_operator_response(
+                    &request,
+                    &Self::user_automation_runtime_error_response(
+                        UserAutomationRuntimeError::Unavailable(
+                            "canonical UserAutomation Store owner is unavailable".to_owned(),
+                        ),
+                    ),
+                );
+            };
+            return Box::pin(Self::user_automation_normalization_response(
+                &gateway, &request,
+            ))
+            .await;
         }
         let transition = match self
             .dispatch_user_automation_operator_transition(session, &request)
@@ -5659,6 +6038,41 @@ impl KernelComposition {
                 ),
             );
         };
+        serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
+    }
+
+    #[cfg(windows)]
+    async fn user_automation_normalization_response(
+        gateway: &eliot_kernel_service::KernelStoreGateway,
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+    ) -> Result<serde_json::Value, TransportError> {
+        let (original_request, revision, normalization_receipt_envelope) =
+            match Box::pin(gateway.normalize_user_automation_schedule(request)).await {
+                Ok(result) => result,
+                Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
+                    return Self::bind_user_automation_operator_response(
+                        request,
+                        &Self::user_automation_precommit_refusal_response(request, &error),
+                    );
+                }
+                Err(_) => {
+                    return Self::bind_user_automation_operator_response(
+                        request,
+                        &Self::user_automation_runtime_error_response(
+                            UserAutomationRuntimeError::UnknownOutcome(
+                                "user_automation_normalization_result_unavailable".to_owned(),
+                            ),
+                        ),
+                    );
+                }
+            };
+        let envelope =
+            eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_normalized_schedule(
+                &original_request,
+                revision,
+                normalization_receipt_envelope,
+            )
+            .map_err(|_| TransportError::SessionFenced)?;
         serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced)
     }
 
@@ -6091,7 +6505,13 @@ impl KernelComposition {
         session: &Session,
         request_id: &RequestId,
         payload: &serde_json::Value,
-    ) -> Result<eliot_kernel_service::UserAutomationServiceRequest, TransportError> {
+    ) -> Result<
+        (
+            eliot_kernel_service::UserAutomationServiceRequest,
+            UserAutomationExpectedStateFence,
+        ),
+        TransportError,
+    > {
         let route: UserAutomationOperatorRoute =
             serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
         if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
@@ -6134,7 +6554,7 @@ impl KernelComposition {
         // that could not bind the session principal has no honest way to
         // complete the selection at all.
         if matches!(
-            route.payload.operation,
+            &route.payload.operation,
             eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
         ) {
             return Err(TransportError::SessionFenced);
@@ -6151,15 +6571,43 @@ impl KernelComposition {
             state_fence: session.module_generation.state_fence.clone(),
             operation: route.payload.operation,
         };
-        Ok(eliot_kernel_service::UserAutomationServiceRequest {
-            context: identity.request.metadata.clone(),
-            authenticated_principal: principal,
-            identity: OperationIdentity {
-                operation_id,
-                idempotency_key: route.payload.idempotency_key,
-                canonical_request_hash: String::new(),
+        Ok((
+            eliot_kernel_service::UserAutomationServiceRequest {
+                context: identity.request.metadata.clone(),
+                authenticated_principal: principal,
+                identity: OperationIdentity {
+                    operation_id,
+                    idempotency_key: route.payload.idempotency_key,
+                    canonical_request_hash: String::new(),
+                },
+                intent,
             },
-            intent,
+            route.expected_state_fence,
+        ))
+    }
+
+    #[cfg(windows)]
+    fn user_automation_state_fence_mismatch_response(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "unknown",
+            "value": {
+                "kind": "user_automation_refusal",
+                "schema_version": 1,
+                "operation": {
+                    "operation_id": request.identity.operation_id.as_str(),
+                    "request_id": &request.context.request_id,
+                    "idempotency_key": request.identity.idempotency_key.as_str(),
+                },
+                "state_fence": &request.context.state_fence,
+                "attempt_state": "store_not_called",
+                "refusal": {"code": "state_fence_mismatch"},
+            },
+            "recovery": {
+                "kind": "unknown_outcome",
+                "reason": "state_fence_mismatch_store_not_called",
+            },
         })
     }
 
@@ -10038,7 +10486,17 @@ impl KernelComposition {
         // capability equality proves every echoed field is exactly what the
         // Kernel minted for this envelope; a substituted echo fails closed.
         let operation_id = host_request_operation_id(&envelope);
-        let live = self.live_local_read_attempt(&operation_id, &envelope.envelope_sha256)?;
+        // This leg is the query-only Gateway path: the admission match above
+        // already refused every non-query form, so the carrier form here is
+        // `Query` by construction rather than by a caller-supplied label. The
+        // claim gate therefore looks up the QUERY slot specifically — a State
+        // pair retained on the same carrier is not claimable here, which is
+        // what keeps the two lanes from completing each other's attempts.
+        let live = self.live_local_read_attempt(
+            &operation_id,
+            &envelope.envelope_sha256,
+            host_request_route::LocalReadPairKind::Query,
+        )?;
         let current = match live {
             Some(state)
                 if state.attempt_id == attempt.attempt_id
@@ -11931,6 +12389,9 @@ fn user_automation_runtime_handoff_need(
         | eliot_kernel_core::UserAutomationOperation::Status { .. }
         | eliot_kernel_core::UserAutomationOperation::History { .. }
         | eliot_kernel_core::UserAutomationOperation::InspectLastFailure { .. }
+        | eliot_kernel_core::UserAutomationOperation::GetContext
+        | eliot_kernel_core::UserAutomationOperation::NormalizeSchedule { .. }
+        | eliot_kernel_core::UserAutomationOperation::MigrateLegacySchedule { .. }
         | eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. } => {
             UserAutomationRuntimeHandoffNeed::None
         }

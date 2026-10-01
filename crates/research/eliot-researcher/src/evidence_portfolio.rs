@@ -7317,6 +7317,17 @@ pub fn audit_claim(
     // a silent skip. The four-argument form is kept as the surface that does
     // *not* have a governed source-admission/persistence owner in hand, and
     // `audit_claim_with_excerpts` is the entry point that takes one.
+    //
+    // A claim reaching this entry point can therefore never come out
+    // `Supported`: its `excerpt_supports_requirement` obligation is
+    // `Unsatisfied` either because it offered no exact excerpt or because no
+    // retained revision was supplied to check the one it did, and
+    // `releasable_as_supported` reads that obligation directly. What the empty
+    // map does *not* do is decide the terminal class on its own — the excerpt
+    // finding is reported after the support-gap and stale findings, so a claim
+    // that is also missing a whole cited source still reports that as the more
+    // specific reason. This is the fail-closed direction: it refuses to release,
+    // it does not misreport why.
     audit_claim_with_retained(claim, portfolio, binding, now_ms, &BTreeMap::new())
 }
 
@@ -7639,13 +7650,19 @@ fn audit_claim_with_retained(
     // all.
     let excerpt_obligation =
         crate::admitted_excerpt::excerpt_requirement_from_checks(&excerpt_checks);
-    // Any excerpt that did not verify is a support gap, and the fail-closed
-    // arm is what turns it into a terminal class. `Unknown` (every excerpt
-    // verified for occurrence and context, semantic sufficiency still
-    // unexamined) is deliberately NOT a gap here: it is already carried by
-    // `requirements`, and it blocks a `Supported` promotion through
-    // `requirements_complete` and `releasable_as_supported` rather than by
-    // flattening the terminal class. Making it a gap as well would turn the
+    // Any excerpt that did not verify is a gap, and the fail-closed arm below
+    // is what turns it into a terminal class. This flag means exactly one
+    // thing: the excerpt obligation came back `Unsatisfied`. It is recorded
+    // independently of the support gaps — `support_gap` is derived from the
+    // dispositions of whole cited sources, and a claim can fail either without
+    // the other — so the two are separate findings and the terminal chain
+    // reports the more specific one first.
+    //
+    // `Unknown` (every excerpt verified for occurrence and context, semantic
+    // sufficiency still unexamined) is deliberately NOT a gap here: it is
+    // already carried by `requirements`, and it blocks a `Supported` promotion
+    // through `requirements_complete` and `releasable_as_supported` rather than
+    // by flattening the terminal class. Making it a gap as well would turn the
     // honest "occurrence verified, semantics unknown" state into a claim about
     // the evidence that the audit did not measure.
     let excerpt_gap = excerpt_obligation.outcome == RequirementOutcome::Unsatisfied;
@@ -7682,19 +7699,6 @@ fn audit_claim_with_retained(
         ClaimOutcome::Contradicted
     } else if !unverifiable.is_empty() {
         ClaimOutcome::NotVerifiableInScope
-    } else if excerpt_gap {
-        // The cited source satisfies the requirement, but the exact words the
-        // claim quotes do not verify against the admitted revision — they are
-        // absent, cropped of a governing negation, stitched across sections, or
-        // were never compared with the original because no retained revision was
-        // supplied. I21.8's `excerpt_supports_requirement` is the separate
-        // obligation that catches exactly this, and an admitted source containing
-        // relevant material with an insufficient or wrong excerpt must not yield
-        // a supported claim. This sits after the support-gap arms so a claim that
-        // is *also* missing a whole source still reports the missing source as
-        // the more specific finding; it sits before the `stale_hit` arm so a
-        // stale source is not reported when the quote is additionally wrong.
-        ClaimOutcome::PartiallySupported
     } else if lineage_gap || precision_gap || support_gap {
         if stale_hit && supporting.is_empty() {
             ClaimOutcome::StaleLimited
@@ -7705,6 +7709,30 @@ fn audit_claim_with_retained(
         }
     } else if stale_hit {
         ClaimOutcome::StaleLimited
+    } else if excerpt_gap {
+        // The cited source satisfies the requirement, but the exact words the
+        // claim quotes do not verify against the admitted revision — they are
+        // absent, cropped of a governing negation, stitched across sections, or
+        // were never compared with the original because no retained revision was
+        // supplied. I21.8's `excerpt_supports_requirement` is the separate
+        // obligation that catches exactly this, and an admitted source containing
+        // relevant material with an insufficient or wrong excerpt must not yield
+        // a supported claim. It sits after the support-gap and stale arms so a
+        // claim that is *also* missing a whole cited source, or carrying a stale
+        // one, still reports that as the more specific finding rather than this
+        // one.
+        //
+        // It is placed there by this change rather than above the support-gap
+        // arms as it was: read in that position it reported a quote failure for
+        // a claim whose excerpts were never the thing being audited, replacing a
+        // more specific finding (a citation outside the claim's domain, a claim
+        // recording no citations at all) with the weaker one. The flag itself is
+        // unchanged and still means exactly what it says — the excerpt
+        // obligation was `Unsatisfied` — so `requirements`,
+        // `requirement_outcome` and `releasable_as_supported` read the same
+        // value they did before; only which terminal class names it changed, and
+        // only for a claim that fails some other obligation too.
+        ClaimOutcome::PartiallySupported
     } else if !unknowns.is_empty()
         || unfrozen_material_claim
         || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())

@@ -254,6 +254,18 @@ const BRIDGE_EVENT_ADAPTER_VERSION: &str = "eliot.bridge-event.kernel-ingest.v1"
 /// against the constant this module really enforces rather than a second copy.
 pub(super) const MAX_QUEUED_LOCAL_READS: usize = 64;
 
+/// Closed capability of the bounded evidence-query carrier form.
+///
+/// Shared by the carrier form tag ([`LocalReadPairKind`]) and the query
+/// selector derivation so one admitted identity cannot drift into two.
+const LOCAL_READ_QUERY_CAPABILITY: &str = "eliot.query";
+
+/// Closed capability of the bounded local-state carrier form (issue #2564).
+///
+/// A separate constant from the query capability because the two are different
+/// admitted shapes with different serving owners, not two names for one read.
+const LOCAL_READ_STATE_CAPABILITY: &str = "eliot.state";
+
 /// Measures the exact retained bytes of one local-read admission.
 ///
 /// I12.14 requires the request-byte bound to be checked *before* expensive
@@ -365,9 +377,24 @@ pub(crate) struct HostRequestOperationRef {
     /// owner-safe release returns what was actually charged rather than a
     /// fresh measurement that could differ.
     pub(crate) local_read_held_bytes: u64,
-    /// Governed attempt ownership for an admitted query or Skill lifecycle
-    /// pair. This queue is never used for campaign packets.
+    /// Governed attempt ownership for an admitted query, Skill lifecycle, or
+    /// local-state pair (issue #2564 adds the state form to this carrier).
+    /// This queue is never used for campaign packets.
     pub(crate) local_read_attempt: LocalReadAttemptState,
+    /// Which bounded read form this carrier slot actually retained (issue
+    /// #2564). `Some(Query)` marks the historical query/Skill form, which is
+    /// served from the exact retained bytes through the bounded
+    /// `GetEvidencePack` read port. `Some(State)` marks the owner-backed
+    /// `eliot.state` form: the daemon must NOT answer it out of the query path,
+    /// because a State answer is a bounded task/scope/attention/health
+    /// projection, not an evidence-pack selector match. `None` on an unoccupied
+    /// slot is never served.
+    ///
+    /// This is the discriminator that keeps the two lanes from confusing each
+    /// other in either direction: the query claim gate refuses a State form and
+    /// the State claim gate refuses a query/Skill form, so neither attempt can
+    /// be completed by the other's result.
+    pub(crate) local_read_pair_kind: Option<LocalReadPairKind>,
     /// Queued observe pair for the daemon observe poller (issue #2565). Set
     /// only for admitted `eliot.observe` invocations whose tool bytes proved
     /// linkage: the exact envelope plus the exact retained tool bytes the
@@ -434,6 +461,128 @@ pub(crate) struct LocalReadAttemptState {
     pub(crate) owner_connection_id: String,
     pub(crate) owner_launch_nonce: String,
     pub(crate) owner_session_epoch: u64,
+}
+
+/// Closed form tag for one retained bounded-read carrier pair (issue #2564).
+///
+/// A carrier slot is a BOUNDED READ, not one capability: the query/Skill form
+/// and the local-state form are different admitted shapes with different
+/// serving owners. The tag is written together with the pair's retained
+/// envelope, tool bytes, identity and byte charge, so a slot can never be read
+/// as a form it was not admitted as, and neither form can be served by the
+/// other's path.
+///
+/// - [`Self::Query`] is the historical bounded evidence read. It is served from
+///   the exact retained bytes through the bounded `GetEvidencePack` read port
+///   with its exact subject/mode selectors.
+/// - [`Self::State`] is the owner-backed `eliot.state` projection. It carries
+///   no evidence selector and has no evidence-pack answer: the daemon must
+///   produce it from the state owners (task/scope/selection/attention plus the
+///   independent Kernel health and session facts) and must leave it visibly
+///   unresolved when a fact is unavailable — never empty, never successful
+///   without an owner-backed answer.
+///
+/// The tag is an admission-derived discriminator, never a caller-declared
+/// string: it is minted from the closed capability the admission gate already
+/// validated, so a hidden method invoked by name faces the same gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalReadPairKind {
+    /// The bounded evidence-query / Skill lifecycle form.
+    Query,
+    /// The bounded owner-backed `eliot.state` form (issue #2564).
+    State,
+}
+
+impl LocalReadPairKind {
+    /// Returns the carrier form admitted by one validated local-read
+    /// admission.
+    ///
+    /// The campaign packet is deliberately absent: it has its own queue marker
+    /// (`campaign_packet_*`) and never occupies a bounded-read carrier slot, so
+    /// a packet can never be tagged as either bounded read form.
+    pub(crate) const fn of_admission(admission: &LocalReadAdmission) -> Option<Self> {
+        match admission {
+            LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => Some(Self::Query),
+            LocalReadAdmission::CampaignPacket { .. } => None,
+        }
+    }
+
+    /// Stable carrier-form code for audit evidence.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::State => "state",
+        }
+    }
+}
+
+/// One claimed bounded read, with the carrier form it was admitted as
+/// (issue #2564).
+///
+/// This is THE SHAPE the daemon receives. Every field is either derived from
+/// the admitted envelope or minted by the Kernel claim record — none is
+/// caller-supplied, and none is a placeholder for an owner fact the Kernel
+/// does not own.
+///
+/// - [`Self::form`] is the discriminator. [`LocalReadPairKind::Query`] is
+///   answered from the exact retained bytes through the bounded evidence read
+///   port; [`LocalReadPairKind::State`] must NOT be: a State answer is an
+///   owner-backed task/scope/attention/health projection and has no
+///   evidence-pack selector, so serving it from the query path would be a
+///   capability confusion rather than a wiring result.
+/// - [`Self::envelope`] carries the exact admitted
+///   [`HostRequestEnvelope`]: authenticated principal/session binding
+///   (`identity`), the permitted `work_scope_id`, the `task_id` when one is
+///   selected (and its ABSENCE when the caller is doing authenticated
+///   no-task discovery — that absence is meaningful, not a failure), the
+///   current [`StateFence`](eliot_contracts::StateFence) (authority epoch,
+///   resource generation, task revision), and the absolute
+///   `deadline_unix_ms` after which the attempt can never complete.
+/// - [`Self::tool`] carries the exact retained canonical tool bytes, so the
+///   daemon reads the same `include` projection list the Kernel admitted and
+///   never re-parses caller intent.
+/// - [`Self::attempt`] is the Kernel-minted fenced capability: operation
+///   handle, boot-unique attempt identity, fencing generation, admitted
+///   session, authority epoch, trusted scope, the admitted facet method, the
+///   absolute expiry, and the single-use budget. It must be presented verbatim
+///   on the State submit leg; only this exact (attempt, generation, owner)
+///   triple may complete the operation.
+///
+/// The daemon is allowed to READ all of it and is allowed to WRITE only the
+/// result body it submits back on the submit leg. It must not restate, widen,
+/// or reinterpret any identity here, and it must not fabricate a fact: a
+/// State preview whose owner facts are partial or unavailable stays visibly
+/// unresolved rather than empty or successful.
+pub(crate) struct RetainedBoundedRead {
+    /// The admitted carrier form, minted at retention and re-derived at claim.
+    pub(crate) form: LocalReadPairKind,
+    /// The exact admitted envelope (identity, scope, task-or-no-task, fence,
+    /// absolute deadline).
+    pub(crate) envelope: HostRequestEnvelope,
+    /// The exact retained canonical tool bytes (the `include` projection list).
+    pub(crate) tool: serde_json::Value,
+    /// The Kernel-minted fenced attempt capability for this generation.
+    pub(crate) attempt: eliot_protocol::LocalReadAttempt,
+}
+
+/// Which bounded-read carrier admission accepted one linked pair (issue
+/// #2564).
+///
+/// This is the single resolved answer the enqueue gate works from, so the form
+/// tag written on the carrier, the repeat gate it runs, and the returned
+/// disposition can never disagree about which shape was admitted.
+enum LocalReadCarrierAdmission {
+    /// The bounded evidence-query / Skill lifecycle form, carrying the exact
+    /// accepted admission so the I7.24 repeat gate can rebuild the same
+    /// admission-derived call request.
+    Query(LocalReadAdmission),
+    /// The owner-backed `eliot.state` form. It has no campaign-derived call
+    /// class and no caller intent block, so it carries no repeat identity: a
+    /// repeated `eliot.state` call is a new bounded read of the same owner
+    /// facts, bounded by the same slot and byte ledgers, not an I7.24 loop
+    /// signal. Re-asking for state is how a caller observes movement, so the
+    /// loop gate deliberately does not fire for it.
+    State,
 }
 
 impl LocalReadAttemptState {
@@ -504,9 +653,16 @@ pub(crate) enum LocalReadSubmitDisposition {
     StaleAttempt(StaleLocalReadObservation),
 }
 
+/// Closed serving queue for one daemon-produced result submission.
+///
+/// The State lane (issue #2564) is a separate arm, not a flag on the local-read
+/// lane: a submitted result is bound to the exact carrier form it was produced
+/// for, so a query result can never complete a State claim and a State result
+/// can never complete a query claim.
 #[derive(Clone, Copy)]
 enum DaemonReadQueue {
     LocalRead,
+    State,
     CampaignPacket,
 }
 
@@ -1559,109 +1715,7 @@ impl KernelComposition {
         // lifecycle pairs use the authenticated local-read poller; a packet is
         // never handed to that queue or selector derivation.
         if record.result_digest.is_none() {
-            let mut mismatch_reason: Option<&'static str> = None;
-            // #2564 I4/AUD-C2/AUD-C5: a lane whose carrier could not retain
-            // its pair must not be answered with a successful acknowledgement.
-            // The carrier's OWN typed reason is carried out of the routing
-            // match and re-raised once the audit evidence for the refusal has
-            // been recorded, so a refusal is never downgraded into a recorded
-            // mismatch beside a successful reply, and a gate failure is never
-            // flattened into a generic fence. `None` until a lane sets it.
-            let mut refused_carrier_error: Option<TransportError> = None;
-            let routed_lane = match check_local_read_admission(envelope, tool) {
-                Ok(LocalReadAdmission::Query(_)) => {
-                    // Queue admission is part of the same authenticated
-                    // operation. Never acknowledge a request whose bounded
-                    // query queue could not retain it.
-                    self.enqueue_local_read_pair_under_transition(envelope, tool)?;
-                    Some("query")
-                }
-                Ok(LocalReadAdmission::Skill) => {
-                    self.enqueue_local_read_pair_under_transition(envelope, tool)?;
-                    Some("skill")
-                }
-                Ok(admission @ LocalReadAdmission::CampaignPacket { .. }) => {
-                    // A2: the effect-capable (Material) lane re-joins the live
-                    // Governor-issued material authority before dispatch. A
-                    // missing derivation or a revocation that landed after
-                    // envelope admission fails this lane closed; read-only
-                    // lanes stay exempt. Routing carries no visibility input,
-                    // so a hidden packet method invoked by name faces the
-                    // identical gate.
-                    super::tool_exposure::authorize_material_lane(
-                        self,
-                        &admission,
-                        &envelope.state_fence,
-                    )?;
-                    self.enqueue_campaign_packet_pair_under_transition(envelope, tool)?;
-                    Some("campaign-packet")
-                }
-                Err(_) => {
-                    if check_task_controller_admission(envelope, tool).is_ok() {
-                        self.enqueue_task_controller_pair_under_transition(envelope, tool)?;
-                        Some("task-controller")
-                    } else if check_finish_admission(envelope, tool).is_ok() {
-                        // #1741 finish lane: the admitted strict finish draft
-                        // rides the same invoke-read admission as the query
-                        // and packet lanes but enters its own daemon-claimable
-                        // queue, so a finish result can never complete a
-                        // query, packet or task-controller claim.
-                        self.enqueue_finish_pair_under_transition(envelope, tool)?;
-                        Some("finish")
-                    } else if check_local_state_admission(envelope, tool).is_ok() {
-                        // #2564 I4/AUD-C2/AUD-C5: a validated `eliot.state` pair
-                        // enters the shared local-read carrier, and the carrier's
-                        // disposition IS this lane's admission result — never a
-                        // remark. The disposition used to be discarded with
-                        // `let _ =` while the request was still acknowledged as
-                        // accepted, so an admitted read produced a recorded
-                        // refusal and nothing else. The typed refusal reason is
-                        // recorded first (so it keeps its durable evidence) and
-                        // the carrier's own error is then propagated, so a state
-                        // read is never acknowledged when its pair could not be
-                        // retained and the real gate failure is never flattened
-                        // into a generic fence.
-                        mismatch_reason = Some("state_carrier_refused");
-                        if let Err(error) =
-                            self.enqueue_local_read_pair_under_transition(envelope, tool)
-                        {
-                            refused_carrier_error = Some(error);
-                        }
-                        None
-                    } else {
-                        mismatch_reason = Some("no_lane");
-                        None
-                    }
-                }
-            };
-            // Issue #1837: durable audit evidence for the routing decision.
-            // Issue #1839 (I16.4 capability discovery/probe/admission): the
-            // requested capability was probed against the daemon-claimable
-            // lanes; a discovered lane records discovery plus admission.
-            self.audit_observe(AuditEventDraft::capability_probe(envelope));
-            if let Some(lane) = routed_lane {
-                self.audit_observe(AuditEventDraft::route_invoke_read_routed(
-                    envelope, &receipt, lane,
-                ));
-                self.audit_observe(AuditEventDraft::capability_lane_discovered(
-                    envelope, &receipt, lane,
-                ));
-                self.audit_observe(AuditEventDraft::capability_admission(
-                    envelope, &receipt, lane,
-                ));
-            } else if let Some(reason) = mismatch_reason {
-                // Issue #1839: durable audit evidence for the rejected
-                // route. The requested capability matched no serving lane,
-                // so the work was refused before queueing.
-                self.audit_observe(AuditEventDraft::route_mismatch_routing(envelope, reason));
-            }
-            // #2564 AUD-C2/AUD-C5: retention is part of admission. The refusal
-            // above has already been recorded durably, so the carrier's own
-            // typed gate failure is raised here instead of being answered with
-            // a successful admission record.
-            if let Some(error) = refused_carrier_error {
-                return Err(error);
-            }
+            self.route_and_retain_invoke_read_lane(envelope, tool, &receipt)?;
         }
         // Coherence gate before serving: a resulted record must carry a
         // digest-bound body, otherwise the row is never served as an answer.
@@ -1683,6 +1737,151 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         }
         Ok((receipt, record))
+    }
+
+    /// Routes one admitted invoke-read envelope into its serving lane and
+    /// retains the bounded pair that lane owns (issues #2564 I4, #1837, #1839).
+    ///
+    /// Production caller: [`Self::invoke_read_host_request`], for every admitted
+    /// record that has no owner-stored result yet.
+    ///
+    /// Retention is part of admission: a lane whose carrier could not retain
+    /// its pair is never answered with a successful acknowledgement. The
+    /// carrier's own typed reason is raised only after the audit evidence for
+    /// the refusal has been recorded, so a refusal is never downgraded into a
+    /// recorded mismatch beside a successful reply, and a gate failure is never
+    /// flattened into a generic fence.
+    fn route_and_retain_invoke_read_lane(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        receipt: &HostRequestAdmissionReceipt,
+    ) -> Result<(), TransportError> {
+        let mut mismatch_reason: Option<&'static str> = None;
+        // A carrier gate failure is a real refusal that must keep its durable
+        // evidence before it propagates: the routing match above can return
+        // through `?` (Backpressure, IdentityConflict, the byte bound, a
+        // connection or replay-class refusal), and a refusal that is never
+        // observed is indistinguishable from a request that never arrived.
+        // So the carrier's own typed reason is carried out of the match and
+        // raised only after the audit block below has recorded it. `None`
+        // until a lane sets it.
+        let mut refused_carrier_error: Option<TransportError> = None;
+        let routed_lane = match check_local_read_admission(envelope, tool) {
+            Ok(LocalReadAdmission::Query(_)) => {
+                // Queue admission is part of the same authenticated
+                // operation. Never acknowledge a request whose bounded
+                // query queue could not retain it. The retained form is
+                // checked, not assumed: a carrier that answered with the
+                // state form did not retain THIS query, and saying so is a
+                // refusal rather than a silent reclassification.
+                if self.retain_bounded_read_as(envelope, tool, LocalReadPairKind::Query)? {
+                    Some("query")
+                } else {
+                    mismatch_reason = Some("query_carrier_refused");
+                    None
+                }
+            }
+            Ok(LocalReadAdmission::Skill) => {
+                if self.retain_bounded_read_as(envelope, tool, LocalReadPairKind::Query)? {
+                    Some("skill")
+                } else {
+                    mismatch_reason = Some("query_carrier_refused");
+                    None
+                }
+            }
+            Ok(admission @ LocalReadAdmission::CampaignPacket { .. }) => {
+                // A2: the effect-capable (Material) lane re-joins the live
+                // Governor-issued material authority before dispatch. A
+                // missing derivation or a revocation that landed after
+                // envelope admission fails this lane closed; read-only
+                // lanes stay exempt. Routing carries no visibility input,
+                // so a hidden packet method invoked by name faces the
+                // identical gate.
+                super::tool_exposure::authorize_material_lane(
+                    self,
+                    &admission,
+                    &envelope.state_fence,
+                )?;
+                self.enqueue_campaign_packet_pair_under_transition(envelope, tool)?;
+                Some("campaign-packet")
+            }
+            Err(_) => {
+                if check_task_controller_admission(envelope, tool).is_ok() {
+                    self.enqueue_task_controller_pair_under_transition(envelope, tool)?;
+                    Some("task-controller")
+                } else if check_finish_admission(envelope, tool).is_ok() {
+                    // #1741 finish lane: the admitted strict finish draft
+                    // rides the same invoke-read admission as the query
+                    // and packet lanes but enters its own daemon-claimable
+                    // queue, so a finish result can never complete a
+                    // query, packet or task-controller claim.
+                    self.enqueue_finish_pair_under_transition(envelope, tool)?;
+                    Some("finish")
+                } else if check_local_state_admission(envelope, tool).is_ok() {
+                    // #2564 I4 state-carrier seam: a validated `eliot.state`
+                    // pair is RETAINED on the same bounded local-read
+                    // carrier, under the same byte/slot bounds, tagged with
+                    // its own carrier form so the daemon's query leg can
+                    // never claim it. The disposition is handled, not
+                    // discarded: a carrier gate failure is carried out and
+                    // raised after its audit evidence is recorded, so a
+                    // state read is never acknowledged when its pair could
+                    // not be retained and the real gate failure is never
+                    // flattened into a generic fence.
+                    //
+                    // `retain_bounded_state_pair` cannot answer `false` here:
+                    // it re-derives the form from the same two admission
+                    // owners this arm has just consulted, so the carrier
+                    // retains exactly the State form or returns its own
+                    // typed gate error. There is no form mismatch to record,
+                    // so `state_carrier_refused` is not invented here.
+                    match self.retain_bounded_state_pair(envelope, tool) {
+                        Ok(true) => Some("state"),
+                        Ok(false) => {
+                            mismatch_reason = Some("state_carrier_refused");
+                            None
+                        }
+                        Err(error) => {
+                            refused_carrier_error = Some(error);
+                            None
+                        }
+                    }
+                } else {
+                    mismatch_reason = Some("no_lane");
+                    None
+                }
+            }
+        };
+        // Issue #1837: durable audit evidence for the routing decision.
+        // Issue #1839 (I16.4 capability discovery/probe/admission): the
+        // requested capability was probed against the daemon-claimable
+        // lanes; a discovered lane records discovery plus admission.
+        self.audit_observe(AuditEventDraft::capability_probe(envelope));
+        if let Some(lane) = routed_lane {
+            self.audit_observe(AuditEventDraft::route_invoke_read_routed(
+                envelope, receipt, lane,
+            ));
+            self.audit_observe(AuditEventDraft::capability_lane_discovered(
+                envelope, receipt, lane,
+            ));
+            self.audit_observe(AuditEventDraft::capability_admission(
+                envelope, receipt, lane,
+            ));
+        } else if let Some(reason) = mismatch_reason {
+            // Issue #1839: durable audit evidence for the rejected
+            // route. The requested capability matched no serving lane,
+            // so the work was refused before queueing.
+            self.audit_observe(AuditEventDraft::route_mismatch_routing(envelope, reason));
+        }
+        // #2564 AUD-C2/AUD-C5: retention is part of admission. The refusal has
+        // already been recorded durably above, so the carrier's own typed gate
+        // failure is raised here instead of being answered with a successful
+        // admission record.
+        if let Some(error) = refused_carrier_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Runs the Kernel-owned bind/dispatch leg for one admitted invoke-read
@@ -2980,6 +3179,7 @@ impl KernelComposition {
                 local_read_tool: None,
                 local_read_held_bytes: 0,
                 local_read_attempt: LocalReadAttemptState::default(),
+                local_read_pair_kind: None,
                 observe_envelope: None,
                 observe_tool: None,
                 observe_reservation: None,
@@ -3123,18 +3323,129 @@ impl KernelComposition {
         Ok(())
     }
 
+    /// Resolves the exact bounded-read carrier form for one linked
+    /// envelope+tool pair, or refuses (issue #2564).
+    ///
+    /// The two closed admission owners are tried in order and the FIRST to
+    /// accept decides the form:
+    ///
+    /// - [`check_local_read_admission`] admits the bounded evidence query and
+    ///   the exact Skill lifecycle tools. Its accepted [`LocalReadAdmission`]
+    ///   is carried through so the I7.24 repeat gate can rebuild the same
+    ///   admission-derived [`eliot_receipts::ToolCallRequest`] it always did.
+    /// - [`check_local_state_admission`] admits the owner-backed `eliot.state`
+    ///   form. That gate re-runs the exact invoke-read linkage check (capability
+    ///   plus payload digest over the presented bytes) and the closed state
+    ///   selector derivation, so a state pair is never retained on a weaker
+    ///   check than the query form requires.
+    ///
+    /// A campaign packet is refused here in both directions: the first gate
+    /// rejects it as a bounded read, and [`bounded_read_carrier_admission`]
+    /// does not re-check state selectors for it. Anything neither gate accepts
+    /// is `None`, which the enqueue treats as a refusal before any mutation.
+    ///
+    /// Both gates are pure and perform no store IO, so this is a
+    /// rejection-before-retention decision, not a read.
+    fn bounded_read_carrier_admission(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Option<LocalReadCarrierAdmission> {
+        let _ = self;
+        if let Ok(admission) = check_local_read_admission(envelope, tool) {
+            // The packet is a first-class admitted shape with its own queue
+            // marker; it is not a bounded read and must not borrow one, so a
+            // form-less admission falls through to the state gate below.
+            if let Some(kind) = LocalReadPairKind::of_admission(&admission) {
+                debug_assert_eq!(kind, LocalReadPairKind::Query);
+                return Some(LocalReadCarrierAdmission::Query(admission));
+            }
+        }
+        if check_local_state_admission(envelope, tool).is_ok() {
+            return Some(LocalReadCarrierAdmission::State);
+        }
+        None
+    }
+
+    /// Retains one validated `eliot.state` pair on the bounded carrier.
+    ///
+    /// A form mismatch is a typed refusal with no mutation, so it answers
+    /// `Ok(false)`. A carrier gate failure is a DIFFERENT outcome — the pair
+    /// was not retained either, but the real gate reason must reach the
+    /// caller — so it stays `Err` and propagates through `?`. A request is
+    /// therefore never acknowledged when its state pair could not be retained,
+    /// and `state_carrier_refused` is recorded only for the form mismatch that
+    /// the routing leg can actually act on.
+    ///
+    /// A mismatch against the form the carrier actually retained is decided by
+    /// the carrier itself, not re-derived here: the routing leg names the form
+    /// it is routing for and compares it against the disposition the carrier
+    /// returned. A carrier that answered with the state form did not retain
+    /// THIS query, and saying so is a refusal rather than a silent
+    /// reclassification.
+    fn retain_bounded_state_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+    ) -> Result<bool, TransportError> {
+        self.retain_bounded_read_as(envelope, tool, LocalReadPairKind::State)
+    }
+
+    /// Retains one bounded read on the carrier ONLY if the carrier admits it as
+    /// exactly `form`, and reports whether it did (issue #2564).
+    ///
+    /// The routing leg is the place a form mismatch becomes visible, so this
+    /// does not re-derive the form: it names the form the caller is routing for
+    /// and compares it against the disposition the carrier actually returned. A
+    /// refusal (`Ok(false)`) is a typed refusal with no mutation — the carrier
+    /// never staged the pair under the wrong form — while a gate failure
+    /// (`Err`) still propagates through `?` so a request is never acknowledged
+    /// when the carrier could not retain it at all.
+    fn retain_bounded_read_as(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        form: LocalReadPairKind,
+    ) -> Result<bool, TransportError> {
+        Ok(self.enqueue_local_read_pair_under_transition(envelope, tool)? == form)
+    }
+
+    /// Retains one bounded-read pair on the shared local-read carrier,
+    /// atomically (issue #2564).
+    ///
+    /// The gate resolves the exact carrier form ONCE from the two closed
+    /// admission owners — [`check_local_read_admission`] for the query/Skill
+    /// form and [`check_local_state_admission`] for the owner-backed
+    /// `eliot.state` form — and refuses everything else before any mutation.
+    /// Both forms then ride the SAME bounded ledger: the identical I12.14 byte
+    /// charge ([`local_read_request_bytes`] through
+    /// `hot_spine.acquire_local_read_capacity`), the identical
+    /// [`MAX_QUEUED_LOCAL_READS`] slot count, the identical eviction rule, and
+    /// the identical owner-safe release from `local_read_held_bytes`.
+    ///
+    /// Atomicity is the property that matters here: the slot's payload, the
+    /// carrier form tag ([`LocalReadPairKind`]), the unclaimed attempt record,
+    /// and the byte charge are written in one index mutation, under the index
+    /// lock, after every gate has already passed. There is no path that writes
+    /// the envelope without the form tag or the byte charge, and a pair that
+    /// fails any gate — connection gate, replay class, repeat signal, capacity
+    /// — mutates nothing at all, returning its just-acquired permit instead.
+    ///
+    /// The returned [`LocalReadPairKind`] is the form actually retained, so the
+    /// caller routes and audits from the disposition it received instead of
+    /// discarding it.
     fn enqueue_local_read_pair_under_transition(
         &self,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
-    ) -> Result<(), TransportError> {
-        let admission = check_local_read_admission(envelope, tool)?;
-        match admission {
-            LocalReadAdmission::Query(_) | LocalReadAdmission::Skill => {}
-            LocalReadAdmission::CampaignPacket { .. } => {
-                return Err(TransportError::SessionFenced);
-            }
-        }
+    ) -> Result<LocalReadPairKind, TransportError> {
+        let Some(admission) = self.bounded_read_carrier_admission(envelope, tool) else {
+            return Err(TransportError::SessionFenced);
+        };
+        let (kind, read_admission) = match admission {
+            LocalReadCarrierAdmission::Query(form) => (LocalReadPairKind::Query, Some(form)),
+            LocalReadCarrierAdmission::State => (LocalReadPairKind::State, None),
+        };
         let _admission_owner = self
             .agent_activation_pending
             .lock()
@@ -3149,12 +3460,18 @@ impl KernelComposition {
             LocalReadReplay::ConflictingConnection => {
                 return Err(TransportError::IdentityConflict);
             }
-            LocalReadReplay::AlreadyStaged => return Ok(()),
+            LocalReadReplay::AlreadyStaged => return Ok(kind),
             LocalReadReplay::Fresh => {}
         }
         // I7.24 step 5: refuse materially repeated calls with no new
-        // owner-observed evidence before staging them as progress.
-        Self::refuse_staged_local_read_repeat(&index, envelope, tool, &admission)?;
+        // owner-observed evidence before staging them as progress. Only the
+        // query/Skill form has a campaign-derived call class here; the State
+        // form is a bounded read of the same class as an evidence query and
+        // carries no caller intent block, so it has no ToolCallRequest to
+        // rebuild and no repeat identity to lose.
+        if let Some(read_admission) = read_admission.as_ref() {
+            Self::refuse_staged_local_read_repeat(&index, envelope, tool, read_admission)?;
+        }
         let queued = index
             .values()
             .flatten()
@@ -3165,30 +3482,12 @@ impl KernelComposition {
         // ledger BEFORE the pair is staged, so an oversized request is refused
         // without an expensive decode and without partially acquiring capacity.
         // The permit is retained until the owner retires the pair, so a claimed
-        // or in-flight item still occupies its slot.
+        // or in-flight item still occupies its slot. The State form is charged
+        // through this same helper, so a state pair is not a way around the
+        // byte bound.
         let request_bytes = local_read_request_bytes(envelope, tool)?;
         self.hot_spine.acquire_local_read_capacity(request_bytes)?;
-        if queued >= MAX_QUEUED_LOCAL_READS {
-            let mut evicted = None;
-            for refs in index.values_mut() {
-                if let Some(position) = refs.iter().position(|candidate| {
-                    candidate.local_read_envelope.is_some()
-                        && !candidate.local_read_attempt.is_live()
-                }) {
-                    evicted = Some(refs.remove(position).local_read_held_bytes);
-                    break;
-                }
-            }
-            // Every exit from here must return the permit it just acquired:
-            // an admission that stages nothing must not stay charged. The
-            // evicted pair is an owner-safe release too, and it returns the
-            // byte count recorded at ITS admission, never a recomputed one.
-            let Some(evicted_bytes) = evicted else {
-                self.hot_spine.release_local_read(request_bytes);
-                return Err(TransportError::Backpressure);
-            };
-            self.hot_spine.release_local_read(evicted_bytes);
-        }
+        Self::release_local_read_slot_when_full(self, &mut index, queued, request_bytes)?;
         let refs = index.entry(envelope.connection_id.clone()).or_default();
         let local_read_attempt = LocalReadAttemptState {
             // The durable claim record is written at enqueue, before any
@@ -3208,6 +3507,7 @@ impl KernelComposition {
                 envelope,
                 tool,
                 request_bytes,
+                kind,
                 local_read_attempt,
             );
         } else {
@@ -3218,6 +3518,7 @@ impl KernelComposition {
                 local_read_tool: Some(tool.clone()),
                 local_read_held_bytes: request_bytes,
                 local_read_attempt,
+                local_read_pair_kind: Some(kind),
                 observe_envelope: None,
                 observe_tool: None,
                 observe_reservation: None,
@@ -3244,26 +3545,79 @@ impl KernelComposition {
         // identities fail — so a replay reconciles the recorded original
         // without new evidence. Best-effort like every observation: a
         // populate failure is terminal-visible but never changes the staged
-        // admission.
-        super::tool_exposure::observe_dispatch_exposure(envelope, tool, &admission, |draft| {
-            self.audit_observe(draft);
-        });
+        // admission. The State form has no campaign-derived `ToolCallRequest`
+        // to expose, so it records no fabricated exposure evidence: the daemon
+        // State leg reads its own owner-backed facts instead.
+        if let Some(read_admission) = read_admission.as_ref() {
+            super::tool_exposure::observe_dispatch_exposure(
+                envelope,
+                tool,
+                read_admission,
+                |draft| {
+                    self.audit_observe(draft);
+                },
+            );
+        }
         // I16.5 (issue #1841): the queue gauges are read from the owner's own
         // live index at admission, so a sample measures the current contour
         // rather than a total carried forward.
         observe_local_read_queue_gauges(&index, queued);
+        Ok(kind)
+    }
+
+    /// Makes room for a just-acquired local-read permit when the owner's index
+    /// is already at [`MAX_QUEUED_LOCAL_READS`] staged reads (I12.14 step 5).
+    ///
+    /// Production caller: [`Self::enqueue_local_read_pair_under_transition`],
+    /// immediately after `acquire_local_read_capacity` and before the new pair
+    /// is staged.
+    ///
+    /// Only a staged read whose attempt is no longer live is evicted, so a
+    /// claimed or in-flight item keeps its slot. Every exit returns the permit
+    /// it was given: an admission that stages nothing must not stay charged,
+    /// and the evicted pair is released at the byte count recorded at ITS
+    /// admission, never a recomputed one.
+    fn release_local_read_slot_when_full(
+        &self,
+        index: &mut BTreeMap<String, Vec<HostRequestOperationRef>>,
+        queued: usize,
+        request_bytes: u64,
+    ) -> Result<(), TransportError> {
+        if queued < MAX_QUEUED_LOCAL_READS {
+            return Ok(());
+        }
+        let mut evicted = None;
+        for refs in index.values_mut() {
+            if let Some(position) = refs.iter().position(|candidate| {
+                candidate.local_read_envelope.is_some() && !candidate.local_read_attempt.is_live()
+            }) {
+                evicted = Some(refs.remove(position).local_read_held_bytes);
+                break;
+            }
+        }
+        let Some(evicted_bytes) = evicted else {
+            self.hot_spine.release_local_read(request_bytes);
+            return Err(TransportError::Backpressure);
+        };
+        self.hot_spine.release_local_read(evicted_bytes);
         Ok(())
     }
 
     /// Installs the just-acquired permit and payload on an indexed row.
     /// A placeholder owns no previous permit, including when its byte charge
     /// is zero. A real zero-byte local read still owns one item permit.
+    ///
+    /// The payload, the form tag and the byte charge move together: a row is
+    /// either carrying a fully-formed bounded read of one declared form, or it
+    /// is not a bounded read at all. The previous permit (if any) is released
+    /// from its own recorded byte count, never from a fresh measurement.
     fn stage_local_read_payload(
         &self,
         candidate: &mut HostRequestOperationRef,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         request_bytes: u64,
+        kind: LocalReadPairKind,
         attempt: LocalReadAttemptState,
     ) {
         if candidate.local_read_envelope.is_some() {
@@ -3274,6 +3628,7 @@ impl KernelComposition {
         candidate.local_read_tool = Some(tool.clone());
         candidate.local_read_held_bytes = request_bytes;
         candidate.local_read_attempt = attempt;
+        candidate.local_read_pair_kind = Some(kind);
     }
 
     /// Revalidates a queued operation's claimed application binding against
@@ -3418,14 +3773,40 @@ impl KernelComposition {
     pub(crate) fn claim_local_read_pair(
         &self,
         session: &Session,
-    ) -> Result<
-        Option<(
-            HostRequestEnvelope,
-            serde_json::Value,
-            eliot_protocol::LocalReadAttempt,
-        )>,
-        TransportError,
-    > {
+    ) -> Result<Option<RetainedBoundedRead>, TransportError> {
+        self.claim_bounded_read_pair_for_form(session, LocalReadPairKind::Query)
+    }
+
+    /// Claims the next admitted `eliot.state` pair for the daemon State leg
+    /// under the same governed attempt ownership (issue #2564).
+    ///
+    /// Same fencing, same identity minting, same ordering and same expiry skip
+    /// as the query claim; the only difference is the form gate, which admits
+    /// exactly the pairs this carrier tagged [`LocalReadPairKind::State`].
+    /// A query or Skill pair is therefore NOT claimable here and a state pair
+    /// is NOT claimable on the query claim — that is the capability-confusion
+    /// guard, and it is why the two claims are separate entries rather than
+    /// one claim with a filter.
+    pub(crate) fn claim_local_state_pair(
+        &self,
+        session: &Session,
+    ) -> Result<Option<RetainedBoundedRead>, TransportError> {
+        self.claim_bounded_read_pair_for_form(session, LocalReadPairKind::State)
+    }
+
+    /// Claims the next bounded-read pair of exactly one admitted carrier form.
+    ///
+    /// The form gate is checked three ways before any attempt is minted: the
+    /// retained tag must equal the requested form, the pair's live capability
+    /// must be the closed capability that form owns, and the exact retained
+    /// envelope+tool must still pass its own admission gate (re-derivation, not
+    /// a remembered verdict). Any disagreement means the pair is not claimable
+    /// in this form and is skipped for reconciliation — never rewritten here.
+    fn claim_bounded_read_pair_for_form(
+        &self,
+        session: &Session,
+        form: LocalReadPairKind,
+    ) -> Result<Option<RetainedBoundedRead>, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         let admission_owner = self
             .agent_activation_pending
@@ -3446,6 +3827,9 @@ impl KernelComposition {
                 ) else {
                     continue;
                 };
+                if candidate.local_read_pair_kind != Some(form) {
+                    continue;
+                }
                 if activation_deadline_expired(now, envelope.identity.deadline_unix_ms) {
                     continue;
                 }
@@ -3453,13 +3837,23 @@ impl KernelComposition {
                     continue;
                 }
                 // Revalidate the exact retained envelope/tool pair before a
-                // daemon claim. Skill lifecycle operations share this bounded
-                // local-read carrier, but packet admission stays isolated in
-                // its dedicated queue and no arbitrary tool becomes claimable.
-                if !matches!(
-                    check_local_read_admission(envelope, tool),
-                    Ok(LocalReadAdmission::Query(_) | LocalReadAdmission::Skill)
-                ) {
+                // daemon claim, and re-derive the form from that revalidated
+                // pair. Skill lifecycle operations share this bounded local-read
+                // carrier; packet admission stays isolated in its dedicated
+                // queue; no arbitrary tool becomes claimable; and a state pair
+                // can never be re-read as a query.
+                let admitted_form = match form {
+                    LocalReadPairKind::Query => match check_local_read_admission(envelope, tool) {
+                        Ok(
+                            admission @ (LocalReadAdmission::Query(_) | LocalReadAdmission::Skill),
+                        ) => LocalReadPairKind::of_admission(&admission),
+                        Ok(LocalReadAdmission::CampaignPacket { .. }) | Err(_) => None,
+                    },
+                    LocalReadPairKind::State => check_local_state_admission(envelope, tool)
+                        .ok()
+                        .map(|_| LocalReadPairKind::State),
+                };
+                if admitted_form != Some(form) {
                     continue;
                 }
                 let previous_generation = candidate.local_read_attempt.generation;
@@ -3500,7 +3894,12 @@ impl KernelComposition {
                 self.audit_observe(AuditEventDraft::dispatch_daemon_claim(
                     envelope, session, &attempt,
                 ));
-                return Ok(Some((envelope.clone(), tool.clone(), attempt)));
+                return Ok(Some(RetainedBoundedRead {
+                    form,
+                    envelope: envelope.clone(),
+                    tool: tool.clone(),
+                    attempt,
+                }));
             }
         }
         Ok(None)
@@ -3591,10 +3990,17 @@ impl KernelComposition {
     ///
     /// Returns `None` when no queued pair exists (never claimed, retired, or
     /// fenced away). Pure queue memory: no store IO.
+    ///
+    /// `form` narrows the lookup to one carrier form: the query leg reads the
+    /// QUERY form's record and the State leg reads the STATE form's record, so
+    /// a result produced for one form can never present the other form's live
+    /// attempt. A missing, mismatched, or unoccupied slot is `None`, never an
+    /// error and never another form's record.
     pub(crate) fn live_local_read_attempt(
         &self,
         operation_id: &str,
         request_digest: &str,
+        form: LocalReadPairKind,
     ) -> Result<Option<LocalReadAttemptState>, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         let admission_owner = self
@@ -3604,6 +4010,7 @@ impl KernelComposition {
         self.live_local_read_attempt_under_transition(
             operation_id,
             request_digest,
+            form,
             &admission_owner,
         )
     }
@@ -3612,6 +4019,7 @@ impl KernelComposition {
         &self,
         operation_id: &str,
         request_digest: &str,
+        form: LocalReadPairKind,
         pending: &super::AgentActivationPendingState,
     ) -> Result<Option<LocalReadAttemptState>, TransportError> {
         let candidate = {
@@ -3626,6 +4034,7 @@ impl KernelComposition {
                     candidate.operation_id == operation_id
                         && candidate.request_digest == request_digest
                         && candidate.local_read_envelope.is_some()
+                        && candidate.local_read_pair_kind == Some(form)
                 })
                 .cloned()
         };
@@ -3854,6 +4263,23 @@ impl KernelComposition {
         self.submit_claimed_result(session, body, DaemonReadQueue::LocalRead)
     }
 
+    /// Submits one daemon-produced `eliot.state` result for its waiting host
+    /// request (issue #2564).
+    ///
+    /// Identical contract to [`Self::submit_local_read_result`] and deliberately
+    /// a SEPARATE entry: the bound carrier form differs, so a query result can
+    /// never complete a State claim (or the reverse) even though both share the
+    /// transport, the persistence owner and the fencing machinery. The stored
+    /// capability must be the state capability and the live attempt must be the
+    /// STATE form's attempt record, or this refuses.
+    pub(crate) fn submit_local_state_result(
+        &self,
+        session: &Session,
+        body: &HostRequestResultBody,
+    ) -> Result<LocalReadSubmitDisposition, TransportError> {
+        self.submit_claimed_result(session, body, DaemonReadQueue::State)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the submit gate keeps replay, deadline, currency, fence, and persistence joins in one audited order"
@@ -3879,19 +4305,24 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?
             .ok_or(TransportError::UnknownRequest)?;
         let capability = stored.capability_ref.as_str();
+        // The stored capability is read from the durable record, so it is the
+        // authority on which form produced this operation — not the carrier
+        // tag and not the presenting lane's own name.
         let queue_matches_capability = match queue {
             DaemonReadQueue::LocalRead => {
-                capability == "eliot.query" || is_skill_lifecycle_tool(capability)
+                capability == LOCAL_READ_QUERY_CAPABILITY || is_skill_lifecycle_tool(capability)
             }
+            DaemonReadQueue::State => capability == LOCAL_READ_STATE_CAPABILITY,
             DaemonReadQueue::CampaignPacket => capability == "eliot.packet",
         };
         let lane = match queue {
-            DaemonReadQueue::LocalRead if capability == "eliot.query" => "query",
+            DaemonReadQueue::LocalRead if capability == LOCAL_READ_QUERY_CAPABILITY => "query",
             DaemonReadQueue::LocalRead => "skill",
+            DaemonReadQueue::State => "state",
             DaemonReadQueue::CampaignPacket => "campaign-packet",
         };
         let retire = match queue {
-            DaemonReadQueue::LocalRead => ExpiryRetireLane::LocalRead,
+            DaemonReadQueue::LocalRead | DaemonReadQueue::State => ExpiryRetireLane::LocalRead,
             DaemonReadQueue::CampaignPacket => ExpiryRetireLane::CampaignPacket,
         };
         if stored.operation_id.as_str() != body.operation_id
@@ -3949,11 +4380,20 @@ impl KernelComposition {
             });
         }
         // Governed attempt currency: only the live (attempt_id, generation,
-        // owner) triple completes.
+        // owner) triple completes. The lookup is narrowed to this submission's
+        // carrier form, so a presented attempt from the other bounded form can
+        // never find a live record to complete against.
         let live = match queue {
             DaemonReadQueue::LocalRead => self.live_local_read_attempt_under_transition(
                 &body.operation_id,
                 &body.request_sha256,
+                LocalReadPairKind::Query,
+                &admission_owner,
+            )?,
+            DaemonReadQueue::State => self.live_local_read_attempt_under_transition(
+                &body.operation_id,
+                &body.request_sha256,
+                LocalReadPairKind::State,
                 &admission_owner,
             )?,
             DaemonReadQueue::CampaignPacket => self.live_campaign_packet_attempt_under_transition(
@@ -4102,7 +4542,9 @@ impl KernelComposition {
                         && candidate.request_digest == body.request_sha256
                 })
                 .and_then(|candidate| match queue {
-                    DaemonReadQueue::LocalRead => candidate.local_read_envelope.clone(),
+                    DaemonReadQueue::LocalRead | DaemonReadQueue::State => {
+                        candidate.local_read_envelope.clone()
+                    }
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_envelope.clone(),
                 })
         };
@@ -4123,7 +4565,9 @@ impl KernelComposition {
                         && candidate.request_digest == body.request_sha256
                 })
                 .and_then(|candidate| match queue {
-                    DaemonReadQueue::LocalRead => candidate.local_read_tool.clone(),
+                    DaemonReadQueue::LocalRead | DaemonReadQueue::State => {
+                        candidate.local_read_tool.clone()
+                    }
                     DaemonReadQueue::CampaignPacket => candidate.campaign_packet_tool.clone(),
                 })
         };
@@ -4289,7 +4733,7 @@ impl KernelComposition {
         // pair in the same queue ledger that authorized it so no later claim
         // or submit can reuse this generation.
         match queue {
-            DaemonReadQueue::LocalRead => {
+            DaemonReadQueue::LocalRead | DaemonReadQueue::State => {
                 self.retire_local_read_pair_under_transition(
                     &body.operation_id,
                     &body.request_sha256,
@@ -4344,8 +4788,17 @@ fn advance_tool_exposure_receipt_for_persisted_result(
     let (Some(envelope), Some(tool)) = (envelope, tool) else {
         return None;
     };
-    let Ok(admission) = check_local_read_admission(envelope, tool) else {
-        return None;
+    // The exposure skeleton is rebuilt from the SAME admission owner this lane
+    // admitted through. The State lane has no `LocalReadAdmission` (and no
+    // campaign-derived `ToolCallRequest`), so it records no fabricated exposure
+    // evidence here: its owner-backed preview carries its own typed lineage,
+    // and inventing a call class for it would be exactly the kind of
+    // all-passed evidence this gate exists to refuse.
+    let admission = match queue {
+        DaemonReadQueue::LocalRead | DaemonReadQueue::CampaignPacket => {
+            check_local_read_admission(envelope, tool).ok()?
+        }
+        DaemonReadQueue::State => return None,
     };
     let request = super::tool_exposure::build_tool_call_request(envelope, tool, &admission)?;
     let operation = persisted.operation_id.as_str();
@@ -4370,7 +4823,7 @@ fn advance_tool_exposure_receipt_for_persisted_result(
     // a present view reached here verified). A present-but-null or absent
     // view means nothing was consumed beyond transport.
     let used = match queue {
-        DaemonReadQueue::LocalRead => delivered,
+        DaemonReadQueue::LocalRead | DaemonReadQueue::State => delivered,
         DaemonReadQueue::CampaignPacket => {
             let view_verified = response
                 .get("campaign_learning_state_view")
@@ -4882,6 +5335,7 @@ impl KernelComposition {
                 local_read_tool: None,
                 local_read_held_bytes: 0,
                 local_read_attempt: LocalReadAttemptState::default(),
+                local_read_pair_kind: None,
                 observe_envelope: None,
                 observe_tool: None,
                 observe_reservation: Some(token),

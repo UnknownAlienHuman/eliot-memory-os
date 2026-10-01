@@ -2524,6 +2524,12 @@ impl HostIdleDrainSupervisor {
     /// the response as a refusal instead of hiding behind an already-sent
     /// success.
     ///
+    /// D1 production dispatch callers (audit 5906086103): every authenticated
+    /// trigger reaches this method before governed effects through
+    /// `consume_startup_wake_demand`, `process_user_automation_owner_requests`
+    /// or `process_runtime_control_requests`; `evaluate` publishes the timer
+    /// only on the classified durable outcome.
+    ///
     /// `trigger` is the class of the request that actually arrived, so the
     /// durable `trigger_class` / `required_capabilities` of this generation
     /// reflect the real ingress rather than one class for the whole plane.

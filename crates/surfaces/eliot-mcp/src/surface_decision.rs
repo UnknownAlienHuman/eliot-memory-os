@@ -34,9 +34,10 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    CANONICAL_DEFINITION_VERSION, EffectClass, OperationClass, SemanticRegistry,
-    ToolMethodIdentity, ToolSchema, check_advertised_schema_compatibility, known_tool_profile,
-    published_mcp_tool_surface,
+    CANONICAL_DEFINITION_VERSION, EffectClass, OperationClass, OperationalProjection,
+    SemanticProfileError, SemanticRegistry, ToolMethodIdentity, ToolSchema, ToolSemanticProfile,
+    check_advertised_schema_compatibility, known_tool_profile, published_mcp_tool_surface,
+    routing_decision, validate_operational_projection,
 };
 
 /// Maximum number of methods carried by one surface decision.
@@ -758,9 +759,15 @@ pub struct PermittedTaskSurface {
 ///
 /// Only visible and lazy-visible methods are admitted, and only when the
 /// generated descriptor still agrees with the live validated semantic-owner
-/// binding and stays inside the supported host compatibility band
-/// ([`check_advertised_schema_compatibility`]). Hidden, forbidden,
-/// unavailable, and compatibility-outside methods are withheld — omitted
+/// binding, keeps behavioral agreement with the live owner
+/// ([`live_behavioral_agreement`]: a live-built [`OperationalProjection`]
+/// validated by [`validate_operational_projection`], plus equality of the
+/// compiled view's recorded operation class, effect class, and profile
+/// version with the live profile), and stays inside the supported host
+/// compatibility band ([`check_advertised_schema_compatibility`]). A view
+/// that disagrees on retry, read-only, or completion behavior fails closed
+/// with a typed withhold reason. Hidden, forbidden, unavailable, and
+/// compatibility-outside methods are withheld — omitted
 /// from the permitted subset, never warned about in prose.
 ///
 /// # Errors
@@ -784,23 +791,36 @@ pub fn derive_permitted_surface(
         match decision.disposition_of(name) {
             Some(disposition @ (SurfaceDisposition::Visible | SurfaceDisposition::LazyVisible)) => {
                 match live_descriptor_for(descriptors, entry) {
-                    Some(descriptor)
-                        if registry
-                            .resolve(name, &entry.method.definition_version)
-                            .is_ok() =>
-                    {
-                        if check_advertised_schema_compatibility(descriptor).is_ok() {
-                            permitted.push(descriptor.clone());
-                        } else {
-                            withheld.push(WithheldSurfaceMethod {
+                    Some(descriptor) => {
+                        match registry.resolve(name, &entry.method.definition_version) {
+                            Ok(profile) => match live_behavioral_agreement(entry, profile) {
+                                Ok(()) => {
+                                    if check_advertised_schema_compatibility(descriptor).is_ok() {
+                                        permitted.push(descriptor.clone());
+                                    } else {
+                                        withheld.push(WithheldSurfaceMethod {
+                                            method: name.to_owned(),
+                                            disposition,
+                                            reason: "advertised schema is outside the supported host compatibility band"
+                                                .to_owned(),
+                                        });
+                                    }
+                                }
+                                Err(agreement) => withheld.push(WithheldSurfaceMethod {
+                                    method: name.to_owned(),
+                                    disposition,
+                                    reason: agreement.to_owned(),
+                                }),
+                            },
+                            Err(_) => withheld.push(WithheldSurfaceMethod {
                                 method: name.to_owned(),
                                 disposition,
-                                reason: "advertised schema is outside the supported host compatibility band"
+                                reason: "live owner binding no longer matches the decision"
                                     .to_owned(),
-                            });
+                            }),
                         }
                     }
-                    _ => withheld.push(WithheldSurfaceMethod {
+                    None => withheld.push(WithheldSurfaceMethod {
                         method: name.to_owned(),
                         disposition,
                         reason: "live owner binding no longer matches the decision".to_owned(),
@@ -823,6 +843,51 @@ pub fn derive_permitted_surface(
         permitted,
         withheld,
     })
+}
+
+/// Verifies that a compiled view still agrees with the single operational owner.
+///
+/// Builds the view's [`OperationalProjection`] from the live registry profile
+/// only — the same routing bits the router consumes, never names or prose —
+/// validates it with [`validate_operational_projection`], and requires the
+/// compiled view's recorded operation class, effect class, and profile
+/// version to equal the live profile's. Any retry, read-only, or completion
+/// disagreement fails closed with a typed reason; the caller withholds the
+/// method instead of advertising it.
+fn live_behavioral_agreement(
+    entry: &ConsideredSurfaceMethod,
+    profile: &ToolSemanticProfile,
+) -> Result<(), &'static str> {
+    let live = routing_decision(profile);
+    let projection = OperationalProjection {
+        canonical_name: profile.method.canonical_name.clone(),
+        claimed_retry_safe: live.retry_safe,
+        claimed_read_only: live.read_only,
+        claimed_completion_ceiling: live.completion_ceiling,
+    };
+    if let Err(error) = validate_operational_projection(profile, &projection) {
+        return Err(match error {
+            SemanticProfileError::ProjectionDisagreement { field, .. } => match field {
+                "projection.retry_safe" => "live retry behavior disagrees with the semantic owner",
+                "projection.read_only" => "live effect behavior disagrees with the semantic owner",
+                "projection.completion_ceiling" => {
+                    "live completion ceiling disagrees with the semantic owner"
+                }
+                _ => "live operational projection disagrees with the semantic owner",
+            },
+            _ => "live operational projection disagrees with the semantic owner",
+        });
+    }
+    if entry.operation_class != profile.operation_class {
+        return Err("compiled view operation class disagrees with the semantic owner");
+    }
+    if entry.effect_class != profile.effect_class {
+        return Err("compiled view effect class disagrees with the semantic owner");
+    }
+    if entry.profile_version != profile.profile_version {
+        return Err("compiled view profile version disagrees with the semantic owner");
+    }
+    Ok(())
 }
 
 fn live_descriptor_for<'a>(

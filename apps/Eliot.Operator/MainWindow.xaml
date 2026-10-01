@@ -175,6 +175,8 @@
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
                     <ComboBox Grid.Column="0" Header="Closed operation" ItemsSource="{Binding UserAutomationOperations}"
                               SelectedItem="{Binding UserAutomationOperation, Mode=TwoWay}"
@@ -186,15 +188,25 @@
                     <TextBox Grid.Column="3" Header="Manual nonce" Text="{Binding UserAutomationNonce, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                              AutomationProperties.Name="UserAutomation explicit manual nonce" />
                     <Button Grid.Column="4" Content="Send typed operation" Click="ExecuteUserAutomation_OnClick"
+                            IsEnabled="{Binding CanRunUserAutomation}"
                             VerticalAlignment="Bottom" AutomationProperties.Name="Send typed UserAutomation operation" />
-                    <CheckBox Grid.Row="1" Grid.Column="0" Content="Include retired" IsChecked="{Binding IncludeRetired, Mode=TwoWay}"
+                    <TextBox Grid.Row="1" Grid.Column="0" Header="Occurrences to normalize (1–256)"
+                             Text="{Binding UserAutomationOccurrenceCount, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             AutomationProperties.Name="Requested UserAutomation normalization occurrence count" />
+                    <TextBox Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="4" Header="Schedule draft / exact owner-normalized revision JSON"
+                             Text="{Binding UserAutomationRevisionJson, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="120"
+                             AutomationProperties.Name="UserAutomation schedule draft or exact owner-normalized revision JSON" />
+                    <TextBox Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="4" Header="Previous immutable revision JSON for edit/migration"
+                             Text="{Binding UserAutomationPreviousRevisionJson, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                             AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="120"
+                             AutomationProperties.Name="Previous immutable UserAutomation revision JSON" />
+                    <TextBox Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="5" Header="Retained owner normalization/migration result (read-only)"
+                             Text="{Binding UserAutomationNormalizationResultJson, Mode=OneWay}" IsReadOnly="True"
+                             AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="120"
+                             AutomationProperties.Name="Exact owner normalization or migration response with original receipt envelope" />
+                    <CheckBox Grid.Row="4" Grid.Column="0" Content="Include retired" IsChecked="{Binding IncludeRetired, Mode=TwoWay}"
                               AutomationProperties.Name="Include retired UserAutomation revisions" />
-                    <TextBox Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="4" Header="Owner-normalized revision JSON for create/edit"
-                             Text="{Binding UserAutomationRevisionJson, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="120"
-                             AutomationProperties.Name="Owner-normalized UserAutomation revision JSON" />
-                    <TextBox Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="4" Header="Previous revision JSON for edit"
-                             Text="{Binding UserAutomationPreviousRevisionJson, Mode=TwoWay}" AcceptsReturn="True" TextWrapping="Wrap" MaxHeight="120"
-                             AutomationProperties.Name="Previous owner-normalized UserAutomation revision JSON" />
                 </Grid>
             </Expander>
 

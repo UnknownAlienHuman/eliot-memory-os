@@ -53,6 +53,10 @@ pub(crate) mod table {
     /// carrying the verbatim Kernel-owned revision document. Create-only;
     /// divergent rewrites fail closed.
     pub(crate) const AUTOMATION_REVISION: &str = "automation_revision";
+    /// Independently retained owner-normalized revision and original receipt
+    /// (issue #2865). One immutable row per automation/revision identity;
+    /// it does not move the current pointer or record occurrence history.
+    pub(crate) const AUTOMATION_NORMALIZATION: &str = "automation_normalization";
     /// Current automation pointer per automation (issue #1779). One row
     /// per `automation_id` carrying the current revision plus the closed
     /// admission state. Compare-and-set on the observed revision.
@@ -124,9 +128,11 @@ pub(crate) mod table {
     ///   name that no baseline DDL ever creates is dispositioned and passed
     ///   like any other. `automation_failure`, `automation_last_failure`, and
     ///   `automation_continuation` are declared without generation DDL;
+    ///   failure tables are ensured on their explicit owner path and
     ///   continuations create their schemaless table only during explicit
-    ///   truncated-page issuance.
-    pub(crate) const ALL_TABLES: [&str; 26] = [
+    ///   truncated-page issuance. `automation_normalization` has an explicit
+    ///   owner DDL body but remains outside admitted schema-generation migrations.
+    pub(crate) const ALL_TABLES: [&str; 27] = [
         SCHEMA_META,
         WRITE_RECEIPT,
         REVISION_HEAD,
@@ -144,6 +150,7 @@ pub(crate) mod table {
         REACTIVE_SESSION,
         RESOURCE_SNAPSHOT,
         AUTOMATION_REVISION,
+        AUTOMATION_NORMALIZATION,
         AUTOMATION_CURRENT,
         AUTOMATION_INVOCATION,
         AUTOMATION_FAILURE,
@@ -342,10 +349,13 @@ DEFINE FIELD task_id ON resource_snapshot TYPE option<string>;
 DEFINE INDEX snapshot_uri ON resource_snapshot FIELDS uri UNIQUE;
 ";
 
-/// Automation revision, pointer, and invocation tables (issue #1779).
-/// Additive delta in the notification style: `automation_revision`
-/// carries one immutable row per joined automation/revision key with the
-/// verbatim revision document; `automation_current` carries one
+/// Automation revision, normalization, pointer, and invocation tables
+/// (issues #1779/#2865). `automation_revision` carries one immutable row per
+/// joined automation/revision key with the verbatim revision document;
+/// `automation_normalization` independently retains the exact owner
+/// normalization request, normalized revision, original receipt, and
+/// `PreparedTransition` provenance without activating an automation;
+/// `automation_current` carries one
 /// compare-and-set pointer per automation with the current revision and
 /// the closed admission state; `automation_invocation` carries one
 /// create-only row per occurrence identity with the verbatim invocation
@@ -359,6 +369,20 @@ DEFINE FIELD revision_json ON automation_revision TYPE string;
 DEFINE FIELD state_fence ON automation_revision TYPE object;
 DEFINE FIELD scope_id ON automation_revision TYPE string;
 DEFINE FIELD task_id ON automation_revision TYPE option<string>;
+
+DEFINE TABLE automation_normalization SCHEMALESS;
+DEFINE FIELD automation_id ON automation_normalization TYPE string;
+DEFINE FIELD revision ON automation_normalization TYPE string;
+DEFINE FIELD revision_json ON automation_normalization TYPE string;
+DEFINE FIELD normalization_receipt_json ON automation_normalization TYPE object;
+DEFINE FIELD normalization_request_json ON automation_normalization TYPE string;
+DEFINE FIELD operation_id ON automation_normalization TYPE string;
+DEFINE FIELD idempotency_key ON automation_normalization TYPE string;
+DEFINE FIELD canonical_request_hash ON automation_normalization TYPE string;
+DEFINE FIELD state_fence ON automation_normalization TYPE object;
+DEFINE FIELD scope_id ON automation_normalization TYPE string;
+DEFINE FIELD task_id ON automation_normalization TYPE option<string>;
+DEFINE INDEX automation_normalization_identity ON automation_normalization FIELDS automation_id, revision UNIQUE;
 
 DEFINE TABLE automation_current SCHEMALESS;
 DEFINE FIELD automation_id ON automation_current TYPE string;

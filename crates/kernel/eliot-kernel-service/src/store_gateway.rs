@@ -386,6 +386,28 @@ fn user_automation_gateway_unknown(error: impl std::fmt::Display) -> UserAutomat
     ))
 }
 
+fn normalization_receipt_binding() -> UserAutomationExecutionError {
+    UserAutomationExecutionError::Contract(
+        eliot_kernel_core::user_automation::UserAutomationError::ReceiptBinding,
+    )
+}
+
+fn normalization_selector(
+    request: &UserAutomationServiceRequest,
+) -> Result<(String, String), UserAutomationExecutionError> {
+    match &request.intent.operation {
+        UserAutomationOperation::NormalizeSchedule { revision, .. }
+        | UserAutomationOperation::MigrateLegacySchedule { revision, .. } => {
+            Ok((revision.automation_id.clone(), revision.revision.clone()))
+        }
+        _ => Err(UserAutomationExecutionError::Contract(
+            eliot_kernel_core::user_automation::UserAutomationError::Invalid(
+                "operation.schedule_normalization",
+            ),
+        )),
+    }
+}
+
 #[path = "store_receipt_gateway.rs"]
 mod store_receipt_gateway;
 
@@ -2680,6 +2702,210 @@ impl KernelStoreGateway {
             .map_err(UserAutomationExecutionError::Contract)
     }
 
+    /// Performs or replays the authenticated schedule normalization operation.
+    /// A newly compiled answer is retained through the existing canonical
+    /// writer before this method returns it to the Kernel operator route.
+    pub async fn normalize_user_automation_schedule(
+        &self,
+        request: &UserAutomationServiceRequest,
+    ) -> Result<
+        (
+            UserAutomationServiceRequest,
+            UserAutomationRevision,
+            eliot_receipts::ReceiptEnvelope,
+        ),
+        UserAutomationExecutionError,
+    > {
+        request
+            .validate_for_schedule_normalization()
+            .map_err(UserAutomationExecutionError::Contract)?;
+        if let UserAutomationOperation::MigrateLegacySchedule {
+            previous_revision, ..
+        } = &request.intent.operation
+        {
+            let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
+            let retained_predecessor = store
+                .read_revision_predecessor_document(
+                    &request.context.state_fence,
+                    &previous_revision.automation_id,
+                    &previous_revision.revision,
+                )
+                .await
+                .map_err(user_automation_gateway_unknown)?;
+            if retained_predecessor != **previous_revision
+                || retained_predecessor.owner_principal != request.authenticated_principal
+            {
+                return Err(normalization_receipt_binding());
+            }
+        }
+        let (automation_id, revision_id) = normalization_selector(request)?;
+        let record = self
+            .read_user_automation_normalization_record(
+                &request.context.state_fence,
+                &automation_id,
+                &revision_id,
+            )
+            .await?;
+        if let Some(record) = record {
+            let (original, revision, envelope) =
+                super::user_automation_store::validate_normalization_record(&record)
+                    .map_err(|_| normalization_receipt_binding())?;
+            if !Self::same_normalization_intent(&original, request) {
+                return Err(normalization_receipt_binding());
+            }
+            return Ok((original, revision, envelope));
+        }
+
+        // A reused operation ID whose original result is not present under
+        // this exact selector is a known conflict. Never compile and retry it.
+        if self
+            .receipt(
+                &request.context.state_fence,
+                request.identity.operation_id.clone(),
+            )
+            .await
+            .map_err(user_automation_gateway_unknown)?
+            .is_some()
+        {
+            return Err(normalization_receipt_binding());
+        }
+
+        let (revision, envelope) =
+            super::user_automation_store::normalize_user_automation_operation(request)
+                .map_err(UserAutomationExecutionError::Contract)?;
+        Box::pin(self.retain_user_automation_normalization_result(request, &revision, &envelope))
+            .await
+    }
+
+    async fn read_user_automation_normalization_record(
+        &self,
+        state_fence: &StateFence,
+        automation_id: &str,
+        revision_id: &str,
+    ) -> Result<
+        Option<super::user_automation_store::UserAutomationNormalizationRecord>,
+        UserAutomationExecutionError,
+    > {
+        let named = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::normalization_read_request(
+            state_fence.clone(),
+            automation_id.to_owned(),
+            revision_id.to_owned(),
+        )
+        .map_err(user_automation_gateway_unknown)?;
+        let response = self
+            .execute_named(named.clone())
+            .await
+            .map_err(user_automation_gateway_unknown)?;
+        let record = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::project_normalization_record(automation_id, revision_id, &named, &response)
+        .map_err(user_automation_gateway_unknown)?;
+        if let Some(record) = &record {
+            let receipt = self
+                .receipt(state_fence, record.operation_id.clone())
+                .await
+                .map_err(user_automation_gateway_unknown)?
+                .ok_or_else(|| {
+                    user_automation_gateway_unknown(
+                        "retained normalization has no canonical write receipt",
+                    )
+                })?;
+            CanonicalUserAutomationStore::<
+                EbpCanonicalStoreClient<NamedPipeTransport>,
+            >::validate_normalization_write_receipt(record, &receipt)
+            .map_err(user_automation_gateway_unknown)?;
+        }
+        Ok(record)
+    }
+
+    async fn retain_user_automation_normalization_result(
+        &self,
+        request: &UserAutomationServiceRequest,
+        revision: &UserAutomationRevision,
+        envelope: &eliot_receipts::ReceiptEnvelope,
+    ) -> Result<
+        (
+            UserAutomationServiceRequest,
+            UserAutomationRevision,
+            eliot_receipts::ReceiptEnvelope,
+        ),
+        UserAutomationExecutionError,
+    > {
+        let (automation_id, revision_id) = normalization_selector(request)?;
+        let original_request_json =
+            serde_json::to_string(request).map_err(user_automation_gateway_unknown)?;
+        let store_request = crate::UserAutomationStoreRequest {
+            context: request.context.clone(),
+            authenticated_principal: request.authenticated_principal.clone(),
+            identity: request.identity.clone(),
+            intent: request.intent.clone(),
+        };
+        let (transition, manifest_digest) = CanonicalUserAutomationStore::<
+            BorrowedCanonicalStoreClient<'_>,
+        >::build_normalization_transition(
+            &store_request,
+            revision,
+            envelope,
+            original_request_json,
+        )
+        .map_err(user_automation_gateway_unknown)?;
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
+        let receipt = Box::pin(store.apply_normalization_transition(
+            &store_request.context,
+            transition,
+            manifest_digest,
+        ))
+        .await
+        .map_err(user_automation_gateway_unknown)?;
+
+        let record = self
+            .read_user_automation_normalization_record(
+                &request.context.state_fence,
+                &automation_id,
+                &revision_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                user_automation_gateway_unknown(
+                    "committed normalization retention was not visible on exact readback",
+                )
+            })?;
+        CanonicalUserAutomationStore::<BorrowedCanonicalStoreClient<'_>>::validate_normalization_write_receipt(&record, &receipt)
+            .map_err(user_automation_gateway_unknown)?;
+        let (original, retained_revision, retained_envelope) =
+            super::user_automation_store::validate_normalization_record(&record)
+                .map_err(user_automation_gateway_unknown)?;
+        if !Self::same_normalization_intent(&original, request)
+            || retained_revision != *revision
+            || retained_envelope != *envelope
+        {
+            return Err(user_automation_gateway_unknown(
+                "committed normalization does not match its exact readback",
+            ));
+        }
+        Ok((original, retained_revision, retained_envelope))
+    }
+
+    /// A retained normalization replay may arrive over a new transport
+    /// request, but its logical operation, source, principal and fence must be
+    /// identical to the original authenticated request.
+    fn same_normalization_intent(
+        original: &UserAutomationServiceRequest,
+        current: &UserAutomationServiceRequest,
+    ) -> bool {
+        original.identity.operation_id == current.identity.operation_id
+            && original.identity.idempotency_key == current.identity.idempotency_key
+            && original.authenticated_principal == current.authenticated_principal
+            && original.intent == current.intent
+            && original.context.session_id == current.context.session_id
+            && original.context.task_id == current.context.task_id
+            && original.context.product_id == current.context.product_id
+            && original.context.source_id == current.context.source_id
+            && original.context.state_fence == current.context.state_fence
+    }
+
     /// Executes one authenticated `UserAutomation` operator operation as one
     /// post-commit orchestration transition.
     ///
@@ -2733,6 +2959,13 @@ impl KernelStoreGateway {
             UserAutomationExecutionError::Runtime(UserAutomationRuntimeError::Rejected(error))
         })?;
         Self::validate_user_automation_request(&request)?;
+        if matches!(
+            &request.intent.operation,
+            UserAutomationOperation::Create { .. } | UserAutomationOperation::Edit { .. }
+        ) {
+            self.validate_submitted_normalization_owner(&request)
+                .await?;
+        }
         let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
         // The sealed request is the one value this frame must keep across every
         // remaining await, and it inlines the closed operator operation
@@ -2783,6 +3016,109 @@ impl KernelStoreGateway {
             .validate()
             .map_err(user_automation_gateway_unknown)?;
         Ok(transition)
+    }
+
+    /// Proves Create/Edit's revision and original envelope came from the
+    /// independently retained normalization owner before any Store mutation.
+    async fn validate_submitted_normalization_owner(
+        &self,
+        request: &UserAutomationServiceRequest,
+    ) -> Result<(), UserAutomationExecutionError> {
+        let (UserAutomationOperation::Create {
+            revision,
+            normalization_receipt_envelope: envelope,
+        }
+        | UserAutomationOperation::Edit {
+            revision,
+            normalization_receipt_envelope: envelope,
+            ..
+        }) = &request.intent.operation
+        else {
+            return Ok(());
+        };
+        let fence = request.context.state_fence.clone();
+        let named = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::normalization_read_request(
+            fence.clone(),
+            revision.automation_id.clone(),
+            revision.revision.clone(),
+        )
+        .map_err(user_automation_gateway_unknown)?;
+        let response = self
+            .execute_named(named.clone())
+            .await
+            .map_err(user_automation_gateway_unknown)?;
+        let record = CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::project_normalization_record(
+            &revision.automation_id,
+            &revision.revision,
+            &named,
+            &response,
+        )
+        .map_err(|_| normalization_receipt_binding())?
+        .ok_or_else(normalization_receipt_binding)?;
+        let receipt = self
+            .receipt(&fence, record.operation_id.clone())
+            .await
+            .map_err(user_automation_gateway_unknown)?
+            .ok_or_else(|| {
+                user_automation_gateway_unknown(
+                    "retained normalization has no canonical write receipt",
+                )
+            })?;
+        CanonicalUserAutomationStore::<
+            EbpCanonicalStoreClient<NamedPipeTransport>,
+        >::validate_normalization_write_receipt(&record, &receipt)
+        .map_err(|_| normalization_receipt_binding())?;
+        let (original, retained_revision, retained_envelope) =
+            super::user_automation_store::validate_normalization_record(&record)
+                .map_err(|_| normalization_receipt_binding())?;
+        let same_context = original.authenticated_principal == request.authenticated_principal
+            && original.context.session_id == request.context.session_id
+            && original.context.task_id == request.context.task_id
+            && original.context.product_id == request.context.product_id
+            && original.context.source_id == request.context.source_id
+            && original.context.state_fence == request.context.state_fence;
+        let migration_predecessor_matches =
+            match (&original.intent.operation, &request.intent.operation) {
+                (
+                    UserAutomationOperation::MigrateLegacySchedule {
+                        previous_revision, ..
+                    },
+                    UserAutomationOperation::Edit {
+                        previous_revision: submitted,
+                        ..
+                    },
+                ) => previous_revision == submitted,
+                (UserAutomationOperation::NormalizeSchedule { .. }, _) => true,
+                _ => false,
+            };
+        let submitted_revision_json =
+            serde_json::to_string(revision).map_err(user_automation_gateway_unknown)?;
+        let submitted_envelope =
+            serde_json::to_value(envelope).map_err(user_automation_gateway_unknown)?;
+        if !same_context
+            || !migration_predecessor_matches
+            || record.revision_json != submitted_revision_json
+            || record.normalization_receipt_json != submitted_envelope
+            || retained_revision != **revision
+            || retained_envelope != **envelope
+        {
+            return Err(normalization_receipt_binding());
+        }
+        let operation_kind = super::user_automation_store::submitted_normalization_operation_kind(
+            &request.intent.operation,
+        )
+        .map_err(|_| normalization_receipt_binding())?;
+        super::user_automation_store::revision_with_owner_normalization_receipt(
+            revision,
+            &retained_envelope,
+            operation_kind,
+        )
+        .map_err(|_| normalization_receipt_binding())?;
+        Ok(())
     }
 
     /// Composes the one post-commit orchestration record of a parent operator
@@ -4996,6 +5332,7 @@ impl KernelStoreGateway {
         let UserAutomationOperation::Edit {
             previous_revision,
             revision,
+            ..
         } = &sealed.intent.operation
         else {
             return Err("the superseding-edit handoff requires edit".to_owned());
@@ -8570,6 +8907,12 @@ enum RetainedUserAutomationObligation {
         /// event nor owner readback ties the body to this claim, which keeps
         /// the answer refused rather than served.
         transport_request_sha256: Option<String>,
+        /// Whether the durable row binds exact owner readback to this claim
+        /// with a result digest equal to the readback's result commitment
+        /// (issue #2970). When set, the retained body is this obligation's
+        /// own exact answer even though it carries no enumeration-receipt
+        /// shape.
+        owner_readback_binds_answer: bool,
     },
     /// The durable record proves the owner effect was issued and its answer is
     /// not durably known, so repeating it is not safe.
@@ -8590,13 +8933,13 @@ enum RetainedUserAutomationObligation {
 /// A `ResultReceived`/`Terminal` row holding an answer is answered, and the
 /// carrier commitment it is read back against is whichever of the two
 /// independently recorded values the claim actually carries: the response
-/// observation's own carrier digest, or — for a claim settled by exact owner
-/// readback, which appends no response observation (issue #2970) — the
-/// ORIGINAL admitted carrier digest, admitted only while the retained owner
-/// evidence still binds to this operation, request, payload, attempt identity
-/// and attempt generation and still owns the record's result digest. A claim
-/// carrying neither stays unanswered, so an unknown outcome is never projected
-/// as a settled answer (I14.21).
+/// observation's own carrier digest, or — for a row settled by exact owner
+/// readback before the response observation was persisted (issue #2970) —
+/// the ORIGINAL admitted carrier digest, admitted only while the retained
+/// owner evidence still binds to this operation, request, payload, attempt
+/// identity and attempt generation and still owns the record's result
+/// digest. A claim carrying neither stays unanswered, so an unknown outcome
+/// is never projected as a settled answer (I14.21).
 fn classify_retained_obligation(
     obligation: &UserAutomationRuntimeObligation,
     record: HostRequestRecord,
@@ -8630,16 +8973,18 @@ fn classify_retained_obligation(
             .map(|observation| observation.transport_request_sha256.clone())
     });
     // An exact owner readback settles the claim in the same transaction as the
-    // result body, but it does not rewrite the original transport observation
-    // history (issue #2970): the readback path terminalizes the phase without
-    // appending a `ResponseReceived` observation. That evidence is an
-    // independently recorded owner receipt, and ORS binds it to this exact
-    // operation, request, payload, attempt identity and attempt generation, and
-    // requires the retained result digest to equal its recorded owner result
-    // commitment. So when that binding holds, the retained body is this
-    // obligation's own answer and the value it must be read back against is the
-    // ORIGINAL admitted carrier digest — not a digest of the retained body, and
-    // not an echo of any payload.
+    // result body. Current settle code (issue #2970 A10) appends the
+    // `ResponseReceived` observation carrying the retained result commitment;
+    // rows settled before that repair carry the readback without such an
+    // observation, so the admitted-carrier fallback below keeps those rows
+    // decodable. That evidence is an independently recorded owner receipt,
+    // and ORS binds it to this exact operation, request, payload, attempt
+    // identity and attempt generation, and requires the retained result digest
+    // to equal its recorded owner result commitment. So when that binding
+    // holds, the retained body is this obligation's own answer and the value
+    // it must be read back against is the ORIGINAL admitted carrier
+    // digest — not a digest of the retained body, and not an echo of any
+    // payload.
     //
     // Requiring the owner's recorded result commitment to equal the record's
     // own `result_digest` is a comparison against a value the owner committed
@@ -8647,21 +8992,22 @@ fn classify_retained_obligation(
     // committed to under this claim — still fails here and stays refused. A
     // claim with no readback and no response observation keeps the previous
     // refusal, so an unknown outcome is never turned into a settled one.
-    let owner_readback_transport_request_sha256 = record
-        .attempt
-        .as_ref()
-        .filter(|attempt| {
-            attempt.owner_readback.as_ref().is_some_and(|readback| {
-                readback.operation_id == record.operation_id
-                    && readback.request_digest == record.request_digest
-                    && readback.payload_digest == record.payload_digest
-                    && readback.attempt_id == attempt.attempt_id
-                    && readback.attempt_generation == attempt.generation
-                    && record.result_digest.as_deref()
-                        == Some(readback.result_commitment_sha256.as_str())
-            })
+    let owner_readback_binds_answer = record.attempt.as_ref().is_some_and(|attempt| {
+        attempt.owner_readback.as_ref().is_some_and(|readback| {
+            readback.operation_id == record.operation_id
+                && readback.request_digest == record.request_digest
+                && readback.payload_digest == record.payload_digest
+                && readback.attempt_id == attempt.attempt_id
+                && readback.attempt_generation == attempt.generation
+                && record.result_digest.as_deref()
+                    == Some(readback.result_commitment_sha256.as_str())
         })
-        .and(admitted_transport_request_sha256);
+    });
+    let owner_readback_transport_request_sha256 = if owner_readback_binds_answer {
+        admitted_transport_request_sha256
+    } else {
+        None
+    };
     let transport_request_sha256 = if record.send_claim_protocol_version
         == eliot_ors::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION
     {
@@ -8695,6 +9041,7 @@ fn classify_retained_obligation(
             RetainedUserAutomationObligation::Answered {
                 result_response,
                 transport_request_sha256,
+                owner_readback_binds_answer,
             }
         }
         (state, _) => reconciling(state),
@@ -8784,12 +9131,14 @@ fn classify_retained_cancellation(
         RetainedObligationLookup::Held(RetainedUserAutomationObligation::Answered {
             result_response,
             transport_request_sha256,
+            owner_readback_binds_answer,
         }) => match decode_retained_cancellation_answer(
             result_response,
             automation_revision,
             &obligation.owner_operation_id,
             obligation.wake_enumeration_receipt.as_deref(),
             transport_request_sha256.as_deref(),
+            owner_readback_binds_answer,
         ) {
             Ok((cancelled_wake_ids, enumeration_receipt)) => RetainedCancellation::Answered {
                 cancelled_wake_ids,
@@ -9084,56 +9433,101 @@ fn decode_retained_wake_enumeration_receipt(
     Ok(*receipt)
 }
 
+/// Expected cancelled wake ids of one retained enumeration receipt, or the
+/// shared unretained-answer refusal when its targets cannot be read.
+fn expected_cancellation_wake_ids(
+    receipt: &UserAutomationWakeEnumerationReceipt,
+    automation_revision: &str,
+    owner_operation_id: &str,
+) -> Result<Vec<String>, String> {
+    Ok(receipt
+        .cancellation_targets()
+        .map_err(|_| {
+            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
+        })?
+        .into_iter()
+        .map(|target| target.wake_id)
+        .collect::<Vec<_>>())
+}
+
 /// Decodes the retained wake-cancellation answer of one durable obligation, or
 /// names why the retained body is not this operation's answer.
+///
+/// A claim settled by exact owner readback (issue #2970) retains the
+/// `UserAutomationHostExecutionResponse::Cancelled` body, which carries no
+/// enumeration-receipt shape; when the durable row binds that readback to
+/// this claim with a matching result digest, the body is accepted as this
+/// obligation's exact answer on its own carrier, fence and target
+/// commitments.
 fn decode_retained_cancellation_answer(
     result_response: serde_json::Value,
     automation_revision: &str,
     owner_operation_id: &str,
     expected_receipt: Option<&UserAutomationWakeEnumerationReceipt>,
     expected_transport_request_sha256: Option<&str>,
+    owner_readback_binds_answer: bool,
 ) -> Result<(Vec<String>, UserAutomationWakeEnumerationReceipt), String> {
+    let refuse = || unretained_cancellation_answer_reason(automation_revision, owner_operation_id);
     let Some(expected_receipt) = expected_receipt else {
-        return Err(unretained_cancellation_answer_reason(
-            automation_revision,
-            owner_operation_id,
-        ));
+        return Err(refuse());
     };
     if let Ok(UserAutomationRuntimeObligationAnswer::WakeCancellation {
         cancelled_wake_ids,
         enumeration_receipt: Some(enumeration_receipt),
     }) = serde_json::from_value::<UserAutomationRuntimeObligationAnswer>(result_response.clone())
     {
-        enumeration_receipt.validate_integrity().map_err(|_| {
-            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-        })?;
+        enumeration_receipt
+            .validate_integrity()
+            .map_err(|_| refuse())?;
         if enumeration_receipt.as_ref() != expected_receipt {
-            return Err(unretained_cancellation_answer_reason(
-                automation_revision,
-                owner_operation_id,
-            ));
+            return Err(refuse());
         }
-        let expected_wake_ids = enumeration_receipt
-            .cancellation_targets()
-            .map_err(|_| {
-                unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-            })?
-            .into_iter()
-            .map(|target| target.wake_id)
-            .collect::<Vec<_>>();
+        let expected_wake_ids = expected_cancellation_wake_ids(
+            enumeration_receipt.as_ref(),
+            automation_revision,
+            owner_operation_id,
+        )?;
         if expected_wake_ids.is_empty() || cancelled_wake_ids != expected_wake_ids {
-            return Err(unretained_cancellation_answer_reason(
-                automation_revision,
-                owner_operation_id,
-            ));
+            return Err(refuse());
         }
         return Ok((cancelled_wake_ids, *enumeration_receipt));
     }
-    let Some(expected_transport_request_sha256) = expected_transport_request_sha256 else {
-        return Err(unretained_cancellation_answer_reason(
+    // Issue #2970 A5: the exact answer of a claim settled by owner readback
+    // is the `UserAutomationHostExecutionResponse::Cancelled` body, which
+    // carries no enumeration-receipt shape, so the arm above can never accept
+    // it. When the durable row binds exact owner readback to this operation,
+    // request, payload and attempt and its result digest equals the
+    // readback's result commitment, that retained body IS this obligation's
+    // exact answer: accept it on its own carrier, fence and target
+    // commitments. Only genuinely missing or conflicting evidence stays
+    // unresolved.
+    if owner_readback_binds_answer {
+        let Ok(UserAutomationHostExecutionResponse::Cancelled {
+            request_sha256,
+            state_fence,
+            wake_ids,
+        }) = serde_json::from_value::<UserAutomationHostExecutionResponse>(result_response.clone())
+        else {
+            return Err(refuse());
+        };
+        expected_receipt
+            .validate_integrity()
+            .map_err(|_| refuse())?;
+        let expected_wake_ids = expected_cancellation_wake_ids(
+            expected_receipt,
             automation_revision,
             owner_operation_id,
-        ));
+        )?;
+        if expected_transport_request_sha256 == Some(request_sha256.as_str())
+            && state_fence == expected_receipt.state_fence
+            && wake_ids == expected_wake_ids
+        {
+            return Ok((wake_ids, expected_receipt.clone()));
+        }
+        return Err(refuse());
+    }
+    let Some(expected_transport_request_sha256) = expected_transport_request_sha256 else {
+        return Err(refuse());
     };
     let Ok(UserAutomationHostExecutionResponse::Cancelled {
         request_sha256,
@@ -9141,22 +9535,13 @@ fn decode_retained_cancellation_answer(
         wake_ids,
     }) = serde_json::from_value::<UserAutomationHostExecutionResponse>(result_response)
     else {
-        return Err(unretained_cancellation_answer_reason(
-            automation_revision,
-            owner_operation_id,
-        ));
+        return Err(refuse());
     };
-    expected_receipt.validate_integrity().map_err(|_| {
-        unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-    })?;
-    let expected_wake_ids = expected_receipt
-        .cancellation_targets()
-        .map_err(|_| {
-            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-        })?
-        .into_iter()
-        .map(|target| target.wake_id)
-        .collect::<Vec<_>>();
+    expected_receipt
+        .validate_integrity()
+        .map_err(|_| refuse())?;
+    let expected_wake_ids =
+        expected_cancellation_wake_ids(expected_receipt, automation_revision, owner_operation_id)?;
     if request_sha256 != expected_transport_request_sha256
         || state_fence != expected_receipt.state_fence
         || wake_ids != expected_wake_ids
@@ -9312,6 +9697,9 @@ fn schedule_horizon_trigger(
         | UserAutomationOperation::RunNow { .. }
         | UserAutomationOperation::Remove { .. }
         | UserAutomationOperation::InspectLastFailure { .. }
+        | UserAutomationOperation::GetContext
+        | UserAutomationOperation::NormalizeSchedule { .. }
+        | UserAutomationOperation::MigrateLegacySchedule { .. }
         // A committed recurring wake horizon belongs to a committed AUTOMATION
         // configuration revision, and the closed reason above names the
         // revision transition that produced it. I12.24:65's decision-owner
