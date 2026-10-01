@@ -110,6 +110,22 @@ pub struct SelectedSourceCaptureCanonicalAdmission {
     /// under that same WorkScope immediately before canonical admission.
     pub(crate) source_workspace:
         crate::task_binding_admission::BoundSelectedSourceObservation,
+    /// Verbatim current Kernel named-read payload and validated projection of
+    /// the original Instrument Registry snapshot used for this admission.
+    pub(crate) instrument_registry_readback: SelectedSourceInstrumentRegistryReadback,
+}
+
+/// Same-fence original Store readback of the admitted instrument snapshot.
+///
+/// The recovered registry is a validated projection of these exact bytes; it
+/// does not create provider freshness or an executable observation.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub(crate) struct SelectedSourceInstrumentRegistryReadback {
+    pub(crate) snapshot_json: String,
+    pub(crate) revision: u64,
+    pub(crate) state_fence: StateFence,
+    pub(crate) registry: eliot_instrument_runner::InstrumentRegistry,
 }
 
 /// Typed failures from the live captured-LSP source read and semantic adoption.
@@ -2426,6 +2442,73 @@ impl DaemonComposition {
                 "staged source digest differs from bytes read under the current WorkScope root",
             ));
         }
+        let registry_request = eliot_store_api::NamedReadRequest {
+            operation: eliot_store_api::NamedReadOperation::GetInstrumentRegistryState,
+            scope_id: None,
+            consistency: eliot_store_api::ReadConsistency::ExactFence,
+            state_fence: claimed.host_request_envelope.state_fence.clone(),
+            parameters: BTreeMap::new(),
+        };
+        let registry_response = kernel
+            .store_named_async(registry_request.clone())
+            .await
+            .map_err(CapturedLspAdoptionError::KernelTransition)?;
+        if registry_response.operation != registry_request.operation
+            || registry_response.state_fence != registry_request.state_fence
+        {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "Instrument Registry owner readback changed the exact request operation or fence",
+            ));
+        }
+        let registry_json = registry_response
+            .payload
+            .get("snapshot_json")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "current Instrument Registry owner has no persisted snapshot",
+            ))?;
+        let registry_revision = registry_response
+            .payload
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .ok_or(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "current Instrument Registry owner readback has no positive revision",
+            ))?;
+        let instrument_registry = eliot_instrument_runner::InstrumentRegistry::recover(registry_json)
+            .map_err(|_| {
+                CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                    "current Instrument Registry owner snapshot failed its existing recovery validator",
+                )
+            })?;
+        let instrument_name = match claimed.invocation.operation {
+            eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => {
+                eliot_instrument_runner::RUST_ANALYZER_DIAGNOSTICS_INSTRUMENT
+            }
+            eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => {
+                eliot_instrument_runner::RUST_ANALYZER_VERSION_INSTRUMENT
+            }
+        };
+        if instrument_registry
+            .spec(instrument_name)
+            .is_none()
+            || instrument_registry
+                .admitted(
+                    eliot_instrument_runner::RUST_ANALYZER_PROFILE,
+                    eliot_instrument_runner::BUILTIN_PROFILE_REVISION,
+                )
+                .is_err()
+        {
+            return Err(CapturedLspAdoptionError::SelectedSourceCaptureRequest(
+                "current Instrument Registry owner snapshot does not admit the exact one-shot Rust Analyzer profile and operation",
+            ));
+        }
+        let instrument_registry_readback = SelectedSourceInstrumentRegistryReadback {
+            snapshot_json: registry_json.to_owned(),
+            revision: registry_revision,
+            state_fence: registry_response.state_fence,
+            registry: instrument_registry,
+        };
         let expected_operation = match claimed.invocation.operation {
             eliot_protocol::SelectedSourceCaptureOperation::Diagnostics => "Diagnostics",
             eliot_protocol::SelectedSourceCaptureOperation::ProbeVersion => "ProbeVersion",
@@ -2589,6 +2672,7 @@ impl DaemonComposition {
             activation,
             work_scope: current.work_scope().clone(),
             source_workspace,
+            instrument_registry_readback,
         })
     }
 
