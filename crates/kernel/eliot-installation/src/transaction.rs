@@ -2777,8 +2777,11 @@ impl InstallationTransaction {
         &self,
         owned_watchdog: Option<usize>,
     ) -> Result<(), InstallationError> {
-        for (index, (effect, progress)) in
-            self.installer_effects.iter().zip(&self.effect_progress).enumerate()
+        for (index, (effect, progress)) in self
+            .installer_effects
+            .iter()
+            .zip(&self.effect_progress)
+            .enumerate()
         {
             let lineage = progress
                 .service_start_proof
