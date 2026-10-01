@@ -288,17 +288,25 @@ fn resolve_epoch(
 /// Executes one isolated restore and reports the observed outcome.
 ///
 /// Resolves the target lineage (explicit triple or fresh genesis lineage),
-/// creates a temp-enforced isolated root, and drives the governed journaled
-/// executor. Returns the target-observed receipt and evidence; cutover is
-/// never performed and `operational_recovery_ready` stays false.
+/// binds the correlated `operation_id` this run answers for, creates a
+/// temp-enforced isolated root, and drives the governed journaled executor.
+/// Returns the target-observed receipt and evidence; cutover is never performed
+/// and `operational_recovery_ready` stays false.
 pub fn run_restore(
     bundle_bytes: &[u8],
     key_bytes: Option<&[u8]>,
     target_id: &str,
+    operation_id: &str,
     epoch_spec: &RestoreEpochSpec,
     label: &str,
 ) -> Result<RestoreRunReport, BackupError> {
     text(target_id, "restore.target_id")?;
+    // The correlated operation identity this run answers for. It is carried
+    // through unchanged into the plan, the journal stream key and the recorded
+    // transaction, so the identity an operator is told to reconcile is one the
+    // owner actually recorded. A blank one refuses here, before any root is
+    // created, rather than defaulting a key two operations could collide on.
+    text(operation_id, "restore.operation_id")?;
     let bundle = BackupBundle::decode(bundle_bytes)?;
     let keys = key_bytes.map(decode_manifest).transpose()?;
     let (authority_epoch, resource_generation) = resolve_epoch(&bundle, epoch_spec)?;
@@ -311,6 +319,7 @@ pub fn run_restore(
     let outcome = execute_isolated_restore(
         &bundle,
         target,
+        operation_id,
         authority_epoch,
         resource_generation,
         &root,

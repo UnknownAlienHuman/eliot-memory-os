@@ -191,20 +191,34 @@ impl IsolatedRestorePlan {
 /// Plans one isolated restore into `root`.
 ///
 /// Compiles the governed plan (validating the bundle, checksums, schema,
-/// purge binding, class denominator, and lineage advance), asserts the
-/// purge-first step order, imports pending ORS work as suspended recovery
-/// (empty for archives without an ORS snapshot), and mints the fresh
-/// Authority Epoch plus Host/Kernel generation the caller proposes. The
-/// minted fence must equal the plan's fence: the caller cannot smuggle a
-/// different lineage past the plan.
+/// purge binding, class denominator, and lineage advance), binds the correlated
+/// operation identity the restore request carried, asserts the purge-first step
+/// order, imports pending ORS work as suspended recovery (empty for archives
+/// without an ORS snapshot), and mints the fresh Authority Epoch plus
+/// Host/Kernel generation the caller proposes. The minted fence must equal the
+/// plan's fence: the caller cannot smuggle a different lineage past the plan.
+///
+/// `operation_id` is the request's own operation identity, carried through
+/// unchanged and never re-derived. It is part of the durable journal stream key
+/// this plan will address, so a blank or control-bearing value is refused here
+/// as [`BackupError::InvalidField`] rather than becoming a default key under
+/// which two operations could collide.
 pub fn plan_isolated_restore(
     bundle: &BackupBundle,
     target: RestoreContext,
+    operation_id: &str,
     authority_epoch: EpochId,
     resource_generation: ResourceGeneration,
     root: &IsolatedRoot,
 ) -> Result<IsolatedRestorePlan, BackupError> {
-    let plan = RestorePlan::compile(bundle, target)?;
+    let mut plan = RestorePlan::compile(bundle, target)?;
+    // The correlated operation identity the restore request carried is bound
+    // BEFORE anything derives a journal identity from this plan. It is the
+    // request's own value, carried through unchanged: without it the durable
+    // stream key would be a function of the archive alone, so two operations
+    // over byte-identical bundles would share one stream and the second would
+    // read back the first's final receipt.
+    plan.bind_operation(operation_id)?;
     // Issue #1141, A6: A13.7 orders the isolated rehearsal ahead of cutover —
     // "restore to isolated root; validate format/schema/checksums; apply privacy
     // purge ledger; rebuild projections/indexes; verify receipt/event chain" —

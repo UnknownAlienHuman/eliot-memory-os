@@ -22,7 +22,13 @@
 //!   helpers — the stream through
 //!   [`RestoreJournalAdmissionOwner::issue_journal_stream`], which publishes it
 //!   outward rather than taking it from a caller — so a caller cannot point the
-//!   issuer at a stream of its own choosing.
+//!   issuer at a stream of its own choosing. What the plan DOES carry is the
+//!   operation identity the restore request itself carried
+//!   ([`RestorePlan::bind_operation`]), and that value is part of the stream
+//!   key and of the transaction. It is not chosen here: it is the request's own
+//!   value, and a plan that never bound one is refused typed rather than keyed
+//!   on the archive alone, which is what let two operations over byte-identical
+//!   bundles share one stream.
 //! - It does not add a second trust scheme. The binding is the existing
 //!   [`OwnerTrustBinding`], and the production test remains the existing
 //!   `require_production_admitted` in the restore owner: this module never
@@ -113,15 +119,16 @@ pub struct DurableJournalRecord {
     ///
     /// This is NOT the per-execution stream key. A channel is fixed across
     /// every execution the owner issues for; the stream key is derived from
-    /// the plan (`sha256(plan_id, bundle_sha256)`) and differs for every
-    /// plan/bundle pair, so it can never equal a fixed channel name. The
-    /// admission's `journal_identity_ref` therefore carries ONE meaning — the
-    /// durable channel — and consumers that need to know which store admitted a
-    /// restore compare it against that channel's own name, which is exactly
-    /// what a composition-side channel check must do. The per-execution stream
-    /// this record was read under is the `journal_key` argument
-    /// [`RestoreJournalAdmissionOwner::durable_journal_record`] was called with,
-    /// and it is proved by that read rather than by this field;
+    /// the plan, its bundle AND the operation identity the request carried
+    /// (`sha256(plan_id, bundle_sha256, operation_id)`) and differs for every
+    /// plan/bundle/operation triple, so it can never equal a fixed channel
+    /// name. The admission's `journal_identity_ref` therefore carries ONE
+    /// meaning — the durable channel — and consumers that need to know which
+    /// store admitted a restore compare it against that channel's own name,
+    /// which is exactly what a composition-side channel check must do. The
+    /// per-execution stream this record was read under is the `journal_key`
+    /// argument [`RestoreJournalAdmissionOwner::durable_journal_record`] was
+    /// called with, and it is proved by that read rather than by this field;
     /// [`RestoreJournalAdmission::binds_owner_record`] supplies the operation
     /// itself and reads the same stream.
     pub journal_identity_ref: String,
@@ -169,6 +176,13 @@ pub trait RestoreJournalAdmissionOwner {
     ///   and published outward. A caller receives the key; it never computes
     ///   one, and no caller-supplied key is accepted, so a coordinator cannot
     ///   point the admission at a stream of its own choosing.
+    /// - The key material is `(plan_id, bundle_sha256, operation_id)`, where
+    ///   `operation_id` is the correlated identity the restore request carried
+    ///   and the plan recorded. Two frames over byte-identical bundles under
+    ///   different operations therefore establish two streams, so the second
+    ///   can never resume the first's and read its `final_receipt` back. A plan
+    ///   that never bound an operation identity is
+    ///   [`BackupError::InvalidField`] and establishes nothing.
     /// - A stream the owner has not established is established by one genesis
     ///   compare-and-swap through the accepted [`RestoreJournalPort`] seam the
     ///   restore engine itself writes through — so the same owner binding, the
@@ -211,8 +225,31 @@ pub trait RestoreJournalAdmissionOwner {
 /// The exact operation one journal admission is bound to.
 ///
 /// Both values are derived from the plan, never supplied: the journal key is
-/// the crate's own stream identity for this plan/bundle pair, and the
-/// transaction is the stable identity for this plan, bundle and context.
+/// the crate's own stream identity for this plan, its bundle AND the operation
+/// identity the request carried, and the transaction is the stable identity for
+/// this plan, operation, bundle and context.
+///
+/// ## Why the operation identity is part of the stream key
+///
+/// The key was `sha256((plan_id, bundle_sha256))`, and `plan_id` is
+/// `restore-plan-<backup_id>` — a function of the ARCHIVE alone. Two restore
+/// frames with byte-identical bundles and different `idempotency_key`s therefore
+/// derived ONE stream: the second loaded the first's completed record and
+/// returned the first's `final_receipt` while answering under its own
+/// correlated key. Adding the request's own operation identity to the material
+/// makes the two derive different streams and different transactions, so a
+/// fresh request under another key cannot read the first one's receipt back.
+/// The bundle identity STAYS in the key — it is a real part of stream
+/// identity — and the operation identity is added, never substituted.
+///
+/// The identity is the request's value carried through unchanged. It is not
+/// re-derived here, not hashed into a second name, and not invented: it is the
+/// same value reconciliation and the operator's `next_action` guidance name, so
+/// "reconcile the same operation {idempotency_key}" refers to something the
+/// owner actually recorded. An admission cannot be issued for a plan that never
+/// bound one — [`RestorePlan::require_operation_identity`] refuses with this
+/// crate's typed [`BackupError::InvalidField`], so there is no default key that
+/// could let two operations collide again.
 struct AdmittedJournalOperation {
     journal_key: String,
     transaction: RestoreTransaction,
@@ -364,13 +401,13 @@ impl RestoreJournalAdmission {
     /// for, and the channel is one fixed name for every stream the owner serves
     /// — the owner's own value, reported at issue time and re-read here. It is
     /// NOT the per-execution stream key: that key is
-    /// `sha256(plan_id, bundle_sha256)`, a different value for every
-    /// plan/bundle pair, so requiring the channel field to equal it made the
-    /// re-proof unsatisfiable for every owner that issues an honest channel
-    /// identity. It is compared here against what the owner reports for the
-    /// exact stream this plan names, which is the strongest statement the field
-    /// can carry: an admission borrowed from another channel, another store or
-    /// another owner refuses.
+    /// `sha256(plan_id, bundle_sha256, operation_id)`, a different value for
+    /// every plan/bundle/operation triple, so requiring the channel field to
+    /// equal it made the re-proof unsatisfiable for every owner that issues an
+    /// honest channel identity. It is compared here against what the owner
+    /// reports for the exact stream this plan names, which is the strongest
+    /// statement the field can carry: an admission borrowed from another
+    /// channel, another store or another owner refuses.
     ///
     /// The per-execution binding is not weakened by that change and is not
     /// carried by this field: `is_journal_of` reads the live journal UNDER

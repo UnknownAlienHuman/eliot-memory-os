@@ -1222,15 +1222,35 @@ pub enum RestoreStep {
 }
 
 /// Stable identity for one recoverable restore transaction. The identity is
-/// bound to the exact bundle, compiled plan and target context; none of these
-/// values may drift while a journaled restore is resumed.
+/// bound to the exact operation, bundle, compiled plan and target context; none
+/// of these values may drift while a journaled restore is resumed.
+///
+/// `operation_id` is recorded, not only hashed into `transaction_id`: it is the
+/// value the owner wrote down, so an operator reconciling "the same operation
+/// {idempotency_key}" reads a recorded identity rather than inferring one. It
+/// is the request's own value carried through unchanged, and
+/// [`RestoreTransaction::operation_id`] refuses a blank one.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestoreTransaction {
     pub transaction_id: String,
+    /// The correlated operation identity this restore runs under, as recorded.
+    pub operation_id: String,
     pub bundle_sha256: String,
     pub plan_sha256: String,
     pub context_sha256: String,
+}
+
+impl RestoreTransaction {
+    /// The recorded operation identity, or the crate's own typed refusal.
+    ///
+    /// A transaction whose recorded identity is blank or control-bearing names
+    /// no operation, so it can be neither reconciled nor compared: it is
+    /// refused here rather than treated as a match.
+    pub fn operation_id(&self) -> Result<&str, BackupError> {
+        text(&self.operation_id, "restore.transaction.operation_id")?;
+        Ok(self.operation_id.as_str())
+    }
 }
 
 /// One externally visible restore boundary. Item identities are stable and do
@@ -1333,10 +1353,36 @@ pub trait RestoreJournalPort {
 }
 
 /// A validated isolated restore plan. It never performs cutover.
+///
+/// ## Why the plan carries the OPERATION identity and not only the archive's
+///
+/// `plan_id` is `restore-plan-<backup_id>`, so it depends on the ARCHIVE alone.
+/// The durable journal stream key was derived from `(plan_id, bundle_sha256)`,
+/// which means two restore operations over byte-identical bundles addressed ONE
+/// stream: the second frame loaded the first's completed record and returned the
+/// first's `final_receipt` while answering under its own correlated identity.
+/// The plan therefore also records [`Self::operation_id`], the correlated
+/// operation identity the restore REQUEST carried, and both journal-facing
+/// derivations — the stream key and the transaction — are bound to it.
+///
+/// [`Self::compile`] does not know that identity (a preview, or any plan
+/// compilation that addresses no journal, has no operation), so it leaves the
+/// field empty. Every derivation that would key, name or resume a durable
+/// stream calls [`Self::require_operation_identity`] first and refuses with this
+/// crate's own typed [`BackupError::InvalidField`] when it is empty. There is no
+/// default key: an unbound plan addresses no stream at all, which is the only
+/// outcome that cannot let two operations collide.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestorePlan {
     pub plan_id: String,
+    /// The correlated operation identity this restore runs under, carried
+    /// through unchanged from the restore request: the same value the caller
+    /// holds and the same value reconciliation and operator guidance name.
+    ///
+    /// Empty until [`Self::bind_operation`] supplies it, and every
+    /// journal-facing derivation refuses rather than deriving a key without it.
+    pub operation_id: String,
     pub bundle_sha256: String,
     pub target: RestoreContext,
     pub restored_fence: RestoredFence,
@@ -1377,6 +1423,12 @@ impl RestorePlan {
         let steps = expected_restore_steps(bundle);
         Ok(Self {
             plan_id: format!("restore-plan-{}", bundle.manifest.backup_id),
+            // The correlated operation identity is not derivable from the
+            // archive: two operations over byte-identical bundles differ only
+            // here. It is supplied through `bind_operation`, and every
+            // journal-facing derivation refuses while it is unbound rather
+            // than keying a stream on the archive alone.
+            operation_id: String::new(),
             bundle_sha256: bundle.bundle_sha256()?,
             target,
             restored_fence,
@@ -1384,14 +1436,53 @@ impl RestorePlan {
         })
     }
 
+    /// Binds the correlated operation identity this restore runs under.
+    ///
+    /// The value is the restore request's OWN operation identity, carried
+    /// through unchanged. It is not re-derived here, not hashed into a second
+    /// name, and not invented: this is the value the caller holds to reconcile
+    /// this exact operation later and the value operator guidance names when
+    /// it says "reconcile the same operation". Because it is a public field,
+    /// this method is the gate that refuses a blank or control-bearing
+    /// identity before it can become part of any durable stream key.
+    pub fn bind_operation(&mut self, operation_id: &str) -> Result<(), BackupError> {
+        text(operation_id, "restore.operation_id")?;
+        self.operation_id = operation_id.to_owned();
+        Ok(())
+    }
+
+    /// The operation identity this plan is bound to, or the crate's own typed
+    /// refusal when the plan was never bound.
+    ///
+    /// This is the single gate every journal-facing derivation passes. A caller
+    /// that reaches the journal without an operation identity gets
+    /// [`BackupError::InvalidField`] — never a stream keyed on the archive
+    /// alone, which is what let two operations share one stream and read back
+    /// each other's receipts.
+    pub fn require_operation_identity(&self) -> Result<&str, BackupError> {
+        if self.operation_id.is_empty() {
+            return Err(BackupError::InvalidField {
+                field: "restore.operation_id",
+                reason: "a restore journal stream requires the operation identity this restore runs under",
+            });
+        }
+        text(&self.operation_id, "restore.operation_id")?;
+        Ok(self.operation_id.as_str())
+    }
+
     /// Derives the stable transaction identity for this exact plan/context.
     pub fn transaction(&self) -> Result<RestoreTransaction, BackupError> {
         let bundle_sha256 = self.bundle_sha256.clone();
         digest(&bundle_sha256, "restore.transaction.bundle_sha256")?;
+        // Bound to the operation identity, so a stream already holding another
+        // operation's transaction refuses rather than being adopted. Read
+        // through the single gate above: an unbound plan has no transaction.
+        let operation_id = self.require_operation_identity()?;
         let plan_sha256 = sha256(self)?;
         let context_sha256 = sha256(&self.target)?;
         let transaction_material = (
             self.plan_id.as_str(),
+            operation_id,
             bundle_sha256.as_str(),
             plan_sha256.as_str(),
             context_sha256.as_str(),
@@ -1399,14 +1490,34 @@ impl RestorePlan {
         let transaction_id = format!("restore-transaction-{}", sha256(&transaction_material)?);
         Ok(RestoreTransaction {
             transaction_id,
+            operation_id: operation_id.to_owned(),
             bundle_sha256,
             plan_sha256,
             context_sha256,
         })
     }
 
+    /// Derives the durable journal stream identity for this restore operation.
+    ///
+    /// `sha256((plan_id, bundle_sha256, operation_id))`. The bundle identity
+    /// STAYS in the key — it is a real part of stream identity — and the
+    /// operation identity is ADDED, not substituted for it. Before this, the
+    /// key was `sha256((plan_id, bundle_sha256))` and `plan_id` depends only on
+    /// the archive, so two frames with byte-identical bundles and different
+    /// `idempotency_key`s derived ONE stream: the second loaded the first's
+    /// completed record and returned the first's `final_receipt` while
+    /// answering under its own correlated key.
+    ///
+    /// The identity is the request's own value, read through
+    /// [`Self::require_operation_identity`]: an unbound plan refuses with this
+    /// crate's typed [`BackupError::InvalidField`] and derives no key at all.
     fn journal_key(&self) -> Result<String, BackupError> {
-        sha256(&(self.plan_id.as_str(), self.bundle_sha256.as_str()))
+        let operation_id = self.require_operation_identity()?;
+        sha256(&(
+            self.plan_id.as_str(),
+            self.bundle_sha256.as_str(),
+            operation_id,
+        ))
     }
 
     /// Executes the plan against a provider-owned isolated target.
@@ -1709,7 +1820,15 @@ fn validate_journal_record(
     transaction: &RestoreTransaction,
     phases: &[RestorePhase],
 ) -> Result<(), BackupError> {
-    if record.journal_key != journal_key || record.transaction != *transaction {
+    // The recorded transaction names the operation it was written under, and
+    // the whole row is compared against the transaction THIS operation
+    // derives. `RestoreTransaction` now carries `operation_id`, so this
+    // equality covers the operation identity as content: a row written under a
+    // different operation cannot agree here, whatever its stream key.
+    if record.journal_key != journal_key
+        || record.transaction != *transaction
+        || record.transaction.operation_id()? != plan.require_operation_identity()?
+    {
         return Err(BackupError::RestoreJournalMismatch);
     }
     let completed_phases =
@@ -1778,7 +1897,7 @@ fn validate_journal_record(
                     .final_receipt
                     .as_ref()
                     .ok_or(BackupError::RestoreJournalCorrupt)?;
-                validate_resumed_final_receipt(plan, bundle, transaction, receipt, final_receipt)?;
+                require_restore_receipt_claim(plan, bundle, transaction, receipt, final_receipt)?;
             }
         }
         RestoreJournalState::Completed => {
@@ -1827,7 +1946,8 @@ fn validate_resumed_intent(
     Ok(())
 }
 
-/// Revalidates a resumed final `RestoreReceipt` for this executor.
+/// Requires that a resumed final `RestoreReceipt` CLAIMS this exact operation,
+/// and returns nothing when it does.
 ///
 /// `effect_receipt_sha256` hashes the separate effect receipt and therefore
 /// covers none of `cutover_performed`, `operational_recovery_ready` or
@@ -1841,7 +1961,23 @@ fn validate_resumed_intent(
 /// restored fence, the exact stored effect receipt, the class proof level, and
 /// `canonical_only` as the requested class requires, with no cutover and no
 /// operational readiness (I5.13: cutover requires separate authority).
-fn validate_resumed_final_receipt(
+///
+/// ## Why the claim is compared and not merely present
+///
+/// The receipt identity is derived from the plan AND the operation identity it
+/// is bound to, so a receipt naming another operation cannot pass this check
+/// for this one. Before the operation identity entered the derivation, the
+/// identity was `restore-receipt-restore-plan-<backup_id>` — a function of the
+/// ARCHIVE alone — so a receipt for a second operation over byte-identical
+/// bundles satisfied every relation here. The plan is also required to be
+/// bound at all: an unbound plan has no receipt claim to check and refuses
+/// typed rather than being read back under a default identity.
+///
+/// A receipt is not trusted because it is well formed. This is the same
+/// fail-closed comparison the whole durable-resume path makes, and it runs on
+/// the production resume path inside `execute_with_journal` — not only in a
+/// test — because a `Completed` row returns its stored receipt to the caller.
+fn require_restore_receipt_claim(
     plan: &RestorePlan,
     bundle: &BackupBundle,
     transaction: &RestoreTransaction,
@@ -1849,7 +1985,8 @@ fn validate_resumed_final_receipt(
     final_receipt: &RestoreReceipt,
 ) -> Result<(), BackupError> {
     final_receipt.validate()?;
-    if final_receipt.receipt_id != restore_receipt_id(plan)
+    let operation_id = plan.require_operation_identity()?;
+    if final_receipt.receipt_id != restore_receipt_id(plan)?
         || final_receipt.bundle_sha256 != transaction.bundle_sha256
         || final_receipt.plan_id != plan.plan_id
         || final_receipt.target_id != plan.target.target_id
@@ -1859,6 +1996,11 @@ fn validate_resumed_final_receipt(
         || final_receipt.canonical_only != executor_canonical_only(bundle.manifest.class)
         || final_receipt.cutover_performed
         || final_receipt.operational_recovery_ready
+        // The transaction is itself bound to this operation, so a row written
+        // under another operation's identity cannot reach this point with an
+        // agreeing receipt. Named explicitly so the relation is a comparison
+        // against THIS operation rather than a property of the stream key.
+        || transaction.operation_id() != operation_id
     {
         return Err(BackupError::RestoreJournalMismatch);
     }
@@ -1866,9 +2008,14 @@ fn validate_resumed_final_receipt(
 }
 
 /// The identity of the isolated restore receipt this executor issues for one
-/// plan. A resumed receipt must carry exactly this identity.
-fn restore_receipt_id(plan: &RestorePlan) -> String {
-    format!("restore-receipt-{}", plan.plan_id)
+/// plan under one operation. A resumed receipt must carry exactly this
+/// identity.
+fn restore_receipt_id(plan: &RestorePlan) -> Result<String, BackupError> {
+    Ok(format!(
+        "restore-receipt-{}-{}",
+        plan.plan_id,
+        plan.require_operation_identity()?
+    ))
 }
 
 /// The `canonical_only` value this executor derives from the requested backup
@@ -1920,7 +2067,7 @@ fn validate_completed_record(
         return Err(BackupError::RestoreJournalCorrupt);
     }
     validate_effect_receipt(intent, effect_receipt)?;
-    validate_resumed_final_receipt(plan, bundle, transaction, effect_receipt, final_receipt)
+    require_restore_receipt_claim(plan, bundle, transaction, effect_receipt, final_receipt)
 }
 
 fn restore_intent(
@@ -2070,7 +2217,7 @@ fn validate_applied_effect(
     }
     evidence.validate_against_plan(plan, bundle)?;
     Ok(Some(RestoreReceipt {
-        receipt_id: restore_receipt_id(plan),
+        receipt_id: restore_receipt_id(plan)?,
         plan_id: plan.plan_id.clone(),
         bundle_sha256: transaction.bundle_sha256.clone(),
         target_id: plan.target.target_id.clone(),
@@ -2616,6 +2763,12 @@ impl RestoreEvidence {
             return Err(BackupError::FinalizeEvidenceMismatch);
         }
         if self.provenance.plan_id != plan.plan_id
+            // The evidence names the operation it observed. Compared with THIS
+            // operation's recorded identity, not merely required to be present:
+            // evidence naming another operation proves nothing about this one,
+            // and the identity an operator reconciles has to be the one the
+            // evidence recorded.
+            || self.provenance.operation_id != plan.require_operation_identity()?
             || self.provenance.source_archive_id != bundle.manifest.backup_id
             || self.provenance.source_class != bundle.manifest.class
             || self.provenance.source_digest != bundle.bundle_sha256()?
@@ -3160,7 +3313,10 @@ mod restore_tests {
         RestoreProvenance {
             transaction_id: plan.transaction().expect("transaction").transaction_id,
             plan_id: plan.plan_id.clone(),
-            operation_id: "restore-operation-1".to_owned(),
+            operation_id: plan
+                .require_operation_identity()
+                .expect("bound operation")
+                .to_owned(),
             phase: RestorePhase::FinalizeIsolatedRoot,
             source_archive_id: bundle.manifest.backup_id.clone(),
             source_class: bundle.manifest.class,
@@ -3440,7 +3596,7 @@ mod restore_tests {
             purge_ledger_revision: 1,
         })
         .expect("bundle");
-        RestorePlan::compile(
+        let mut plan = RestorePlan::compile(
             &bundle,
             RestoreContext {
                 target_id: "target".to_owned(),
@@ -3448,7 +3604,10 @@ mod restore_tests {
                 target_resource_generation: ResourceGeneration::new(2).expect("generation"),
             },
         )
-        .expect("plan")
+        .expect("plan");
+        plan.bind_operation("restore-operation-fixture")
+            .expect("fixture operation binds");
+        plan
     }
 
     fn bundle_for(plan: &RestorePlan) -> BackupBundle {

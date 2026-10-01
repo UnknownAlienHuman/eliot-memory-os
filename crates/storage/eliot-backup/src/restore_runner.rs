@@ -695,6 +695,13 @@ fn build_evidence(
             |artifact| artifact.sha256.clone(),
         );
     let transaction = plan.transaction()?;
+    // The provenance records the operation identity the plan is bound to, not a
+    // name this runner invents for itself. It was the literal
+    // `restore-operation-runner`, which named no operation the caller holds and
+    // therefore could not be reconciled against; the plan's recorded identity is
+    // the request's own value, so what the evidence names is what the owner
+    // recorded. An unbound plan refuses above, before this point.
+    let operation_id = plan.require_operation_identity()?.to_owned();
     let evidence = RestoreEvidence {
         target_id: plan.target.target_id.clone(),
         isolated_root: true,
@@ -709,7 +716,7 @@ fn build_evidence(
         provenance: RestoreProvenance {
             transaction_id: transaction.transaction_id.clone(),
             plan_id: plan.plan_id.clone(),
-            operation_id: "restore-operation-runner".to_owned(),
+            operation_id,
             phase: super::RestorePhase::FinalizeIsolatedRoot,
             source_archive_id: bundle.manifest.backup_id.clone(),
             source_class: bundle.manifest.class,
@@ -780,10 +787,16 @@ pub struct RunnerOutcome {
 /// Binds the portable key manifest when supplied (blob-carrying archives
 /// without coverage fail before any effect, and a manifest minted for a
 /// different archive fails as a fence mismatch), plans the isolated restore
-/// (validating bundle, lineage advance, purge-first order, fresh lineage),
-/// then drives the governed journaled executor with a file-backed journal
-/// and a file-backed target. Re-running against the same root resumes from
-/// the durable journal instead of re-applying.
+/// (validating bundle, lineage advance, purge-first order, fresh lineage, and
+/// binding the correlated operation identity), then drives the governed
+/// journaled executor with a file-backed journal and a file-backed target.
+/// Re-running against the same root resumes from the durable journal instead
+/// of re-applying.
+///
+/// `operation_id` is the restore request's own correlated identity, carried
+/// through unchanged. It is part of the journal stream key, so two runs under
+/// different identities address two streams even over byte-identical bundles,
+/// and one run's receipt can never be read back as another's.
 ///
 /// Sealed blob bytes cross into the isolated root byte-for-byte unchanged:
 /// `FileRestoreTarget::apply_phase` writes `blob.sealed_bytes` itself after
@@ -796,6 +809,7 @@ pub struct RunnerOutcome {
 pub fn execute_isolated_restore(
     bundle: &BackupBundle,
     target: RestoreContext,
+    operation_id: &str,
     authority_epoch: EpochId,
     resource_generation: ResourceGeneration,
     root: &IsolatedRoot,
@@ -808,8 +822,14 @@ pub fn execute_isolated_restore(
         }
         None => {}
     }
-    let isolated =
-        plan_isolated_restore(bundle, target, authority_epoch, resource_generation, root)?;
+    let isolated = plan_isolated_restore(
+        bundle,
+        target,
+        operation_id,
+        authority_epoch,
+        resource_generation,
+        root,
+    )?;
     let journal_path = root.path().join("journal.json");
     let mut journal = FileRestoreJournal::at(journal_path.clone());
     let mut runner_target = FileRestoreTarget::new(root);
