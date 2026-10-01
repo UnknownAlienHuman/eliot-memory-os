@@ -526,7 +526,7 @@ pub fn run_setup_recommend(args: &SetupRecommendArgs) -> Result<i32> {
     // gates the disabled-automation path and owns dedup/no-job semantics;
     // this narrows the key, never a second scheme.
     recommendation.dedup_key = format!("maintenance:{family}:{scope}:{reason}:{policy_episode}");
-    recommendation.reason = reason.to_owned();
+    reason.clone_into(&mut recommendation.reason);
     let mut board = RecommendationBoard::new();
     let is_new = board
         .insert_dedup(&recommendation)
