@@ -5779,6 +5779,24 @@ impl BridgeRunner {
     /// reaches the response. A handle that does not resolve to the exact
     /// bytes withholds the evidence slot (`None`) instead of emitting a
     /// dangling reference; the gateway response itself is never rewritten.
+    ///
+    /// Receipt STITCH (I7.24, exact): this site already yields every receipt
+    /// field except the token count — `view.handle().digest()` is the exact
+    /// result digest (SHA-256 over the published bytes, verified by the
+    /// expand round-trip above), `view.handle().uri()` is the admissible
+    /// source handle, `view.total_bytes()` is the rendered byte count, and
+    /// [`Self::observed_hot_delivery`] is the observed delivery. Only
+    /// `tokens_rendered` is missing: the bridge runs no tokenizer and never
+    /// estimates, and no route emits a `TokenMeasurementPayload` in
+    /// production, so [`Self::project_tool_result_receipt`] stays route-fed
+    /// and `AgentBridgeCore::project_produced_tool_result` stays unattested
+    /// (its admission/binding types are not a dependency of this crate).
+    /// Completing the receipt is the main.rs owner's stitch: feed the
+    /// recorded view plus the route attestation into
+    /// `project_produced_tool_result`, publish it on
+    /// `Response::Invocation.receipt`, and let `record_invocation_delivery`
+    /// refuse a present non-`FULL` receipt through
+    /// [`ToolResultReceipt::check_complete_evidence`].
     pub fn record_tool_result_delivery(
         &mut self,
         outcome: &HostInvocationOutcome,
