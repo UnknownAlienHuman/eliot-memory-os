@@ -332,11 +332,19 @@ fn raw_hash_run(chars: &[char], index: usize) -> usize {
     chars[index..].iter().take_while(|c| **c == '#').count()
 }
 
-/// Returns `source` with comment and string-literal bodies replaced by spaces
-/// of the same length. A guard that scans the result sees executable code only,
-/// so prose in a doc comment can never masquerade as a dependency, and no `::`
-/// pair can be synthesised across a removed region. Character literals need no
-/// handling: one character cannot contain a path segment.
+/// Returns `source` with comment, character-literal and string-literal bodies
+/// replaced by spaces of the same length. A guard that scans the result sees
+/// executable code only, so prose in a doc comment can never masquerade as a
+/// dependency, and no `::` pair can be synthesised across a removed region
+/// because blanking preserves both length and position.
+///
+/// Character literals DO need handling, even though one character cannot hold a
+/// path segment: `'"'` contains a double quote, so a scanner that has no
+/// character-literal arm reads that quote as the opening of a string literal
+/// and blanks the remainder of the file as string body. The same failure mode
+/// applies to a raw identifier such as `r#match`, which is not a raw string.
+/// Both are consumed explicitly below, and `code_only_stays_live` is the test
+/// that keeps a future edit from reintroducing either.
 fn code_only(source: &str) -> String {
     let chars: Vec<char> = source.chars().collect();
     let mut out = String::with_capacity(source.len());
@@ -374,8 +382,20 @@ fn code_only(source: &str) -> String {
                     }
                 }
             }
-            ('r', Some('"')) | ('r', Some('#')) => {
+            // A raw string is `r"..."`, `r#"..."#`, `r##"..."##`; a raw
+            // IDENTIFIER is `r#match` and is ordinary code. The two are told
+            // apart by what follows the `#` run: a raw string has `"` there and
+            // a raw identifier has the identifier's first character. Without
+            // this, one `r#match` would be read as an unterminated raw string
+            // and blank the rest of the file, which would silently disable
+            // every token in this guard.
+            ('r', next) if matches!(next, Some('"' | '#')) => {
                 let hashes = raw_hash_run(&chars, index + 1);
+                if chars.get(index + 1 + hashes).copied() != Some('"') {
+                    out.push(current);
+                    index += 1;
+                    continue;
+                }
                 let opening = hashes + 2;
                 out.push_str(&" ".repeat(opening));
                 index += opening;
@@ -384,6 +404,33 @@ fn code_only(source: &str) -> String {
                         let closing = hashes + 1;
                         out.push_str(&" ".repeat(closing));
                         index += closing;
+                        break;
+                    }
+                    out.push(blanked(chars[index]));
+                    index += 1;
+                }
+            }
+            // A character literal is `'x'`, `'\n'` or `'\''`, and it may itself
+            // contain a double quote (`'"'`). It must be consumed here, before
+            // the `"` arm below, or that quote is read as the opening of a
+            // string literal and everything after it is blanked as string
+            // body - which would silently disable every token in this guard.
+            ('\'', _) => {
+                out.push(' ');
+                index += 1;
+                while index < chars.len() {
+                    if chars[index] == '\\' {
+                        out.push(' ');
+                        index += 1;
+                        if index < chars.len() {
+                            out.push(blanked(chars[index]));
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    if chars[index] == '\'' {
+                        out.push(' ');
+                        index += 1;
                         break;
                     }
                     out.push(blanked(chars[index]));
@@ -436,6 +483,66 @@ fn contains_identifier(code: &str, token: &str) -> bool {
         !continues_identifier(code[..start].chars().next_back())
             && (path_prefix || !continues_identifier(code[start + found.len()..].chars().next()))
     })
+}
+
+// WORK_UNIT_CASE: 954/1 (guard robustness)
+#[test]
+fn code_only_stays_live() {
+    // A real dependency, far from any construct that could swallow it.
+    const DEPENDENCY: &str = "std::fs::read_to_string";
+    // Each fragment is valid Rust that a lexer can mistake for the START of a
+    // string or raw-string literal. If `code_only` entered string mode at any
+    // of them it would blank everything after, and the dependency would become
+    // invisible - which is the same fail-open failure as deleting the check.
+    let triggers = [
+        // A character literal containing a double quote.
+        "let q = '\"';",
+        // An escaped single quote, whose scanner must not end the literal early.
+        "let q = '\\'';",
+        // A raw identifier, which is NOT a raw string.
+        "let r#match = 1;",
+        "let r#type = 1;",
+        // A raw string, which IS one and must be blanked.
+        "let s = r#\"std::fs::read_to_string\"#;",
+        // An ordinary doc comment and a nested block comment.
+        "/// std::fs::read_to_string in prose",
+        "/* outer /* inner */ std::fs::read_to_string */",
+        // A normal string literal.
+        "let s = \"std::fs::read_to_string\";",
+    ];
+    for trigger in triggers {
+        let source = format!("{trigger}\nfn later() {{ let _ = {DEPENDENCY}; }}\n");
+        let code = code_only(&source);
+        assert_eq!(
+            code.len(),
+            source.len(),
+            "blanking must preserve length for trigger {trigger:?}"
+        );
+        assert!(
+            contains_identifier(&code, "std::fs::"),
+            "trigger {trigger:?} blinded the guard: {code:?}"
+        );
+    }
+    // The converse: a dependency that appears ONLY inside prose or a literal
+    // must stay invisible, or the guard is noise rather than a boundary.
+    for hidden in [
+        "/// std::fs::read_to_string is forbidden here",
+        "// std::fs::read_to_string",
+        "/* std::fs::read_to_string */",
+        "let s = \"std::fs::read_to_string\";",
+        "let s = r#\"std::fs::read_to_string\"#;",
+    ] {
+        let code = code_only(hidden);
+        assert!(
+            !contains_identifier(&code, "std::fs::"),
+            "prose or literal must not read as a dependency: {hidden:?}"
+        );
+    }
+    // A field whose name merely ends in a forbidden fragment is not a
+    // dependency: `fs:` is a suffix of `causal_predecessor_refs:`, and the old
+    // substring rule could not tell the difference.
+    let field = "Foo { causal_predecessor_refs: Vec::new() }";
+    assert!(!contains_identifier(&code_only(field), "fs::"));
 }
 
 // WORK_UNIT_CASE: 954/1
