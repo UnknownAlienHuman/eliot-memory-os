@@ -3794,16 +3794,7 @@ fn handle_mcp_initialize(
     };
     if let Err(error) = runner.attach(AttachRequest::managed(demand, connection)) {
         *provider_failure |= matches!(error, BridgeError::PlanGap(_));
-        let (code, message) = bridge_error_code(&error);
-        return render_error(
-            Some(id),
-            WIRE_INTERNAL_ERROR,
-            "attach was refused",
-            serde_json::json!({
-                "code": code,
-                "message": message,
-            }),
-        );
+        return mcp_attach_refusal(id, &error);
     }
     // Best-effort durable restore for the fresh attach, mirroring the private
     // path: a refused restore keeps the empty-ledger behavior and is reported
@@ -4154,6 +4145,49 @@ fn bridge_error_code(error: &BridgeError) -> (&'static str, String) {
             "bridge request was refused".to_owned(),
         ),
     }
+}
+
+/// Renders one MCP `initialize` attach refusal for both MCP surfaces.
+///
+/// A typed activation denial travels through the lossless [`bridge_error`]
+/// arm, so the agent frame carries the I7.20 disposition, exact
+/// `reason_code`, directive kind, and owner-issued detail (candidate and
+/// recovery handles) instead of the generic bridge refusal. Any other
+/// bridge failure keeps the shared [`bridge_error_code`] projection. The
+/// stdio front door and the loopback-HTTP profile share
+/// [`handle_mcp_frame`], so this one helper covers both surfaces.
+fn mcp_attach_refusal(id: &JsonRpcId, error: &BridgeError) -> Value {
+    if let Response::ActivationDenied {
+        code,
+        reason_code,
+        disposition,
+        directive_kind,
+        detail,
+    } = bridge_error(error)
+    {
+        return render_error(
+            Some(id),
+            WIRE_INTERNAL_ERROR,
+            "attach was refused",
+            serde_json::json!({
+                "code": code,
+                "reason_code": reason_code,
+                "disposition": disposition,
+                "directive_kind": directive_kind,
+                "detail": detail,
+            }),
+        );
+    }
+    let (code, message) = bridge_error_code(error);
+    render_error(
+        Some(id),
+        WIRE_INTERNAL_ERROR,
+        "attach was refused",
+        serde_json::json!({
+            "code": code,
+            "message": message,
+        }),
+    )
 }
 
 /// Bounds one wire control name echoed in diagnostics so diagnostics never
