@@ -59,7 +59,9 @@ use super::{
     Frame, FrameKind, KernelComposition, KernelFrameAction, MessageType, ProtocolPayload, Session,
     TransportError, activation_deadline_expired, sha256_json, status_frame, unix_ms,
 };
-use eliot_contracts::{BridgeRecoverySelector, RequestId};
+use eliot_contracts::{
+    BridgeRecoverySelector, ClockReading, ProductId, RequestId, RequestMetadata, SessionId, SourceId,
+};
 use eliot_ipc::PeerIdentity;
 use eliot_kernel_service::{
     AgentBridgeAdmissionDescriptor, KernelHostRequestBinder, KernelServiceState,
@@ -80,10 +82,11 @@ use eliot_protocol::{
     HostRequestInvokeReadPayload, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
     WatchdogIntentKind, WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome,
     WatchdogSpoolExportBatchPayload, WatchdogSpoolExportOutcomeSubmission,
-    WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
+    RequestIdentity, WatchdogSpoolExportResultPayload, WatchdogSpoolExportSubmission,
     WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission, host_request_operation_id,
 };
 use eliot_runtime_contracts::RecoveryDirective;
+use eliot_receipts::RequestBinding;
 use eliot_store_api::{
     CampaignLearningStateViewPublication, EVIDENCE_PACK_MAX_RECORDS, RevisionHead, RevisionKey,
     ScopeId,
@@ -402,6 +405,9 @@ pub(crate) struct HostRequestOperationRef {
     /// invocation can never be interpreted as an evidence query.
     pub(crate) task_controller_envelope: Option<HostRequestEnvelope>,
     pub(crate) task_controller_tool: Option<serde_json::Value>,
+    /// Kernel-issued typed request identity retained with this admitted
+    /// Task Controller pair so retries reuse the same immutable identity.
+    pub(crate) task_controller_request_identity: Option<RequestIdentity>,
     pub(crate) task_controller_attempt: LocalReadAttemptState,
     /// Finish candidate pair queued for the authenticated daemon finish
     /// poller (issue #1741). The exact admitted envelope plus the exact
@@ -2966,6 +2972,7 @@ impl KernelComposition {
                 campaign_packet_attempt: LocalReadAttemptState::default(),
                 task_controller_envelope: None,
                 task_controller_tool: None,
+                task_controller_request_identity: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
                 finish_envelope: None,
                 finish_tool: None,
@@ -3204,6 +3211,7 @@ impl KernelComposition {
                 campaign_packet_attempt: LocalReadAttemptState::default(),
                 task_controller_envelope: None,
                 task_controller_tool: None,
+                task_controller_request_identity: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
                 finish_envelope: None,
                 finish_tool: None,
@@ -4868,6 +4876,7 @@ impl KernelComposition {
                 campaign_packet_attempt: LocalReadAttemptState::default(),
                 task_controller_envelope: None,
                 task_controller_tool: None,
+                task_controller_request_identity: None,
                 task_controller_attempt: LocalReadAttemptState::default(),
                 finish_envelope: None,
                 finish_tool: None,
@@ -10465,6 +10474,7 @@ mod invoke_read_tool_tests {
             campaign_packet_attempt: LocalReadAttemptState::default(),
             task_controller_envelope: None,
             task_controller_tool: None,
+            task_controller_request_identity: None,
             task_controller_attempt: LocalReadAttemptState::default(),
             finish_envelope: None,
             finish_tool: None,

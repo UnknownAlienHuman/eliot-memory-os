@@ -1539,6 +1539,7 @@ fn is_daemon_operation(operation: &str) -> bool {
             // rather than the payload.
             | super::daemon_request_dispatch::MAINTENANCE_TRIGGER_INTAKE_OPERATION
             | "store_recovery"
+            | "store_work_scope_owner"
             | "store_initialize_genesis"
             | "apply_prepared"
             | "receipt"

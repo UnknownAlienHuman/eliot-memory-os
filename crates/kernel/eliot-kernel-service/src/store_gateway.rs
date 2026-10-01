@@ -101,7 +101,8 @@ use eliot_store_api::{
     OrderingScopeId, PreparedTransition, RecoveryRecord, RecoveryRecordKey, RequestMeta,
     ReservedWriteRequest, RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation,
     RevisionKey, ScopeId, ScopeRevisionView, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus, WriteSubmission,
+    StoreRecoveryRequest, StoreRecoverySnapshot, StoreWorkScopeOwnerRequest,
+    StoreWorkScopeOwnerResponse, WriteReceipt, WriteReceiptStatus, WriteSubmission,
     admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
     generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
 };
@@ -974,6 +975,18 @@ impl CanonicalStoreClient for BorrowedCanonicalStoreClient<'_> {
     async fn health(&self) -> Result<StoreHealth, StoreError> {
         self.require_active_generation()?;
         self.gateway.store.health().await
+    }
+
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        self.require_active_generation()?;
+        self.gateway
+            .store
+            .write_work_scope_owner(context, request)
+            .await
     }
 }
 
@@ -7348,6 +7361,86 @@ impl KernelStoreGateway {
         .map_err(|error| error.to_string());
         drop(lease);
         result
+    }
+
+    /// Performs the narrow durable WorkScope owner CAS on the active Store
+    /// generation. The Governor-issued canonical snapshot remains opaque here;
+    /// the EBP client owns unknown-outcome same-fence readback.
+    pub async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, NamedReadGatewayError> {
+        let _flight = self.flight.enter().map_err(NamedReadGatewayError::GatewayRefusal)?;
+        if self.is_fenced() {
+            return Err(NamedReadGatewayError::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
+        }
+        self.refuse_shadow_mutation()
+            .map_err(NamedReadGatewayError::GatewayRefusal)?;
+        context
+            .validate()
+            .map_err(|error| NamedReadGatewayError::GatewayRefusal(error.to_string()))?;
+        request.validate_for_context(context)?;
+        if context.source_id.as_str() != ACTIVE_DAEMON_CALLER {
+            return Err(NamedReadGatewayError::GatewayRefusal(
+                "WorkScope owner caller is not the active daemon".to_owned(),
+            ));
+        }
+        self.validate_active_route(&context.state_fence)
+            .map_err(NamedReadGatewayError::GatewayRefusal)?;
+        let lease = {
+            let service = self
+                .service
+                .lock()
+                .map_err(|_| NamedReadGatewayError::GatewayRefusal("Kernel service lock poisoned".to_owned()))?;
+            if service.generation_fenced() {
+                return Err(NamedReadGatewayError::GatewayRefusal("Kernel generation is fenced".to_owned()));
+            }
+            let lease = service
+                .acquire_admission()
+                .map_err(|error| NamedReadGatewayError::GatewayRefusal(error.to_string()))?;
+            if lease.authority_epoch() != request.state_fence.authority_epoch {
+                return Err(NamedReadGatewayError::GatewayRefusal(
+                    "WorkScope owner route authority epoch is stale".to_owned(),
+                ));
+            }
+            lease
+        };
+        if self.is_fenced() {
+            return Err(NamedReadGatewayError::GatewayRefusal(
+                "canonical-store gateway is fenced for rebind".to_owned(),
+            ));
+        }
+        let response = self
+            .store
+            .write_work_scope_owner(context, request)
+            .await?;
+        let readback = self
+            .store
+            .recovery(StoreRecoveryRequest {
+                contract_version: eliot_store_api::CONTRACT_VERSION,
+                state_fence: response.record.state_fence.clone(),
+                records: vec![RecoveryRecordKey::new("owner", "work_scope")?],
+                include_receipts: false,
+                include_jobs: false,
+            })
+            .await?;
+        readback.validate().map_err(NamedReadGatewayError::Store)?;
+        if readback.owner_records.len() != 1
+            || readback.owner_records.first() != Some(&response.record)
+            || readback.state_fence != response.record.state_fence
+            || !readback.receipts.is_empty()
+            || !readback.job_records.is_empty()
+        {
+            return Err(NamedReadGatewayError::GatewayRefusal(
+                "WorkScope owner CAS did not match independent durable readback".to_owned(),
+            ));
+        }
+        response.validate().map_err(NamedReadGatewayError::Store)?;
+        drop(lease);
+        Ok(response)
     }
 
     /// Applies one closed Dreamer ledger operation through the active Kernel

@@ -51,7 +51,7 @@ use eliot_process::{
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody,
     HostRequestResultLineage, HostRequestResultSourceRevision, LocalReadAttempt,
-    LocalReadExecutionEvidence, RequestIdentity, TaskControllerResultBody,
+    LocalReadExecutionEvidence, RequestIdentity, TaskControllerAttempt, TaskControllerResultBody,
     host_request_operation_id,
 };
 #[cfg(windows)]
@@ -68,8 +68,9 @@ use eliot_store_api::{
     CampaignSourceRevisionRef, CanonicalRequestView, MAX_RECOVERY_OWNER_RECORDS,
     NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
     OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
+    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreFailure,
+    StoreFailureIdentityContext, StoreGenesisRequest, StoreRecoveryRequest, StoreRecoverySnapshot,
+    StoreWorkScopeOwnerRequest, WriteReceipt, WriteReceiptStatus,
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::Deserialize;
@@ -643,6 +644,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         USER_AUTOMATION_RUNTIME_OPERATION => USER_AUTOMATION_RUNTIME_OPERATION,
         "health" => "health",
         "store_recovery" => "store_recovery",
+        "store_work_scope_owner" => "store_work_scope_owner",
         "store_initialize_genesis" => "store_initialize_genesis",
         "apply_prepared" => "apply_prepared",
         "receipt" => "receipt",
@@ -1504,6 +1506,139 @@ impl KernelComposition {
 struct StoreInitializeGenesisOperation {
     context: RequestMeta,
     request: StoreGenesisRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreWorkScopeOwnerOperation {
+    operation_id: String,
+    request_sha256: String,
+    attempt: TaskControllerAttempt,
+    request: StoreWorkScopeOwnerRequest,
+}
+
+fn validate_work_scope_record_against_retained_input(
+    record: &RecoveryRecord,
+    task_input: &serde_json::Value,
+    work_scope_id: &str,
+    authenticated_principal: &str,
+    authenticated_session: &str,
+) -> Result<(), TransportError> {
+    if record.namespace != "owner" || record.key != "work_scope" {
+        return Err(TransportError::SessionFenced);
+    }
+    let owner_snapshot: serde_json::Value =
+        serde_json::from_slice(&record.payload).map_err(|_| TransportError::SessionFenced)?;
+    let canonical_payload =
+        canonical_json_bytes(&owner_snapshot).map_err(|_| TransportError::SessionFenced)?;
+    if canonical_payload != record.payload
+        || owner_snapshot.get("state_fence")
+            != Some(
+                &serde_json::to_value(&record.state_fence)
+                    .map_err(|_| TransportError::SessionFenced)?,
+            )
+        || owner_snapshot
+            .get("owner_revision")
+            .and_then(serde_json::Value::as_u64)
+            != Some(record.revision)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let task_input = task_input
+        .as_object()
+        .ok_or(TransportError::SessionFenced)?;
+    if task_input.len() != 11
+        || task_input.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "explicit_root"
+                    | "bootstrap_discovery"
+                    | "descriptor"
+                    | "binding"
+                    | "sources"
+                    | "privacy"
+                    | "source_candidates"
+                    | "declared_precedences"
+                    | "absence_reason_ref"
+                    | "admission_deadline"
+                    | "discovery_lease"
+            )
+        })
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let field = |name: &str| task_input.get(name).ok_or(TransportError::SessionFenced);
+    let binding = field("binding")?;
+    let sources = field("sources")?;
+    let privacy = field("privacy")?;
+    let bootstrap = field("bootstrap_discovery")?;
+    let owner_binding = owner_snapshot
+        .get("binding")
+        .ok_or(TransportError::SessionFenced)?;
+    let source_closure = owner_snapshot
+        .get("source_closure")
+        .and_then(serde_json::Value::as_array)
+        .filter(|closure| closure.len() == 2)
+        .ok_or(TransportError::SessionFenced)?;
+    let cold_start_inputs = owner_snapshot
+        .get("cold_start_inputs")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(TransportError::SessionFenced)?;
+    if owner_binding != binding
+        || source_closure[0] != *sources
+        || source_closure[1] != *privacy
+        || cold_start_inputs.get("descriptor") != field("descriptor").ok()
+        || cold_start_inputs.get("discovery_lease") != field("discovery_lease").ok()
+        || cold_start_inputs.get("bootstrap_discovery_inputs") != Some(bootstrap)
+        || cold_start_inputs.get("privacy_boundary") != bootstrap.get("privacy_boundary")
+        || cold_start_inputs.get("principal_ref").and_then(serde_json::Value::as_str)
+            != Some(authenticated_principal)
+        || cold_start_inputs.get("session_ref").and_then(serde_json::Value::as_str)
+            != Some(authenticated_session)
+        || owner_binding
+            .get("scope")
+            .and_then(|scope| scope.get("scope_ref"))
+            .and_then(serde_json::Value::as_str)
+            != Some(work_scope_id)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn work_scope_owner_store_failure_response(
+    error: StoreError,
+    context: &RequestMeta,
+    operation_id: &eliot_store_api::OperationId,
+    idempotency_key: &str,
+) -> Result<serde_json::Value, TransportError> {
+    let failure = StoreFailure::from_store_error(
+        error,
+        StoreFailureIdentityContext {
+            request_id: Some(context.request_id.clone()),
+            operation_id: Some(operation_id.clone()),
+            idempotency_key_ref_or_digest: Some(idempotency_key.to_owned()),
+            state_fence_ref_or_exact_safe_projection: Some(context.state_fence.clone()),
+            evidence_ref: None,
+            transport_unavailable: false,
+        },
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
+    if failure.validate().is_err()
+        || failure.request_id.as_ref() != Some(&context.request_id)
+        || failure.operation_id.as_ref() != Some(operation_id)
+        || failure.idempotency_key_ref_or_digest.as_deref() != Some(idempotency_key)
+        || failure.state_fence_ref_or_exact_safe_projection.as_ref() != Some(&context.state_fence)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(serde_json::json!({
+        "status": "error",
+        "code": "STORE_FAILURE",
+        "reason": "The canonical WorkScope owner write was refused.",
+        "value": { "kind": "store_work_scope_owner", "value": null },
+        "failure": failure,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -3164,7 +3299,7 @@ impl KernelComposition {
         let result = match operation {
             #[cfg(windows)]
             scan_disclosure_route::OPERATION => {
-                self.scan_disclosure_owner_operation(session, payload)
+                self.scan_disclosure_owner_operation(session, payload).await
             }
             "snapshot" => self.daemon_snapshot().map(|value| {
                 serde_json::json!({
@@ -3351,6 +3486,10 @@ impl KernelComposition {
                 .map(|health| Self::daemon_health_response(&health)),
             "store_recovery" => {
                 self.store_recovery_operation(session, payload.clone())
+                    .await
+            }
+            "store_work_scope_owner" => {
+                self.store_work_scope_owner_operation(session, request_identity, payload.clone())
                     .await
             }
             "store_initialize_genesis" => {
@@ -4016,11 +4155,14 @@ impl KernelComposition {
                     }
                     self.claim_task_controller_pair(session)
                         .map(|pair| match pair {
-                            Some((envelope, tool, invocation, attempt)) => serde_json::json!({
+                            Some((envelope, tool, invocation, attempt, authenticated_principal, identity)) => {
+                                serde_json::json!({
                                 "status": "known",
                                 "value": {
                                     "pair": {
                                         "invocation": invocation,
+                                        "authenticated_principal": authenticated_principal,
+                                        "identity": identity,
                                         "envelope": envelope,
                                         "tool": tool,
                                         "operation_id": attempt.operation_id,
@@ -4028,7 +4170,8 @@ impl KernelComposition {
                                     }
                                 },
                                 "recovery": null,
-                            }),
+                            })
+                            },
                             None => serde_json::json!({
                                 "status": "known",
                                 "value": { "pair": null },
@@ -9090,6 +9233,125 @@ impl KernelComposition {
                 &error,
             )),
         }
+    }
+
+    #[cfg(windows)]
+    async fn store_work_scope_owner_operation(
+        &self,
+        session: &Session,
+        request_identity: Option<&RequestIdentity>,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: StoreWorkScopeOwnerOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let context = &identity.request.metadata;
+        if context.product_id.as_str() != "eliotd"
+            || context.source_id.as_str() != "eliotd"
+            || context
+                .session_id
+                .as_ref()
+                .map(eliot_contracts::SessionId::as_str)
+                != Some(operation.attempt.session_id.as_str())
+            || context.task_id.as_ref().is_none_or(|task| task.as_str() != operation.attempt.task_id.as_str())
+            || identity.request.state_fence != operation.attempt.state_fence
+            || identity.deadline_unix_ms != operation.attempt.expires_at_unix_ms
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if operation.request.state_fence != context.state_fence
+            || operation.attempt.state_fence != context.state_fence
+            || operation.operation_id != operation.attempt.operation_id
+            || operation.request.operation_id.as_str() != operation.operation_id
+            || operation.request.idempotency_key != identity.idempotency_key
+            || operation.request_sha256.trim().is_empty()
+            || operation.request_sha256.chars().any(char::is_control)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_store_session_fence(session, &context.state_fence)?;
+        if let Some(rejection) = self.material_write_admission_response(&context.state_fence) {
+            return Ok(rejection);
+        }
+        let (envelope, invocation, _tool, authenticated_principal) = self
+            .admit_task_controller_work_scope_owner_write(
+                session,
+                &operation.operation_id,
+                &operation.request_sha256,
+                &operation.attempt,
+            )?;
+        if invocation.action != eliot_protocol::TaskControllerAction::BindScope
+            || context.task_id.as_ref() != Some(&invocation.task_id)
+            || context.state_fence != envelope.state_fence
+            || context.request_id.as_str() != envelope.identity.request_id.as_str()
+            || context
+                .session_id
+                .as_ref()
+                .map(eliot_contracts::SessionId::as_str)
+                != envelope.identity.session_id.as_deref()
+            || operation.request.idempotency_key != envelope.identity.idempotency_key
+            || identity.idempotency_key != envelope.identity.idempotency_key
+            || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+            || identity.cancellation_id != envelope.identity.cancellation_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if let Err(error) = operation.request.validate_for_context(context) {
+            return work_scope_owner_store_failure_response(
+                error,
+                context,
+                &operation.request.operation_id,
+                &operation.request.idempotency_key,
+            );
+        }
+        validate_work_scope_record_against_retained_input(
+            &operation.request.owner_record,
+            &invocation.task_input,
+            &invocation.work_scope_id,
+            &authenticated_principal,
+            &operation.attempt.session_id,
+        )?;
+        self.validate_owner_protected_snapshot(&operation.request.protected_snapshot_digest)?;
+        let failure_operation_id = operation.request.operation_id.clone();
+        let failure_idempotency_key = operation.request.idempotency_key.clone();
+        let gateway = self.retained_store_gateway()?;
+        match gateway
+            .write_work_scope_owner(context, operation.request)
+            .await
+        {
+            Ok(response) => Ok(serde_json::json!({
+                "kind": "store_work_scope_owner",
+                "value": response.record,
+            })),
+            Err(NamedReadGatewayError::Store(error)) => work_scope_owner_store_failure_response(
+                error,
+                context,
+                &failure_operation_id,
+                &failure_idempotency_key,
+            ),
+            Err(NamedReadGatewayError::GatewayRefusal(_)) => Ok(serde_json::json!({
+                "status": "error",
+                "code": "KERNEL_GATEWAY_REFUSAL",
+                "reason": "The canonical WorkScope owner route refused the request.",
+                "value": { "kind": "store_work_scope_owner", "value": null },
+                "recovery": null,
+            })),
+        }
+    }
+
+    #[cfg(not(windows))]
+    async fn store_work_scope_owner_operation(
+        &self,
+        _session: &Session,
+        _request_identity: Option<&RequestIdentity>,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _ = payload;
+        Err(TransportError::SessionFenced)
     }
 
     #[cfg(not(windows))]

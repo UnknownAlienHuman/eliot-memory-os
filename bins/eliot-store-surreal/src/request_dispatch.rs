@@ -425,6 +425,11 @@ fn mutation_failure_context(request: &Request) -> Option<StoreFailureIdentityCon
             request.operation_id.clone(),
             request.idempotency_key.clone(),
         )),
+        Request::WriteWorkScopeOwner { context, request } => Some(failure_context_for_operation(
+            context,
+            request.operation_id.clone(),
+            request.idempotency_key.clone(),
+        )),
         Request::DreamerJob { context, request } => Some(failure_context_for_operation(
             context,
             request.request_identity.operation.operation_id.clone(),
@@ -709,6 +714,23 @@ impl StoreDispatchBackend for StoreComposition {
                 )
                 .await;
                 map_genesis_dispatch_result(&context, &request, result)
+            }
+            Request::WriteWorkScopeOwner { context, request } => {
+                let failure_context = failure_context_for_operation(
+                    &context,
+                    request.operation_id.clone(),
+                    request.idempotency_key.clone(),
+                );
+                match CanonicalStoreClient::write_work_scope_owner(
+                    &self.store,
+                    &context,
+                    request.clone(),
+                )
+                .await
+                {
+                    Ok(response) => Response::WorkScopeOwner { response },
+                    Err(error) => map_store_error(error, failure_context),
+                }
             }
             Request::DreamerJob { context, request } => {
                 // Boxed: the ledger request/response futures hold

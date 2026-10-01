@@ -46,7 +46,6 @@ use eliot_contracts::{
 use eliot_contracts::{canonical_json_bytes, sha256_hex};
 use eliot_governor::{GovernorLaunchConfig, KernelGenerationSnapshot, KernelPortError};
 use eliot_kernel_service::PROVIDER_CAPABILITY_WIRE_VERSION;
-use eliot_learning_contracts::LearningStateViewRecipe;
 use eliot_ors::OperationIdentity;
 use eliot_protocol::{
     AgentActivationClaimRequest, AgentActivationKernelOwnerReadback, AgentActivationOwnerReadback,
@@ -416,13 +415,19 @@ pub enum LocalReadSubmitOutcome {
 }
 
 /// Kernel-derived Task Controller claim. The duplicated invocation, envelope,
-/// tool and identity are checked for exact binding before it reaches Governor.
+/// tool, authenticated principal, and enqueue-retained identity are checked for
+/// exact binding before it reaches Governor.
 #[derive(Clone, Debug)]
 pub struct TaskControllerClaimedInvocation {
     pub invocation: TaskControllerInvocation,
     pub envelope: HostRequestEnvelope,
+    /// Kernel-retained authenticated application principal for this claim.
+    /// This stays distinct from the transport connection and request labels.
+    pub authenticated_principal: String,
     pub tool: serde_json::Value,
-    pub request_identity: RequestIdentity,
+    /// Kernel-retained identity for every Task Controller action. The daemon
+    /// never reconstructs it from recipe, task, or scope payload fields.
+    pub request_identity: Option<RequestIdentity>,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
 }
@@ -506,60 +511,6 @@ fn canonical_kernel_request_digest(
     Ok(sha256_hex(&bytes))
 }
 
-fn derive_task_controller_request_identity(
-    invocation: &TaskControllerInvocation,
-    envelope: &HostRequestEnvelope,
-) -> Result<RequestIdentity, String> {
-    let recipe: LearningStateViewRecipe =
-        serde_json::from_value(invocation.learning_state_view_recipe.clone())
-            .map_err(|error| format!("Task Controller learning recipe does not decode: {error}"))?;
-    recipe
-        .validate()
-        .map_err(|error| format!("Task Controller learning recipe is invalid: {error}"))?;
-    if recipe.binding.task_id != invocation.task_id
-        || recipe.binding.scope.as_str()
-            != envelope
-                .identity
-                .work_scope_id
-                .as_deref()
-                .unwrap_or_default()
-        || recipe.binding.state_fence != envelope.state_fence
-        || recipe.binding.request_id.as_str() != envelope.identity.request_id.as_str()
-    {
-        return Err(
-            "Task Controller invocation is not bound to the admitted recipe/envelope".to_owned(),
-        );
-    }
-    let session_id = envelope
-        .identity
-        .session_id
-        .clone()
-        .map(|value| SessionId::new(value).map_err(|error| error.to_string()))
-        .transpose()?;
-    let metadata = RequestMetadata {
-        request_id: recipe.binding.request_id.clone(),
-        session_id,
-        task_id: Some(recipe.binding.task_id.clone()),
-        product_id: recipe.binding.product_id.clone(),
-        source_id: recipe.binding.source.owner.clone(),
-        state_fence: envelope.state_fence.clone(),
-        clock: ClockReading::default(),
-    };
-    let identity = RequestIdentity {
-        request: RequestBinding {
-            metadata,
-            state_fence: envelope.state_fence.clone(),
-        },
-        idempotency_key: envelope.identity.idempotency_key.clone(),
-        deadline_unix_ms: envelope.identity.deadline_unix_ms,
-        cancellation_id: envelope.identity.cancellation_id.clone(),
-    };
-    identity
-        .validate()
-        .map_err(|error| format!("derived Task Controller identity is invalid: {error}"))?;
-    Ok(identity)
-}
-
 /// Parses one unwrapped Task Controller poll answer into its exact admitted
 /// invocation and Kernel-issued attempt.
 pub fn parse_task_controller_claimed_pair(
@@ -589,13 +540,20 @@ pub fn parse_task_controller_claimed_pair(
     envelope
         .validate()
         .map_err(|error| format!("Kernel Task Controller envelope is invalid: {error}"))?;
+    let authenticated_principal = decode("authenticated_principal")?
+        .as_str()
+        .filter(|principal| !principal.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Kernel Task Controller claim has no authenticated principal".to_owned())?;
     let tool = decode("tool")?;
-    let request_identity: RequestIdentity = match pair.get("identity") {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|error| format!("Kernel Task Controller identity does not decode: {error}"))?,
-        None => derive_task_controller_request_identity(&invocation, &envelope)?,
-    };
+    let request_identity: Option<RequestIdentity> = Some(
+        serde_json::from_value(decode("identity")?).map_err(|error| {
+            format!("Kernel Task Controller owner identity does not decode: {error}")
+        })?,
+    );
     request_identity
+        .as_ref()
+        .expect("owner identity was decoded")
         .validate()
         .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
     let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
@@ -624,9 +582,21 @@ pub fn parse_task_controller_claimed_pair(
                 .work_scope_id
                 .as_deref()
                 .unwrap_or_default()
-        || request_identity.request.state_fence != envelope.state_fence
-        || request_identity.request.metadata.state_fence != envelope.state_fence
-        || request_identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
+        || request_identity.as_ref().is_some_and(|identity| {
+            identity.request.metadata.request_id != envelope.identity.request_id
+                || identity.request.metadata.session_id.as_ref().map(SessionId::as_str)
+                    != envelope.identity.session_id.as_deref()
+                || identity.request.metadata.task_id.as_ref().map(TaskId::as_str)
+                    != envelope.identity.task_id.as_deref()
+                || identity.request.metadata.product_id.as_str() != "eliotd"
+                || identity.request.metadata.source_id.as_str() != "eliotd"
+                || identity.idempotency_key != envelope.identity.idempotency_key
+                || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+                || identity.cancellation_id != envelope.identity.cancellation_id
+                || identity.request.state_fence != envelope.state_fence
+                || identity.request.metadata.state_fence != envelope.state_fence
+                || identity.request.metadata.task_id.as_ref() != Some(&invocation.task_id)
+        })
         || operation_id.as_str() != expected_operation
         || attempt.operation_id != expected_operation
         || attempt.task_id != invocation.task_id
@@ -640,6 +610,7 @@ pub fn parse_task_controller_claimed_pair(
     Ok(Some(TaskControllerClaimedInvocation {
         invocation,
         envelope,
+        authenticated_principal,
         tool,
         request_identity,
         operation_id,
@@ -2286,6 +2257,30 @@ impl DaemonKernelClient {
         payload: serde_json::Value,
         identity: RequestIdentity,
     ) -> Result<serde_json::Value, KernelClientError> {
+        match self
+            .transact_async_with_identity_outcome(operation, payload, identity)
+            .await?
+        {
+            WireOutcome::Known { value, recovery } => {
+                let _ = recovery;
+                Ok(value)
+            }
+            WireOutcome::Error { code, reason, .. } => {
+                Err(KernelClientError::Contract(format!("{code}: {reason}")))
+            }
+            WireOutcome::Partial { reason, .. } | WireOutcome::Unknown { reason } => {
+                Err(KernelClientError::Unknown(reason))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) async fn transact_async_with_identity_outcome(
+        &self,
+        operation: &str,
+        payload: serde_json::Value,
+        identity: RequestIdentity,
+    ) -> Result<WireOutcome, KernelClientError> {
         let (mut transport, limits) = self.connect_transport().await?;
         let request_id = identity.request.metadata.request_id.clone();
         let frame = Frame {
@@ -2329,22 +2324,8 @@ impl DaemonKernelClient {
                 "Kernel response is not JSON".to_owned(),
             ));
         };
-        match serde_json::from_value::<WireOutcome>(value)
-            .map_err(|error| KernelClientError::Unknown(error.to_string()))?
-        {
-            WireOutcome::Known { value, recovery } => {
-                let _ = recovery;
-                Ok(value)
-            }
-            WireOutcome::Error { code, reason } => {
-                Err(KernelClientError::Contract(format!("{code}: {reason}")))
-            }
-            WireOutcome::Partial { reason, value } => {
-                let _ = value;
-                Err(KernelClientError::Unknown(reason))
-            }
-            WireOutcome::Unknown { reason } => Err(KernelClientError::Unknown(reason)),
-        }
+        serde_json::from_value::<WireOutcome>(value)
+            .map_err(|error| KernelClientError::Unknown(error.to_string()))
     }
 
     #[cfg(not(windows))]
@@ -2363,6 +2344,16 @@ impl DaemonKernelClient {
         _payload: serde_json::Value,
         _identity: RequestIdentity,
     ) -> Result<serde_json::Value, KernelClientError> {
+        Err(KernelClientError::Unsupported)
+    }
+
+    #[cfg(not(windows))]
+    pub(super) async fn transact_async_with_identity_outcome(
+        &self,
+        _operation: &str,
+        _payload: serde_json::Value,
+        _identity: RequestIdentity,
+    ) -> Result<WireOutcome, KernelClientError> {
         Err(KernelClientError::Unsupported)
     }
 

@@ -59,6 +59,10 @@ pub(crate) enum WireOutcome {
     Error {
         code: String,
         reason: String,
+        #[serde(default)]
+        value: Option<serde_json::Value>,
+        #[serde(default)]
+        failure: Option<eliot_store_api::StoreFailure>,
     },
 }
 
