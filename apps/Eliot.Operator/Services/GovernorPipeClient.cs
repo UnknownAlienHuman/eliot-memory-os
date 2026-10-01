@@ -158,15 +158,29 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// capability the route acts on.
     ///
     /// Two refusals share one disposition, because this process can hold no
-    /// other one: a state-changing route with no retained principal has no
-    /// principal to present, and a route whose principal the broker granted
-    /// without `operator.command` is a capability-expanded request. In both
-    /// cases the retained binding authorizes nothing on this route, and the
-    /// handoff is single-use, so a fresh broker-issued handoff - and therefore
-    /// a fresh UI process - is the only owner of the remedy. That is the same
+    /// other one: a state-changing route with no retained principal has nothing
+    /// to present, and a route whose broker-issued grant does not cover
+    /// `operator.command` is a capability-expanded request. In both cases the
+    /// retained binding authorizes nothing on this route, and the handoff is
+    /// single-use, so a fresh broker-issued handoff - and therefore a fresh UI
+    /// process - is the only owner of the remedy. That is the same
     /// `ReacquisitionRequirement` the lost-binding latch already reports, so no
     /// new fault code is invented and no value from the retained principal ever
     /// reaches a message.
+    ///
+    /// The two refusals are NOT equally ordinary, and the difference matters to
+    /// anyone reasoning about what this check proves. `EnsureConnectedAsync`
+    /// publishes the retained broker session strictly BEFORE it publishes the
+    /// Governor connection this check runs against, so on the establishing path
+    /// the principal is necessarily present and the no-principal arm cannot
+    /// fire there. That arm is reached on the paths where the retained session
+    /// has genuinely ended under a request that was already past admission: the
+    /// disposal race in which `DisposeAsync` releases the binding, and a
+    /// retained pipe that no longer reports itself connected. The
+    /// capability arm is the ordinary one - `ValidateEndpoint` admits any
+    /// non-empty subset of the closed two-capability vocabulary, so a
+    /// read-only broker-issued binding is a real admitted shape and reaches
+    /// here without `operator.command`.
     ///
     /// The check reads the retained binding, never a constant and never the
     /// endpoint's requested authority: the broker's granted answer is the only
@@ -418,8 +432,10 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             // authenticated Human principal. The only principal this client can
             // present is the one the User Broker issued and this client retained
             // at redemption, so the check runs HERE - after the connection is
-            // established, which is what proves that redemption, and before the
-            // exchange's own try block, so the refusal keeps its own typed
+            // established, which is what proves that redemption happened at all,
+            // because `EnsureConnectedAsync` publishes the retained broker
+            // session strictly before it publishes this connection - and before
+            // the exchange's own try block, so the refusal keeps its own typed
             // disposition instead of being reported as an owner outcome.
             RequireRetainedHumanPrincipal(tool);
             var state = new ExchangeState();
@@ -966,7 +982,10 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
     /// `ObjectDisposedException` or a flush exception: nothing here throws, and
     /// every incomplete cleanup is recorded explicitly. The close path is
     /// bounded by two teardown allowances in the worst case: the gate wait and
-    /// then the aborted connection's stream disposal.
+    /// then the aborted connection's stream disposal. The retained broker
+    /// binding is released after both, whether or not the gate was acquired, so
+    /// the hold on the broker-issued principal ends with the session instead of
+    /// outliving it.
     public async ValueTask DisposeAsync()
     {
         // Only the transition from OPEN owns the teardown. A repeated or
@@ -1028,6 +1047,29 @@ public sealed class GovernorPipeClient(RuntimeDiscoveryService discovery) : IGov
             }
             if (soleHolder) _requestGate.Dispose();
         }
+        // The retained broker binding ends HERE, and this is the only site that
+        // ends it. Disposal is the one deterministic end of this session: the
+        // process that holds the bound pipe is going away, the same closing
+        // transition already refused new work and cancelled every current wait,
+        // and `MainWindow_OnClosed` is the only caller of this method, so this
+        // is the point at which the session that holds the retained principal
+        // is genuinely finished. Releasing it from anywhere else would be a
+        // guess about liveness this process cannot make - the broker's operator
+        // handler closes its pipe end as soon as it has written `redeemed`, so
+        // this client cannot observe the peer going away and has no such signal
+        // to release on.
+        //
+        // It is called unguarded because it cannot throw: it clears the session
+        // under the binding gate and its only action outside that lock is a
+        // `BrokerPipeSession.Dispose` that absorbs every close failure. So it
+        // cannot replace a refusal already being reported with a close failure,
+        // and wrapping it would only hide a future change that broke that
+        // property. It runs AFTER the transport abort above, so the Governor
+        // pipe is closed first and the broker binding second, and it runs even
+        // when the gate could not be acquired - an in-flight request that
+        // outlived the teardown allowance must not be the reason a retained
+        // principal outlives the session.
+        BrokerPipeClient.ReleaseOperatorBinding();
         Interlocked.Exchange(ref _lifecycle, LifecycleDisposed);
     }
 

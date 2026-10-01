@@ -112,9 +112,20 @@ public sealed record OperatorRoleBinding(
 ///
 /// The Kernel session token is a binding proof, not a bearer credential, and it
 /// lives only in this process's memory: it is never persisted, never logged and
-/// never sent on another pipe, and it is released with the session holding it.
-/// A restarted UI retains nothing here and has to earn a fresh one through the
-/// whole exchange again.
+/// never sent on another pipe. It is retained for the lifetime of the session
+/// that redeemed it and no longer: `GovernorPipeClient.DisposeAsync` calls
+/// `BrokerPipeClient.ReleaseOperatorBinding`, which takes the session out from
+/// under its gate and disposes it exactly once, and `RetainedPrincipal`
+/// reports null for any session that has been released or whose pipe no longer
+/// reports itself connected. That release is what this sentence claims, and it
+/// is a single call site: no other code path ends the hold, so a session that
+/// outlives its client would be a defect rather than a supported lifetime.
+///
+/// The consequence is stated plainly rather than as a guarantee about the
+/// process: a restarted UI retains nothing here and has to earn a fresh token
+/// through the whole exchange again, and while this process lives the retained
+/// copy is ordinary managed memory that is dropped, not scrubbed. Nothing here
+/// claims the bytes are zeroed on release, because no code zeroes them.
 internal sealed record OperatorHumanPrincipal(
     string Principal,
     string InteractiveSessionId,
