@@ -1771,6 +1771,19 @@ pub(crate) struct ProcessExecutionGateway {
     effect_baselines: Mutex<BTreeMap<OperationId, GovernedProcessEffectBaseline>>,
 }
 
+/// Opaque TestD-facing capability issued after the Kernel has retained the
+/// exact authenticated owner-facts response and initial one-use call token.
+/// No Store `RequestIdentity`, lease, receipt context or Blob root authority
+/// leaves the Kernel.
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+pub(crate) struct KernelIssuedBlobProcessStreamGrant {
+    pub(crate) capability: eliot_blob_api::wire::ProcessStreamSinkCapabilityRef,
+    pub(crate) initial_call_token: eliot_blob_api::wire::BlobProcessStreamCallToken,
+    pub(crate) owner_facts_response:
+        eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse,
+}
+
 #[cfg(windows)]
 pub(crate) struct CanonicalStoreAttachment<'a> {
     pub(crate) gateway: Arc<KernelStoreGateway>,
@@ -2894,6 +2907,226 @@ impl ProcessExecutionGateway {
         Ok(request)
     }
 
+    /// Pulls current WorkScope, source, policy, residency and catalog facts
+    /// from the authenticated daemon owner for one admitted TestD process.
+    /// Kernel supplies only the exact process/authority/cause material it
+    /// already issued; the daemon independently reads its retained owners.
+    #[cfg(windows)]
+    pub(crate) async fn pull_testd_blob_process_stream_owner_facts(
+        &self,
+        p07_ors: &RedbRecoveryStore,
+        owner: &ProcessOwnerBinding,
+        process: &ProcessRequest,
+        identity: &eliot_protocol::RequestIdentity,
+        invocation_id: &str,
+        source_root_identity_sha256: &str,
+        expected_module_id: Option<String>,
+        expected_generation_id: Option<String>,
+        deadline_ms: u64,
+    ) -> Result<eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse, ProcessExecutionError>
+    {
+        use eliot_blob_api::wire::{
+            BlobProcessStreamOwnerFactsPullOutcome, BlobProcessStreamOwnerFactsPullRequest,
+            BlobProcessStreamOwnerFactsPullResponse, BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID,
+            BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+        };
+        use eliot_contracts::{ContractId, StateFence, TransactionSequence, canonical_json_bytes, sha256_hex};
+        use eliot_ors::{
+            BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamOwnerFactsPullRecord,
+            BlobProcessStreamOwnerFactsPullState,
+        };
+        use eliot_receipts::{AuthorityBinding, CausalBinding, EffectClass, ProofCeiling};
+
+        static NEXT_BLOB_OWNER_PULL_NONCE: AtomicU64 = AtomicU64::new(1);
+
+        identity
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        process
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if owner.module_id() != super::front_door_session::TESTD_MODULE_ID
+            || invocation_id.trim().is_empty()
+            || deadline_ms == 0
+            || deadline_ms > identity.deadline_unix_ms
+            || expected_module_id.is_some() != expected_generation_id.is_some()
+        {
+            return Err(ProcessExecutionError::Unavailable(
+                "Blob owner-facts pull does not match the admitted TestD process".to_owned(),
+            ));
+        }
+        let process_binding = process
+            .expected_execution_binding()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        if process_binding.job_id().as_str() != process.job_id().as_str()
+            || process_binding.operation_id().as_str() != process.operation_id().as_str()
+            || process_binding.process_tree_id().as_str() != process.process_tree_id().as_str()
+            || process_binding.session_id().as_str() != process.session_id().as_str()
+            || process_binding.generation().get()
+                != identity.request.state_fence.resource_generation.value()
+            || !process_binding
+                .authority_epoch()
+                .is_same_authority(&identity.request.state_fence.authority_epoch)
+        {
+            return Err(ProcessExecutionError::Unavailable(
+                "Kernel process binding does not match the authenticated request fence".to_owned(),
+            ));
+        }
+        if source_root_identity_sha256.len() != 64
+            || !source_root_identity_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ProcessExecutionError::Unavailable(
+                "Kernel source-root identity digest is invalid".to_owned(),
+            ));
+        }
+        let state_fence: StateFence = identity.request.state_fence.clone();
+        let authority = AuthorityBinding {
+            authority_id: ContractId::new(process_binding.authority_id().as_str())
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+            authority_owner: format!(
+                "kernel-testd-process-stream:{}:{}",
+                owner.module_id(),
+                owner.principal_digest()
+            ),
+            authority_epoch: process_binding.authority_epoch().clone(),
+            state_fence: state_fence.clone(),
+            allowed_effect: EffectClass::ReversibleMutation,
+            proof_ceiling: ProofCeiling::Observation,
+        };
+        let causal = CausalBinding {
+            state_fence: state_fence.clone(),
+            transaction_sequence: TransactionSequence::genesis(),
+            parent_receipt_id: None,
+            predecessor_receipt_ids: Vec::new(),
+        };
+        let authority_json = String::from_utf8(
+            canonical_json_bytes(&authority)
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+        )
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let causal_json = String::from_utf8(
+            canonical_json_bytes(&causal)
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+        )
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let process_binding_json = String::from_utf8(
+            canonical_json_bytes(&process_binding)
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+        )
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let process_binding_sha256 = sha256_hex(process_binding_json.as_bytes());
+        let outer_identity_json = String::from_utf8(
+            canonical_json_bytes(identity)
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+        )
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let now = self.now();
+        if now >= deadline_ms {
+            return Err(ProcessExecutionError::Unavailable(
+                "Blob owner-facts deadline elapsed before pull".to_owned(),
+            ));
+        }
+        let nonce = NEXT_BLOB_OWNER_PULL_NONCE.fetch_add(1, Ordering::Relaxed);
+        let pull_seed = canonical_json_bytes(&(
+            process_binding_sha256.as_str(),
+            identity.request.metadata.request_id.as_str(),
+            now,
+            nonce,
+        ))
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let pull_ref = format!("blob-owner-facts-{}", &sha256_hex(&pull_seed)[..32]);
+        let request = BlobProcessStreamOwnerFactsPullRequest {
+            wire_id: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_ID.to_owned(),
+            wire_revision: BLOB_PROCESS_STREAM_OWNER_FACTS_WIRE_REVISION,
+            pull_ref: pull_ref.clone(),
+            job_id: process.job_id().as_str().to_owned(),
+            invocation_id: invocation_id.to_owned(),
+            process_binding_json,
+            process_binding_sha256,
+            kernel_authority_binding_sha256: sha256_hex(authority_json.as_bytes()),
+            kernel_authority_binding_json: authority_json,
+            kernel_causal_binding_sha256: sha256_hex(causal_json.as_bytes()),
+            kernel_causal_binding_json: causal_json,
+            outer_request_sha256: sha256_hex(outer_identity_json.as_bytes()),
+            product_id: identity.request.metadata.product_id.as_str().to_owned(),
+            source_id: identity.request.metadata.source_id.as_str().to_owned(),
+            session_id: identity
+                .request
+                .metadata
+                .session_id
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            task_id: identity
+                .request
+                .metadata
+                .task_id
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            expected_work_scope_ref: None,
+            expected_module_id,
+            expected_generation_id,
+            source_root_identity_sha256: source_root_identity_sha256.to_owned(),
+            state_fence,
+            deadline_ms,
+        };
+        request
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let request_json = String::from_utf8(
+            canonical_json_bytes(&request)
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?,
+        )
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let pull = BlobProcessStreamOwnerFactsPullRecord {
+            contract_version: BLOB_PROCESS_STREAM_ORS_VERSION,
+            pull_ref: pull_ref.clone(),
+            job_id: request.job_id.clone(),
+            request_sha256: sha256_hex(request_json.as_bytes()),
+            request_json,
+            state: BlobProcessStreamOwnerFactsPullState::Pending,
+            response_json: None,
+            response_sha256: None,
+        };
+        p07_ors
+            .persist_blob_process_stream_owner_facts_pull(&pull)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+
+        loop {
+            if self.now() >= deadline_ms {
+                return Err(ProcessExecutionError::UnknownOutcome);
+            }
+            let retained = p07_ors
+                .load_blob_process_stream_owner_facts_pull(&pull_ref)
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?
+                .ok_or(ProcessExecutionError::UnknownOutcome)?;
+            if retained.state == BlobProcessStreamOwnerFactsPullState::Completed {
+                let response: BlobProcessStreamOwnerFactsPullResponse = serde_json::from_str(
+                    retained
+                        .response_json
+                        .as_deref()
+                        .ok_or(ProcessExecutionError::UnknownOutcome)?,
+                )
+                .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+                response
+                    .validate_for_request(&request)
+                    .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+                if !matches!(
+                    response.outcome,
+                    BlobProcessStreamOwnerFactsPullOutcome::Available { .. }
+                ) {
+                    return Err(ProcessExecutionError::Unavailable(
+                        "daemon owner-facts resolver did not return all required current facts"
+                            .to_owned(),
+                    ));
+                }
+                return Ok(response);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     pub(crate) async fn inspect(
         &self,
         owner: &ProcessOwnerBinding,
@@ -3519,6 +3752,187 @@ impl ProcessExecutionGateway {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl KernelComposition {
+    /// Pulls current owner facts through the retained process issuer and
+    /// Kernel ORS. The public caller never receives or constructs issuer
+    /// secrets; its inputs are already admitted process identities.
+    pub(crate) async fn pull_testd_blob_process_stream_owner_facts(
+        &self,
+        owner: &ProcessOwnerBinding,
+        process: &ProcessRequest,
+        identity: &eliot_protocol::RequestIdentity,
+        invocation_id: &str,
+        source_root_identity_sha256: &str,
+        expected_module_id: Option<String>,
+        expected_generation_id: Option<String>,
+        deadline_ms: u64,
+    ) -> Result<eliot_blob_api::wire::BlobProcessStreamOwnerFactsPullResponse, ProcessExecutionError>
+    {
+        let gateway = self
+            .process_gateway
+            .as_ref()
+            .ok_or_else(|| ProcessExecutionError::Unavailable(
+                "Kernel process issuer is unavailable".to_owned(),
+            ))?;
+        gateway
+            .pull_testd_blob_process_stream_owner_facts(
+                &self.p07_ors,
+                owner,
+                process,
+                identity,
+                invocation_id,
+                source_root_identity_sha256,
+                expected_module_id,
+                expected_generation_id,
+                deadline_ms,
+            )
+            .await
+    }
+
+    /// Issues and durably retains the capability and its first one-use call
+    /// token only after the authenticated owner-facts pull is complete and
+    /// independently validated.
+    #[cfg(windows)]
+    pub(crate) async fn issue_testd_blob_process_stream_grant(
+        &self,
+        owner: &ProcessOwnerBinding,
+        process: &ProcessRequest,
+        identity: &eliot_protocol::RequestIdentity,
+        invocation_id: &str,
+        source_root_identity_sha256: &str,
+        expected_module_id: Option<String>,
+        expected_generation_id: Option<String>,
+        deadline_ms: u64,
+    ) -> Result<KernelIssuedBlobProcessStreamGrant, ProcessExecutionError> {
+        use eliot_blob_api::wire::{
+            BlobProcessStreamCallToken, BlobProcessStreamOwnerFactsPullOutcome,
+            ProcessStreamSinkCapabilityRef,
+        };
+        use eliot_contracts::{canonical_json_bytes, sha256_hex};
+        use eliot_ors::{
+            BLOB_PROCESS_STREAM_ORS_VERSION, BlobProcessStreamGrantRecord,
+            BlobProcessStreamGrantState,
+        };
+
+        static NEXT_BLOB_GRANT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+        let response = self
+            .pull_testd_blob_process_stream_owner_facts(
+                owner,
+                process,
+                identity,
+                invocation_id,
+                source_root_identity_sha256,
+                expected_module_id,
+                expected_generation_id,
+                deadline_ms,
+            )
+            .await?;
+        let owner_facts_sha256 = match &response.outcome {
+            BlobProcessStreamOwnerFactsPullOutcome::Available {
+                owner_facts_sha256,
+                ..
+            } => owner_facts_sha256.clone(),
+            BlobProcessStreamOwnerFactsPullOutcome::Unavailable { .. } => {
+                return Err(ProcessExecutionError::Unavailable(
+                    "daemon owner-facts pull did not supply all required Blob authority".to_owned(),
+                ));
+            }
+        };
+        let binding = process
+            .expected_execution_binding()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let binding_json = canonical_json_bytes(&binding)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let identity_json = canonical_json_bytes(identity)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let now = unix_ms();
+        if deadline_ms <= now {
+            return Err(ProcessExecutionError::Unavailable(
+                "Blob grant deadline elapsed before durable issue".to_owned(),
+            ));
+        }
+        let nonce = NEXT_BLOB_GRANT_NONCE.fetch_add(1, Ordering::Relaxed);
+        let capability_seed = canonical_json_bytes(&(
+            response.pull_ref.as_str(),
+            sha256_hex(&binding_json),
+            sha256_hex(&identity_json),
+            now,
+            nonce,
+        ))
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let capability_ref = format!("blob-cap-{}", &sha256_hex(&capability_seed)[..40]);
+        let token_seed = canonical_json_bytes(&(capability_ref.as_str(), 1_u32, nonce))
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let token_ref = format!("blob-call-{}", &sha256_hex(&token_seed)[..40]);
+        let state_fence_json = canonical_json_bytes(&identity.request.state_fence)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let store_session_binding_json = canonical_json_bytes(&(
+            identity.request.metadata.product_id.as_str(),
+            identity.request.metadata.source_id.as_str(),
+            identity.request.metadata.session_id.as_ref().map(|value| value.as_str()),
+            identity.request.metadata.task_id.as_ref().map(|value| value.as_str()),
+            &identity.request.state_fence,
+        ))
+        .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let grant = BlobProcessStreamGrantRecord {
+            contract_version: BLOB_PROCESS_STREAM_ORS_VERSION,
+            capability_ref: capability_ref.clone(),
+            job_id: response.job_id.clone(),
+            invocation_id: response.invocation_id.clone(),
+            process_binding_sha256: response.process_binding_sha256.clone(),
+            store_session_binding_sha256: sha256_hex(&store_session_binding_json),
+            owner_facts_sha256,
+            owner_facts_pull_ref: response.pull_ref.clone(),
+            authority_lineage_id: identity
+                .request
+                .state_fence
+                .authority_epoch
+                .lineage_id
+                .as_str()
+                .to_owned(),
+            authority_epoch: identity.request.state_fence.authority_epoch.sequence.get(),
+            generation: identity
+                .request
+                .state_fence
+                .resource_generation
+                .value(),
+            state_fence_sha256: sha256_hex(&state_fence_json),
+            expires_at_unix_ms: deadline_ms,
+            next_ordinal: 1,
+            state: BlobProcessStreamGrantState::Active,
+        };
+        grant
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let ors = &self.p07_ors;
+        ors.persist_blob_process_stream_grant(&grant)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let token = ors
+            .issue_blob_process_stream_call_token(&capability_ref, &token_ref)
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let initial_call_token = BlobProcessStreamCallToken {
+            reference: token.token_ref,
+            ordinal: token.ordinal,
+        };
+        initial_call_token
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        let capability = ProcessStreamSinkCapabilityRef {
+            reference: capability_ref,
+        };
+        capability
+            .validate()
+            .map_err(|error| ProcessExecutionError::Unavailable(error.to_string()))?;
+        Ok(KernelIssuedBlobProcessStreamGrant {
+            capability,
+            initial_call_token,
+            owner_facts_response: response,
+        })
     }
 }
 
