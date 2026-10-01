@@ -9224,6 +9224,24 @@ impl KernelComposition {
                 &campaign_source_publications,
             )
         {
+            // Issue #1679 W7: the ORS owner outcome is typed, so the refusal
+            // follows the enum arm rather than the rendered line. A publication
+            // conflict is an identity conflict, never backpressure: the
+            // presented heads/records disagree with durable ORS state, the
+            // failed reservation staged nothing (the owner commits once at the
+            // end, after every check, and this call precedes any Store send),
+            // and an identical retry is deterministically refused again. The
+            // caller must reconcile current heads and re-present, so the typed
+            // identity-conflict terminal travels here instead of a
+            // `STORAGE_BACKPRESSURE` code that would claim measured byte
+            // exhaustion this owner never reported. Every other arm keeps the
+            // honest code-only staging refusal below.
+            if matches!(
+                error,
+                eliot_ors::OrsError::CampaignSourcePublicationConflict { .. }
+            ) {
+                return Err(TransportError::IdentityConflict);
+            }
             return Ok(Self::store_staging_refusal_response(
                 "write_receipt",
                 campaign_source_operation_id.as_str(),
@@ -11392,7 +11410,10 @@ impl KernelComposition {
     /// error string. It is not read from the absence of a receipt: this arm is
     /// entered only on a real `reserve_campaign_source_publications` error, so
     /// the durable staging attempt is known to have failed rather than inferred
-    /// from a later check being absent.
+    /// from a later check being absent. The typed publication-conflict arm
+    /// never enters here: identity conflict is not backpressure (issue #1679
+    /// W7), so the call site above answers it with the typed
+    /// identity-conflict terminal instead.
     #[cfg(windows)]
     fn store_staging_refusal_response(
         kind: &str,
