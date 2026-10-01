@@ -32,6 +32,7 @@ pub mod provider_denominator;
 pub mod registry;
 pub mod testd_port;
 pub mod testd_profile_dispatch;
+pub mod verification_executor;
 pub mod verification_profile;
 
 pub use admission_submission::{AdmissionSubmission, submit_admission_snapshot};
