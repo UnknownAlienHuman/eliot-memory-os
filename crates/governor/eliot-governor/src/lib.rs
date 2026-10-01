@@ -293,7 +293,9 @@ pub use route_registry::{
     RouteOutcomeProfile, RouteOutcomeProfileIndex, RouteRefusalReason, RouteRegistryError,
     RuntimeRoute, diverging_scope_layers, effective_route_key,
 };
-pub use scan_disclosure_owner::{InstallationScanContour, InstallationScanDisclosureStore};
+pub use scan_disclosure_owner::{
+    InstallationScanContour, InstallationScanDisclosureStore, ScanDisclosureQuarantineHandle,
+};
 pub use scope_identity_admission::{
     BindingToken, GenerationEvidence, GoverningSourceSet, GuardTrigger, GuardVerdict,
     HostObservedHandles, IdentityEvidence, IdentityLegOutcome, ManifestBoundaryClaim,
