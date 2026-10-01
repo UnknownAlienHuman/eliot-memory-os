@@ -33,8 +33,9 @@ use eliot_runtime_contracts::{
     ModuleContract, ModuleGeneration, ModuleGenerationState, VerifiedSupervisionLease,
 };
 use eliot_watchdog_core::{
-    WatchdogSpoolAcknowledgement, WatchdogSpoolExportBatch, WatchdogSpoolPayloadKind,
-    validate_batch, validate_batch_freshness,
+    WatchdogSpoolAcknowledgement, WatchdogSpoolEntryDisposition, WatchdogSpoolExportBatch,
+    WatchdogSpoolPayloadKind, WatchdogSpoolSinkDisposition, validate_batch,
+    validate_batch_freshness,
 };
 
 use crate::watchdog_spool::intent::{
@@ -919,8 +920,6 @@ fn entry_disposition_from_export_projection(
     projection: &serde_json::Value,
     submitted: &WatchdogSpoolExportSubmission,
 ) -> Result<WatchdogSpoolEntryDisposition, SpoolError> {
-    use eliot_watchdog_core::{WatchdogSpoolEntryDisposition, WatchdogSpoolSinkDisposition};
-
     if projection
         .get("sequence")
         .and_then(serde_json::Value::as_u64)
@@ -998,9 +997,7 @@ fn entry_disposition_from_export_projection(
 /// would strand the entry forever.
 fn terminal_disposition_from_kernel_outcome(
     value: &serde_json::Value,
-) -> Result<eliot_watchdog_core::WatchdogSpoolSinkDisposition, SpoolError> {
-    use eliot_watchdog_core::WatchdogSpoolSinkDisposition as Disposition;
-
+) -> Result<WatchdogSpoolSinkDisposition, SpoolError> {
     let outcome: WatchdogSpoolEntryOutcome =
         serde_json::from_value(value.clone()).map_err(|_| {
             SpoolError::LeaseFenced(
@@ -1009,9 +1006,13 @@ fn terminal_disposition_from_kernel_outcome(
             )
         })?;
     Ok(match outcome {
-        WatchdogSpoolEntryOutcome::Applied => Disposition::Applied,
-        WatchdogSpoolEntryOutcome::Rejected { reason } => Disposition::Rejected { reason },
-        WatchdogSpoolEntryOutcome::GapRequiresRecovery => Disposition::GapRequiresRecovery,
+        WatchdogSpoolEntryOutcome::Applied => WatchdogSpoolSinkDisposition::Applied,
+        WatchdogSpoolEntryOutcome::Rejected { reason } => {
+            WatchdogSpoolSinkDisposition::Rejected { reason }
+        }
+        WatchdogSpoolEntryOutcome::GapRequiresRecovery => {
+            WatchdogSpoolSinkDisposition::GapRequiresRecovery
+        }
     })
 }
 
