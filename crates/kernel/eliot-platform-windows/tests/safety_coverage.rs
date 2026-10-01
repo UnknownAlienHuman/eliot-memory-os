@@ -20,12 +20,16 @@ use std::path::{Path, PathBuf};
 // updating the oracle (pristine-base proof: 166 sites, 165 blocks, tests.rs 19;
 // same 5 failures on clean 714fb830). #1357 added scm_entry.rs outside the old
 // lib.rs/tests.rs scan. SAFETY-COVERAGE-ALL-SRC (#728) widens discovery to
-// every `.rs` file under `src/` (35 files, 575 sites at this source revision).
-// The current additions are 11 lib.rs sites (10 blocks, one impl), five
-// event_log.rs blocks, two terminal_containment.rs blocks, and zero in
-// profile_supervision.rs. The explicit per-file rows below are the audited
-// denominator; EXPECTED_SITES is their sum.
-const EXPECTED_SITES: usize = 575;
+// every `.rs` file under `src/`. The earlier 575-site table omitted admitted
+// source additions in named_pipe_peer_auth.rs, platform_security.rs,
+// process_job.rs, protected_path.rs, secret_store.rs, and user_owned_leases.rs.
+// The current audit is 35 files and 637 sites: the six corrected rows add 62
+// sites (all blocks); the other rows retain their audited counts. Relevant
+// source history includes #22 (#4228), #860 (#3469), #1888 (#4079), and #1771
+// (#4480), with per-file history recorded in the baseline audit ledger. The
+// explicit rows below are the audited denominator; EXPECTED_SITES is an
+// independent lock and is not derived from those rows.
+const EXPECTED_SITES: usize = 637;
 const EXPECTED_FILE_COUNT: usize = 35;
 const EXPECTED_TOTAL_IMPL: usize = 6;
 const EXPECTED_TOTAL_EXTERN: usize = 4;
@@ -227,8 +231,8 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
     },
     FileExpectation {
         rel: "named_pipe_peer_auth.rs",
-        sites: 34,
-        blocks: 34,
+        sites: 42,
+        blocks: 42,
         impls: 0,
         externs: 0,
     },
@@ -290,8 +294,8 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
     },
     FileExpectation {
         rel: "platform_security.rs",
-        sites: 30,
-        blocks: 30,
+        sites: 69,
+        blocks: 69,
         impls: 0,
         externs: 0,
     },
@@ -304,8 +308,8 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
     },
     FileExpectation {
         rel: "process_job.rs",
-        sites: 58,
-        blocks: 57,
+        sites: 66,
+        blocks: 65,
         impls: 1,
         externs: 0,
     },
@@ -332,8 +336,8 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
     },
     FileExpectation {
         rel: "protected_path.rs",
-        sites: 16,
-        blocks: 16,
+        sites: 17,
+        blocks: 17,
         impls: 0,
         externs: 0,
     },
@@ -353,8 +357,8 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
     },
     FileExpectation {
         rel: "secret_store.rs",
-        sites: 11,
-        blocks: 11,
+        sites: 14,
+        blocks: 14,
         impls: 0,
         externs: 0,
     },
@@ -402,8 +406,8 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
     },
     FileExpectation {
         rel: "user_owned_leases.rs",
-        sites: 14,
-        blocks: 14,
+        sites: 17,
+        blocks: 17,
         impls: 0,
         externs: 0,
     },
