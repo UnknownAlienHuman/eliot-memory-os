@@ -623,7 +623,7 @@ impl ProviderVerifier for KernelProviderVerifier {
         // row, selected by proof kind: never the presented value echoed
         // back. A kind with no retained payload yet yields empty, which the
         // owner treats as "no evidence on this leg".
-        let loaded_canonical_payload_sha256 = witnessed.receipt_payload_for_kind(&kind);
+        let loaded_canonical_payload_sha256 = witnessed.receipt_payload_for_kind(kind);
         let request = ProviderCapabilityRequest {
             claim_id: presented.claim_id.clone(),
             attempt_id: receipt_attempt_id,
