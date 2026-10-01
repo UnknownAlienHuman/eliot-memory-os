@@ -17,18 +17,30 @@
 //! * `open` pins the sink session (operation binding, stream kind, policy,
 //!   limits, open digest). A reopened request with the same open digest
 //!   returns the same session; a different digest is `OpenDigestMismatch`.
-//! * `append` admits exact sequence/offset chunks into a staging buffer
-//!   bounded by the session ceilings, with exact-replay acknowledgement and
-//!   an explicit backpressure contract. Appends never touch storage.
-//! * `finalize` publishes only a gap-free, transport-complete source through
-//!   one durable stage call, verifies the ready receipt, reads the object
-//!   back, and only then mints the `COMPLETE_SOURCE` terminal. Anything else
-//!   (gaps, policy prohibition, redaction failure, provider failure, digest
-//!   mismatch, cancellation, unknown outcome) never becomes
-//!   `COMPLETE_SOURCE`, and policy-prohibited or failed-redaction terminals
-//!   never stage raw bytes.
+//! * `append` admits exact sequence/offset chunks into a bounded staging
+//!   window and advances the incremental admissible-source identity (byte
+//!   count plus the full SHA-256) as the bytes flow, so the durable source
+//!   identity never needs a re-read of the window. Appends never touch
+//!   storage and never await, so the pipe cannot be blocked here; a full
+//!   window returns the one declared overflow disposition
+//!   (`Backpressured`, carrying the session's own wait budget) and records
+//!   the exact shed boundary, which finalize requires to be declared as
+//!   `PERSISTENCE_BACKPRESSURE`.
+//! * `finalize` decides from the declared gap set, through the contract's one
+//!   disposition table, what may be staged and which terminal names it: a
+//!   complete durable source, a shorter exact durable prefix with exact
+//!   coverage, or an explicit unavailable/prohibited/failed terminal. A
+//!   contradiction between the declared gaps and the declared byte coverage
+//!   fails closed instead of minting a terminal.
+//! * One durable stage call publishes the admitted prefix, verifies the ready
+//!   receipt, reads the object back, and only then mints the terminal. A
+//!   declared policy transformation binds the exact input/output receipt: the
+//!   staged bytes must be the declared output and the inline preview must be
+//!   a prefix of those transformed bytes in durable-source coordinates, so a
+//!   raw pre-policy byte can never enter the record. Policy-prohibited or
+//!   failed-redaction terminals never stage raw bytes at all.
 //! * Staged plaintext is dropped when a terminal lands; only counts and the
-//!   incremental transport digest survive for readback/replay.
+//!   incremental admissible digest survive for readback/replay.
 //!
 //! Finalization is a bounded phase machine, never a permanently reserved
 //! flag (issue #297 external audit `5881604166`). The one terminal command of
@@ -73,14 +85,14 @@ use eliot_blob_api::{
 };
 use eliot_process::{
     DurableProcessStreamSource, DurableStreamLocatorKind, PROCESS_STREAM_SINK_SCHEMA_VERSION,
-    ProcessStreamEvidence, ProcessStreamPrefixPreview, ProcessStreamSinkAbortReason,
-    ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
-    ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
-    ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest, ProcessStreamSinkReadback,
-    ProcessStreamSinkSession, ProcessStreamSinkSessionView, ProcessStreamSinkState,
-    ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
-    ProcessStreamSinkUnknownOutcome, StreamEvidenceGap, StreamPersistenceStatus,
-    StreamPreviewRepresentation, StreamTransportStatus,
+    ProcessStreamEvidence, ProcessStreamPersistenceDisposition, ProcessStreamPrefixPreview,
+    ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
+    ProcessStreamSinkAppendDisposition, ProcessStreamSinkClient, ProcessStreamSinkError,
+    ProcessStreamSinkFinalizeRequest, ProcessStreamSinkFuture, ProcessStreamSinkOpenRequest,
+    ProcessStreamSinkReadback, ProcessStreamSinkSession, ProcessStreamSinkSessionView,
+    ProcessStreamSinkState, ProcessStreamSinkTerminal, ProcessStreamSinkTerminalCommandIdentity,
+    ProcessStreamSinkUnknownOutcome, ProcessStreamTransportPrefixIdentity, StreamEvidenceGap,
+    StreamPersistenceStatus, StreamPreviewRepresentation, StreamTransportStatus,
 };
 use eliot_receipts::EffectClass;
 use sha2::{Digest, Sha256};
@@ -170,11 +182,18 @@ impl BlobStreamSinkStoreBinding {
 
 struct SinkState {
     session: Option<ProcessStreamSinkSession>,
+    /// Bounded staging window of the admitted admissible bytes, capped by the
+    /// session's `max_total_admitted_bytes` and `max_chunks` ceilings. It never
+    /// holds a byte the caller did not admit under the bound policy.
     staged: Vec<u8>,
-    digester: Sha256,
+    /// Incremental admissible-source identity: the byte count and the full
+    /// versioned digest over every admitted chunk, advanced as chunks flow.
+    admitted: AdmittedAccount,
+    /// The exact boundary at which the bounded staging window refused more
+    /// bytes. `None` means this session never shed an append.
+    overflow: Option<StagingOverflow>,
     admitted_chunks: Vec<AdmittedChunk>,
     next_sequence: u64,
-    next_offset: u64,
     terminal: Option<ProcessStreamSinkTerminal>,
     terminal_command: Option<ProcessStreamSinkTerminalCommandIdentity>,
     /// The one bounded phase record of the one reserved terminal command.
@@ -182,6 +201,54 @@ struct SinkState {
     /// Monotonic local incarnation counter. A stale finalizer that outlived
     /// its reservation can never release the successor's reservation.
     finalization_incarnation: u64,
+}
+
+/// Incremental admissible-source identity for one sink session.
+///
+/// The byte count and the full SHA-256 identity are advanced with every
+/// admitted chunk, so the durable source identity is always available without
+/// re-reading or re-hashing the staging window. The accumulator is the single
+/// owner of both values: `SinkState` keeps no second byte counter.
+struct AdmittedAccount {
+    digester: Sha256,
+    byte_length: u64,
+}
+
+impl AdmittedAccount {
+    fn new() -> Self {
+        Self {
+            digester: Sha256::new(),
+            byte_length: 0,
+        }
+    }
+
+    /// Absorbs one admitted chunk as it flows.
+    fn absorb(&mut self, bytes: &[u8]) {
+        self.digester.update(bytes);
+        self.byte_length = self.byte_length.saturating_add(bytes.len() as u64);
+    }
+
+    /// Number of admissible bytes admitted so far.
+    const fn byte_length(&self) -> u64 {
+        self.byte_length
+    }
+
+    /// SHA-256 over every admissible byte admitted so far.
+    fn sha256_hex(&self) -> String {
+        format!("{:x}", self.digester.clone().finalize())
+    }
+}
+
+/// The exact boundary where bounded staging refused to grow.
+///
+/// This is the recorded form of the declared overflow disposition: a session
+/// that shed an append can never afterwards present its retained prefix as a
+/// complete source, because finalize requires the matching
+/// `PERSISTENCE_BACKPRESSURE` gap.
+#[derive(Clone, Copy)]
+struct StagingOverflow {
+    sequence: u64,
+    byte_length: u64,
 }
 
 struct AdmittedChunk {
@@ -207,6 +274,13 @@ struct FinalizeReservation {
     next_sequence: u64,
     next_offset: u64,
     admitted_sha256: String,
+    /// The exact terminal state this command was admitted to mint, decided once
+    /// from the declared coverage so a resumed publish cannot rename itself.
+    terminal_state: ProcessStreamSinkState,
+    /// Whether the admitted admissible bytes are the whole declared physical
+    /// transport stream, retained so the resumed readback keeps the exact
+    /// coverage it was reserved with.
+    coverage_complete: bool,
     stage_operation_id: String,
     stage_idempotency_key: String,
     phase: FinalizePhase,
@@ -254,6 +328,8 @@ struct PublishTicket {
     next_sequence: u64,
     next_offset: u64,
     admitted_sha256: String,
+    terminal_state: ProcessStreamSinkState,
+    coverage_complete: bool,
     step: PublishStep,
 }
 
@@ -300,19 +376,15 @@ impl SinkState {
         Self {
             session: None,
             staged: Vec::new(),
-            digester: Sha256::new(),
+            admitted: AdmittedAccount::new(),
+            overflow: None,
             admitted_chunks: Vec::new(),
             next_sequence: 0,
-            next_offset: 0,
             terminal: None,
             terminal_command: None,
             finalization: None,
             finalization_incarnation: 0,
         }
-    }
-
-    fn admitted_sha256(&self) -> String {
-        format!("{:x}", self.digester.clone().finalize())
     }
 }
 
@@ -372,14 +444,38 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Ok(existing)
     }
 
-    fn check_observed(
+    /// Whether the admissible bytes this provider holds are provably the whole
+    /// physical transport stream the command declared.
+    ///
+    /// The admissible set is a prefix of the physical stream, so the byte
+    /// counts alone decide coverage; the digest equality for equal lengths is
+    /// enforced by the contract in `ProcessStreamSinkTerminal`.
+    fn coverage_complete(state: &SinkState, observed_bytes: u64) -> Result<bool, ProcessStreamSinkError> {
+        if state.admitted.byte_length() > observed_bytes {
+            return Err(ProcessStreamSinkError::OffsetMismatch {
+                expected: observed_bytes,
+                observed: state.admitted.byte_length(),
+            });
+        }
+        Ok(state.admitted.byte_length() == observed_bytes)
+    }
+
+    /// Whether a staging-window overflow was declared on the command.
+    ///
+    /// A session that shed an append must not present its retained prefix as a
+    /// complete source, so the declared gap set has to name the backpressure.
+    fn check_overflow_declared(
         state: &SinkState,
-        observed_sha256: &str,
-        observed_bytes: u64,
+        gaps: &[StreamEvidenceGap],
     ) -> Result<(), ProcessStreamSinkError> {
-        if observed_sha256 != state.admitted_sha256() || observed_bytes != state.next_offset {
+        if let Some(overflow) = state.overflow
+            && !gaps.contains(&StreamEvidenceGap::PersistenceBackpressure)
+        {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "observed transport facts do not match admitted chunks".to_owned(),
+                reason: format!(
+                    "the staging window shed at sequence {} and {} admissible bytes, which must be declared as persistence backpressure",
+                    overflow.sequence, overflow.byte_length
+                ),
             });
         }
         Ok(())
@@ -396,22 +492,63 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 observed: sequence,
             });
         }
-        if offset != state.next_offset {
+        if offset != state.admitted.byte_length() {
             return Err(ProcessStreamSinkError::OffsetMismatch {
-                expected: state.next_offset,
+                expected: state.admitted.byte_length(),
                 observed: offset,
             });
         }
         Ok(())
     }
 
-    /// Verifies that a transport-bytes preview is exactly the admitted prefix.
-    fn check_preview(
+    /// Proves the command's inline preview is an exact prefix of the very bytes
+    /// this provider will stage.
+    ///
+    /// Both coordinate systems are checked against the same staging window, so
+    /// every inline byte in the durable record is an admissible-source byte. A
+    /// declared policy transformation additionally requires the durable-source
+    /// coordinate system, so a raw pre-policy transport preview can never enter
+    /// the record of a transformed source, and the governing policy identity
+    /// must be the one bound at session open.
+    fn check_staged_preview(
         state: &SinkState,
-        preview: &ProcessStreamPrefixPreview,
+        session: &ProcessStreamSinkSession,
+        request: &ProcessStreamSinkFinalizeRequest,
     ) -> Result<(), ProcessStreamSinkError> {
-        if preview.representation() != StreamPreviewRepresentation::TransportBytes {
-            return Ok(());
+        let preview = request.preview();
+        let staged_length = u64::try_from(state.staged.len()).map_err(|_| {
+            ProcessStreamSinkError::EvidenceInvariant {
+                reason: "staged length does not fit the session counters".to_owned(),
+            }
+        })?;
+        match request.transformation() {
+            None => {
+                if preview.representation() != StreamPreviewRepresentation::TransportBytes {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "an untransformed source cannot carry a durable-source preview"
+                            .to_owned(),
+                    });
+                }
+            }
+            Some(transformation) => {
+                if transformation.policy_ref() != session.policy().policy_ref()
+                    || transformation.redaction_ref() != session.policy().redaction_ref()
+                {
+                    return Err(ProcessStreamSinkError::PolicyMismatch);
+                }
+                if preview.representation() != StreamPreviewRepresentation::DurableSourceBytes {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "a policy-transformed source cannot expose a raw transport preview"
+                            .to_owned(),
+                    });
+                }
+                if preview.represented_bytes() != staged_length {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "a transformed preview must use durable source coordinates"
+                            .to_owned(),
+                    });
+                }
+            }
         }
         let retained = usize::try_from(preview.retained_bytes()).map_err(|_| {
             ProcessStreamSinkError::EvidenceInvariant {
@@ -420,7 +557,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         })?;
         if retained > state.staged.len() || preview.bytes() != &state.staged[..retained] {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "transport preview does not match admitted bytes".to_owned(),
+                reason: "the preview is not a prefix of the admissible source".to_owned(),
             });
         }
         Ok(())
@@ -471,10 +608,10 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 ProcessStreamSinkState::Open
             },
             state.next_sequence,
-            state.next_offset,
+            state.admitted.byte_length(),
             state.next_sequence,
-            state.next_offset,
-            state.admitted_sha256(),
+            state.admitted.byte_length(),
+            state.admitted.sha256_hex(),
             session.open_request_sha256().to_owned(),
             None,
         )
@@ -512,7 +649,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             if matches_admitted_chunk {
                 return Ok(ProcessStreamSinkAppendDisposition::Replayed {
                     next_sequence: state.next_sequence,
-                    next_offset: state.next_offset,
+                    next_offset: state.admitted.byte_length(),
                 });
             }
             return Err(ProcessStreamSinkError::MismatchedReplay);
@@ -523,42 +660,64 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 observed: request.sequence(),
             });
         }
-        if request.offset() != state.next_offset {
+        if request.offset() != state.admitted.byte_length() {
             return Err(ProcessStreamSinkError::OffsetMismatch {
-                expected: state.next_offset,
+                expected: state.admitted.byte_length(),
                 observed: request.offset(),
             });
         }
         let limits = session.limits();
-        if state.next_sequence >= limits.max_chunks() {
-            return Err(ProcessStreamSinkError::ChunkCountLimitExceeded);
-        }
-        if request.byte_length()
-            > limits
-                .max_total_admitted_bytes()
-                .saturating_sub(state.next_offset)
+        // Bounded staging, one declared overflow disposition. This adapter
+        // never awaits and never performs provider I/O on the drain path, so
+        // the pipe cannot be blocked here; a full window instead refuses the
+        // append with the session's own declared backpressure disposition and
+        // records the exact shed boundary. The caller keeps draining and
+        // declares the shed tail as a persistence gap at finalize.
+        if state.next_sequence >= limits.max_chunks()
+            || request.byte_length()
+                > limits
+                    .max_total_admitted_bytes()
+                    .saturating_sub(state.admitted.byte_length())
         {
-            return Err(ProcessStreamSinkError::TotalLimitExceeded);
+            // The first shed boundary is the exact coverage this session can
+            // still prove; later refusals report the same boundary.
+            if state.overflow.is_none() {
+                state.overflow = Some(StagingOverflow {
+                    sequence: state.next_sequence,
+                    byte_length: state.admitted.byte_length(),
+                });
+            }
+            return Ok(Self::overflow_disposition(session));
         }
-        // This synchronous adapter has no append queue: each request is
-        // admitted as one bounded chunk. The total byte and chunk ceilings
-        // bound staged memory and reject overflow explicitly above. Since
-        // each admitted sequence adds one record, max_chunks also bounds
-        // this metadata without retaining another plaintext copy.
+        // Each admitted sequence adds exactly one metadata record, so the
+        // chunk ceiling bounds this list without retaining another plaintext
+        // copy of the stream.
         state.admitted_chunks.push(AdmittedChunk {
             sequence: request.sequence(),
             offset: request.offset(),
             length: request.byte_length(),
             sha256: request.sha256().to_owned(),
         });
-        state.digester.update(request.bytes());
+        state.admitted.absorb(request.bytes());
         state.staged.extend_from_slice(request.bytes());
         state.next_sequence = state.next_sequence.saturating_add(1);
-        state.next_offset = state.next_offset.saturating_add(request.byte_length());
         Ok(ProcessStreamSinkAppendDisposition::Accepted {
             next_sequence: state.next_sequence,
-            next_offset: state.next_offset,
+            next_offset: state.admitted.byte_length(),
         })
+    }
+
+    /// The one declared overflow disposition of the bounded staging window.
+    ///
+    /// The retry hint is the session's own declared append wait budget, so the
+    /// caller learns the exact ceiling this session published at open instead
+    /// of a private constant.
+    fn overflow_disposition(
+        session: &ProcessStreamSinkSession,
+    ) -> ProcessStreamSinkAppendDisposition {
+        ProcessStreamSinkAppendDisposition::Backpressured {
+            retry_after_ms: session.limits().max_append_wait_ms(),
+        }
     }
 
     fn abort_state(reason: ProcessStreamSinkAbortReason) -> ProcessStreamSinkState {
@@ -603,7 +762,11 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request.expected_final_sequence(),
             request.expected_final_offset(),
         )?;
-        Self::check_observed(state, request.observed_sha256(), request.observed_bytes())?;
+        // The declared physical coverage may legitimately exceed the admitted
+        // custody here; the abort terminal then names exactly that gap. The
+        // staging overflow needs no gap declaration on this path: an abort
+        // never publishes, so it can never claim a complete source.
+        let _ = Self::coverage_complete(state, request.observed_bytes())?;
         // Abort never publishes: no stage call for any reason, so a
         // policy-prohibited or failed-redaction session cannot stage raw
         // bytes. The staged plaintext is dropped with the terminal.
@@ -625,8 +788,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request,
             Self::abort_state(reason),
             state.next_sequence,
-            state.next_offset,
-            state.admitted_sha256(),
+            state.admitted.byte_length(),
+            state.admitted.sha256_hex(),
             evidence,
         )?;
         Self::record_locked(state, identity, terminal)
@@ -805,30 +968,88 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Ok(())
     }
 
-    fn complete_source(
+    /// Builds the terminal evidence for the published admissible prefix.
+    ///
+    /// The durable source identity comes from the owner-issued ready receipt,
+    /// which `retain_ready` already proved against the staged bytes, so the
+    /// locator, the length and the digest describe the very object the owner
+    /// holds. A declared policy transformation additionally binds the exact
+    /// input/output receipt: the staged bytes must be the declared output and
+    /// the declared input must be the physical transport identity the command
+    /// carries. The transport-prefix identity is present exactly when a shorter
+    /// exact prefix is durable, and never for a transformed source, which
+    /// cannot prove which part of its input it covers.
+    fn publish_evidence(
         session: &ProcessStreamSinkSession,
         request: &ProcessStreamSinkFinalizeRequest,
         admitted_sha256: &str,
+        coverage_complete: bool,
         ready: &BlobReadyReceipt,
     ) -> Result<ProcessStreamEvidence, ProcessStreamSinkError> {
         let receipt_ref = ready.receipt().identity.receipt_id.to_string();
-        let source = DurableProcessStreamSource::exact_transport(
-            DurableStreamLocatorKind::Blob,
-            format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash),
-            receipt_ref,
-            admitted_sha256.to_owned(),
-            ready.plaintext_length(),
-        )?;
-        ProcessStreamEvidence::new_raw(
+        let locator = format!("{BLOB_SOURCE_LOCATOR_SCHEME}:{}", ready.locator().hash);
+        let source = match request.transformation() {
+            None => DurableProcessStreamSource::exact_transport(
+                DurableStreamLocatorKind::Blob,
+                locator,
+                receipt_ref,
+                admitted_sha256.to_owned(),
+                ready.plaintext_length(),
+            )?,
+            Some(transformation) => {
+                // The receipt must describe the staged bytes exactly, and its
+                // declared input must be the physical stream this command
+                // carries. Anything else is refused before a terminal exists.
+                if ready.plaintext_sha256() != transformation.output_sha256()
+                    || ready.plaintext_length() != transformation.output_byte_length()
+                {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "the staged bytes are not the declared transformation output"
+                            .to_owned(),
+                    });
+                }
+                if transformation.input_sha256() != request.observed_sha256()
+                    || transformation.input_byte_length() != request.observed_bytes()
+                {
+                    return Err(ProcessStreamSinkError::EvidenceInvariant {
+                        reason: "the transformation input is not the declared transport stream"
+                            .to_owned(),
+                    });
+                }
+                DurableProcessStreamSource::policy_transformed(
+                    DurableStreamLocatorKind::Blob,
+                    locator,
+                    receipt_ref,
+                    transformation.output_sha256().to_owned(),
+                    ready.plaintext_length(),
+                    transformation.clone(),
+                )?
+            }
+        };
+        let prefix_identity = if coverage_complete || request.transformation().is_some() {
+            None
+        } else {
+            Some(ProcessStreamTransportPrefixIdentity::new(
+                admitted_sha256.to_owned(),
+                ready.plaintext_length(),
+            )?)
+        };
+        let persistence = if coverage_complete {
+            StreamPersistenceStatus::CompleteSource
+        } else {
+            StreamPersistenceStatus::PartialSource
+        };
+        ProcessStreamEvidence::new_raw_with_transport_prefix_identity(
             session.binding().clone(),
             session.stream(),
             session.policy().clone(),
             request.transport(),
-            StreamPersistenceStatus::CompleteSource,
+            persistence,
             request.observed_sha256().to_owned(),
             request.observed_bytes(),
             request.preview().clone(),
             Some(source),
+            prefix_identity,
             request.gaps().to_vec(),
         )
         .map_err(ProcessStreamSinkError::from)
@@ -855,18 +1076,32 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request.expected_final_sequence(),
             request.expected_final_offset(),
         )?;
-        Self::check_observed(&state, request.observed_sha256(), request.observed_bytes())?;
-        let publishes =
-            request.gaps().is_empty() && request.transport() == StreamTransportStatus::Complete;
+        let coverage_complete = Self::coverage_complete(&state, request.observed_bytes())?;
+        Self::check_overflow_declared(&state, request.gaps())?;
+        // The declared gap set, not an adapter-local comparison, decides what
+        // may be staged and which terminal names the outcome.
+        let disposition = ProcessStreamPersistenceDisposition::from_gaps(request.gaps());
+        let named_state = disposition.terminal_state(coverage_complete)?;
+        let publishes = disposition.stages_admissible_bytes(coverage_complete)
+            && Self::publishable_transport(request, named_state);
+        // A state that names a durable source while nothing was staged would be
+        // an unprovable claim, so the honest terminal is the unavailable one:
+        // the retained admissible bytes are custody, not a durable locator. A
+        // withheld disposition keeps its own exact name.
+        let terminal_state = if !publishes
+            && matches!(
+                named_state,
+                ProcessStreamSinkState::CompleteSource | ProcessStreamSinkState::PartialSource
+            )
+        {
+            ProcessStreamSinkState::SourceUnavailable
+        } else {
+            named_state
+        };
         if publishes {
-            if request.transformation().is_some() {
-                return Err(ProcessStreamSinkError::EvidenceInvariant {
-                    reason: "adapter stages exact transport bytes only".to_owned(),
-                });
-            }
-            Self::check_preview(&state, request.preview())?;
+            Self::check_staged_preview(&state, &existing, request)?;
         }
-        let admitted_sha256 = state.admitted_sha256();
+        let admitted_sha256 = state.admitted.sha256_hex();
 
         // An existing reservation for this exact command is resumed, never
         // re-reserved: the same terminal id can never drive a second stage.
@@ -891,6 +1126,8 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 next_sequence: reservation.next_sequence,
                 next_offset: reservation.next_offset,
                 admitted_sha256: reservation.admitted_sha256.clone(),
+                terminal_state: reservation.terminal_state,
+                coverage_complete: reservation.coverage_complete,
                 step,
             })));
         }
@@ -902,44 +1139,75 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
                 request,
                 identity,
                 admitted_sha256,
+                terminal_state,
             ));
         }
 
         // One reservation per session: bound to this session, this exact
         // command digest and the one bound blob stage operation.
-        Ok(self.reserve_publish(&mut state, existing, request, identity, admitted_sha256))
+        Ok(self.reserve_publish(
+            &mut state,
+            existing,
+            request,
+            identity,
+            admitted_sha256,
+            terminal_state,
+            coverage_complete,
+        ))
+    }
+
+    /// Whether the evidence contract can represent this durable publication.
+    ///
+    /// A complete source is always representable. A partial source must be an
+    /// exact transport prefix, because a policy-transformed source has no
+    /// transport-prefix identity and therefore cannot prove which part of its
+    /// input it covers once the transport itself reached EOF. The evidence
+    /// contract remains the final authority: this only avoids staging an object
+    /// whose terminal could never be minted.
+    fn publishable_transport(
+        request: &ProcessStreamSinkFinalizeRequest,
+        terminal_state: ProcessStreamSinkState,
+    ) -> bool {
+        match terminal_state {
+            ProcessStreamSinkState::CompleteSource => true,
+            ProcessStreamSinkState::PartialSource => {
+                request.transformation().is_none()
+                    || request.transport() != StreamTransportStatus::Complete
+            }
+            ProcessStreamSinkState::Opening
+            | ProcessStreamSinkState::Open
+            | ProcessStreamSinkState::Finalizing
+            | ProcessStreamSinkState::SourceUnavailable
+            | ProcessStreamSinkState::PolicyProhibited
+            | ProcessStreamSinkState::RedactionFailed
+            | ProcessStreamSinkState::PersistenceFailed
+            | ProcessStreamSinkState::Cancelled
+            | ProcessStreamSinkState::UnknownOutcome => false,
+        }
     }
 
     /// Builds the never-published terminal plan for a non-publishing
     /// finalize.
     ///
-    /// No durable publication except for the complete-source path: a gapped,
-    /// policy-prohibited, or failed-redaction finalize must not stage raw
-    /// bytes as a second object. This step cannot fail, so it mints no error
-    /// and reserves nothing.
+    /// No durable publication except for the exact states named by the
+    /// disposition table: a policy-prohibited, failed-redaction, or
+    /// complete-coverage-contradicting finalize must not stage raw bytes as a
+    /// second object. This step cannot fail, so it mints no error and reserves
+    /// nothing.
     fn withheld_plan(
         state: &SinkState,
         session: ProcessStreamSinkSession,
         request: &ProcessStreamSinkFinalizeRequest,
         identity: ProcessStreamSinkTerminalCommandIdentity,
         admitted_sha256: String,
+        withheld: ProcessStreamSinkState,
     ) -> FinalizePlan {
-        let withheld = if request
-            .gaps()
-            .contains(&StreamEvidenceGap::PolicyProhibited)
-        {
-            ProcessStreamSinkState::PolicyProhibited
-        } else if request.gaps().contains(&StreamEvidenceGap::RedactionFailed) {
-            ProcessStreamSinkState::RedactionFailed
-        } else {
-            ProcessStreamSinkState::SourceUnavailable
-        };
         FinalizePlan::Withheld(Box::new(WithheldTicket {
             session,
             request: request.clone(),
             identity,
             next_sequence: state.next_sequence,
-            next_offset: state.next_offset,
+            next_offset: state.admitted.byte_length(),
             admitted_sha256,
             state: withheld,
         }))
@@ -950,6 +1218,7 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
     /// One reservation per session, bound to this session, this exact command
     /// digest and the one bound blob stage operation. The phase starts
     /// `Reserved`: nothing has been handed to the blob owner yet.
+    #[allow(clippy::too_many_arguments)]
     fn reserve_publish(
         &self,
         state: &mut SinkState,
@@ -957,16 +1226,22 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         request: &ProcessStreamSinkFinalizeRequest,
         identity: ProcessStreamSinkTerminalCommandIdentity,
         admitted_sha256: String,
+        terminal_state: ProcessStreamSinkState,
+        coverage_complete: bool,
     ) -> FinalizePlan {
         let incarnation = state.finalization_incarnation.saturating_add(1);
         state.finalization_incarnation = incarnation;
+        let next_sequence = state.next_sequence;
+        let next_offset = state.admitted.byte_length();
         state.finalization = Some(FinalizeReservation {
             identity: identity.clone(),
             incarnation,
             request: request.clone(),
-            next_sequence: state.next_sequence,
-            next_offset: state.next_offset,
+            next_sequence,
+            next_offset,
             admitted_sha256: admitted_sha256.clone(),
+            terminal_state,
+            coverage_complete,
             stage_operation_id: self
                 .binding
                 .stage_context()
@@ -987,9 +1262,11 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             request: request.clone(),
             identity,
             incarnation,
-            next_sequence: state.next_sequence,
-            next_offset: state.next_offset,
+            next_sequence,
+            next_offset,
             admitted_sha256,
+            terminal_state,
+            coverage_complete,
             step: PublishStep::Stage {
                 staged: state.staged.clone(),
             },
@@ -1025,9 +1302,9 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Ok(terminal)
     }
 
-    /// Publishes the reserved complete source: at most one stage under the
-    /// original identity, then the readback, then the `CompleteSource`
-    /// terminal. A failure leaves the phase advanced, never a bare flag.
+    /// Publishes the reserved admissible source: at most one stage under the
+    /// original identity, then the readback, then the reserved terminal. A
+    /// failure leaves the phase advanced, never a bare flag.
     async fn publish_reserved(
         &self,
         ticket: PublishTicket,
@@ -1041,16 +1318,17 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
             }
         };
         self.verify_readback(&ready).await?;
-        let evidence = Self::complete_source(
+        let evidence = Self::publish_evidence(
             &ticket.session,
             &ticket.request,
             &ticket.admitted_sha256,
+            ticket.coverage_complete,
             &ready,
         )?;
         let terminal = ProcessStreamSinkTerminal::from_finalize(
             ticket.session,
             ticket.request,
-            ProcessStreamSinkState::CompleteSource,
+            ticket.terminal_state,
             ticket.next_sequence,
             ticket.next_offset,
             ticket.admitted_sha256,

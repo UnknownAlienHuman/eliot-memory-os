@@ -40,7 +40,8 @@ pub use operation_owner_map::{
 
 mod stream_sink;
 pub use stream_sink::{
-    PROCESS_STREAM_SINK_SCHEMA_VERSION, ProcessStreamDigestAlgorithm, ProcessStreamSinkAbortReason,
+    PROCESS_STREAM_SINK_SCHEMA_VERSION, ProcessStreamDigestAlgorithm,
+    ProcessStreamPersistenceDisposition, ProcessStreamSinkAbortReason,
     ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend, ProcessStreamSinkAppendDisposition,
     ProcessStreamSinkClient, ProcessStreamSinkError, ProcessStreamSinkFinalizeRequest,
     ProcessStreamSinkFuture, ProcessStreamSinkLimits, ProcessStreamSinkModel,

@@ -71,6 +71,8 @@ impl ProcessStreamSinkSession {
             });
         }
         validate_binding(&self.binding)?;
+        super::validate_digest_algorithm(self.transport_digest_algorithm)?;
+        super::validate_digest_algorithm(self.source_digest_algorithm)?;
         validate_digest("open_request_sha256", &self.open_request_sha256)
     }
 
@@ -218,8 +220,7 @@ impl ProcessStreamSinkTerminal {
         if command_identity.terminal_id() != session.terminal_id()
             || final_sequence != request.expected_final_sequence()
             || final_offset != request.expected_final_offset()
-            || request.observed_sha256() != admitted_sha256
-            || request.observed_bytes() != final_offset
+            || request.observed_bytes() != evidence.observed_bytes()
             || request.transport() != evidence.transport()
             || request.preview() != evidence.preview()
             || request.transformation()
@@ -285,8 +286,7 @@ impl ProcessStreamSinkTerminal {
         if command_identity.terminal_id() != session.terminal_id()
             || final_sequence != request.expected_final_sequence()
             || final_offset != request.expected_final_offset()
-            || request.observed_sha256() != admitted_sha256
-            || request.observed_bytes() != final_offset
+            || request.observed_bytes() != evidence.observed_bytes()
             || request.transport() != evidence.transport()
             || request.preview() != evidence.preview()
             || request.transformation()
@@ -354,13 +354,15 @@ impl ProcessStreamSinkTerminal {
         if evidence.policy() != session.policy() {
             return Err(ProcessStreamSinkError::PolicyMismatch);
         }
-        if evidence.observed_sha256() != admitted_sha256
-            || evidence.observed_bytes() != final_offset
+        if evidence.observed_bytes() != request.observed_bytes()
+            || evidence.observed_sha256() != request.observed_sha256()
         {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
-                reason: "evidence must identify every admitted transport byte".to_owned(),
+                reason: "evidence must identify every physical transport byte the command declared"
+                    .to_owned(),
             });
         }
+        validate_admitted_coverage(request, &admitted_sha256, final_offset)?;
         validate_terminal_evidence(state, &evidence)?;
         let mut value = Self {
             schema_version: super::PROCESS_STREAM_SINK_SCHEMA_VERSION.to_owned(),
@@ -433,8 +435,9 @@ impl ProcessStreamSinkTerminal {
             });
         }
         if self.final_offset != self.admitted_bytes
-            || self.evidence.observed_bytes() != self.admitted_bytes
-            || self.evidence.observed_sha256() != self.admitted_sha256
+            || self.admitted_bytes > self.evidence.observed_bytes()
+            || (self.admitted_bytes == self.evidence.observed_bytes()
+                && self.admitted_sha256 != self.evidence.observed_sha256())
         {
             return Err(ProcessStreamSinkError::EvidenceInvariant {
                 reason: "terminal counters do not match evidence".to_owned(),
@@ -522,6 +525,8 @@ trait CommandRequest {
         &self,
     ) -> Result<ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkError>;
     fn expected_final_offset(&self) -> u64;
+    fn observed_bytes(&self) -> u64;
+    fn observed_sha256(&self) -> &str;
 }
 
 impl CommandRequest for ProcessStreamSinkFinalizeRequest {
@@ -533,6 +538,14 @@ impl CommandRequest for ProcessStreamSinkFinalizeRequest {
 
     fn expected_final_offset(&self) -> u64 {
         self.expected_final_offset()
+    }
+
+    fn observed_bytes(&self) -> u64 {
+        self.observed_bytes()
+    }
+
+    fn observed_sha256(&self) -> &str {
+        self.observed_sha256()
     }
 }
 
@@ -546,4 +559,44 @@ impl CommandRequest for ProcessStreamSinkAbortRequest {
     fn expected_final_offset(&self) -> u64 {
         self.expected_final_offset()
     }
+
+    fn observed_bytes(&self) -> u64 {
+        self.observed_bytes()
+    }
+
+    fn observed_sha256(&self) -> &str {
+        self.observed_sha256()
+    }
+}
+
+/// The one coverage algebra between the physical transport identity a command
+/// declares and the admissible-source identity a provider actually holds.
+///
+/// The two identities are independent by construction: the command declares
+/// every physical transport byte it observed, while the provider holds only the
+/// admissible bytes it admitted. The admissible set is therefore a prefix of
+/// the physical stream, never longer, and when the two lengths are equal they
+/// are the same byte sequence and must carry the same digest. A provider that
+/// claims more admissible bytes than the command observed, or the same length
+/// with a different digest, is refused before a terminal exists.
+fn validate_admitted_coverage<R: CommandRequest>(
+    request: &R,
+    admitted_sha256: &str,
+    admitted_bytes: u64,
+) -> Result<(), ProcessStreamSinkError> {
+    if admitted_bytes > request.observed_bytes() {
+        return Err(ProcessStreamSinkError::OffsetMismatch {
+            expected: request.observed_bytes(),
+            observed: admitted_bytes,
+        });
+    }
+    if admitted_bytes == request.observed_bytes()
+        && admitted_sha256 != request.observed_sha256()
+    {
+        return Err(ProcessStreamSinkError::EvidenceInvariant {
+            reason: "equal-length admissible and physical identities must share one digest"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }

@@ -17,6 +17,7 @@ const MAX_APPEND_WIRE_BYTES: usize = 16 * 1024 * 1024;
 
 mod command;
 mod model;
+mod outcome;
 mod port;
 mod requests;
 mod terminal;
@@ -24,6 +25,7 @@ mod types;
 
 pub use command::{ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkTerminalCommandKind};
 pub use model::ProcessStreamSinkModel;
+pub use outcome::ProcessStreamPersistenceDisposition;
 pub use port::{ProcessStreamSinkClient, ProcessStreamSinkFuture};
 pub use requests::{
     ProcessStreamSinkAbortReason, ProcessStreamSinkAbortRequest, ProcessStreamSinkAppend,
@@ -60,6 +62,20 @@ fn validate_digest(field: &'static str, value: &str) -> Result<(), ProcessStream
         return Err(ProcessStreamSinkError::InvalidDigest { field });
     }
     Ok(())
+}
+
+/// Rejects a digest algorithm this contract revision cannot verify.
+///
+/// The match is exhaustive over [`ProcessStreamDigestAlgorithm`], so a new
+/// member cannot be recorded as a durable identity until its digest shape and
+/// version are stated here. A transport or source digest is therefore always
+/// a digest of a named, versioned algorithm rather than an unnamed hash.
+fn validate_digest_algorithm(
+    algorithm: types::ProcessStreamDigestAlgorithm,
+) -> Result<(), ProcessStreamSinkError> {
+    match algorithm {
+        types::ProcessStreamDigestAlgorithm::Sha256 => Ok(()),
+    }
 }
 
 fn canonical_digest<T: Serialize>(

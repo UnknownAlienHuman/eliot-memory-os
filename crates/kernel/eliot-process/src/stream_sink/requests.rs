@@ -9,8 +9,8 @@ use super::{PROCESS_STREAM_SINK_SCHEMA_VERSION, ProcessStreamSinkError};
 use super::{
     ProcessExecutionBinding, ProcessStreamKind, ProcessStreamPolicyBinding,
     ProcessStreamPrefixPreview, ProcessStreamTransformationBinding, StreamEvidenceGap,
-    StreamTransportStatus, canonical_digest, validate_binding, validate_digest, validate_gaps,
-    validate_preview_limit,
+    StreamTransportStatus, canonical_digest, validate_binding, validate_digest,
+    validate_digest_algorithm, validate_gaps, validate_preview_limit,
 };
 use super::{ProcessStreamSinkTerminalCommandIdentity, ProcessStreamSinkTerminalCommandKind};
 
@@ -107,6 +107,8 @@ impl ProcessStreamSinkOpenRequest {
             });
         }
         validate_binding(&self.binding)?;
+        validate_digest_algorithm(self.transport_digest_algorithm)?;
+        validate_digest_algorithm(self.source_digest_algorithm)?;
         let policy = serde_json::to_value(&self.policy).map_err(|_| {
             ProcessStreamSinkError::InvalidRequest {
                 reason: "invalid policy",
