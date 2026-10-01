@@ -53,32 +53,13 @@ use eliot_observability_runtime::{
 
 #[cfg(windows)]
 mod front_door_driver;
+mod crash_context;
 mod startup_binding;
 
 /// Stable operational-log stem for this process. The generation name carries
 /// the exit code, so a fresh process start is distinguishable from a rolling
 /// rotation without any second naming scheme.
 const OPERATIONAL_LOG_STEM: &str = "eliot-kernel";
-
-/// Bounded operational-log generation size, in bytes.
-///
-/// I16.2/I16.9 make the operational log a rolling, non-authoritative surface,
-/// and the crate's own declared ceiling for one generation is
-/// `MAX_ROLLING_BYTES` (`eliot-observability-runtime::config`). The Kernel is
-/// the busiest shipped surface, so it runs at the declared ceiling rather than
-/// a smaller private number.
-const OPERATIONAL_LOG_GENERATION_BYTES: u64 =
-    eliot_observability_runtime::config::MAX_ROLLING_BYTES;
-
-/// Bounded operational-log generation count, at the same declared ceiling.
-const OPERATIONAL_LOG_GENERATIONS: u32 =
-    eliot_observability_runtime::config::MAX_ROLLING_GENERATIONS;
-
-/// Bounded writer-queue depth, in records, before admission starts dropping and
-/// the visible dropped-records gauge advances (I16.11 forbids hidden loss), at
-/// the crate's own declared ceiling.
-const OPERATIONAL_LOG_QUEUED_RECORDS: usize =
-    eliot_observability_runtime::config::MAX_ROLLING_QUEUED_RECORDS;
 
 /// Bounded protected spool generation count, at the same declared ceiling.
 const OPERATIONAL_SPOOL_GENERATIONS: u32 =
@@ -132,14 +113,11 @@ fn observability_config(
     };
     ObservabilityConfig {
         profile,
-        rolling_log: RollingLogPolicy {
-            directory: receipt_root.join("logs"),
-            file_stem: OPERATIONAL_LOG_STEM.to_owned(),
-            max_bytes_per_generation: OPERATIONAL_LOG_GENERATION_BYTES,
-            max_generations: OPERATIONAL_LOG_GENERATIONS,
-            max_buffered_records: OPERATIONAL_LOG_QUEUED_RECORDS,
-            exit_code: 0,
-        },
+        rolling_log: RollingLogPolicy::declared_bounded(
+            receipt_root.join("logs"),
+            OPERATIONAL_LOG_STEM,
+            0,
+        ),
         spool,
         metrics_listen: None,
         otlp_endpoint: None,
@@ -156,6 +134,18 @@ async fn main() {
     // contract: diagnostics never gate startup, so both the first install
     // and an AlreadyOwned re-init continue into the launch funnel.
     let _ = install_kernel_diagnostics();
+    #[cfg(windows)]
+    let mut crash_reporter = eliot_observability_runtime::install_crash_reporter(
+        eliot_observability_runtime::CrashReporterConfig {
+            process: "eliot-kernel".to_owned(),
+            package_version: env!("CARGO_PKG_VERSION").to_owned(),
+            runtime_profile: None,
+            symbol_artifact: None,
+            retention_policy: None,
+            initial_context: crash_context::unavailable_context(),
+        },
+    )
+    .ok();
     observe_entrypoint(EntrypointStage::Startup);
     let options = match startup_binding::parse_launch_options(std::env::args_os().skip(1)) {
         Ok(options) => options,
@@ -174,6 +164,10 @@ async fn main() {
             Err(error) => exit_error("PRINCIPAL_FAILURE", &error),
         };
     #[cfg(windows)]
+    let (supervision_profile, portable_dev_repository_root) = startup_binding
+        .supervision_profile_binding(profile_root_leases.as_ref())
+        .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
+    #[cfg(windows)]
     observe_entrypoint(EntrypointStage::HostStartupBinding);
     let authority_path = options.authority_descriptor.clone();
     let authority_contour = startup_binding::authority_contour(&options.work_root, &authority_path);
@@ -191,11 +185,28 @@ async fn main() {
     // leaves the launch funnel untouched and is never turned into a startup
     // failure.
     #[cfg(windows)]
-    let _observability = eliot_observability_runtime::install(&observability_config(
+    let kernel_observability_config = observability_config(
         &startup_binding.receipt_root,
         &startup_binding.kernel_ors_root,
         &authority_contour,
-    ));
+    );
+    #[cfg(windows)]
+    let _observability =
+        eliot_observability_runtime::install(&kernel_observability_config);
+    #[cfg(windows)]
+    if let Some(reporter) = &crash_reporter {
+        let runtime_profile = match supervision_profile {
+            eliot_installation::InstallationProfile::SystemService => "system_service",
+            eliot_installation::InstallationProfile::UserMode => "user_mode",
+            eliot_installation::InstallationProfile::PortableDev => "portable_dev",
+        };
+        let _ = reporter.update_runtime_profile(runtime_profile);
+        if let Ok(Some(artifact)) =
+            crash_context::kernel_symbol_artifact(startup_binding.admitted_symbol_binding())
+        {
+            let _ = reporter.update_symbol_artifact(artifact);
+        }
+    }
     let prepared_store = match startup_binding::prepare_store_bootstrap(&options) {
         Ok(prepared) => prepared,
         Err(error) => exit_error("INVALID_STORE_BOOTSTRAP", &error),
@@ -214,9 +225,6 @@ async fn main() {
         KernelConfig::new(options.work_root.clone()).require_descriptor_supervision_authority();
     #[cfg(windows)]
     {
-        let (supervision_profile, portable_dev_repository_root) = startup_binding
-            .supervision_profile_binding(profile_root_leases.as_ref())
-            .unwrap_or_else(|error| exit_error("PRINCIPAL_FAILURE", &error));
         kernel_config = kernel_config.with_supervision_installation_profile(
             supervision_profile,
             portable_dev_repository_root,
@@ -365,6 +373,17 @@ async fn main() {
         },
     );
     observe_entrypoint(EntrypointStage::Composition);
+    #[cfg(windows)]
+    if let Some(reporter) = crash_reporter {
+        let _ = reporter.update_retention_policy(crash_context::incident_retention_policy(
+            kernel_observability_config.rolling_log.clone(),
+            &startup_binding.receipt_root,
+        ));
+        let _ = kernel.attach_crash_reporter(
+            reporter,
+            Some(startup_binding.approved_generation.clone()),
+        );
+    }
     #[cfg(windows)]
     {
         // DISPATCH-WIRE E1 (issue #461): compose the production

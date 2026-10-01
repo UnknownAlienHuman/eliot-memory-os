@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod host_console_protocol;
+mod crash_context;
 
 #[cfg(windows)]
 use std::ffi::OsString;
@@ -42,6 +43,31 @@ use eliot_platform_windows::profile_supervision::USER_MODE_SUPERVISOR_SWITCH;
 use host_console_protocol::{Request, Response, write_response};
 
 static PROCESS_BOOTSTRAP: OnceLock<Result<HostLaunchOptions, String>> = OnceLock::new();
+static CRASH_REPORTER: OnceLock<eliot_observability_runtime::CrashReporterHandle> = OnceLock::new();
+
+fn install_host_crash_reporter() {
+    let config = eliot_observability_runtime::CrashReporterConfig {
+        process: "eliot-host".to_owned(),
+        package_version: env!("CARGO_PKG_VERSION").to_owned(),
+        runtime_profile: None,
+        symbol_artifact: None,
+        // The composition selects incident retention only after it has opened
+        // and retained the validated HostStateRoot.
+        retention_policy: None,
+        initial_context: crash_context::unavailable_context(),
+    };
+    if let Ok(reporter) = eliot_observability_runtime::install_crash_reporter(config) {
+        let _ = CRASH_REPORTER.set(reporter);
+    }
+}
+
+fn attach_current_host_crash_reporter(
+    host: &mut HostComposition,
+) {
+    if let Some(reporter) = CRASH_REPORTER.get() {
+        crash_context::attach_reporter(host, reporter);
+    }
+}
 
 /// Win32 `ERROR_SERVICE_SPECIFIC_ERROR`: the `dwWin32ExitCode` reported for
 /// every typed Host start failure. The per-class detail travels in
@@ -360,6 +386,11 @@ fn main() {
     let _ = PROCESS_BOOTSTRAP.set(parse_process_bootstrap(process_args.clone()));
     // HOST-0 (issue #889): best-effort diagnostics install; never gates startup.
     let _ = eliot_host::host_diagnostics::install_host_diagnostics();
+    // I16.2 / issue #1847: install the shared bounded panic reporter before
+    // any Host startup work. The approved root is known from the already
+    // captured launch bootstrap; profile and symbol identity are published
+    // only after the existing composition owner admits them.
+    install_host_crash_reporter();
     // One bounded Event Log worker owns the potentially blocking OS call.
     // Start it before the first projected request; startup failure only
     // degrades diagnostics and never changes Host control flow.
@@ -699,6 +730,7 @@ fn run_profile_supervisor(
         ));
     }
     let mut host = HostComposition::open_for_profile(launch_options.clone(), profile)?;
+    attach_current_host_crash_reporter(&mut host);
     let active = host.registry().active().ok_or_else(|| {
         HostError::ProcessContour(format!(
             "{profile:?} supervisor has no active approved generation"
@@ -864,7 +896,9 @@ fn captured_process_bootstrap() -> Result<HostLaunchOptions, HostError> {
 }
 
 fn open_host(launch_options: HostLaunchOptions) -> Result<HostComposition, HostError> {
-    HostComposition::open(launch_options)
+    let mut host = HostComposition::open(launch_options.clone())?;
+    attach_current_host_crash_reporter(&mut host);
+    Ok(host)
 }
 
 #[cfg(windows)]
