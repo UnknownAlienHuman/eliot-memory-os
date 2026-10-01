@@ -2018,7 +2018,37 @@ struct UserAutomationOperatorRoute {
     operation: String,
     /// Front-door-authenticated request identity copied by the frame router.
     request_identity: RequestIdentity,
+    /// Independent fence witness acquired through a fresh `get_context` read.
+    /// Omitted only for that read-only handshake operation.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_user_automation_expected_state_fence"
+    )]
+    expected_state_fence: UserAutomationExpectedStateFence,
     payload: UserAutomationOperatorIntent,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+enum UserAutomationExpectedStateFence {
+    #[default]
+    Missing,
+    Null,
+    Witness(StateFence),
+}
+
+#[cfg(windows)]
+fn deserialize_user_automation_expected_state_fence<'de, D>(
+    deserializer: D,
+) -> Result<UserAutomationExpectedStateFence, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<StateFence>::deserialize(deserializer)
+        .map(|witness| match witness {
+            Some(witness) => UserAutomationExpectedStateFence::Witness(witness),
+            None => UserAutomationExpectedStateFence::Null,
+        })
 }
 
 #[cfg(windows)]
@@ -5445,7 +5475,8 @@ impl KernelComposition {
         request_id: RequestId,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        let request = Self::build_user_automation_operator_request(session, &request_id, payload)?;
+        let (request, expected_state_fence) =
+            Self::build_user_automation_operator_request(session, &request_id, payload)?;
         match eliot_kernel_service::KernelStoreGateway::validate_user_automation_request(&request) {
             Ok(()) => {}
             Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
@@ -5464,6 +5495,68 @@ impl KernelComposition {
                     ),
                 );
             }
+        }
+        let is_context = matches!(
+            &request.intent.operation,
+            eliot_kernel_core::UserAutomationOperation::GetContext
+        );
+        if is_context {
+            if !matches!(
+                &expected_state_fence,
+                UserAutomationExpectedStateFence::Missing
+            ) {
+                return Err(TransportError::SessionFenced);
+            }
+            let envelope =
+                eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_context(&request)
+                    .map_err(|_| TransportError::SessionFenced)?;
+            return serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced);
+        }
+        if !matches!(
+            &expected_state_fence,
+            UserAutomationExpectedStateFence::Witness(witness)
+                if witness == &session.module_generation.state_fence
+        ) {
+            return Self::bind_user_automation_operator_response(
+                &request,
+                &Self::user_automation_state_fence_mismatch_response(&request),
+            );
+        }
+        if matches!(
+            &request.intent.operation,
+            eliot_kernel_core::UserAutomationOperation::NormalizeSchedule { .. }
+                | eliot_kernel_core::UserAutomationOperation::MigrateLegacySchedule { .. }
+        ) {
+            let (revision, normalization_receipt_envelope) =
+                match eliot_kernel_service::KernelStoreGateway::normalize_user_automation_schedule(
+                    &request,
+                ) {
+                    Ok(result) => result,
+                    Err(eliot_kernel_service::UserAutomationExecutionError::Contract(error)) => {
+                        return Self::bind_user_automation_operator_response(
+                            &request,
+                            &Self::user_automation_precommit_refusal_response(&request, &error),
+                        );
+                    }
+                    Err(_) => {
+                        return Self::bind_user_automation_operator_response(
+                            &request,
+                            &Self::user_automation_runtime_error_response(
+                                UserAutomationRuntimeError::UnknownOutcome(
+                                    "user_automation_normalization_result_unavailable".to_owned(),
+                                ),
+                            ),
+                        );
+                    }
+                };
+            let envelope =
+                eliot_kernel_service::UserAutomationOperatorResultEnvelope::from_normalized_schedule(
+                    &request,
+                    revision,
+                    normalization_receipt_envelope,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+            return serde_json::to_value(envelope).map_err(|_| TransportError::SessionFenced);
         }
         let transition = match self
             .dispatch_user_automation_operator_transition(session, &request)
@@ -5935,7 +6028,13 @@ impl KernelComposition {
         session: &Session,
         request_id: &RequestId,
         payload: &serde_json::Value,
-    ) -> Result<eliot_kernel_service::UserAutomationServiceRequest, TransportError> {
+    ) -> Result<
+        (
+            eliot_kernel_service::UserAutomationServiceRequest,
+            UserAutomationExpectedStateFence,
+        ),
+        TransportError,
+    > {
         let route: UserAutomationOperatorRoute =
             serde_json::from_value(payload.clone()).map_err(|_| TransportError::SessionFenced)?;
         if route.operation != USER_AUTOMATION_OPERATOR_OPERATION {
@@ -5978,7 +6077,7 @@ impl KernelComposition {
         // that could not bind the session principal has no honest way to
         // complete the selection at all.
         if matches!(
-            route.payload.operation,
+            &route.payload.operation,
             eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. }
         ) {
             return Err(TransportError::SessionFenced);
@@ -5995,7 +6094,7 @@ impl KernelComposition {
             state_fence: session.module_generation.state_fence.clone(),
             operation: route.payload.operation,
         };
-        Ok(eliot_kernel_service::UserAutomationServiceRequest {
+        Ok((eliot_kernel_service::UserAutomationServiceRequest {
             context: identity.request.metadata.clone(),
             authenticated_principal: principal,
             identity: OperationIdentity {
@@ -6004,6 +6103,31 @@ impl KernelComposition {
                 canonical_request_hash: String::new(),
             },
             intent,
+        }, route.expected_state_fence))
+    }
+
+    #[cfg(windows)]
+    fn user_automation_state_fence_mismatch_response(
+        request: &eliot_kernel_service::UserAutomationServiceRequest,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "unknown",
+            "value": {
+                "kind": "user_automation_refusal",
+                "schema_version": 1,
+                "operation": {
+                    "operation_id": request.identity.operation_id.as_str(),
+                    "request_id": &request.context.request_id,
+                    "idempotency_key": request.identity.idempotency_key.as_str(),
+                },
+                "state_fence": &request.context.state_fence,
+                "attempt_state": "store_not_called",
+                "refusal": {"code": "state_fence_mismatch"},
+            },
+            "recovery": {
+                "kind": "unknown_outcome",
+                "reason": "state_fence_mismatch_store_not_called",
+            },
         })
     }
 
@@ -11746,6 +11870,9 @@ fn user_automation_runtime_handoff_need(
         | eliot_kernel_core::UserAutomationOperation::Status { .. }
         | eliot_kernel_core::UserAutomationOperation::History { .. }
         | eliot_kernel_core::UserAutomationOperation::InspectLastFailure { .. }
+        | eliot_kernel_core::UserAutomationOperation::GetContext
+        | eliot_kernel_core::UserAutomationOperation::NormalizeSchedule { .. }
+        | eliot_kernel_core::UserAutomationOperation::MigrateLegacySchedule { .. }
         | eliot_kernel_core::UserAutomationOperation::DecideImprovementBrief { .. } => {
             UserAutomationRuntimeHandoffNeed::None
         }
