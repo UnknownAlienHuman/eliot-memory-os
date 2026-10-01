@@ -218,11 +218,12 @@ pub enum InquiryError {
     /// proves is blocked. A debt that is resolved, or one whose claim class
     /// this disposition does not name, does not raise this error.
     ///
-    /// MEASURED REACHABILITY, stated so this is not mistaken for live
-    /// enforcement: on the `InquiryGovernance::record` path this error CANNOT
-    /// fire today, and the reason is structural rather than accidental. The
-    /// only disposition `terminal_disposition` can return that any debt
-    /// refuses is `ANSWERED_WITH_SUPPORTED_RESULT`, and reaching it requires
+    /// MEASURED REACHABILITY **at this site**, stated so it is not mistaken for
+    /// the whole of the I21.12 enforcement: at the terminal disposition this
+    /// error CANNOT fire on the `InquiryGovernance::record` path, and the reason
+    /// is structural rather than accidental. The only disposition
+    /// `terminal_disposition` can return that any debt refuses is
+    /// `ANSWERED_WITH_SUPPORTED_RESULT`, and reaching it requires
     /// `outcome == Completed` with an intact denominator. A completed run
     /// contributes no `provider_degradation` (so no `Verification` debt) and
     /// leaves no open member (so no `Coverage` debt); `Replication` and
@@ -230,6 +231,15 @@ pub enum InquiryError {
     /// registered. The guard is kept because it is the correct invariant and
     /// because `bind` is public: a caller that binds a record directly can
     /// reach it today. It is a bound, not a fired, check.
+    ///
+    /// **WHERE THE SAME TABLE IS ENFORCED LIVE:** at the consumer that promotes
+    /// the claim, [`InquiryGovernance::release_gate`], which refuses the
+    /// supported release while an open debt refuses
+    /// `ANSWERED_WITH_SUPPORTED_RESULT`. That is the use-time check I21.12's
+    /// item 4 asks for ("check at use time"), and it is reached on every real
+    /// run by `eliot-mod-research`. A reader must not conclude from the
+    /// paragraph above that the restriction table is unenforced: it is
+    /// unenforced *here* and enforced there.
     DebtRestrictedDisposition {
         /// Failing field path.
         field: &'static str,
@@ -289,12 +299,17 @@ pub enum InquiryError {
     /// I21.8 item 6 forbids a `SUPPORTED` promotion while a required chain,
     /// excerpt or audit dimension fails or is unknown, and the issue's
     /// acceptance requires an omitted material claim to block a complete-audit
-    /// claim. The two gates refuse for different reasons, so the gate that
-    /// refused and the specific member that refused it are both carried: a
+    /// claim. The gates refuse for different reasons, so the gate that refused
+    /// and the specific member or condition it refused on are both carried: a
     /// consumer that only learns "blocked" would have to re-derive which
     /// requirement failed.
+    ///
+    /// `gate` names which one refused: `research_debt` for the I21.12 open-debt
+    /// restriction, `claim_coverage` for the material-claim roster, `claim_audit`
+    /// for a per-claim verdict and `released_wording` for the delivered text.
     ReleaseGateRefused {
-        /// Which gate refused: `claim_coverage` or `claim_audit`.
+        /// Which gate refused: `research_debt`, `claim_coverage`, `claim_audit`
+        /// or `released_wording`.
         gate: &'static str,
         /// The specific member or condition the gate refused on.
         detail: String,
@@ -6348,9 +6363,27 @@ impl InquiryGovernance {
     ///
     /// Returns [`InquiryError::IntegrityMismatch`] naming the first gate that
     /// refuses, or [`InquiryError::ReleaseGateRefused`] naming
-    /// `released_wording` and the offending claim, so a consumer reads WHICH
-    /// requirement failed rather than only that the release is blocked.
+    /// `research_debt`, `released_wording` and the offending claim, so a
+    /// consumer reads WHICH requirement failed rather than only that the
+    /// release is blocked.
     pub fn release_gate(&self, delivered: &BTreeMap<String, String>) -> Result<(), InquiryError> {
+        // I21.12, checked HERE and not only inside the terminal record. This is
+        // the use-time consumer the issue's item 4 names: "Release/Context/
+        // swarm/final-decision consumers revalidate applicability and current
+        // authority; a stale clean freeze cannot ignore a newly active applicable
+        // debt." `releasable_as_supported` is the claim this gate authorizes, so
+        // the disposition an open debt refuses is the one whose release is being
+        // asked for here, and the restriction is re-read off this record's own
+        // registered debts rather than off a flag.
+        //
+        // It runs FIRST so the most fundamental refusal is the one a consumer is
+        // told: I21.12's sentence is "A release that carries open debts states
+        // them; it does not describe them as minor limitations", and a consumer
+        // that reads only `claim_coverage` would read a narrower reason than the
+        // one that actually applies.
+        if let Some(refusal) = self.refused_by_research_debt() {
+            return Err(refusal);
+        }
         if let Some(prior) =
             crate::evidence_portfolio::require_complete_claim_coverage(&self.claim_coverage).err()
         {
@@ -6418,6 +6451,39 @@ impl InquiryGovernance {
             }
         }
         Ok(())
+    }
+
+    /// The I21.12 use-time refusal this record's open research debts place on the
+    /// supported release, if any.
+    ///
+    /// The disposition consulted is
+    /// [`CompletionDisposition::AnsweredWithSupportedResult`] because that is the
+    /// claim this gate authorizes: `releasable_as_supported` is what a consumer
+    /// gets back from the gates above it, so a debt that refuses it refuses the
+    /// release. The refusal is derived from
+    /// [`ResearchDebtRestriction`], which is itself derived from
+    /// [`Self::research_debts`] rather than restated, so a debt the producer
+    /// registered and the restriction a consumer reads cannot disagree.
+    ///
+    /// The detail carries the debt statement — id, I21.12 kind, blocked claim
+    /// class, accountable owner and review condition — so the consumer learns
+    /// WHICH obligation refused rather than only that the release is blocked.
+    fn refused_by_research_debt(&self) -> Option<InquiryError> {
+        let disposition = CompletionDisposition::AnsweredWithSupportedResult;
+        let restriction = &self.terminal.debt_restriction;
+        if !restriction.refuses(disposition) {
+            return None;
+        }
+        debug_assert!(
+            restriction.restricted,
+            "a refused disposition is derived only from open debts, so the restriction is set",
+        );
+        restriction
+            .statement()
+            .map(|debts| InquiryError::ReleaseGateRefused {
+                gate: "research_debt",
+                detail: format!("{debts}; refuses {}", disposition_wire(disposition)),
+            })
     }
 
     /// Re-proves every digest this record publishes and every binding between
@@ -9650,12 +9716,15 @@ fn terminal_record(
     // to be the one reported. The debt statement below keeps the specific
     // reason, so the downgrade loses nothing a reader needs.
     //
-    // MEASURED: on this path the downgrade is currently INERT. No debt kind
+    // MEASURED: at THIS site the downgrade is currently INERT. No debt kind
     // that refuses a disposition can coexist with a disposition this function
     // produces - see the reachability note on
     // `InquiryError::DebtRestrictedDisposition` for the proof. The branch is
     // kept because it is the correct invariant and because it costs nothing,
-    // but nothing should be read into it as live enforcement today.
+    // but nothing should be read into it as live enforcement today: the live
+    // enforcement of the same I21.12 table is at
+    // `InquiryGovernance::release_gate`, which a release consumer asks on every
+    // run and which refuses the supported release while an open debt refuses it.
     let disposition = if debt_restriction.refuses(derived) {
         CompletionDisposition::IncompleteCoverage
     } else {
