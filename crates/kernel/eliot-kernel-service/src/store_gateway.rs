@@ -2830,32 +2830,14 @@ impl KernelStoreGateway {
                 original_request_json,
             )
             .map_err(user_automation_gateway_unknown)?;
-        let view = CanonicalRequestView::from_apply(
-            &store_request.context,
-            &transition,
-            &[],
-            &[],
-        );
-        let planned_hash = canonical_request_hash(&view).map_err(user_automation_gateway_unknown)?;
-        transition.identity.canonical_request_hash = planned_hash.clone();
-        let receipt = self
-            .apply(&store_request.context, transition, Vec::new(), Vec::new())
+        let store = CanonicalUserAutomationStore::new(BorrowedCanonicalStoreClient::new(self));
+        let receipt = store
+            .apply_normalization_transition(
+                &store_request.context,
+                transition,
+                manifest_digest,
+            )
             .await
-            .map_err(user_automation_gateway_unknown)?;
-        receipt.validate().map_err(user_automation_gateway_unknown)?;
-        if receipt.status != WriteReceiptStatus::Committed
-            || receipt.operation_id != request.identity.operation_id
-            || receipt.idempotency_key != request.identity.idempotency_key
-            || receipt.canonical_request_hash != planned_hash
-            || receipt.state_fence != request.context.state_fence
-            || receipt.operation_manifest_digest != manifest_digest
-        {
-            return Err(user_automation_gateway_unknown(
-                "normalization retention receipt does not bind the prepared transition",
-            ));
-        }
-        receipt
-            .require_reconciliation_envelope()
             .map_err(user_automation_gateway_unknown)?;
 
         let record = self
