@@ -1145,13 +1145,11 @@ impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
             // authorize a capture leg bound to reusable task evidence.
             let current_source_closure = self
                 .work_scope
-                .ok_or_else(|| {
-                    CompositionError::Kernel(KernelPortError::TaskScopeIncompatible)
-                })?
+                .ok_or(CompositionError::Kernel(
+                    KernelPortError::TaskScopeIncompatible,
+                ))?
                 .read_current_source_closure(fence)
-                .map_err(|_| {
-                    CompositionError::Kernel(KernelPortError::TaskScopeIncompatible)
-                })?;
+                .map_err(|_| CompositionError::Kernel(KernelPortError::TaskScopeIncompatible))?;
             if selection.work_scope() != &current_scope
                 || selection.source_closure()
                     != (&current_source_closure.0, &current_source_closure.1)
