@@ -1386,23 +1386,19 @@ fn revalidate_dispatch_material(
     if reservation.definition_id != definition.definition_id
         || reservation.definition_digest != definition.definition_digest
     {
-        return Err(DaemonError::ProviderAdmission(
-            FabricError::ReceiptBinding(
-                "solo dispatch refuses a reservation that no longer stages the planned definition"
-                    .to_owned(),
-            ),
-        ));
+        return Err(DaemonError::ProviderAdmission(FabricError::ReceiptBinding(
+            "solo dispatch refuses a reservation that no longer stages the planned definition"
+                .to_owned(),
+        )));
     }
     if admission.definition_id != definition.definition_id
         || admission.definition_digest != definition.definition_digest
         || admission.reservation_id != reservation.reservation_id
     {
-        return Err(DaemonError::ProviderAdmission(
-            FabricError::StaleAdmission(
-                "solo dispatch refuses an admission that no longer commits the staged definition"
-                    .to_owned(),
-            ),
-        ));
+        return Err(DaemonError::ProviderAdmission(FabricError::StaleAdmission(
+            "solo dispatch refuses an admission that no longer commits the staged definition"
+                .to_owned(),
+        )));
     }
     if sha256_hex(&intake.delegate.source_bytes) != intake.delegate.source_digest {
         return Err(DaemonError::ProviderAdmission(
