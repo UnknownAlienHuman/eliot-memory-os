@@ -10,11 +10,12 @@
 //!   task-memory, support/influence promotion, or finish relevance.
 //! - Every task-relative reusable/control transition (`UpdateTaskState` and any
 //!   `CaptureObservation` that names a task) requires the exact binding: the
-//!   context and transition task identities agree, the fences agree, and at
-//!   least two distinct exact evidence handles are present (the revision
-//!   evidence and the digest evidence, whose values were verified upstream).
-//!   Absence rejects with `TASK_SELECTION_REQUIRED`; a different/incompatible
-//!   scope rejects with `TASK_SCOPE_INCOMPATIBLE`.
+//!   context and transition task identities agree, the complete fences agree,
+//!   retained original evidence agrees with the operation's separate
+//!   revision/digest/scope/source/evidence fields, and at least two distinct
+//!   exact evidence handles are present. Absence rejects with
+//!   `TASK_SELECTION_REQUIRED`; a different/incompatible scope rejects with
+//!   `TASK_SCOPE_INCOMPATIBLE`.
 //! - Every Governor finish write (`RecordFinishDecision`,
 //!   `RecordFinishEvidence`) is task-bearing by construction and requires the
 //!   finish binding: the context and transition task identities agree, the
@@ -53,6 +54,7 @@ use eliot_store_api::{
     EffectClass, NamedMutationOperation, PreparedTransition, RequestMeta, StoreError,
     TransitionClass,
 };
+use serde::Deserialize;
 
 /// Stable rejection code when task-bound promotion lacks current evidence.
 pub const TASK_SELECTION_REQUIRED: &str = "TASK_SELECTION_REQUIRED";
@@ -196,6 +198,140 @@ fn has_single_authority_ref(transition: &PreparedTransition) -> bool {
         .all(|handle| exact_handle(handle))
 }
 
+/// The original owner-issued evidence carried on each task-bound capture or
+/// task-control operation. This mirrors the closed upstream shape so the
+/// bridge can compare the retained bytes with the operation's separate
+/// admission fields; it does not mint or recompute any evidence value.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedTaskSelectionEvidence {
+    task_ref: String,
+    task_revision: u64,
+    acceptance_digest: String,
+    work_scope_ref: String,
+    selection_source_ref: String,
+    evidence_ref: String,
+    #[serde(default)]
+    contamination_flags: Vec<String>,
+}
+
+fn operation_text<'a>(
+    operation: &'a eliot_store_api::NamedMutationRequest,
+    field: &'static str,
+) -> Result<&'a str, TaskBindingRejection> {
+    operation
+        .parameters
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| exact_handle(value))
+        .ok_or_else(|| {
+            TaskBindingRejection::selection_required(format!(
+                "task-bound operation is missing exact {field}"
+            ))
+        })
+}
+
+/// Cross-checks the retained evidence independently against the operation,
+/// admitted task/fence and transition scope. The acceptance digest is compared
+/// as recorded; it is never reconstructed from caller-supplied lists or bytes.
+fn validate_retained_selection(
+    context: &RequestMeta,
+    transition: &PreparedTransition,
+    task_id: &str,
+) -> Result<(), TaskBindingRejection> {
+    let context_task = context.task_id.as_ref().map(TaskId::as_str);
+    if context_task != Some(task_id) || transition.task_id.as_deref() != Some(task_id) {
+        return Err(TaskBindingRejection::scope_incompatible(
+            "retained task selection does not match the admitted task and prepared operation",
+        ));
+    }
+    if context.state_fence != transition.state_fence {
+        return Err(TaskBindingRejection::selection_required(
+            "task selection fence differs from the complete admitted State Fence",
+        ));
+    }
+
+    let mut checked = false;
+    for operation in &transition.named_operations {
+        if !matches!(
+            operation.operation,
+            NamedMutationOperation::CaptureObservation | NamedMutationOperation::UpdateTaskState
+        ) {
+            continue;
+        }
+        checked = true;
+        let encoded = operation_text(operation, "task_selection_evidence_json")?;
+        let evidence: RetainedTaskSelectionEvidence =
+            serde_json::from_str(encoded).map_err(|_| {
+                TaskBindingRejection::selection_required(
+                    "retained task selection evidence is not the exact closed evidence shape",
+                )
+            })?;
+        if !evidence.contamination_flags.is_empty() {
+            return Err(TaskBindingRejection::selection_required(
+                "contaminated task selection evidence cannot authorize a task-bound write",
+            ));
+        }
+
+        let revision = operation_text(operation, "task_selection_revision")?;
+        let acceptance_digest = operation_text(operation, "task_selection_acceptance_digest")?;
+        let scope_ref = operation_text(operation, "task_selection_scope_ref")?;
+        let source_ref = operation_text(operation, "task_selection_source_ref")?;
+        let evidence_ref = operation_text(operation, "task_selection_evidence_ref")?;
+
+        if evidence.task_ref != task_id {
+            return Err(TaskBindingRejection::scope_incompatible(
+                "retained task selection names a different task than the admitted operation",
+            ));
+        }
+        if evidence.work_scope_ref != transition.scope_id.as_str()
+            || scope_ref != evidence.work_scope_ref
+        {
+            return Err(TaskBindingRejection::scope_incompatible(
+                "retained task selection WorkScope does not match the prepared operation",
+            ));
+        }
+
+        let current_revision = context
+            .state_fence
+            .task_revision
+            .map(|revision| revision.value());
+        if evidence.task_revision.to_string() != revision
+            || current_revision != Some(evidence.task_revision)
+            || evidence.acceptance_digest != acceptance_digest
+            || evidence.selection_source_ref != source_ref
+            || evidence.evidence_ref != evidence_ref
+            || !transition
+                .required_proof_and_approval_refs
+                .iter()
+                .any(|reference| reference == &evidence.selection_source_ref)
+            || !transition
+                .required_proof_and_approval_refs
+                .iter()
+                .any(|reference| reference == &evidence.evidence_ref)
+        {
+            return Err(TaskBindingRejection::selection_required(
+                "retained task selection revision, acceptance digest, or exact evidence references do not match the operation",
+            ));
+        }
+
+        if operation.operation == NamedMutationOperation::UpdateTaskState
+            && operation_text(operation, "task_id")? != task_id
+        {
+            return Err(TaskBindingRejection::scope_incompatible(
+                "task-control payload names a different task than the admitted selection",
+            ));
+        }
+    }
+
+    if !checked {
+        return Err(TaskBindingRejection::selection_required(
+            "task-bound capture/control requires retained TaskSelectionEvidence",
+        ));
+    }
+    Ok(())
+}
+
 /// Gates one prepared transition before any provider I/O.
 ///
 /// Rules:
@@ -205,11 +341,12 @@ fn has_single_authority_ref(transition: &PreparedTransition) -> bool {
 ///   memory or authority evidence and are rejected before provider I/O.
 /// - `CaptureObservation` naming a task, and every `UpdateTaskState`, require
 ///   exact binding: context/transition task identities present and equal,
-///   fences equal, `WorkScope` (transition `scope_id`) consistent with the
-///   context fence, and at least two distinct exact evidence handles covering
-///   the revision and digest evidence verified upstream. Missing binding
-///   rejects with `TASK_SELECTION_REQUIRED`; a task/scope mismatch rejects
-///   with `TASK_SCOPE_INCOMPATIBLE`.
+///   fences equal, retained original evidence agrees with the operation's
+///   separate revision/digest/scope/source/evidence fields, `WorkScope` agrees
+///   with the prepared transition's `scope_id`, and at least two distinct
+///   exact evidence handles are present. Missing binding rejects with
+///   `TASK_SELECTION_REQUIRED`; a task/scope mismatch rejects with
+///   `TASK_SCOPE_INCOMPATIBLE`.
 /// - `RecordFinishDecision` and `RecordFinishEvidence` are task-bearing
 ///   Governor finish writes and require the finish binding: context/transition
 ///   task identities present and equal, fences equal, and at least one exact
@@ -371,6 +508,7 @@ fn require_exact_binding(
             "task-bound transition requires exact revision and digest evidence handles",
         ));
     }
+    validate_retained_selection(context, transition, task_id)?;
     Ok(())
 }
 
