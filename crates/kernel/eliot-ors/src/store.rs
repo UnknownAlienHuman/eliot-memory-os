@@ -5972,10 +5972,12 @@ impl RedbRecoveryStore {
                 token_ref: token_ref.to_owned(),
                 ordinal,
                 operation_sha256: None,
+                operation_projection_json: None,
                 request_identity_json: None,
                 request_identity_sha256: None,
                 state: BlobProcessStreamCallState::Issued,
                 response_sha256: None,
+                response_projection_json: None,
                 response_ref: None,
                 owner_receipt_ref: None,
             };
