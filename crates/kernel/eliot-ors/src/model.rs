@@ -7148,6 +7148,165 @@ impl HostRequestOwnerReadbackEvidence {
     }
 }
 
+/// Durable owner-receipt reference for one host-request operation whose
+/// effect may already have happened (issue #2565 AUD14; I14.21).
+///
+/// This is the half of AUD14 the retained attempt plus an audit chain cannot
+/// express: after the Governor/Store transition may have executed but
+/// host-result persistence fails, the row advances to
+/// [`HostRequestState::Unknown`] and the owner's OWN receipt is retained beside
+/// it as an explicit durable reference, rather than left for a reader to
+/// reconstruct.
+///
+/// Why every value here is a copy and never a derivation: the receipt is the
+/// owner's own out-of-band evidence — the exact result lineage the owner
+/// authenticated on its own submit channel and that the wire contract already
+/// bound to the result it presented — carried across verbatim. It is
+/// deliberately NOT a digest of the row being repaired and NOT recomputed from
+/// the record this reference describes. A reference derived from the thing it
+/// references proves nothing: it would be the reader's own checksum standing in
+/// for the owner's proof.
+///
+/// The record is DATA, not a capability. A Human or Doctor reconciling the
+/// `Unknown` operation reads the receipt itself off durable state; nothing here
+/// grants the ability to fetch it, and nothing here is permission to resend.
+/// Under I14.21 the possible effect stays preserved and unrepeated while the
+/// Ordering Scope is paused: reconciliation is a human decision over this
+/// evidence, never a system retry.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRequestPossibleEffectReference {
+    /// Original ORS operation identity this reference reconciles.
+    pub operation_id: OperationIdentity,
+    /// Original ORS request commitment this reference reconciles.
+    pub request_digest: String,
+    /// Original admitted payload commitment this reference reconciles.
+    pub payload_digest: String,
+    /// The send attempt that held custody when the effect became possible.
+    /// A reference naming another attempt cannot reconcile this row.
+    pub attempt_id: OpaqueLabel,
+    /// Generation of the send attempt named by [`Self::attempt_id`].
+    pub attempt_generation: u64,
+    /// Exact canonical commitment of the result the owner presented, which is
+    /// the commitment whose persistence failed.
+    ///
+    /// It is absent from the operation row by construction, and that absence
+    /// is what keeps the effect merely possible rather than observed.
+    pub unpersisted_result_commitment_sha256: String,
+    /// The owner's own receipt for that result, retained as DATA.
+    pub owner_receipt: HostRequestRetainedLineage,
+}
+
+impl HostRequestPossibleEffectReference {
+    /// Binds this reference to the exact host-request row and the exact
+    /// retained attempt it reconciles.
+    ///
+    /// Every comparison below is between two ORIGINALLY RECORDED values: this
+    /// reference against the row's own `operation_id`, `request_digest`,
+    /// `payload_digest` and the row's own retained attempt identity. Nothing is
+    /// re-derived and no content hash is taken over whatever the reader happens
+    /// to be holding — a fresh checksum would replace the owner's recorded
+    /// proof with a new one instead of checking it, which is exactly the
+    /// substitution this entry exists to refuse.
+    ///
+    /// The receipt is then bound to the commitment the OWNER presented, read
+    /// back unchanged from both recorded sides. It is never compared with this
+    /// row's own `result_digest`: the whole point of the reference is that this
+    /// row retains no result, so a check against that absent value would be
+    /// vacuous.
+    pub(crate) fn validate_for(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        self.validate_standalone()?;
+        if self.operation_id != record.operation_id
+            || self.request_digest != record.request_digest
+            || self.payload_digest != record.payload_digest
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        let Some(attempt) = record.attempt.as_ref() else {
+            return Err(OrsError::InvalidField {
+                field: "host_request_possible_effect_reference",
+                reason: "a possible-effect reference must name the attempt that held custody",
+            });
+        };
+        if self.attempt_id != attempt.attempt_id || self.attempt_generation != attempt.generation {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the parts of this reference that stand on their own, without a
+    /// row to compare against.
+    ///
+    /// This is what the persistence codec checks on every decoded row: the
+    /// identity shape, the commitment shape, and the owner's receipt bound to
+    /// the commitment the owner presented. The row-relative comparisons in
+    /// [`Self::validate_for`] need the row this reference was written beside,
+    /// so they are made at the write and at the read that loads both.
+    pub(crate) fn validate_standalone(&self) -> Result<(), OrsError> {
+        validate_text(
+            self.operation_id.as_str(),
+            "host_request_possible_effect_operation_id",
+        )?;
+        validate_digest(
+            &self.request_digest,
+            "host_request_possible_effect_request_digest",
+        )?;
+        validate_digest(
+            &self.payload_digest,
+            "host_request_possible_effect_payload_digest",
+        )?;
+        validate_text(
+            self.attempt_id.as_str(),
+            "host_request_possible_effect_attempt_id",
+        )?;
+        if self.attempt_generation == 0 {
+            return Err(OrsError::InvalidField {
+                field: "host_request_possible_effect_attempt_generation",
+                reason: "must be non-zero",
+            });
+        }
+        validate_digest(
+            &self.unpersisted_result_commitment_sha256,
+            "host_request_possible_effect_unpersisted_result_commitment_sha256",
+        )?;
+        self.owner_receipt
+            .validate(&self.unpersisted_result_commitment_sha256)?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_for(&self, record: &HostRequestRecord) -> Result<(), OrsError> {
+        self.validate_standalone()?;
+        if self.operation_id != record.operation_id
+            || self.request_digest != record.request_digest
+            || self.payload_digest != record.payload_digest
+        {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        let Some(attempt) = record.attempt.as_ref() else {
+            return Err(OrsError::InvalidField {
+                field: "host_request_possible_effect_reference",
+                reason: "a possible-effect reference must name the attempt that held custody",
+            });
+        };
+        if self.attempt_id != attempt.attempt_id || self.attempt_generation != attempt.generation {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: record.operation_id.as_str().to_owned(),
+                request_digest: record.request_digest.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl HostRequestAttemptPhase {
     /// Returns the durable custody observation, if this phase carries one.
     pub const fn transport_custody(self) -> Option<HostRequestTransportCustody> {

@@ -496,12 +496,20 @@ impl StaleLocalReadReason {
 /// Disposition of one daemon-produced local-read result submission.
 ///
 /// `Persisted` is the single completion for the current fencing generation;
-/// `StaleAttempt` is the quarantined noncanonical observation. There is no
-/// third outcome: exactly one completion per current generation.
+/// `StaleAttempt` is the quarantined noncanonical observation. Exactly one
+/// completion per current generation holds either way: `PossibleEffectRetained`
+/// is not a completion at all, so it cannot become a second one.
 #[derive(Clone, Debug)]
 pub(crate) enum LocalReadSubmitDisposition {
     Persisted(Box<HostRequestRecord>),
     StaleAttempt(StaleLocalReadObservation),
+    /// Issue #2565 AUD14: this operation may already have effected, and the
+    /// owner's own receipt for that possible effect is returned instead of a
+    /// completion. It is a reconciliation INPUT, never a result: the operation
+    /// stays `Unknown`, so nothing here can be read back as an outcome or
+    /// re-dispatched. The receipt is the durable data a Human or Doctor
+    /// reconciles against (I14.21), not a capability to look one up.
+    PossibleEffectRetained(Box<eliot_ors::HostRequestPossibleEffectReference>),
 }
 
 #[derive(Clone, Copy)]
@@ -5334,29 +5342,46 @@ impl KernelComposition {
     /// - The queue pair is retired, which is what stops the same live owner
     ///   from being handed the identical pair on the next poll.
     ///
-    /// The reconciliation reference is the ORIGINAL attempt identity already
-    /// durable on the row (`attempt_id`, generation, owner session, fence
-    /// digest) plus the `result_native_raw_appended` audit record emitted
-    /// before persistence, which carries the submitted result digest. Both are
-    /// recorded values read back unchanged; nothing here recomputes a digest or
-    /// compares a payload against itself, and no receipt is invented for a
-    /// write that did not happen.
+    /// The reconciliation reference is the ORIGINAL OWNER RECEIPT the daemon
+    /// just presented — the explicit result lineage that
+    /// [`HostRequestResultBody::validate_observe_submission`] requires on this
+    /// leg and that it already bound to this exact result digest and the
+    /// completing attempt. Issue #2565 AUD14 asks for that receipt as a durable
+    /// reference, not for a reconstruction of it: the retained attempt plus an
+    /// audit chain only tells a reconciler WHICH attempt existed, while the
+    /// receipt itself is the evidence of what the owner says it did.
+    ///
+    /// `owner_receipt` and `owner_result_commitment` are carried across
+    /// verbatim. They are NOT derived from the row being repaired: the receipt
+    /// arrived out of band from the owner on its own authenticated channel and
+    /// was validated before this point, and the ORS entry that consumes them
+    /// refuses any reference naming another operation, request, payload, or
+    /// retained attempt. The carried record holds the receipt DATA, so a Human
+    /// or Doctor reconciles from durable state instead of from a capability to
+    /// go and look it up.
     ///
     /// The advance is best-effort by construction: a store error must not
     /// replace the original refusal with a different one, so its outcome is
     /// contained here and the caller's own transport error still reports the
-    /// real cause. The in-memory retirement always runs.
+    /// real cause. The in-memory retirement always runs, and the receipt is
+    /// never invented for a write that did not happen.
     fn retain_observe_possible_effect(
         &self,
         operation_id: &OperationIdentity,
         request_digest: &str,
+        owner_receipt: &HostRequestRetainedLineage,
+        owner_result_commitment: &str,
     ) {
-        let _ = self.generation_gateway.ors.advance_host_request(
-            operation_id,
-            request_digest,
-            HostRequestState::Unknown,
-            None,
-        );
+        let _ = self
+            .generation_gateway
+            .ors
+            .advance_host_request_to_possible_effect(
+                operation_id,
+                request_digest,
+                HostRequestState::Unknown,
+                owner_result_commitment,
+                owner_receipt,
+            );
         self.retire_observe_pair_under_transition(operation_id.as_str(), request_digest);
     }
 
@@ -5427,6 +5452,38 @@ impl KernelComposition {
             && same_observe_owner_receipt(&stored, body)
         {
             return Ok(LocalReadSubmitDisposition::Persisted(Box::new(stored)));
+        }
+        // Issue #2565 AUD14: an operation whose result persistence failed is
+        // already `Unknown` with the owner's own receipt retained beside it. The
+        // daemon's at-least-once resubmission of that same receipt therefore
+        // never reaches persistence — a blind retry is precisely what I14.21
+        // forbids — and instead reads the retained reference back so the caller
+        // learns what was preserved instead of re-executing it.
+        //
+        // The join is the OWNER'S OWN RECEIPT on both sides, compared as
+        // originally recorded: the body's lineage must equal the retained
+        // receipt's `semantic_receipt_ref` and `output_digest`. A body with
+        // foreign or absent lineage does not match and falls through to the
+        // lineage and currency gates below, which fail closed — so this arm
+        // cannot be used to have a different result adopted onto a preserved
+        // possible effect, and it cannot complete the operation either.
+        if matches!(
+            stored.state,
+            HostRequestState::PossiblyEffected
+                | HostRequestState::Unknown
+                | HostRequestState::Reconciling
+        ) && stored.result_digest.is_none()
+            && stored.result_response.is_none()
+            && let Some(retained) = self
+                .generation_gateway
+                .ors
+                .load_host_request_possible_effect_reference(&operation_id, &body.request_sha256)
+                .map_err(|_| TransportError::SessionFenced)?
+            && same_possible_effect_owner_receipt(&retained, body)
+        {
+            return Ok(LocalReadSubmitDisposition::PossibleEffectRetained(
+                Box::new(retained),
+            ));
         }
         // Issue #1839: record the adapter-produced native presentation
         // before Kernel validation and normalization, as on the claim
@@ -5635,6 +5692,23 @@ impl KernelComposition {
         // `HostRequestIdentityConflict` stays a conflict rather than a possible
         // effect: it means a different body is already retained under this
         // identity, so the operation is closed, not unknown.
+        //
+        // The owner receipt handed to that advance is the one THIS body
+        // presented: `validate_observe_submission` above already refused any
+        // receiptless observe body, and `body.validate()` bound that lineage to
+        // this exact result digest and the completing attempt. So what reaches
+        // ORS is the owner's own authenticated out-of-band evidence for the
+        // result whose persistence failed — never a value computed from the row
+        // being repaired, and never a stand-in for a receipt nobody presented.
+        //
+        // A receiptless body cannot reach the advance at all. Failing closed
+        // there rather than advancing with an empty reference is deliberate: a
+        // possible-effect row carrying no owner receipt is precisely the
+        // implicit reconstruction AUD14 rejects, and it would leave the
+        // operation unservable with nothing to reconcile against.
+        let Some(owner_receipt) = retained.result_lineage.as_ref() else {
+            return Err(TransportError::SessionFenced);
+        };
         let persisted = match self.generation_gateway.ors.persist_host_request_result(
             &operation_id,
             &body.request_sha256,
@@ -5649,7 +5723,12 @@ impl KernelComposition {
                 return Err(TransportError::IdentityConflict);
             }
             Err(_) => {
-                self.retain_observe_possible_effect(&operation_id, &body.request_sha256);
+                self.retain_observe_possible_effect(
+                    &operation_id,
+                    &body.request_sha256,
+                    owner_receipt,
+                    &body.result_digest,
+                );
                 return Err(TransportError::SessionFenced);
             }
         };
@@ -6024,6 +6103,39 @@ fn same_observe_owner_receipt(stored: &HostRequestRecord, body: &HostRequestResu
         (Some(retained), Some(presented)) => {
             presented.output_digest == retained.output_digest
                 && presented.semantic_receipt_ref == retained.semantic_receipt_ref
+        }
+        _ => false,
+    }
+}
+
+/// Reports whether one submitted body presents the SAME owner receipt that a
+/// possible-effect advance retained for this operation (issue #2565 AUD14).
+///
+/// Both sides are ORIGINALLY RECORDED values. The retained side is the owner's
+/// receipt captured when the Governor/Store transition may already have taken
+/// effect; the presented side is the lineage this body carries, which
+/// [`HostRequestResultBody::validate`] already bound to this exact result digest
+/// and the completing attempt. Equal receipt reference plus equal output
+/// commitment means the presentation repeats THIS preserved observation rather
+/// than a receiptless or foreign-receipt body over identical bytes.
+///
+/// A retained reference carrying no `semantic_receipt_ref` never matches. That
+/// is deliberate rather than permissive: such a receipt admits no semantic
+/// record (see `HostRequestRetainedLineage::semantic_receipt_ref`), so it cannot
+/// identify a resubmission as the same owner receipt, and declining here sends
+/// the body to the lineage and currency gates, which fail closed. Pure: no IO,
+/// no digest recomputation, no promotion.
+fn same_possible_effect_owner_receipt(
+    retained: &eliot_ors::HostRequestPossibleEffectReference,
+    body: &HostRequestResultBody,
+) -> bool {
+    match (
+        retained.owner_receipt.semantic_receipt_ref.as_deref(),
+        body.lineage.as_ref().and_then(|lineage| lineage.semantic_receipt_ref.as_deref()),
+    ) {
+        (Some(retained_ref), Some(presented_ref)) => {
+            retained_ref == presented_ref
+                && retained.owner_receipt.output_digest == body.result_digest
         }
         _ => false,
     }

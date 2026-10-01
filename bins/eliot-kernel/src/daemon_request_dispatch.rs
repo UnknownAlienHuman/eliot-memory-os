@@ -3865,6 +3865,9 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
+                        Ok(host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(
+                            reference,
+                        )) => Ok(Self::possible_effect_retained_daemon_response(&reference)),
                         Err(TransportError::Timeout) => {
                             // F-LOG-KERNEL-1 (#897 T19): timeout after
                             // possible work stays `unknown` in the diagnostic
@@ -8814,6 +8817,38 @@ impl KernelComposition {
         })
     }
 
+    /// Typed outcome when a possible-effect advance retained the owner's own
+    /// receipt for an operation whose result persistence failed (issue #2565
+    /// AUD14; I14.21).
+    ///
+    /// `accepted` is `false` and `possible_effect` is `true`: the operation may
+    /// already have effected and was NOT completed, so this is never read as a
+    /// success. `owner_receipt_ref` is the exact admitted semantic receipt the
+    /// owner authenticated, carried back so the caller reconciles against the
+    /// preserved evidence instead of resubmitting — a blind duplicate effect is
+    /// what I14.21 forbids. `recovery` stays `null` because no automatic recovery
+    /// is offered for an unknown outcome; the disposition is a Human or Doctor
+    /// decision over this receipt.
+    fn possible_effect_retained_daemon_response(
+        reference: &eliot_ors::HostRequestPossibleEffectReference,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "known",
+            "value": {
+                "accepted": false,
+                "possible_effect": true,
+                "operation_id": reference.operation_id.as_str(),
+                "request_digest": reference.request_digest,
+                "attempt_id": reference.attempt_id.as_str(),
+                "attempt_generation": reference.attempt_generation,
+                "unpersisted_result_commitment_sha256":
+                    reference.unpersisted_result_commitment_sha256,
+                "owner_receipt_ref": reference.owner_receipt.semantic_receipt_ref,
+            },
+            "recovery": null,
+        })
+    }
+
     /// Typed outcome when a deferral arrives for an already-terminal record.
     ///
     /// Nothing is outstanding: the waiter path serves the stored truth, so
@@ -10173,7 +10208,13 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         let resulted = match self.submit_local_read_result(session, &submission)? {
             host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,
-            host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
+            host_request_route::LocalReadSubmitDisposition::StaleAttempt(_)
+            // Only the observe lane retains a possible-effect owner receipt
+            // (#2565 AUD14), so this variant cannot arrive from the local-read
+            // leg. Failing closed rather than serving a completion keeps the
+            // "exactly one completion" rule a property of the type, not of
+            // which lane happened to be served.
+            | host_request_route::LocalReadSubmitDisposition::PossibleEffectRetained(_) => {
                 return Err(TransportError::SessionFenced);
             }
         };

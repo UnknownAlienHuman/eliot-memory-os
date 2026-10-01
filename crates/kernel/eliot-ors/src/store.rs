@@ -499,6 +499,26 @@ const HOST_REQUESTS: TableDefinition<&str, &str> = TableDefinition::new("ors_hos
 /// table owner.
 const HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS: TableDefinition<&str, &str> =
     TableDefinition::new("ors_host_request_tool_exposure_receipts_v1");
+/// Durable owner-receipt references for host-request operations whose effect
+/// may already have happened (issue #2565 AUD14; I14.21).
+///
+/// One row per affected operation, keyed exactly like its host-request row
+/// (`operation_id::request_digest`), written in the SAME ORS write transaction
+/// that advances that row out of the executable set. That single transaction is
+/// what makes the reference trustworthy as a reconciliation input: a durable
+/// possible-effect row can never exist without the owner's own receipt beside
+/// it, and a receipt can never be durable for a row the same commit did not
+/// advance.
+///
+/// The row holds the owner's out-of-band evidence as DATA, not a capability to
+/// look it up later, and it is never a permission to resend. The first retained
+/// reference stands: a later failed persistence can neither replace nor erase
+/// the receipt a Human or Doctor would reconcile against. This is one more
+/// table in the existing ORS table family, owned by the same
+/// `RedbRecoveryStore` and written through the same `persistence_codec`; it is
+/// not a second receipt store and not a second table owner.
+const HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES: TableDefinition<&str, &str> =
+    TableDefinition::new("ors_host_request_possible_effect_references_v1");
 /// Durable versioned-artifact registry rows (issue #1971; I1.6, I1.12, I14.14).
 ///
 /// One row per versioned-artifact registry entry, keyed
@@ -5093,6 +5113,14 @@ impl persistence_codec::PersistedValue for HostRequestRecord {
     }
 }
 
+impl persistence_codec::PersistedValue for crate::HostRequestPossibleEffectReference {
+    const RECORD_TYPE: &'static str = "host_request_possible_effect_reference";
+
+    fn validate_persisted(&self) -> Result<(), OrsError> {
+        self.validate_standalone()
+    }
+}
+
 /// Durable pointer from one logical host-request key to its winning
 /// operation (issue #2571).
 ///
@@ -7670,6 +7698,57 @@ impl RedbRecoveryStore {
             .transpose()
     }
 
+    /// Loads the ORIGINAL OWNER RECEIPT retained beside one host-request
+    /// operation's possible-effect advance (issue #2565 AUD14; I14.21).
+    ///
+    /// This is the read half of
+    /// [`Self::advance_host_request_to_possible_effect`], and it exists so a
+    /// Human or Doctor reconciling an `Unknown` operation reads the receipt
+    /// DATA off durable state. Without it the retained receipt would only ever
+    /// be written: a stored reference nobody can read is not a reconciliation
+    /// reference, and the alternative — reconstructing the receipt from the
+    /// retained attempt plus the audit chain — is exactly what AUD14 rules out.
+    ///
+    /// The reference is bound to the row on every read, not trusted for having
+    /// been written correctly: a decoded reference naming another operation,
+    /// request, payload or retained attempt fails with
+    /// [`OrsError::HostRequestIdentityConflict`] here rather than reaching a
+    /// reconciler as this operation's evidence. A row with no retained
+    /// reference returns `Ok(None)`, which is unknown-never-clean, not absence
+    /// of an effect.
+    pub fn load_host_request_possible_effect_reference(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+    ) -> Result<Option<crate::HostRequestPossibleEffectReference>, OrsError> {
+        let read = self.database.begin_read().map_err(storage)?;
+        let row: Option<crate::HostRequestRecord> = {
+            let table = read.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(format!("{}::{}", operation_id.as_str(), request_digest).as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        };
+        let Some(record) = row else {
+            return Ok(None);
+        };
+        let reference: Option<crate::HostRequestPossibleEffectReference> = {
+            let table = read
+                .open_table(HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES)
+                .map_err(storage)?;
+            table
+                .get(format!("{}::{}", operation_id.as_str(), request_digest).as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestPossibleEffectReference>(value.value()))
+                .transpose()?
+        };
+        if let Some(reference) = reference.as_ref() {
+            reference.validate_for(&record)?;
+        }
+        Ok(reference)
+    }
+
     /// Derives the canonical logical key for one host-request record
     /// (issue #2571: the admitted correlation namespace).
     ///
@@ -10066,6 +10145,147 @@ impl RedbRecoveryStore {
             let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
             table
                 .insert(key.as_str(), payload.as_str())
+                .map_err(storage)?;
+        }
+        write.commit().map_err(storage)?;
+        Ok(Some(next))
+    }
+
+    /// Advances one operation to a possible-effect state AND retains the
+    /// OWNER'S OWN RECEIPT as its durable reconciliation reference, in one ORS
+    /// write transaction (issue #2565 AUD14; I14.21).
+    ///
+    /// AUD14's first half: when the Governor/Store transition may have executed
+    /// but host-result persistence fails, the row advances to
+    /// [`crate::HostRequestState::Unknown`] carrying the original owner receipt
+    /// as an explicit reference. The retained attempt plus an audit chain is a
+    /// reconstruction the reader has to perform and can get wrong; this is the
+    /// receipt itself.
+    ///
+    /// What the caller supplies is the owner's out-of-band evidence and the
+    /// commitment it was presented under, both already authenticated on the
+    /// owner's own channel before this entry is reached. Nothing is derived from
+    /// the row here: the reference's identity, payload and attempt fields are
+    /// read back off the row this transaction advances, and the owner's
+    /// commitment and receipt are stored exactly as presented. The reference is
+    /// therefore never a digest of the record it describes and never a
+    /// capability to read one later.
+    ///
+    /// Every possible-effect target is a non-executable state in
+    /// [`crate::HostRequestState::transition_to`], so after this advance the
+    /// operation leaves the claimable set and can only move forward through
+    /// reconciliation evidence — there is no path from here back to a
+    /// re-dispatch. `target` itself is still checked against that transition
+    /// table rather than trusted, so this entry grants no new edge.
+    ///
+    /// Monotonic, like [`Self::persist_host_request_result`]'s retained
+    /// evidence: the first reference stands. An exact replay returns the row
+    /// unchanged, and a DIFFERENT receipt or commitment under the same
+    /// operation identity is a [`OrsError::HostRequestIdentityConflict`] rather
+    /// than a silent overwrite of the evidence a human would reconcile against.
+    /// An unknown operation returns `Ok(None)`; this entry never invents a row.
+    pub fn advance_host_request_to_possible_effect(
+        &self,
+        operation_id: &crate::OperationIdentity,
+        request_digest: &str,
+        target: crate::HostRequestState,
+        unpersisted_result_commitment_sha256: &str,
+        owner_receipt: &crate::HostRequestRetainedLineage,
+    ) -> Result<Option<crate::HostRequestRecord>, OrsError> {
+        crate::model::validate_digest(
+            unpersisted_result_commitment_sha256,
+            "host_request_possible_effect_unpersisted_result_commitment_sha256",
+        )?;
+        if !matches!(
+            target,
+            crate::HostRequestState::PossiblyEffected
+                | crate::HostRequestState::Unknown
+                | crate::HostRequestState::Reconciling
+        ) {
+            return Err(OrsError::InvalidField {
+                field: "host_request_possible_effect_target",
+                reason: "a possible-effect reference belongs only to an unresolved state",
+            });
+        }
+        let key = format!("{}::{}", operation_id.as_str(), request_digest);
+        let write = self.database.begin_write().map_err(storage)?;
+        let existing: Option<crate::HostRequestRecord> = {
+            let table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestRecord>(value.value()))
+                .transpose()?
+        };
+        let Some(mut next) = existing else {
+            return Ok(None);
+        };
+        next.validate()?;
+        if next.operation_id != *operation_id || next.request_digest != request_digest {
+            return Err(OrsError::HostRequestIdentityConflict {
+                operation_id: operation_id.as_str().to_owned(),
+                request_digest: request_digest.to_owned(),
+            });
+        }
+        // A versioned send-claim row owns its own durable transport-custody
+        // lifecycle, so this legacy-lifecycle entry does not move it. Identical
+        // to the guard [`Self::advance_host_request`] applies, kept here so
+        // replacing that call with this one cannot widen what is reachable: the
+        // observe lane stages protocol-zero rows, so this is a no-op for the
+        // caller and a refusal everywhere else.
+        if next.send_claim_protocol_version == crate::HOST_REQUEST_SEND_CLAIM_PROTOCOL_VERSION {
+            return Err(OrsError::InvalidTransition);
+        }
+        let retained: Option<crate::HostRequestPossibleEffectReference> = {
+            let table = write
+                .open_table(HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES)
+                .map_err(storage)?;
+            table
+                .get(key.as_str())
+                .map_err(storage)?
+                .map(|value| decode::<crate::HostRequestPossibleEffectReference>(value.value()))
+                .transpose()?
+        };
+        if let Some(retained) = retained {
+            if retained.unpersisted_result_commitment_sha256
+                != unpersisted_result_commitment_sha256
+                || retained.owner_receipt != *owner_receipt
+            {
+                return Err(OrsError::HostRequestIdentityConflict {
+                    operation_id: operation_id.as_str().to_owned(),
+                    request_digest: request_digest.to_owned(),
+                });
+            }
+            return Ok(Some(next));
+        }
+        next.state = next.state.transition_to(target)?;
+        let attempt = next.attempt.as_ref().ok_or(OrsError::InvalidField {
+            field: "host_request_possible_effect_reference",
+            reason: "a possible-effect reference must name the retained attempt that held custody",
+        })?;
+        let reference = crate::HostRequestPossibleEffectReference {
+            operation_id: next.operation_id.clone(),
+            request_digest: next.request_digest.clone(),
+            payload_digest: next.payload_digest.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            attempt_generation: attempt.generation,
+            unpersisted_result_commitment_sha256: unpersisted_result_commitment_sha256.to_owned(),
+            owner_receipt: owner_receipt.clone(),
+        };
+        reference.validate_for(&next)?;
+        next.validate()?;
+        {
+            let mut table = write.open_table(HOST_REQUESTS).map_err(storage)?;
+            table
+                .insert(key.as_str(), encode(&next)?.as_str())
+                .map_err(storage)?;
+        }
+        {
+            let mut table = write
+                .open_table(HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES)
+                .map_err(storage)?;
+            table
+                .insert(key.as_str(), encode(&reference)?.as_str())
                 .map_err(storage)?;
         }
         write.commit().map_err(storage)?;
@@ -27903,6 +28123,17 @@ impl RedbRecoveryStore {
         drop(
             write
                 .open_table(HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS)
+                .map_err(storage)?,
+        );
+        // #2565 AUD14: the possible-effect reference table is part of the base
+        // ORS table family for the same reason, and because the row-family census
+        // refuses a table the store declares without a disposition. Materialized
+        // empty on every open, so a store that never had a failed observe
+        // result persistence reads authoritatively empty. No row is backfilled
+        // or inferred here.
+        drop(
+            write
+                .open_table(HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES)
                 .map_err(storage)?,
         );
         drop(write.open_table(GRANT_CLOSURE_CURRENT).map_err(storage)?);

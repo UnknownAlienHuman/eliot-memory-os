@@ -1039,6 +1039,16 @@ fn canonical_family_tables() -> Vec<DispositionedTable> {
             super::HOST_REQUEST_TOOL_EXPOSURE_RECEIPTS,
             RowFamilyKind::HostRequests,
         ),
+        // #2565 AUD14: a possible-effect reference is the owner's own receipt
+        // for an operation whose effect may already have happened. It is
+        // operation-bound evidence of a past execution, never a re-dispatchable
+        // route, so it rides the host-requests family beside the row it
+        // reconciles and is restorable with it: a restored `Unknown` row whose
+        // receipt was left behind would be reconcilable from nothing.
+        family(
+            super::HOST_REQUEST_POSSIBLE_EFFECT_REFERENCES,
+            RowFamilyKind::HostRequests,
+        ),
         family(
             super::VERSIONED_ARTIFACTS,
             RowFamilyKind::VersionedArtifacts,
