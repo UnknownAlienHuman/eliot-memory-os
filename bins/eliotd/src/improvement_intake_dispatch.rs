@@ -635,6 +635,16 @@ pub enum ImprovementDispatchError {
     /// The durable learning-record commit was refused.
     #[error("improvement learning-record commit: {0}")]
     Commit(String),
+    /// The Governor owner refused to build the durable terminal decision record
+    /// for this route.
+    ///
+    /// The typed [`UnboundDecisionRecord`] travels unchanged, so a missing bounded
+    /// experiment, a verdict with no evaluation record behind it, and a verdict
+    /// that disagrees with its recorded evidence stay four distinguishable facts
+    /// across this boundary instead of collapsing into one reason string. None of
+    /// them produces a record, and none of them is read as an admission.
+    #[error("improvement terminal decision: {0}")]
+    Decision(#[from] eliot_maintenance::UnboundDecisionRecord),
     /// The store scope or record identity is not a valid contract value.
     #[error("improvement contract value: {0}")]
     Contract(String),

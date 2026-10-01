@@ -1422,37 +1422,38 @@ pub struct ImprovementUnknownEffectIdentity {
     pub invalidation_set: Vec<String>,
 }
 
-impl ImprovementUnknownEffectIdentity {
-    /// Refuses a retained identity whose commitment does not carry this build's
-    /// checked content identity.
+impl ProposalCommitment {
+    /// Refuses a commitment that does not carry this build's checked content
+    /// identity.
     ///
     /// The three components compared are the SAME constants
     /// [`commitment_of`] stamps and the same ones
-    /// [`check_checked_record_identity`] enforces, read here against the
-    /// ORIGINAL recorded values rather than against anything recomputed from
-    /// local state. A retained record written under another domain, encoding
-    /// revision or algorithm is a typed refusal rather than a tolerated debt, and
-    /// nothing is padded, rounded or reinterpreted toward the current identity.
+    /// [`check_checked_record_identity`] enforces, read against the ORIGINAL
+    /// recorded values rather than against anything recomputed from local
+    /// state. A commitment written under another domain, encoding revision or
+    /// algorithm is a typed refusal rather than a tolerated record, and nothing
+    /// is padded, rounded or reinterpreted toward the current identity.
     ///
-    /// The candidate, experiment and owner identities are not checked here: they
-    /// are compared against the current checked record by
-    /// [`reconcile_retained_unknown_effect`], which is the only place that
-    /// holds both sides.
+    /// This is the one commitment-identity comparison in the crate.
+    /// [`ImprovementUnknownEffectIdentity::validate`] and
+    /// [`ImprovementTerminalDecision::validate`] both delegate to it, so the
+    /// durable obligation and the durable terminal decision cannot drift apart in
+    /// what counts as a current record.
     pub fn validate(&self) -> Result<(), UncheckedRecordIdentity> {
         for (component, found, expected) in [
             (
                 "commitment.domain",
-                self.commitment.domain.as_str(),
+                self.domain.as_str(),
                 IMPROVEMENT_PROPOSAL_COMMITMENT_DOMAIN,
             ),
             (
                 "commitment.encoding_version",
-                self.commitment.encoding_version.as_str(),
+                self.encoding_version.as_str(),
                 IMPROVEMENT_PROPOSAL_ENCODING_VERSION,
             ),
             (
                 "commitment.algorithm",
-                self.commitment.algorithm.as_str(),
+                self.algorithm.as_str(),
                 IMPROVEMENT_PROPOSAL_DIGEST_ALGORITHM,
             ),
         ] {
@@ -1466,6 +1467,455 @@ impl ImprovementUnknownEffectIdentity {
         }
         Ok(())
     }
+}
+
+impl ImprovementUnknownEffectIdentity {
+    /// Refuses a retained identity whose commitment does not carry this build's
+    /// checked content identity.
+    ///
+    /// The check is [`ProposalCommitment::validate`] itself, so this module has
+    /// exactly one statement of what a current commitment is. A retained record
+    /// written under another domain, encoding revision or algorithm is a typed
+    /// refusal rather than a tolerated debt, and nothing is padded, rounded or
+    /// reinterpreted toward the current identity.
+    ///
+    /// The candidate, experiment and owner identities are not checked here: they
+    /// are compared against the current checked record by
+    /// [`reconcile_retained_unknown_effect`], which is the only place that
+    /// holds both sides.
+    pub fn validate(&self) -> Result<(), UncheckedRecordIdentity> {
+        self.commitment.validate()
+    }
+}
+
+/// The independent evaluation identities one terminal decision was made against.
+///
+/// This is a projection of the run's own [`ActivationEvidence`], field for field,
+/// and nothing else. It exists because a terminal decision has to be durable, and
+/// a durable decision that cannot say WHICH evaluation it was made against cannot
+/// be re-proved by a later reader: the reader holds the record, not the process
+/// that produced it. Every field is copied, so a decision can never carry an
+/// evaluation the run did not hold.
+///
+/// It carries no outcome authority. [`ImprovementEvidenceExecution`] is the
+/// machine state the pipeline read, `independent` and `verifier_passed` are the
+/// two booleans it read, and the three references name the run and the raw
+/// measurement that were (or were not) recorded. Nothing here decides anything:
+/// the decision's own disposition is the verdict, and this is the evidence the
+/// verdict is checked against.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementEvaluationBinding {
+    /// Stable evidence identity the run held.
+    pub evidence_id: String,
+    /// Verifier principal the run held.
+    pub verifier_id: String,
+    /// Whether the run's evidence record stated the verifier was independent.
+    pub independent: bool,
+    /// Whether the run's evidence record stated the verifier passed.
+    pub verifier_passed: bool,
+    /// The `I0.5` execution status the run's evidence record carried.
+    pub execution: ImprovementEvidenceExecution,
+    /// Exact run the run's evidence record named; may be empty when none ran.
+    pub run_ref: String,
+    /// Exact content revision the run's evidence record named.
+    pub content_revision_ref: String,
+    /// Raw measured evidence reference the run's evidence record named.
+    pub raw_evidence_ref: String,
+    /// Candidate the run's evidence record was bound to.
+    pub bound_candidate_id: String,
+    /// Experiment the run's evidence record was bound to.
+    pub bound_experiment_id: String,
+}
+
+impl ImprovementEvaluationBinding {
+    /// Copies one run's evaluation record into its durable binding.
+    ///
+    /// The single construction site. Every field is a copy, so the binding cannot
+    /// describe an evaluation the run did not hold, and the reader compares the
+    /// binding against the decision's own disposition.
+    fn of(evidence: &ActivationEvidence) -> Self {
+        Self {
+            evidence_id: evidence.evidence_id.clone(),
+            verifier_id: evidence.verifier_id.clone(),
+            independent: evidence.independent,
+            verifier_passed: evidence.verifier_passed,
+            execution: evidence.execution,
+            run_ref: evidence.run_ref.clone(),
+            content_revision_ref: evidence.content_revision_ref.clone(),
+            raw_evidence_ref: evidence.raw_evidence_ref.clone(),
+            bound_candidate_id: evidence.bound_candidate_id.clone(),
+            bound_experiment_id: evidence.bound_experiment_id.clone(),
+        }
+    }
+}
+
+/// Durable identity of one terminal improvement decision.
+///
+/// This is the record a consumer reads when the process that made the decision is
+/// gone. It binds the decision to the EXACT candidate identity and candidate
+/// REVISION it was made on, to the exact bounded experiment, to the exact
+/// committed proposal bytes when the run reached the admitted branch, to the
+/// evaluation record the verdict was made against, and to the pipeline's own
+/// advisory-only disposition verbatim.
+///
+/// # Why the candidate revision is bound
+///
+/// A candidate's revision advances when the deduplication registry merges a new
+/// evidence lineage into it. A decision recorded against an earlier revision was
+/// made about content that has since changed, so a later reader must be able to
+/// see that from the record alone. Binding the revision makes the comparison
+/// possible without keeping the proposal bytes; it does not decide the
+/// comparison, which stays with the owner that holds the current candidate.
+///
+/// # What this record is NOT
+///
+/// It is not a permit, not an activation, not an effect outcome, and not an
+/// authority to retry. `ImprovementTerminalDisposition::CanaryAdmitted` inside it
+/// still carries `execution_authorized == false` and still requires the Kernel
+/// `#11` owner to authorize and execute activation independently. The retry and
+/// completion booleans a consumer reads are the Governor owner's own answers,
+/// and the owner outcome they depend on stays private to this module.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImprovementTerminalDecision {
+    /// Candidate identity the decision was made on.
+    pub candidate_id: String,
+    /// Candidate REVISION the decision was made on.
+    pub candidate_revision: u64,
+    /// Proposal identity the decision was made over.
+    pub proposal_id: String,
+    /// Bounded experiment the decision was made over.
+    pub experiment_id: String,
+    /// Logical operation the decision belongs to.
+    pub operation_ref: String,
+    /// Idempotency namespace the decision belongs to.
+    pub idempotency_key: String,
+    /// The single content commitment this run committed, present EXACTLY when
+    /// the run published one. Only the admitted branch publishes a checked
+    /// current record, so only that branch carries a commitment here; a refusal
+    /// disposition commits nothing and carries none.
+    pub proposal_commitment: Option<ProposalCommitment>,
+    /// The independent evaluation record this run held, whatever its status.
+    ///
+    /// Present whenever the run held an evaluation record at all, including the
+    /// never-ran one. Its absence means the run held no evaluation record, which
+    /// a later reader re-checks against the disposition.
+    pub evaluation: Option<ImprovementEvaluationBinding>,
+    /// The pipeline's own advisory-only terminal disposition, verbatim.
+    pub disposition: ImprovementTerminalDisposition,
+}
+
+/// Why a durable terminal decision was refused.
+///
+/// Every variant is a refusal to BELIEVE the record, so none of them ever
+/// produces a decision, a handoff, or a permit: the disposition stays where it
+/// was and the caller learns the record cannot be read as a current decision.
+/// They are distinct because they are distinct facts — a missing bounded
+/// experiment, an evaluation bound to another candidate, a verdict with no
+/// evaluation record behind it, and a verdict that disagrees with the recorded
+/// evidence are four different things a reader has to go and fix.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum UnboundDecisionRecord {
+    /// A required identity is missing or past the admitted byte ceiling, so the
+    /// record does not establish which decision it is.
+    #[error("improvement terminal decision identity {field} is absent or oversized")]
+    MissingIdentity {
+        /// Which identity the record left unusable.
+        field: &'static str,
+    },
+    /// The decision names no bounded experiment, or names a different one than
+    /// the evaluation and the admitted handoff bind.
+    #[error("improvement terminal decision experiment binding is not established: {relation}")]
+    UnboundExperiment {
+        /// Static identity of the diverging experiment relation.
+        relation: &'static str,
+    },
+    /// The decision's disposition is not the one its own bound records support.
+    #[error("improvement terminal decision disagrees with its recorded evidence: {relation}")]
+    UnverifiableVerdict {
+        /// Static identity of the diverging verdict relation.
+        relation: &'static str,
+    },
+    /// A recorded commitment does not carry this build's checked content identity.
+    #[error("improvement terminal decision commitment identity is unchecked: {0}")]
+    UncheckedCommitment(#[from] UncheckedRecordIdentity),
+}
+
+impl ImprovementTerminalDecision {
+    /// Re-proves this record against its OWN fields, with no other input.
+    ///
+    /// This is the reader half of [`improvement_terminal_decision`], and it is
+    /// what a later pass uses after the process that made the decision is gone.
+    /// It is deliberately narrower than the producer: it can compare the
+    /// decision's identities with each other, but it cannot re-derive the
+    /// proposal bytes, so it never claims the commitment is a current one for
+    /// THIS proposal — only that it carries this build's checked commitment
+    /// identity, which is what a spliced document would fail.
+    ///
+    /// The four questions are decided in the order they differ:
+    ///
+    /// 1. every identity the record must carry is present and bounded;
+    /// 2. the bounded experiment is established — named once, and named by the
+    ///    evaluation record too when one is present;
+    /// 3. the disposition is the one the bound records support: only the admitted
+    ///    branch may carry a commitment and an executed evaluation, and only the
+    ///    refused branches must carry neither;
+    /// 4. the admitted branch's own handoff agrees with the record's identity,
+    ///    with the recorded commitment, and carries no execution authority.
+    pub fn validate(&self) -> Result<(), UnboundDecisionRecord> {
+        self.check_identities()?;
+        if let Some(commitment) = self.proposal_commitment.as_ref() {
+            commitment.validate()?;
+        }
+        // The evaluation, when present, must be bound to the SAME candidate and
+        // experiment the decision names. An evaluation of some other candidate is
+        // not evidence about this one, whatever its own status.
+        if let Some(evaluation) = self.evaluation.as_ref() {
+            for (relation, bound, decided) in [
+                (
+                    "decision-evaluation: candidate-binding-mismatch",
+                    evaluation.bound_candidate_id.as_str(),
+                    self.candidate_id.as_str(),
+                ),
+                (
+                    "decision-evaluation: experiment-binding-mismatch",
+                    evaluation.bound_experiment_id.as_str(),
+                    self.experiment_id.as_str(),
+                ),
+            ] {
+                if bound != decided {
+                    return Err(UnboundDecisionRecord::UnboundExperiment { relation });
+                }
+            }
+        }
+        match &self.disposition {
+            ImprovementTerminalDisposition::CanaryAdmitted { handoff } => {
+                self.check_admitted_branch(handoff)
+            }
+            // Every refused branch, named explicitly so a new disposition is a
+            // compile error here until its own answer is decided rather than
+            // inheriting an unexamined default.
+            ImprovementTerminalDisposition::Rejected { .. }
+            | ImprovementTerminalDisposition::Inconclusive { .. }
+            | ImprovementTerminalDisposition::RegressionRejected { .. }
+            | ImprovementTerminalDisposition::UnknownRequiresReconciliation { .. }
+            | ImprovementTerminalDisposition::RolledBack { .. }
+            | ImprovementTerminalDisposition::NoProgress { .. }
+            | ImprovementTerminalDisposition::Blocked { .. } => self.check_refused_branch(),
+        }
+    }
+
+    /// Requires every identity this record must carry to be present and bounded.
+    ///
+    /// Presence, not shape: an absent identity means the record names no
+    /// candidate, no proposal, no bounded experiment or no operation, and an
+    /// identity past the admitted reference ceiling cannot be read back inside
+    /// the bounds this crate commits under. Both are the same fact about this
+    /// record — it does not establish which decision this is — so both are
+    /// [`UnboundDecisionRecord::MissingIdentity`].
+    fn check_identities(&self) -> Result<(), UnboundDecisionRecord> {
+        for (field, value) in [
+            ("candidate_id", self.candidate_id.as_str()),
+            ("proposal_id", self.proposal_id.as_str()),
+            ("experiment_id", self.experiment_id.as_str()),
+            ("operation_ref", self.operation_ref.as_str()),
+            ("idempotency_key", self.idempotency_key.as_str()),
+        ] {
+            if value.trim().is_empty() || value.len() > IMPROVEMENT_MAX_REFERENCE_BYTES {
+                return Err(UnboundDecisionRecord::MissingIdentity { field });
+            }
+        }
+        Ok(())
+    }
+
+    /// Requires the ADMITTED branch to arrive with everything it claims.
+    ///
+    /// The admitted branch is the only one that can support activation, so it is
+    /// the only one that must arrive with the committed proposal bytes and with
+    /// an executed, independent, passing evaluation by a verifier principal that
+    /// is neither the experiment executor nor the admitting Governor owner. A
+    /// verdict with no evaluation record behind it, or with a recorded evaluation
+    /// that never executed or did not pass, is a verdict that disagrees with its
+    /// own evidence — and it is REFUSED, never downgraded to a rejection and
+    /// never treated as a canary.
+    ///
+    /// The handoff is then re-proved against the record: same candidate, same
+    /// experiment, same operation and idempotency namespace, the same committed
+    /// bytes, and no execution authority. A handoff this crate can never build is
+    /// not a stronger decision when it appears in a durable record.
+    fn check_admitted_branch(
+        &self,
+        handoff: &ImprovementCanaryHandoff,
+    ) -> Result<(), UnboundDecisionRecord> {
+        let Some(commitment) = self.proposal_commitment.as_ref() else {
+            return Err(UnboundDecisionRecord::UnverifiableVerdict {
+                relation: "decision-admitted: no-committed-proposal-bytes",
+            });
+        };
+        let Some(evaluation) = self.evaluation.as_ref() else {
+            return Err(UnboundDecisionRecord::UnverifiableVerdict {
+                relation: "decision-admitted: no-evaluation-record",
+            });
+        };
+        if evaluation.execution != ImprovementEvidenceExecution::Executed
+            || !evaluation.independent
+            || !evaluation.verifier_passed
+        {
+            return Err(UnboundDecisionRecord::UnverifiableVerdict {
+                relation: "decision-admitted: evaluation-is-not-executed-independent-and-passing",
+            });
+        }
+        if !evaluation.verifier_id.starts_with(VERIFIER_OWNER_FAMILY)
+            || evaluation.verifier_id == TESTD_OWNER
+            || evaluation.verifier_id == IMPROVEMENT_PIPELINE_OWNER
+            || evaluation.verifier_id == self.operation_ref
+        {
+            return Err(UnboundDecisionRecord::UnverifiableVerdict {
+                relation: "decision-admitted: evaluator-is-not-an-independent-verifier-principal",
+            });
+        }
+        for (relation, held, recorded) in [
+            (
+                "decision-admitted: handoff-candidate-mismatch",
+                handoff.candidate_id.as_str(),
+                self.candidate_id.as_str(),
+            ),
+            (
+                "decision-admitted: handoff-experiment-mismatch",
+                handoff.experiment_id.as_str(),
+                self.experiment_id.as_str(),
+            ),
+            (
+                "decision-admitted: handoff-operation-mismatch",
+                handoff.operation_ref.as_str(),
+                self.operation_ref.as_str(),
+            ),
+            (
+                "decision-admitted: handoff-idempotency-mismatch",
+                handoff.idempotency_key.as_str(),
+                self.idempotency_key.as_str(),
+            ),
+        ] {
+            if held != recorded {
+                return Err(UnboundDecisionRecord::UnverifiableVerdict { relation });
+            }
+        }
+        if &handoff.proposal_commitment != commitment {
+            return Err(UnboundDecisionRecord::UnverifiableVerdict {
+                relation: "decision-admitted: handoff-commitment-differs-from-the-recorded-one",
+            });
+        }
+        if handoff.execution_authorized {
+            return Err(UnboundDecisionRecord::UnverifiableVerdict {
+                relation: "decision-admitted: handoff-claims-execution-authority",
+            });
+        }
+        Ok(())
+    }
+
+    /// Requires a REFUSED branch to have committed nothing.
+    ///
+    /// No refused branch publishes a checked current record, so none of them may
+    /// carry a proposal commitment: a refusal that carries committed proposal
+    /// bytes is a spliced document, and a reader that believed it would read a
+    /// rejection as though the same bytes had been admitted. This is the same
+    /// direction as the admitted branch's checks — what a decision claims must be
+    /// what its own records support — read for the branches that claim nothing.
+    fn check_refused_branch(&self) -> Result<(), UnboundDecisionRecord> {
+        if self.proposal_commitment.is_some() {
+            return Err(UnboundDecisionRecord::UnverifiableVerdict {
+                relation: "decision-refused: a-refused-decision-committed-proposal-bytes",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Builds the durable terminal decision for one checked pipeline run.
+///
+/// This is the ONE producer of [`ImprovementTerminalDecision`] and the seam a
+/// caller reaches for after [`run_improvement_candidate_pipeline`] returned a
+/// disposition. Every field is copied from a record the run already checked: the
+/// candidate and proposal identities from the proposal, the bounded experiment
+/// from the plan, the evaluation binding from the run's own
+/// [`ActivationEvidence`], and the disposition verbatim. Nothing is derived,
+/// recomputed, or supplied by the caller except the candidate REVISION, which the
+/// caller holds because the candidate record is the candidate owner's.
+///
+/// `current` is the run's own checked current record, read out of its canary
+/// handoff. It is present EXACTLY on the admitted branch, and that is checked
+/// rather than assumed: a caller that pairs the committed bytes with a refusal,
+/// or omits them from an admission, is refused.
+///
+/// `candidate_id` is the candidate identity the caller's own record holds, and it
+/// must equal the proposal's. That is the "bound to the same candidate identity"
+/// half of the record, and it is a refusal rather than a silent rewrite.
+/// `candidate_revision` is not checked against the candidate record here: the
+/// owner of the candidate holds that, and the caller checks it against the record
+/// it read before committing.
+///
+/// Four refusals are reachable and all of them are typed
+/// [`UnboundDecisionRecord`] values, never a default, a skip, or a
+/// treat-as-admitted:
+///
+/// 1. a MISSING BOUNDED EXPERIMENT — the plan names none, or the evaluation is
+///    bound to a different candidate or experiment than the proposal;
+/// 2. a VERDICT WITHOUT ITS EVALUATION RECORD — the admitted branch arriving with
+///    no evaluation record, or with one that never executed, is not independent, or
+///    did not pass;
+/// 3. A VERDICT THAT DISAGREES WITH THE RECORDED EVIDENCE — a refused branch
+///    carrying committed proposal bytes, a committed identity that is not this
+///    build's, or an admitted handoff that disagrees with the record about the
+///    candidate, the experiment, the operation, or the commitment;
+/// 4. a MISSING IDENTITY — a record naming no candidate, proposal, experiment or
+///    operation at all.
+///
+/// The candidate REVISION is the fourth obligation this record carries and the
+/// only one this crate cannot check for itself; see [`ImprovementTerminalDecision`]
+/// for why it is bound and what it does and does not establish.
+pub fn improvement_terminal_decision(
+    candidate_id: &str,
+    candidate_revision: u64,
+    proposal: &ImprovementProposal,
+    experiment: &ExperimentPlan,
+    evidence: &ActivationEvidence,
+    current: Option<&ImprovementCurrentProposal>,
+    disposition: &ImprovementTerminalDisposition,
+) -> Result<ImprovementTerminalDecision, UnboundDecisionRecord> {
+    if candidate_id.trim().is_empty() || candidate_id != proposal.candidate_id.as_str() {
+        return Err(UnboundDecisionRecord::UnboundExperiment {
+            relation: "decision-proposal: candidate-identity-mismatch",
+        });
+    }
+    if experiment.experiment_id.trim().is_empty() {
+        return Err(UnboundDecisionRecord::UnboundExperiment {
+            relation: "decision-plan: names-no-bounded-experiment",
+        });
+    }
+    if evidence.bound_candidate_id != proposal.candidate_id {
+        return Err(UnboundDecisionRecord::UnboundExperiment {
+            relation: "decision-evaluation: candidate-binding-mismatch",
+        });
+    }
+    if evidence.bound_experiment_id != experiment.experiment_id {
+        return Err(UnboundDecisionRecord::UnboundExperiment {
+            relation: "decision-evaluation: experiment-binding-mismatch",
+        });
+    }
+    let decision = ImprovementTerminalDecision {
+        candidate_id: candidate_id.to_owned(),
+        candidate_revision,
+        proposal_id: proposal.proposal_id.clone(),
+        experiment_id: experiment.experiment_id.clone(),
+        operation_ref: proposal.operation_ref.clone(),
+        idempotency_key: proposal.idempotency_key.clone(),
+        proposal_commitment: current.map(|current| current.commitment.clone()),
+        evaluation: Some(ImprovementEvaluationBinding::of(evidence)),
+        disposition: disposition.clone(),
+    };
+    decision.validate()?;
+    Ok(decision)
 }
 
 /// Why a receipt was refused as this obligation's settled owner outcome.
@@ -1898,6 +2348,19 @@ pub enum PipelineError {
     /// an absent owner outcome produces.
     #[error("improvement owner outcome was refused: {0}")]
     UnboundOwnerOutcome(#[from] UnboundOwnerOutcome),
+    /// The durable terminal decision for this run was refused.
+    ///
+    /// This is the seam a caller reaches for after the pipeline returned a
+    /// disposition, and it is the one place on the improvement path where a
+    /// decision can fail to be RECORDED even though the pipeline produced one.
+    /// The refusal travels whole, so a missing bounded experiment, a verdict with
+    /// no evaluation record behind it, and a verdict that disagrees with its own
+    /// recorded evidence stay distinguishable across this layer boundary. None of
+    /// them produces a record, a handoff, or a permit, and none of them is
+    /// resolved into a weaker disposition: the caller sees the refusal and the
+    /// decision it belonged to is not durable.
+    #[error("improvement terminal decision record was refused: {0}")]
+    UnboundDecisionRecord(#[from] UnboundDecisionRecord),
 }
 
 /// Returns the versioned content commitment for one complete proposal.
