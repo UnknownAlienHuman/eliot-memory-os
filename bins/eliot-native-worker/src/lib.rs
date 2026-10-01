@@ -2610,6 +2610,9 @@ mod tests {
             state_fence: fence(),
             wire_version: NATIVE_WORKER_CLAIM_WIRE_VERSION,
             executable_binding: with_join.then(|| join(route, adapter, nonce)),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
             binding_digest: "f".repeat(64),
         }
     }
@@ -2629,6 +2632,9 @@ mod tests {
             state_fence: fence(),
             route_ref: route.to_owned(),
             requested_capabilities: BTreeSet::from(["inspect".to_owned()]),
+            visibility: None,
+            privacy_class: None,
+            swarm_id: None,
         }
     }
 
