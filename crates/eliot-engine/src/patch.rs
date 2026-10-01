@@ -648,6 +648,11 @@ impl CompletionGate {
         if patch_run.write_receipt.is_none() {
             reasons.push("patch_run_missing_canonical_receipt".to_owned());
         }
+        if proof.project_id != patch_run.project_id
+            || proof.task_id != patch_run.task_id.to_string()
+        {
+            reasons.push("completion_proof_patch_scope_mismatch".to_owned());
+        }
         if proof.changed_files.iter().any(|file| {
             !patch_run
                 .changed_files
@@ -656,19 +661,28 @@ impl CompletionGate {
         }) {
             reasons.push("proof_file_not_in_patch_run".to_owned());
         }
-        let required_verifier_runs = verifier_runs
+        // A caller-supplied run is usable only when the patch execution itself
+        // names that exact run, name, and status. Otherwise an unrelated
+        // passing VerifierRun could be paired with an applied PatchRun to
+        // manufacture completion evidence.
+        let canonical_runs = canonical_verifier_runs(patch_run, verifier_runs, &mut reasons);
+        let required_verifier_runs = canonical_runs
             .iter()
+            .copied()
             .filter(|run| run.required_for_done)
             .collect::<Vec<_>>();
         if required_verifier_runs.is_empty() {
             reasons.push("missing_required_verifier_run".to_owned());
-        } else if !required_verifiers_passed(verifier_runs) {
+        } else if required_verifier_runs.iter().copied().any(|run| {
+            run.status != VerifierStatus::Passed || is_quarantined_legacy_run(run)
+        }) {
             reasons.push("required_verifier_failed".to_owned());
             return completion_decision(proof, CompletionStatus::FailedVerifier, reasons);
         }
-        if required_verifier_runs.iter().any(|run| {
+        if required_verifier_runs.iter().copied().any(|run| {
             run.project_id != patch_run.project_id
                 || run.task_id != patch_run.task_id
+                || run.agent_id != patch_run.agent_id
                 || run.write_receipt.is_none()
         }) {
             reasons.push("required_verifier_missing_canonical_scope_or_receipt".to_owned());
@@ -679,7 +693,11 @@ impl CompletionGate {
         // DONE_VERIFIED.
         match InstrumentRegistry::with_builtin_profiles(1) {
             Ok(instrument_registry) => {
-                for run in verifier_runs.iter().filter(|run| run.required_for_done) {
+                for run in canonical_runs
+                    .iter()
+                    .copied()
+                    .filter(|run| run.required_for_done)
+                {
                     if gate_requirement_profile(&instrument_registry, &run.name, run.command_kind)
                         .is_err()
                     {
@@ -692,7 +710,11 @@ impl CompletionGate {
         // Quarantined legacy-lane runs can never satisfy DONE_VERIFIED
         // (issue #1852 W3): the private command map is not an accepted
         // verification source even when the legacy command itself exited 0.
-        for run in verifier_runs.iter().filter(|run| run.required_for_done) {
+        for run in canonical_runs
+            .iter()
+            .copied()
+            .filter(|run| run.required_for_done)
+        {
             if is_quarantined_legacy_run(run) {
                 reasons.push(format!("quarantined_legacy_verifier:{}", run.name));
             }
@@ -704,7 +726,11 @@ impl CompletionGate {
         {
             reasons.push("completion_proof_missing_patch_run_ref".to_owned());
         }
-        for run in verifier_runs.iter().filter(|run| run.required_for_done) {
+        for run in canonical_runs
+            .iter()
+            .copied()
+            .filter(|run| run.required_for_done)
+        {
             if !proof
                 .evidence
                 .iter()
@@ -1354,6 +1380,83 @@ fn required_verifiers_passed(runs: &[VerifierRun]) -> bool {
     runs.iter()
         .filter(|run| run.required_for_done)
         .all(|run| run.status == VerifierStatus::Passed && !is_quarantined_legacy_run(run))
+}
+
+fn canonical_verifier_runs<'a>(
+    patch_run: &PatchRun,
+    verifier_runs: &'a [VerifierRun],
+    reasons: &mut Vec<String>,
+) -> Vec<&'a VerifierRun> {
+    let mut canonical = Vec::with_capacity(patch_run.verifier_runs.len());
+    for (index, reference) in patch_run.verifier_runs.iter().enumerate() {
+        if patch_run.verifier_runs[..index]
+            .iter()
+            .any(|prior| prior.verifier_run_id == reference.verifier_run_id)
+        {
+            reasons.push(format!(
+                "patch_run_verifier_ref_duplicate:{}",
+                reference.verifier_run_id
+            ));
+            continue;
+        }
+
+        let mut matching = verifier_runs
+            .iter()
+            .filter(|run| run.verifier_run_id == reference.verifier_run_id);
+        let Some(run) = matching.next() else {
+            reasons.push(format!(
+                "patch_run_verifier_ref_missing:{}",
+                reference.verifier_run_id
+            ));
+            continue;
+        };
+        if matching.next().is_some() {
+            reasons.push(format!(
+                "patch_run_verifier_ref_has_duplicate_runs:{}",
+                reference.verifier_run_id
+            ));
+            continue;
+        }
+        if run.name != reference.name || run.status != reference.status {
+            reasons.push(format!(
+                "patch_run_verifier_ref_mismatch:{}",
+                reference.verifier_run_id
+            ));
+            continue;
+        }
+        if run.project_id != patch_run.project_id
+            || run.task_id != patch_run.task_id
+            || run.agent_id != patch_run.agent_id
+        {
+            reasons.push(format!(
+                "patch_run_verifier_scope_mismatch:{}",
+                reference.verifier_run_id
+            ));
+            continue;
+        }
+        canonical.push(run);
+    }
+
+    for (index, run) in verifier_runs.iter().enumerate() {
+        if verifier_runs[..index]
+            .iter()
+            .any(|prior| prior.verifier_run_id == run.verifier_run_id)
+        {
+            continue;
+        }
+        if !patch_run
+            .verifier_runs
+            .iter()
+            .any(|reference| reference.verifier_run_id == run.verifier_run_id)
+        {
+            reasons.push(format!(
+                "verifier_run_not_in_patch_run:{}",
+                run.verifier_run_id
+            ));
+        }
+    }
+
+    canonical
 }
 
 fn verifier_run_ref(run: &VerifierRun) -> VerifierRunRef {

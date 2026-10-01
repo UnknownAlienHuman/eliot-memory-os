@@ -9,7 +9,8 @@ use eliot_types::{
     CompletionStatus, DiagnosticEvidence, FileEvidence, GovernorConfig, InvariantCard,
     LeaseDecision, LeaseStatus, PatchRequest, PatchRequestId, PatchRun, PatchRunStatus, ProjectId,
     ReceiptId, SymbolEvidence, TaskId, UnifiedDiff, VerifierCommandKind, VerifierEvidence,
-    VerifierPlan, VerifierRequirement, VerifierRun, VerifierStatus, WorkItemId, WorkLease,
+    VerifierPlan, VerifierRequirement, VerifierRun, VerifierRunId, VerifierStatus, WorkItemId,
+    WorkLease,
     WorkLeaseDecision, WorkLeaseDecisionKind, WorkLeaseDecisionReason, WorkLeaseId, WorkLeaseState,
     WriteId, WriteReceiptRef,
 };
@@ -190,6 +191,46 @@ async fn verifier_success_allows_completion_done() -> TestResult {
         CompletionGate::decide_with_patch_context(&proof, Some(&patch_run), &verifier_runs);
 
     assert_eq!(decision.final_status, CompletionStatus::DoneVerified);
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_service_reads_only_canonical_patch_execution() -> TestResult {
+    let bundle = Bundle::new("completion-canonical-patch-run", value_diff("2"))?;
+    let (patch_run, verifier_runs) = bundle.apply().await?;
+    assert_eq!(patch_run.verifier_runs.len(), verifier_runs.len());
+    for reference in &patch_run.verifier_runs {
+        let matching = verifier_runs
+            .iter()
+            .filter(|run| run.verifier_run_id == reference.verifier_run_id)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].name, reference.name);
+        assert_eq!(matching[0].status, reference.status);
+    }
+
+    let mut substituted_runs = verifier_runs.clone();
+    let substituted_index = substituted_runs
+        .iter()
+        .position(|run| run.required_for_done)
+        .expect("fixture has a required verifier run");
+    let original_id = substituted_runs[substituted_index].verifier_run_id;
+    substituted_runs[substituted_index].verifier_run_id = VerifierRunId::new_v7();
+    let foreign_id = substituted_runs[substituted_index].verifier_run_id;
+    let proof = completion_proof(&patch_run, &substituted_runs);
+    let decision = CompletionGate::decide_with_patch_context(
+        &proof,
+        Some(&patch_run),
+        &substituted_runs,
+    );
+
+    assert_ne!(decision.final_status, CompletionStatus::DoneVerified);
+    assert!(decision.reasons.contains(&format!(
+        "patch_run_verifier_ref_missing:{original_id}"
+    )));
+    assert!(decision
+        .reasons
+        .contains(&format!("verifier_run_not_in_patch_run:{foreign_id}")));
     Ok(())
 }
 

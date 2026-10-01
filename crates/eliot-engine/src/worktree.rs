@@ -6,7 +6,7 @@ use eliot_types::{
     ActionLease, AgentId, AgentSessionId, CandidateDiff, CandidateDiffId, CandidateDiffStatus,
     CandidateReview, CandidateReviewDecision, CommandContext, CompletionGateDecision,
     CompletionProof, CompletionStatus, LifecycleStatus, PatchRequest, SemanticCommand, TaintClass,
-    ToolObservationRecordCommand, UnifiedDiff, VerifierRun, VerifierStatus, Visibility, WorkLease,
+    ToolObservationRecordCommand, UnifiedDiff, VerifierRun, Visibility, WorkLease,
     WorkScope, WorktreeLease, WorktreeLeaseId, WorktreeLeaseKind, WorktreeLeaseRequest,
     WorktreeLeaseState, WriteId, WriteReceiptRef,
 };
@@ -804,6 +804,7 @@ impl crate::CompletionGate {
             context.patch_run,
             context.verifier_runs,
         );
+        let base_status = base.final_status;
         let mut reasons = base.reasons;
         let Some(candidate_diff) = context.candidate_diff else {
             reasons.push("missing_candidate_diff".to_owned());
@@ -850,12 +851,7 @@ impl crate::CompletionGate {
         {
             reasons.push("completion_proof_missing_candidate_review_ref".to_owned());
         }
-        if context
-            .verifier_runs
-            .iter()
-            .filter(|run| run.required_for_done)
-            .any(|run| run.status != VerifierStatus::Passed)
-        {
+        if base_status == CompletionStatus::FailedVerifier {
             return candidate_completion_decision(proof, CompletionStatus::FailedVerifier, reasons);
         }
         if reasons.is_empty() {

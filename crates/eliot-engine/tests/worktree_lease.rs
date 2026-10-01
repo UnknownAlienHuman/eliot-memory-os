@@ -712,9 +712,39 @@ async fn completion_requires_candidate_patch_verifiers() -> TestResult {
             verifier_runs: &verifier_runs,
         },
     );
+    let mut substituted_runs = verifier_runs.clone();
+    let substituted_index = substituted_runs
+        .iter()
+        .position(|run| run.required_for_done)
+        .expect("fixture has a required verifier run");
+    let original_id = substituted_runs[substituted_index].verifier_run_id;
+    substituted_runs[substituted_index].verifier_run_id = eliot_types::VerifierRunId::new_v7();
+    let foreign_id = substituted_runs[substituted_index].verifier_run_id;
+    let substituted_proof = completion_proof(
+        &patch_run,
+        &substituted_runs,
+        &candidate_diff,
+        &review,
+    );
+    let unbound = CompletionGate::decide_with_candidate_context(
+        &substituted_proof,
+        CandidateCompletionContext {
+            candidate_diff: Some(&candidate_diff),
+            candidate_review: Some(&review),
+            patch_run: Some(&patch_run),
+            verifier_runs: &substituted_runs,
+        },
+    );
 
     assert_eq!(decision.final_status, CompletionStatus::DoneVerified);
     assert_eq!(missing.final_status, CompletionStatus::PartialProgress);
+    assert_eq!(unbound.final_status, CompletionStatus::PartialProgress);
+    assert!(unbound.reasons.contains(&format!(
+        "patch_run_verifier_ref_missing:{original_id}"
+    )));
+    assert!(unbound
+        .reasons
+        .contains(&format!("verifier_run_not_in_patch_run:{foreign_id}")));
     Ok(())
 }
 
