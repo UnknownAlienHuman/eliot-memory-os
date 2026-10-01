@@ -1459,33 +1459,36 @@ pub fn stage_request(
 ) -> Result<InstrumentStageRequest, TestdPortError> {
     let stage = &planned.stage;
     let route = planned.route.stage();
-    let current_registry = crate::profile_replay::testd_builtin_profile_registry()
-        .map_err(|_| TestdPortError::StageBinding {
-            detail: "current Testd builtin profile registry could not be assembled",
-        })?;
-    if plan.registry_generation != current_registry.generation()
-        || plan.registry_digest != current_registry.digest()
-    {
-        return Err(TestdPortError::StageBinding {
-            detail: "stage plan does not match the independently owned current Testd registry",
-        });
-    }
-    let current_profile = ProfileCompiler::new(&current_registry)
-        .compile_exact(&plan.profile, plan.revision)
-        .map_err(|_| TestdPortError::StageBinding {
-            detail: "stage plan profile is not admitted by the current Testd registry",
-        })?;
-    let current_stage = current_profile
-        .stages
-        .iter()
-        .find(|candidate| candidate.stage_id == stage.stage_id);
-    if plan.profile_digest != current_profile.profile_digest
-        || plan.dag_digest != current_profile.dag_digest
-        || current_stage != Some(stage)
-    {
-        return Err(TestdPortError::StageBinding {
-            detail: "planned stage does not match the current admitted profile and DAG",
-        });
+    let testd_executor_profile = eliot_testd_core::is_testd_executor_profile(&plan.profile);
+    if testd_executor_profile {
+        let current_registry = crate::profile_replay::testd_builtin_profile_registry()
+            .map_err(|_| TestdPortError::StageBinding {
+                detail: "current Testd builtin profile registry could not be assembled",
+            })?;
+        if plan.registry_generation != current_registry.generation()
+            || plan.registry_digest != current_registry.digest()
+        {
+            return Err(TestdPortError::StageBinding {
+                detail: "stage plan does not match the independently owned current Testd registry",
+            });
+        }
+        let current_profile = ProfileCompiler::new(&current_registry)
+            .compile_exact(&plan.profile, plan.revision)
+            .map_err(|_| TestdPortError::StageBinding {
+                detail: "stage plan profile is not admitted by the current Testd registry",
+            })?;
+        let current_stage = current_profile
+            .stages
+            .iter()
+            .find(|candidate| candidate.stage_id == stage.stage_id);
+        if plan.profile_digest != current_profile.profile_digest
+            || plan.dag_digest != current_profile.dag_digest
+            || current_stage != Some(stage)
+        {
+            return Err(TestdPortError::StageBinding {
+                detail: "planned stage does not match the current admitted profile and DAG",
+            });
+        }
     }
     if plan.profile != route.profile
         || plan.revision != route.profile_revision
@@ -1554,10 +1557,12 @@ pub fn stage_request(
         } else {
             StageExecutionKind::Process
         },
-        stage_command: Some(eliot_testd_core::InstrumentStageCommand {
-            executable: stage.command.executable.clone(),
-            argv: stage.command.argv.clone(),
-            spec_digest: stage.spec_digest.clone(),
+        stage_command: testd_executor_profile.then(|| {
+            eliot_testd_core::InstrumentStageCommand {
+                executable: stage.command.executable.clone(),
+                argv: stage.command.argv.clone(),
+                spec_digest: stage.spec_digest.clone(),
+            }
         }),
     })
 }
