@@ -38026,6 +38026,107 @@ fn campaign_source_identity_conflict(key: &str) -> OrsError {
 }
 
 #[cfg(test)]
+mod issue_1935_restricted_source_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn owner_joined_staging(source: &[u8], verdict: &str) -> serde_json::Value {
+        let source_digest = crate::model::sha256_hex(source);
+        let policy_terms = json!({
+            "schema_version": 1,
+            "rules": [{
+                "source_class": "RESTRICTED_HANDLE_ONLY",
+                "workscope_privacy_class": "PRIVATE",
+                "provider_restriction": "HIDDEN_REASONING_EXCLUDED",
+                "retention": "RAW_ALLOWED"
+            }]
+        });
+        let owner = json!({
+            "policy_owner_digest": "aa".repeat(32),
+            "work_scope_owner_digest": "bb".repeat(32),
+            "scope_ref": "scope-current",
+            "policy_revision": 3,
+            "work_scope_owner_revision": 5,
+            "policy_snapshot_digest": "cc".repeat(32),
+            "policy_snapshot_id": "policy-current",
+            "work_scope_privacy_class": "PRIVATE",
+            "policy_terms": policy_terms
+        });
+        json!({
+            "restricted_source_bytes": source,
+            "restricted_source_sha256": source_digest,
+            "restricted_source_authorization": {
+                "verdict": verdict,
+                "source_sha256": source_digest,
+                "source_class": "RESTRICTED_HANDLE_ONLY",
+                "scope_ref": "scope-current",
+                "work_scope_privacy_class": "PRIVATE",
+                "work_scope_owner_digest": "bb".repeat(32),
+                "work_scope_owner_revision": 5,
+                "policy_owner_digest": "aa".repeat(32),
+                "policy_snapshot_digest": "cc".repeat(32),
+                "policy_snapshot_id": "policy-current",
+                "policy_revision": 3,
+                "policy_terms": if verdict == "admitted" { policy_terms } else { serde_json::Value::Null }
+            },
+            "privacy_owner_readback": if verdict == "admitted" {
+                owner
+            } else {
+                json!({
+                    "policy_owner_digest": "aa".repeat(32),
+                    "work_scope_owner_digest": "bb".repeat(32),
+                    "scope_ref": "scope-current",
+                    "policy_revision": 3,
+                    "work_scope_owner_revision": 5,
+                    "policy_snapshot_digest": "cc".repeat(32),
+                    "policy_snapshot_id": "policy-current",
+                    "work_scope_privacy_class": "PRIVATE",
+                    "policy_terms": null
+                })
+            },
+            "stream_id": "native-stream",
+            "event_id": "native-event"
+        })
+    }
+
+    #[test]
+    fn issue_1935_restricted_source_stores_exact_bytes_only_for_owner_admission() {
+        let source = canonical_json_bytes(&json!({"event":"session.idle","source":"callback"}))
+            .expect("canonical callback source");
+        let staged = owner_joined_staging(&source, "admitted");
+        let namespace = "dd".repeat(32);
+        let retained = RedbRecoveryStore::bridge_event_restricted_source_staging(
+            &staged,
+            Some(namespace.as_str()),
+        )
+        .expect("owner-admitted raw callback");
+
+        assert_eq!(retained.verdict, "ADMITTED");
+        assert_eq!(retained.bytes, source);
+        assert_eq!(retained.digest, crate::model::sha256_hex(&retained.bytes));
+        assert!(!retained.read_handle.is_empty());
+    }
+
+    #[test]
+    fn issue_1935_restricted_source_withholds_bytes_when_current_owner_denies() {
+        let source = canonical_json_bytes(&json!({"event":"session.idle","source":"callback"}))
+            .expect("canonical callback source");
+        let staged = owner_joined_staging(&source, "rejected");
+        let namespace = "dd".repeat(32);
+        let retained = RedbRecoveryStore::bridge_event_restricted_source_staging(
+            &staged,
+            Some(namespace.as_str()),
+        )
+        .expect("owner refusal is a durable withheld disposition");
+
+        assert_eq!(retained.verdict, "WITHHELD");
+        assert!(retained.bytes.is_empty());
+        assert_eq!(retained.digest, crate::model::sha256_hex(&source));
+        assert!(retained.read_handle.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod process_start_abort_tests {
     use super::*;
     use crate::OperationIdentity;
