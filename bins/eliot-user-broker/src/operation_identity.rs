@@ -1730,7 +1730,8 @@ mod tests {
     use serde_json::json;
 
     const BINDING_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const REGISTRATION_DIGEST: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const REGISTRATION_DIGEST: &str =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
     const USER_BROKER_EPOCH: u64 = 4;
     const NOW: u64 = 1_786_000_000_000;
 
