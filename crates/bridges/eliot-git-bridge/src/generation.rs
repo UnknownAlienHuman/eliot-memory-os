@@ -21,7 +21,7 @@
 //! Wiring: the crate root declares `mod generation;` and re-exports this
 //! sequence. `GitBridge::stage_generation` feeds staged values built from
 //! `git_application_obligations().supported_operations`, the dispatch path
-//! (exec/exec_stdin) records dispatched invocation identities in the
+//! (`exec/exec_stdin`) records dispatched invocation identities in the
 //! ledger, and the composition owner holding the `AdmittedLine` supplies the
 //! canary verdict and performs the switch.
 

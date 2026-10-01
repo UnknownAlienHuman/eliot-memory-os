@@ -18,7 +18,7 @@
 //! new journal.
 //!
 //! Wiring: the crate root declares `mod removal;` and re-exports this
-//! sequence. The dispatch path (exec/exec_stdin) consults
+//! sequence. The dispatch path (`exec/exec_stdin`) consults
 //! `blocks_new_calls` before dispatch, feeds per-operation exit evidence
 //! from real receipts, and the composition owner performs the revocations
 //! and the artifact release the receipt enumerates.
