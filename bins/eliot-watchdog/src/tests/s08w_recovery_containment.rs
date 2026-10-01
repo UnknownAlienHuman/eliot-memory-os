@@ -434,6 +434,7 @@ async fn s08w_sensor_port_recovery_containment_export() {
             WatchdogSpoolPayload::Gap {
                 reason: GapRecoveryReason::HostPidReused,
                 coverage_claimed: false,
+                    evidence_json: None,
                 ..
             }
         ),
@@ -445,6 +446,7 @@ async fn s08w_sensor_port_recovery_containment_export() {
             WatchdogSpoolPayload::Gap {
                 reason: GapRecoveryReason::HostImageSubstituted,
                 coverage_claimed: false,
+                    evidence_json: None,
                 ..
             }
         ),

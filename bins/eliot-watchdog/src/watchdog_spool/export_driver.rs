@@ -812,6 +812,7 @@ fn export_batch_payload(
                     entry.sequence,
                     &entry.record_digest,
                 ),
+                owner_evidence_json: entry.owner_evidence_json.clone(),
             })
         })
         .collect::<Result<Vec<_>, SpoolError>>()?;

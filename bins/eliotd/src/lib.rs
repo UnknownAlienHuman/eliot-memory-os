@@ -289,6 +289,7 @@ pub use freshness_admission::{
 };
 pub use governor_authority_feed::{
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, GovernorAuthorityObservation,
+    WatchdogCoverageAssessment, WatchdogFreshness, assess_watchdog_interval_readback,
     maintain_governor_authority_feed, maintain_governor_authority_route_mismatch,
 };
 pub use governor_local_read::{
@@ -721,6 +722,11 @@ pub struct DaemonComposition {
     /// [`maintain_governor_authority_feed`](crate::maintain_governor_authority_feed);
     /// nothing is derived here and no coverage is synthesized.
     governor_authority: eliot_governor::LiveGovernorAuthority,
+    /// Last actual Watchdog interval report read back from a Kernel-retained
+    /// export entry; it is owner evidence, never a caller freshness flag.
+    watchdog_coverage_readback: std::sync::Mutex<
+        Option<eliot_integration_coverage::WatchdogEvidence>,
+    >,
     /// Retained ingress record for an attach of an already-running
     /// external agent (issue #1782, I11.11 lines 27-42).
     ///
@@ -1068,6 +1074,7 @@ impl DaemonComposition {
             capability_outcomes: std::sync::Mutex::new(CapabilityRegistryView::default()),
             learning_closure: eliot_governor::LearningClosureService::new(),
             governor_authority: eliot_governor::LiveGovernorAuthority::new(),
+            watchdog_coverage_readback: std::sync::Mutex::new(None),
             external_attach: None,
             solo_state: std::sync::Mutex::new(solo_agent_driver::SoloDriverState::new()),
             swarm_attachment: eliot_governor::SwarmAttachmentComposition::new(
@@ -4012,6 +4019,31 @@ impl DaemonComposition {
             return Err(DaemonError::Composition(CompositionError::NotReady));
         }
         Ok(&mut self.governor_authority)
+    }
+
+    /// Retains the exact Watchdog owner report supplied by the authenticated
+    /// Kernel claim path for the current daemon process.
+    pub(crate) fn record_watchdog_coverage_readback(
+        &self,
+        evidence: eliot_integration_coverage::WatchdogEvidence,
+    ) -> Result<(), String> {
+        let mut retained = self
+            .watchdog_coverage_readback
+            .lock()
+            .map_err(|_| "Watchdog coverage readback lock is poisoned".to_owned())?;
+        *retained = Some(evidence);
+        Ok(())
+    }
+
+    /// Returns the latest exact Watchdog owner report retained from a Kernel
+    /// export claim, if the current process has read one.
+    pub(crate) fn watchdog_coverage_readback(
+        &self,
+    ) -> Option<eliot_integration_coverage::WatchdogEvidence> {
+        self.watchdog_coverage_readback
+            .lock()
+            .ok()
+            .and_then(|retained| retained.clone())
     }
 
     /// Borrows the daemon-held Governor outcome registry view (#1961, I3.4).

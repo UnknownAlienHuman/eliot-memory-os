@@ -24,7 +24,7 @@ use eliot_agent_bridge_core::{
     RestrictedRawSourceHandle, SessionId, SessionLifecycleObservation, SessionLifecycleTransition,
     SessionObservation, TaskId, UnsupportedDisposition, WorkUnitId,
 };
-use eliot_contracts::{EpochId, EpochLineageId};
+use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use eliot_integration_coverage::{
     ALL_EVENTS, DispatchOrdering, EventCompleteness, EventCoverage, EventDisposition,
     GovernorCoverageDerivation, IntegrationCoverageProfile, LogicalEvent, TraceFreshness,
@@ -262,15 +262,45 @@ fn live_derivation() -> GovernorCoverageDerivation {
     .verify("fingerprint-1", true)
     .expect("verified");
     let mut derivation = GovernorCoverageDerivation::new();
+    let state_fence = StateFence::new(
+        EpochId::new(
+            EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+            NonZeroU64::new(2).expect("nonzero epoch"),
+        )
+        .expect("valid test epoch"),
+        ResourceGeneration::new(7).expect("nonzero generation"),
+    );
+    let fence_json = serde_json::to_string(&state_fence).expect("state fence");
+    let interval_id = eliot_contracts::sha256_hex(b"watchdog-interval-v1\02\01000\01000");
     derivation
         .derive(
             &coverage,
             &WatchdogEvidence {
                 supervisor_id: "watchdog-1".to_owned(),
-                fresh: true,
+                source_observation_id: eliot_contracts::sha256_hex(
+                    b"watchdog-hook-chain-v1\0watchdog-1\07\02\01000",
+                ),
+                interval_id: interval_id.clone(),
+                export_batch_id: eliot_contracts::sha256_hex(b"test-export-batch"),
+                export_batch_digest: eliot_contracts::sha256_hex(b"test-export-batch-digest"),
+                owner_receipt_id: eliot_contracts::sha256_hex(b"test-export-receipt"),
+                source_generation: 7,
+                authority_epoch: 2,
+                observed_at_ms: 1_000,
+                state_fence_json: fence_json.clone(),
+                interval_coverage: Some(serde_json::json!({
+                    "sensor_map_revision": 2,
+                    "valid": true,
+                        "full_coverage_claimed": false,
+                    "interval_id": interval_id,
+                    "interval": { "start_ms": 1_000, "end_ms": 1_000 },
+                    "records": [],
+                })),
                 summary: "test supervision".to_owned(),
             },
             TraceFreshness::Fresh,
+            &fence_json,
+            2_000,
         )
         .expect("derive");
     derivation

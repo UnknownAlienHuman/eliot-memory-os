@@ -997,6 +997,7 @@ impl WatchdogSpool {
                     service: SERVICE_NAME.to_owned(),
                     reason: crate::GapRecoveryReason::SpoolPressure,
                     coverage_claimed: false,
+                    evidence_json: None,
                 },
             };
             let entry_sequence = sequence
@@ -1666,6 +1667,7 @@ impl WatchdogSpool {
             observed_at_ms,
             producer_generation,
             record_reason,
+            evidence_json,
         } = observation;
         let episode_key =
             eliot_watchdog_core::FailureEpisodeKey::derive(&identity).map_err(|error| {
@@ -1843,6 +1845,8 @@ impl WatchdogSpool {
                         service: SERVICE_NAME.to_owned(),
                         reason: record_reason,
                         coverage_claimed: false,
+                    evidence_json: None,
+                        evidence_json,
                     };
                     let (_appended, created) =
                         Self::append_in_transaction(write, observed_at_ms, payload)?;
@@ -3354,6 +3358,10 @@ fn build_export_batch(
             payload_kind: export_payload_kind(&entry.payload),
             payload_digest,
             record_digest,
+            owner_evidence_json: match &entry.payload {
+                WatchdogSpoolPayload::Gap { evidence_json, .. } => evidence_json.clone(),
+                _ => None,
+            },
         });
         byte_size = byte_size.saturating_add(raw.len() as u64);
         raws.push(raw.clone());

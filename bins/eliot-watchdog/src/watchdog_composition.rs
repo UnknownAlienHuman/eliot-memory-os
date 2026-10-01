@@ -427,6 +427,9 @@ impl WatchdogComposition {
         config.validate()?;
         let runtime = config.runtime()?;
         let task_admission = admission.clone();
+        let task_hook_chain = admission
+            .hook_chain_bootstrap()
+            .map(crate::hook_chain::LiveHookChainSource::new);
         let task_host = host;
         let authority_state = WatchdogAuthorityStateCell::new();
         let task_authority_state = authority_state.clone();
@@ -457,6 +460,7 @@ impl WatchdogComposition {
             move |token| {
                 let kernel = task_kernel.clone();
                 let admission = task_admission.clone();
+                let hook_chain = task_hook_chain;
                 let host = task_host.clone();
                 let authority_state = task_authority_state.clone();
                 let heartbeat = task_heartbeat.clone();
@@ -591,6 +595,24 @@ impl WatchdogComposition {
                                 ObservationChannel::ArtifactConfigIdentity,
                                 ObservationClass::ArtifactDigest,
                             );
+                        }
+                        if let Some(source) = hook_chain.as_ref() {
+                            match source.observe_chain() {
+                                Ok(chain) => {
+                                    let mut observation =
+                                        crate::hook_chain::HookChainObservation::from(&chain);
+                                    observation.interval_coverage = coverage
+                                        .latest()
+                                        .map(|report| crate::hook_chain::project_interval_coverage(&report));
+                                    if let Err(error) = kernel
+                                        .record_hook_chain_observation(observation)
+                                        .await
+                                    {
+                                        tracing::warn!(event = "watchdog.hook_chain_retention_failed", error = %error, "original hook-chain readback was not retained");
+                                    }
+                                }
+                                Err(error) => tracing::warn!(event = "watchdog.hook_chain_observation_failed", error = %error, "original hook-chain owner readback failed"),
+                            }
                         }
                         let admission = match admission.reload() {
                             Ok(admission) => admission,

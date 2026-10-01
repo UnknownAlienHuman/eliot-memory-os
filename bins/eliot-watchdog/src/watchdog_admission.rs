@@ -302,6 +302,13 @@ impl WatchdogAdmissionSource for FileWatchdogAdmission {
     fn approved_host_registration(&self) -> Option<ApprovedHostRegistration> {
         Some(self.binding.approved_host_registration.clone())
     }
+
+    fn hook_chain_bootstrap(&self) -> Option<eliot_platform_windows::ServiceBootstrapArguments> {
+        self.binding
+            .approved_watchdog_registration
+            .bootstrap()
+            .cloned()
+    }
 }
 
 /// Single read-only registry inspection for the Watchdog contour.

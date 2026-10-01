@@ -277,9 +277,45 @@ mod tests {
     }
 
     fn fresh_watchdog() -> WatchdogEvidence {
+        let source_observation_id = eliot_contracts::sha256_hex(
+            b"watchdog-hook-chain-v1\0watchdog-1\03\07\01000",
+        );
+        let interval_id = eliot_contracts::sha256_hex(b"watchdog-interval-v1\02\01000\01000");
+        let records = [
+            "scm_service_state", "process_exit_identity", "job_resource_counters",
+            "named_pipe_handshake", "filesystem_journal", "artifact_config_identity",
+            "store_process_health", "kernel_heartbeat", "hook_event_cadence",
+            "listener_inventory", "security_audit",
+        ]
+        .into_iter()
+        .map(|channel| serde_json::json!({
+            "channel": channel,
+            "competent_source": "owner",
+            "competent_classes": ["observation"],
+            "observed_classes": [],
+            "disposition": "BLIND",
+            "gaps": [{"channel": channel, "reason": "missing_source"}],
+        }))
+        .collect::<Vec<_>>();
         WatchdogEvidence {
             supervisor_id: "watchdog-1".to_owned(),
-            fresh: true,
+            source_observation_id,
+            interval_id: interval_id.clone(),
+            export_batch_id: eliot_contracts::sha256_hex(b"test-export-batch"),
+            export_batch_digest: eliot_contracts::sha256_hex(b"test-export-batch-digest"),
+            owner_receipt_id: eliot_contracts::sha256_hex(b"test-export-receipt"),
+            source_generation: 3,
+            authority_epoch: 7,
+            observed_at_ms: 1_000,
+            state_fence_json: serde_json::to_string(&test_fence()).expect("state fence"),
+            interval_coverage: Some(serde_json::json!({
+                "sensor_map_revision": 2,
+                "valid": true,
+                        "full_coverage_claimed": false,
+                "interval_id": interval_id,
+                "interval": { "start_ms": 1_000, "end_ms": 1_000 },
+                "records": records,
+            })),
             summary: "test supervision".to_owned(),
         }
     }
@@ -300,7 +336,7 @@ mod tests {
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         let profile = derivation
-            .derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh)
+            .derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh, fresh_watchdog().state_fence_json.as_str(), 2_000)
             .expect("derive");
         (derivation, profile)
     }
@@ -347,7 +383,7 @@ mod tests {
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         derivation
-            .derive(&coverage, &fresh_watchdog(), TraceFreshness::Stale)
+            .derive(&coverage, &fresh_watchdog(), TraceFreshness::Stale, fresh_watchdog().state_fence_json.as_str(), 2_000)
             .expect("derive");
         assert_eq!(
             assess_reactive_risk(derivation.current(), true, &test_fence()),
@@ -381,7 +417,7 @@ mod tests {
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         derivation
-            .derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh)
+            .derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh, fresh_watchdog().state_fence_json.as_str(), 2_000)
             .expect("derive");
         assert!(
             !derivation
@@ -416,7 +452,7 @@ mod tests {
         .expect("verified");
         let mut derivation = GovernorCoverageDerivation::new();
         derivation
-            .derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh)
+            .derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh, fresh_watchdog().state_fence_json.as_str(), 2_000)
             .expect("derive");
         assert_eq!(
             assess_reactive_risk(derivation.current(), false, &test_fence()).map(|a| a.tier),

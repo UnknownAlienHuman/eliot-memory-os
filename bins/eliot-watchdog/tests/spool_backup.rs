@@ -77,6 +77,7 @@ fn gap_payload(reason: GapRecoveryReason) -> WatchdogSpoolPayload {
         service: SERVICE_NAME.to_owned(),
         reason,
         coverage_claimed: false,
+                    evidence_json: None,
     }
 }
 

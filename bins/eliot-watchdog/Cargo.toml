@@ -18,6 +18,7 @@ blake3.workspace = true
 ed25519-dalek.workspace = true
 eliot-contracts.workspace = true
 eliot-host-state.workspace = true
+eliot-integration-coverage.workspace = true
 eliot-ipc.workspace = true
 eliot-installation.workspace = true
 eliot-notify-core.workspace = true

@@ -81,6 +81,35 @@ pub const ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME: &str = "Eliot Watchdog";
 pub const ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK: u32 =
     0x0000_0001 | 0x0000_0004 | 0x0000_0010 | 0x0000_0020 | 0x0002_0000;
 
+/// One active SCM registration read from the local service database.
+///
+/// `process` is tied to the service status PID through the platform owner's
+/// process-handle identity reader. `None` is an explicit per-entry identity
+/// gap; it is never replaced with the approved binary path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveServiceRegistration {
+    pub service_name: String,
+    pub display_name: String,
+    pub configured_command: Option<String>,
+    pub configuration_error: Option<u32>,
+    pub service_type: u32,
+    pub current_state: u32,
+    pub process: Option<crate::ProcessIdentity>,
+    pub process_identity_error: Option<u32>,
+}
+
+/// Complete local SCM enumeration, or an explicit API-level gap.
+///
+/// Entries returned before an enumeration error remain available as observed
+/// evidence, but `complete == false` means they cannot establish absence of an
+/// additional registration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveServiceRegistrationInventory {
+    pub entries: Vec<ActiveServiceRegistration>,
+    pub complete: bool,
+    pub win32_error: Option<u32>,
+}
+
 /// Exact service-object rights granted to the `EliotHost` service SID on the
 /// canonical `EliotHost` registration.
 ///
@@ -624,6 +653,12 @@ impl ServiceRegistrationRequest {
     #[must_use]
     pub fn binary_path(&self) -> &Path {
         &self.binary_path
+    }
+
+    /// Returns the exact UTF-16 command line this owner will store in SCM.
+    #[must_use]
+    pub fn binary_command_line(&self) -> String {
+        String::from_utf16_lossy(&self.binary_command_wide())
     }
 
     #[must_use]

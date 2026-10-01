@@ -117,8 +117,12 @@ impl LiveGovernorAuthority {
         coverage: &IntegrationCoverageProfile,
         watchdog: &WatchdogEvidence,
         trace: TraceFreshness,
+        active_fence_json: &str,
+        now_ms: u64,
     ) -> Result<GovernorAuthorityProjection, CoverageError> {
-        let profile = self.derivation.derive(coverage, watchdog, trace)?;
+        let profile = self
+            .derivation
+            .derive(coverage, watchdog, trace, active_fence_json, now_ms)?;
         Ok(Self::project(&profile))
     }
 

@@ -4251,15 +4251,44 @@ async fn run_governor_authority_drive(
     let live_route = kernel
         .owner_session_facts()
         .map(|facts| facts.session_binding().to_owned());
-    // STITCH (issue #1935 produce side): no production owner on this base
-    // issues the verified active-fingerprint coverage, Watchdog supervision
-    // evidence, or trace freshness the feed derives from — the coverage
-    // crate's `candidate`/`verify` constructors are reached only by tests —
-    // so the feed arm honestly observes nothing and skips. The first publish
-    // stays pending and every Material/Critical gate keeps refusing closed
-    // until that observation owner lands and threads its bundle through this
-    // call site.
+    // The Watchdog interval readback is consumed from the retained export
+    // batch below. The separate verified I7.16 active-fingerprint profile and
+    // trace owner remain absent, so they cannot be invented for publication.
     let mut guard = composition.lock().await;
+    if let Some(evidence) = guard.watchdog_coverage_readback() {
+        match serde_json::to_string(guard.governor.kernel_snapshot().state_fence()) {
+            Ok(active_fence_json) => match driver.drive_watchdog_readback(
+                &evidence,
+                &active_fence_json,
+                crate::unix_ms(),
+            ) {
+                Ok(assessment) => {
+                    let gap_count = assessment
+                        .rules
+                        .iter()
+                        .map(|rule| rule.gaps.len())
+                        .sum::<usize>();
+                    tracing::debug!(
+                        target: "eliotd::diagnostics",
+                        event = "eliotd.watchdog_interval_coverage_readback",
+                        rules = assessment.rules.len(),
+                        gaps = gap_count,
+                        freshness = ?assessment.freshness,
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    target: "eliotd::diagnostics",
+                    event = "eliotd.watchdog_interval_coverage_refused",
+                    reason = %error,
+                ),
+            },
+            Err(error) => tracing::warn!(
+                target: "eliotd::diagnostics",
+                event = "eliotd.watchdog_interval_coverage_refused",
+                reason = %error,
+            ),
+        }
+    }
     match driver.drive_feed(&mut guard, kernel, None).await {
         Ok(GovernorAuthorityDriveOutcome::FeedPublished { revision }) => {
             tracing::info!(

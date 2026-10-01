@@ -104,6 +104,13 @@ pub(crate) const SUPERVISION_GAP_RULE_ID: &str = "watchdog_supervision_gap_obser
 /// Immutable revision of [`SUPERVISION_GAP_RULE_ID`].
 pub(crate) const SUPERVISION_GAP_RULE_REVISION: u64 = 1;
 
+/// Identity of the Watchdog-owned rule that observes competing registrations.
+pub(crate) const REGISTRATION_CONFLICT_RULE_ID: &str =
+    "watchdog_competing_integration_registration";
+
+/// Immutable revision of the registration-conflict rule.
+pub(crate) const REGISTRATION_CONFLICT_RULE_REVISION: u64 = 1;
+
 const _: () = assert!(SUPERVISION_GAP_RULE_REVISION == 1);
 
 /// One admitted source event identity with the payload digest recorded for it.
@@ -269,6 +276,8 @@ pub(crate) struct SignalEpisodeObservation {
     pub(crate) producer_generation: u64,
     /// The retained gap reason appended for one newly accepted revision.
     pub(crate) record_reason: GapRecoveryReason,
+    /// Original owner-read observation bytes retained with the signal record.
+    pub(crate) evidence_json: Option<String>,
 }
 
 /// Typed refusal of one offered observation.
@@ -358,6 +367,10 @@ pub(crate) fn failure_class_of_reason(reason: GapRecoveryReason) -> Option<Failu
         GapRecoveryReason::HostImageSubstituted => Some(FailureClass::HostImageSubstituted),
         GapRecoveryReason::HostIdentityChanged => Some(FailureClass::HostIdentityChanged),
         GapRecoveryReason::HostUnknown => Some(FailureClass::HostUnknown),
+        GapRecoveryReason::RegistrationConflict => {
+            Some(FailureClass::CompetingIntegrationRegistration)
+        }
+        GapRecoveryReason::HookChainObservation => None,
         GapRecoveryReason::SpoolPressure => None,
     }
 }

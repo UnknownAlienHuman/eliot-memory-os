@@ -413,7 +413,9 @@ impl GovernorUnavailability {
             | GapRecoveryReason::HostPidReused
             | GapRecoveryReason::HostImageSubstituted
             | GapRecoveryReason::HostIdentityChanged
-            | GapRecoveryReason::HostUnknown => Err(SpoolError::Corrupt(
+            | GapRecoveryReason::HostUnknown
+            | GapRecoveryReason::RegistrationConflict
+            | GapRecoveryReason::HookChainObservation => Err(SpoolError::Corrupt(
                 "watchdog intent reason is not an observed Governor admission failure; refusing the stored row"
                     .to_owned(),
             )),
@@ -810,6 +812,8 @@ pub(crate) fn governor_unavailable_observation_digest(
         GapRecoveryReason::HostImageSubstituted => "HOST_IMAGE_SUBSTITUTED",
         GapRecoveryReason::HostIdentityChanged => "HOST_IDENTITY_CHANGED",
         GapRecoveryReason::HostUnknown => "HOST_UNKNOWN",
+        GapRecoveryReason::RegistrationConflict => "REGISTRATION_CONFLICT",
+        GapRecoveryReason::HookChainObservation => "HOOK_CHAIN_OBSERVATION",
         GapRecoveryReason::SpoolPressure => "SPOOL_PRESSURE",
     };
     let material = format!(
@@ -1966,6 +1970,7 @@ mod tests {
                         service: SERVICE_NAME.to_owned(),
                         reason: GapRecoveryReason::AdmissionUnavailable,
                         coverage_claimed: false,
+                    evidence_json: None,
                     }
                 )
                 .expect("append leading gap"),

@@ -64,6 +64,7 @@ use eliot_store_api::{NamedReadRequest, NamedReadResponse, WriteReceipt};
 use eliot_testd_core::{
     TestdPendingVerifierDispatch, TestdTerminalCompletionEvidence, TestdVerifierDispatchBinding,
 };
+use eliot_integration_coverage::WatchdogEvidence;
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
@@ -1233,6 +1234,7 @@ pub fn parse_watchdog_export_claimed_batch(
             },
             payload_digest: entry.payload_digest.clone(),
             record_digest: entry.record_digest.clone(),
+            owner_evidence_json: entry.owner_evidence_json.clone(),
         })
         .collect::<Vec<_>>();
     Ok(Some(eliot_watchdog_core::WatchdogSpoolExportBatch {
@@ -1260,6 +1262,114 @@ pub fn parse_watchdog_export_claimed_batch(
         created_at_ms: payload.created_at_ms,
         expires_at_ms: payload.expires_at_ms,
     }))
+}
+
+/// Reads the Watchdog coverage supplier from the exact Kernel-retained export
+/// batch. Entries without the interval supplier remain ordinary gaps; this
+/// never fills missing sensor channels from caller profiles.
+pub fn watchdog_evidence_from_claimed_batch(
+    batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
+) -> Result<Option<WatchdogEvidence>, String> {
+    let mut selected: Option<WatchdogEvidence> = None;
+    for entry in &batch.entries {
+        let Some(raw) = entry.owner_evidence_json.as_deref() else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| format!("retained Watchdog evidence is malformed: {error}"))?;
+        if value.get("interval_coverage").is_none_or(serde_json::Value::is_null) {
+            continue;
+        }
+        let installation_id = value
+            .get("installation_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "retained Watchdog evidence has no installation identity".to_owned())?;
+        let scope = value
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "retained Watchdog evidence has no enumerated scope".to_owned())?;
+        let source_observation_id = value
+            .get("source_observation_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "retained Watchdog evidence has no source observation id".to_owned())?;
+        let source_generation = value
+            .get("source_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "retained Watchdog evidence has no source generation".to_owned())?;
+        let authority_epoch = value
+            .get("authority_epoch")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "retained Watchdog evidence has no authority epoch".to_owned())?;
+        let observed_at_ms = value
+            .get("observed_at_ms")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "retained Watchdog evidence has no owner clock".to_owned())?;
+        let state_fence_json = value
+            .get("state_fence_json")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "retained Watchdog evidence has no full StateFence".to_owned())?;
+        let source_fence: eliot_contracts::StateFence = serde_json::from_str(state_fence_json)
+            .map_err(|_| "retained Watchdog evidence StateFence is malformed".to_owned())?;
+        source_fence
+            .validate()
+            .map_err(|_| "retained Watchdog evidence StateFence is invalid".to_owned())?;
+        let interval_coverage = value
+            .get("interval_coverage")
+            .cloned()
+            .ok_or_else(|| "retained Watchdog evidence has no interval coverage".to_owned())?;
+        if installation_id != batch.installation_id
+            || scope != installation_id
+            || source_generation != batch.watchdog_generation
+            || authority_epoch != batch.watchdog_epoch
+            || source_fence.resource_generation.value() != source_generation
+            || source_fence.authority_epoch.sequence.get() != authority_epoch
+            || observed_at_ms > entry.observed_at_ms
+            || entry.observed_at_ms.saturating_sub(observed_at_ms) > 30_000
+        {
+            return Err("retained Watchdog evidence does not join its export batch".to_owned());
+        }
+        let interval_id = interval_coverage
+            .get("interval_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "retained Watchdog report has no interval id".to_owned())?;
+        let evidence = WatchdogEvidence {
+            supervisor_id: installation_id.to_owned(),
+            source_observation_id: source_observation_id.to_owned(),
+            interval_id: interval_id.to_owned(),
+            export_batch_id: batch.batch_id.clone(),
+            export_batch_digest: batch.batch_digest.clone(),
+            owner_receipt_id: eliot_protocol::watchdog_export_reconciliation_idempotency_key(
+                &batch.installation_id,
+                entry.sequence,
+                &entry.record_digest,
+            ),
+            source_generation,
+            authority_epoch,
+            observed_at_ms,
+            state_fence_json: state_fence_json.to_owned(),
+            interval_coverage: Some(interval_coverage),
+            summary: "retained Watchdog interval coverage observation".to_owned(),
+        };
+        evidence
+            .validate()
+            .map_err(|error| format!("retained Watchdog interval is invalid: {error}"))?;
+        if let Some(previous) = selected.as_ref() {
+            if previous.supervisor_id != evidence.supervisor_id
+                || previous.source_generation != evidence.source_generation
+                || previous.authority_epoch != evidence.authority_epoch
+                || previous.state_fence_json != evidence.state_fence_json
+            {
+                return Err("claimed export batch has conflicting Watchdog owners".to_owned());
+            }
+        }
+        if selected
+            .as_ref()
+            .is_none_or(|previous| previous.observed_at_ms < evidence.observed_at_ms)
+        {
+            selected = Some(evidence);
+        }
+    }
+    Ok(selected)
 }
 
 /// Builds the typed terminal-disposition result for one admitted drain window.

@@ -71,6 +71,8 @@ pub enum FailureClass {
     /// A provider host-event sequence skip was proved by its own owner inside
     /// one provider attempt.
     ProviderHostEventSequenceGap,
+    /// Two active registrations claimed one ELIOT interception ownership.
+    CompetingIntegrationRegistration,
 }
 
 impl FailureClass {
@@ -91,6 +93,7 @@ impl FailureClass {
             Self::HostIdentityChanged => "HOST_IDENTITY_CHANGED",
             Self::HostUnknown => "HOST_UNKNOWN",
             Self::ProviderHostEventSequenceGap => "PROVIDER_HOST_EVENT_SEQUENCE_GAP",
+            Self::CompetingIntegrationRegistration => "COMPETING_INTEGRATION_REGISTRATION",
         }
     }
 
@@ -116,6 +119,9 @@ impl FailureClass {
             b"HOST_IDENTITY_CHANGED" => Ok(Self::HostIdentityChanged),
             b"HOST_UNKNOWN" => Ok(Self::HostUnknown),
             b"PROVIDER_HOST_EVENT_SEQUENCE_GAP" => Ok(Self::ProviderHostEventSequenceGap),
+            b"COMPETING_INTEGRATION_REGISTRATION" => {
+                Ok(Self::CompetingIntegrationRegistration)
+            }
             _ => Err(SignalValidationError::InvalidText("failure_class")),
         }
     }

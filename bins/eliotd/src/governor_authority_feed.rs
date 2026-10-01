@@ -27,7 +27,9 @@
 use std::sync::Arc;
 
 use eliot_governor::CompositionError;
-use eliot_integration_coverage::{IntegrationCoverageProfile, TraceFreshness, WatchdogEvidence};
+use eliot_integration_coverage::{
+    BypassRuleCoverage, IntegrationCoverageProfile, TraceFreshness, WatchdogEvidence,
+};
 
 use super::daemon_kernel_client::DaemonKernelClient;
 use super::{DaemonComposition, DaemonError, kind_value};
@@ -40,6 +42,42 @@ const PUBLISH_GOVERNOR_AUTHORITY_OPERATION: &str = "publish_governor_authority";
 const GOVERNOR_AUTHORITY_RECEIPT_KIND: &str = "governor_authority_receipt";
 /// Only an acknowledged `recorded` receipt counts as published.
 const GOVERNOR_AUTHORITY_RECORDED_STATUS: &str = "recorded";
+
+/// Derived freshness of a retained Watchdog interval against the live full
+/// fence and consumer clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchdogFreshness {
+    Fresh,
+    Stale,
+}
+
+/// Real I8.6 competent-sensor coverage derived from one retained Watchdog
+/// interval; rule gaps are carried even when the interval itself is fresh.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchdogCoverageAssessment {
+    pub freshness: WatchdogFreshness,
+    pub rules: Vec<BypassRuleCoverage>,
+}
+
+/// The feed consumer derives current freshness and the finite I8.6 sensor map
+/// from the exact owner report returned through the Kernel retained readback.
+pub fn assess_watchdog_interval_readback(
+    evidence: &WatchdogEvidence,
+    active_fence_json: &str,
+    now_ms: u64,
+) -> Result<WatchdogCoverageAssessment, String> {
+    let rules = evidence
+        .assess_all_bypass_rules()
+        .map_err(|error| format!("Watchdog rule-to-sensor coverage: {error}"))?;
+    Ok(WatchdogCoverageAssessment {
+        freshness: if evidence.is_fresh_for(active_fence_json, now_ms) {
+            WatchdogFreshness::Fresh
+        } else {
+            WatchdogFreshness::Stale
+        },
+        rules,
+    })
+}
 
 /// Wire shape answered by the Kernel `publish_governor_authority` arm: the
 /// recorded revision plus the acknowledged status. Anything but `recorded`
@@ -75,6 +113,11 @@ pub async fn maintain_governor_authority_feed(
     watchdog: &WatchdogEvidence,
     trace: TraceFreshness,
 ) -> Result<u64, CompositionError> {
+    let active_fence_json = serde_json::to_string(
+        composition.governor.kernel_snapshot().state_fence(),
+    )
+    .map_err(|error| CompositionError::Owner(format!("active Watchdog fence: {error}")))?;
+    let now_ms = crate::unix_ms();
     let authority = composition
         .governor_authority_mut()
         .map_err(|error| match error {
@@ -82,7 +125,7 @@ pub async fn maintain_governor_authority_feed(
             error => CompositionError::Recovery(error.to_string()),
         })?;
     let projection = authority
-        .refresh(coverage, watchdog, trace)
+        .refresh(coverage, watchdog, trace, &active_fence_json, now_ms)
         .map_err(|error| CompositionError::Owner(error.to_string()))?;
     publish_projection(kernel, &projection).await
 }
@@ -184,6 +227,17 @@ impl GovernorAuthorityDriver {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Consumes the actual retained Watchdog report from the same Kernel
+    /// export batch and derives current freshness plus per-rule sensor gaps.
+    pub fn drive_watchdog_readback(
+        &self,
+        evidence: &WatchdogEvidence,
+        active_fence_json: &str,
+        now_ms: u64,
+    ) -> Result<WatchdogCoverageAssessment, String> {
+        assess_watchdog_interval_readback(evidence, active_fence_json, now_ms)
     }
 
     /// Drives one feed pass through the designated

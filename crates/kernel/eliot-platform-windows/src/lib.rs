@@ -282,6 +282,7 @@ pub use secret_store::{
     InstallerSecretObservation, ProtectedSecret, WindowsInstallerSecretProvider,
 };
 pub use service_registration::{
+    ActiveServiceRegistration, ActiveServiceRegistrationInventory,
     ELIOT_HOST_SERVICE_CONTROL_ACCESS_MASK, ELIOT_HOST_SERVICE_DISPLAY_NAME,
     ELIOT_HOST_SERVICE_NAME, ELIOT_WATCHDOG_HOST_CONTROL_ACCESS_MASK,
     ELIOT_WATCHDOG_SERVICE_DISPLAY_NAME, ELIOT_WATCHDOG_SERVICE_NAME,
@@ -3004,6 +3005,16 @@ impl WindowsPlatform {
         request: &ServiceRegistrationRequest,
     ) -> ServiceRegistrationRuntimeInspection {
         inspect_service_registration_runtime(request)
+    }
+
+    /// Enumerates active Win32 services from the local SCM and binds each
+    /// running service to the process identity observed through its reported
+    /// PID. Any API or per-entry identity failure remains explicit in the
+    /// returned inventory; callers cannot interpret a partial list as an
+    /// empty remainder.
+    #[must_use]
+    pub fn enumerate_active_service_registrations() -> ActiveServiceRegistrationInventory {
+        enumerate_active_service_registrations()
     }
 
     /// Reads back the complete canonical registration and its current SCM
@@ -6162,6 +6173,181 @@ fn inspect_service_registration_runtime_readback(
         CloseServiceHandle(manager);
     }
     runtime_readback_from_inspection(request, result, control_grant)
+}
+
+/// Reads active SCM registrations and their running process identities. The
+/// fixed page buffer bounds every kernel-to-process transfer; `resume` walks
+/// subsequent pages until the SCM says enumeration is complete. A failed page
+/// retains entries already observed but marks the denominator incomplete.
+#[cfg(windows)]
+fn enumerate_active_service_registrations() -> ActiveServiceRegistrationInventory {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW, OpenSCManagerW,
+        OpenServiceW, SC_ENUM_PROCESS_INFO, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_ACTIVE,
+        SERVICE_QUERY_CONFIG, SERVICE_WIN32,
+    };
+
+    const PAGE_WORDS: usize = 8192;
+    const MAX_ACTIVE_REGISTRATIONS: usize = 4096;
+    let manager = unsafe {
+        // SAFETY: null machine/database selects the local SCM; only enumeration
+        // access is requested and the returned handle is closed below.
+        OpenSCManagerW(
+            std::ptr::null(),
+            std::ptr::null(),
+            SC_MANAGER_ENUMERATE_SERVICE,
+        )
+    };
+    if manager.is_null() {
+        return ActiveServiceRegistrationInventory {
+            entries: Vec::new(),
+            complete: false,
+            win32_error: Some(last_win32_code()),
+        };
+    }
+
+    let mut entries = Vec::new();
+    let mut resume = 0_u32;
+    let mut failure = None;
+    loop {
+        let mut page = vec![0_usize; PAGE_WORDS];
+        let buffer_bytes = u32::try_from(page.len() * std::mem::size_of::<usize>())
+            .unwrap_or(u32::MAX);
+        let mut needed = 0_u32;
+        let mut returned = 0_u32;
+        let success = unsafe {
+            // SAFETY: `page` is suitably aligned writable storage whose byte
+            // size is passed exactly; the SCM writes at most this size, and
+            // `returned` bounds the records read before this page is dropped.
+            EnumServicesStatusExW(
+                manager,
+                SC_ENUM_PROCESS_INFO,
+                SERVICE_WIN32,
+                SERVICE_ACTIVE,
+                page.as_mut_ptr().cast(),
+                buffer_bytes,
+                &raw mut needed,
+                &raw mut returned,
+                &raw mut resume,
+                std::ptr::null(),
+            )
+        };
+        let base = page.as_ptr().cast::<u8>();
+        let end = unsafe { base.add(buffer_bytes as usize) };
+        let records = page.as_ptr().cast::<ENUM_SERVICE_STATUS_PROCESSW>();
+        for record in unsafe { std::slice::from_raw_parts(records, returned as usize) } {
+            if entries.len() >= MAX_ACTIVE_REGISTRATIONS {
+                failure = Some(ERROR_MORE_DATA);
+                break;
+            }
+            let Some(service_name) = scm_text_in_page(record.lpServiceName, base, end) else {
+                failure = Some(last_win32_code());
+                break;
+            };
+            let Some(display_name) = scm_text_in_page(record.lpDisplayName, base, end) else {
+                failure = Some(last_win32_code());
+                break;
+            };
+            let wide_name = std::ffi::OsStr::new(&service_name)
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let service = unsafe {
+                // SAFETY: the name is NUL terminated and the live manager
+                // grants query-only access to this service object.
+                OpenServiceW(manager, wide_name.as_ptr(), SERVICE_QUERY_CONFIG)
+            };
+            let (configured_command, configuration_error) = if service.is_null() {
+                (None, Some(last_win32_code()))
+            } else {
+                let configuration = query_service_configuration(service);
+                // SAFETY: `service` is the one handle returned by OpenServiceW
+                // immediately above and is closed exactly once.
+                unsafe { CloseServiceHandle(service) };
+                match configuration {
+                    Ok(configuration) => (
+                        String::from_utf16(&configuration.binary).ok(),
+                        None,
+                    ),
+                    Err(detail) => (None, Some(detail.win32_error)),
+                }
+            };
+            let process_id = record.ServiceStatusProcess.dwProcessId;
+            let process = (process_id != 0)
+                .then(|| inspect_process_identity(process_id).ok())
+                .flatten();
+            let process_identity_error = (process_id != 0 && process.is_none())
+                .then(last_win32_code);
+            entries.push(ActiveServiceRegistration {
+                service_name,
+                display_name,
+                configured_command,
+                configuration_error,
+                service_type: record.ServiceStatusProcess.dwServiceType,
+                current_state: record.ServiceStatusProcess.dwCurrentState,
+                process,
+                process_identity_error,
+            });
+        }
+        if failure.is_some() {
+            break;
+        }
+        if success != 0 {
+            if resume == 0 {
+                break;
+            }
+            continue;
+        }
+        let error = last_win32_code();
+        if error == ERROR_MORE_DATA && returned != 0 && resume != 0 {
+            continue;
+        }
+        failure = Some(error);
+        let _ = needed;
+        break;
+    }
+    // SAFETY: `manager` is the single live handle returned by OpenSCManagerW
+    // above and is closed exactly once after enumeration.
+    unsafe { CloseServiceHandle(manager) };
+    ActiveServiceRegistrationInventory {
+        entries,
+        complete: failure.is_none(),
+        win32_error: failure,
+    }
+}
+
+#[cfg(not(windows))]
+fn enumerate_active_service_registrations() -> ActiveServiceRegistrationInventory {
+    ActiveServiceRegistrationInventory {
+        entries: Vec::new(),
+        complete: false,
+        win32_error: Some(50),
+    }
+}
+
+#[cfg(windows)]
+fn scm_text_in_page(
+    value: windows_sys::core::PWSTR,
+    base: *const u8,
+    end: *const u8,
+) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    let pointer = value.cast::<u8>();
+    if pointer < base || pointer >= end {
+        return None;
+    }
+    let units = unsafe {
+        // SAFETY: the SCM supplies a pointer into the current output page; the
+        // range check above bounds the scan and the terminator search below
+        // prevents reading past the returned buffer.
+        std::slice::from_raw_parts(value.cast_const(), end.offset_from(pointer) as usize / 2)
+    };
+    let length = units.iter().position(|unit| *unit == 0)?;
+    String::from_utf16(&units[..length]).ok()
 }
 
 #[cfg(not(windows))]

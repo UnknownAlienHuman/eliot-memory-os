@@ -52,6 +52,8 @@ pub enum WatchdogSpoolPayload {
         service: String,
         reason: GapRecoveryReason,
         coverage_claimed: bool,
+        #[serde(default)]
+        evidence_json: Option<String>,
     },
     Recovery {
         service: String,
@@ -161,6 +163,40 @@ pub(crate) fn decode_entry(sequence: u64, bytes: &[u8]) -> Result<WatchdogSpoolE
         )));
     }
     super::intent::check_stored_intent_payload(entry.observed_at_ms, &entry.payload)?;
+    match &entry.payload {
+        WatchdogSpoolPayload::Gap {
+            reason: GapRecoveryReason::RegistrationConflict | GapRecoveryReason::HookChainObservation,
+            evidence_json: Some(evidence),
+            ..
+        } if serde_json::from_str::<serde_json::Value>(evidence).is_ok() => {}
+        WatchdogSpoolPayload::Gap {
+            reason: GapRecoveryReason::RegistrationConflict | GapRecoveryReason::HookChainObservation,
+            evidence_json: None,
+            ..
+        } => {
+            return Err(SpoolError::Corrupt(
+                "hook-chain observation lacks its original owner evidence".to_owned(),
+            ));
+        }
+        WatchdogSpoolPayload::Gap {
+            reason: GapRecoveryReason::RegistrationConflict | GapRecoveryReason::HookChainObservation,
+            evidence_json: Some(_),
+            ..
+        } => {
+            return Err(SpoolError::Corrupt(
+                "hook-chain evidence is not valid JSON".to_owned(),
+            ));
+        }
+        WatchdogSpoolPayload::Gap {
+            evidence_json: Some(_),
+            ..
+        } => {
+            return Err(SpoolError::Corrupt(
+                "non-registration gap carries registration-conflict evidence".to_owned(),
+            ));
+        }
+        _ => {}
+    }
     Ok(entry)
 }
 

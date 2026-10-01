@@ -490,6 +490,8 @@ pub fn incident_class_for(reason: GapRecoveryReason) -> &'static str {
         GapRecoveryReason::HostImageSubstituted => "CONTROL_LOSS_HOST_IMAGE_SUBSTITUTED",
         GapRecoveryReason::HostIdentityChanged => "CONTROL_LOSS_HOST_IDENTITY_CHANGED",
         GapRecoveryReason::HostUnknown => "CONTROL_LOSS_HOST_UNKNOWN",
+        GapRecoveryReason::RegistrationConflict => "REGISTRATION_CONFLICT",
+        GapRecoveryReason::HookChainObservation => "HOOK_CHAIN_OBSERVATION",
         GapRecoveryReason::SpoolPressure => "CONTROL_LOSS_SPOOL_PRESSURE",
     }
 }

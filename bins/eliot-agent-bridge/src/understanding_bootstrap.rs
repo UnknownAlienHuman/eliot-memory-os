@@ -1671,6 +1671,19 @@ mod tests {
     use eliot_integration_coverage::{
         ALL_EVENTS, DispatchOrdering, EventCoverage, GovernorCoverageDerivation,
     };
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use std::num::NonZeroU64;
+
+    fn test_fence() -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new("watchdog-bootstrap-test").expect("lineage"),
+                NonZeroU64::new(3).expect("epoch"),
+            )
+            .expect("epoch identity"),
+            ResourceGeneration::new(7).expect("generation"),
+        )
+    }
 
     fn fixture_governance() -> GovernanceEvidence {
         let coverage_profile = IntegrationCoverageProfile {
@@ -1698,15 +1711,38 @@ mod tests {
             gaps: vec!["coverage-gap:source-freshness".to_owned()],
         };
         let mut derivation = GovernorCoverageDerivation::new();
+        let fence = test_fence();
+        let fence_json = serde_json::to_string(&fence).expect("state fence");
+        let interval_id = eliot_contracts::sha256_hex(b"watchdog-interval-v1\02\01000\01000");
         let governance_profile = derivation
             .derive(
                 &coverage_profile,
                 &eliot_integration_coverage::WatchdogEvidence {
                     supervisor_id: "watchdog:fixture".to_owned(),
-                    fresh: true,
+                    source_observation_id: eliot_contracts::sha256_hex(
+                        b"watchdog-hook-chain-v1\0watchdog:fixture\07\03\01000",
+                    ),
+                    interval_id: interval_id.clone(),
+                    export_batch_id: eliot_contracts::sha256_hex(b"test-export-batch"),
+                    export_batch_digest: eliot_contracts::sha256_hex(b"test-export-batch-digest"),
+                    owner_receipt_id: eliot_contracts::sha256_hex(b"test-export-receipt"),
+                    source_generation: 7,
+                    authority_epoch: 3,
+                    observed_at_ms: 1_000,
+                    state_fence_json: fence_json.clone(),
+                    interval_coverage: Some(serde_json::json!({
+                        "sensor_map_revision": 2,
+                        "valid": true,
+                        "full_coverage_claimed": false,
+                        "interval_id": interval_id,
+                        "interval": { "start_ms": 1_000, "end_ms": 1_000 },
+                        "records": [],
+                    })),
                     summary: "test fixture supervision".to_owned(),
                 },
                 eliot_integration_coverage::TraceFreshness::Fresh,
+                &fence_json,
+                2_000,
             )
             .expect("verified owner coverage derives a governance profile");
         GovernanceEvidence {

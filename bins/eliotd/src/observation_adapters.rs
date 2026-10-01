@@ -281,6 +281,9 @@ impl super::DaemonComposition {
         batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
     ) -> Result<WatchdogExportDrainStep, String> {
         let entries = batch.entries.len();
+        if let Some(evidence) = crate::daemon_kernel_client::watchdog_evidence_from_claimed_batch(batch)? {
+            self.record_watchdog_coverage_readback(evidence)?;
+        }
         let acknowledgement = admit_claimed_watchdog_export(self, batch).await?;
         let Some(result) = crate::daemon_kernel_client::watchdog_export_result_for_acknowledgement(
             batch,
@@ -533,6 +536,7 @@ mod tests {
                     payload_kind: eliot_watchdog_core::WatchdogSpoolPayloadKind::Heartbeat,
                     payload_digest: fixture_digest(0x0c),
                     record_digest: fixture_digest(0x0d),
+                    owner_evidence_json: None,
                 },
                 eliot_watchdog_core::WatchdogSpoolExportEntry {
                     sequence: 2,
@@ -541,6 +545,7 @@ mod tests {
                     payload_kind: eliot_watchdog_core::WatchdogSpoolPayloadKind::Gap,
                     payload_digest: fixture_digest(0x0e),
                     record_digest: fixture_digest(0x0f),
+                    owner_evidence_json: None,
                 },
             ],
             item_count: 2,

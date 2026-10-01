@@ -108,6 +108,9 @@ pub struct WatchdogSpoolExportEntry {
     pub payload_digest: String,
     /// Opaque caller-supplied 64-hex digest of the full record bytes.
     pub record_digest: String,
+    /// Original Watchdog owner evidence carried by this retained record, when
+    /// the payload is a typed coverage or registration-conflict gap.
+    pub owner_evidence_json: Option<String>,
 }
 
 /// Ownership: immutable export view built by the Watchdog (spool owner) for

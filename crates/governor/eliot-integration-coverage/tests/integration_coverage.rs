@@ -45,9 +45,53 @@ fn enforced_pre_action(event: LogicalEvent) -> EventCoverage {
 }
 
 fn fresh_watchdog() -> WatchdogEvidence {
+    let source_observation_id = eliot_contracts::sha256_hex(
+        b"watchdog-hook-chain-v1\0watchdog:supervisor-1\01\01\01000",
+    );
+    let interval_id = eliot_contracts::sha256_hex(b"watchdog-interval-v1\02\01000\01000");
+    let state_fence = eliot_contracts::StateFence::new(
+        eliot_contracts::EpochId::new(
+            eliot_contracts::EpochLineageId::new("coverage-test-lineage").expect("lineage"),
+            std::num::NonZeroU64::new(1).expect("epoch"),
+        )
+        .expect("epoch identity"),
+        eliot_contracts::ResourceGeneration::new(1).expect("generation"),
+    );
+    let records = [
+        "scm_service_state", "process_exit_identity", "job_resource_counters",
+        "named_pipe_handshake", "filesystem_journal", "artifact_config_identity",
+        "store_process_health", "kernel_heartbeat", "hook_event_cadence",
+        "listener_inventory", "security_audit",
+    ]
+    .into_iter()
+    .map(|channel| serde_json::json!({
+        "channel": channel,
+        "competent_source": "owner",
+        "competent_classes": ["observation"],
+        "observed_classes": [],
+        "disposition": "BLIND",
+        "gaps": [{"channel": channel, "reason": "missing_source"}],
+    }))
+    .collect::<Vec<_>>();
     WatchdogEvidence {
         supervisor_id: "watchdog:supervisor-1".to_owned(),
-        fresh: true,
+        source_observation_id,
+        interval_id: interval_id.clone(),
+        export_batch_id: eliot_contracts::sha256_hex(b"test-export-batch"),
+        export_batch_digest: eliot_contracts::sha256_hex(b"test-export-batch-digest"),
+        owner_receipt_id: eliot_contracts::sha256_hex(b"test-export-receipt"),
+        source_generation: 1,
+        authority_epoch: 1,
+        observed_at_ms: 1_000,
+        state_fence_json: serde_json::to_string(&state_fence).expect("state fence"),
+        interval_coverage: Some(serde_json::json!({
+            "sensor_map_revision": 2,
+            "valid": true,
+                        "full_coverage_claimed": false,
+            "interval_id": interval_id,
+            "interval": { "start_ms": 1_000, "end_ms": 1_000 },
+            "records": records,
+        })),
         summary: "trace supervision current".to_owned(),
     }
 }
@@ -65,7 +109,7 @@ fn observed_lifecycle_without_enforcement_denies_enforcement_ops() {
     // Discovery output alone cannot derive production claims.
     let mut governor = GovernorCoverageDerivation::new();
     assert_eq!(
-        governor.derive(&candidate, &fresh_watchdog(), TraceFreshness::Fresh),
+        governor.derive(&candidate, &fresh_watchdog(), TraceFreshness::Fresh, fresh_watchdog().state_fence_json.as_str(), 2_000),
         Err(CoverageError::CandidateNotVerified)
     );
     // Exact active-fingerprint production observation verifies the profile.
@@ -78,7 +122,7 @@ fn observed_lifecycle_without_enforcement_denies_enforcement_ops() {
         coverage.disposition(LogicalEvent::PermissionRequest),
         Some(EventDisposition::Observed)
     );
-    let profile = must(governor.derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh));
+    let profile = must(governor.derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh, fresh_watchdog().state_fence_json.as_str(), 2_000));
     assert!(!profile.authorizes_enforcement);
     // Enforcement-dependent operations are not authorized; observation-only
     // operations still are.
@@ -220,7 +264,7 @@ fn coverage_loss_emits_new_revision_and_rejects_prior_capability() {
         .verify("host:adapter:fingerprint-a", true),
     );
     let mut governor = GovernorCoverageDerivation::new();
-    let before = must(governor.derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh));
+    let before = must(governor.derive(&coverage, &fresh_watchdog(), TraceFreshness::Fresh, fresh_watchdog().state_fence_json.as_str(), 2_000));
     assert!(before.authorizes_enforcement);
     let capability = must(governor.issue_capability("cap:guarded-tool", true, true));
     must(governor.authorize(&capability.capability_id));
@@ -250,7 +294,7 @@ fn coverage_loss_emits_new_revision_and_rejects_prior_capability() {
         ))
         .verify("host:adapter:fingerprint-a", true),
     );
-    let after = must(governor.derive(&degraded, &fresh_watchdog(), TraceFreshness::Fresh));
+    let after = must(governor.derive(&degraded, &fresh_watchdog(), TraceFreshness::Fresh, fresh_watchdog().state_fence_json.as_str(), 2_000));
     assert!(after.revision > before.revision);
     assert!(matches!(
         governor.authorize(&capability.capability_id),

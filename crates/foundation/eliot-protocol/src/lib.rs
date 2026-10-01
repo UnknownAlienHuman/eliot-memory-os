@@ -5961,6 +5961,11 @@ pub struct WatchdogSpoolExportSubmission {
     /// Exactly-once reconciliation key; the Kernel re-derives it and fences on
     /// any presented value it cannot reproduce.
     pub idempotency_key: String,
+    /// Bounded original owner evidence for a typed gap record. Kernel retains
+    /// these exact bytes with the durable export projection for caller
+    /// readback; it does not reinterpret them as a semantic decision.
+    #[serde(default)]
+    pub owner_evidence_json: Option<String>,
 }
 
 impl WatchdogSpoolExportSubmission {
@@ -6000,6 +6005,25 @@ impl WatchdogSpoolExportSubmission {
             &self.idempotency_key,
             "watchdog_spool_export_submission.idempotency_key",
         )?;
+        if let Some(evidence) = self.owner_evidence_json.as_deref() {
+            bounded_text(
+                evidence,
+                "watchdog_spool_export_submission.owner_evidence_json",
+                64 * 1024,
+            )?;
+            if self.entry_kind != WatchdogSpoolEntryKind::Gap {
+                return Err(ProtocolError::InvalidField {
+                    field: "watchdog_spool_export_submission.owner_evidence_json",
+                    reason: "owner evidence is permitted only on a gap entry",
+                });
+            }
+            serde_json::from_str::<serde_json::Value>(evidence).map_err(|_| {
+                ProtocolError::InvalidField {
+                    field: "watchdog_spool_export_submission.owner_evidence_json",
+                    reason: "owner evidence must be valid JSON",
+                }
+            })?;
+        }
         if self.idempotency_key
             != watchdog_export_reconciliation_idempotency_key(
                 installation_id,

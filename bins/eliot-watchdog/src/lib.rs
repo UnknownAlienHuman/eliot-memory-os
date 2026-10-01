@@ -63,6 +63,7 @@ mod diagnostics;
 mod health_projection;
 mod heartbeat_transport;
 mod host_identity_observation;
+mod hook_chain;
 mod independent_sensor;
 mod observation_attribution;
 mod observation_coverage;
@@ -182,6 +183,7 @@ pub use backup_control::{
 pub use heartbeat_transport::{
     FENCE_SEQUENCE, HeartbeatTransport, HeartbeatTransportDescriptor, HeartbeatTransportError,
 };
+pub use hook_chain::HookChainObservation;
 #[cfg(test)]
 use runtime_manifest_selection::manifest_matches_bootstrap;
 use runtime_manifest_selection::{read_registry_for_bootstrap, select_runtime_manifest};
@@ -270,6 +272,14 @@ pub trait WatchdogAdmissionSource: Send + Sync + 'static {
     fn approved_host_registration(&self) -> Option<ApprovedHostRegistration> {
         None
     }
+
+    /// Installer-issued bootstrap identity used to read this installation's
+    /// retained registration scope. Test and non-production sources return
+    /// `None` rather than inventing a scope.
+    fn hook_chain_bootstrap(&self) -> Option<eliot_platform_windows::ServiceBootstrapArguments> {
+        None
+    }
+
 }
 
 /// Errors from the independent protected watchdog spool.
@@ -307,6 +317,8 @@ pub enum GapRecoveryReason {
     HostImageSubstituted,
     HostIdentityChanged,
     HostUnknown,
+    RegistrationConflict,
+    HookChainObservation,
     SpoolPressure,
 }
 
@@ -1232,6 +1244,7 @@ impl IndependentKernelSensor {
                     service: disposition.service.to_owned(),
                     reason: disposition.reason,
                     coverage_claimed: disposition.coverage_claimed,
+                    evidence_json: None,
                 },
             )
             .map(|_| ())
@@ -1333,6 +1346,7 @@ impl IndependentKernelSensor {
                 observed_at_ms,
                 producer_generation: self.watchdog_generation,
                 record_reason: reason,
+                evidence_json: None,
             });
         match outcome {
             Ok(episode::SignalEpisodeOutcome::Accepted {
@@ -1435,6 +1449,86 @@ impl KernelWatchdogPort for IndependentKernelSensor {
         disposition: GapRecoveryDisposition,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
         Box::pin(async move { self.record_gap(disposition) })
+    }
+
+    fn record_hook_chain_observation<'a>(
+        &'a self,
+        observation: hook_chain::HookChainObservation,
+    ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
+        Box::pin(async move {
+            let state_fence: eliot_contracts::StateFence =
+                serde_json::from_str(&observation.state_fence_json).map_err(|error| {
+                    KernelWatchdogError::FailedWithDetail(format!(
+                        "hook-chain StateFence did not decode: {error}"
+                    ))
+                })?;
+            state_fence.validate().map_err(|error| {
+                KernelWatchdogError::FailedWithDetail(format!(
+                    "hook-chain StateFence failed validation: {error}"
+                ))
+            })?;
+            if observation.installation_id != self.installation_id
+                || observation.source_generation != self.watchdog_generation
+                || observation.scope != observation.installation_id
+                || observation.authority_epoch == 0
+                || state_fence.authority_epoch.sequence.get() != observation.authority_epoch
+                || observation.observed_at_ms == 0
+                || observation.state_fence_json.is_empty()
+            {
+                return Err(KernelWatchdogError::FailedWithDetail(
+                    "hook-chain observation does not bind this Watchdog owner".to_owned(),
+                ));
+            }
+            let evidence_json = serde_json::to_string(&observation)
+                .map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?;
+            let conflict = !observation.members.conflicting.is_empty();
+            if conflict {
+                let payload_digest = blake3::hash(evidence_json.as_bytes()).to_hex().to_string();
+                let source_event = eliot_watchdog_core::AcceptedSourceEvent::new(
+                    format!(
+                        "hook-chain:{}:{}:{}:{}",
+                        observation.installation_id,
+                        observation.source_generation,
+                        observation.authority_epoch,
+                        observation.observed_at_ms
+                    ),
+                    payload_digest,
+                )
+                .map_err(|error| KernelWatchdogError::FailedWithDetail(format!("hook-chain source event identity invalid: {error:?}")))?;
+                let identity = eliot_watchdog_core::FailureEpisodeIdentity {
+                    rule: eliot_watchdog_core::RuleRevision {
+                        rule_id: episode::REGISTRATION_CONFLICT_RULE_ID.to_owned(),
+                        revision: episode::REGISTRATION_CONFLICT_RULE_REVISION,
+                    },
+                    target: eliot_watchdog_core::SignalTarget {
+                        subject_id: self.installation_id.clone(),
+                        scope_id: observation.scope.clone(),
+                        generation: observation.source_generation,
+                    },
+                    failure_class: eliot_watchdog_core::FailureClass::CompetingIntegrationRegistration,
+                };
+                self.spool.observe_signal_episode(episode::SignalEpisodeObservation {
+                    identity,
+                    source_event,
+                    reopen_condition: ReopenCondition::RecurrenceWithNewSourceEvent,
+                    observed_at_ms: observation.observed_at_ms,
+                    producer_generation: self.watchdog_generation,
+                    record_reason: GapRecoveryReason::RegistrationConflict,
+                    evidence_json: Some(evidence_json),
+                }).map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?;
+            } else {
+                self.spool.append(
+                    observation.observed_at_ms,
+                    WatchdogSpoolPayload::Gap {
+                        service: SERVICE_NAME.to_owned(),
+                        reason: GapRecoveryReason::HookChainObservation,
+                        coverage_claimed: false,
+                        evidence_json: Some(evidence_json),
+                    },
+                ).map_err(|error| KernelWatchdogError::FailedWithDetail(error.to_string()))?;
+            }
+            Ok(())
+        })
     }
 
     fn installation_identity(&self) -> Option<&str> {
@@ -1576,6 +1670,10 @@ impl WatchdogAdmissionSource for GovernorIntentAdmissionSource {
     fn approved_host_registration(&self) -> Option<ApprovedHostRegistration> {
         self.inner.approved_host_registration()
     }
+
+    fn hook_chain_bootstrap(&self) -> Option<eliot_platform_windows::ServiceBootstrapArguments> {
+        self.inner.hook_chain_bootstrap()
+    }
 }
 
 #[must_use]
@@ -1625,6 +1723,15 @@ pub trait KernelWatchdogPort: Send + Sync + 'static {
     fn report_gap<'a>(
         &'a self,
         _disposition: GapRecoveryDisposition,
+    ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Retains one original registration-owner observation in this port's
+    /// durable spool. Implementations without that owner retain no evidence.
+    fn record_hook_chain_observation<'a>(
+        &'a self,
+        _observation: HookChainObservation,
     ) -> Pin<Box<dyn Future<Output = Result<(), KernelWatchdogError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
@@ -3036,6 +3143,7 @@ mod tests {
                 service: SERVICE_NAME.to_owned(),
                 reason: GapRecoveryReason::AdmissionUnavailable,
                 coverage_claimed: false,
+                evidence_json: None,
             },
         }
     }
@@ -3432,6 +3540,7 @@ mod tests {
             WatchdogSpoolPayload::Gap {
                 reason: GapRecoveryReason::SpoolPressure,
                 coverage_claimed: false,
+    evidence_json: None,
                 ..
             }
         )));
@@ -3462,6 +3571,7 @@ mod tests {
                     service: SERVICE_NAME.to_owned(),
                     reason: GapRecoveryReason::AdmissionUnavailable,
                     coverage_claimed: false,
+                    evidence_json: None,
                 },
             )
             .unwrap_or_else(|error| panic!("{error}"));
@@ -3540,6 +3650,7 @@ mod tests {
                     service: SERVICE_NAME.to_owned(),
                     reason: GapRecoveryReason::AdmissionUnavailable,
                     coverage_claimed: false,
+                    evidence_json: None,
                 },
             )
             .unwrap_or_else(|error| panic!("{error}"));
@@ -3574,6 +3685,7 @@ mod tests {
                     service: SERVICE_NAME.to_owned(),
                     reason: GapRecoveryReason::AdmissionUnavailable,
                     coverage_claimed: false,
+                    evidence_json: None,
                 },
             )
             .unwrap_or_else(|error| panic!("{error}"));
@@ -3633,6 +3745,7 @@ mod tests {
                 payload_kind: eliot_watchdog_core::WatchdogSpoolPayloadKind::Heartbeat,
                 payload_digest: spool_ack_fixture_digest(0x0c),
                 record_digest: spool_ack_fixture_digest(0x0d),
+                owner_evidence_json: None,
             }],
             item_count: 1,
             byte_size: 64,
