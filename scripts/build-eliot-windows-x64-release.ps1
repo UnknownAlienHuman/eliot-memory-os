@@ -892,6 +892,91 @@ function Resolve-GovernorDisposition([object]$Metadata, [string]$Repo, [string]$
     $retiredDisposition = "retired (detached owner approval R(C) $($approvalReference.content_sha256) issued by $($approvalReference.issuer) for historical source C=$($approvalReference.owner_candidate_commit) tree $($approvalReference.owner_candidate_tree); release candidate D=$SourceCommit tree $($approvalReference.candidate_tree) is independently bound by closure $($approvalReference.candidate_closure_digest_sha256); owner closure $($approvalReference.closure_digest_sha256) covers $($approvalReference.closure_count) classified tracked references under rule set $($approvalReference.closure_rule_set); the governor executable, the gated legacy include, and the Codex plugin leave the release together so no shipped plugin names a missing command; the Claude legacy path is unavailable - select agent-bridge; ceiling: $($approvalReference.proof_ceiling))"
     return [pscustomobject]@{ Kind = 'Retired'; Reason = $null; Identity = $cargo; Evidence = $retiredEvidence; Disposition = $retiredDisposition; ApprovalReference = $approvalReference }
 }
+function Resolve-CodexCompatBinding([string]$Repo, [string]$SourceCommit) {
+    # Issue #1227 W2/A7: the retained Codex plugin is a temporary
+    # compatibility artifact, never a second default runtime. This resolver
+    # binds it to exactly one signed route (the staged agent-bridge copy under
+    # the codex_controller profile), one consumer (the Codex host MCP client),
+    # the declared installation policy, and the current-route admission state
+    # read from the pinned route profile. Both staging and Test-ReleaseBundle
+    # re-resolve this from the pinned source commit, so no builder-written
+    # string can invent or extend the compat window. Expiry: the compat ends
+    # when the current route is admitted or when a detached owner retirement
+    # approval retires the governor. Removal: the retired disposition drops
+    # eliot-governor.exe and integrations/codex together. INSTALLED_BY_DEFAULT
+    # is refused once the current route is admitted: the compat cannot stay
+    # installed by default after the current route exists.
+    if ([string]::IsNullOrWhiteSpace($SourceCommit) -or $SourceCommit -notmatch '^[0-9a-f]{40}$') {
+        throw 'codex compat binding requires the pinned 40-hex release source commit'
+    }
+    $marketplaceRelative = 'integrations/codex/marketplace.json'
+    $marketplacePath = Join-Path $Repo $marketplaceRelative.Replace('/', '\')
+    $marketplaceEvidence = Read-VerifiedResidentFile $marketplacePath 'pinned Codex marketplace manifest'
+    if ((Get-FilteredFileHash $Repo $marketplaceRelative $marketplacePath) -cne (Get-GitBlobHash $Repo $SourceCommit $marketplaceRelative)) {
+        throw 'the Codex marketplace manifest differs from the pinned source commit'
+    }
+    $marketplace = Read-GovernorRetirementJsonFile $marketplacePath 'pinned Codex marketplace manifest'
+    $marketplacePlugins = @((Read-ObjectProperty $marketplace 'plugins'))
+    if ([string](Read-ObjectProperty $marketplace 'name') -cne 'eliot-system' -or
+        $marketplacePlugins.Count -ne 1) {
+        throw 'the pinned Codex marketplace does not expose exactly one ELIOT plugin'
+    }
+    $plugin = $marketplacePlugins[0]
+    $pluginSource = Read-ObjectProperty $plugin 'source'
+    $pluginPolicy = Read-ObjectProperty $plugin 'policy'
+    $pluginServer = Read-ObjectProperty $plugin 'eliot_mcp_server'
+    $routeArgv = @((Read-ObjectProperty $pluginServer 'args'))
+    $expectedArgv = @('mcp', '--profile', 'codex_controller', '--transport', 'stdio', '--client-declaration', '${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json')
+    if ([string](Read-ObjectProperty $plugin 'name') -cne 'eliot-governor' -or
+        [string](Read-ObjectProperty $pluginSource 'source') -cne 'local' -or
+        [string](Read-ObjectProperty $pluginSource 'path') -cne './plugins/eliot-governor' -or
+        [string]::IsNullOrWhiteSpace([string](Read-ObjectProperty $pluginPolicy 'installation')) -or
+        [string](Read-ObjectProperty $pluginServer 'command') -cne 'bin/eliot-agent-bridge.exe' -or
+        [string](Read-ObjectProperty $pluginServer 'owner') -cne 'bins/eliot-agent-bridge' -or
+        $routeArgv.Count -ne $expectedArgv.Count) {
+        throw 'the pinned Codex marketplace does not name exactly the current-owner bridge route'
+    }
+    for ($routeIndex = 0; $routeIndex -lt $expectedArgv.Count; $routeIndex++) {
+        if ([string]$routeArgv[$routeIndex] -cne $expectedArgv[$routeIndex]) {
+            throw "the pinned Codex marketplace bridge route argument $routeIndex is not canonical"
+        }
+    }
+    $installation = [string](Read-ObjectProperty $pluginPolicy 'installation')
+    $routeProfileRelative = 'integrations/codex/route-profile.json'
+    $routeProfilePath = Join-Path $Repo $routeProfileRelative.Replace('/', '\')
+    $routeProfileEvidence = Read-VerifiedResidentFile $routeProfilePath 'pinned Codex route profile'
+    if ((Get-FilteredFileHash $Repo $routeProfileRelative $routeProfilePath) -cne (Get-GitBlobHash $Repo $SourceCommit $routeProfileRelative)) {
+        throw 'the Codex route profile differs from the pinned source commit'
+    }
+    $routeProfile = Read-GovernorRetirementJsonFile $routeProfilePath 'pinned Codex route profile'
+    $disposition = Read-ObjectProperty $routeProfile 'disposition'
+    $currentRouteId = [string](Read-ObjectProperty $disposition 'route_id')
+    $admitted = Read-ObjectProperty $disposition 'admitted'
+    $admittable = Read-ObjectProperty $disposition 'admittable'
+    if ([string]::IsNullOrWhiteSpace($currentRouteId) -or
+        $admitted -isnot [bool] -or $admittable -isnot [bool]) {
+        throw 'the pinned Codex route profile carries no boolean current-route admission decision'
+    }
+    if ($admitted -and $installation -ceq 'INSTALLED_BY_DEFAULT') {
+        throw 'the Codex compat plugin is still installed by default after the current route was admitted; default installation ends at current-route admission'
+    }
+    return [pscustomobject]@{
+        schema = 'eliot-codex-compat-binding-v1'
+        route_command = 'bin/eliot-agent-bridge.exe'
+        route_argv = @($expectedArgv)
+        route_consumer = 'codex_controller'
+        installation = $installation
+        marketplace_path = $marketplaceRelative
+        marketplace_sha256 = [string]$marketplaceEvidence.sha256
+        route_profile_path = $routeProfileRelative
+        route_profile_sha256 = [string]$routeProfileEvidence.sha256
+        current_route_id = $currentRouteId
+        current_route_admitted = [bool]$admitted
+        current_route_admittable = [bool]$admittable
+        expiry = "temporary compat for the Codex consumer codex_controller only; ends when $currentRouteId is admitted (integrations/codex/route-profile.json disposition.admitted) or when a detached owner retirement approval retires the governor; INSTALLED_BY_DEFAULT installation ends at current-route admission"
+        removal = 'an admitted detached owner retirement approval removes eliot-governor.exe and integrations/codex from the bundle together; the retired disposition asserts that absence and refuses a retired bundle containing the legacy governor surface'
+    }
+}
 function Assert-NoRetiredLaunchReferences([string]$BundlePath, [object[]]$LiveReferences) {
     # A legitimately retired bundle carries no retired launch reference under
     # the approved denominator: no bundle file may contain the exact bytes of
@@ -3030,7 +3115,7 @@ function Assert-ClosedCodeBearingPayload([string]$BundlePath, [object[]]$Signing
 # below invoke that slice with the repository root, pinned source commit,
 # staged bundle root, and staged Bridge record.
 
-function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [object]$ModuleBuildProvenance, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot) {
+function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [object]$RuntimePlan, [string]$CodexPluginBaseVersion, [object]$SurrealArtifact, [object]$SelectedPolicyReceipt, [object]$FrontDoorBridge, [object]$ModuleBuildProvenance, [bool]$LegacyGovernorPresent, [string]$GovernorDisposition, [object]$GovernorEvidence, [object]$GovernorApproval, [object[]]$SigningInventory, [string]$RepoRoot, [string]$BundleRoot, [object]$CodexCompat) {
     $entries = @()
     foreach ($artifact in @($RuntimePlan)) {
         $entries += [ordered]@{
@@ -3141,6 +3226,9 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
         gate = '#1137-operator-build'
     }
     if ($LegacyGovernorPresent) {
+        if (-not $CodexCompat) {
+            throw 'the retained Codex plugin requires its pinned temporary-compat binding (one signed route, consumer, installation, expiry and removal)'
+        }
         $entries += [ordered]@{
             path = 'integrations/codex/marketplace.json'
             selection = 'pinned source file'
@@ -3149,6 +3237,11 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             generation = $SourceCommit
             proof_ceiling = 'pinned-blob evidence (provider route scope is Part B after #1217)'
             gate = '#1217-provider-host-integration-route (GATED: retained explicitly, never wholesale)'
+            compat_route = 'bin/eliot-agent-bridge.exe mcp --profile codex_controller --transport stdio --client-declaration ${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json'
+            compat_consumer = 'codex_controller'
+            compat_installation = [string]$CodexCompat.installation
+            compat_expiry = [string]$CodexCompat.expiry
+            compat_removal = [string]$CodexCompat.removal
         }
         $entries += [ordered]@{
             path = 'integrations/codex/plugins/eliot-governor/'
@@ -3158,6 +3251,11 @@ function Get-StagedPayloadManifest([string]$SourceCommit, [string]$Version, [obj
             generation = $SourceCommit
             proof_ceiling = 'pinned-blob evidence (provider route scope is Part B after #1217)'
             gate = '#1217-provider-host-integration-route (GATED: retained explicitly, never wholesale)'
+            compat_route = 'bin/eliot-agent-bridge.exe mcp --profile codex_controller --transport stdio --client-declaration ${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json'
+            compat_consumer = 'codex_controller'
+            compat_installation = [string]$CodexCompat.installation
+            compat_expiry = [string]$CodexCompat.expiry
+            compat_removal = [string]$CodexCompat.removal
         }
     }
     else {
@@ -3490,6 +3588,21 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
             [int64]$codexPluginBridgeStagedFile.Length -ne [int64]$codexPluginBridge.bytes) {
             throw 'release Codex plugin bridge binary differs from the RELEASE.json current-owner record'
         }
+        # Issue #1227 W2/A7: the retained plugin is admitted only under its
+        # pinned temporary-compat binding. Re-resolve the binding from the
+        # pinned source commit (never from builder-written strings) and
+        # require the staged marketplace to name exactly that route, consumer
+        # and installation policy. A default-installed compat after
+        # current-route admission fails here as it already fails at staging.
+        $codexCompatVerified = Resolve-CodexCompatBinding $repo ([string]$release.source_commit)
+        if ([string]$marketplacePlugins[0].policy.installation -cne [string]$codexCompatVerified.installation) {
+            throw 'staged Codex marketplace installation policy differs from the pinned compat binding'
+        }
+        $stagedMarketplaceArgv = @($marketplacePlugins[0].eliot_mcp_server.args)
+        $compatArgv = @($codexCompatVerified.route_argv)
+        if ((@($stagedMarketplaceArgv) -join "`n") -cne (@($compatArgv) -join "`n")) {
+            throw 'staged Codex marketplace route differs from the pinned compat binding'
+        }
     }
 
     # Issue #1719 Claude Code front door: the bundle provisions exactly the
@@ -3548,6 +3661,49 @@ function Test-ReleaseBundle([string]$Path, [string]$GovernorRetirementApproval) 
     $governorEvidence.approval_reference `
     (Resolve-GovernorApprovalReferenceOrNull $payloadManifest) `
     'staged payload manifest'
+    if (-not $governorRetired) {
+        # Issue #1227 W2/A7: one approval identity is not enough for the
+        # compat surface; the staged manifest and RELEASE.json must also carry
+        # the same temporary-compat binding (one signed route, consumer,
+        # installation, expiry, removal) that re-resolves from the pinned
+        # commit. A retained bundle whose manifests disagree about the compat
+        # window is not admissible.
+        if (-not $codexCompatVerified) {
+            $codexCompatVerified = Resolve-CodexCompatBinding $repo ([string]$release.source_commit)
+        }
+        $compatRoute = "$([string]$codexCompatVerified.route_command) $(@($codexCompatVerified.route_argv) -join ' ')"
+        $codexManifestEntries = @($payloadManifest.entries | Where-Object {
+                [string]$_.path -ceq 'integrations/codex/marketplace.json' -or
+                [string]$_.path -ceq 'integrations/codex/plugins/eliot-governor/'
+            })
+        if ($codexManifestEntries.Count -ne 2) {
+            throw 'staged payload manifest does not carry exactly the two retained Codex compat entries'
+        }
+        foreach ($codexEntry in $codexManifestEntries) {
+            if ([string](Read-ObjectProperty $codexEntry 'compat_route') -cne $compatRoute -or
+                [string](Read-ObjectProperty $codexEntry 'compat_consumer') -cne [string]$codexCompatVerified.route_consumer -or
+                [string](Read-ObjectProperty $codexEntry 'compat_installation') -cne [string]$codexCompatVerified.installation -or
+                [string](Read-ObjectProperty $codexEntry 'compat_expiry') -cne [string]$codexCompatVerified.expiry -or
+                [string](Read-ObjectProperty $codexEntry 'compat_removal') -cne [string]$codexCompatVerified.removal) {
+                throw "staged payload manifest Codex entry carries a different compat binding: $([string]$codexEntry.path)"
+            }
+        }
+        $carriedCompat = Read-ObjectProperty $release 'codex_compat'
+        if (-not $carriedCompat -or
+            [string](Read-ObjectProperty $carriedCompat 'schema') -cne 'eliot-codex-compat-binding-v1' -or
+            [string](Read-ObjectProperty $carriedCompat 'route_command') -cne [string]$codexCompatVerified.route_command -or
+            (@((Read-ObjectProperty $carriedCompat 'route_argv')) -join "`n") -cne (@($codexCompatVerified.route_argv) -join "`n") -or
+            [string](Read-ObjectProperty $carriedCompat 'route_consumer') -cne [string]$codexCompatVerified.route_consumer -or
+            [string](Read-ObjectProperty $carriedCompat 'installation') -cne [string]$codexCompatVerified.installation -or
+            [string](Read-ObjectProperty $carriedCompat 'marketplace_sha256') -cne [string]$codexCompatVerified.marketplace_sha256 -or
+            [string](Read-ObjectProperty $carriedCompat 'route_profile_sha256') -cne [string]$codexCompatVerified.route_profile_sha256 -or
+            [string](Read-ObjectProperty $carriedCompat 'current_route_id') -cne [string]$codexCompatVerified.current_route_id -or
+            [bool](Read-ObjectProperty $carriedCompat 'current_route_admitted') -ne [bool]$codexCompatVerified.current_route_admitted -or
+            [string](Read-ObjectProperty $carriedCompat 'expiry') -cne [string]$codexCompatVerified.expiry -or
+            [string](Read-ObjectProperty $carriedCompat 'removal') -cne [string]$codexCompatVerified.removal) {
+            throw 'RELEASE.json carries a different Codex compat binding than the pinned source commit'
+        }
+    }
     $excludedPaths = @($payloadManifest.exclusions | ForEach-Object { [string]$_.path })
     if (-not ($excludedPaths -contains 'config') -or -not ($excludedPaths -contains 'migrations')) {
         throw 'staged payload manifest must exclude wholesale config and migrations roots'
@@ -4224,6 +4380,13 @@ if ($legacyGovernorPresent) {
         throw 'Codex release source must use a cache-neutral base SemVer without +codex metadata'
     }
 }
+# Issue #1227 W2/A7: the retained Codex plugin ships only under its pinned
+# temporary-compat binding (one signed bridge route, one consumer, declared
+# installation policy, current-route admission, expiry and removal). The
+# binding is re-resolved from the pinned commit here and again by every
+# verifier; staging refuses a default-installed compat once the current route
+# is admitted.
+$codexCompat = if ($legacyGovernorPresent) { Resolve-CodexCompatBinding $repo $sourceCommit } else { $null }
 # Item 1228 generation_binding (v1 single-generation semantics): one release
 # generation built from one isolated immutable source tree pinned by
 # $sourceCommit (the same variable gated by Assert-IsolatedSourceTree
@@ -4296,6 +4459,7 @@ $plan = [ordered]@{
     codex_marketplace_source = if ($legacyGovernorPresent) { (Join-Path $repo 'integrations/codex/marketplace.json') } else { $null }
     codex_plugin_source = if ($legacyGovernorPresent) { $codexPluginSource } else { $null }
     codex_plugin_base_version = $codexPluginBaseVersion
+    codex_compat = $codexCompat
     codex_mcp_profile = if ($legacyGovernorPresent) { 'codex_controller' } else { $null }
     surreal = [ordered]@{
         path = $verifiedPinnedSurreal.path
@@ -4901,7 +5065,7 @@ try {
             $legacyGovernorPresent ([bool]$frontDoorBridgeStaged) $expectedBridgeSha256 $expectedBridgeBytes `
             ([bool]$codexPluginBridgeStaged) $(if ($codexPluginBridgeStaged) { [string]$codexPluginBridgeStaged.sha256 } else { '' }) $(if ($codexPluginBridgeStaged) { [int64]$codexPluginBridgeStaged.bytes } else { [int64]0 }))
     Assert-ClosedCodeBearingPayload $bundle $signingInventory
-    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $moduleBuildProvenance $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle
+    $stagedPayloadManifest = Get-StagedPayloadManifest $sourceCommit $Version $runtimeArtifactPlan $codexPluginBaseVersion $verifiedPinnedSurreal $selectedSurrealPolicyReceipt $frontDoorBridgeStaged $moduleBuildProvenance $legacyGovernorPresent ([string]$plan.governor_disposition) $governorEvidence $governorApprovalReference $signingInventory $repo $bundle $codexCompat
     $stagedPayloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Encoding utf8
     $stagedPayloadManifestHash = (Get-FileHash -LiteralPath (Join-Path $bundle 'STAGED_PAYLOAD_MANIFEST.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     # Issue #1858 AUD6/W6: stage the installed-entrypoint readback PLAN beside
@@ -4964,6 +5128,24 @@ try {
         operator_protocol_version = $verifiedOperator.protocol_version
         operator_protocol_hash = $verifiedOperator.protocol_hash
         codex_plugin_base_version = $codexPluginBaseVersion
+        codex_compat = if ($legacyGovernorPresent) {
+            [ordered]@{
+                schema = [string]$codexCompat.schema
+                route_command = [string]$codexCompat.route_command
+                route_argv = @($codexCompat.route_argv)
+                route_consumer = [string]$codexCompat.route_consumer
+                installation = [string]$codexCompat.installation
+                marketplace_path = [string]$codexCompat.marketplace_path
+                marketplace_sha256 = [string]$codexCompat.marketplace_sha256
+                route_profile_path = [string]$codexCompat.route_profile_path
+                route_profile_sha256 = [string]$codexCompat.route_profile_sha256
+                current_route_id = [string]$codexCompat.current_route_id
+                current_route_admitted = [bool]$codexCompat.current_route_admitted
+                current_route_admittable = [bool]$codexCompat.current_route_admittable
+                expiry = [string]$codexCompat.expiry
+                removal = [string]$codexCompat.removal
+            }
+        } else { $null }
         codex_plugin_bridge = if ($legacyGovernorPresent) {
             [ordered]@{
                 path = 'integrations/codex/plugins/eliot-governor/bin/eliot-agent-bridge.exe'
