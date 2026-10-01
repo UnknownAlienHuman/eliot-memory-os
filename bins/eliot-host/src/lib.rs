@@ -12012,10 +12012,7 @@ impl HostComposition {
     }
 
     #[cfg(windows)]
-    fn has_current_active_activation_for_readiness_at(
-        &mut self,
-        now: std::time::Instant,
-    ) -> bool {
+    fn has_current_active_activation_for_readiness_at(&mut self, now: std::time::Instant) -> bool {
         // A late Store recovery result is not proof that Host supervision
         // recovered. Require the exact current activation generation before
         // fresh positive readiness evidence is appended. An Active generation
