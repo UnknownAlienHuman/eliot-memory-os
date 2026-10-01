@@ -2353,8 +2353,7 @@ impl DaemonComposition {
             ),
         )?;
         if envelope.kind != eliot_protocol::HostRequestKind::SelectedSourceCapture
-            || host_identity.capability
-                != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
+            || host_identity.capability != eliot_protocol::SELECTED_SOURCE_CAPTURE_CAPABILITY
             || host_identity.payload_schema_id
                 != eliot_protocol::SELECTED_SOURCE_CAPTURE_PAYLOAD_SCHEMA_ID
             || host_identity.parent_operation_id.is_some()
@@ -2475,8 +2474,10 @@ impl DaemonComposition {
             task_id: Some(record.task_id.clone()),
             transition_class: eliot_store_api::TransitionClass::TaskControl,
             requested_effect_ceiling: eliot_store_api::EffectClass::ReversibleMutation,
-            admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()
-                .map_err(|error| CapturedLspAdoptionError::CanonicalEnvelope(error.to_string()))?,
+            admission_contract_set_digest:
+                eliot_canonical::supported_admission_contract_set_digest().map_err(|error| {
+                    CapturedLspAdoptionError::CanonicalEnvelope(error.to_string())
+                })?,
             operation_manifest_digest,
             semantic_commands: vec![command],
             event_projection_relation_intents: eliot_store_api::EventProjectionRelationIntents {
@@ -2549,7 +2550,9 @@ impl DaemonComposition {
             .await
             .map_err(|error| {
                 CapturedLspAdoptionError::SelectedSourceCaptureRequest(match error {
-                    DaemonError::Kernel(_) => "Kernel ORS activation saga rejected the canonical owner result",
+                    DaemonError::Kernel(_) => {
+                        "Kernel ORS activation saga rejected the canonical owner result"
+                    }
                     _ => "Kernel ORS activation saga failed",
                 })
             })?;
