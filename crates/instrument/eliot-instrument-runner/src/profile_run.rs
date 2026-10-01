@@ -49,10 +49,6 @@ use eliot_testd_core::{
     InstrumentStageRequest, StageExecutionKind, TestdProviderCatalogLifecycle,
     TestdProviderFingerprints, TestdProviderRegistryFreshness,
 };
-use eliot_testd_core::{
-    InstrumentStageRequest, StageExecutionKind, TestdProviderCatalogLifecycle,
-    TestdProviderFingerprints, TestdProviderRegistryFreshness,
-};
 
 /// Failures raised while planning or recording profile runs.
 ///
