@@ -1511,6 +1511,12 @@ impl KernelStoreGateway {
         )
         .map_err(|error| error.to_string())?;
         ensure_eligible(&owner, &sealed.token).map_err(|error| error.to_string())?;
+        let operation_id = transition.identity.operation_id.as_str().to_owned();
+        if let Err(error) = validate_current_proof_approval_support(&transition) {
+            let refusal =
+                refuse_determinate_reserved_write(&owner, &sealed.token, &error, &operation_id);
+            return Err(refusal);
+        }
         // Bounded send window: one normal admission lease, mirroring `apply`
         // (Slices A+B, #65). Cancellation and reconciliation stay on the
         // protected reserve and never consume this lease.
@@ -1518,7 +1524,6 @@ impl KernelStoreGateway {
         if self.is_fenced() {
             return Err("canonical-store gateway is fenced for rebind".to_owned());
         }
-        let operation_id = transition.identity.operation_id.as_str().to_owned();
         // The single authenticated send goes through the Kernel-visible
         // reserved submission (issue #2031): the exact `#990` projection plus
         // the boundary validation, so the production path and the tested
@@ -9631,14 +9636,14 @@ fn validate_route(
 /// unsupported behavior from a backend without reserved capability, never a
 /// reason to fall back to unreserved `Apply`.
 ///
-/// A `ManifestMismatch` is the one determinate refusal I05-06 treats as a
-/// PRESERVED plan rather than a discarded one: the plan's recorded operation
-/// manifest is outside current admissible support, so this build refuses to
-/// execute it and must not reinterpret it under newer code. The reserved order
-/// is still released, but the staged plan is first recorded as a visible
-/// durable Recovery Problem keyed by its own operation identity, so it enters
-/// visible recovery instead of vanishing with the release. Recording precedes
-/// the release because the retention reads the staged operation's own epoch,
+/// A manifest/contract mismatch or unsupported proof/approval reference is a
+/// determinate refusal I05-06 treats as a PRESERVED plan rather than a
+/// discarded one: this build refuses to execute unsupported recorded material
+/// and must not reinterpret it under newer code. The reserved order is still
+/// released, but the staged plan is first recorded as a visible durable
+/// Recovery Problem keyed by its own operation identity, so it enters visible
+/// recovery instead of vanishing with the release. Recording precedes the
+/// release because the retention reads the staged operation's own epoch,
 /// fence, recovery owner and reservation identity.
 ///
 /// A failure to record never discards the refusal itself: the original cause is
@@ -9651,18 +9656,30 @@ fn refuse_determinate_reserved_write(
     error: &StoreError,
     operation_id: &str,
 ) -> String {
-    if matches!(error, StoreError::ManifestMismatch) {
+    let unsupported_proof_refs = matches!(
+        error,
+        StoreError::InvalidField {
+            field: "proof_and_approval_refs",
+            ..
+        }
+    );
+    if matches!(error, StoreError::ManifestMismatch) || unsupported_proof_refs {
+        let reason = if unsupported_proof_refs {
+            "prepared transition proof/approval references lack current receiving-owner support"
+        } else {
+            "prepared transition outside current contract or operation-manifest support"
+        };
         let retained = retain_unsupported_prepared_plan(
             owner,
             token,
-            "prepared transition outside current operation-manifest support",
+            reason,
         );
         if let Err(retained) = retained {
             let _ = cancel_before_send(owner, token);
             return format!(
                 "reserved write refused for operation {operation_id}: the staged prepared \
-                 transition is outside current operation-manifest support and could not be \
-                 retained as visible recovery work ({retained}); cause: {error}"
+                 transition is outside current admissible support and could not be retained \
+                 as visible recovery work ({retained}); cause: {error}"
             );
         }
     }
@@ -9708,7 +9725,7 @@ fn refuse_determinate_reserved_write(
 /// ORS. The reserved-write path is a different owner with a different act and
 /// deliberately does not come through here.
 ///
-/// The only decisions converted into the `Err` arm HERE are the two refusals,
+/// Every decision converted into the `Err` arm HERE is an admission refusal,
 /// which is why the decision point is this function and not
 /// [`KernelStoreGateway::apply`]: there is no second state check downstream
 /// that a `not_accepted` or `resolved_existing` value would have to be caught
@@ -9738,6 +9755,7 @@ fn admit_prepared_transition(
             return Err(StoreError::ManifestMismatch);
         }
         transition.validate()?;
+        validate_current_proof_approval_support(transition)?;
         if transition.state_fence != context.state_fence {
             return Err(StoreError::FenceMismatch);
         }
@@ -9780,6 +9798,24 @@ fn admit_prepared_transition(
     // always rendered.
     let cause = gate_cause.unwrap_or_else(|| submission.to_string());
     Err(StoreApplyRefusal::admission(submission, cause))
+}
+
+/// Refuses recorded generic proof/approval handles unless this receiving
+/// Kernel has a current owner projection that can resolve them. The current
+/// contract carries opaque strings only and this build has no owner lookup
+/// for them, so non-empty handles cannot authorize execution. Reserved writes
+/// call this after staging and retain the exact plan as visible recovery work;
+/// unreserved writes refuse before any store send.
+fn validate_current_proof_approval_support(
+    transition: &PreparedTransition,
+) -> Result<(), StoreError> {
+    if transition.required_proof_and_approval_refs.is_empty() {
+        return Ok(());
+    }
+    Err(StoreError::InvalidField {
+        field: "proof_and_approval_refs",
+        reason: "receiving Kernel has no current owner lookup for these references",
+    })
 }
 
 /// Reserved-write admission gates shared by the gateway entry point.
