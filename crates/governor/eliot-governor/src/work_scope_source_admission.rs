@@ -41,6 +41,71 @@ use thiserror::Error;
 /// Wire/schema revision for the Human-approved normative source closure.
 pub const GOVERNING_SOURCE_APPROVAL_SCHEMA: &str = "eliot.governing-source-approval.v1";
 
+/// Closed initial setup effects that a Human explicitly consents to before
+/// the existing installation signer signs the setup approval. This list is
+/// deliberately narrow: it authorizes the first Policy owner write, the
+/// first WorkScope source-admission write, and the exact-root discovery needed
+/// to validate that source admission. It does not authorize TaskD dispatch or
+/// any external effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialSetupEffect {
+    /// Create the first canonical Policy owner snapshot from the signed setup
+    /// payload after an independent physical-absence read.
+    CreatePolicyOwnerSnapshot,
+    /// Admit one initial WorkScope source pair under the signed policy.
+    AdmitInitialWorkScopeSources,
+    /// Read only the exact approved repository root for source validation.
+    DiscoverApprovedSourceRoot,
+}
+
+/// Explicit, signed consent for the exact one-time bootstrap effects required
+/// to install policy and establish the first WorkScope binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct InitialSetupMutationConsent {
+    /// Closed consent schema revision.
+    pub schema_version: String,
+    /// Exact closed effect set required for initial configuration. Ordering is
+    /// canonical and duplicates or omissions are rejected.
+    pub effects: Vec<InitialSetupEffect>,
+}
+
+impl InitialSetupMutationConsent {
+    /// Constructs the exact effect set only after the caller has collected an
+    /// affirmative Human confirmation in the trusted setup interaction.
+    pub fn from_explicit_confirmation(confirmed: bool) -> Result<Self, WorkScopeSourceAdmissionError> {
+        if !confirmed {
+            return Err(WorkScopeSourceAdmissionError::InitialSetupConsentMissing);
+        }
+        let consent = Self {
+            schema_version: "eliot.initial-setup-mutation-consent.v1".to_owned(),
+            effects: vec![
+                InitialSetupEffect::CreatePolicyOwnerSnapshot,
+                InitialSetupEffect::AdmitInitialWorkScopeSources,
+                InitialSetupEffect::DiscoverApprovedSourceRoot,
+            ],
+        };
+        consent.validate()?;
+        Ok(consent)
+    }
+
+    /// Refuses any broadened, partial, reordered, or legacy consent.
+    pub fn validate(&self) -> Result<(), WorkScopeSourceAdmissionError> {
+        if self.schema_version != "eliot.initial-setup-mutation-consent.v1"
+            || self.effects
+                != [
+                    InitialSetupEffect::CreatePolicyOwnerSnapshot,
+                    InitialSetupEffect::AdmitInitialWorkScopeSources,
+                    InitialSetupEffect::DiscoverApprovedSourceRoot,
+                ]
+        {
+            return Err(WorkScopeSourceAdmissionError::InitialSetupConsentMissing);
+        }
+        Ok(())
+    }
+}
+
 /// The exact source document approved for one governing normative role.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +154,9 @@ pub struct GoverningSourceApproval {
     pub architecture: ApprovedNormativeSource,
     /// Approved Implementation document identity and classification.
     pub implementation: ApprovedNormativeSource,
+    /// Human-confirmed initial setup effects, covered by the same existing
+    /// InitialSnapshotSigner signature as this source approval.
+    pub initial_setup_consent: InitialSetupMutationConsent,
 }
 
 impl GoverningSourceApproval {
@@ -108,6 +176,7 @@ impl GoverningSourceApproval {
         scope_privacy_class: eliot_security_contracts::PrivacyClass,
         architecture_privacy: eliot_security_contracts::PrivacyClass,
         implementation_privacy: eliot_security_contracts::PrivacyClass,
+        initial_setup_consent: InitialSetupMutationConsent,
         capture: &NormativePairSourceCapture,
     ) -> Result<Self, WorkScopeSourceAdmissionError> {
         let approval = Self {
@@ -134,6 +203,7 @@ impl GoverningSourceApproval {
                 content_sha256: capture.implementation.content_sha256.clone(),
                 privacy_class: implementation_privacy,
             },
+            initial_setup_consent,
         };
         approval.validate()?;
         Ok(approval)
@@ -155,6 +225,7 @@ impl GoverningSourceApproval {
         self.state_fence
             .validate()
             .map_err(|_| WorkScopeSourceAdmissionError::InvalidSourceApproval)?;
+        self.initial_setup_consent.validate()?;
         self.privacy
             .validate()
             .map_err(|_| WorkScopeSourceAdmissionError::InvalidSourceApproval)?;
@@ -910,6 +981,9 @@ impl PreparedWorkScopeSourceAdmission {
 /// Refusal while preparing an initial WorkScope source-admission transition.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum WorkScopeSourceAdmissionError {
+    /// The one-time Human-approved initial mutation set is missing or widened.
+    #[error("initial Policy and WorkScope mutations lack exact Human setup consent")]
+    InitialSetupConsentMissing,
     /// A supplied identity, authority, causal, binding, or CAS fence differed.
     #[error("WorkScope source admission inputs do not share the exact request fence")]
     FenceMismatch,
