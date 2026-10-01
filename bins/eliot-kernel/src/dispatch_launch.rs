@@ -157,8 +157,7 @@ use super::{
     ActionLeaseRef, EnvironmentInheritance, EnvironmentProjection, FencingToken, Generation,
     ImageId, JobId, KernelComposition, ProcessExecutionAdmissionRequest, ProcessExecutionError,
     ProcessIntent, ProcessOwnerBinding, ProcessStartReceipt, ProcessTreeId, RequestIdentity,
-    TestdOuterProcessStreamAdmission,
-    ResourceLimits, SessionId,
+    ResourceLimits, SessionId, TestdOuterProcessStreamAdmission,
 };
 
 /// One-shot worker kind served by the dispatch-launch contour.
@@ -3599,13 +3598,7 @@ async fn spawn_ready_child(
     let started = match inputs.testd_outer_stream_admission {
         Some(stream_admission) => {
             gateway
-                .start_testd_outer_stream(
-                    &owner,
-                    admission,
-                    proof,
-                    outer_binding,
-                    stream_admission,
-                )
+                .start_testd_outer_stream(&owner, admission, proof, outer_binding, stream_admission)
                 .await
         }
         None => gateway.start(&owner, admission, proof, outer_binding).await,

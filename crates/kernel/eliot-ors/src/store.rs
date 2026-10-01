@@ -5891,9 +5891,11 @@ impl RedbRecoveryStore {
         prepared: &eliot_store_api::PreparedTransition,
     ) -> Result<Option<BlobProcessStreamOwnerFactsPullRecord>, OrsError> {
         crate::model::validate_text(operation_id, "blob_ready_operation_id")?;
-        prepared.validate().map_err(|error| OrsError::Contract(format!(
-            "ReadyAttach prepared transition is invalid: {error}"
-        )))?;
+        prepared.validate().map_err(|error| {
+            OrsError::Contract(format!(
+                "ReadyAttach prepared transition is invalid: {error}"
+            ))
+        })?;
         if prepared.identity.operation_id.as_str() != operation_id {
             return Err(OrsError::InvalidField {
                 field: "blob_ready_operation_id",

@@ -229,8 +229,8 @@ pub(super) fn append_policy_owner_statement(
             reason: "revision overflow",
         })
     })?;
-    let key = eliot_store_api::RecoveryRecordKey::new("owner", "policy")
-        .map_err(AdapterError::Store)?;
+    let key =
+        eliot_store_api::RecoveryRecordKey::new("owner", "policy").map_err(AdapterError::Store)?;
     let key_json = eliot_store_api::canonical_json_bytes(&key)
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
     let owner_id = eliot_store_api::sha256_hex(&key_json);
@@ -259,7 +259,10 @@ pub(super) fn append_policy_owner_statement(
         "policy_expected_state_fence".to_owned(),
         json!(&transition.state_fence),
     );
-    bindings.insert("policy_expected_revision".to_owned(), json!(expected_revision));
+    bindings.insert(
+        "policy_expected_revision".to_owned(),
+        json!(expected_revision),
+    );
     bindings.insert(
         "policy_expected_value_digest".to_owned(),
         json!(expected_value_digest),

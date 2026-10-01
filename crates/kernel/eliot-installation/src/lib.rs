@@ -124,9 +124,9 @@ mod approved_generation_registry;
 mod canary_removal;
 mod credential_provision;
 mod guard_containment;
+mod initial_config_snapshot;
 mod installation_registry;
 mod integration_discovery;
-mod initial_config_snapshot;
 mod managed_change_plan;
 mod package;
 mod package_planner;
@@ -176,6 +176,11 @@ use approved_generation_registry::{
     active_phase_b_rebind_intent_digest, active_phase_b_rebind_receipt_digest,
 };
 
+pub use initial_config_snapshot::{
+    InitialSnapshotKeyRecord, ProtectedInitialSnapshotSigner,
+    create_or_reopen_initial_snapshot_signer, load_verified_initial_config_snapshot,
+    open_retained_initial_snapshot_signer, publish_verified_initial_config_snapshot,
+};
 pub(crate) use integration_discovery::WindowsPathIdentity;
 pub use integration_discovery::{
     AcceptedCatalogueContext, AcceptedInstallationSurvey, AcceptedIntegrationCatalogue,
@@ -185,12 +190,6 @@ pub use integration_discovery::{
     ManagedChangeAdmissionError, NON_SECRET_PROBE_ENVIRONMENT_NAMES, ProbeBehaviour,
     admit_installation_survey_and_compile_change, integration_seed_family_ids,
     load_accepted_catalogue, resolve_bounded_probe, survey_accepted_installation,
-};
-pub use initial_config_snapshot::{
-    InitialSnapshotKeyRecord, ProtectedInitialSnapshotSigner,
-    create_or_reopen_initial_snapshot_signer,
-    load_verified_initial_config_snapshot, open_retained_initial_snapshot_signer,
-    publish_verified_initial_config_snapshot,
 };
 
 pub use managed_change_plan::{

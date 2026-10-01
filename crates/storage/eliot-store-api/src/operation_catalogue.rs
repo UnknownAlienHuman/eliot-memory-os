@@ -1061,12 +1061,11 @@ fn validate_policy_snapshot_transition(
     let expected_digest = text("expected_policy_digest")?;
     validate_digest(expected_digest, "policy.expected_digest")?;
     let snapshot_json = text("snapshot_json")?;
-    let row: serde_json::Value = serde_json::from_str(snapshot_json).map_err(|_| {
-        StoreError::InvalidField {
+    let row: serde_json::Value =
+        serde_json::from_str(snapshot_json).map_err(|_| StoreError::InvalidField {
             field: "policy.snapshot_json",
             reason: "must be canonical JSON",
-        }
-    })?;
+        })?;
     if !row.is_object()
         || canonical_json_bytes(&row)
             .map_err(|error| StoreError::Serialization(error.to_string()))?
@@ -1084,10 +1083,12 @@ fn validate_policy_snapshot_transition(
             field: "policy.revision",
             reason: "must be a positive integer",
         })?;
-    let next_revision = expected_revision.checked_add(1).ok_or(StoreError::InvalidField {
-        field: "policy.revision",
-        reason: "revision overflow",
-    })?;
+    let next_revision = expected_revision
+        .checked_add(1)
+        .ok_or(StoreError::InvalidField {
+            field: "policy.revision",
+            reason: "revision overflow",
+        })?;
     let expected_fence = serde_json::to_value(&transition.state_fence)
         .map_err(|error| StoreError::Serialization(error.to_string()))?;
     if revision != next_revision || row.get("state_fence") != Some(&expected_fence) {
@@ -1131,12 +1132,11 @@ fn validate_policy_snapshot_transition(
     match (envelope_json, envelope_sha) {
         (Some(envelope_json), Some(envelope_sha)) => {
             validate_digest(envelope_sha, "policy.initial_config_envelope_sha256")?;
-            let envelope: serde_json::Value = serde_json::from_str(envelope_json).map_err(|_| {
-                StoreError::InvalidField {
+            let envelope: serde_json::Value =
+                serde_json::from_str(envelope_json).map_err(|_| StoreError::InvalidField {
                     field: "policy.initial_config_envelope_json",
                     reason: "must be canonical signed-envelope JSON",
-                }
-            })?;
+                })?;
             if !envelope.is_object()
                 || canonical_json_bytes(&envelope)
                     .map_err(|error| StoreError::Serialization(error.to_string()))?

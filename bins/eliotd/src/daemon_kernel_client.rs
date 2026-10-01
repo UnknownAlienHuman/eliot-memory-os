@@ -554,9 +554,9 @@ pub fn parse_task_controller_claimed_pair(
         serde_json::from_value(decode("authenticated_peer")?).map_err(|error| {
             format!("Kernel Task Controller authenticated peer does not decode: {error}")
         })?;
-    authenticated_peer
-        .validate()
-        .map_err(|error| format!("Kernel Task Controller authenticated peer is invalid: {error}"))?;
+    authenticated_peer.validate().map_err(|error| {
+        format!("Kernel Task Controller authenticated peer is invalid: {error}")
+    })?;
     let authenticated_peer_sha256 = decode("authenticated_peer_sha256")?
         .as_str()
         .map(str::to_owned)
@@ -605,7 +605,12 @@ pub fn parse_task_controller_claimed_pair(
         || authenticated_peer.connection_id != envelope.connection_id
         || request_identity.request.metadata.request_id.as_str()
             != envelope.identity.request_id.as_str()
-        || request_identity.request.metadata.session_id.as_ref().map(|id| id.as_str())
+        || request_identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(|id| id.as_str())
             != envelope.identity.session_id.as_deref()
         || request_identity.idempotency_key != envelope.identity.idempotency_key
         || request_identity.cancellation_id != envelope.identity.cancellation_id
@@ -3224,8 +3229,7 @@ pub(super) const TESTD_OWNER_BIND_DISPATCH_OPERATION: &str =
 pub(super) const TESTD_OWNER_PENDING_TERMINALS_OPERATION: &str =
     "eliot.kernel.testd-owner-pending-terminals";
 pub(super) const TESTD_OWNER_ACK_TERMINAL_OPERATION: &str = "eliot.kernel.testd-owner-ack-terminal";
-pub(super) const TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION: &str =
-    "testd_blob_owner_facts_pending";
+pub(super) const TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION: &str = "testd_blob_owner_facts_pending";
 pub(super) const TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION: &str =
     "testd_blob_owner_facts_complete";
 pub(super) const TESTD_OWNER_WIRE_VERSION: u16 = 1;
@@ -3468,7 +3472,8 @@ impl DaemonKernelClient {
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         if ack.pull_ref != pull.pull_ref || ack.response_sha256 != response_sha256 {
             return Err(KernelPortError::Contract(
-                "Kernel owner-facts completion does not bind the exact pull and response".to_owned(),
+                "Kernel owner-facts completion does not bind the exact pull and response"
+                    .to_owned(),
             ));
         }
         Ok(())

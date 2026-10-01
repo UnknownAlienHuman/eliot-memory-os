@@ -1858,32 +1858,29 @@ fn decode_initial_snapshot_key_record(
         serde_json::from_slice(bytes).map_err(|error| InstallationError::CorruptRegistry {
             reason: error.to_string(),
         })?;
-    let version = value
-        .get("wire_version")
-        .cloned()
-        .ok_or_else(|| InstallationError::MigrationRequired {
-            reason: "initial snapshot key record lacks a wire discriminator".to_owned(),
-        })?;
-    let version: ContractVersion = serde_json::from_value(version).map_err(|_| {
-        InstallationError::MigrationRequired {
+    let version =
+        value
+            .get("wire_version")
+            .cloned()
+            .ok_or_else(|| InstallationError::MigrationRequired {
+                reason: "initial snapshot key record lacks a wire discriminator".to_owned(),
+            })?;
+    let version: ContractVersion =
+        serde_json::from_value(version).map_err(|_| InstallationError::MigrationRequired {
             reason: "initial snapshot key record has an unsupported wire discriminator".to_owned(),
-        }
-    })?;
+        })?;
     if version != ContractVersion::new(1, 0, 0) {
         return Err(InstallationError::MigrationRequired {
             reason: format!("initial snapshot key record wire {version} requires migration"),
         });
     }
-    let envelope: InitialSnapshotKeyRecordEnvelope = serde_json::from_value(value).map_err(|error| {
-        InstallationError::CorruptRegistry {
+    let envelope: InitialSnapshotKeyRecordEnvelope =
+        serde_json::from_value(value).map_err(|error| InstallationError::CorruptRegistry {
             reason: format!("initial snapshot key record is malformed: {error}"),
-        }
-    })?;
-    if canonical_json_bytes(&envelope)
-        .map_err(|error| InstallationError::CorruptRegistry {
-            reason: error.to_string(),
-        })?
-        != bytes
+        })?;
+    if canonical_json_bytes(&envelope).map_err(|error| InstallationError::CorruptRegistry {
+        reason: error.to_string(),
+    })? != bytes
     {
         return Err(InstallationError::CorruptRegistry {
             reason: "initial snapshot key record is not canonical JSON".to_owned(),

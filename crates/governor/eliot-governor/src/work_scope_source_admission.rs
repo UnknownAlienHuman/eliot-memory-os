@@ -10,30 +10,28 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_bootstrap::capture::NormativePairSourceCapture;
 use eliot_canonical::CanonicalWriteEnvelope;
 use eliot_contracts::{ProductId, SourceId, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_protocol::RequestIdentity;
 use eliot_receipts::{AuthorityBinding, CausalBinding};
+use eliot_security_contracts::{
+    CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, IndependenceLevel,
+    InstructionTaint, IntegrityStatus, QuarantineState, SourceAssurance,
+};
 use eliot_store_api::{
     EffectClass, EventProjectionRelationIntents, NamedMutationOperation, NamedMutationRequest,
-    OperationId, ScopeId, SecurityContext, TransitionClass,
-    generated_operation_manifests, operation_manifest_set_digest,
-    supported_admission_contract_set_digest,
+    OperationId, ScopeId, SecurityContext, TransitionClass, generated_operation_manifests,
+    operation_manifest_set_digest, supported_admission_contract_set_digest,
 };
-use crate::composition::WorkScopeOwnerSnapshotReadback;
 use eliot_workscope::{
     AuthorityBasis, DiscoveryLeaseKey, DiscoveryLeaseRequest, DiscoveryRead, DiscoveryReadLease,
-    GoverningSourceAdmission, GoverningSourceCandidate, GoverningSourceRole,
-    GoverningSourceSet, NewSourceCandidate, ObservedScopeResources, PrivacyProfile,
-    ScopeBinding, ScopeIdentity, SourceAdmissionRequest,
-    SourceCoverage, WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeDescriptor,
-    admit_governing_sources, admit_initial_binding, issue_discovery_lease,
+    GoverningSourceAdmission, GoverningSourceCandidate, GoverningSourceRole, GoverningSourceSet,
+    NewSourceCandidate, ObservedScopeResources, PrivacyProfile, ScopeBinding, ScopeIdentity,
+    SourceAdmissionRequest, SourceCoverage, WorkScopeBindingOwner, WorkScopeBindingSnapshot,
+    WorkScopeDescriptor, admit_governing_sources, admit_initial_binding, issue_discovery_lease,
     observed_scope_binding,
-};
-use eliot_security_contracts::{
-    CompetenceLevel, EffectCeiling, EpistemicUse, FreshnessStatus, InstructionTaint,
-    IndependenceLevel, IntegrityStatus, QuarantineState, SourceAssurance,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -203,16 +201,13 @@ impl GoverningSourceApproval {
         let implementation_matches = self.implementation.source_ref
             == capture.implementation.source_ref
             && self.implementation.entry_ref == capture.implementation.entry_ref
-            && self.implementation.compatibility_ref
-                == capture.implementation.compatibility_ref
+            && self.implementation.compatibility_ref == capture.implementation.compatibility_ref
             && self.implementation.content_sha256 == capture.implementation.content_sha256;
         if self.pair_key != capture.receipt.pair_key
             || !architecture_matches
             || !implementation_matches
-            || self.architecture.content_sha256
-                != capture.receipt.pair.architecture_sha256
-            || self.implementation.content_sha256
-                != capture.receipt.pair.implementation_sha256
+            || self.architecture.content_sha256 != capture.receipt.pair.architecture_sha256
+            || self.implementation.content_sha256 != capture.receipt.pair.implementation_sha256
             || self.explicit_root_identity != explicit_root_identity
             || &self.product_id != product_id
             || &self.source_id != source_id
@@ -380,9 +375,7 @@ impl GoverningSourceApproval {
                 explicit_root_identity,
                 now,
             )
-            .map_err(|error| {
-                WorkScopeSourceAdmissionError::SourceAdmission(error.to_string())
-            })
+            .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
         admit_approved_candidates(
@@ -450,8 +443,9 @@ impl GoverningSourceApproval {
     /// InitialSnapshotPayload field.
     pub fn canonical_json(&self) -> Result<String, WorkScopeSourceAdmissionError> {
         self.validate()?;
-        let bytes = canonical_json_bytes(self)
-            .map_err(|error| WorkScopeSourceAdmissionError::CaptureSerialization(error.to_string()))?;
+        let bytes = canonical_json_bytes(self).map_err(|error| {
+            WorkScopeSourceAdmissionError::CaptureSerialization(error.to_string())
+        })?;
         String::from_utf8(bytes)
             .map_err(|error| WorkScopeSourceAdmissionError::CaptureSerialization(error.to_string()))
     }
@@ -467,10 +461,9 @@ impl GoverningSourceApproval {
             .governing_source_approval_json
             .as_deref()
             .ok_or(WorkScopeSourceAdmissionError::SourceApprovalMissing)?;
-        let approval: Self = serde_json::from_str(approval_json)
-            .map_err(|error| {
-                WorkScopeSourceAdmissionError::SourceApprovalEncoding(error.to_string())
-            })?;
+        let approval: Self = serde_json::from_str(approval_json).map_err(|error| {
+            WorkScopeSourceAdmissionError::SourceApprovalEncoding(error.to_string())
+        })?;
         approval.validate()?;
         if approval.approver_principal_ref != payload.owner_ref
             || approval.state_fence != payload.snapshot.state_fence
@@ -567,29 +560,35 @@ fn require_exact_admitted_pair(
         ));
     }
     let matches = |role, document: &ApprovedNormativeSource| {
-        admission.admitted.sources.iter().filter(|source| {
-            source.role == role
-                && source.source_ref == document.source_ref
-                && source.digest == document.content_sha256
-                && source.applicable_generation == generation
-                && source.authority_basis
-                    == Some(AuthorityBasis::HumanOwner {
-                        owner_ref: required_owner_ref.to_owned(),
-                    })
-                && source.assurance.source_ref == document.source_ref
-                && source.assurance.state_fence == *state_fence
-                && source.assurance.integrity == IntegrityStatus::Verified
-                && source.assurance.freshness == FreshnessStatus::Current
-                && source.assurance.privacy_class == document.privacy_class
-                && source.assurance.competence == CompetenceLevel::Unknown
-                && source.assurance.independence == IndependenceLevel::Unknown
-                && source.assurance.instruction_taint == InstructionTaint::DataOnly
-                && source.assurance.allowed_epistemic_use.len() == 1
-                && source.assurance.allowed_epistemic_use[0] == EpistemicUse::Observation
-                && source.assurance.allowed_effects.len() == 1
-                && source.assurance.allowed_effects[0] == EffectCeiling::NoExternalEffect
-                && source.assurance.quarantine == QuarantineState::ReviewRequired
-        }).count() == 1
+        admission
+            .admitted
+            .sources
+            .iter()
+            .filter(|source| {
+                source.role == role
+                    && source.source_ref == document.source_ref
+                    && source.digest == document.content_sha256
+                    && source.applicable_generation == generation
+                    && source.authority_basis
+                        == Some(AuthorityBasis::HumanOwner {
+                            owner_ref: required_owner_ref.to_owned(),
+                        })
+                    && source.assurance.source_ref == document.source_ref
+                    && source.assurance.state_fence == *state_fence
+                    && source.assurance.integrity == IntegrityStatus::Verified
+                    && source.assurance.freshness == FreshnessStatus::Current
+                    && source.assurance.privacy_class == document.privacy_class
+                    && source.assurance.competence == CompetenceLevel::Unknown
+                    && source.assurance.independence == IndependenceLevel::Unknown
+                    && source.assurance.instruction_taint == InstructionTaint::DataOnly
+                    && source.assurance.allowed_epistemic_use.len() == 1
+                    && source.assurance.allowed_epistemic_use[0] == EpistemicUse::Observation
+                    && source.assurance.allowed_effects.len() == 1
+                    && source.assurance.allowed_effects[0] == EffectCeiling::NoExternalEffect
+                    && source.assurance.quarantine == QuarantineState::ReviewRequired
+            })
+            .count()
+            == 1
     };
     if !matches(GoverningSourceRole::Architecture, architecture)
         || !matches(GoverningSourceRole::Implementation, implementation)
@@ -706,7 +705,8 @@ pub fn issue_initial_work_scope_source_discovery_lease(
         || lease_key.root_filesystem_identity_ref != explicit_root_identity
     {
         return Err(WorkScopeSourceAdmissionError::SourceAdmission(
-            "discovery lease key differs from the authenticated request or approved root".to_owned(),
+            "discovery lease key differs from the authenticated request or approved root"
+                .to_owned(),
         ));
     }
     let signed_approval = approval.approval();
@@ -762,9 +762,7 @@ impl VerifiedGoverningSourceApproval {
         snapshot: &eliot_config::initial_snapshot::VerifiedInitialConfigSnapshot,
     ) -> Result<Self, WorkScopeSourceAdmissionError> {
         let approval = GoverningSourceApproval::from_verified_initial_snapshot(snapshot)?;
-        let signed_snapshot_digest = snapshot
-            .envelope_digest()
-            .to_owned();
+        let signed_snapshot_digest = snapshot.envelope_digest().to_owned();
         if !is_sha256(&signed_snapshot_digest) {
             return Err(WorkScopeSourceAdmissionError::SourceApprovalEncoding(
                 "verified snapshot has an invalid envelope digest".to_owned(),
@@ -1016,7 +1014,9 @@ pub fn prepare_initial_work_scope_source_admission(
     if identity.request.metadata.state_fence != *fence
         || authority.state_fence != *fence
         || causal.state_fence != *fence
-        || !fence.authority_epoch.is_same_authority(&authority.authority_epoch)
+        || !fence
+            .authority_epoch
+            .is_same_authority(&authority.authority_epoch)
         || !eliot_store_api::effect_is_at_most(
             EffectClass::ReversibleMutation,
             authority.allowed_effect,
@@ -1056,7 +1056,8 @@ pub fn prepare_initial_work_scope_source_admission(
         || lease_key.root_filesystem_identity_ref != binding.scope.root_identity
     {
         return Err(WorkScopeSourceAdmissionError::SourceAdmission(
-            "discovery lease key differs from the authenticated request or approved root".to_owned(),
+            "discovery lease key differs from the authenticated request or approved root"
+                .to_owned(),
         ));
     }
     if lease.lease.deadline != identity.deadline_unix_ms
@@ -1065,11 +1066,12 @@ pub fn prepare_initial_work_scope_source_admission(
         || lease.lease.consumption_limit != 1
         || lease.authenticated_approver_principal_ref != lease_key.host_ref
         || !lease.lease.key_matches(
-        &lease_key.proposer_ref,
-        &lease_key.session_ref,
-        &lease_key.host_ref,
-        &lease_key.root_filesystem_identity_ref,
-    ) {
+            &lease_key.proposer_ref,
+            &lease_key.session_ref,
+            &lease_key.host_ref,
+            &lease_key.root_filesystem_identity_ref,
+        )
+    {
         return Err(WorkScopeSourceAdmissionError::SourceAdmission(
             "source discovery lease differs from its admitted request or read scope".to_owned(),
         ));
@@ -1101,7 +1103,10 @@ pub fn prepare_initial_work_scope_source_admission(
     }
     lease
         .lease
-        .authorize(DiscoveryRead::GoverningSourceCandidates, now_after_source_reads)
+        .authorize(
+            DiscoveryRead::GoverningSourceCandidates,
+            now_after_source_reads,
+        )
         .map_err(|error| WorkScopeSourceAdmissionError::SourceAdmission(error.to_string()))?;
     let sources = approval.derive_work_scope_sources(
         &capture,
@@ -1123,12 +1128,10 @@ pub fn prepare_initial_work_scope_source_admission(
             state_fence,
             owner_revision,
             value_digest,
-        } if state_fence == fence
-            && *owner_revision > 0
-            && is_sha256(value_digest) => (*owner_revision, value_digest.clone()),
-        WorkScopeOwnerSnapshotReadback::Empty { state_fence, .. }
-            if state_fence != fence =>
-        {
+        } if state_fence == fence && *owner_revision > 0 && is_sha256(value_digest) => {
+            (*owner_revision, value_digest.clone())
+        }
+        WorkScopeOwnerSnapshotReadback::Empty { state_fence, .. } if state_fence != fence => {
             return Err(WorkScopeSourceAdmissionError::FenceMismatch);
         }
         WorkScopeOwnerSnapshotReadback::Empty { .. } => {
@@ -1210,10 +1213,7 @@ pub fn prepare_initial_work_scope_source_admission(
         "expected_work_scope_digest".to_owned(),
         Value::String(expected_digest),
     );
-    parameters.insert(
-        "snapshot_json".to_owned(),
-        Value::String(snapshot_json),
-    );
+    parameters.insert("snapshot_json".to_owned(), Value::String(snapshot_json));
     let operation_manifest_digest = operation_manifest_set_digest(
         &generated_operation_manifests()
             .map_err(|error| WorkScopeSourceAdmissionError::Transition(error.to_string()))?,

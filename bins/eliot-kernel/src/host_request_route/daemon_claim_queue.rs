@@ -376,15 +376,15 @@ impl KernelComposition {
         &self,
         session: &Session,
     ) -> Result<
-            Option<(
-                HostRequestEnvelope,
-                serde_json::Value,
-                TaskControllerInvocation,
-                TaskControllerAttempt,
-                eliot_protocol::RequestIdentity,
-                eliot_ors::HostRequestKernelAuthenticatedPeer,
-                String,
-            )>,
+        Option<(
+            HostRequestEnvelope,
+            serde_json::Value,
+            TaskControllerInvocation,
+            TaskControllerAttempt,
+            eliot_protocol::RequestIdentity,
+            eliot_ors::HostRequestKernelAuthenticatedPeer,
+            String,
+        )>,
         TransportError,
     > {
         let _transition = self.agent_bridge_transition_read()?;

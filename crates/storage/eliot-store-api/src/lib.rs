@@ -4307,9 +4307,7 @@ pub enum PolicyOwnerSnapshotReadResult {
 impl PolicyOwnerSnapshotReadResult {
     /// Validates the closed key/schema/fence and content-addressed owner row.
     pub fn validate(&self, expected_fence: &StateFence) -> Result<(), StoreError> {
-        expected_fence
-            .validate()
-            .map_err(StoreError::Foundation)?;
+        expected_fence.validate().map_err(StoreError::Foundation)?;
         let expected_key = RecoveryRecordKey::new("owner", "policy")?;
         match self {
             Self::Absent { record_key } if record_key == &expected_key => Ok(()),

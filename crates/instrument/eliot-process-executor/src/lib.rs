@@ -2418,9 +2418,7 @@ impl WindowsProcessExecutor {
             // the legacy `SourceUnavailable` path applies (provider failure
             // never claims a complete source).
             let stream_binding = state.view().binding().clone();
-            let stream_sink = stream_sink_override
-                .as_ref()
-                .or(self.stream_sink.as_ref());
+            let stream_sink = stream_sink_override.as_ref().or(self.stream_sink.as_ref());
             let stdout_pump = open_stream_pump(
                 stream_sink,
                 &stream_binding,

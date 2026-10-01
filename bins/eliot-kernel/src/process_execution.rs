@@ -46,9 +46,8 @@ use eliot_process::{
     OriginControlOperation, OriginControlPresentation, OriginGrantEffectOutcome, PermitIssuance,
     ProcessEvidence, ProcessEvidenceSink, ProcessExecutionAdmissionRequest, ProcessExecutionError,
     ProcessExecutor, ProcessLaunchAdmission, ProcessLifecycle, ProcessOwnerBinding, ProcessRequest,
-    ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, SessionId,
-    SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
-    ProcessStreamSinkClient,
+    ProcessSessionBinding, ProcessStartReceipt, ProcessStreamEvidence, ProcessStreamSinkClient,
+    SessionId, SuspendedLaunchEvidence, SuspendedProcessIdentity, ValidatedDispatch,
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_store_api::{
@@ -3282,6 +3281,9 @@ impl ProcessExecutionGateway {
             state: BlobProcessStreamOwnerFactsPullState::Pending,
             response_json: None,
             response_sha256: None,
+            prepared_write_transition_json: None,
+            prepared_write_transition_sha256: None,
+            prepared_write_canonical_request_hash: None,
         };
         p07_ors
             .persist_blob_process_stream_owner_facts_pull(&pull)
@@ -4413,12 +4415,7 @@ async fn run_process_start_with_testd_outer_stream<P: ProcessStartPorts>(
         "attempt",
     );
     let receipt = match ports
-        .execute_with_testd_outer_stream(
-            owner,
-            request,
-            outer_binding.as_ref(),
-            stream_admission,
-        )
+        .execute_with_testd_outer_stream(owner, request, outer_binding.as_ref(), stream_admission)
         .await
     {
         Ok(receipt) => receipt,
@@ -4728,14 +4725,16 @@ impl ProcessStartPorts for ProcessExecutionGateway {
                         if binding.job_identity().name() == candidate.job_object_id.as_str() =>
                     {
                         match stream_sink {
-                            Some(stream_sink) => self.executor
+                            Some(stream_sink) => self
+                                .executor
                                 .start_with_kernel_outer_job_binding_and_stream_sink(
                                     request,
                                     sink,
                                     binding,
                                     stream_sink,
                                 ),
-                            None => self.executor
+                            None => self
+                                .executor
                                 .start_with_kernel_outer_job_binding(request, sink, binding),
                         }
                     }

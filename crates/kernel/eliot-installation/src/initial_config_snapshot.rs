@@ -6,8 +6,7 @@
 
 use eliot_config::initial_snapshot::{
     InitialConfigSnapshotTrustAnchor, InitialSnapshotPayload, InitialSnapshotSigner,
-    InitialSnapshotVerificationContext, SignedInitialConfigSnapshot,
-    VerifiedInitialConfigSnapshot,
+    InitialSnapshotVerificationContext, SignedInitialConfigSnapshot, VerifiedInitialConfigSnapshot,
 };
 use eliot_platform_windows::{
     HostOwnerEpochCapability, INSTALLATION_AUTHORITY_KEY_ROOT_RELATIVE,
@@ -58,7 +57,10 @@ impl InitialSnapshotKeyRecord {
 
     /// Checks that all persisted public identity fields came from one key.
     pub fn validate(&self) -> Result<(), InstallationError> {
-        handle(self.transaction_id.as_str(), "initial_snapshot_key.transaction_id")?;
+        handle(
+            self.transaction_id.as_str(),
+            "initial_snapshot_key.transaction_id",
+        )?;
         if self.setup_revision == 0 {
             return Err(invalid_setup("key record setup revision must be non-zero"));
         }
@@ -110,7 +112,10 @@ impl InitialSnapshotSigner for ProtectedInitialSnapshotSigner<'_> {
         self.protected.public_key_fingerprint()
     }
 
-    fn sign(&self, canonical_bytes: &[u8]) -> Result<Vec<u8>, eliot_config::initial_snapshot::InitialSnapshotError> {
+    fn sign(
+        &self,
+        canonical_bytes: &[u8],
+    ) -> Result<Vec<u8>, eliot_config::initial_snapshot::InitialSnapshotError> {
         InstallationActivationApprovalSigner::sign(self.protected, canonical_bytes).map_err(
             |error| {
                 eliot_config::initial_snapshot::InitialSnapshotError::SigningFailure(
@@ -137,11 +142,11 @@ pub fn publish_verified_initial_config_snapshot(
     trust_anchor: &InitialConfigSnapshotTrustAnchor,
     verification_context: &InitialSnapshotVerificationContext,
 ) -> Result<VerifiedInitialConfigSnapshot, InstallationError> {
-    let setup = store
-        .load_setup_binding(transaction_id)?
-        .ok_or_else(|| InstallationError::TransactionNotFound {
+    let setup = store.load_setup_binding(transaction_id)?.ok_or_else(|| {
+        InstallationError::TransactionNotFound {
             transaction_id: transaction_id.as_str().to_owned(),
-        })?;
+        }
+    })?;
     if setup.transaction_id != *transaction_id
         || setup.installation_id.as_str() != payload.installation_id
         || setup.confirmed_owner().as_str() != payload.owner_ref
@@ -192,7 +197,9 @@ pub fn publish_verified_initial_config_snapshot(
         .map_err(|error| invalid_initial_snapshot(error.to_string()))?;
 
     if setup.state() == SetupMilestone::InitialSnapshotCreated {
-        if setup.configuration_snapshot_ref().map(PlatformHandle::as_str)
+        if setup
+            .configuration_snapshot_ref()
+            .map(PlatformHandle::as_str)
             != Some(envelope_digest.as_str())
         {
             return Err(InstallationError::IdentityConflict);
@@ -280,13 +287,18 @@ pub fn create_or_reopen_initial_snapshot_signer(
     store: &mut RedbInstallationTransactionStore,
     transaction_id: &PlatformHandle,
     host: &HostOwnerEpochCapability,
-) -> Result<(InstallationAuthorityKeySigner, InitialConfigSnapshotTrustAnchor), InstallationError>
-{
-    let setup = store
-        .load_setup_binding(transaction_id)?
-        .ok_or_else(|| InstallationError::TransactionNotFound {
+) -> Result<
+    (
+        InstallationAuthorityKeySigner,
+        InitialConfigSnapshotTrustAnchor,
+    ),
+    InstallationError,
+> {
+    let setup = store.load_setup_binding(transaction_id)?.ok_or_else(|| {
+        InstallationError::TransactionNotFound {
             transaction_id: transaction_id.as_str().to_owned(),
-        })?;
+        }
+    })?;
     if setup.transaction_id != *transaction_id
         || !host.is_for_installation(&setup.installation_id)
         || !matches!(
@@ -386,7 +398,10 @@ pub fn create_or_reopen_initial_snapshot_signer(
     Ok((signer, trust_anchor))
 }
 
-fn handle(value: impl AsRef<str>, field: &'static str) -> Result<PlatformHandle, InstallationError> {
+fn handle(
+    value: impl AsRef<str>,
+    field: &'static str,
+) -> Result<PlatformHandle, InstallationError> {
     PlatformHandle::new(value.as_ref()).map_err(|error| InstallationError::InvalidField {
         field: field.to_owned(),
         reason: error.to_string(),

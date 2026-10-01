@@ -4273,9 +4273,9 @@ pub fn prepare_initial_policy_owner_snapshot(
             "Policy owner CAS digest is not a lowercase SHA-256".to_owned(),
         ));
     }
-    let next_revision = expected_revision.checked_add(1).ok_or_else(|| {
-        CompositionError::Provider("Policy owner revision overflow".to_owned())
-    })?;
+    let next_revision = expected_revision
+        .checked_add(1)
+        .ok_or_else(|| CompositionError::Provider("Policy owner revision overflow".to_owned()))?;
     let snapshot = signed.payload.snapshot.clone();
     snapshot
         .validate()
@@ -4317,9 +4317,8 @@ pub fn prepare_initial_policy_owner_snapshot(
             .map_err(|error| CompositionError::Provider(error.to_string()))?,
     )
     .map_err(|error| CompositionError::Provider(error.to_string()))?;
-    let admission_contract_set_digest =
-        eliot_store_api::supported_admission_contract_set_digest()
-            .map_err(|error| CompositionError::Provider(error.to_string()))?;
+    let admission_contract_set_digest = eliot_store_api::supported_admission_contract_set_digest()
+        .map_err(|error| CompositionError::Provider(error.to_string()))?;
     let envelope = CanonicalWriteEnvelope {
         operation_id: operation_id.clone(),
         request: identity.request.metadata.clone(),
@@ -4339,12 +4338,11 @@ pub fn prepare_initial_policy_owner_snapshot(
             operation: eliot_store_api::NamedMutationOperation::RecordPolicySnapshot,
             parameters,
         }],
-        event_projection_relation_intents:
-            eliot_store_api::EventProjectionRelationIntents {
-                event_ids: Vec::new(),
-                projection_kinds: Vec::new(),
-                relation_kinds: Vec::new(),
-            },
+        event_projection_relation_intents: eliot_store_api::EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
         security: eliot_store_api::SecurityContext::default(),
         required_proof_and_approval_refs: Vec::new(),
         expected_revision_heads: Vec::new(),
@@ -4431,9 +4429,12 @@ impl PolicyOwner {
             wire.signed_initial_config_envelope_sha256.as_deref(),
         ) {
             (None, None) => {
-                if wire.snapshot.settings.iter().any(|setting| {
-                    setting.key == eliot_config::GOVERNING_SOURCE_APPROVAL_KEY
-                }) {
+                if wire
+                    .snapshot
+                    .settings
+                    .iter()
+                    .any(|setting| setting.key == eliot_config::GOVERNING_SOURCE_APPROVAL_KEY)
+                {
                     return Err(CompositionError::Recovery(
                         "Policy approval Setting has no retained signed initial-config envelope"
                             .to_owned(),
@@ -4481,8 +4482,7 @@ impl PolicyOwner {
             }
             _ => {
                 return Err(CompositionError::Recovery(
-                    "signed initial-config envelope and digest must be present together"
-                        .to_owned(),
+                    "signed initial-config envelope and digest must be present together".to_owned(),
                 ));
             }
         };
@@ -4503,8 +4503,7 @@ impl PolicyOwner {
             snapshot_digest: wire.policy_digest,
             snapshot: wire.snapshot,
             signed_initial_config_envelope,
-            signed_initial_config_envelope_sha256: wire
-                .signed_initial_config_envelope_sha256,
+            signed_initial_config_envelope_sha256: wire.signed_initial_config_envelope_sha256,
         })
     }
 
@@ -4560,8 +4559,7 @@ impl PolicyOwner {
                 "signed initial-config envelope failed independent verification: {error}"
             ))
         })?;
-        if Some(verified.envelope_digest())
-            != self.signed_initial_config_envelope_sha256.as_deref()
+        if Some(verified.envelope_digest()) != self.signed_initial_config_envelope_sha256.as_deref()
         {
             return Err(CompositionError::Recovery(
                 "verified signed initial-config digest differs from the Policy owner record"
@@ -5944,8 +5942,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             || current.canonical_digest() != semantic.canonical_digest()
             || current.snapshot_digest() != semantic.snapshot_digest()
             || current.snapshot() != semantic.snapshot()
-            || current.signed_initial_config_envelope()
-                != semantic.signed_initial_config_envelope()
+            || current.signed_initial_config_envelope() != semantic.signed_initial_config_envelope()
         {
             return Err(CompositionError::Recovery(
                 "fresh Store Policy owner read differs from the canonical Governor owner"
@@ -6021,11 +6018,12 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             return Ok(PolicyOwnerSnapshotReadback::Bound(current));
         }
 
-        let empty: EmptyOwnerSnapshot = serde_json::from_slice(&reply.payload).map_err(|error| {
-            CompositionError::Recovery(format!(
-                "Kernel Policy owner payload is neither a bound nor empty snapshot: {error}"
-            ))
-        })?;
+        let empty: EmptyOwnerSnapshot =
+            serde_json::from_slice(&reply.payload).map_err(|error| {
+                CompositionError::Recovery(format!(
+                    "Kernel Policy owner payload is neither a bound nor empty snapshot: {error}"
+                ))
+            })?;
         empty.validate(expected_state_fence)?;
         if empty.revision != reply.revision {
             return Err(CompositionError::Recovery(

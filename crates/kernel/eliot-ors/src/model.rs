@@ -1385,10 +1385,12 @@ impl BlobProcessStreamOwnerFactsPullRecord {
                         reason: "does not match prepared transition identity",
                     });
                 }
-                let request: serde_json::Value = serde_json::from_str(&self.request_json)
-                    .map_err(|_| OrsError::InvalidField {
-                        field: "blob_process_stream_pull_request_json",
-                        reason: "must remain a typed object",
+                let request: serde_json::Value =
+                    serde_json::from_str(&self.request_json).map_err(|_| {
+                        OrsError::InvalidField {
+                            field: "blob_process_stream_pull_request_json",
+                            reason: "must remain a typed object",
+                        }
                     })?;
                 if request.get("purpose").and_then(serde_json::Value::as_str)
                     != Some("READY_ATTACH")
@@ -8501,7 +8503,10 @@ impl HostRequestKernelAuthenticatedPeer {
                 reason: "process and transport session identities must be non-zero",
             });
         }
-        validate_digest(&self.launch_nonce_sha256, "host_request_peer_launch_nonce_sha256")
+        validate_digest(
+            &self.launch_nonce_sha256,
+            "host_request_peer_launch_nonce_sha256",
+        )
     }
 }
 
@@ -8635,27 +8640,24 @@ impl HostRequestRecord {
                     field: "host_request_kernel_identity_json",
                     reason: "must contain request metadata",
                 })?;
-            let request_id = metadata
-                .get("request_id")
-                .and_then(Value::as_str)
-                .ok_or(OrsError::InvalidField {
+            let request_id = metadata.get("request_id").and_then(Value::as_str).ok_or(
+                OrsError::InvalidField {
                     field: "host_request_kernel_identity_json",
                     reason: "must contain a request id",
-                })?;
-            let idempotency_key = value
-                .get("idempotency_key")
-                .and_then(Value::as_str)
-                .ok_or(OrsError::InvalidField {
+                },
+            )?;
+            let idempotency_key = value.get("idempotency_key").and_then(Value::as_str).ok_or(
+                OrsError::InvalidField {
                     field: "host_request_kernel_identity_json",
                     reason: "must contain an idempotency key",
-                })?;
-            let cancellation_id = value
-                .get("cancellation_id")
-                .and_then(Value::as_str)
-                .ok_or(OrsError::InvalidField {
+                },
+            )?;
+            let cancellation_id = value.get("cancellation_id").and_then(Value::as_str).ok_or(
+                OrsError::InvalidField {
                     field: "host_request_kernel_identity_json",
                     reason: "must contain a cancellation id",
-                })?;
+                },
+            )?;
             let deadline = value
                 .get("deadline_unix_ms")
                 .and_then(Value::as_u64)
