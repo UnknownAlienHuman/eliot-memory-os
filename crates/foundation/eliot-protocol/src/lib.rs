@@ -1339,6 +1339,299 @@ impl ReplayLedger {
     }
 }
 
+/// Explicit module lifecycle phase for the I7.4 control flows.
+///
+/// The phase only moves through [`ModuleLifecycle::apply`]: control frames
+/// are explicit transitions, never inferred process behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum ModuleLifecyclePhase {
+    /// Accepting ordinary work.
+    Active,
+    /// Quiesced: no new effects admitted, checkpoint/restore may proceed.
+    Quiesced,
+    /// Shutdown completed; no further control frames are admitted.
+    Terminated,
+    /// A fatal failure was recorded; no further control frames are admitted.
+    Failed,
+}
+
+/// Stored checkpoint identity for the I7.4 checkpoint/restore control flow.
+///
+/// `checkpoint_id` is the originating request identity text, so a later
+/// `RestoreCheckpoint` restores this exact checkpoint instead of treating
+/// the restart as a new uncorrelated request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleCheckpoint {
+    /// Stable checkpoint identity (the originating frame `request_id` text).
+    pub checkpoint_id: String,
+    /// Originating control request identity.
+    pub request_id: RequestId,
+    /// Originating idempotency key.
+    pub idempotency_key: String,
+}
+
+impl ModuleCheckpoint {
+    /// Validates the stored checkpoint identity shape.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        text(&self.checkpoint_id, "module_checkpoint.checkpoint_id")?;
+        text(
+            self.request_id.as_str(),
+            "module_checkpoint.request_id",
+        )?;
+        text(&self.idempotency_key, "module_checkpoint.idempotency_key")?;
+        if self.checkpoint_id != self.request_id.as_str() {
+            return Err(ProtocolError::InvalidField {
+                field: "module_checkpoint.checkpoint_id",
+                reason: "must match the originating request_id text",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Observed drain report for the I7.4 `DrainStatus` control flow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleDrainReport {
+    /// Lifecycle phase observed when the report was issued.
+    pub phase: ModuleLifecyclePhase,
+    /// Whether the module is quiesced.
+    pub quiesced: bool,
+    /// Whether a checkpoint is retained.
+    pub has_checkpoint: bool,
+}
+
+/// Explicit outcome of applying one lifecycle control frame.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum ModuleControlEffect {
+    /// The module moved `Active` to `Quiesced`.
+    Quiesced,
+    /// A checkpoint was recorded while quiesced.
+    CheckpointRecorded(ModuleCheckpoint),
+    /// The retained checkpoint was restored.
+    CheckpointRestored(ModuleCheckpoint),
+    /// Current drain state without moving the phase.
+    DrainReported(ModuleDrainReport),
+    /// The module moved to `Terminated`.
+    ShutdownStarted,
+    /// A fatal failure moved the module to `Failed`.
+    FatalRecorded,
+}
+
+/// Explicit owner for the I7.4 quiesce/checkpoint/restore/drain/shutdown/fatal
+/// control flows (W4).
+///
+/// Every control frame is validated first via [`Frame::validate`]; the
+/// request-bearing controls additionally require the validated
+/// [`RequestIdentity`] the frame carries. Illegal phase moves are rejected
+/// with a typed [`ProtocolError`]; nothing is inferred from process state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleLifecycle {
+    phase: ModuleLifecyclePhase,
+    checkpoint: Option<ModuleCheckpoint>,
+}
+
+impl ModuleLifecycle {
+    /// Creates a lifecycle in the active phase with no retained checkpoint.
+    pub const fn new() -> Self {
+        Self {
+            phase: ModuleLifecyclePhase::Active,
+            checkpoint: None,
+        }
+    }
+
+    /// Returns the current explicit lifecycle phase.
+    #[must_use]
+    pub const fn phase(&self) -> ModuleLifecyclePhase {
+        self.phase
+    }
+
+    /// Returns the retained checkpoint, if any.
+    #[must_use]
+    pub fn checkpoint(&self) -> Option<&ModuleCheckpoint> {
+        self.checkpoint.as_ref()
+    }
+
+    /// Reports the current drain state without moving the phase.
+    #[must_use]
+    pub fn drain_report(&self) -> ModuleDrainReport {
+        ModuleDrainReport {
+            phase: self.phase,
+            quiesced: self.phase == ModuleLifecyclePhase::Quiesced,
+            has_checkpoint: self.checkpoint.is_some(),
+        }
+    }
+
+    /// Applies one validated lifecycle control frame as an explicit transition.
+    pub fn apply(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        frame.validate()?;
+        match frame.message_type {
+            MessageType::Quiesce => self.apply_quiesce(frame),
+            MessageType::Checkpoint => self.apply_checkpoint(frame),
+            MessageType::RestoreCheckpoint => self.apply_restore(frame),
+            MessageType::DrainStatus => self.apply_drain(frame),
+            MessageType::Shutdown => self.apply_shutdown(frame),
+            MessageType::Fatal => self.apply_fatal(frame),
+            _ => Err(ProtocolError::InvalidField {
+                field: "message_type",
+                reason: "not a module lifecycle control message",
+            }),
+        }
+    }
+
+    fn control_identity(frame: &Frame) -> Result<&RequestIdentity, ProtocolError> {
+        let identity =
+            frame
+                .request_identity
+                .as_ref()
+                .ok_or(ProtocolError::InvalidField {
+                    field: "request_identity",
+                    reason: "required for lifecycle control requests",
+                })?;
+        identity.validate()?;
+        if frame.request_id.is_none() {
+            return Err(ProtocolError::InvalidField {
+                field: "request_id",
+                reason: "required for lifecycle control requests",
+            });
+        }
+        Ok(identity)
+    }
+
+    fn apply_quiesce(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        Self::control_identity(frame)?;
+        if self.phase != ModuleLifecyclePhase::Active {
+            return Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.phase",
+                reason: "quiesce requires the active phase",
+            });
+        }
+        self.phase = ModuleLifecyclePhase::Quiesced;
+        Ok(ModuleControlEffect::Quiesced)
+    }
+
+    fn apply_checkpoint(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        let identity = Self::control_identity(frame)?;
+        if self.phase != ModuleLifecyclePhase::Quiesced {
+            return Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.phase",
+                reason: "checkpoint requires the quiesced phase",
+            });
+        }
+        let request_id =
+            frame
+                .request_id
+                .clone()
+                .ok_or(ProtocolError::InvalidField {
+                    field: "request_id",
+                    reason: "required for lifecycle control requests",
+                })?;
+        let checkpoint = ModuleCheckpoint {
+            checkpoint_id: request_id.as_str().to_owned(),
+            request_id,
+            idempotency_key: identity.idempotency_key.clone(),
+        };
+        checkpoint.validate()?;
+        self.checkpoint = Some(checkpoint.clone());
+        Ok(ModuleControlEffect::CheckpointRecorded(checkpoint))
+    }
+
+    fn apply_restore(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        Self::control_identity(frame)?;
+        if self.phase != ModuleLifecyclePhase::Quiesced {
+            return Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.phase",
+                reason: "restore requires the quiesced phase",
+            });
+        }
+        let checkpoint = self.checkpoint.as_ref().ok_or(ProtocolError::InvalidField {
+            field: "module_lifecycle.checkpoint",
+            reason: "restore requires a retained checkpoint",
+        })?;
+        checkpoint.validate()?;
+        Ok(ModuleControlEffect::CheckpointRestored(checkpoint.clone()))
+    }
+
+    fn apply_drain(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        Self::control_identity(frame)?;
+        Ok(ModuleControlEffect::DrainReported(self.drain_report()))
+    }
+
+    fn apply_shutdown(&mut self, frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        Self::control_identity(frame)?;
+        match self.phase {
+            ModuleLifecyclePhase::Active | ModuleLifecyclePhase::Quiesced => {
+                self.phase = ModuleLifecyclePhase::Terminated;
+                Ok(ModuleControlEffect::ShutdownStarted)
+            }
+            _ => Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.phase",
+                reason: "shutdown requires the active or quiesced phase",
+            }),
+        }
+    }
+
+    fn apply_fatal(&mut self, _frame: &Frame) -> Result<ModuleControlEffect, ProtocolError> {
+        if self.phase == ModuleLifecyclePhase::Terminated
+            || self.phase == ModuleLifecyclePhase::Failed
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "module_lifecycle.phase",
+                reason: "fatal requires a non-terminal phase",
+            });
+        }
+        self.phase = ModuleLifecyclePhase::Failed;
+        Ok(ModuleControlEffect::FatalRecorded)
+    }
+}
+
+impl Default for ModuleLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Routes one lifecycle `Event` frame through the durable replay/ack envelope
+/// (W5: I7.2 envelope plus I7.4 lifecycle `Event`).
+///
+/// The frame is validated, the envelope is extracted from the typed
+/// [`ProtocolPayload::Event`] variant or from JSON encoding the same
+/// [`EventEnvelope`], the envelope is validated, its payload type must come
+/// from a known producer via [`EventEnvelope::require_known_payload_type`],
+/// and the identity is observed through the receiver-owned [`ReplayLedger`].
+/// Duplicates report [`EventDisposition::Duplicate`] without staging a
+/// second logical event; conflicts surface [`ProtocolError::ReplayConflict`].
+pub fn route_lifecycle_event(
+    frame: &Frame,
+    ledger: &mut ReplayLedger,
+) -> Result<EventDisposition, ProtocolError> {
+    frame.validate()?;
+    let envelope = match (frame.kind, frame.message_type, &frame.payload) {
+        (FrameKind::Event, MessageType::Event, ProtocolPayload::Event(envelope)) => {
+            envelope.validate()?;
+            (**envelope).clone()
+        }
+        (FrameKind::Event, MessageType::Event, ProtocolPayload::Json(value)) => {
+            let envelope: EventEnvelope =
+                serde_json::from_value(value.clone()).map_err(|_| ProtocolError::InvalidField {
+                    field: "payload",
+                    reason: "lifecycle Event JSON must encode an EventEnvelope",
+                })?;
+            envelope.validate()?;
+            envelope
+        }
+        _ => {
+            return Err(ProtocolError::InvalidField {
+                field: "kind/message_type",
+                reason: "lifecycle Event dispatch requires an Event frame carrying an EventEnvelope",
+            });
+        }
+    };
+    envelope.require_known_payload_type()?;
+    ledger.observe(&envelope)
+}
+
 /// Client-side EBP handshake declaration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
