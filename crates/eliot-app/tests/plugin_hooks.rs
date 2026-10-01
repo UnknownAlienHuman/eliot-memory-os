@@ -1,7 +1,8 @@
+use eliot_engine::EliotHookService;
+use eliot_types::HookEventKind;
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -22,19 +23,36 @@ fn plugin_mcp_config_exists_and_has_governed_server() -> TestResult {
         .ok_or("Claude MCP server map missing")?;
     assert_eq!(servers.len(), 1);
     let server = servers.get("eliot").ok_or("eliot server missing")?;
+    // The legacy `eliot-governor.exe mcp stdio --host claude --instance default`
+    // entry is retired. `docs/release/WINDOWS_X64_RELEASE.md` ("Claude Code
+    // front door"): every legacy entrypoint other than the delegated MCP
+    // stdio edge "unconditionally refuse[s] with
+    // `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the canonical-route receipt",
+    // and the Bridge "runs `eliot-agent-bridge mcp --profile SPINE_FUNCTIONAL
+    // --transport stdio --client-declaration
+    // <installation-absolute>/agent-bridge/client-declaration-v2.json`".
+    // `docs/integrations/claude/CLAUDE_CODE_PLUGIN.md` ("Front-door
+    // selection") records the same argv as the new-path contract, and the
+    // migrated edge is registered in
+    // `crates/eliot-app/src/disposition.rs::MIGRATED_CONSUMER_EDGES` ("Claude
+    // Code plugin MCP server"): `legacy_reference` `"command":
+    // "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe"` must be absent from this
+    // file, `current_owner_reference` `"command":
+    // "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe"` must be present.
     assert_eq!(
         server.get("command").and_then(Value::as_str),
-        Some("${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe")
+        Some("${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe")
     );
     assert_eq!(
         server.get("args"),
         Some(&json!([
             "mcp",
+            "--profile",
+            "SPINE_FUNCTIONAL",
+            "--transport",
             "stdio",
-            "--host",
-            "claude",
-            "--instance",
-            "default"
+            "--client-declaration",
+            "${CLAUDE_PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json"
         ]))
     );
     Ok(())
@@ -47,15 +65,25 @@ fn plugin_hooks_config_exists_and_parses() -> TestResult {
         .get("hooks")
         .and_then(Value::as_object)
         .ok_or("hooks object missing")?;
+    // `PostToolUseFailure` and `SessionEnd` are deliberately absent from this
+    // edge. `crates/eliot-app/src/disposition.rs::MIGRATED_CONSUMER_EDGES`
+    // ("Claude Code plugin lifecycle hooks", evidence field) states: "the two
+    // host event --host claude --event rows (PostToolUseFailure, SessionEnd)
+    // are removed from this edge because record_event lease-gating plus
+    // reports/host-events writes are host-runtime behavior owned by the #77
+    // host-request protocol migration and are not servable by the hook intake;
+    // host-observable output is unchanged (continue/suppress ack either way)
+    // and no current reader consumes reports/host-events". The bridge hook
+    // intake serves exactly these seven events
+    // (`bins/eliot-agent-bridge/src/hook_intake.rs::parse_hook_event`).
     for event in [
         "SessionStart",
         "PreToolUse",
-        "PostToolUseFailure",
+        "PostToolUse",
         "SubagentStart",
         "SubagentStop",
         "PreCompact",
         "Stop",
-        "SessionEnd",
     ] {
         assert!(
             events
@@ -63,6 +91,13 @@ fn plugin_hooks_config_exists_and_parses() -> TestResult {
                 .and_then(Value::as_array)
                 .is_some_and(|items| !items.is_empty()),
             "{event} hook is missing"
+        );
+    }
+    // The retired host-event rows must stay gone, not merely be unasserted.
+    for retired in ["PostToolUseFailure", "SessionEnd"] {
+        assert!(
+            !events.contains_key(retired),
+            "{retired} is a retired host-event row on this edge"
         );
     }
     Ok(())
@@ -94,7 +129,21 @@ fn plugin_hooks_use_rust_binary_not_python_node() -> TestResult {
                 "forbidden hook wrapper: {forbidden}"
             );
         }
-        assert!(lowered.ends_with("eliot-governor.exe"));
+        // The current owner is the bridge binary, not the retired facade.
+        // `docs/release/WINDOWS_X64_RELEASE.md` ("Claude Code front door"):
+        // "Codex ... executes the SHA-256-verified Governor inside that
+        // immutable cache" no longer describes the hook route -- it states that
+        // "`eliot-governor.exe` ... remains only as an unconditional Bridge
+        // redirect/refusal shim for installed entrypoints, and every other
+        // entrypoint refuses without serving", and that the bundle stages
+        // "`eliot-agent-bridge.exe` at the bundle root next to
+        // `eliot-governor.exe`". The migrated hook edge is recorded in
+        // `crates/eliot-app/src/disposition.rs::MIGRATED_CONSUMER_EDGES`
+        // ("Claude Code plugin lifecycle hooks"), whose `legacy_reference`
+        // `"command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-governor.exe"` must be
+        // absent from the tracked hooks file and whose `current_owner_reference`
+        // is `"command": "${CLAUDE_PLUGIN_ROOT}/bin/eliot-agent-bridge.exe"`.
+        assert!(lowered.ends_with("eliot-agent-bridge.exe"));
         assert!(command.contains("CLAUDE_PLUGIN_ROOT"));
     }
     Ok(())
@@ -436,33 +485,45 @@ fn run_hook_inner(
     payload: &Value,
     task_id: Option<&str>,
 ) -> TestResult<Value> {
-    let config_path = runtime.join("config").join("governor.toml");
-    let mut command = Command::new(binary());
-    command
-        .arg("--config")
-        .arg(config_path)
-        .arg("hook")
-        .arg(hook)
-        .current_dir(repo_root());
-    match task_id {
-        Some(value) => command.env("ELIOT_TASK_ID", value),
-        None => command.env_remove("ELIOT_TASK_ID"),
-    };
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        serde_json::to_writer(&mut stdin, &payload)?;
-    }
-    let output = child.wait_with_output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(serde_json::from_slice(&output.stdout)?)
+    // `docs/release/WINDOWS_X64_RELEASE.md` ("Claude Code front door"): "every
+    // non-stdio entrypoint (`daemon run`, `service run`, `hook`, and the rest),
+    // unconditionally refuse with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the
+    // canonical-route receipt". Spawning `eliot-governor hook <event>` here
+    // therefore tests a retired route, not the hook contract.
+    //
+    // The documented current owner is the bridge hook intake, which evaluates
+    // the host hook JSON through the existing owner
+    // `eliot_engine::EliotHookService::for_session().process`
+    // (`bins/eliot-agent-bridge/src/hook_intake.rs::run_hook_intake`, recorded
+    // in `crates/eliot-app/src/disposition.rs::MIGRATED_CONSUMER_EDGES` for
+    // "Claude Code plugin lifecycle hooks"). This suite drives that owner
+    // directly with the same three inputs the intake feeds it: the decoded
+    // payload, `ELIOT_TASK_ID` attachment, and the same runtime root
+    // (`<runtime>/config/governor.toml`'s grandparent under the retired
+    // `run_hook` contract). Only the retired transport changed.
+    let kind = hook_event_kind(hook)?;
+    let service = EliotHookService::for_session(runtime, task_id.is_some());
+    Ok(service.process(kind, payload)?.decision.stdout)
+}
+
+/// Argv spelling the bridge hook intake accepts for each lifecycle event
+/// (`parse_hook_event`, `bins/eliot-agent-bridge/src/hook_intake.rs`); the
+/// tracked `integrations/claude/eliot/hooks/hooks.json` rows pass exactly these
+/// tokens after `hook`.
+fn hook_event_kind(name: &str) -> TestResult<HookEventKind> {
+    Ok(match name {
+        "session-start" => HookEventKind::SessionStart,
+        "user-prompt-submit" => HookEventKind::UserPromptSubmit,
+        "subagent-start" => HookEventKind::SubagentStart,
+        "pre-tool-use" => HookEventKind::PreToolUse,
+        "permission-request" => HookEventKind::PermissionRequest,
+        "post-tool-use" => HookEventKind::PostToolUse,
+        "pre-compact" => HookEventKind::PreCompact,
+        "post-compact" => HookEventKind::PostCompact,
+        "subagent-stop" => HookEventKind::SubagentStop,
+        "stop" => HookEventKind::Stop,
+        other => return Err(format!("unknown hook event: {other}").into()),
+    })
 }
 
 fn pending_spool_count(runtime: &Path) -> TestResult<usize> {
@@ -493,8 +554,4 @@ fn repo_root() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
-}
-
-fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_eliot-governor"))
 }

@@ -125,21 +125,36 @@ fn codex_system_artifact_has_controller_mcp_and_default_policy() -> TestResult {
             .map(serde_json::Map::len),
         Some(1)
     );
+    // The Codex plugin MCP edge no longer launches the legacy
+    // `bin/eliot-governor.exe mcp stdio --profile codex_controller --instance
+    // default` route. `docs/release/WINDOWS_X64_RELEASE.md` states: "Its sole
+    // MCP server is `eliot`, resolves `bin/eliot-agent-bridge.exe` relative to
+    // the plugin root, and starts the `codex_controller` profile for every
+    // project through `bins/eliot-agent-bridge` with the installation-owned
+    // client declaration", and in the front-door paragraph that every
+    // non-stdio entrypoint other than the delegated MCP edges "unconditionally
+    // refuse[s] with `LEGACY_GOVERNOR_FRONT_DOOR_CUTOVER` plus the
+    // canonical-route receipt". The migrated edge is registered in
+    // `crates/eliot-app/src/disposition.rs::MIGRATED_CONSUMER_EDGES` ("Codex
+    // plugin MCP server"), whose `legacy_reference` `"command":
+    // "bin/eliot-governor.exe"` must be absent from this artifact and whose
+    // `current_owner_reference` is `"command": "bin/eliot-agent-bridge.exe"`.
     assert_eq!(
         mcp.pointer("/mcpServers/eliot/args"),
         Some(&serde_json::json!([
             "mcp",
-            "stdio",
             "--profile",
             "codex_controller",
-            "--instance",
-            "default"
+            "--transport",
+            "stdio",
+            "--client-declaration",
+            "${PLUGIN_ROOT}/bin/agent-bridge/client-declaration-v2.json"
         ]))
     );
     assert_eq!(
         mcp.pointer("/mcpServers/eliot/command")
             .and_then(Value::as_str),
-        Some("bin/eliot-governor.exe")
+        Some("bin/eliot-agent-bridge.exe")
     );
     assert_eq!(
         mcp.pointer("/mcpServers/eliot/cwd").and_then(Value::as_str),
@@ -167,12 +182,20 @@ fn codex_system_artifact_has_controller_mcp_and_default_policy() -> TestResult {
         let handler = hooks
             .pointer(&format!("/hooks/{event}/0/hooks/0"))
             .ok_or_else(|| format!("missing canonical {event} command hook"))?;
+        // Same retirement as the MCP route above, one edge over:
+        // `crates/eliot-app/src/disposition.rs::MIGRATED_CONSUMER_EDGES` ("Codex
+        // plugin lifecycle hooks") records the legacy hook argv
+        // `"${PLUGIN_ROOT}\\bin\\eliot-governor.exe"` as `legacy_reference` (it
+        // must be absent here) and the current-owner argv
+        // `"${PLUGIN_ROOT}\\bin\\eliot-agent-bridge.exe\" hook` as
+        // `current_owner_reference`, served by
+        // `bins/eliot-agent-bridge/src/hook_intake.rs::run_hook_intake`.
         assert!(
             handler
                 .get("command")
                 .and_then(Value::as_str)
                 .is_some_and(|command| command
-                    .starts_with("\"${PLUGIN_ROOT}\\bin\\eliot-governor.exe\" hook "))
+                    .starts_with("\"${PLUGIN_ROOT}\\bin\\eliot-agent-bridge.exe\" hook "))
         );
         assert!(handler.get("args").is_none());
         assert!(handler.get("async").is_none());
