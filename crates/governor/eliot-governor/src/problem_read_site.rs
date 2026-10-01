@@ -58,6 +58,7 @@ use eliot_context_candidates::ProjectionState;
 use eliot_problem::Problem;
 use eliot_store_api::{
     PROBLEM_OWNER_STATE_MUTATION_NAME, PROBLEM_PARAM_PROBLEM_ID, ProblemOwnerTransition,
+    SequenceDispositionChoice, SequenceDispositionEvidence, SequenceGapStatus,
     decode_problem_owner_state_mutation,
 };
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,10 @@ pub struct ProblemReadback {
     /// When `false`, [`Self::head`] is the newest revision this page returned and
     /// is not established as the record's head.
     pub history_complete: bool,
+    /// Canonical sequence-gap controls retained by the same committed,
+    /// scope-filtered Problem-owner read. A committed choice remains visible
+    /// here while the Kernel reconciles its immutable receipt into ORS.
+    pub sequence_gaps: Vec<SequenceGapStatus>,
 }
 
 /// Typed refusals of the committed Problem read site.
@@ -180,11 +185,52 @@ pub fn read_committed_problem(
         ));
     };
     let mut committed: Vec<(Problem, ProblemReadbackRevision)> = Vec::new();
+    let mut sequence_gaps = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         let page_position = u64::try_from(index).unwrap_or(u64::MAX);
         let Some(parameters) = owner_transition_parameters(record, problem_id) else {
             continue;
         };
+        if let Some(value) = parameters.get("sequence_disposition") {
+            let evidence: SequenceDispositionEvidence = serde_json::from_value(value.clone())
+                .map_err(|error| {
+                    ProblemReadbackError::TransitionUndecodable {
+                        page_position,
+                        reason: format!("sequence disposition is malformed: {error}"),
+                    }
+                })?;
+            evidence.validate().map_err(|error| {
+                ProblemReadbackError::TransitionUndecodable {
+                    page_position,
+                    reason: format!("sequence disposition is invalid: {error}"),
+                }
+            })?;
+            let (supported_choices, next_authorized_action) = match evidence.choice {
+                SequenceDispositionChoice::CancelDependents { .. } => (
+                    vec![
+                        "skip_proven_no_effect".to_owned(),
+                        "replace_same_identity".to_owned(),
+                    ],
+                    Some("prepare_gap_closing_disposition".to_owned()),
+                ),
+                SequenceDispositionChoice::SkipProvenNoEffect { .. }
+                | SequenceDispositionChoice::ReplaceSameIdentity { .. } => (
+                    Vec::new(),
+                    Some("reconcile_sequence_gap_control_receipt".to_owned()),
+                ),
+            };
+            let gap_id = evidence.operation.original.gap.gap_id.clone();
+            sequence_gaps.insert(
+                gap_id.clone(),
+                SequenceGapStatus {
+                    gap_id,
+                    original: evidence.operation.original,
+                    affected_scopes: evidence.operation.affected_scopes,
+                    supported_choices,
+                    next_authorized_action,
+                },
+            );
+        }
         let (problem, revision) = decode_history_entry(
             &parameters,
             page_position,
@@ -204,6 +250,7 @@ pub fn read_committed_problem(
         head,
         timeline,
         history_complete,
+        sequence_gaps: sequence_gaps.into_values().collect(),
     }))
 }
 
