@@ -25,10 +25,10 @@
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
     "scope": "the selected decision workset of this cell",
-    "source_stu": 18387,
+    "source_stu": 18407,
     "test_stu": 239681,
     "selected_file_count": 18,
-    "physical_source_stu": 1289191,
+    "physical_source_stu": 1294741,
     "physical_file_count": 60,
     "inline_cfg_test_modules": 1,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
@@ -48,9 +48,9 @@
     "selected_source": [
       {
         "path": "crates/kernel/eliot-kernel-service/src/lib.rs",
-        "bytes": 28884,
-        "sha256": "fd95fec69d30e596d6c8a80267e1a530a25e6496bd8a121cca54c73a667f0b21",
-        "stu": 9628,
+        "bytes": 28944,
+        "sha256": "77093c59f0db4ccca8672a06952bae3502597f274a993cb989f3f06b4fc21583",
+        "stu": 9648,
         "inline_cfg_test": true
       },
       {
@@ -263,11 +263,11 @@
         ]
       }
     ],
-    "source_selection_digest": "c32437f92d9818ee4f6e60ff274502b3c600f94e87daf8c1dff753d7d4fffeb6"
+    "source_selection_digest": "1b457d8c1f6fb659d27e2deede7c13d24c7c7937911efd9fd4d024b79d04f4d9"
   },
   "unselected_package_files": {
     "physical_inventory_file_count": 60,
-    "physical_inventory_digest": "10cf387689cb61de12cfa4892774a4bae8691135e229a4b8a9ded2fd479d2fc4",
+    "physical_inventory_digest": "0b0f29576c040592433f1f73229eee7ff6eb1f41a0a4205be602f5d86beecc83",
     "unselected_files": [
       {
         "path": "crates/kernel/eliot-kernel-service/src/capacity_evidence.rs",
@@ -386,7 +386,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/storage_replacement.rs",
-        "bytes": 87265,
+        "bytes": 100251,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -416,7 +416,7 @@
       },
       {
         "path": "crates/kernel/eliot-kernel-service/src/store_write_status.rs",
-        "bytes": 7720,
+        "bytes": 11324,
         "reason": "production source not allocated to this cell"
       },
       {
@@ -594,20 +594,20 @@
         },
         "physical_source_inventory": {
           "path_count": 60,
-          "sha256": "10cf387689cb61de12cfa4892774a4bae8691135e229a4b8a9ded2fd479d2fc4"
+          "sha256": "0b0f29576c040592433f1f73229eee7ff6eb1f41a0a4205be602f5d86beecc83"
         },
         "selected_workset": {
           "allocation_scope": "PER_CELL",
           "allocation_state": "ACCEPTED_ALLOCATION",
           "path_count": 18,
-          "sha256": "c32437f92d9818ee4f6e60ff274502b3c600f94e87daf8c1dff753d7d4fffeb6"
+          "sha256": "1b457d8c1f6fb659d27e2deede7c13d24c7c7937911efd9fd4d024b79d04f4d9"
         }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "e50f7177fb209a55d4ed1717bcbd99c12fb337ced2af5faecfb22d7e62fa6efb",
+  "artifact_digest": "113cac6aa67c21c25935190cad85b224c51c585c3a752f136e6db6eab5a626aa",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "9ecd7eeec495b53c"

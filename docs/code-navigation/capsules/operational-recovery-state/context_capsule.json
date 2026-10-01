@@ -25,10 +25,10 @@
   "source_token_estimate": {
     "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
     "scope": "the selected decision workset of this cell",
-    "source_stu": 1167127,
+    "source_stu": 1169353,
     "test_stu": 74293,
     "selected_file_count": 36,
-    "physical_source_stu": 1241420,
+    "physical_source_stu": 1243646,
     "physical_file_count": 36,
     "inline_cfg_test_modules": 5,
     "qualification": "planning estimate only; not a qualified Context Envelope (I2.16)"
@@ -188,9 +188,9 @@
       },
       {
         "path": "crates/kernel/eliot-ors/src/store.rs",
-        "bytes": 1687223,
-        "sha256": "839b1c4e687f878f59faca79a5c0f138e10d20599035aabe48e435eb2bb324f1",
-        "stu": 562408,
+        "bytes": 1693900,
+        "sha256": "36aefde577b0cce0cd98d845e3db5a927456f7568f43eab7aac27d6b5c0ccfa9",
+        "stu": 564634,
         "inline_cfg_test": true
       },
       {
@@ -331,11 +331,11 @@
         ]
       }
     ],
-    "source_selection_digest": "84c6ea608b174e3f6062c5a5baa6bb39e26a4f83e71472b0f6a151ae720f2dce"
+    "source_selection_digest": "323a71215104a98679096160463cbca60dd5f1a9122d93afd9518180d75ee652"
   },
   "unselected_package_files": {
     "physical_inventory_file_count": 36,
-    "physical_inventory_digest": "84c6ea608b174e3f6062c5a5baa6bb39e26a4f83e71472b0f6a151ae720f2dce",
+    "physical_inventory_digest": "323a71215104a98679096160463cbca60dd5f1a9122d93afd9518180d75ee652",
     "unselected_files": [],
     "note": "Physical package inventory beyond this cell's selected workset. No file is dropped: an unlinked or unresolved file is reported here with the reason it was not selected."
   },
@@ -432,20 +432,20 @@
         },
         "physical_source_inventory": {
           "path_count": 36,
-          "sha256": "84c6ea608b174e3f6062c5a5baa6bb39e26a4f83e71472b0f6a151ae720f2dce"
+          "sha256": "323a71215104a98679096160463cbca60dd5f1a9122d93afd9518180d75ee652"
         },
         "selected_workset": {
           "allocation_scope": "PACKAGE_WIDE",
           "allocation_state": "EXPLICIT_PACKAGE_WIDE",
           "path_count": 36,
-          "sha256": "84c6ea608b174e3f6062c5a5baa6bb39e26a4f83e71472b0f6a151ae720f2dce"
+          "sha256": "323a71215104a98679096160463cbca60dd5f1a9122d93afd9518180d75ee652"
         }
       }
     },
     "generator": "scripts/code_navigation.py capsules",
     "generator_version": "1.0.0"
   },
-  "artifact_digest": "51b6390647f16e723a0f1c8926f8929400d0a6c4cc232d4d13e3c8ffe4e6e7c3",
+  "artifact_digest": "99c63e19d51a84c6ee75cc163c28376a80f5be7976793dd3fdab5e2be1dc4c6a",
   "contract_revision": {
     "derivation": "first 16 hex characters of the SHA-256 over the namespaced canonical contract-semantic body (artifact_digest, contract_revision and source_provenance excluded)",
     "value": "8d4e4476ef742678"

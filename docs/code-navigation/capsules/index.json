@@ -1062,8 +1062,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 95,
-          "source_stu": 2181069,
-          "sha256": "f388954698f16eb07346b0fb70917acc74fab0e19433843cb48ee4d627cf4539"
+          "source_stu": 2186582,
+          "sha256": "0dd5c1e577f30b3926e88af5ab2f2e97b8337ef76d37073808ed5c618ba07162"
         },
         "source_classification": {
           "production_source_file_count": 3,
@@ -1135,7 +1135,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/canonical_store_runtime.rs",
-              "bytes": 60095,
+              "bytes": 63327,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1155,7 +1155,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/coordination_mailbox.rs",
-              "bytes": 32730,
+              "bytes": 39997,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1350,7 +1350,7 @@
             },
             {
               "path": "bins/eliot-kernel/src/provider_capability_route.rs",
-              "bytes": 30412,
+              "bytes": 36450,
               "reason": "production source not allocated to this cell"
             },
             {
@@ -1697,8 +1697,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 20,
-          "source_stu": 233678,
-          "sha256": "cd93a81eba98cca19a3e10f903f955fb7028a9e58298f253b1543b392bff035e"
+          "source_stu": 236462,
+          "sha256": "e2032e5d73b359edc972856acb05ca4d4c7ee1b85298a398cc3d4bdee4809030"
         },
         "source_classification": {
           "production_source_file_count": 15,
@@ -6057,8 +6057,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 15,
-          "source_stu": 253112,
-          "sha256": "57e1c529b74ad867878aac3bf08f19261de5d2cd4f34da74d0c525ec7ca3d388"
+          "source_stu": 254367,
+          "sha256": "fa8217cd77f516c138a85d1254a300f2b2c0994684e76239d72d0596aedfc8cb"
         },
         "source_classification": {
           "production_source_file_count": 13,
@@ -7718,8 +7718,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 56,
-          "source_stu": 832588,
-          "sha256": "aa2f45527a41d300127f4bfaa52287aef036bdcdda9d39321ea656726524b6c4"
+          "source_stu": 833078,
+          "sha256": "3421afe2f6f983e72a04f938bb89a73ffcc73ed17e086787e20a16de5e597551"
         },
         "source_classification": {
           "production_source_file_count": 42,
@@ -10026,19 +10026,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-service/contract_kit.json",
-          "artifact_digest": "878c21ebc354d0b1c4d60ca9fb80667d1a3badcb3f0f7f3ccc6d5fbe9aa56c00",
+          "artifact_digest": "65cf302bc1e4f030f18950e0ae713207e4c27758bcf2b3fa776e7c3586365fca",
           "contract_revision": "5ea02eabb3332172"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/context_capsule.json",
-          "artifact_digest": "e50f7177fb209a55d4ed1717bcbd99c12fb337ced2af5faecfb22d7e62fa6efb",
+          "artifact_digest": "113cac6aa67c21c25935190cad85b224c51c585c3a752f136e6db6eab5a626aa",
           "contract_revision": "9ecd7eeec495b53c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/test_capsule.json",
-          "artifact_digest": "48665af724870d64f1b255f76bfa9510efe441628a93c1a89a697b3a8e68568d",
+          "artifact_digest": "25955db3e9c89b42481cb29df5b5f05f9ab4aabacb41d7f10bf7e6819cc88e2f",
           "contract_revision": "01d9f1c2f17c8fc4"
         }
       }
@@ -10378,19 +10378,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/operational-recovery-state/contract_kit.json",
-          "artifact_digest": "d948fd474d0869c57a2c86c077b338e30bb4c764d5b27755de9c60b547950283",
+          "artifact_digest": "e5c73ec368eb48a0fba6b31cb0b8976a62b9232bd375db55c488de40e7e5a8e2",
           "contract_revision": "f0f817c31b0daaf2"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
-          "artifact_digest": "51b6390647f16e723a0f1c8926f8929400d0a6c4cc232d4d13e3c8ffe4e6e7c3",
+          "artifact_digest": "99c63e19d51a84c6ee75cc163c28376a80f5be7976793dd3fdab5e2be1dc4c6a",
           "contract_revision": "8d4e4476ef742678"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
-          "artifact_digest": "7560456b806609108492495b3b97a3a38d58a03d3b4a06ce556b43fdd3a5fd7f",
+          "artifact_digest": "d5e3e85cecf5bcd0a52576040e732b31ded6481cd4e462c70783e5e687d39f2b",
           "contract_revision": "d874d82a1f33c0fc"
         }
       }
@@ -12085,8 +12085,8 @@
         "physical_source_inventory": {
           "method": "STU = ceil(UTF-8 bytes / 3) (I2.16)",
           "file_count": 10,
-          "source_stu": 105085,
-          "sha256": "eb1e96e8a774ef2b16037175b692d192f4ec33966e3da690599c68a9a06f557b"
+          "source_stu": 107773,
+          "sha256": "b0e8f65f9a165ae1acb568a0c931bbd8443abf067108b7c9205f3d2cb0823b53"
         },
         "source_classification": {
           "production_source_file_count": 7,
@@ -16866,19 +16866,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/kernel-service/contract_kit.json",
-          "artifact_digest": "878c21ebc354d0b1c4d60ca9fb80667d1a3badcb3f0f7f3ccc6d5fbe9aa56c00",
+          "artifact_digest": "65cf302bc1e4f030f18950e0ae713207e4c27758bcf2b3fa776e7c3586365fca",
           "contract_revision": "5ea02eabb3332172"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/context_capsule.json",
-          "artifact_digest": "e50f7177fb209a55d4ed1717bcbd99c12fb337ced2af5faecfb22d7e62fa6efb",
+          "artifact_digest": "113cac6aa67c21c25935190cad85b224c51c585c3a752f136e6db6eab5a626aa",
           "contract_revision": "9ecd7eeec495b53c"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/kernel-service/test_capsule.json",
-          "artifact_digest": "48665af724870d64f1b255f76bfa9510efe441628a93c1a89a697b3a8e68568d",
+          "artifact_digest": "25955db3e9c89b42481cb29df5b5f05f9ab4aabacb41d7f10bf7e6819cc88e2f",
           "contract_revision": "01d9f1c2f17c8fc4"
         }
       },
@@ -17433,19 +17433,19 @@
         "contract_kit": {
           "kind": "ModuleContractKit",
           "path": "docs/code-navigation/capsules/operational-recovery-state/contract_kit.json",
-          "artifact_digest": "d948fd474d0869c57a2c86c077b338e30bb4c764d5b27755de9c60b547950283",
+          "artifact_digest": "e5c73ec368eb48a0fba6b31cb0b8976a62b9232bd375db55c488de40e7e5a8e2",
           "contract_revision": "f0f817c31b0daaf2"
         },
         "context_capsule": {
           "kind": "CrateContextCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/context_capsule.json",
-          "artifact_digest": "51b6390647f16e723a0f1c8926f8929400d0a6c4cc232d4d13e3c8ffe4e6e7c3",
+          "artifact_digest": "99c63e19d51a84c6ee75cc163c28376a80f5be7976793dd3fdab5e2be1dc4c6a",
           "contract_revision": "8d4e4476ef742678"
         },
         "test_capsule": {
           "kind": "ModuleTestCapsule",
           "path": "docs/code-navigation/capsules/operational-recovery-state/test_capsule.json",
-          "artifact_digest": "7560456b806609108492495b3b97a3a38d58a03d3b4a06ce556b43fdd3a5fd7f",
+          "artifact_digest": "d5e3e85cecf5bcd0a52576040e732b31ded6481cd4e462c70783e5e687d39f2b",
           "contract_revision": "d874d82a1f33c0fc"
         }
       },
@@ -22590,5 +22590,5 @@
       }
     }
   ],
-  "registry_digest": "097b76d4b0edc98c95f0b521ee1c9d81757ab04821e15a7e7436fb6afd0c6063"
+  "registry_digest": "13cdff94ea6b2f13a1237f8bb222fb1e0ff12b0ceec77c0a90ffbb1d0c2d96a2"
 }
