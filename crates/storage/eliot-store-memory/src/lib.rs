@@ -368,6 +368,12 @@ impl MemoryStore {
             }
         }
         let mut plan = transaction_plan(&state, &transition, &operation_key)?;
+        // Build the optional, exact-byte receipt authority before any named
+        // operation dispatcher mutates in-memory state. Genesis-compatible
+        // transitions have no named operation to index and need no such
+        // authority record.
+        let receipt_authority =
+            memory_receipt_authority(&transition, plan.commit_sequence)?;
         // Issue #1780: admitted notification-state legs execute here, before
         // the receipt is built, so the receipt's outbox references include
         // the appended notification outbox intents. State, receipt, and
@@ -418,8 +424,6 @@ impl MemoryStore {
         // one receipt, recoverable replay without duplicate work. Any other
         // class is a no-op in this hook.
         dispatch_apply_erasure(&mut state, &transition)?;
-        let receipt_authority =
-            memory_receipt_authority(&transition, &receipt, plan.commit_sequence)?;
         Ok(commit_transaction(
             &mut state,
             transition,
@@ -4132,11 +4136,13 @@ fn transaction_receipt(
 
 fn memory_receipt_authority(
     transition: &PreparedTransition,
-    receipt: &WriteReceipt,
     commit_sequence: u64,
-) -> Result<eliot_store_api::RecoveryReceiptAuthority, StoreError> {
-    if transition.named_operations.is_empty() || commit_sequence == 0 {
+) -> Result<Option<eliot_store_api::RecoveryReceiptAuthority>, StoreError> {
+    if commit_sequence == 0 {
         return Err(StoreError::InvalidReceipt);
+    }
+    if transition.named_operations.is_empty() {
+        return Ok(None);
     }
     let named_operation_count = transition.named_operations.len();
     let records = transition
@@ -4155,13 +4161,13 @@ fn memory_receipt_authority(
             })
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
-    Ok(eliot_store_api::RecoveryReceiptAuthority {
-        operation_id: receipt.operation_id.clone(),
-        state_fence: receipt.state_fence.clone(),
+    Ok(Some(eliot_store_api::RecoveryReceiptAuthority {
+        operation_id: transition.identity.operation_id.clone(),
+        state_fence: transition.state_fence.clone(),
         commit_sequence,
         named_operation_count,
         records,
-    })
+    }))
 }
 
 fn commit_transaction(
@@ -4170,7 +4176,7 @@ fn commit_transaction(
     operation_key: String,
     plan: TransactionPlan,
     receipt: WriteReceipt,
-    receipt_authority: eliot_store_api::RecoveryReceiptAuthority,
+    receipt_authority: Option<eliot_store_api::RecoveryReceiptAuthority>,
 ) -> WriteReceipt {
     for head in plan.next_revision_heads {
         state
@@ -4221,9 +4227,11 @@ fn commit_transaction(
     state
         .receipts_by_operation
         .insert(operation_key, receipt.clone());
-    state
-        .receipt_authorities
-        .insert(receipt.operation_id.as_str().to_owned(), receipt_authority);
+    if let Some(receipt_authority) = receipt_authority {
+        state
+            .receipt_authorities
+            .insert(receipt.operation_id.as_str().to_owned(), receipt_authority);
+    }
     receipt
 }
 
