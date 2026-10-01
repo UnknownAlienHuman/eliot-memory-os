@@ -5,6 +5,10 @@
 //! a typed normalization class, but cannot submit an `Allow` decision.
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
+use eliot_config::{
+    BridgeEventPrivacyProjection, BridgeEventSourceClass, BridgeProviderRestriction,
+    BridgeRawRetention,
+};
 use eliot_security_contracts::{
     ClosureCompleteness, DisclosureDecision, DisclosureDecisionKind, DisclosureDependencyClosure,
     ObservationDomainRef, PolicyFence, PrivacyClass,
@@ -109,6 +113,8 @@ pub struct BridgeEventPrivacyOwnerSnapshot {
     pub policy_state_fence: StateFence,
     pub policy_owner_canonical_digest: String,
     pub policy_snapshot_digest: String,
+    /// Typed current Policy terms tied to the exact Kernel named-read digest.
+    pub policy_privacy: BridgeEventPrivacyProjection,
 }
 
 /// Result of Governor disclosure evaluation, bound to exact event bytes and
@@ -157,7 +163,7 @@ impl BridgeEventPrivacyOwnerSnapshot {
         policy_owner: &PolicyOwner,
         attach_receipt: ScopeRelocationOrAttachReceipt,
         privacy_boundary: PrivacyBoundary,
-        retention: BridgeEventRetentionPolicy,
+        policy_privacy: BridgeEventPrivacyProjection,
         domain_rules: Vec<BridgeEventDisclosureDomainRule>,
         closure: BridgeEventDisclosureClosureOwner,
         recipient: BridgeEventPrivacyRecipient,
@@ -216,6 +222,17 @@ impl BridgeEventPrivacyOwnerSnapshot {
                 "WorkScope, attach receipt, boundary and Policy fence disagree",
             ));
         }
+        if policy_privacy.policy_owner_ref != policy_snapshot.policy_owner.owner_ref
+            || policy_privacy.policy_snapshot_id != policy_snapshot.snapshot_id
+            || policy_privacy.policy_revision.value() != policy_owner.revision()
+            || policy_privacy.state_fence != *state_fence
+            || policy_privacy.canonical_snapshot_digest != policy_owner.canonical_digest()
+        {
+            return Err(BridgeEventPrivacyError::InvalidOwner(
+                "Bridge privacy terms do not match current Policy named-read evidence",
+            ));
+        }
+        let retention = retention_from_policy_projection(&policy_privacy)?;
         let snapshot = Self {
             schema_version: BRIDGE_EVENT_PRIVACY_OWNER_SCHEMA_VERSION,
             work_scope,
@@ -230,6 +247,7 @@ impl BridgeEventPrivacyOwnerSnapshot {
             policy_state_fence: state_fence.clone(),
             policy_owner_canonical_digest: policy_owner.canonical_digest().to_owned(),
             policy_snapshot_digest: policy_owner.snapshot_digest().to_owned(),
+            policy_privacy,
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -291,6 +309,19 @@ impl BridgeEventPrivacyOwnerSnapshot {
                 "owner evidence fence or binding mismatch",
             ));
         }
+        if self.policy_privacy.policy_snapshot_id != self.policy_snapshot_id
+            || self.policy_privacy.policy_revision.value() != self.policy_revision
+            || self.policy_privacy.state_fence != self.policy_state_fence
+            || self.policy_privacy.canonical_snapshot_digest
+                != self.policy_owner_canonical_digest
+            || !valid_text(&self.policy_privacy.policy_owner_ref)
+            || self.policy_privacy.terms.validate().is_err()
+            || retention_from_policy_projection(&self.policy_privacy)? != self.retention
+        {
+            return Err(BridgeEventPrivacyError::InvalidOwner(
+                "typed Bridge privacy profile is stale, foreign or inconsistent",
+            ));
+        }
         self.retention.validate()?;
         self.recipient.validate()?;
         if self.domain_rules.is_empty() {
@@ -324,6 +355,46 @@ impl BridgeEventPrivacyOwnerSnapshot {
         }
         Ok(())
     }
+}
+
+fn retention_from_policy_projection(
+    projection: &BridgeEventPrivacyProjection,
+) -> Result<BridgeEventRetentionPolicy, BridgeEventPrivacyError> {
+    let rules = projection
+        .terms
+        .rules
+        .iter()
+        .map(|rule| {
+            let source_class = match rule.source_class {
+                BridgeEventSourceClass::PublicSummary => BridgeEventSourcePrivacyClass::PublicSummary,
+                BridgeEventSourceClass::RedactedSummary => BridgeEventSourcePrivacyClass::RedactedSummary,
+                BridgeEventSourceClass::RestrictedHandleOnly => BridgeEventSourcePrivacyClass::RestrictedHandleOnly,
+            };
+            let disposition = match rule.retention {
+                BridgeRawRetention::RawAllowed => BridgeEventRetentionDisposition::RawAllowed,
+                BridgeRawRetention::RedactedOnly => BridgeEventRetentionDisposition::RedactedOnly,
+                BridgeRawRetention::Denied => BridgeEventRetentionDisposition::Denied,
+            };
+            if disposition == BridgeEventRetentionDisposition::RawAllowed
+                && rule.provider_restriction != BridgeProviderRestriction::HiddenReasoningExcluded
+            {
+                return Err(BridgeEventPrivacyError::InvalidOwner(
+                    "raw retention lacks an admitted provider restriction",
+                ));
+            }
+            Ok(BridgeEventRetentionRule {
+                source_class,
+                workscope_privacy_class: rule.workscope_privacy_class,
+                disposition,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy = BridgeEventRetentionPolicy {
+        policy_ref: projection.policy_snapshot_id.clone(),
+        rules,
+    };
+    policy.validate()?;
+    Ok(policy)
 }
 
 impl BridgeEventRetentionPolicy {
@@ -599,7 +670,7 @@ mod issue_1935_tests {
                 }),
             },
             retention: BridgeEventRetentionPolicy {
-                policy_ref: "retention:test".to_owned(),
+                policy_ref: "policy:test".to_owned(),
                 rules: [
                     BridgeEventSourcePrivacyClass::PublicSummary,
                     BridgeEventSourcePrivacyClass::RedactedSummary,
@@ -645,6 +716,45 @@ mod issue_1935_tests {
             policy_state_fence: fence,
             policy_owner_canonical_digest: "0".repeat(64),
             policy_snapshot_digest: "1".repeat(64),
+            policy_privacy: BridgeEventPrivacyProjection {
+                terms: eliot_config::BridgeEventPrivacyTerms {
+                    schema_version: 1,
+                    rules: [
+                        BridgeEventSourceClass::PublicSummary,
+                        BridgeEventSourceClass::RedactedSummary,
+                        BridgeEventSourceClass::RestrictedHandleOnly,
+                    ]
+                    .into_iter()
+                    .map(|source_class| eliot_config::BridgeEventPrivacyRule {
+                        source_class,
+                        workscope_privacy_class: PrivacyClass::Internal,
+                        provider_restriction: if source_class
+                            == BridgeEventSourceClass::PublicSummary
+                            && disposition == BridgeEventRetentionDisposition::RawAllowed
+                        {
+                            BridgeProviderRestriction::HiddenReasoningExcluded
+                        } else {
+                            BridgeProviderRestriction::Unavailable
+                        },
+                        retention: if source_class == BridgeEventSourceClass::PublicSummary {
+                            match disposition {
+                                BridgeEventRetentionDisposition::RawAllowed => BridgeRawRetention::RawAllowed,
+                                BridgeEventRetentionDisposition::RedactedOnly => BridgeRawRetention::RedactedOnly,
+                                BridgeEventRetentionDisposition::Denied => BridgeRawRetention::Denied,
+                            }
+                        } else {
+                            BridgeRawRetention::RedactedOnly
+                        },
+                    })
+                    .collect(),
+                },
+                policy_owner_ref: "human:test".to_owned(),
+                policy_snapshot_id: "policy:test".to_owned(),
+                policy_revision: eliot_contracts::PolicyRevision::new(1)
+                    .expect("test policy revision"),
+                state_fence: fence.clone(),
+                canonical_snapshot_digest: "0".repeat(64),
+            },
         }
     }
 
