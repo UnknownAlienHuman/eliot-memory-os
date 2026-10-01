@@ -7595,6 +7595,21 @@ fn audit_claim_with_retained(
     // release, and both still project onto `NOT_VERIFIABLE_IN_SCOPE`.
     let unfrozen_material_claim =
         claim.material && !claim_identity_verified && !outside_citation && !revoked_citation;
+    // A material claim that cites nothing and contests nothing is decided ahead
+    // of `excerpt_gap` rather than together with the accounting arm below, and
+    // the predicate is the one that arm already used: it is moved, not widened.
+    //
+    // The reason is causal rather than a matter of taste. `excerpt_gap` means
+    // the excerpt obligation came back `Unsatisfied`, and for a claim that cites
+    // nothing that obligation cannot come back anything else — `admitted_content`
+    // is read off `evidence_map`, which is empty here, so there is no admitted
+    // revision for an excerpt to be checked against and the obligation is
+    // `Unsatisfied` because there was nothing to check, not because a quote was
+    // found wanting. A claim with no quoted words has no quote to have failed, so
+    // reporting the excerpt gap for one names a consequence of citing nothing
+    // while dropping the finding that actually explains it.
+    let uncited_material_claim =
+        claim.material && claim.citations.is_empty() && counterevidence.is_empty();
     // The measured occurrence-and-context result for every exact excerpt the
     // claim offers, computed **before** the terminal outcome so the outcome can
     // read it.
@@ -7682,19 +7697,6 @@ fn audit_claim_with_retained(
         ClaimOutcome::Contradicted
     } else if !unverifiable.is_empty() {
         ClaimOutcome::NotVerifiableInScope
-    } else if excerpt_gap {
-        // The cited source satisfies the requirement, but the exact words the
-        // claim quotes do not verify against the admitted revision — they are
-        // absent, cropped of a governing negation, stitched across sections, or
-        // were never compared with the original because no retained revision was
-        // supplied. I21.8's `excerpt_supports_requirement` is the separate
-        // obligation that catches exactly this, and an admitted source containing
-        // relevant material with an insufficient or wrong excerpt must not yield
-        // a supported claim. This sits after the support-gap arms so a claim that
-        // is *also* missing a whole source still reports the missing source as
-        // the more specific finding; it sits before the `stale_hit` arm so a
-        // stale source is not reported when the quote is additionally wrong.
-        ClaimOutcome::PartiallySupported
     } else if lineage_gap || precision_gap || support_gap {
         if stale_hit && supporting.is_empty() {
             ClaimOutcome::StaleLimited
@@ -7705,14 +7707,55 @@ fn audit_claim_with_retained(
         }
     } else if stale_hit {
         ClaimOutcome::StaleLimited
-    } else if !unknowns.is_empty()
-        || unfrozen_material_claim
-        || (claim.material && claim.citations.is_empty() && counterevidence.is_empty())
-    {
-        // An open material claim, an unfrozen one, or one with preserved unknowns
-        // is not supported. This arm sits after the support gaps so a claim that
-        // is both unsupported and unfrozen reports the support gap, which is the
-        // more specific finding.
+    } else if uncited_material_claim {
+        // The same class this arm has always reported for a material claim that
+        // records no citations, now reached ahead of the excerpt gap for the
+        // causal reason given where `uncited_material_claim` is defined.
+        //
+        // Which public class that is matters and is the reason this is a defect
+        // fix rather than a preference between two refusal classes. Both
+        // `IncompleteAccounting` and `PartiallySupported` refuse release, but
+        // `public_class` projects them onto two different members of the
+        // five-class wire projection, and `PARTIALLY_SUPPORTED` tells a release
+        // consumer that support exists. For a claim whose `evidence_map` is
+        // empty and whose `source_satisfies_requirement` is `Unsatisfied`
+        // because it cited nothing, that is false on its face, so the earlier
+        // position published a materially better answer than the evidence
+        // supports. Nothing is lost by moving it: the excerpt obligation is
+        // still `Unsatisfied` in `requirements`, and `requirements_complete`
+        // and `releasable_as_supported` read that same value as before, so the
+        // claim still cannot be released. Only the class that names the reason
+        // changed.
+        ClaimOutcome::IncompleteAccounting
+    } else if excerpt_gap {
+        // The cited source satisfies the requirement, but the exact words the
+        // claim quotes do not verify against the admitted revision — they are
+        // absent, cropped of a governing negation, stitched across sections, or
+        // were never compared with the original because no retained revision was
+        // supplied. I21.8's `excerpt_supports_requirement` is the separate
+        // obligation that catches exactly this, and an admitted source containing
+        // relevant material with an insufficient or wrong excerpt must not yield
+        // a supported claim. This sits after the support-gap and stale arms so a
+        // claim that is *also* missing a whole cited source, or carrying a stale
+        // one, still reports that as the more specific finding rather than this
+        // one, and after `uncited_material_claim` so a claim that cited nothing is
+        // not told its quote failed.
+        //
+        // The flag itself is unchanged and still means exactly what it says — the
+        // excerpt obligation was `Unsatisfied` — so `requirements`,
+        // `requirement_outcome`, `requirements_complete` and
+        // `releasable_as_supported` read the same value they did before. Only
+        // which terminal class names the gap changed, and only for a claim that
+        // fails some other obligation too.
+        ClaimOutcome::PartiallySupported
+    } else if !unknowns.is_empty() || unfrozen_material_claim {
+        // An open material claim or an unfrozen one is not supported. This arm
+        // sits after the support gaps, the stale finding and the excerpt gap, so
+        // a claim that also has a broken source, a stale one, or a quote that did
+        // not verify reports that as the more specific finding: an unknown or a
+        // missing frozen identity says the audit could not close the claim,
+        // while a quote that does not occur in the admitted revision is a
+        // positive measurement about evidence that was examined.
         ClaimOutcome::IncompleteAccounting
     } else {
         ClaimOutcome::Supported
