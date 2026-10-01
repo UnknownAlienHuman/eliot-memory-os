@@ -114,9 +114,10 @@ pub use negative_memory_read::{
     resolve_negative_memory_rule_read,
 };
 pub use orientation_projection_owner::{
-    OrientationProjectionMemberStates, OrientationProjectionOwnerInput,
-    OrientationProjectionOwnerOutput, OrientationProjectionSourceClosure,
-    bind_orientation_projections,
+    OrientationHeadroomSupplyInput, OrientationProjectionMemberStates,
+    OrientationProjectionOwnerInput, OrientationProjectionOwnerOutput,
+    OrientationProjectionSourceClosure, bind_orientation_projections,
+    build_admitted_orientation_headroom_supply,
 };
 mod controlboard_projection;
 mod learning_admission;

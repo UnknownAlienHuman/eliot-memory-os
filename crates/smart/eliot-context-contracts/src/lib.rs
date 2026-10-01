@@ -79,10 +79,12 @@ pub use error::{
     ContextError, ContextErrorCode, ContextOutcome, DecisionContextIncomplete, ProviderRoleGap,
 };
 pub use headroom::{
-    DOWNSTREAM_HEADROOM_SCHEMA_VERSION, DownstreamHeadroomRequest, DownstreamHeadroomResult,
+    ADMITTED_ORIENTATION_HEADROOM_SCHEMA_VERSION, DOWNSTREAM_HEADROOM_SCHEMA_VERSION,
+    AdmittedOrientationHeadroomSupplyV1, DownstreamHeadroomRequest, DownstreamHeadroomResult,
     HeadroomAllocationLedger, HeadroomAttempt, HeadroomConsumer, HeadroomDecision, HeadroomDemand,
     HeadroomDimension, HeadroomOutcome, HeadroomPurpose, HeadroomQuantity, HeadroomRefusal,
-    HeadroomReleaseCondition, HeadroomReleaseInstruction, PurposeAllocation,
+    HeadroomReleaseCondition, HeadroomReleaseInstruction, OrientationHeadroomDemandProfile,
+    OrientationHeadroomProfileV1, ORIENTATION_HEADROOM_PROFILE_VERSION, PurposeAllocation,
 };
 pub use identity::{
     CONTEXT_CONTRACT_NAME, CONTEXT_CONTRACT_VERSION, ContextBinding, DecisionRevision,

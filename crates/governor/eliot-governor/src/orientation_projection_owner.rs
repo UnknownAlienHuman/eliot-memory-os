@@ -10,13 +10,17 @@ use std::collections::BTreeSet;
 use eliot_agent_api::RouteFingerprint;
 use eliot_context_candidates::ProjectionState;
 use eliot_context_contracts::{
-    AffordanceProjection, CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet,
-    ContextBinding, ContinuityProjection, MAX_PROJECTION_ENTRIES, MAX_PROJECTION_TEXT,
-    MAX_SET_OMISSIONS, OmissionRecord, SafetyProjection, TaskProjection,
+    AdmittedOrientationHeadroomSupplyV1, AffordanceProjection,
+    CANONICAL_PROJECTIONS_SCHEMA_VERSION, CanonicalProjectionSet, ContextBinding,
+    ContextError, ContextRecipe, ContextRecipePolicy, ContinuityProjection,
+    DownstreamHeadroomRequest, HeadroomReleaseCondition, MAX_PROJECTION_ENTRIES,
+    MAX_PROJECTION_TEXT, MAX_SET_OMISSIONS, OmissionRecord, OrientationHeadroomProfileV1,
+    SafetyProjection, TaskProjection,
 };
-use eliot_contracts::fences_match_exact;
+use eliot_contracts::{ArtifactId, TaskId, fences_match_exact};
 use eliot_dreamer_failure::NegativeMemoryDisposition;
 use eliot_read::{DeclaredResultSelector, ReadCoverage, ReadIdentity};
+use eliot_receipts::WorkScopeBinding;
 use eliot_store_api::{NamedReadOperation, NamedReadRequest, ReadConsistency, ScopeRevisionView};
 use eliot_workscope::{ScopeBindingDisposition, WorkScopeBindingSnapshot};
 use serde::Serialize;
@@ -28,6 +32,107 @@ use crate::context_inputs::{
     SevenRoleInputs,
 };
 use crate::{CapabilityRegistry, RouteScopeFingerprint};
+
+/// Original inputs needed to compile one recipe-backed Orientation headroom
+/// request. Every value is supplied by its admitted owner; this function does
+/// not estimate capacity or invent a job/candidate identity.
+#[derive(Clone, Copy, Debug)]
+pub struct OrientationHeadroomSupplyInput<'a> {
+    /// Exact reusable policy selected and admitted by Governor.
+    pub approved_policy: &'a ContextRecipePolicy,
+    /// Exact compilation-bound recipe executed for this request.
+    pub executable_recipe: &'a ContextRecipe,
+    /// Exact Context binding from the original request.
+    pub context_binding: &'a ContextBinding,
+    /// Exact WorkScope receipt admitted for this operation.
+    pub work_scope: &'a WorkScopeBinding,
+    /// Durable job identity from the authenticated claim.
+    pub job_id: &'a TaskId,
+    /// Original pipeline identity already retained with the durable job.
+    pub pipeline_id: &'a ArtifactId,
+    /// Digest from the exact Orientation candidate owner output.
+    pub candidate_digest: &'a str,
+    /// Source revision returned by the original context owner readback.
+    pub source_revision: &'a str,
+    /// Original route and serializer selected by the admitted recipe.
+    pub route_id: &'a str,
+    pub serializer_id: &'a str,
+    /// Completion artifact and deadline from the admitted job contract.
+    pub completion_artifact_id: &'a ArtifactId,
+    pub deadline_ms: u64,
+}
+
+/// Compile the approved recipe's source-backed demands into the exact
+/// downstream owner request, preserving the original job, candidate, task,
+/// scope, operation, source revision and fence closure.
+pub fn build_admitted_orientation_headroom_supply(
+    input: OrientationHeadroomSupplyInput<'_>,
+) -> Result<AdmittedOrientationHeadroomSupplyV1, ContextError> {
+    input.approved_policy.validate()?;
+    input
+        .approved_policy
+        .binds_recipe(input.executable_recipe)?;
+    input.executable_recipe.validate()?;
+    input.context_binding.validate()?;
+    input.work_scope.state_fence.validate().map_err(|_| ContextError::InvalidFence)?;
+    if input.context_binding != &input.executable_recipe.binding
+        || input.work_scope.scope_id != input.context_binding.scope_id
+        || input.work_scope.state_fence != input.context_binding.state_fence
+        || input.context_binding.operation_id.is_none()
+        || input.deadline_ms == 0
+    {
+        return Err(ContextError::IdentityConflict);
+    }
+    let operation_id = input
+        .context_binding
+        .operation_id
+        .as_ref()
+        .ok_or(ContextError::MissingField("orientation_headroom.operation_id"))?;
+    let attempt_id = ArtifactId::new(input.context_binding.attempt_id.as_str().to_owned())
+        .map_err(|_| ContextError::InvalidField("orientation_headroom.attempt_id"))?;
+    let state_fence = &input.context_binding.state_fence;
+    let profile: &OrientationHeadroomProfileV1 =
+        &input.approved_policy.orientation_headroom_profile;
+    let release = HeadroomReleaseCondition {
+        completion_receipt: input.completion_artifact_id.clone(),
+        release_on_cancel: profile.release_on_cancel,
+        expires_at_ms: input.deadline_ms,
+    };
+    let request: DownstreamHeadroomRequest = profile.compile_request(
+        input.pipeline_id.clone(),
+        attempt_id.clone(),
+        input.context_binding.clone(),
+        input.route_id.to_owned(),
+        input.serializer_id.to_owned(),
+        input.executable_recipe.recipe_sha256.clone(),
+        operation_id,
+        state_fence,
+        input.deadline_ms,
+        input.completion_artifact_id.clone(),
+    )?;
+    let request_digest = request.canonical_digest()?;
+    let work_scope = input.work_scope.clone();
+    let supply = AdmittedOrientationHeadroomSupplyV1 {
+        schema_version: eliot_context_contracts::ADMITTED_ORIENTATION_HEADROOM_SCHEMA_VERSION,
+        request,
+        request_digest,
+        candidate_digest: input.candidate_digest.to_owned(),
+        pipeline_id: input.pipeline_id.clone(),
+        job_id: input.job_id.clone(),
+        task_id: input.context_binding.task_id.clone(),
+        attempt_id,
+        work_scope,
+        context_binding: input.context_binding.clone(),
+        state_fence: state_fence.clone(),
+        operation_id: operation_id.clone(),
+        source_revision: input.source_revision.to_owned(),
+        deadline_ms: input.deadline_ms,
+        completion_artifact_id: input.completion_artifact_id.clone(),
+        release,
+    };
+    supply.validate()?;
+    Ok(supply)
+}
 
 /// Original owner values supplied to the projection join.
 #[derive(Clone, Copy, Debug)]

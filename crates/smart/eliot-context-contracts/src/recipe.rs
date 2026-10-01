@@ -32,6 +32,7 @@
 //!   result_budgets                           -> section_budgets
 //! protected_reasoning_review_and_margin
 //!   _reserve                                 -> protected_reserve
+//! downstream resource formula/profile        -> orientation_headroom_profile
 //! layout_position_and_repetition_policy      -> layout
 //! omission_and_expansion_policy              -> omission
 //! scorecard_blocking_dimensions              -> blocking_dimensions
@@ -215,6 +216,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AdmittedContextSet, BoundaryDisposition, BoundaryTransformerRevision, BoundaryUnitKind,
     ContextError, ContextRecipe, DecisionSafetyFloor, LossPolicy, NonRecoverableReason,
+    OrientationHeadroomProfileV1,
     OmissionReason, QUALITY_DIMENSIONS, QualityApplicability, QualityApplicabilityInput,
     QualityDimension, RepresentationKind, SemanticRole, validate_digest, validate_text,
 };
@@ -233,7 +235,9 @@ use crate::{
 /// #1725 W3k9 raised this from `1` to `2`. Revision `2` adds the required
 /// [`ContextSectionBudget`] members `required_exact_references` and
 /// `planning_route_profile`; revision `1` carried only a whole-unit count and a
-/// bare planning figure. Nothing is defaulted and nothing is reinterpreted:
+/// bare planning figure. Revision `3` adds the approved, source-backed
+/// `orientation_headroom_profile`; no resource quantity or release policy is
+/// defaulted from an operation request. Nothing is reinterpreted:
 /// `required_exact_references` has no `#[serde(default)]`, so a revision-`1`
 /// payload cannot decode into a revision-`2` policy, and `validate()` refuses a
 /// `policy_schema_version` that is not this exact constant. An approved
@@ -241,8 +245,10 @@ use crate::{
 /// recorded `policy_sha256`; re-issuing it as revision `2` is a new owner
 /// decision naming the exact required identities and the route profile its
 /// planning maximum is expressed in, because revision `1` never said which
-/// whole units were required or in which profile.
-pub const CONTEXT_RECIPE_POLICY_SCHEMA_VERSION: u32 = 2;
+/// whole units were required or in which profile. A revision-`2` policy cannot
+/// declare downstream resource demand because that profile was not part of its
+/// approved bytes.
+pub const CONTEXT_RECIPE_POLICY_SCHEMA_VERSION: u32 = 3;
 
 /// Digest domain separator for the reusable recipe policy.
 ///
@@ -1249,6 +1255,9 @@ pub struct ContextRecipePolicy {
     pub section_budgets: Vec<ContextSectionBudget>,
     /// Protected reasoning/review reserve and protected margin.
     pub protected_reserve: ProtectedReservePolicy,
+    /// Approved source-backed resource profile for Orientation's downstream
+    /// completion consumer. Its facts are included in `policy_sha256`.
+    pub orientation_headroom_profile: OrientationHeadroomProfileV1,
     /// Layout, position and repetition policy.
     pub layout: RecipeLayoutPolicy,
     /// Omission and expansion policy.
@@ -1342,6 +1351,7 @@ impl ContextRecipePolicy {
         }
         self.validate_section_budgets(&features)?;
         self.protected_reserve.validate()?;
+        self.orientation_headroom_profile.validate()?;
         self.layout.validate()?;
         for declared in &self.layout.role_positions {
             if !features.contains(&declared.semantic_role) {
