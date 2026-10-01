@@ -1257,13 +1257,16 @@ fn check_verified_binds_intake(
 ///
 /// Missing, substituted, moved-route, or stale-activation material refuses
 /// here, before the first possible external effect: the activation must
-/// address this exact admission and attempt (and belong to it), and the live
+/// address this exact admission and attempt (and belong to it), the live
+/// queue head must still carry the consumed route revision, and the live
 /// fence/epoch must still match the activation fence/epoch.
 fn revalidate_launch_gate(
+    composition: &DaemonComposition,
     kernel: &Arc<DaemonKernelClient>,
     admission: &FabricAdmission,
     attempt_id: &AttemptId,
     evidence: &ActivationEvidence,
+    consumed: &VerifiedProviderMaterial,
 ) -> Result<(), DaemonError> {
     if evidence.admission_id != admission.admission_id
         || evidence.attempt_id != *attempt_id
@@ -1272,6 +1275,29 @@ fn revalidate_launch_gate(
         return Err(DaemonError::ProviderAdmission(FabricError::StaleAdmission(
             "solo launch gate refuses activation for another admission or attempt".to_owned(),
         )));
+    }
+    {
+        let state = composition.solo_state.lock().map_err(|_| {
+            DaemonError::Composition(CompositionError::Recovery(
+                "solo driver state lock poisoned".to_owned(),
+            ))
+        })?;
+        let Some(head) = state.queue.front() else {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo launch gate refuses: queue head left before dispatch".to_owned(),
+                ),
+            ));
+        };
+        if head.claimed.operation_id != consumed.operation_id
+            || head.claimed.route_revision != consumed.route_revision
+        {
+            return Err(DaemonError::ProviderAdmission(
+                FabricError::IdentityConflict(
+                    "solo launch gate refuses a route-moved activation".to_owned(),
+                ),
+            ));
+        }
     }
     let live = kernel.kernel_fence();
     if !fences_match_exact(&live, &evidence.fence) {
@@ -1568,7 +1594,14 @@ async fn drive_admitted_material_async(
     // after the last owner write and before the first possible external
     // effect. Missing, substituted, moved-route, or stale-activation
     // material refuses here instead of launching.
-    revalidate_launch_gate(kernel, &admission, &attempt_id, &activation)?;
+    revalidate_launch_gate(
+        composition,
+        kernel,
+        &admission,
+        &attempt_id,
+        &activation,
+        &prepared,
+    )?;
     let dispatch_id = solo_dispatch_identity(attempt_id.as_str(), admission.admission_id.as_str());
     let intent = fabric.dispatch(&admission.admission_id, &attempt_id, &dispatch_id)?;
     let dispatch = SoloDispatchRecord {
