@@ -341,11 +341,12 @@ pub struct CanonicalLaunchOutboxIntent {
 /// them is the launch row that store issued under
 /// [`eliot_store_api::OutboxIntentKind::Launch`].
 ///
-/// The row is selected by the store's own prefix classifier, never by a
-/// caller-supplied id, so an event-projection row can never be adopted as
-/// launch authority. The check is also scoped to THIS operation: a receipt
-/// whose operation identity is not the one being proven, or which is not a
-/// committed receipt at all, proves nothing.
+/// Exactly one launch row must appear in the owner receipt, and its ID must
+/// equal the original owner-prepared transition's expected launch ID. The
+/// ID is also checked against the store's `Launch.outbox_id(operation, 0)`
+/// naming rule; a foreign same-operation launch or duplicate launch cannot be
+/// adopted by selecting the first matching prefix. The check is scoped to THIS
+/// committed operation and exact prepared launch identity.
 ///
 /// # Errors
 ///
@@ -355,6 +356,7 @@ pub struct CanonicalLaunchOutboxIntent {
 pub fn verify_launch_outbox_intent(
     receipt: &CanonicalWriteReceipt,
     operation_id: &OperationIdentity,
+    expected_launch_outbox_id: &eliot_store_api::OutboxId,
 ) -> Result<CanonicalLaunchOutboxIntent, OrsError> {
     receipt
         .validate()
@@ -364,18 +366,28 @@ pub fn verify_launch_outbox_intent(
     {
         return Err(OrsError::ReconciliationMismatch);
     }
-    // The store's own launch-row naming is the only spelling accepted, and the
-    // row must be one the receipt itself enumerates: a launch row the owner did
-    // not record against this operation is not this operation's launch intent.
-    let prefix = format!("{}-", eliot_store_api::OutboxIntentKind::Launch.id_prefix());
-    let outbox_id = receipt
+    let derived_expected = eliot_store_api::OutboxIntentKind::Launch
+        .outbox_id(operation_id.as_str(), 0)
+        .map_err(|_| OrsError::ReconciliationMismatch)?;
+    if expected_launch_outbox_id != &derived_expected {
+        return Err(OrsError::ReconciliationMismatch);
+    }
+    // The store's own launch-kind classifier is the only selector accepted;
+    // exactly one launch row must be in the exact receipt, and that ID must
+    // equal both the prepared expectation and the operation-derived ID.
+    let launch_rows = receipt
         .outbox_refs
         .iter()
-        .map(eliot_store_api::OutboxId::as_str)
-        .find(|outbox_id| outbox_id.starts_with(&prefix))
-        .ok_or(OrsError::ReconciliationMismatch)?;
+        .filter(|outbox_id| {
+            eliot_store_api::OutboxIntentKind::of(outbox_id)
+                == Some(eliot_store_api::OutboxIntentKind::Launch)
+        })
+        .collect::<Vec<_>>();
+    if launch_rows.len() != 1 || launch_rows[0] != expected_launch_outbox_id {
+        return Err(OrsError::ReconciliationMismatch);
+    }
     Ok(CanonicalLaunchOutboxIntent {
-        outbox_id: outbox_id.to_owned(),
+        outbox_id: expected_launch_outbox_id.as_str().to_owned(),
         operation_id: operation_id.as_str().to_owned(),
     })
 }
@@ -450,6 +462,7 @@ pub fn prove_canonical_admission_for_reservation<S: OperationalRecoveryStore + ?
     proposed_attempt_id: &OperationIdentity,
     operation_id: &OperationIdentity,
     commit: &CanonicalAdmissionCommit,
+    expected_launch_outbox_id: &eliot_store_api::OutboxId,
     authority_epoch: &EpochLineage,
     state_fence: &StateFenceSnapshot,
     now_ms: i64,
@@ -501,7 +514,11 @@ pub fn prove_canonical_admission_for_reservation<S: OperationalRecoveryStore + ?
     // derived from that receipt's own reconciliation envelope — is built from
     // that same owner-issued receipt: never from a Kernel assertion and never
     // inferred from a successful transport call.
-    let launch = verify_launch_outbox_intent(&commit.receipt, operation_id)?;
+    let launch = verify_launch_outbox_intent(
+        &commit.receipt,
+        operation_id,
+        expected_launch_outbox_id,
+    )?;
     let retained = canonical_admission_from_owner_commit(
         &commit.receipt,
         operation_id.as_str(),
@@ -614,7 +631,19 @@ pub fn reconcile_canonical_admission(
             // intent for this operation is also proven: a committed `ADMITTED`
             // decision without its launch outbox is not the complete I14.6 step
             // 3, so it stays Unknown rather than becoming activation authority.
-            if verify_launch_outbox_intent(receipt, &reconciled_operation).is_err() {
+            let expected_launch_id = match eliot_store_api::OutboxIntentKind::Launch
+                .outbox_id(reconciled_operation.as_str(), 0)
+            {
+                Ok(expected) => expected,
+                Err(_) => {
+                    return Ok(CanonicalAdmissionResolution::Unknown {
+                        reason: CanonicalAdmissionUnknownReason::LaunchIntentUnproven,
+                    });
+                }
+            };
+            if verify_launch_outbox_intent(receipt, &reconciled_operation, &expected_launch_id)
+                .is_err()
+            {
                 return Ok(CanonicalAdmissionResolution::Unknown {
                     reason: CanonicalAdmissionUnknownReason::LaunchIntentUnproven,
                 });

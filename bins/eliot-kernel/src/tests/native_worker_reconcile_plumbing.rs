@@ -129,6 +129,7 @@ fn claim_record(
         binding_digest: binding_digest.to_owned(),
         request_digest: "e".repeat(64),
         executable_binding_digest: "d".repeat(64),
+        executable_binding_record_json: None,
         execution_unit_schema_version: 1,
         predecessor_revision: label(&format!("{claim}-predecessor")),
         resource_envelope_digest: "f".repeat(63) + "0",
