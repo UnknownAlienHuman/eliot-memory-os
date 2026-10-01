@@ -36,7 +36,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use eliot_authority::{
     AuthorityError, CrossRootQuarantineEvidence, GrantGraphRecoverySnapshot,
-    QuarantineEnforcementRef, RevocationHistoryEvidence, VerifiedQuarantineBinding,
+    QuarantineEnforcementRef, RevocationHistoryEvidence, RootTransitionRecord,
+    VerifiedQuarantineBinding,
 };
 use eliot_contracts::StateFence;
 use eliot_receipts::{GrantClosureDeclaration, ReceiptIdentity};
@@ -75,6 +76,9 @@ use crate::introduction_lifecycle::IntroductionHydration;
 /// - `retained_quarantine_decisions` are the typed semantic decisions the
 ///   owner retained keyed by decision reference, proving presented
 ///   evidence content;
+/// - `retained_transition_decisions` are the typed semantic decisions the
+///   owner retained keyed by decision reference, resolving the owner
+///   readback a root transition's admission requires;
 /// - `retained_quarantine_enforcements` are the exact enforcement results
 ///   the owner retained keyed by ORS record reference, resolving claimed
 ///   ORS references.
@@ -124,6 +128,16 @@ pub struct GovernorClosureRestore {
     /// against these owner facts; absence fails closed to a partial
     /// closure, never to a complete one.
     pub retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
+    /// Typed semantic transition decisions the owner retained, keyed by
+    /// semantic decision reference. This is the owner-readback carrier a
+    /// cross-root transition admission must resolve its decision inside, on
+    /// the same durable-boundary-only terms as the quarantine decisions
+    /// above: the adapter validates the carrier and never derives a decision
+    /// from presented material. Never defaulted — an omitted section is a
+    /// decode refusal, not an empty one, because an owner that retains
+    /// nothing must say so rather than let absence read as a satisfied
+    /// readback.
+    pub retained_transition_decisions: BTreeMap<String, RootTransitionRecord>,
     /// Exact mechanical enforcement results the owner retained, keyed by
     /// durable ORS record reference. A claimed ORS reference must resolve
     /// here before any receipt readback can satisfy a fenced disposition;
@@ -135,18 +149,30 @@ pub struct GovernorClosureRestore {
 pub const GOVERNOR_CLOSURE_RESTORE_SCHEMA: &str = "eliot.kernel.governor-closure-restore";
 /// Current Governor-to-Kernel closure restore wire version.
 ///
-/// v2 adds the typed quarantine-evidence map (#2976). The retained
-/// semantic decisions and exact enforcement results ride v2 as optional
-/// readback facts on the `canonical_receipts` precedent: their absence
-/// fails closed to a partial closure, never to a complete one, and an
-/// unpatched reader refuses patched bytes loudly through
-/// `deny_unknown_fields` instead of silently downgrading to
-/// identity-only readback. This versions the Governor-to-Kernel restore
-/// contract once, coherently with — but separately from — the #2962
-/// grant-graph recovery v2 it embeds: each contract carries its own
-/// single version lineage, never competing interpretations of one
-/// payload.
-pub const GOVERNOR_CLOSURE_RESTORE_VERSION: u16 = 2;
+/// v2 added the typed quarantine-evidence map (#2976). The retained
+/// semantic quarantine decisions and exact enforcement results ride v2 as
+/// optional readback facts on the `canonical_receipts` precedent: their
+/// absence fails closed to a partial closure, never to a complete one, and
+/// an unpatched reader refuses patched bytes loudly through
+/// `deny_unknown_fields` instead of silently downgrading to identity-only
+/// readback.
+///
+/// v3 (#2962) adds the typed retained **transition** decision map. Unlike the
+/// quarantine readback facts, this carrier is authority-sensitive rather than
+/// refusal-only: it is the half of the root-transition owner readback that
+/// decides whether a cross-root crossing resolves its semantic decision, so it
+/// is written on every v3 payload and required on every v3 read. It carries no
+/// `#[serde(default)]` and no `skip_serializing_if`, so an absent carrier is a
+/// loud decode refusal instead of an empty map that would read as an owner
+/// retaining no decision, and an owner that genuinely retains none must state
+/// it explicitly. The version bump is what makes the schema change unambiguous:
+/// `deny_unknown_fields` plus the version equality check means a v2 reader
+/// refuses v3 bytes and a v3 reader refuses v2 bytes, so no payload is ever
+/// interpreted under the wrong contract. Each contract carries its own single
+/// version lineage, never competing interpretations of one payload, and this
+/// lineage stays coherently — but separately — from the #2962 grant-graph
+/// recovery v2 the snapshot embeds.
+pub const GOVERNOR_CLOSURE_RESTORE_VERSION: u16 = 3;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +191,11 @@ struct GovernorClosureRestoreWire {
     quarantine_evidence: BTreeMap<String, CrossRootQuarantineEvidence>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     retained_quarantine_decisions: BTreeMap<String, CrossRootQuarantineEvidence>,
+    // No `serde(default)` and no `skip_serializing_if`: the retained
+    // transition decision carrier is authority-sensitive readback, so it is
+    // always written and always required. An omitted section refuses the
+    // decode rather than reading as an owner that retains nothing.
+    retained_transition_decisions: BTreeMap<String, RootTransitionRecord>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     retained_quarantine_enforcements: BTreeMap<String, QuarantineEnforcementRef>,
 }
@@ -187,6 +218,7 @@ impl serde::Serialize for GovernorClosureRestore {
             canonical_receipts: self.canonical_receipts.clone(),
             quarantine_evidence: self.quarantine_evidence.clone(),
             retained_quarantine_decisions: self.retained_quarantine_decisions.clone(),
+            retained_transition_decisions: self.retained_transition_decisions.clone(),
             retained_quarantine_enforcements: self.retained_quarantine_enforcements.clone(),
         }
         .serialize(serializer)
@@ -217,6 +249,7 @@ impl<'de> serde::Deserialize<'de> for GovernorClosureRestore {
             canonical_receipts: wire.canonical_receipts,
             quarantine_evidence: wire.quarantine_evidence,
             retained_quarantine_decisions: wire.retained_quarantine_decisions,
+            retained_transition_decisions: wire.retained_transition_decisions,
             retained_quarantine_enforcements: wire.retained_quarantine_enforcements,
         })
     }
@@ -338,6 +371,15 @@ impl GovernorClosureSource {
     )]
     fn admit(restore: GovernorClosureRestore) -> Result<AdmittedClosureState, KernelError> {
         validate_canonical_receipt_links(&restore.canonical_receipts)?;
+        // The Kernel revalidates the retained transition decision carrier for
+        // the same reason it revalidates the canonical receipt links: map
+        // identity, closed shape, and operation uniqueness are proven here so
+        // a later owner readback cannot resolve a substituted or malformed
+        // decision. This gate never admits anything — a crossing still refuses
+        // until a root transition is admitted against a CURRENT readback — so
+        // adding the carrier cannot make a transition-bearing snapshot restore
+        // as authority.
+        validate_retained_transition_decision_links(&restore.retained_transition_decisions)?;
         let history = restore.revocation_history.as_ref().ok_or_else(|| {
             KernelError::RecoveryUnavailable(
                 "closure owner revocation history is unavailable; unavailable history is not absence of revocation".to_owned(),
@@ -984,6 +1026,41 @@ fn validate_retained_decision_links(
     Ok(())
 }
 
+/// Validates owner-retained semantic transition decisions before the restore
+/// becomes a trust anchor: map identity against the semantic decision
+/// reference, closed structural shape, and operation identity uniqueness.
+/// CURRENT qualification is proven per admission against the live owner
+/// readback, never here, so this gate admits nothing and an empty map simply
+/// resolves no reference.
+fn validate_retained_transition_decision_links(
+    links: &BTreeMap<String, RootTransitionRecord>,
+) -> Result<(), KernelError> {
+    let mut operation_ids = BTreeSet::new();
+    let mut idempotency_keys = BTreeSet::new();
+    for (decision_ref, retained) in links {
+        if decision_ref != &retained.semantic_decision_ref {
+            return Err(KernelError::InvalidField {
+                field: "restore.retained_transition_decision.decision_ref",
+                reason: "map key disagrees with the retained decision reference",
+            });
+        }
+        retained.validate_shape().map_err(|error| {
+            KernelError::RecoveryUnavailable(format!(
+                "retained transition decision refused: {error}"
+            ))
+        })?;
+        if !operation_ids.insert(retained.operation_id.clone())
+            || !idempotency_keys.insert(retained.idempotency_key.clone())
+        {
+            return Err(KernelError::InvalidField {
+                field: "restore.retained_transition_decision.operation_id",
+                reason: "operation identity is bound to more than one decision",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validates owner-retained exact enforcement results before the restore
 /// becomes a trust anchor: map identity against the ORS record
 /// reference, closed shape, and enforcement operation uniqueness.
@@ -1478,6 +1555,10 @@ mod tests {
             // No retained quarantine readback either: nothing was decided
             // or enforced for this fixture.
             retained_quarantine_decisions: BTreeMap::new(),
+            // No retained transition readback either: this fixture re-roots
+            // nothing, so the owner retains no transition decision and no
+            // crossing could resolve one here.
+            retained_transition_decisions: BTreeMap::new(),
             retained_quarantine_enforcements: BTreeMap::new(),
         })
     }
