@@ -105,7 +105,7 @@ jobs:
         shell: pwsh
         run: |
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Dependency-policy input preparation'
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Owner entrypoint scripts/prepare-dependency-policy-inputs.py (profile offline-source) owns the pinned scanner identity, scripts/provision-surrealdb-release.py and the standalone resolver inputs. This step adds only the exact pinned scanner install and the root locked prefetch; it writes no lock, no receipt and no verdict'
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '- Owner entrypoint scripts/prepare-dependency-policy-inputs.py (profile offline-source) owns the pinned scanner identity, scripts/provision-surrealdb-release.py and the standalone resolver inputs. This step adds only the exact pinned scanner install, the retained scanner acquisition outcome record and the root locked prefetch; it writes no lock and no verdict'
           # The dependency-policy gate resolves its scanner through PATH and
           # admits only digest-matched bytes, so a clean runner must
           # materialize the exact identity declared in
@@ -114,11 +114,40 @@ jobs:
           # never installs a tool, so this provisioning call stays ahead of
           # it. A nonzero exit here keeps the gate failed; the provisioner
           # provisions inputs and never writes a verdict.
+          $scannerReceipt = '.eliot/dependency-policy/cargo-deny/provisioning-outcome.json'
           $scannerJson = python scripts/provision-dependency-scanner.py --root .
           $scannerExit = $LASTEXITCODE
+          # Retained fixed-source acquisition outcome (issue #3004, external
+          # audit 5886158422: "retain a result for one fixed source"). The
+          # provisioner writes this receipt on BOTH paths, so a failed or
+          # truncated download still leaves a record for the exact candidate
+          # instead of exiting with none. Its digest is recomputed over the
+          # exact bytes on disk, never quoted from the receipt itself. This is
+          # report-only: the receipt cannot promote a failed acquisition, the
+          # nonzero exit below still fails the step, and the read-only offline
+          # gate retains the verdict.
+          if (Test-Path -LiteralPath $scannerReceipt -PathType Leaf) {
+            $scannerReceiptHash = ((Get-FileHash -LiteralPath $scannerReceipt -Algorithm SHA256).Hash).ToLowerInvariant()
+            $scannerReceiptRaw = Get-Content -LiteralPath $scannerReceipt -Raw
+            $scannerOutcome = $null
+            try { $scannerOutcome = $scannerReceiptRaw | ConvertFrom-Json } catch { $scannerOutcome = $null }
+            if ($null -eq $scannerOutcome) {
+              Write-Host "SCANNER_OUTCOME_BINDING: malformed=$scannerReceipt sha256=$scannerReceiptHash"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Scanner acquisition receipt malformed sha256=$scannerReceiptHash (retained bytes are unreadable; the offline gate keeps the failed result failed)"
+            } else {
+              Write-Host "SCANNER_OUTCOME_BINDING: sha256=$scannerReceiptHash status=$($scannerOutcome.status) source_sha=$($scannerOutcome.source_sha) failure_kind=$($scannerOutcome.failure_kind)"
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Scanner acquisition receipt sha256=$scannerReceiptHash status=$($scannerOutcome.status) source_sha=$($scannerOutcome.source_sha) (digest recomputed over the exact bytes on disk; an outcome record, never a PASS receipt)"
+              if (-not [string]::IsNullOrWhiteSpace([string]$scannerOutcome.failure_kind)) {
+                Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Scanner acquisition failed: $($scannerOutcome.failure_kind) - $([string]$scannerOutcome.detail)"
+              }
+            }
+          } else {
+            Write-Host "SCANNER_OUTCOME_BINDING: absent=$scannerReceipt"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Scanner acquisition receipt absent at $scannerReceipt (the offline gate below owns the verdict and reports the same inputs)"
+          }
           if ($scannerExit -ne 0) {
             Write-Host "PREPARE_SCANNER_EXACT_IDENTITY: exit=$scannerExit"
-            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Pinned scanner provisioning exit=$scannerExit (exact identity unavailable; the offline gate keeps the failed result failed)"
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Pinned scanner provisioning exit=$scannerExit (exact identity unavailable; the retained outcome record above names the failure; the offline gate keeps the failed result failed)"
             exit $scannerExit
           }
           $scanner = ($scannerJson -join "`n") | ConvertFrom-Json
@@ -357,6 +386,7 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value '### Failure diagnostics (MERGE_COMPILE_SOURCE_ONLY)'
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "- Candidate source SHA=$candidateSha profile=MergeCompile event=$env:GITHUB_EVENT_NAME ref=$env:GITHUB_REF run=$env:GITHUB_RUN_ID"
           $diagnosticPaths = @(
+            '.eliot/dependency-policy/cargo-deny/provisioning-outcome.json',
             '.eliot/dependency-policy-preparation.json',
             '.eliot/dependency-policy/surrealdb/provisioning-receipt.json',
             '.eliot/dependency-policy-artifacts/sbom.json',
