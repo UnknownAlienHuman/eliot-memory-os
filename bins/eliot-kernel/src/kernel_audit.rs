@@ -94,9 +94,8 @@ where
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.as_mut().get_mut();
-            let previous = ACTIVE_AUDIT_REQUEST_IDENTITY.with(|active| {
-                std::mem::replace(&mut *active.borrow_mut(), this.identity.clone())
-            });
+            let previous = ACTIVE_AUDIT_REQUEST_IDENTITY
+                .with(|active| std::mem::replace(&mut *active.borrow_mut(), this.identity.clone()));
             struct Restore(Option<RequestIdentity>);
             impl Drop for Restore {
                 fn drop(&mut self) {
@@ -3092,14 +3091,11 @@ impl crate::KernelComposition {
             || frame.connection_id != session.connection_id
             || envelope.connection_id != session.connection_id
             || frame.request_id.as_ref() != Some(&envelope.identity.request_id)
-            || frame
-                .request_identity
-                .as_ref()
-                .is_none_or(|identity| {
-                    identity.validate().is_err()
-                        || identity.request.metadata.request_id != envelope.identity.request_id
-                        || identity.request.state_fence != envelope.state_fence
-                })
+            || frame.request_identity.as_ref().is_none_or(|identity| {
+                identity.validate().is_err()
+                    || identity.request.metadata.request_id != envelope.identity.request_id
+                    || identity.request.state_fence != envelope.state_fence
+            })
             || !session
                 .module_generation
                 .state_fence
@@ -3131,19 +3127,15 @@ impl crate::KernelComposition {
             lineage.work_scope.as_deref(),
             lineage.module_generation.as_deref(),
         ) else {
-            return CrashOperationContext::UnavailableWithOwnerEvidence(
-                original_owner_evidence,
-            );
+            return CrashOperationContext::UnavailableWithOwnerEvidence(original_owner_evidence);
         };
         if operation_id.trim().is_empty() {
-            return CrashOperationContext::UnavailableWithOwnerEvidence(
-                original_owner_evidence,
-            );
+            return CrashOperationContext::UnavailableWithOwnerEvidence(original_owner_evidence);
         }
         let base = self.crash_runtime_context(false);
         let same_fence = base.state_fence.as_ref() == Some(&envelope.state_fence);
-        let runtime_context = CrashRuntimeContext::from_observations(
-            CrashRuntimeContextObservations {
+        let runtime_context =
+            CrashRuntimeContext::from_observations(CrashRuntimeContextObservations {
                 module_generation_ref: Some(module_generation.to_owned()),
                 process_generation_ref: same_fence.then_some(base.process_generation_ref).flatten(),
                 state_fence: Some(envelope.state_fence.clone()),
@@ -3152,12 +3144,9 @@ impl crate::KernelComposition {
                 audit_head: same_fence.then_some(base.audit_head).flatten(),
                 evidence_handles: Vec::new(),
                 journal_head: None,
-            },
-        );
+            });
         if runtime_context.validate().is_err() {
-            return CrashOperationContext::UnavailableWithOwnerEvidence(
-                original_owner_evidence,
-            );
+            return CrashOperationContext::UnavailableWithOwnerEvidence(original_owner_evidence);
         }
         CrashOperationContext::Current {
             runtime_context,
@@ -3224,9 +3213,15 @@ impl crate::KernelComposition {
                 || envelope.identity.cancellation_id != identity.cancellation_id
                 || envelope.identity.deadline_unix_ms != identity.deadline_unix_ms
                 || envelope.identity.task_id.as_deref()
-                    != request_metadata.task_id.as_ref().map(|value| value.as_str())
+                    != request_metadata
+                        .task_id
+                        .as_ref()
+                        .map(|value| value.as_str())
                 || envelope.identity.session_id.as_deref()
-                    != request_metadata.session_id.as_ref().map(|value| value.as_str())
+                    != request_metadata
+                        .session_id
+                        .as_ref()
+                        .map(|value| value.as_str())
             {
                 return unavailable;
             }
@@ -3327,8 +3322,8 @@ impl crate::KernelComposition {
         };
         let base = self.crash_runtime_context(false);
         let same_fence = base.state_fence.as_ref() == Some(&identity.request.state_fence);
-        let runtime_context = CrashRuntimeContext::from_observations(
-            CrashRuntimeContextObservations {
+        let runtime_context =
+            CrashRuntimeContext::from_observations(CrashRuntimeContextObservations {
                 module_generation_ref: lineage.module_generation.clone(),
                 process_generation_ref: same_fence.then_some(base.process_generation_ref).flatten(),
                 state_fence: Some(identity.request.state_fence.clone()),
@@ -3337,8 +3332,7 @@ impl crate::KernelComposition {
                 audit_head: same_fence.then_some(base.audit_head).flatten(),
                 evidence_handles: Vec::new(),
                 journal_head: None,
-            },
-        );
+            });
         if runtime_context.validate().is_err() {
             return CrashOperationContext::UnavailableWithOwnerEvidence(original_owner_evidence);
         }
@@ -3393,9 +3387,7 @@ impl crate::KernelComposition {
                 ),
             );
         }
-        if let Err(error) = handle
-            .update_context(self.crash_runtime_context(false))
-        {
+        if let Err(error) = handle.update_context(self.crash_runtime_context(false)) {
             handle.invalidate_runtime_context();
             return Err(error);
         }
@@ -3474,22 +3466,27 @@ impl crate::KernelComposition {
                 },
             );
         let process_generation_ref = if try_only {
-            self.service
-                .try_lock()
-                .ok()
-                .and_then(|service| service.candidate_binding().map(|candidate| {
+            self.service.try_lock().ok().and_then(|service| {
+                service.candidate_binding().map(|candidate| {
                     format!(
                         "{}:{}",
-                        candidate.supervision_incarnation.kernel_generation.lineage_id,
+                        candidate
+                            .supervision_incarnation
+                            .kernel_generation
+                            .lineage_id,
                         candidate.supervision_incarnation.kernel_generation.sequence
                     )
-                }))
+                })
+            })
         } else {
             self.service.lock().ok().and_then(|service| {
                 service.candidate_binding().map(|candidate| {
                     format!(
                         "{}:{}",
-                        candidate.supervision_incarnation.kernel_generation.lineage_id,
+                        candidate
+                            .supervision_incarnation
+                            .kernel_generation
+                            .lineage_id,
                         candidate.supervision_incarnation.kernel_generation.sequence
                     )
                 })
@@ -3516,7 +3513,9 @@ impl crate::KernelComposition {
             .ok()
             .and_then(|binding| binding.as_ref().map(|binding| binding.handle.clone()));
         if let Some(handle) = handle {
-            if handle.update_context(self.crash_runtime_context(true)).is_err()
+            if handle
+                .update_context(self.crash_runtime_context(true))
+                .is_err()
             {
                 tracing::warn!(
                     target: "eliot::crash_reporter",

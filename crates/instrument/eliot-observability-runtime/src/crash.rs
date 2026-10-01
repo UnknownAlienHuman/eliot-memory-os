@@ -150,10 +150,7 @@ pub fn enter_crash_operation(
 }
 
 /// Runs one synchronous owner call under its exact admitted-operation context.
-pub fn with_crash_operation<R>(
-    context: CrashOperationContext,
-    operation: impl FnOnce() -> R,
-) -> R {
+pub fn with_crash_operation<R>(context: CrashOperationContext, operation: impl FnOnce() -> R) -> R {
     // Observability setup never changes whether an already admitted action
     // runs. If a Current context cannot be installed, retain an explicit gap
     // scope and still execute the operation.
@@ -178,10 +175,7 @@ pub fn with_crash_operation<R>(
 /// this follows task migration and restores the previous nested context after
 /// every `Pending`, `Ready`, or unwind without holding a thread-local guard
 /// across an await.
-pub async fn scope_crash_operation<F>(
-    context: CrashOperationContext,
-    future: F,
-) -> F::Output
+pub async fn scope_crash_operation<F>(context: CrashOperationContext, future: F) -> F::Output
 where
     F: Future,
 {
@@ -202,9 +196,7 @@ where
             .is_err() =>
         {
             if validate_original_owner_evidence(original_owner_evidence).is_ok() {
-                CrashOperationContext::UnavailableWithOwnerEvidence(
-                    original_owner_evidence.clone(),
-                )
+                CrashOperationContext::UnavailableWithOwnerEvidence(original_owner_evidence.clone())
             } else {
                 CrashOperationContext::Unavailable
             }
@@ -775,9 +767,7 @@ impl CrashReportMetadata {
                 }
             }
             Some(_) => {
-                return Err(CrashReportError::InvalidMetadata(
-                    "operation_scope_status",
-                ));
+                return Err(CrashReportError::InvalidMetadata("operation_scope_status"));
             }
             None => {
                 if let Some(evidence) = &self.operation_owner_evidence {
@@ -1298,64 +1288,60 @@ impl CrashReporterState {
             Ok(context) => context,
             Err(_) => Some(CrashOperationContext::Unavailable),
         };
-        let (mut context, operation_id, operation_owner_evidence, operation_scope_status) = match operation_context {
-            Some(CrashOperationContext::Unavailable) => {
-                self.enqueue_gap(
-                    report_id,
-                    CrashTelemetryGapReason::ActiveOperationContextUnavailable,
-                );
-                return;
-            }
-            Some(CrashOperationContext::UnavailableWithOwnerEvidence(evidence)) => {
-                self.enqueue_gap_with_owner_evidence(
-                    report_id,
-                    CrashTelemetryGapReason::ActiveOperationContextUnavailable,
-                    evidence,
-                );
-                return;
-            }
-            Some(CrashOperationContext::Current {
-                runtime_context,
-                operation_id,
-                original_owner_evidence,
-            }) => (
-                runtime_context,
-                operation_id,
-                Some(original_owner_evidence),
-                Some("active_operation".to_owned()),
-            ),
-            None | Some(CrashOperationContext::NoActiveOperation) => {
-                if self.context_gap.load(Ordering::Acquire) {
+        let (mut context, operation_id, operation_owner_evidence, operation_scope_status) =
+            match operation_context {
+                Some(CrashOperationContext::Unavailable) => {
                     self.enqueue_gap(
                         report_id,
-                        CrashTelemetryGapReason::RuntimeContextUnavailable,
+                        CrashTelemetryGapReason::ActiveOperationContextUnavailable,
                     );
                     return;
                 }
-                let context = if let Ok(context) = self.context.try_read() {
-                    context.clone()
-                } else {
-                    self.enqueue_gap(
+                Some(CrashOperationContext::UnavailableWithOwnerEvidence(evidence)) => {
+                    self.enqueue_gap_with_owner_evidence(
                         report_id,
-                        CrashTelemetryGapReason::RuntimeContextUnavailable,
-                    );
-                    return;
-                };
-                if self.context_gap.load(Ordering::Acquire) {
-                    self.enqueue_gap(
-                        report_id,
-                        CrashTelemetryGapReason::RuntimeContextUnavailable,
+                        CrashTelemetryGapReason::ActiveOperationContextUnavailable,
+                        evidence,
                     );
                     return;
                 }
-                (
-                    context,
-                    None,
-                    None,
-                    Some("no_active_operation".to_owned()),
-                )
-            }
-        };
+                Some(CrashOperationContext::Current {
+                    runtime_context,
+                    operation_id,
+                    original_owner_evidence,
+                }) => (
+                    runtime_context,
+                    operation_id,
+                    Some(original_owner_evidence),
+                    Some("active_operation".to_owned()),
+                ),
+                None | Some(CrashOperationContext::NoActiveOperation) => {
+                    if self.context_gap.load(Ordering::Acquire) {
+                        self.enqueue_gap(
+                            report_id,
+                            CrashTelemetryGapReason::RuntimeContextUnavailable,
+                        );
+                        return;
+                    }
+                    let context = if let Ok(context) = self.context.try_read() {
+                        context.clone()
+                    } else {
+                        self.enqueue_gap(
+                            report_id,
+                            CrashTelemetryGapReason::RuntimeContextUnavailable,
+                        );
+                        return;
+                    };
+                    if self.context_gap.load(Ordering::Acquire) {
+                        self.enqueue_gap(
+                            report_id,
+                            CrashTelemetryGapReason::RuntimeContextUnavailable,
+                        );
+                        return;
+                    }
+                    (context, None, None, Some("no_active_operation".to_owned()))
+                }
+            };
         if self.journal_head_gap.load(Ordering::Acquire) {
             context.journal_head = None;
             context.journal_head_gap = true;
@@ -1523,21 +1509,18 @@ fn validate_original_owner_evidence_for_context(
     let work_scope = original_lineage_optional_string(lineage, "work_scope")?;
     let module_generation = original_lineage_optional_string(lineage, "module_generation")?;
     let authority_epoch = original_lineage_string(lineage, "authority_epoch")?;
-    let state_fence: StateFence = serde_json::from_value(
+    let state_fence: StateFence =
+        serde_json::from_value(lineage.get("state_fence").cloned().ok_or(
+            CrashReportError::InvalidMetadata("operation_owner_evidence.state_fence"),
+        )?)
+        .map_err(|_| CrashReportError::InvalidMetadata("operation_owner_evidence.state_fence"))?;
+    let request_identity =
         lineage
-            .get("state_fence")
+            .get("request_identity")
             .cloned()
             .ok_or(CrashReportError::InvalidMetadata(
-                "operation_owner_evidence.state_fence",
-            ))?,
-    )
-    .map_err(|_| CrashReportError::InvalidMetadata("operation_owner_evidence.state_fence"))?;
-    let request_identity = lineage
-        .get("request_identity")
-        .cloned()
-        .ok_or(CrashReportError::InvalidMetadata(
-            "operation_owner_evidence.request_identity",
-        ))?;
+                "operation_owner_evidence.request_identity",
+            ))?;
     let request = request_identity
         .get("request")
         .and_then(serde_json::Value::as_object)
@@ -1556,24 +1539,23 @@ fn validate_original_owner_evidence_for_context(
         .ok_or(CrashReportError::InvalidMetadata(
             "operation_owner_evidence.request_identity",
         ))?;
-    let identity_fence = request
-        .get("state_fence")
-        .cloned()
-        .ok_or(CrashReportError::InvalidMetadata(
-            "operation_owner_evidence.request_identity",
-        ))?;
-    let identity_fence: StateFence = serde_json::from_value(identity_fence).map_err(|_| {
-        CrashReportError::InvalidMetadata("operation_owner_evidence.request_identity")
-    })?;
-    let metadata_fence: StateFence = serde_json::from_value(
-        metadata
+    let identity_fence =
+        request
             .get("state_fence")
             .cloned()
             .ok_or(CrashReportError::InvalidMetadata(
                 "operation_owner_evidence.request_identity",
-            ))?,
-    )
-    .map_err(|_| CrashReportError::InvalidMetadata("operation_owner_evidence.request_identity"))?;
+            ))?;
+    let identity_fence: StateFence = serde_json::from_value(identity_fence).map_err(|_| {
+        CrashReportError::InvalidMetadata("operation_owner_evidence.request_identity")
+    })?;
+    let metadata_fence: StateFence =
+        serde_json::from_value(metadata.get("state_fence").cloned().ok_or(
+            CrashReportError::InvalidMetadata("operation_owner_evidence.request_identity"),
+        )?)
+        .map_err(|_| {
+            CrashReportError::InvalidMetadata("operation_owner_evidence.request_identity")
+        })?;
     if request_identity
         .get("idempotency_key")
         .and_then(serde_json::Value::as_str)
