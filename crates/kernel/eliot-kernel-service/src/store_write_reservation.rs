@@ -792,6 +792,10 @@ pub fn reserve_for_transition(
         seed.payload_bytes.clone(),
     )
     .map_err(ReservationWriteError::Ors)?;
+    // Issue #1927: the whole-transition digest includes the original paired
+    // Authority/Causal bindings. `gateway_seed` stages the matching canonical
+    // transition bytes through the existing protected payload; replay must
+    // reproduce this digest instead of translating the retained plan.
     let transition_digest = prepared_transition_digest(transition)?;
     let mut scopes: Vec<ScopeReservationRequest> = seed
         .heads
