@@ -2405,13 +2405,16 @@ fn assembled_view() -> (AdmittedContextSet, ActiveUnderstandingView) {
     // as `QualityIncomplete` before any membership is proved. The serializer,
     // route and options identities already come from the execution the view is
     // assembled under, so they need no second value here.
-    quality.output.recipe_digest = recipe_digest.clone();
-    quality.output.fence_digest = fence_digest.clone();
+    quality.output.recipe_digest.clone_from(&recipe_digest);
+    quality.output.fence_digest.clone_from(&fence_digest);
     quality.output.admitted_digest = admitted
         .canonical_payload_digest()
         .expect("admitted payload digest");
-    quality.output.rendered_digest = output_digest.clone();
-    quality.output.omission_handles = admitted.economy.displaced.clone();
+    quality.output.rendered_digest.clone_from(&output_digest);
+    quality
+        .output
+        .omission_handles
+        .clone_from(&admitted.economy.displaced);
     let rendered_bytes = ActiveUnderstandingView::canonical_output_utf8_bytes(
         &admitted.binding,
         &recipe_digest,
