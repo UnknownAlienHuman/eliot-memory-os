@@ -1030,6 +1030,12 @@ class TestWaveAdmissionC0(unittest.TestCase):
         widen the issue's exclusive mutable scope. This case therefore fails on
         any ``.rs`` path in the recorded transaction, which is the true state of
         the merged #829 admission.
+
+        ``admission.json`` carries two disjoint path sets.
+        ``observed_delta_paths`` is what PR #1456 actually changed and must match
+        git exactly. ``authorized_delta_paths`` is the exact permitted set: every
+        non-Rust path of that transaction. The two differ by exactly the Rust
+        paths, and that difference is the violation this case reports.
         """
         delta = changed_paths(self.merge_parent, self.merge_commit)
         self.assertEqual(delta, self.admission["observed_delta_paths"])
@@ -1051,6 +1057,16 @@ class TestWaveAdmissionC0(unittest.TestCase):
             self.admission["authorized_delta_paths"]))
         self.assertTrue(validate_admission_scope(delta[:-1],
                                                  self.admission["authorized_delta_paths"]))
+
+        # The frozen authorization itself must be Rust-free, so the exact-scope
+        # gate can never be widened to admit a source/test path by editing the
+        # fixture instead of the transaction.
+        authorized_rust = sorted(p for p in self.admission["authorized_delta_paths"]
+                                  if p.endswith(RUST_SOURCE_SUFFIXES))
+        self.assertEqual(authorized_rust, [], authorized_rust)
+        self.assertEqual(validate_admission_scope(self.admission["authorized_delta_paths"],
+                                                  self.admission["authorized_delta_paths"]),
+                         [])
 
         allowed_cargo = {"prototype", "workspace_admission"}
         allowed_module = {"status", "workspace_admission"}
