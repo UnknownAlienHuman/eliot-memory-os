@@ -105,6 +105,12 @@ pub struct DurableJournalRecord {
     /// The durable database the journal is admitted against.
     pub database_ref: String,
     /// The exact installation identity the journal is admitted against.
+    ///
+    /// Read by the owner from durable state it committed for this database — the
+    /// store's own set-once installation binding — rather than from the live
+    /// composition the read was issued from. A process is not the database, so
+    /// what the durable bytes belong to is the owner's durable statement and not
+    /// a live cell value.
     pub installation_ref: String,
     /// The committed authority generation of that installation.
     pub generation: ResourceGeneration,

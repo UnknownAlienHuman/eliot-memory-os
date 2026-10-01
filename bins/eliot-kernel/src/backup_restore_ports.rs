@@ -1163,8 +1163,9 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 /// Four of the six fields are read out of the ORS stream-binding row the ORS
 /// owner committed through `bind_restore_journal_stream`:
 /// `persistent_owner.owner_id`, `persistent_owner.trust_binding_ref`,
-/// `journal_identity_ref` and `admission_receipt_ref`. The remaining two are
-/// NOT read from that row and are not claimed to be:
+/// `journal_identity_ref` and `admission_receipt_ref`. `installation_ref` is
+/// read from the same durable store's `ors_meta_v1` store-object identity, and
+/// the last one is NOT read from durable state and is not claimed to be:
 ///
 /// - `generation` is the live effect fence's `resource_generation`, a live
 ///   composition fact rather than a durable one. It is not a caller number: the
@@ -1191,11 +1192,20 @@ fn require_live_installation(binding: &OrsRestoreBinding) -> Result<(), KernelRe
 ///   reports, and the label is this owner's own name for that store. Row
 ///   presence proves a row exists; it does not prove the label names that row's
 ///   database, and no code here makes that claim.
-/// - `installation_ref` — `OrsRestoreBinding::installation_ref`, read from the
-///   live composition cell by `live_installation_id` and re-compared against it
-///   by `require_live_installation` at this constructor. It is a
-///   composition fact, not a durable one: the row type has no installation
-///   column and is not modified here.
+/// - `installation_ref` — read from the DURABLE `ors_meta_v1` store-object
+///   identity this owner reads its rows through
+///   (`RedbRecoveryStore::installed_store_identity`), not from the live
+///   composition cell. That identity is the set-once binding ORS itself
+///   committed for this database, so it is the owner's durable statement of
+///   which installation the bytes under it belong to; the composition cell is a
+///   live fact about the process. Both are required and cross-checked: the
+///   constructor refused a binding that disagreed with the live cell
+///   (`require_live_installation`) and every issue requires the durable identity
+///   to equal the binding's value, so a rebound, cloned or foreign database
+///   refuses rather than reporting an installation it never durably held. The
+///   journal stream-binding row itself still has no installation column — that
+///   row type is owned by `crates/kernel/eliot-ors` and is not modified here —
+///   so this is the durable store's own binding, not a per-stream column.
 /// - `generation` — the live effect fence's `resource_generation`, as above.
 /// - `journal_identity_ref` — [`RESTORE_JOURNAL_IDENTITY`], the durable ORS
 ///   restore-journal CHANNEL this owner answers for. It is one fixed name for
@@ -1315,13 +1325,42 @@ impl RestoreJournalAdmissionOwner for OrsRestoreJournalOwner {
         if !matches_stream(&self.binding, &bound, &self.writer_fence_digest) {
             return Err(BackupError::RestoreJournalMismatch);
         }
+        // `installation_ref` is read from DURABLE owner state rather than from
+        // the composition cell this owner was built with. The
+        // `ors_meta_v1` store-object identity is the set-once binding ORS itself
+        // committed for this database, so it says which installation the durable
+        // bytes under this owner actually belong to; the composition cell is a
+        // live fact about the process, and a process is not the database. The
+        // two are cross-checked rather than one replacing the other: the
+        // constructor already refused a binding that disagreed with the live
+        // cell (`require_live_installation`), so requiring the durable identity
+        // to equal the binding's value as well means a store that was rebound,
+        // restored from another installation, or opened under a different
+        // identity refuses instead of reporting an installation it never held.
+        //
+        // The store's own typed error passes through unchanged; a database that
+        // is not bound to an installed identity at all is
+        // `RestoreJournalRequired` rather than an admission carrying a
+        // placeholder, because an unbound store proves nothing about which
+        // installation its rows belong to.
+        let installed = self
+            .store
+            .installed_store_identity()
+            .map_err(|error| match ors_to_backup(error) {
+                BackupError::IntegrityMismatch { .. } => BackupError::RestoreJournalRequired,
+                other => other,
+            })?;
+        let installation = installed.installation_id();
+        if installation != self.binding.installation_ref() {
+            return Err(BackupError::RestoreJournalMismatch);
+        }
         Ok(DurableJournalRecord {
             persistent_owner: OwnerTrustBinding {
                 owner_id: bound.writer_id,
                 trust_binding_ref: bound.writer_fence_digest,
             },
             database_ref: RESTORE_JOURNAL_OWNER_LABEL.to_owned(),
-            installation_ref: self.binding.installation_ref().to_owned(),
+            installation_ref: installation.to_owned(),
             generation: self.kernel_fence.resource_generation,
             // The journal IDENTITY this owner writes under is the ORS restore
             // journal namespace itself, which is what the coordinator's
