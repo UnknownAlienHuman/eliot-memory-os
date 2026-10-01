@@ -851,7 +851,14 @@ async fn serve_admitted_bridge_host_requests(
             }
         };
         match action {
-            KernelFrameAction::Reply(reply) => {
+            KernelFrameAction::Reply(mut reply) => {
+                if let Err(error) = kernel
+                    .await_observe_host_request_reply(&frame, &mut reply, shutdown.clone())
+                    .await
+                {
+                    kernel.revoke_agent_bridge(&connection_id);
+                    return Err(error);
+                }
                 if let Err(error) = send_checked(&mut front_door, &reply, limits).await {
                     kernel.revoke_agent_bridge(&connection_id);
                     return Err(error);

@@ -18,17 +18,19 @@ use eliot_protocol::dreamer_job::{DurableJobRequest, DurableJobResponse};
 use eliot_protocol::{ClientHello, Frame, ProtocolRange, ProtocolVersion, ServerHello};
 use eliot_runtime_contracts::{ModuleContract, ModuleGeneration, ModuleGenerationState};
 use eliot_store_api::{
-    BackupOperationReconciliation, CAPABILITIES, CanonicalRequestView, CanonicalRestoreBatch,
-    CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS, IsolatedDestination,
-    IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest, NamedReadResponse,
-    OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation, OrderingScopeId,
-    PreparedTransition, ReadConsistency, RecoveryRecordKey, RequestMeta, ReservedWriteRequest,
-    RestoreValidationReceipt, RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId,
-    ScopeRevisionView, SnapshotBeginRequest, SnapshotCursor, SnapshotEndReceipt, SnapshotHandle,
-    SnapshotPage, StoreBackupStatus, StoreError, StoreGenesisRequest, StoreHealth,
-    StoreRecoveryRequest, StoreRecoverySnapshot, StoreRequest, StoreResponse, StoreWireError,
-    WriteReceipt, dreamer_job_capability, map_durable_error, validate_genesis_receipt_envelope,
-    verify_canonical_request_hash, verify_ordering_scope_binding,
+    BackupOperationReconciliation, CAPABILITIES, CAPABILITY_RESERVED_WRITE, CanonicalRequestView,
+    CanonicalRestoreBatch, CanonicalStoreClient, CanonicalValidationSnapshot, EFFECTS,
+    IsolatedDestination, IsolatedDestinationReceipt, NamedReadOperation, NamedReadRequest,
+    NamedReadResponse, OperationId, OperationIdentity, OrderingHead, OrderingHeadExpectation,
+    OrderingHeadReadback, OrderingScopeId, PreparedTransition, ReadConsistency, RecoveryRecordKey,
+    RequestMeta, ReservedWriteRequest, RestoreValidationReceipt, RevisionHead,
+    RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, SnapshotBeginRequest,
+    SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StoreBackupStatus,
+    StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
+    StoreRequest, StoreResponse, StoreWireError, StoreWorkScopeOwnerRequest,
+    StoreWorkScopeOwnerResponse, WriteReceipt, dreamer_job_capability, map_durable_error,
+    validate_genesis_receipt_envelope, verify_canonical_request_hash,
+    verify_ordering_scope_binding,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -225,6 +227,7 @@ pub struct EbpCanonicalStoreClient<T> {
     requirement: HostStoreBootstrapRequirement,
     protocol_version: ProtocolVersion,
     limits: TransportLimits,
+    reserved_write_capability: bool,
     request_counter: AtomicU64,
     /// One-shot production fault hook (issue #2030). The harness-gated
     /// `arm_fault` arms it, observation reads it, and the write paths consume
@@ -277,6 +280,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
             transport: Arc::new(Mutex::new(transport)),
             requirement,
             protocol_version: server.selected_protocol,
+            reserved_write_capability: server
+                .allowed_capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_RESERVED_WRITE),
             limits,
             request_counter: AtomicU64::new(1),
             fault: AtomicU8::new(StoreClientFault::NONE),
@@ -723,6 +730,12 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
         &self,
         request: ReservedWriteRequest,
     ) -> Result<WriteReceipt, StoreError> {
+        if !self.reserved_write_capability {
+            return Err(StoreError::InvalidField {
+                field: "store.reserved_write",
+                reason: "the authenticated Store generation did not negotiate reserved-write execution",
+            });
+        }
         request.validate()?;
         request.context.validate().map_err(StoreError::Foundation)?;
         self.validate_requirement_fence(&request.context.state_fence)?;
@@ -837,6 +850,84 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             // admitted operation in `execute_raw`; reconcile exactly it.
             Err(error) if error.is_unknown_outcome_failure() => {
                 self.reconcile_genesis(context, &request).await
+            }
+            Err(error) => Err(error.into_store_error()),
+        }
+    }
+
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        request.validate_for_context(context)?;
+        self.validate_requirement_fence(&context.state_fence)?;
+        self.validate_requirement_fence(&request.state_fence)?;
+        let requested_record = request.owner_record.clone();
+        let expected_revision = request.expected_owner_revision;
+        let state_fence = request.state_fence.clone();
+        let response = self
+            .execute_raw(
+                StoreRequest::WriteWorkScopeOwner {
+                    context: context.clone(),
+                    request: request.clone(),
+                },
+                Some(context),
+                &request.idempotency_key,
+            )
+            .await;
+        match response {
+            Ok(StoreResponse::WorkScopeOwner { response })
+                if response.record == requested_record =>
+            {
+                response.validate_for_request(&request)?;
+                Ok(response)
+            }
+            // A successful but mismatched response does not establish whether
+            // the admitted CAS took effect. Preserve the original write's
+            // operation identity as unknown rather than projecting a conflict.
+            Ok(_) => Err(StoreError::UnknownOutcome {
+                operation_id: request.operation_id.clone(),
+            }),
+            Err(error)
+                if matches!(&error, RequestFailure::Unknown { .. })
+                    || error.is_unknown_outcome_failure() =>
+            {
+                // The CAS may have committed before its response was lost or
+                // the Store explicitly retained its outcome as unknown.
+                // Reconcile only through a same-fence named WorkScope owner
+                // read; never submit the mutation again on an uncertain answer.
+                // If that read is unavailable or does not prove the exact row,
+                // retain the original operation's unknown disposition.
+                let snapshot = self
+                    .recovery(StoreRecoveryRequest {
+                        contract_version: request.contract_version,
+                        state_fence: state_fence.clone(),
+                        records: vec![RecoveryRecordKey::new("owner", "work_scope")?],
+                        include_receipts: false,
+                        include_jobs: false,
+                    })
+                    .await;
+                match snapshot {
+                    Ok(snapshot) if snapshot.state_fence == state_fence => {
+                        match snapshot.owner_records.as_slice() {
+                            [record]
+                                if record == &requested_record
+                                    && record.revision == expected_revision.saturating_add(1) =>
+                            {
+                                Ok(StoreWorkScopeOwnerResponse {
+                                    record: record.clone(),
+                                })
+                            }
+                            _ => Err(StoreError::UnknownOutcome {
+                                operation_id: request.operation_id.clone(),
+                            }),
+                        }
+                    }
+                    Err(_) | Ok(_) => Err(StoreError::UnknownOutcome {
+                        operation_id: request.operation_id.clone(),
+                    }),
+                }
             }
             Err(error) => Err(error.into_store_error()),
         }
@@ -975,6 +1066,37 @@ impl<T: EbpStoreTransport + 'static> CanonicalStoreClient for EbpCanonicalStoreC
             .map_err(RequestFailure::into_store_error)?;
         match response {
             StoreResponse::OrderingHeads { heads } => Ok(heads),
+            _ => Err(StoreError::InvalidReceipt),
+        }
+    }
+
+    async fn ordering_head_readbacks(
+        &self,
+        scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        let response = self
+            .execute_raw(
+                StoreRequest::OrderingHeadReadbacks {
+                    scopes: scopes.clone(),
+                },
+                None,
+                "store-ordering-head-readbacks",
+            )
+            .await
+            .map_err(RequestFailure::into_store_error)?;
+        match response {
+            StoreResponse::OrderingHeadReadbacks { heads } => {
+                for readback in &heads {
+                    readback.validate()?;
+                    if !scopes.contains(&readback.head.scope) {
+                        return Err(StoreError::IdentityConflict);
+                    }
+                    if readback.head.state_fence != self.requirement.state_fence {
+                        return Err(StoreError::FenceMismatch);
+                    }
+                }
+                Ok(heads)
+            }
             _ => Err(StoreError::InvalidReceipt),
         }
     }
@@ -1294,6 +1416,7 @@ mod tests {
                     allowed_capabilities: CAPABILITIES
                         .iter()
                         .map(|value| (*value).to_owned())
+                        .chain(std::iter::once(CAPABILITY_RESERVED_WRITE.to_owned()))
                         .collect(),
                     allowed_effects: EFFECTS.iter().map(|value| (*value).to_owned()).collect(),
                     config_snapshot: json!({
@@ -2410,6 +2533,7 @@ mod tests {
             admission,
             expected_revision_heads,
             expected_ordering_heads,
+            original_write_submission: None,
         };
         request.validate().expect("reserved request validates");
         request
@@ -2595,7 +2719,7 @@ fn client_hello(
             "store.apply".to_owned(),
             "store.validation_snapshot".to_owned(),
         ],
-        optional_capabilities: Vec::new(),
+        optional_capabilities: vec![CAPABILITY_RESERVED_WRITE.to_owned()],
         advisory_capabilities: Vec::new(),
         state_owner: "eliot-kernel".to_owned(),
         failure_domain: "canonical-store".to_owned(),
@@ -2648,6 +2772,7 @@ fn client_hello(
         capabilities: CAPABILITIES
             .iter()
             .map(|value| (*value).to_owned())
+            .chain(std::iter::once(CAPABILITY_RESERVED_WRITE.to_owned()))
             .collect(),
         privacy_classes: vec!["PUBLIC".to_owned()],
         max_frame: u32::try_from(eliot_protocol::MAX_FRAME_BYTES)
@@ -2674,7 +2799,8 @@ fn decode_server_hello(
         .config_snapshot
         .get("artifact_hash")
         .and_then(serde_json::Value::as_str);
-    let expected_capabilities: BTreeSet<&str> = CAPABILITIES.iter().copied().collect();
+    let mut expected_capabilities: BTreeSet<&str> = CAPABILITIES.iter().copied().collect();
+    expected_capabilities.insert(CAPABILITY_RESERVED_WRITE);
     let observed_capabilities: BTreeSet<&str> = server
         .allowed_capabilities
         .iter()
@@ -2683,13 +2809,19 @@ fn decode_server_hello(
     let expected_effects: BTreeSet<&str> = EFFECTS.iter().copied().collect();
     let observed_effects: BTreeSet<&str> =
         server.allowed_effects.iter().map(String::as_str).collect();
+    let expected_without_reserved: BTreeSet<&str> = expected_capabilities
+        .iter()
+        .copied()
+        .filter(|capability| *capability != CAPABILITY_RESERVED_WRITE)
+        .collect();
     if server.authority_epoch != requirement.authority_epoch().clone()
         || server.selected_protocol != ProtocolVersion::CURRENT
         || server.session_principal_binding != expected_session_principal_binding
         || server.rejection_reason.is_some()
         || artifact_hash != Some(requirement.approved_artifact_hash.as_str())
         || config_hash != Some(requirement.approved_config_hash.as_str())
-        || observed_capabilities != expected_capabilities
+        || (observed_capabilities != expected_capabilities
+            && observed_capabilities != expected_without_reserved)
         || observed_effects != expected_effects
     {
         return Err(StoreClientError::Contract(

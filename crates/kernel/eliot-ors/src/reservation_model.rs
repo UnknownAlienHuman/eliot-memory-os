@@ -63,6 +63,12 @@ impl ReservationRequest {
                 reason: "required for a canonical write reservation",
             })?;
         write_binding.validate()?;
+        if write_binding.write_response_mode.is_none() {
+            return Err(OrsError::InvalidField {
+                field: "write_response_mode",
+                reason: "required for a new canonical write reservation",
+            });
+        }
         if write_binding.prepared_transition_sha256 != self.prepared_transition_sha256 {
             return Err(OrsError::PayloadIntegrityMismatch);
         }

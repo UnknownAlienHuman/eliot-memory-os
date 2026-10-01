@@ -269,6 +269,9 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         .expect("submit must not fail")
     {
         LocalReadSubmitDisposition::Persisted(record) => record,
+        LocalReadSubmitDisposition::StagedWrite(_) => {
+            panic!("current attempt must persist, got staged write")
+        }
         LocalReadSubmitDisposition::StaleAttempt(observation) => {
             panic!("current attempt must persist, got stale: {observation:?}")
         }
@@ -306,6 +309,9 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         .expect("exact replay must not fail")
     {
         LocalReadSubmitDisposition::Persisted(record) => record,
+        LocalReadSubmitDisposition::StagedWrite(_) => {
+            panic!("exact replay must stay terminal, got staged write")
+        }
         LocalReadSubmitDisposition::StaleAttempt(observation) => {
             panic!("exact replay must stay idempotent, got stale: {observation:?}")
         }
@@ -482,6 +488,9 @@ fn governed_stale_then_current(
         LocalReadSubmitDisposition::Persisted(_) => {
             panic!("a superseded attempt must never persist")
         }
+        LocalReadSubmitDisposition::StagedWrite(_) => {
+            panic!("a superseded attempt must never stage a write")
+        }
     }
     let waiter = waiter_record(kernel, envelope);
     assert!(
@@ -502,6 +511,9 @@ fn governed_stale_then_current(
         }
         LocalReadSubmitDisposition::StaleAttempt(observation) => {
             panic!("the current attempt must persist, got stale: {observation:?}")
+        }
+        LocalReadSubmitDisposition::StagedWrite(_) => {
+            panic!("the current attempt must persist, got staged write")
         }
     }
     assert!(
@@ -552,6 +564,9 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
         }
         LocalReadSubmitDisposition::Persisted(_) => {
             panic!("a revoked attempt must never persist")
+        }
+        LocalReadSubmitDisposition::StagedWrite(_) => {
+            panic!("a revoked attempt must never stage a write")
         }
     }
     let waiter = waiter_record(kernel, &revoked);

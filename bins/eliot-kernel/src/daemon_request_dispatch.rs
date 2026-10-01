@@ -19,12 +19,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_service::AuthenticatedHostSession;
+#[cfg(windows)]
+use eliot_ors::HostRequestRecord;
 // Issue #1872: the I5.11 `canonical_store` storage-replacement ingress. The
 // coordinator itself is the existing owner in `eliot_kernel_service`; this
 // import is the closed wire vocabulary the ingress projects out of it, never a
 // second stage machine or a second cutover gate.
 #[cfg(windows)]
 use eliot_kernel_service::MaintenanceTriggerDeliveryError;
+#[cfg(windows)]
+use eliot_kernel_service::StagedReservedWriteError;
 #[cfg(windows)]
 use eliot_kernel_service::{
     AuthenticatedUserAutomationHostExecutionTransport, NamedReadGatewayError, PreStageRejection,
@@ -41,8 +45,10 @@ use eliot_kernel_service::{
     horizon_retry_handle, refuse_consumed_wake, resolve_due_wake,
 };
 use eliot_kernel_service::{
-    IrreversibleStorageEffect, StorageReplacement, StorageReplacementCutoverReceipt,
-    StorageReplacementStage, StorageReplacementTransfer, StorageRollbackDisposition,
+    BorrowedCanonicalStoreClient, IrreversibleStorageEffect, ObservedHead, ReservationSeed,
+    StorageReplacement, StorageReplacementCutoverReceipt, StorageReplacementStage,
+    StorageReplacementTransfer, StorageRollbackDisposition,
+    gateway_seed_from_protected_original_operation,
 };
 use eliot_process::{
     OperationId, OriginChallengeRequest, OriginControlGrant, OriginControlOperation,
@@ -51,7 +57,7 @@ use eliot_process::{
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody,
     HostRequestResultLineage, HostRequestResultSourceRevision, LocalReadAttempt,
-    LocalReadExecutionEvidence, RequestIdentity, TaskControllerResultBody,
+    LocalReadExecutionEvidence, RequestIdentity, TaskControllerAttempt, TaskControllerResultBody,
     host_request_operation_id,
 };
 #[cfg(windows)]
@@ -65,11 +71,12 @@ use eliot_runtime_contracts::{
 use eliot_store_api::{
     CampaignLearningStateViewLookup, CampaignLearningStateViewRead,
     CampaignLearningStateViewReadStatus, CampaignSourcePublication, CampaignSourceRevisionLookup,
-    CampaignSourceRevisionRef, CanonicalRequestView, MAX_RECOVERY_OWNER_RECORDS,
-    NamedReadOperation, NamedReadRequest, NamedReadResponse, OperationIdentity,
-    OrderingHeadExpectation, PreparedTransition, ReadConsistency, RecoveryRecord,
-    RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError, StoreGenesisRequest,
-    StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt, WriteReceiptStatus,
+    CampaignSourceRevisionRef, CanonicalRequestView, CanonicalStoreClient,
+    MAX_RECOVERY_OWNER_RECORDS, NamedReadOperation, NamedReadRequest, NamedReadResponse,
+    OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
+    RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
+    StoreFailure, StoreFailureIdentityContext, StoreGenesisRequest, StoreRecoveryRequest,
+    StoreRecoverySnapshot, StoreWorkScopeOwnerRequest, WriteReceipt, WriteReceiptStatus,
     verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::Deserialize;
@@ -651,6 +658,7 @@ fn trusted_daemon_operation(operation: &str) -> &'static str {
         "health" => "health",
         "store_recovery" => "store_recovery",
         "store_initialize_genesis" => "store_initialize_genesis",
+        "store_work_scope_owner" => "store_work_scope_owner",
         "apply_prepared" => "apply_prepared",
         "receipt" => "receipt",
         "store_named" => "store_named",
@@ -787,6 +795,131 @@ struct StoreRecoveryOperation {
     /// a real ORS operation identity before the durable read.
     #[serde(default)]
     process_stream_recovery_operations: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoreWorkScopeOwnerOperation {
+    operation_id: String,
+    request_sha256: String,
+    attempt: TaskControllerAttempt,
+    request: StoreWorkScopeOwnerRequest,
+}
+
+/// Compares the durable owner projection with the exact proposal retained in
+/// the original admitted Task Controller tool. Kernel treats the snapshot as
+/// opaque canonical JSON and checks only byte-bound structure; Governor owns
+/// semantic interpretation and admission.
+fn validate_work_scope_record_against_retained_input(
+    record: &RecoveryRecord,
+    task_input: &serde_json::Value,
+    work_scope_id: &str,
+) -> Result<(), TransportError> {
+    if record.namespace != "owner" || record.key != "work_scope" {
+        return Err(TransportError::SessionFenced);
+    }
+    let owner_snapshot: serde_json::Value =
+        serde_json::from_slice(&record.payload).map_err(|_| TransportError::SessionFenced)?;
+    let canonical_payload =
+        canonical_json_bytes(&owner_snapshot).map_err(|_| TransportError::SessionFenced)?;
+    if canonical_payload != record.payload
+        || owner_snapshot.get("state_fence")
+            != Some(
+                &serde_json::to_value(&record.state_fence)
+                    .map_err(|_| TransportError::SessionFenced)?,
+            )
+        || owner_snapshot
+            .get("owner_revision")
+            .and_then(serde_json::Value::as_u64)
+            != Some(record.revision)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let task_input = task_input
+        .as_object()
+        .ok_or(TransportError::SessionFenced)?;
+    if task_input.len() != 9
+        || task_input.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "explicit_root"
+                    | "descriptor"
+                    | "binding"
+                    | "sources"
+                    | "privacy"
+                    | "source_candidates"
+                    | "declared_precedences"
+                    | "absence_reason_ref"
+                    | "admission_deadline"
+            )
+        })
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let binding = task_input
+        .get("binding")
+        .ok_or(TransportError::SessionFenced)?;
+    let sources = task_input
+        .get("sources")
+        .ok_or(TransportError::SessionFenced)?;
+    let privacy = task_input
+        .get("privacy")
+        .ok_or(TransportError::SessionFenced)?;
+    let owner_binding = owner_snapshot
+        .get("binding")
+        .ok_or(TransportError::SessionFenced)?;
+    let source_closure = owner_snapshot
+        .get("source_closure")
+        .and_then(serde_json::Value::as_array)
+        .filter(|closure| closure.len() == 2)
+        .ok_or(TransportError::SessionFenced)?;
+    if owner_binding != binding
+        || source_closure[0] != *sources
+        || source_closure[1] != *privacy
+        || owner_binding
+            .get("scope")
+            .and_then(|scope| scope.get("scope_ref"))
+            .and_then(serde_json::Value::as_str)
+            != Some(work_scope_id)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(())
+}
+
+fn work_scope_owner_store_failure_response(
+    error: StoreError,
+    context: &RequestMeta,
+    operation_id: &eliot_store_api::OperationId,
+    idempotency_key: &str,
+) -> Result<serde_json::Value, TransportError> {
+    let failure = StoreFailure::from_store_error(
+        error,
+        StoreFailureIdentityContext {
+            request_id: Some(context.request_id.clone()),
+            operation_id: Some(operation_id.clone()),
+            idempotency_key_ref_or_digest: Some(idempotency_key.to_owned()),
+            state_fence_ref_or_exact_safe_projection: Some(context.state_fence.clone()),
+            evidence_ref: None,
+            transport_unavailable: false,
+        },
+    )
+    .map_err(|_| TransportError::SessionFenced)?;
+    if failure.validate().is_err()
+        || failure.request_id.as_ref() != Some(&context.request_id)
+        || failure.operation_id.as_ref() != Some(operation_id)
+        || failure.idempotency_key_ref_or_digest.as_deref() != Some(idempotency_key)
+        || failure.state_fence_ref_or_exact_safe_projection.as_ref() != Some(&context.state_fence)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(serde_json::json!({
+        "status": "error",
+        "code": "STORE_FAILURE",
+        "reason": "The canonical WorkScope owner write was refused.",
+        "value": { "kind": "store_work_scope_owner", "value": null },
+        "failure": failure,
+    }))
 }
 
 /// Closed Governor owner-bundle publish operation (`#2100`).
@@ -1513,13 +1646,15 @@ struct StoreInitializeGenesisOperation {
     request: StoreGenesisRequest,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoreApplyOperation {
-    context: RequestMeta,
-    transition: PreparedTransition,
-    expected_revision_heads: Vec<RevisionHeadExpectation>,
-    expected_ordering_heads: Vec<OrderingHeadExpectation>,
+pub(crate) struct StoreApplyOperation {
+    pub(crate) context: RequestMeta,
+    pub(crate) transition: PreparedTransition,
+    pub(crate) expected_revision_heads: Vec<RevisionHeadExpectation>,
+    pub(crate) expected_ordering_heads: Vec<OrderingHeadExpectation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) original_write_submission: Option<eliot_store_api::OriginalWriteSubmission>,
 }
 
 /// Canonical notification transition carrier for the
@@ -3481,11 +3616,14 @@ impl KernelComposition {
                 .map_err(|_| TransportError::SessionFenced)
                 .map(|health| Self::daemon_health_response(&health)),
             "store_recovery" => {
-                self.store_recovery_operation(session, payload.clone())
-                    .await
+                Box::pin(self.store_recovery_operation(session, payload.clone())).await
             }
             "store_initialize_genesis" => {
                 self.store_initialize_genesis_operation(session, payload.clone())
+                    .await
+            }
+            "store_work_scope_owner" => {
+                self.store_work_scope_owner_operation(session, request_identity, payload.clone())
                     .await
             }
             "apply_prepared" => {
@@ -3844,6 +3982,9 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
                             Ok(Self::accepted_daemon_response())
                         }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StagedWrite(_)) => {
+                            Err(TransportError::SessionFenced)
+                        }
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
@@ -3881,9 +4022,16 @@ impl KernelComposition {
                         return Err(TransportError::SessionFenced);
                     }
                     self.claim_observe_pair(session).map(|pair| match pair {
-                        Some((envelope, tool, attempt)) => serde_json::json!({
+                        Some(pair) => serde_json::json!({
                             "status": "known",
-                            "value": { "pair": { "envelope": envelope, "tool": tool, "attempt": attempt } },
+                            "value": { "pair": {
+                                "record": pair.record,
+                                "durable_attempt": pair.durable_attempt,
+                                "envelope": pair.envelope,
+                                "tool": pair.tool,
+                                "attempt": pair.result_attempt,
+                                "source_request_identity": pair.source_request_identity,
+                            } },
                             "recovery": null,
                         }),
                         None => serde_json::json!({
@@ -3993,6 +4141,9 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
                             Ok(Self::accepted_daemon_response())
                         }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StagedWrite(
+                            submission,
+                        )) => Ok(store_apply_staged_response(&submission)),
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
@@ -4048,6 +4199,13 @@ impl KernelComposition {
                         Ok(host_request_route::ObserveDeferDisposition::Settled(record)) => Ok(
                             Self::settled_observe_daemon_response(record.operation_id.as_str()),
                         ),
+                        Ok(
+                            host_request_route::ObserveDeferDisposition::ReconciliationRequired(
+                                record,
+                            ),
+                        ) => Ok(Self::unknown_observe_daemon_response(
+                            record.operation_id.as_str(),
+                        )),
                         Ok(host_request_route::ObserveDeferDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
@@ -4119,6 +4277,9 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
                             Ok(Self::accepted_daemon_response())
                         }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StagedWrite(_)) => {
+                            Err(TransportError::SessionFenced)
+                        }
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
@@ -4147,11 +4308,18 @@ impl KernelComposition {
                     }
                     self.claim_task_controller_pair(session)
                         .map(|pair| match pair {
-                            Some((envelope, tool, invocation, attempt)) => serde_json::json!({
+                            Some((
+                                envelope,
+                                tool,
+                                invocation,
+                                attempt,
+                                authenticated_principal,
+                            )) => serde_json::json!({
                                 "status": "known",
                                 "value": {
                                     "pair": {
                                         "invocation": invocation,
+                                        "authenticated_principal": authenticated_principal,
                                         "envelope": envelope,
                                         "tool": tool,
                                         "operation_id": attempt.operation_id,
@@ -4185,6 +4353,9 @@ impl KernelComposition {
                     match self.submit_task_controller_result(session, &body) {
                         Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
                             Ok(Self::accepted_daemon_response())
+                        }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StagedWrite(_)) => {
+                            Err(TransportError::SessionFenced)
                         }
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
@@ -4252,6 +4423,9 @@ impl KernelComposition {
                         Ok(host_request_route::LocalReadSubmitDisposition::Persisted(_)) => {
                             Ok(Self::accepted_daemon_response())
                         }
+                        Ok(host_request_route::LocalReadSubmitDisposition::StagedWrite(_)) => {
+                            Err(TransportError::SessionFenced)
+                        }
                         Ok(host_request_route::LocalReadSubmitDisposition::StaleAttempt(
                             observation,
                         )) => Ok(Self::stale_attempt_daemon_response(&observation)),
@@ -4293,8 +4467,11 @@ impl KernelComposition {
                 // faked with a consumer in this crate.
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let observe_tool = payload.get("tool").cloned();
-                let (receipt, record) =
-                    self.admit_and_queue_observe_submit(&envelope, observe_tool.as_ref())?;
+                let (receipt, record) = self.admit_and_queue_observe_submit(
+                    &envelope,
+                    observe_tool.as_ref(),
+                    request_identity,
+                )?;
                 Ok(host_request_route::host_request_admitted_response(
                     &receipt, &record,
                 ))
@@ -4349,8 +4526,10 @@ impl KernelComposition {
                 let envelope = host_request_route::host_request_envelope_from_payload(payload)?;
                 let receipt = host_request_route::host_request_receipt_from_payload(payload)?;
                 let record = self.rehydrate_host_request(&envelope, &receipt)?;
+                let stage = self.validated_original_staged_observe_submission(&record)?;
                 Ok(host_request_route::host_request_rehydrated_response(
                     &record,
+                    stage.as_ref(),
                 ))
             }
             "initialize_owner_revision" => {
@@ -8975,6 +9154,23 @@ impl KernelComposition {
         })
     }
 
+    /// Typed outcome for a protected Observe pair whose published claim did
+    /// not yield a canonical owner receipt. Its durable row is `Unknown` and
+    /// may only advance through explicit reconciliation.
+    fn unknown_observe_daemon_response(operation_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "status": "unknown",
+            "value": {
+                "outcome": "unknown_outcome",
+                "operation_id": operation_id,
+            },
+            "recovery": {
+                "kind": "unknown_outcome",
+                "reason": "published_observe_pair_requires_reconciliation",
+            },
+        })
+    }
+
     /// Typed acknowledgement for a v2 semantic-result submit: the exact
     /// retained result (with its full disposition) travels inside `ack`, so
     /// the daemon leg stays lossless without parsing error strings.
@@ -9060,8 +9256,10 @@ impl KernelComposition {
                 // payload leaves behind. Step 6 is recorded only when that scan
                 // is exhaustive and clean; an unresolved reservation, a retained
                 // problem, or a truncated scan keeps normal writes gated, and
-                // nothing is retried, decoded, or dropped to reach readiness.
-                let staged = match gateway
+                // The resume helper uses only this exact inventory and each
+                // original protected operation; any residual problem keeps
+                // normal writes gated.
+                let mut staged = match gateway
                     .reconcile_staged_writes(&recovery_fence, eliot_ors::MAX_RECOVERY_PAGE)
                     .await
                 {
@@ -9070,6 +9268,23 @@ impl KernelComposition {
                         return Ok(Self::store_error_response_text("store_recovery", &error));
                     }
                 };
+                if staged.readiness() == eliot_kernel_service::StagedWriteReadiness::Blocked {
+                    if let Err(error) = self
+                        .resume_staged_observe_reservations(&gateway, &staged)
+                        .await
+                    {
+                        return Ok(Self::store_error_response_text("store_recovery", &error));
+                    }
+                    staged = match gateway
+                        .reconcile_staged_writes(&recovery_fence, eliot_ors::MAX_RECOVERY_PAGE)
+                        .await
+                    {
+                        Ok(staged) => staged,
+                        Err(error) => {
+                            return Ok(Self::store_error_response_text("store_recovery", &error));
+                        }
+                    };
+                }
                 if staged.readiness() == eliot_kernel_service::StagedWriteReadiness::Ready {
                     // The Store snapshot is same-fence validated above and the
                     // staged envelopes are reconciled under that same fence, so
@@ -9236,10 +9451,145 @@ impl KernelComposition {
         }
     }
 
+    #[cfg(windows)]
+    fn validate_owner_protected_snapshot(&self, expected: &str) -> Result<(), TransportError> {
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let current = policy
+            .config_snapshot
+            .get("protected_snapshot_digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if current != expected {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn store_work_scope_owner_operation(
+        &self,
+        session: &Session,
+        request_identity: Option<&RequestIdentity>,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let operation: StoreWorkScopeOwnerOperation =
+            serde_json::from_value(without_daemon_routing_key(payload)?)
+                .map_err(|_| TransportError::SessionFenced)?;
+        let identity = request_identity.ok_or(TransportError::SessionFenced)?;
+        identity
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let context = &identity.request.metadata;
+        if context.product_id.as_str() != ACTIVE_DAEMON_CALLER
+            || context.source_id.as_str() != ACTIVE_DAEMON_CALLER
+            || context
+                .session_id
+                .as_ref()
+                .map(eliot_contracts::SessionId::as_str)
+                != Some(operation.attempt.session_id.as_str())
+            || context.task_id.as_ref() != Some(&operation.attempt.task_id)
+            || identity.request.state_fence != operation.attempt.state_fence
+            || identity.deadline_unix_ms != operation.attempt.expires_at_unix_ms
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if operation.request.state_fence != context.state_fence
+            || operation.attempt.state_fence != context.state_fence
+            || operation.operation_id != operation.attempt.operation_id
+            || operation.request.operation_id.as_str() != operation.operation_id
+            || operation.request.idempotency_key != identity.idempotency_key
+            || operation.request_sha256.trim().is_empty()
+            || operation.request_sha256.chars().any(char::is_control)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        validate_store_session_fence(session, &context.state_fence)?;
+        if let Some(rejection) = self.material_write_admission_response(&context.state_fence) {
+            return Ok(rejection);
+        }
+        let (envelope, invocation, _tool, _principal) = self
+            .admit_task_controller_work_scope_owner_write(
+                session,
+                &operation.operation_id,
+                &operation.request_sha256,
+                &operation.attempt,
+            )?;
+        if invocation.action != eliot_protocol::TaskControllerAction::BindScope
+            || context.task_id.as_ref() != Some(&invocation.task_id)
+            || context.state_fence != envelope.state_fence
+            || context.request_id != envelope.identity.request_id
+            || context
+                .session_id
+                .as_ref()
+                .map(eliot_contracts::SessionId::as_str)
+                != envelope.identity.session_id.as_deref()
+            || operation.request.operation_id.as_str() != operation.operation_id
+            || operation.request.idempotency_key != envelope.identity.idempotency_key
+            || identity.idempotency_key != envelope.identity.idempotency_key
+            || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+            || identity.cancellation_id != envelope.identity.cancellation_id
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if let Err(error) = operation.request.validate_for_context(context) {
+            return work_scope_owner_store_failure_response(
+                error,
+                context,
+                &operation.request.operation_id,
+                &operation.request.idempotency_key,
+            );
+        }
+        validate_work_scope_record_against_retained_input(
+            &operation.request.owner_record,
+            &invocation.task_input,
+            &invocation.work_scope_id,
+        )?;
+        self.validate_owner_protected_snapshot(&operation.request.protected_snapshot_digest)?;
+        let failure_operation_id = operation.request.operation_id.clone();
+        let failure_idempotency_key = operation.request.idempotency_key.clone();
+        let gateway = self.retained_store_gateway()?;
+        match gateway
+            .write_work_scope_owner(context, operation.request)
+            .await
+        {
+            Ok(response) => Ok(serde_json::json!({
+                "kind": "store_work_scope_owner",
+                "value": response.record,
+            })),
+            Err(NamedReadGatewayError::Store(error)) => work_scope_owner_store_failure_response(
+                error,
+                context,
+                &failure_operation_id,
+                &failure_idempotency_key,
+            ),
+            Err(NamedReadGatewayError::GatewayRefusal(_)) => Ok(serde_json::json!({
+                "status": "error",
+                "code": "KERNEL_GATEWAY_REFUSAL",
+                "reason": "The canonical WorkScope owner route refused the request.",
+                "value": { "kind": "store_work_scope_owner", "value": null },
+                "recovery": null,
+            })),
+        }
+    }
+
     #[cfg(not(windows))]
     async fn store_initialize_genesis_operation(
         &self,
         _session: &Session,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, TransportError> {
+        let _ = payload;
+        Err(TransportError::SessionFenced)
+    }
+
+    #[cfg(not(windows))]
+    async fn store_work_scope_owner_operation(
+        &self,
+        _session: &Session,
+        _request_identity: Option<&RequestIdentity>,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
@@ -9358,6 +9708,17 @@ impl KernelComposition {
                 return Ok(Self::store_error_response_text("write_receipt", &error));
             }
         };
+        let is_observation_capture = operation.transition.transition_class
+            == eliot_store_api::TransitionClass::CaptureCandidate
+            && operation.transition.named_operations.iter().any(|named| {
+                named.operation == eliot_store_api::NamedMutationOperation::CaptureObservation
+            });
+        if is_observation_capture && !campaign_source_publications.is_empty() {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                "protected Observe capture cannot share a campaign-source publication",
+            ));
+        }
         let campaign_source_operation_id = operation.transition.identity.operation_id.clone();
         let campaign_source_request_digest =
             operation.transition.identity.canonical_request_hash.clone();
@@ -9375,117 +9736,74 @@ impl KernelComposition {
             ));
         }
         let gateway = self.retained_store_gateway()?;
-        // Reserved-write route boundary (issue #1925, I5.2/I5.5/I5.6; owner
-        // audit comment 5856193606).
-        //
-        // The audit named three defects and all three are STILL OPEN. This
-        // comment records that state; it is not a claim that any of them closed.
-        //
-        // - `KernelStoreGateway::apply_reserved` has no production caller.
-        // - `store_write_reservation::gateway_seed` has no caller at all. It is
-        //   a real function that seals the admitted transition's canonical
-        //   bytes, so the `RecoveryPayload::Encrypted` claim it makes would be
-        //   true, but nothing calls it. `ReservationSeed { .. }` is constructed
-        //   in exactly one production place, inside `gateway_seed` itself, so no
-        //   envelope is produced on any route. "Reachable through
-        //   `KernelComposition::platform`" is reachability, not a caller.
-        // - therefore the live canonical write below reaches no recovery
-        //   seed/reservation envelope.
-        //
-        // The reservation cannot be staged on this route even with a caller
-        // written today, for four independent code facts, each verified by a
-        // searched negative rather than an owner decision:
-        //
-        // 1. Store-side execution generation. `KernelStoreGateway::apply_reserved`
-        //    ends in the Store's `ReservedWrite` wire operation. On the store
-        //    side `SurrealStoreAdapter::apply_reserved_write`
-        //    (`crates/storage/eliot-store-surreal-adapter/src/apply.rs:780`)
-        //    takes the `execution_handle()` `None` arm at `:785` and returns
-        //    `StoreError::UnknownOperation` before any provider I/O. The two
-        //    methods that can install a generation,
-        //    `SurrealStoreAdapter::install_concurrent_execution`
-        //    (`crates/storage/eliot-store-surreal-adapter/src/lib.rs:269`) and
-        //    `install_serial_execution` (`:296`), have no non-test caller
-        //    anywhere in the workspace; the only production construction path,
-        //    `StoreComposition::new` (`bins/eliot-store-surreal/src/lib.rs`),
-        //    builds the adapter there and never installs one. Routing live
-        //    writes through `apply_reserved` today would therefore refuse
-        //    every production canonical write.
-        // 2. Store-side capability advertisement. `CAPABILITY_RESERVED_WRITE`
-        //    (`crates/storage/eliot-store-api/src/wire.rs:49`) is mapped to the
-        //    `ReservedWrite` operation at `wire.rs:353`, but is absent from the
-        //    advertised `CAPABILITIES` array at `wire.rs:85`, so the handshake
-        //    never admits the capability this wire would select. The Kernel
-        //    consumes that same static array on its own side: the session
-        //    hello it sends declares
-        //    `allowed_capabilities: CAPABILITIES`
-        //    (`crates/kernel/eliot-kernel-service/src/store_client.rs:1290`),
-        //    so a `ReservedWrite` request this Kernel submits would sit outside
-        //    the admitted set for the session even against a fully installed
-        //    Store generation. The honest dynamic advertisement already exists
-        //    on the adapter
-        //    (`SurrealStoreAdapter::reserved_write_capability`,
-        //    `crates/storage/eliot-store-surreal-adapter/src/lib.rs:324`) and
-        //    correctly returns `None` until a concurrent generation owns the
-        //    adapter, but it has no non-test caller, so the Kernel can never
-        //    learn a reserved-write Store is present.
-        // 3. No production source for the observed ordering-head digest.
-        //    `ReservationSeed::heads` requires
-        //    `ObservedHead::expected_head_digest`
-        //    (`crates/kernel/eliot-kernel-service/src/store_write_reservation.rs:351`),
-        //    documented there as the digest of the exact observed canonical head
-        //    bytes, and it is forwarded verbatim to ORS as
-        //    `ExpectedOrderingHead::head_sha256` at `:804`. The only store-side
-        //    ordering-head read, `eliot_store_api::OrderingHead`
-        //    (`crates/storage/eliot-store-api/src/lib.rs:4082`), carries
-        //    `scope`/`sequence`/`state_fence` and no head hash, so no
-        //    production caller can supply that value honestly.
-        // 4. ORS canonical-evidence binding. `reserve_for_transition` reaches
-        //    `RedbRecoveryStore::stage_and_reserve`, whose
-        //    `self.evidence.verify_ordering_heads(&request.scopes)?`
-        //    (`crates/kernel/eliot-ors/src/store.rs:28006`) fails closed while the
-        //    bound provider is `RejectUnboundEvidence` (`store.rs:2777`, whose
-        //    `verify_ordering_heads` at `store.rs:2780` returns
-        //    `OrsError::CanonicalEvidence` at `store.rs:2784`). This composition
-        //    opens its production ORS with `RedbRecoveryStore::open`
-        //    (`bins/eliot-kernel/src/composition_bootstrap.rs:197`, `:247`,
-        //    `:355`), whose production default binds that rejecting provider at
-        //    `store.rs:21803`; the only `open_with_evidence` (`store.rs:21813`)
-        //    call site is the `new_with_adapters` path at
-        //    `composition_bootstrap.rs:997`/`:1007`, which production composition
-        //    never takes. So even a correct seed would be refused by ORS before it
-        //    could reserve. No production `CanonicalEvidenceProvider`
-        //    implementation exists: the only ones are `eliot_ors` test support
-        //    and test files.
-        //
-        // Facts 1-2 and 4 live in the storage/store-bridge and ORS owners, which
-        // is what this issue's `## Scope and owner` ("Kernel / ORS `redb` owner")
-        // excludes. Fact 3 is the write-side half of the Kernel's own gap and is
-        // not closed by this delivery either. Nothing here works around any of the
-        // four, and there is no configuration switch, second route or
-        // `attach_*` probe that manufactures one call.
-        //
-        // `store.apply` is also a wait-for-commit request: `StoreApplyOperation`
-        // carries no `response_mode` and the route returns the canonical
-        // `WriteReceipt`, so it never observes or claims `ACCEPTED_PENDING`
-        // (I5.5). I5.2 forbids `accepted_pending` outright when ORS cannot
-        // durably stage the complete opaque operation, and a live write that
-        // could not stage must not report it. This is not a silent fallback for
-        // `accept_after_stage`: there is no `accept_after_stage` request on this
-        // wire to fall back from. The startup recovery owner
-        // (`store_recovery_operation` -> `KernelStoreGateway::reconcile_staged_writes`)
-        // enumerates, revalidates by the envelope's recorded hash, and reconciles
-        // by operation identity into either the canonical receipt or a durable
-        // Recovery Problem whenever ORS does hold one.
-        match gateway
-            .apply(
-                &operation.context,
-                operation.transition,
-                operation.expected_revision_heads,
-                operation.expected_ordering_heads,
+        let reserved_seed = match self
+            .observe_reservation_seed(
+                &gateway,
+                &operation,
+                operation.original_write_submission.as_ref(),
             )
             .await
         {
+            Ok(seed) => seed,
+            Err(error) => return Ok(Self::store_error_response_text("write_receipt", &error)),
+        };
+        if is_observation_capture && reserved_seed.is_none() {
+            return Ok(Self::store_error_response_text(
+                "write_receipt",
+                "observation capture lacks its protected original host request binding",
+            ));
+        }
+        if let Some((seed, deadline_unix_ms)) = reserved_seed {
+            let Some(original_submission) = operation.original_write_submission.as_ref() else {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    "protected Observe apply has no original write submission",
+                ));
+            };
+            if original_submission.validate().is_err() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    "original write submission is invalid",
+                ));
+            }
+            if !campaign_source_publications.is_empty() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    "protected Observe capture cannot share a campaign-source publication",
+                ));
+            }
+            let original_submission = original_submission.clone();
+            return Ok(self
+                .run_reserved_observe_write(
+                    Arc::clone(&gateway),
+                    operation,
+                    seed,
+                    original_submission,
+                    deadline_unix_ms,
+                )
+                .await);
+        }
+        let apply_result = {
+            if operation.original_write_submission.is_some() {
+                return Ok(Self::store_error_response_text(
+                    "write_receipt",
+                    "original write submission is only valid for protected Observe capture",
+                ));
+            }
+            match gateway
+                .apply(
+                    &operation.context,
+                    operation.transition,
+                    operation.expected_revision_heads,
+                    operation.expected_ordering_heads,
+                )
+                .await
+            {
+                Ok(receipt) => Ok(receipt),
+                Err(error) => Err(Self::store_apply_refusal_response("write_receipt", &error)),
+            }
+        };
+        match apply_result {
             Ok(receipt) => {
                 if !campaign_source_publications.is_empty() {
                     if receipt.status == WriteReceiptStatus::Committed {
@@ -9520,8 +9838,450 @@ impl KernelComposition {
                     journal_issue,
                 ))
             }
-            Err(error) => Ok(Self::store_apply_refusal_response("write_receipt", &error)),
+            Err(response) => Ok(response),
         }
+    }
+
+    /// Builds a reserved-write seed only for a protected, durably claimed
+    /// Observe submission. Its canonical head evidence comes from current
+    /// Store owner readbacks, while its access class and deadline are copied
+    /// from the exact retained host request.
+    #[cfg(windows)]
+    async fn observe_reservation_seed(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        operation: &StoreApplyOperation,
+        original_submission: Option<&eliot_store_api::OriginalWriteSubmission>,
+    ) -> Result<Option<(ReservationSeed, u64)>, String> {
+        let transition = &operation.transition;
+        let operation_identity =
+            eliot_ors::OperationIdentity::new(transition.identity.operation_id.as_str())
+                .map_err(|error| error.to_string())?;
+        let Some(record) = self
+            .generation_gateway
+            .ors
+            .load_host_request_by_operation(&operation_identity)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let Some(input) = Self::retained_observe_reservation_input(&record, operation)? else {
+            return Ok(None);
+        };
+        let original_submission = original_submission.ok_or_else(|| {
+            "protected Observe request is missing its original write submission".to_owned()
+        })?;
+        self.validate_original_write_submission_source(&record, original_submission)
+            .map_err(|error| format!("original Observe write source mismatch: {error}"))?;
+        let current_time_ms = unix_ms();
+        if current_time_ms >= record.deadline_unix_ms {
+            return Err("protected Observe request deadline has expired".to_owned());
+        }
+        let created_at_ms = i64::try_from(current_time_ms)
+            .map_err(|_| "Kernel clock is outside the reservation time range".to_owned())?;
+        let expires_at_ms = i64::try_from(record.deadline_unix_ms).map_err(|_| {
+            "host request deadline is outside the reservation time range".to_owned()
+        })?;
+
+        let observed_heads = self
+            .read_observe_reservation_heads(gateway, operation)
+            .await?;
+        let access = input
+            .protected_envelope
+            .privacy_and_visibility_class
+            .clone();
+        access.validate().map_err(|error| error.to_string())?;
+        let protected_operation_bytes =
+            canonical_json_bytes(operation).map_err(|error| error.to_string())?;
+        let protected_operation = self
+            .platform
+            .protect_secret(&protected_operation_bytes)
+            .map_err(|error| error.to_string())?;
+        let operation_id = transition.identity.operation_id.as_str().to_owned();
+        let seed = ReservationSeed {
+            reservation_id: operation_id.clone(),
+            operation_id,
+            recovery_owner: "kernel-composition".to_owned(),
+            payload_bytes: protected_operation.as_bytes().to_vec(),
+            key_provider: eliot_kernel_service::RESERVATION_KEY_PROVIDER.to_owned(),
+            key_name: eliot_kernel_service::RESERVATION_KEY_NAME.to_owned(),
+            recovery_access_class: access,
+            created_at_ms,
+            known_at_ms: created_at_ms,
+            expires_at_ms,
+            heads: observed_heads,
+        };
+        let seed = gateway_seed_from_protected_original_operation(transition, seed)
+            .map_err(|error| error.to_string())?;
+        Ok(Some((seed, record.deadline_unix_ms)))
+    }
+
+    #[cfg(windows)]
+    async fn run_reserved_observe_write(
+        &self,
+        gateway: Arc<KernelStoreGateway>,
+        operation: StoreApplyOperation,
+        seed: ReservationSeed,
+        original_submission: eliot_store_api::OriginalWriteSubmission,
+        deadline_unix_ms: u64,
+    ) -> serde_json::Value {
+        use eliot_runtime::{SpawnDisposition, TaskFailure};
+
+        let (staged_sender, staged_receiver) = tokio::sync::oneshot::channel();
+        let (receipt_sender, receipt_receiver) = tokio::sync::oneshot::channel();
+        let expected_operation_id = operation
+            .transition
+            .identity
+            .operation_id
+            .as_str()
+            .to_owned();
+        let expected_request_hash = operation.transition.identity.canonical_request_hash.clone();
+        let response_mode = original_submission.response_mode.clone();
+        let staged = self.runtime.spawn(
+            "kernel.observe-reserved-write",
+            move |cancellation| async move {
+                if unix_ms() >= deadline_unix_ms {
+                    let _ = staged_sender.send(Err(StagedReservedWriteError::Refused {
+                        detail: "protected Observe request expired before durable staging"
+                            .to_owned(),
+                    }));
+                    return Ok::<(), TaskFailure>(());
+                }
+                let accepted = match gateway
+                    .stage_reserved_with_original_submission(
+                        &operation.context,
+                        operation.transition.clone(),
+                        operation.expected_revision_heads.clone(),
+                        operation.expected_ordering_heads.clone(),
+                        seed,
+                        &original_submission,
+                    )
+                    .await
+                {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        let _ = staged_sender.send(Err(error));
+                        return Ok::<(), TaskFailure>(());
+                    }
+                };
+                let submission = accepted.submission().clone();
+                let token = accepted.token().clone();
+                if !write_submission_matches_staged_operation(
+                    &submission,
+                    &expected_operation_id,
+                    &expected_request_hash,
+                ) {
+                    let _ = staged_sender.send(Err(StagedReservedWriteError::OutcomeUnknown {
+                        operation_id: expected_operation_id,
+                        detail: "durable Observe stage did not match the original operation"
+                            .to_owned(),
+                    }));
+                    return Ok::<(), TaskFailure>(());
+                }
+                let _ = staged_sender.send(Ok(submission));
+                let receipt = Box::pin(Self::execute_or_resume_reserved_observe_write(
+                    &gateway,
+                    accepted,
+                    operation,
+                    token,
+                    &expected_operation_id,
+                    cancellation,
+                ))
+                .await;
+                let _ = receipt_sender.send(receipt);
+                Ok::<(), TaskFailure>(())
+            },
+        );
+        match staged {
+            SpawnDisposition::DeniedShuttingDown => {
+                return Self::store_error_response_text(
+                    "write_receipt",
+                    "Kernel runtime is shutting down before protected Observe staging",
+                );
+            }
+            SpawnDisposition::Admitted(handle) => drop(handle),
+        }
+
+        Self::finish_reserved_observe_response(
+            staged_receiver,
+            receipt_receiver,
+            response_mode,
+            deadline_unix_ms,
+        )
+        .await
+    }
+
+    #[cfg(windows)]
+    async fn finish_reserved_observe_response(
+        staged_receiver: tokio::sync::oneshot::Receiver<
+            Result<eliot_store_api::WriteSubmission, StagedReservedWriteError>,
+        >,
+        receipt_receiver: tokio::sync::oneshot::Receiver<
+            Result<WriteReceipt, StagedReservedWriteError>,
+        >,
+        response_mode: String,
+        deadline_unix_ms: u64,
+    ) -> serde_json::Value {
+        let write_submission = match staged_receiver.await {
+            Ok(Ok(submission)) => submission,
+            Ok(Err(error)) => {
+                return Self::store_error_response_text("write_receipt", &error.to_string());
+            }
+            Err(_) => {
+                return Self::store_error_response_text(
+                    "write_receipt",
+                    "protected Observe staging task ended before returning its durable stage",
+                );
+            }
+        };
+        if response_mode == "accept_after_stage" {
+            return store_apply_staged_response(&write_submission);
+        }
+        let remaining_ms = deadline_unix_ms.saturating_sub(unix_ms());
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(remaining_ms),
+            receipt_receiver,
+        )
+        .await
+        {
+            Ok(Ok(Ok(receipt))) => store_apply_response(&receipt, None, None),
+            Ok(Ok(Err(error))) => {
+                Self::store_error_response_text("write_receipt", &error.to_string())
+            }
+            Ok(Err(_)) | Err(_) => store_apply_staged_response(&write_submission),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn execute_or_resume_reserved_observe_write(
+        gateway: &KernelStoreGateway,
+        accepted: eliot_kernel_service::AcceptedReservedWrite,
+        operation: StoreApplyOperation,
+        token: eliot_ors::WriterReservationToken,
+        expected_operation_id: &str,
+        cancellation: eliot_runtime::CancellationToken,
+    ) -> Result<WriteReceipt, StagedReservedWriteError> {
+        let original_submission =
+            operation
+                .original_write_submission
+                .as_ref()
+                .ok_or_else(|| StagedReservedWriteError::Refused {
+                    detail: "protected Observe operation has no original write source".to_owned(),
+                })?;
+        let mut result = gateway.execute_staged_reserved(accepted).await;
+        loop {
+            let pending_operation = match &result {
+                Err(StagedReservedWriteError::RetryablePredecessorPending { operation_id }) => {
+                    Some(operation_id.as_str())
+                }
+                _ => None,
+            };
+            let Some(pending_operation) = pending_operation else {
+                return result;
+            };
+            if pending_operation != expected_operation_id
+                || token.operation_id.as_str() != expected_operation_id
+                || operation.transition.identity.operation_id.as_str() != expected_operation_id
+            {
+                return Err(StagedReservedWriteError::OutcomeUnknown {
+                    operation_id: expected_operation_id.to_owned(),
+                    detail: "predecessor wait did not name the original Store operation".to_owned(),
+                });
+            }
+            if cancellation.is_cancelled() {
+                return Err(StagedReservedWriteError::OutcomeUnknown {
+                    operation_id: expected_operation_id.to_owned(),
+                    detail: "runtime shutdown interrupted the retained predecessor wait".to_owned(),
+                });
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    return Err(StagedReservedWriteError::OutcomeUnknown {
+                        operation_id: expected_operation_id.to_owned(),
+                        detail: "runtime shutdown interrupted the retained predecessor wait"
+                            .to_owned(),
+                    });
+                }
+                waited = gateway.wait_for_staged_predecessor(
+                    &operation.context,
+                    &operation.transition,
+                    &token,
+                ) => waited?,
+            }
+            if cancellation.is_cancelled() {
+                return Err(StagedReservedWriteError::OutcomeUnknown {
+                    operation_id: expected_operation_id.to_owned(),
+                    detail: "runtime shutdown interrupted the retained predecessor wait".to_owned(),
+                });
+            }
+            result = gateway
+                .restore_staged_reserved(
+                    &operation.context,
+                    operation.transition.clone(),
+                    operation.expected_revision_heads.clone(),
+                    operation.expected_ordering_heads.clone(),
+                    original_submission,
+                    token.clone(),
+                )
+                .await;
+        }
+    }
+
+    pub(crate) fn retained_observe_reservation_input<'a>(
+        record: &'a HostRequestRecord,
+        operation: &StoreApplyOperation,
+    ) -> Result<Option<&'a eliot_ors::HostRequestExecutableInput>, String> {
+        let Some(input) = record.executable_input.as_ref() else {
+            if record.kind == eliot_ors::HostRequestKind::Invocation
+                && record.capability_ref.as_str() == "eliot.observe"
+            {
+                return Err("Observe request has no retained executable input".to_owned());
+            }
+            return Ok(None);
+        };
+        record.validate().map_err(|error| error.to_string())?;
+        input
+            .validate_for(record)
+            .map_err(|error| error.to_string())?;
+        let attempt = record
+            .attempt
+            .as_ref()
+            .ok_or_else(|| "protected Observe row has no durable claim attempt".to_owned())?;
+        if record.kind != eliot_ors::HostRequestKind::Invocation
+            || record.capability_ref.as_str() != "eliot.observe"
+            || record.state != eliot_ors::HostRequestState::Submitted
+            || attempt.phase != eliot_ors::HostRequestAttemptPhase::Claimed
+            || attempt.input_commitment_sha256.as_deref() != Some(input.commitment_sha256.as_str())
+        {
+            return Err(
+                "protected Observe row is not the exact durably claimed submission".to_owned(),
+            );
+        }
+        let transition = &operation.transition;
+        let app = &input.application_binding;
+        let scope_ref = record
+            .scope_ref
+            .as_ref()
+            .ok_or_else(|| "protected Observe row has no owner-resolved scope".to_owned())?;
+        if record.operation_id.as_str() != transition.identity.operation_id.as_str()
+            || record.idempotency_key.as_str() != transition.identity.idempotency_key.as_str()
+            || app.state_fence != operation.context.state_fence
+            || app.state_fence != transition.state_fence
+            || transition.scope_id.as_str() != scope_ref.as_str()
+            || app.scope_ref.as_ref() != Some(scope_ref)
+            || transition.transition_class != eliot_store_api::TransitionClass::CaptureCandidate
+            || transition.named_operations.len() != 1
+            || transition.named_operations[0].operation
+                != eliot_store_api::NamedMutationOperation::CaptureObservation
+        {
+            return Err(
+                "prepared observation does not match the retained host request binding".to_owned(),
+            );
+        }
+        Ok(Some(input))
+    }
+
+    async fn read_observe_reservation_heads(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        operation: &StoreApplyOperation,
+    ) -> Result<Vec<ObservedHead>, String> {
+        let store = BorrowedCanonicalStoreClient::new(gateway);
+        let actual_revision_heads = store
+            .revision_heads(
+                operation
+                    .expected_revision_heads
+                    .iter()
+                    .map(|head| head.key.clone())
+                    .collect(),
+            )
+            .await
+            .map_err(|error| format!("could not observe canonical revision heads: {error}"))?;
+        if actual_revision_heads.len() != operation.expected_revision_heads.len() {
+            return Err("canonical revision-head observation is incomplete".to_owned());
+        }
+        let expected_revisions: BTreeMap<_, _> = operation
+            .expected_revision_heads
+            .iter()
+            .map(|head| {
+                (
+                    head.key.as_str(),
+                    (head.expected_revision, &head.state_fence),
+                )
+            })
+            .collect();
+        let mut seen_revision_keys = BTreeSet::new();
+        for head in &actual_revision_heads {
+            head.validate().map_err(|error| error.to_string())?;
+            if !seen_revision_keys.insert(head.key.as_str()) {
+                return Err("canonical revision-head observation contains duplicates".to_owned());
+            }
+            if expected_revisions
+                .get(head.key.as_str())
+                .is_none_or(|(revision, fence)| {
+                    *revision != head.revision || **fence != head.state_fence
+                })
+            {
+                return Err("canonical revision heads changed before reservation".to_owned());
+            }
+        }
+        if seen_revision_keys.len() != expected_revisions.len() {
+            return Err(
+                "canonical revision-head observation does not cover the admitted keys".to_owned(),
+            );
+        }
+
+        let actual_ordering_heads = store
+            .ordering_head_readbacks(operation.transition.ordering_scopes.clone())
+            .await
+            .map_err(|error| format!("could not observe canonical ordering heads: {error}"))?;
+        if actual_ordering_heads.len() != operation.expected_ordering_heads.len() {
+            return Err("canonical ordering-head observation is incomplete".to_owned());
+        }
+        let expected_ordering: BTreeMap<_, _> = operation
+            .expected_ordering_heads
+            .iter()
+            .map(|head| {
+                (
+                    head.scope.as_str(),
+                    (head.expected_sequence, &head.state_fence),
+                )
+            })
+            .collect();
+        let mut observed_heads = Vec::with_capacity(actual_ordering_heads.len());
+        let mut seen_ordering_scopes = BTreeSet::new();
+        for readback in actual_ordering_heads {
+            let head = readback.head;
+            head.validate().map_err(|error| error.to_string())?;
+            if !seen_ordering_scopes.insert(head.scope.clone()) {
+                return Err("canonical ordering-head observation contains duplicates".to_owned());
+            }
+            let canonical_head = canonical_json_bytes(&head).map_err(|error| error.to_string())?;
+            if canonical_head != readback.canonical_bytes
+                || sha256_hex(&readback.canonical_bytes) != readback.canonical_sha256
+                || head.state_fence != operation.context.state_fence
+                || expected_ordering
+                    .get(head.scope.as_str())
+                    .is_none_or(|(sequence, fence)| {
+                        *sequence != head.sequence || **fence != head.state_fence
+                    })
+            {
+                return Err("canonical ordering heads changed or failed exact readback".to_owned());
+            }
+            observed_heads.push(ObservedHead {
+                scope: head.scope.as_str().to_owned(),
+                expected_sequence: head.sequence,
+                expected_head_digest: readback.canonical_sha256,
+                revision_head: None,
+            });
+        }
+        if seen_ordering_scopes.len() != expected_ordering.len() {
+            return Err(
+                "canonical ordering-head observation does not cover admitted scopes".to_owned(),
+            );
+        }
+
+        Ok(observed_heads)
     }
 
     /// Resolves an already-committed `Apply` receipt for this exact operation
@@ -10317,7 +11077,8 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         let resulted = match self.submit_local_read_result(session, &submission)? {
             host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,
-            host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
+            host_request_route::LocalReadSubmitDisposition::StagedWrite(_)
+            | host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
                 return Err(TransportError::SessionFenced);
             }
         };
@@ -11780,8 +12541,9 @@ fn authenticated_user_automation_principal(session: &Session) -> Result<String, 
         {
             Ok(user_identity.clone())
         }
-        PeerIdentity::Authenticated { .. } => Err(TransportError::PeerIdentityUnavailable),
-        PeerIdentity::Unavailable { .. } => Err(TransportError::PeerIdentityUnavailable),
+        PeerIdentity::Authenticated { .. } | PeerIdentity::Unavailable { .. } => {
+            Err(TransportError::PeerIdentityUnavailable)
+        }
     }
 }
 
@@ -12890,6 +13652,29 @@ fn store_apply_response(
         });
     }
     response
+}
+
+#[cfg(windows)]
+fn store_apply_staged_response(submission: &eliot_store_api::WriteSubmission) -> serde_json::Value {
+    serde_json::json!({
+        "status": "accepted_pending",
+        "value": { "kind": "write_submission", "value": submission },
+        "recovery": null,
+    })
+}
+
+#[cfg(windows)]
+fn write_submission_matches_staged_operation(
+    submission: &eliot_store_api::WriteSubmission,
+    operation_id: &str,
+    request_hash: &str,
+) -> bool {
+    submission.validate().is_ok()
+        && submission.state == eliot_store_api::WriteSubmissionState::Staged
+        && submission.operation_id.as_str() == operation_id
+        && submission.request_hash == request_hash
+        && submission.ors_stage_ref.is_some()
+        && submission.canonical_receipt_ref.is_none()
 }
 
 /// Requires a local-read store request to be the closed evidence-pack read.

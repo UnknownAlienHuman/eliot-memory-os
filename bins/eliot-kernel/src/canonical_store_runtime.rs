@@ -25,7 +25,7 @@ use crate::kernel_diagnostics::{
     EntrypointStage, observe_entrypoint_with_detail, observe_terminal_error,
 };
 #[cfg(windows)]
-use eliot_contracts::ResourceGeneration;
+use eliot_contracts::{ResourceGeneration, StateFence, canonical_json_bytes};
 #[cfg(windows)]
 use eliot_platform::PlatformHandle;
 use std::sync::atomic::Ordering;
@@ -46,9 +46,22 @@ use eliot_kernel_core::RouteScope;
 #[cfg(windows)]
 use eliot_kernel_service::{EbpCanonicalStoreClient, StoreClientError};
 #[cfg(windows)]
+use eliot_kernel_service::{RESERVATION_KEY_NAME, RESERVATION_KEY_PROVIDER};
+#[cfg(windows)]
+use eliot_ors::{RecoveryPayload, ReservationState, StateFenceSnapshot};
+#[cfg(windows)]
+use eliot_platform_windows::ProtectedSecret;
+#[cfg(windows)]
 use eliot_platform_windows::{NamedPipePeerExpectation, observe_named_pipe_peer_process_in_job};
 #[cfg(windows)]
 use std::fmt;
+
+#[cfg(windows)]
+struct VerifiedObserveReservation {
+    state_fence: StateFence,
+    operation: super::daemon_request_dispatch::StoreApplyOperation,
+    original_submission: eliot_store_api::OriginalWriteSubmission,
+}
 
 /// Maps one Store bootstrap/build failure to its stable owner-typed code.
 ///
@@ -481,13 +494,17 @@ impl KernelComposition {
                 admission.durable_owner_generation.value()
             ),
         );
-        let gateway = Arc::new(KernelStoreGateway::new(
+        let evidence = self.canonical_store_evidence.clone().ok_or_else(|| {
+            KernelBuildError::Service("canonical Store evidence provider is unavailable".to_owned())
+        })?;
+        let gateway = Arc::new(KernelStoreGateway::new_with_evidence(
             self.service.clone(),
             Arc::new(client),
             route,
             // I14.21 (#1690): the gateway owns unknown-commit recovery
             // against the composition-retained Kernel ORS handle.
             Some(Arc::clone(&self.generation_gateway.ors)),
+            evidence,
         ));
         attach_then_retain_canonical_store(
             Arc::clone(&gateway),
@@ -521,6 +538,178 @@ impl KernelComposition {
             "kernel.store.gateway_attached",
         );
         Ok(gateway)
+    }
+
+    /// Resumes only new, exact full-operation Observe reservations after the
+    /// existing Store and ORS recovery pass has established their denominator.
+    /// Legacy transition-only records and uncertain send states stay on the
+    /// receipt-only path. Complete original operations are decoded only from
+    /// their protected reservation payload and are never reconstructed from
+    /// current heads.
+    #[cfg(windows)]
+    pub(crate) async fn resume_staged_observe_reservations(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        inventory: &eliot_kernel_service::StagedWriteRecovery,
+    ) -> Result<(), String> {
+        for staged in &inventory.envelopes {
+            let operation_identity =
+                eliot_ors::OperationIdentity::new(staged.operation_id.as_str())
+                    .map_err(|error| error.to_string())?;
+            let Some(reservation) = self
+                .generation_gateway
+                .ors
+                .load_write_reservation_by_operation(&operation_identity)
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            if reservation.token.operation_id != operation_identity
+                || reservation.token.reservation_order != staged.reservation_order
+                || reservation.state != staged.state
+            {
+                continue;
+            }
+            if matches!(
+                reservation.state,
+                ReservationState::Reserved
+                    | ReservationState::Eligible
+                    | ReservationState::Executing
+                    | ReservationState::Reconciling
+            ) {
+                let _ = self
+                    .resume_one_staged_observe_reservation(gateway, &reservation)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn resume_one_staged_observe_reservation(
+        &self,
+        gateway: &Arc<KernelStoreGateway>,
+        reservation: &eliot_ors::ReservationRecord,
+    ) -> Result<(), String> {
+        let token = &reservation.token;
+        let Some(host_record) = self
+            .generation_gateway
+            .ors
+            .load_host_request_by_operation(&token.operation_id)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        if host_record.kind != eliot_ors::HostRequestKind::Invocation
+            || host_record.capability_ref.as_str() != "eliot.observe"
+            || host_record.executable_input.is_none()
+        {
+            return Ok(());
+        }
+        let verified =
+            self.verify_staged_observe_reservation(gateway, reservation, &host_record)?;
+        let Ok(receipt) = gateway
+            .receipt(
+                &verified.state_fence,
+                verified.operation.transition.identity.operation_id.clone(),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        if receipt.is_none()
+            && !matches!(
+                reservation.state,
+                ReservationState::Reserved | ReservationState::Eligible
+            )
+        {
+            return Ok(());
+        }
+        gateway
+            .restore_staged_reserved(
+                &verified.operation.context,
+                verified.operation.transition,
+                verified.operation.expected_revision_heads,
+                verified.operation.expected_ordering_heads,
+                &verified.original_submission,
+                token.clone(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn verify_staged_observe_reservation(
+        &self,
+        gateway: &KernelStoreGateway,
+        reservation: &eliot_ors::ReservationRecord,
+        host_record: &eliot_ors::HostRequestRecord,
+    ) -> Result<VerifiedObserveReservation, String> {
+        let token = &reservation.token;
+        let state_fence: StateFence = serde_json::from_str(&token.state_fence.canonical_json)
+            .map_err(|error| error.to_string())?;
+        let recaptured =
+            StateFenceSnapshot::capture(&state_fence, token.state_fence.observed_authority_epoch)
+                .map_err(|error| error.to_string())?;
+        if recaptured != token.state_fence {
+            return Err("retained Observe reservation fence did not round-trip".to_owned());
+        }
+        let operation_identity = eliot_ors::OperationIdentity::new(token.operation_id.as_str())
+            .map_err(|error| error.to_string())?;
+        let envelope = gateway.verify_staged_envelope(&state_fence, &operation_identity)?;
+        let staged_access = envelope.privacy_and_visibility_class.clone();
+        let ciphertext = match envelope.payload {
+            RecoveryPayload::Encrypted { key, ciphertext }
+                if key.provider.as_str() == RESERVATION_KEY_PROVIDER
+                    && key.key.as_str() == RESERVATION_KEY_NAME =>
+            {
+                ciphertext
+            }
+            _ => {
+                return Err(
+                    "retained Observe reservation payload is not its protected operation"
+                        .to_owned(),
+                );
+            }
+        };
+        let protected =
+            ProtectedSecret::from_ciphertext(ciphertext).map_err(|error| error.to_string())?;
+        let original_bytes = self
+            .platform
+            .unprotect_secret(&protected)
+            .map_err(|error| error.to_string())?;
+        let operation: super::daemon_request_dispatch::StoreApplyOperation =
+            serde_json::from_slice(original_bytes.expose()).map_err(|error| error.to_string())?;
+        if canonical_json_bytes(&operation).map_err(|error| error.to_string())?
+            != original_bytes.expose()
+            || eliot_store_api::prepared_transition_digest(&operation.transition)
+                .map_err(|error| error.to_string())?
+                != token.prepared_transition_sha256
+            || operation.context.state_fence != state_fence
+            || operation.transition.identity.operation_id.as_str() != token.operation_id.as_str()
+        {
+            return Err("retained Observe operation differs from its reservation token".to_owned());
+        }
+        let input = Self::retained_observe_reservation_input(host_record, &operation)?
+            .ok_or_else(|| "retained Observe operation has no executable input".to_owned())?;
+        let original_submission = operation
+            .original_write_submission
+            .as_ref()
+            .ok_or_else(|| "retained Observe operation has no original write source".to_owned())?
+            .clone();
+        self.validate_original_write_submission_source(host_record, &original_submission)
+            .map_err(|error| format!("retained Observe source failed validation: {error}"))?;
+        if staged_access != input.protected_envelope.privacy_and_visibility_class
+            || input.payload_sha256 != host_record.payload_digest
+        {
+            return Err("retained Observe protected input does not match its owner row".to_owned());
+        }
+        Ok(VerifiedObserveReservation {
+            state_fence,
+            operation,
+            original_submission,
+        })
     }
 
     /// Observes the three independent canonical-Store facts and refuses

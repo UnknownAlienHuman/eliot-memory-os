@@ -262,6 +262,10 @@ impl<T: EbpStoreTransport + 'static> EbpCanonicalStoreClient<T> {
                 Some(request.transition.identity.operation_id.clone())
             }
             StoreRequest::InitializeGenesis { request, .. } => Some(request.operation_id.clone()),
+            // The WorkScope CAS carries the exact original Host operation
+            // identity through the admitted request; RequestMeta.request_id is
+            // a separate request identity and must never be substituted here.
+            StoreRequest::WriteWorkScopeOwner { request, .. } => Some(request.operation_id.clone()),
             StoreRequest::Receipt { operation_id } => Some(operation_id.clone()),
             // T12-04 K1 (owner #779): the Dreamer ledger family carries its
             // stable mutation identity in the K0 request identity. Extracting
