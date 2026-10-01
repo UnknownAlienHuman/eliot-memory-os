@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
+use eliot_config::Setting;
 use eliot_config::first_run::{
     FirstRunAutomation, FirstRunDecision, FirstRunInput, FirstRunRole, RecommendationBoard,
     RouteKind, RouteSelection, apply_automation_update, apply_update, decide_first_run,
@@ -35,7 +36,6 @@ use eliot_config::first_run::{
 use eliot_config::initial_snapshot::{
     InitialSnapshotIdentity, PrivacyChoice, prepare_initial_snapshot_payload,
 };
-use eliot_config::Setting;
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -200,8 +200,7 @@ fn decision_from_settings(settings: &[Setting]) -> Result<(FirstRunDecision, Str
             Some(_) => anyhow::bail!("stored setup state mixes settings owners"),
         }
         if let Some(role_key) = setting.key.strip_prefix("route.") {
-            let role =
-                parse_role(role_key).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let role = parse_role(role_key).map_err(|error| anyhow::anyhow!(error.to_string()))?;
             let state = setting.value_ref.strip_prefix("literal:").ok_or_else(|| {
                 anyhow::anyhow!("stored route value is not a literal: {}", setting.key)
             })?;
@@ -237,7 +236,10 @@ fn decision_from_settings(settings: &[Setting]) -> Result<(FirstRunDecision, Str
                         },
                     );
                 }
-                _ => anyhow::bail!("stored setup state carries unknown route state: {}", setting.key),
+                _ => anyhow::bail!(
+                    "stored setup state carries unknown route state: {}",
+                    setting.key
+                ),
             }
         } else if setting.key == "automation.maintenance_mode" {
             let mode = setting.value_ref.strip_prefix("literal:").ok_or_else(|| {
@@ -289,11 +291,7 @@ fn load_stored_decision(path: &Path) -> Result<Option<(FirstRunDecision, String)
 
 /// Persists the typed decision as the canonical `Setting` payload produced
 /// by the owner.
-fn save_stored_decision(
-    path: &Path,
-    decision: &FirstRunDecision,
-    owner_ref: &str,
-) -> Result<()> {
+fn save_stored_decision(path: &Path, decision: &FirstRunDecision, owner_ref: &str) -> Result<()> {
     let document = serde_json::json!({
         "schema": SETUP_STATE_SCHEMA,
         "settings": to_settings(decision, owner_ref),
@@ -305,7 +303,8 @@ fn save_stored_decision(
             .map_err(|error| anyhow::anyhow!("create stored setup state dir: {error}"))?;
     }
     let encoded = serde_json::to_string_pretty(&document).context("encode stored setup state")?;
-    std::fs::write(path, encoded).map_err(|error| anyhow::anyhow!("write stored setup state: {error}"))?;
+    std::fs::write(path, encoded)
+        .map_err(|error| anyhow::anyhow!("write stored setup state: {error}"))?;
     Ok(())
 }
 
