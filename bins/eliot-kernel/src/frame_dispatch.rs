@@ -40,6 +40,9 @@ use super::{
     TestdAdmissionAttemptRequest, TransportError, caller_binding, probe_ready_state_admitted,
     route_doctor_repair, route_testd_admission, status_frame, unix_ms,
 };
+use eliot_blob_api::wire::{
+    BLOB_PROCESS_STREAM_KERNEL_WIRE_ID, BlobProcessStreamKernelRequest,
+};
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_kernel_core::{
     CapabilityReadiness, CompatibilityEnvelope, DurableCompatibilityState, HealthDimensionKind,
@@ -254,6 +257,7 @@ fn observe_runtime_capability_health(capability: &eliot_kernel_core::CapabilityH
 fn actual_route_name(action: &KernelFrameAction) -> &'static str {
     match action {
         KernelFrameAction::Reply(_) => "reply_admitted",
+        KernelFrameAction::BlobProcessStream { .. } => "blob_process_stream_admitted",
         KernelFrameAction::Daemon { .. } => "daemon_admitted",
         KernelFrameAction::Process { .. } => "process_admitted",
         KernelFrameAction::Doctor { .. } => "doctor_admitted",
@@ -281,6 +285,7 @@ fn requested_route_name(frame: &Frame) -> Option<String> {
     payload
         .get("operation")
         .and_then(serde_json::Value::as_str)
+        .or_else(|| payload.get("wire_id").and_then(serde_json::Value::as_str))
         .map(str::to_owned)
 }
 
@@ -880,6 +885,32 @@ impl KernelComposition {
                 ProtocolPayload::Json(payload) => payload.clone(),
                 _ => return Err(TransportError::SessionFenced),
             };
+            // The dedicated Blob exchange has no generic RequestIdentity
+            // because its per-Store identities are issued by Kernel from the
+            // retained TestD grant. Keep this exact closed wire selector ahead
+            // of the generic operation/identity routes.
+            if payload.get("wire_id").and_then(serde_json::Value::as_str)
+                == Some(BLOB_PROCESS_STREAM_KERNEL_WIRE_ID)
+            {
+                if session.module_generation.module_id.as_str() != TESTD_MODULE_ID
+                    || frame.request_identity.is_some()
+                    || !probe_ready_state_admitted(
+                        self.service_state()
+                            .map_err(|_| TransportError::SessionFenced)?,
+                    )
+                {
+                    return Err(TransportError::SessionFenced);
+                }
+                let request: BlobProcessStreamKernelRequest =
+                    serde_json::from_value(payload).map_err(|_| TransportError::SessionFenced)?;
+                request
+                    .validate()
+                    .map_err(|_| TransportError::SessionFenced)?;
+                return Ok(KernelFrameAction::BlobProcessStream {
+                    request_id,
+                    request,
+                });
+            }
             // The closed selector is owned here so the exact payload can still be
             // moved into the dispatched frame action below.
             let operation = payload
@@ -1483,6 +1514,8 @@ fn is_daemon_operation(operation: &str) -> bool {
         | STORAGE_REPLACEMENT_RESUME_OPERATION
         | STORAGE_REPLACEMENT_ROLLBACK_OPERATION
             | DAEMON_STARTUP_EVIDENCE_OPERATION
+            | super::daemon_request_dispatch::TESTD_BLOB_OWNER_FACTS_PENDING_OPERATION
+            | super::daemon_request_dispatch::TESTD_BLOB_OWNER_FACTS_COMPLETE_OPERATION
             // Issue #1779: the authenticated `UserAutomation` runtime route.
             // The marker is the closed daemon operation name the retained
             // `UserAutomation` admission path already serves, so this entry
