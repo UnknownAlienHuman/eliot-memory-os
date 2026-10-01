@@ -616,6 +616,7 @@ pub struct VerifiedGoverningSourceApproval {
 pub struct InitialWorkScopeSourceDiscoveryLease {
     lease: DiscoveryReadLease,
     authenticated_approver_principal_ref: String,
+    issued_at: u64,
 }
 
 /// Initial-bind authority and its exact committed Policy operation parent as
@@ -751,6 +752,7 @@ pub fn issue_initial_work_scope_source_discovery_lease(
     Ok(InitialWorkScopeSourceDiscoveryLease {
         lease,
         authenticated_approver_principal_ref: lease_key.host_ref.clone(),
+        issued_at: now,
     })
 }
 
@@ -970,9 +972,11 @@ pub fn prepare_initial_work_scope_source_admission(
         approved.scope_privacy_class,
         governing_source_generation,
     )?;
-    if now_after_source_reads > identity.deadline_unix_ms {
+    if now_after_source_reads < lease.issued_at
+        || now_after_source_reads > identity.deadline_unix_ms
+    {
         return Err(WorkScopeSourceAdmissionError::SourceAdmission(
-            "request deadline elapsed while observing governing sources".to_owned(),
+            "source observation clock is outside the active request lease".to_owned(),
         ));
     }
     let request_session = identity
