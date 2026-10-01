@@ -109,6 +109,21 @@ pub use finish_attempt::{
     FINISH_RESULT_BODY_WIRE_ID, FINISH_RESULT_BODY_WIRE_VERSION, FinishAttempt, FinishResultBody,
 };
 
+mod stop_boundary;
+pub use stop_boundary::{
+    STOP_BOUNDARY_RECORD_WIRE_ID, STOP_BOUNDARY_RECORD_WIRE_VERSION,
+    StopBoundaryActionCoverage, StopBoundaryActionPlan,
+    StopBoundaryCoverage, StopBoundaryCoverageGap, StopBoundaryCursorState,
+    StopBoundaryCursorUnknownReason, StopBoundaryDescendant, StopBoundaryEffectDisposition,
+    StopBoundaryEnumeration, StopBoundaryEventPosition, StopBoundaryEventPositions,
+    StopBoundaryGeneration, StopBoundaryGenerationUnknownReason, StopBoundaryOperation,
+    StopBoundaryPageRef, StopBoundaryPositionState, StopBoundaryPositionUnknownReason,
+    StopBoundaryRecord,
+    StopBoundaryRequiredAction, StopBoundarySourceBinding, StopBoundarySourceContent,
+    StopBoundarySourceContentAbsence, StopBoundarySourceContentUnknownReason,
+    StopBoundarySourceCursor,
+};
+
 pub mod route_continuation;
 pub use route_continuation::{
     ContinuityKind, HandoffCausalLink, HandoffCompleteness, InFlightEffectDisposition,
