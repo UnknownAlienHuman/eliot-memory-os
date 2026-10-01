@@ -109,7 +109,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         clippy::too_many_lines,
         reason = "the event driver carries the trigger, scanner, lease, candidate, source, fence, privacy, task, and receipt inputs of the three sequenced legs in one fail-closed entry"
     )]
-    pub fn drive_cold_start_for_event(
+    pub async fn drive_cold_start_for_event(
         &mut self,
         trigger: ColdStartTrigger,
         discovery_lease: &mut DiscoveryReadLease,
@@ -148,19 +148,48 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         task: TaskBindingInput,
         now: u64,
     ) -> Result<ColdStartTriggerCompilation, CompositionError> {
-        let outcome = Self::run_cold_start_trigger_scan(
+        let original = self
+            .read_cold_start_owner_inputs_for_root(
+                principal_ref,
+                session_ref,
+                &scan.canonical_root_ref,
+                state_fence,
+                discovery_lease,
+                now,
+            )
+            .await?;
+        let discovery = original.bootstrap_discovery_inputs.as_ref().ok_or(
+            CompositionError::ScanDisclosure(eliot_workscope::WorkScopeError::ScanReceiptMissing),
+        )?;
+        if discovery.candidate_privacy != Some(candidate_privacy)
+            || discovery.privacy_boundary.as_ref() != privacy_boundary
+            || discovery.evidence != *scan
+            || discovery.proposed_kind != proposed_kind
+            || discovery.identity_fingerprint != identity_fingerprint
+            || discovery.governing_source_refs != governing_source_refs
+            || discovery
+                .policy
+                .as_ref()
+                .map(|policy| policy.verifier_refs.as_slice())
+                != Some(verifier_candidates)
+        {
+            return Err(CompositionError::ScanDisclosure(
+                eliot_workscope::WorkScopeError::BindingReceiptMismatch,
+            ));
+        }
+        let bound_store = self.bound_installation_scan_store()?;
+        if store.contour() != bound_store.contour() {
+            return Err(CompositionError::ScanDisclosure(
+                eliot_workscope::WorkScopeError::ScanContourNotAdmitted,
+            ));
+        }
+        let store = bound_store;
+        let outcome = self.run_cold_start_trigger_scan(
             trigger,
             &mut *discovery_lease,
             lease_key,
-            &mut *store,
             binding,
-            candidate_privacy,
-            privacy_boundary,
-            scan,
-            proposed_kind,
-            identity_fingerprint,
-            verifier_candidates,
-            governing_source_refs,
+            discovery,
             now,
         )?;
         let scan_receipt = match &outcome {
@@ -180,9 +209,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             sources,
             privacy,
             scan,
-            &*store,
-            binding,
-            scan_receipt,
+            (&store, binding, scan_receipt),
         )?;
         let join = self.join_cold_start_lease(
             trigger,
@@ -192,7 +219,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             sources,
             privacy,
             scan,
-            &*store,
+            &store,
             binding,
             scan_receipt,
             now,
@@ -200,38 +227,40 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         if matches!(join, LeaseJoin::JoinedTerminal { .. }) {
             return Ok(ColdStartTriggerCompilation { claim, join });
         }
-        let compiled = self.compile_cold_start_at_trigger(
-            trigger,
-            &*discovery_lease,
-            proposed,
-            receipt_ref,
-            principal_ref,
-            session_ref,
-            scope,
-            instance,
-            lineage,
-            candidate,
-            sources,
-            state_fence,
-            governance_profile_ref,
-            limiting_integration_evidence,
-            route_profile_ref,
-            serializer_id,
-            serializer_version,
-            serializer_options_digest,
-            tokenizer_id,
-            tokenizer_version,
-            tokenizer_hash,
-            projection_source_ref,
-            projection_generation,
-            privacy,
-            task,
-            scan,
-            &*store,
-            binding,
-            Some(scan_receipt),
-            now,
-        )?;
+        let compiled = self
+            .compile_cold_start_at_trigger(
+                trigger,
+                &*discovery_lease,
+                proposed,
+                receipt_ref,
+                principal_ref,
+                session_ref,
+                scope,
+                instance,
+                lineage,
+                candidate,
+                sources,
+                state_fence,
+                governance_profile_ref,
+                limiting_integration_evidence,
+                route_profile_ref,
+                serializer_id,
+                serializer_version,
+                serializer_options_digest,
+                Some(tokenizer_id),
+                Some(tokenizer_version),
+                Some(tokenizer_hash),
+                Some(projection_source_ref),
+                Some(projection_generation),
+                privacy,
+                task,
+                scan,
+                &store,
+                binding,
+                scan_receipt,
+                now,
+            )
+            .await?;
         Ok(ColdStartTriggerCompilation {
             claim,
             join: compiled,

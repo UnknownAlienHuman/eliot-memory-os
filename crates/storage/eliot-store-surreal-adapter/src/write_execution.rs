@@ -358,7 +358,7 @@ pub enum ExclusiveOpKind {
     SchemaReplacement,
     /// Provider/execution generation cutover.
     GenerationCutover,
-    /// Durable WorkScope owner compare-and-swap.
+    /// Durable `WorkScope` owner compare-and-swap.
     WorkScopeOwner,
 }
 

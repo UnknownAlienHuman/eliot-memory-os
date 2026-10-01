@@ -2791,6 +2791,11 @@ impl AgentActivationResolutionTicket {
                 });
             }
         }
+        self.validate_ticket_digest()?;
+        Ok(())
+    }
+
+    fn validate_ticket_digest(&self) -> Result<(), ProtocolError> {
         lowercase_sha256(
             &self.ticket_sha256,
             "agent_activation_resolution_ticket.ticket_sha256",
@@ -3387,7 +3392,7 @@ pub struct OpenAgentBridgeActivationResponse {
     /// Typed activation outcome, including additive canonical denials.
     pub disposition: OpenAgentBridgeActivationDisposition,
     /// Owner-produced pre-scope proof returned only with the exact
-    /// `ScopeSelectionRequired` denial. It may authorize BIND_SCOPE only and
+    /// `ScopeSelectionRequired` denial. It may authorize `BIND_SCOPE` only and
     /// never represents an authenticated Session or Resolved binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_scope_evidence: Option<AgentActivationBindScopeEvidence>,
@@ -3435,7 +3440,7 @@ impl OpenAgentBridgeActivationResponse {
     }
 
     /// Adds the exact owner proof needed to submit an explicit initial
-    /// BIND_SCOPE request. The denial remains non-authenticated and its
+    /// `BIND_SCOPE` request. The denial remains non-authenticated and its
     /// response digest covers the proof.
     pub fn with_bind_scope_evidence(
         mut self,

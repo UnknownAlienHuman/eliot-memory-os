@@ -315,8 +315,8 @@ pub struct AgentActivationOwnerReadback {
 }
 
 /// Authenticated semantic-owner proof that a single admitted task selection
-/// can bind its explicitly selected WorkScope before a Resolved activation
-/// exists. This is a BIND_SCOPE-only capability: it does not create a
+/// can bind its explicitly selected `WorkScope` before a Resolved activation
+/// exists. This is a `BIND_SCOPE`-only capability: it does not create a
 /// Session, a Resolved binding, or readiness. Every semantic field is copied
 /// from the Governor's existing WorkLease/session/task/canonical-plan and
 /// TaskContract-acceptance proof and is sealed to the exact activation ticket.
@@ -917,7 +917,7 @@ pub struct AgentActivationResolutionResult {
     /// every negative disposition.
     #[serde(default)]
     pub owner_evidence: Option<AgentActivationOwnerEvidence>,
-    /// Pre-scope owner proof authorizing only an explicit BIND_SCOPE claim.
+    /// Pre-scope owner proof authorizing only an explicit `BIND_SCOPE` claim.
     /// It never creates an activated binding, Session, or readiness.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_scope_evidence: Option<AgentActivationBindScopeEvidence>,
@@ -1071,7 +1071,7 @@ impl AgentActivationResolutionResult {
         Ok(self)
     }
 
-    /// Attaches the owner-produced pre-scope proof for an explicit BIND_SCOPE
+    /// Attaches the owner-produced pre-scope proof for an explicit `BIND_SCOPE`
     /// operation and reseals the exact result digest. The ticket join is
     /// checked by `validate_against` at the authenticated Kernel boundary.
     pub fn with_bind_scope_evidence(

@@ -616,6 +616,82 @@ pub enum WorkScopeError {
     ScanReceiptUnknownCommit,
 }
 
+/// Closed owner failure identity retained across a serialized result boundary.
+/// Detail remains diagnostic; consumers select recovery by this owner code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkScopeErrorCode {
+    InvalidText,
+    InvalidDigest,
+    InvalidCounter,
+    DuplicateReference,
+    EmptyCollection,
+    AmbiguousObservation,
+    InvalidSourceEvidence,
+    SourceIdentityMismatch,
+    SourceSetMismatch,
+    SourceClosureUnavailable,
+    DiscoveryLeaseMissing,
+    PrivacyBoundaryMissing,
+    OriginalObservationMissing,
+    UnresolvedSourceConflict,
+    TaskAuthorityDenied,
+    InvalidTaskSelectionEvidence,
+    PrivacyDenied,
+    InvalidStateFence,
+    StateFenceMismatch,
+    BindingReceiptNotMatched,
+    BindingReceiptMismatch,
+    ScanContourNotAdmitted,
+    ScanIdentityConflict,
+    ScanReceiptMissing,
+    ScanReceiptInaccessible,
+    ScanReceiptCorrupt,
+    ScanReceiptReplaced,
+    ScanReceiptStale,
+    ScanReceiptInvalidated,
+    ScanReceiptUnknownCommit,
+}
+
+impl WorkScopeError {
+    /// Retain the exact typed failure class without parsing its display text.
+    #[must_use]
+    pub const fn code(&self) -> WorkScopeErrorCode {
+        match self {
+            Self::InvalidText { .. } => WorkScopeErrorCode::InvalidText,
+            Self::InvalidDigest { .. } => WorkScopeErrorCode::InvalidDigest,
+            Self::InvalidCounter { .. } => WorkScopeErrorCode::InvalidCounter,
+            Self::DuplicateReference { .. } => WorkScopeErrorCode::DuplicateReference,
+            Self::EmptyCollection { .. } => WorkScopeErrorCode::EmptyCollection,
+            Self::AmbiguousObservation { .. } => WorkScopeErrorCode::AmbiguousObservation,
+            Self::InvalidSourceEvidence => WorkScopeErrorCode::InvalidSourceEvidence,
+            Self::SourceIdentityMismatch => WorkScopeErrorCode::SourceIdentityMismatch,
+            Self::SourceSetMismatch => WorkScopeErrorCode::SourceSetMismatch,
+            Self::SourceClosureUnavailable => WorkScopeErrorCode::SourceClosureUnavailable,
+            Self::DiscoveryLeaseMissing => WorkScopeErrorCode::DiscoveryLeaseMissing,
+            Self::PrivacyBoundaryMissing => WorkScopeErrorCode::PrivacyBoundaryMissing,
+            Self::OriginalObservationMissing => WorkScopeErrorCode::OriginalObservationMissing,
+            Self::UnresolvedSourceConflict => WorkScopeErrorCode::UnresolvedSourceConflict,
+            Self::TaskAuthorityDenied => WorkScopeErrorCode::TaskAuthorityDenied,
+            Self::InvalidTaskSelectionEvidence => WorkScopeErrorCode::InvalidTaskSelectionEvidence,
+            Self::PrivacyDenied => WorkScopeErrorCode::PrivacyDenied,
+            Self::InvalidStateFence => WorkScopeErrorCode::InvalidStateFence,
+            Self::StateFenceMismatch => WorkScopeErrorCode::StateFenceMismatch,
+            Self::BindingReceiptNotMatched => WorkScopeErrorCode::BindingReceiptNotMatched,
+            Self::BindingReceiptMismatch => WorkScopeErrorCode::BindingReceiptMismatch,
+            Self::ScanContourNotAdmitted => WorkScopeErrorCode::ScanContourNotAdmitted,
+            Self::ScanIdentityConflict => WorkScopeErrorCode::ScanIdentityConflict,
+            Self::ScanReceiptMissing => WorkScopeErrorCode::ScanReceiptMissing,
+            Self::ScanReceiptInaccessible => WorkScopeErrorCode::ScanReceiptInaccessible,
+            Self::ScanReceiptCorrupt => WorkScopeErrorCode::ScanReceiptCorrupt,
+            Self::ScanReceiptReplaced => WorkScopeErrorCode::ScanReceiptReplaced,
+            Self::ScanReceiptStale => WorkScopeErrorCode::ScanReceiptStale,
+            Self::ScanReceiptInvalidated => WorkScopeErrorCode::ScanReceiptInvalidated,
+            Self::ScanReceiptUnknownCommit => WorkScopeErrorCode::ScanReceiptUnknownCommit,
+        }
+    }
+}
+
 fn text(value: &str, field: &'static str) -> Result<(), WorkScopeError> {
     if value.trim().is_empty() || value.chars().any(char::is_control) {
         Err(WorkScopeError::InvalidText { field })

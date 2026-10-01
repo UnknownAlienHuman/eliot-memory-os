@@ -9228,7 +9228,7 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         Ok(store)
     }
 
-    fn bound_installation_scan_store(
+    pub(crate) fn bound_installation_scan_store(
         &self,
     ) -> Result<InstallationScanDisclosureStore, CompositionError> {
         let contour = self.cold_start_readiness_contour.as_ref().ok_or_else(|| {

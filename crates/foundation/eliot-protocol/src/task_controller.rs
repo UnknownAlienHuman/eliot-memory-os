@@ -102,7 +102,7 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
-    /// Install the exact admitted task's initial WorkScope binding.
+    /// Install the exact admitted task's initial `WorkScope` binding.
     BindScope,
 }
 
@@ -148,7 +148,7 @@ pub struct TaskControllerInvocation {
     /// Create or update operation selected by the admitted caller.
     pub action: TaskControllerAction,
     /// Original activation-owner proof authorizing only this exact initial
-    /// WorkScope binding. Required for `BindScope`, absent for every other
+    /// `WorkScope` binding. Required for `BindScope`, absent for every other
     /// action; it is checked against Kernel-retained activation state before
     /// the invocation is claimable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +269,11 @@ impl TaskControllerInvocation {
                 "task_controller_invocation.prior_delivery_selector",
             )?;
         }
+        self.validate_campaign_owner_materials()?;
+        Ok(())
+    }
+
+    fn validate_campaign_owner_materials(&self) -> Result<(), ProtocolError> {
         if let Some(materials) = &self.campaign_owner_materials {
             structured_object(
                 &materials.prior_delivery,

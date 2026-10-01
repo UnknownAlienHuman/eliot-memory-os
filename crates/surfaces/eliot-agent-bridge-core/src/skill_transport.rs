@@ -50,9 +50,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Versioned Skill transport contract identity.
-pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v5";
+pub const SKILL_TRANSPORT_CONTRACT_ID: &str = "eliot.skill.transport/v6";
 /// Payload contract revision. Decode rejects any other revision.
-pub const SKILL_TRANSPORT_VERSION: u32 = 5;
+pub const SKILL_TRANSPORT_VERSION: u32 = 6;
 /// Maximum encoded intake bytes (I7.2 default frame max). Larger material
 /// must arrive by Blob or handle reference (future extension), never as
 /// giant inline frames; oversize fails closed here.
@@ -461,6 +461,15 @@ pub enum SkillResultOutcome {
     /// A readiness refusal retains its owner receipt, effect, directive, and
     /// exact missing inputs through the result wire.
     MaterialReadinessDenied(Box<eliot_skill::SkillMaterialReadinessDenial>),
+    /// Preserve the exact cold-start owner failure class through the bridge.
+    WorkScopeReadinessDenied {
+        code: eliot_skill::WorkScopeErrorCode,
+        detail: String,
+    },
+    /// Preserve discovery-lease degradation without collapsing it to text.
+    ColdStartLeaseDenied {
+        cause: eliot_skill::OnboardingDegraded,
+    },
 }
 
 impl SkillResultEnvelope {
@@ -537,6 +546,13 @@ impl SkillResultEnvelope {
             }
             SkillError::MaterialReadinessDenied(failure) => {
                 SkillResultOutcome::MaterialReadinessDenied(failure.clone())
+            }
+            SkillError::WorkScope(failure) => SkillResultOutcome::WorkScopeReadinessDenied {
+                code: failure.code(),
+                detail: failure.to_string(),
+            },
+            SkillError::ColdStartLease(cause) => {
+                SkillResultOutcome::ColdStartLeaseDenied { cause: *cause }
             }
             SkillError::FenceMismatch => SkillResultOutcome::Refused {
                 code: "FENCE_MISMATCH".to_owned(),

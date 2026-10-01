@@ -91,7 +91,7 @@ pub(crate) async fn initialize_genesis(
     Ok(receipt)
 }
 
-/// Replaces one retained WorkScope owner row through a same-fence CAS and
+/// Replaces one retained `WorkScope` owner row through a same-fence CAS and
 /// acknowledges it only after exact durable readback.
 pub(crate) async fn write_work_scope_owner(
     adapter: &SurrealStoreAdapter,

@@ -1768,6 +1768,11 @@ fn legacy_host_refusal() -> KernelServiceError {
 fn ors_refusal(error: &OrsError) -> KernelServiceError {
     match error {
         OrsError::StoreContract(source) => store_contract_refusal(source),
+        OrsError::ScanDisclosureReadFailure(cause) => {
+            KernelServiceError::Core(eliot_kernel_core::KernelError::RecoveryState(
+                OrsError::ScanDisclosureReadFailure(*cause),
+            ))
+        }
         // The presented ORS state does not match the required authority,
         // fence, owner or durable head.
         OrsError::FenceMismatch => mismatch("authority_epoch_fence"),

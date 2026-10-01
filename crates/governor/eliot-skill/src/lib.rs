@@ -22,6 +22,9 @@ use eliot_contracts::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Original cold-start owner failure vocabulary used by Skill result transport.
+pub use eliot_workscope::{OnboardingDegraded, WorkScopeErrorCode};
+
 pub mod catalogue;
 pub use catalogue::*;
 pub mod canonical_tools;
@@ -155,7 +158,7 @@ pub enum SkillError {
     Surface(String),
     #[error("Skill lifecycle store failure: {0:?}")]
     Store(eliot_store_api::StoreFailure),
-    /// Exact typed WorkScope readiness or scan readback failure.
+    /// Exact typed `WorkScope` readiness or scan readback failure.
     #[error("Skill lifecycle WorkScope readiness failed: {0}")]
     WorkScope(#[from] eliot_workscope::WorkScopeError),
     /// Exact typed discovery-lease degradation from cold-start admission.
