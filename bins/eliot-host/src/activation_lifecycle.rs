@@ -972,7 +972,7 @@ impl HostComposition {
                     host_terminal.disarm();
                     return Ok(false);
                 };
-                self.append_idle_drain_draining(&activation, Some(&attempt))?;
+                self.append_idle_drain_draining(&activation, Some(&attempt), Vec::new())?;
                 self.transition_activation(ActivationState::Draining, "host-idle-drain")?;
                 true
             }
@@ -1214,7 +1214,10 @@ impl HostComposition {
         // census or prevents the drain.
         let census_binding = format!(
             "idle:{}",
-            sha256_json(&(&owner_census.state_fence, &owner_census.supervision_lease_id))?
+            sha256_json(&(
+                &owner_census.state_fence,
+                &owner_census.supervision_lease_id
+            ))?
         );
         let predecessor_checksum = record_checksum(&HostStateRecord::Drain(predecessor.clone()))?;
         // The successor inherits its predecessor's evidence, which is what
