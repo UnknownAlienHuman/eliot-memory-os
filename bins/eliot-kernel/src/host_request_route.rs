@@ -2061,7 +2061,7 @@ impl KernelComposition {
             || transition.named_operations[0].operation
                 != eliot_store_api::NamedMutationOperation::AdmitProposedAttempt
             || transition.identity.operation_id.as_str()
-                == staged_record.stage_operation_id.as_str()
+                != staged_record.stage_operation_id.as_str()
         {
             return Err(TransportError::IdentityConflict);
         }
