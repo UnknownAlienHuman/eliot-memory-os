@@ -1700,10 +1700,19 @@ impl ContextRecipePolicy {
     /// [`ContextError::MissingField`]. Both halves matter: skipping a budgeted
     /// role the instance does not govern would leave its `omission_or_handle_policy`
     /// certified inside `policy_sha256` and read by no path, which is the
-    /// certified-behavioural-no-op A2 forbids. The absence refusal reuses the
-    /// crate's own vocabulary for it — `ContextRecipe::validate` already raises
-    /// `MissingField("recipe.role_policies")` when a role it governs carries no
-    /// rule.
+    /// certified-behavioural-no-op A2 forbids.
+    ///
+    /// The absence refusal is `ContextError::MissingField("recipe.role_policies")`
+    /// — the same constructed type and the same field string
+    /// `ContextRecipe::validate` in `atom.rs` raises — but it is NOT that
+    /// validator's refusal and it does not reuse it. That validator requires a
+    /// loss rule for every role in the INSTANCE's `mandatory_roles`; this one
+    /// requires one for every role in the POLICY's `section_budgets`. The
+    /// subjects differ: a policy may budget a role the instance does not make
+    /// mandatory, and that role's `omission_or_handle_policy` is exactly the
+    /// declaration nothing else reads. Sharing the field name says a role has no
+    /// rule; it does not say which record failed to carry one, and the two
+    /// records are validated independently.
     pub fn binds_recipe(&self, recipe: &ContextRecipe) -> Result<(), ContextError> {
         self.validate()?;
         recipe.validate()?;
@@ -1744,10 +1753,14 @@ impl ContextRecipePolicy {
     /// A budgeted role the instance governs no rule for is refused rather than
     /// skipped, for the same reason: skipping it would leave that budget's
     /// `omission_or_handle_policy` inside `policy_sha256` and read by no path at
-    /// all, which is the certified behavioural no-op A2 forbids. The refusal
-    /// reuses the crate's own vocabulary for a role without a rule —
-    /// `ContextRecipe::validate` raises the same
-    /// [`ContextError::MissingField`] for `recipe.role_policies`.
+    /// all, which is the certified behavioural no-op A2 forbids. The refusal is
+    /// [`ContextError::MissingField`] over `recipe.role_policies` — the same
+    /// constructed variant and field `ContextRecipe::validate` raises for a
+    /// `mandatory_roles` role with no rule, but raised here for a role the
+    /// POLICY budgets. The subject is this policy's budget list, not the
+    /// instance's mandatory list; see the note on
+    /// [`ContextRecipePolicy::binds_recipe`] for why those are different
+    /// records and the shared string is only vocabulary, not a reused check.
     fn require_consistent_role_policies(&self, recipe: &ContextRecipe) -> Result<(), ContextError> {
         for budget in &self.section_budgets {
             let Some(rule) = recipe
@@ -2075,6 +2088,38 @@ impl RecipeExecutionSupport {
         )?;
         self.repetition.validate()?;
         Ok(())
+    }
+
+    /// The support record for the current Context compile-and-render path.
+    ///
+    /// One construction for every path that runs it. The four settings the
+    /// path actually executes are read from this file's own
+    /// [`EXECUTED_CONTEXT_STAGE`], [`EXECUTED_REPETITION_POLICY`] and
+    /// [`EXECUTED_SECTION_DEGRADATION`] and from the absence of a
+    /// feature-disable capability, so no path restates them and no two paths
+    /// can disagree about what the path runs.
+    ///
+    /// `ordering_revision` is the ONE value the caller supplies, and it is the
+    /// executing crate's own scheme constant rather than this contract's. That
+    /// is deliberate: [`EXECUTED_ORDERING_REVISION`] is this crate's own
+    /// spelling of the scheme and cannot be the same value by construction, so
+    /// keeping the cross-check requires the caller's spelling to travel
+    /// separately. [`ContextRecipePolicy::require_executable`] then compares
+    /// the two and refuses with
+    /// [`RecipeResolutionRefusal::UnsupportedSetting`] naming
+    /// `recipe_support.ordering_revision` when the executing path changes its
+    /// scheme without this contract changing with it.
+    pub fn for_context_compiler(ordering_revision: ArtifactId) -> Result<Self, ContextError> {
+        let support = Self {
+            executed_stage: ArtifactId::new(EXECUTED_CONTEXT_STAGE)
+                .map_err(|_| ContextError::InvalidField("recipe_support.executed_stage"))?,
+            ordering_revision,
+            repetition: EXECUTED_REPETITION_POLICY,
+            section_degradation: EXECUTED_SECTION_DEGRADATION,
+            supports_feature_disable: false,
+        };
+        support.validate()?;
+        Ok(support)
     }
 }
 

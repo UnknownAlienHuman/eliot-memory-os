@@ -4,9 +4,10 @@ use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, ContextError, ContextExecutionIdentity,
     ContextRecipe, DownstreamHeadroomRequest, DownstreamHeadroomResult, HeadroomAttempt,
     HeadroomDimension, HeadroomRefusal, HeadroomReleaseInstruction, MeasurementStatus,
-    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard, ResolvedContextRecipe,
-    SerializedContextMeasurement,
+    QualityOperation, QualityRefusal, QualityRefusalKind, QualityScorecard,
+    RecipeExecutionSupport, ResolvedContextRecipe, SerializedContextMeasurement,
 };
+use eliot_contracts::ArtifactId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -368,6 +369,30 @@ fn executed_ordering_revision(approved: &ResolvedContextRecipe) -> String {
     )
 }
 
+/// The execution-support record this assembly path runs, for
+/// [`ContextRecipePolicy::require_executable`](eliot_context_contracts::ContextRecipePolicy::require_executable).
+///
+/// #1724 W4. The record is the single one the contracts crate builds in
+/// [`RecipeExecutionSupport::for_context_compiler`], which is the same
+/// construction the Context owner publication path uses, so the two paths
+/// cannot disagree about the stage, repetition treatment, section degradation
+/// or feature-disable capability. Only the ordering SCHEME identity is local:
+/// it is this crate's own [`ASSEMBLY_ORDERING_REVISION`], which is exactly the
+/// cross-check `require_executable` exists to make — restating
+/// [`EXECUTED_ORDERING_REVISION`](eliot_context_contracts::EXECUTED_ORDERING_REVISION)
+/// here instead would make the comparison vacuously true and the fail-closed
+/// coupling described on that constant pointless.
+fn assembly_execution_support() -> Result<RecipeExecutionSupport, AssemblyError> {
+    let ordering_revision = ArtifactId::new(ASSEMBLY_ORDERING_REVISION)
+        .map_err(|_| {
+            AssemblyError::Contract(ContextError::InvalidField(
+                "recipe_support.ordering_revision",
+            ))
+        })?;
+    RecipeExecutionSupport::for_context_compiler(ordering_revision)
+        .map_err(AssemblyError::Contract)
+}
+
 /// Require that the approved revision supplying the executed order is the exact
 /// revision the compilation-bound instance was issued under.
 ///
@@ -381,17 +406,40 @@ fn executed_ordering_revision(approved: &ResolvedContextRecipe) -> String {
 /// there is no path on which a delivered order comes from a revision other than
 /// the one the recipe names.
 ///
+/// #1724 W4/W3: the same binding runs
+/// [`ContextRecipePolicy::require_executable`](eliot_context_contracts::ContextRecipePolicy::require_executable)
+/// — the EXISTING contract function, called, not restated — against
+/// [`assembly_execution_support`]. It has to run HERE and not only at Context
+/// owner publication, because this path is what applies the approved revision:
+/// [`render::render`] reads `layout.role_positions` from it, so before this call
+/// a revision declaring `ContiguousExtract` / `CallResultPair` / `EvidenceEdge`
+/// as its `unit_boundary_kind`, or an `ordering_revision` this crate does not
+/// run, would be rendered anyway with the unsupported declaration sitting inside
+/// `policy_sha256` and read by nothing — the certified behavioural no-op A2
+/// forbids. Both entrypoints that consume an approved revision reach this one
+/// function, so neither can skip the refusal.
+///
+/// The refusal is [`AssemblyError::UnsupportedRecipeSetting`], carrying the
+/// contract owner's own typed
+/// [`RecipeResolutionRefusal`](eliot_context_contracts::RecipeResolutionRefusal).
+///
 /// # Errors
 ///
 /// Returns [`AssemblyError::Contract`] over the exact [`ContextError`] from the
-/// contract owners' validators, so a stale, forged or mismatched resolution is
-/// refused by name and the cross-bound refusal type survives this layer.
+/// contract owners' validators, and [`AssemblyError::UnsupportedRecipeSetting`]
+/// over the exact
+/// [`RecipeResolutionRefusal`](eliot_context_contracts::RecipeResolutionRefusal),
+/// so a stale, forged or mismatched resolution and an unexecutable declaration
+/// are each refused by name and the cross-bound refusal types survive this layer.
 fn require_approved_recipe_binding(
     approved: &ResolvedContextRecipe,
     recipe: &ContextRecipe,
 ) -> Result<(), AssemblyError> {
     approved.validate()?;
     approved.policy.binds_recipe(recipe)?;
+    approved
+        .policy
+        .require_executable(&assembly_execution_support()?)?;
     Ok(())
 }
 
@@ -469,10 +517,12 @@ pub fn rendered_output_identity(
 /// [`render::render`] reads the rendered sequence from its
 /// `layout.role_positions` declaration, and [`require_approved_recipe_binding`]
 /// refuses a resolution that is not the revision the compilation-bound instance was
-/// issued under. The recipe instance still supplies the capacity, denominator,
-/// membership and loss rules, so both halves of the same compilation are consumed:
-/// the approved revision for what order and features mean, the bound instance for
-/// this task's envelope.
+/// issued under AND a revision that declares anything this path does not execute
+/// (it runs [`ContextRecipePolicy::require_executable`](eliot_context_contracts::ContextRecipePolicy::require_executable)
+/// against [`assembly_execution_support`]). The recipe instance still supplies the
+/// capacity, denominator, membership and loss rules, so both halves of the same
+/// compilation are consumed: the approved revision for what order and features mean,
+/// the bound instance for this task's envelope.
 pub fn assemble_active_view<F>(
     admitted: &AdmittedContextSet,
     recipe: &ContextRecipe,

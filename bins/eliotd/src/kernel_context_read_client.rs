@@ -1744,9 +1744,18 @@ impl<'a> PacketHeadroomJoin<'a> {
     /// Liveness is read from the owner, not from the record: every held permit
     /// must still carry the owner's current epoch, the owner's own minted
     /// binding must carry the same epoch sequence, and the reservation must
-    /// still be inside its own expiry at `now_ms`. A second clock reading is
-    /// supplied by the caller for this step so it is an observation taken after
-    /// the selection rather than a restatement of the one taken before it.
+    /// still be inside its own expiry at `now_ms`.
+    ///
+    /// #1869: `now_ms` is NOT a value the composition's caller supplies for
+    /// this step. The caller of THIS method is the packet composition itself,
+    /// and it reads `crate::unix_ms()` in the argument position at the
+    /// revalidation, after the selection and the delivery record exist. A
+    /// caller-supplied reading can be as old as the pre-selection one, which is
+    /// exactly the restatement the reservation contract forbids: the point is to
+    /// prove the lease is still inside its own expiry NOW, so a reading taken
+    /// before the work cannot stand for the instant after it. The parameter is
+    /// read here only so this check stays a value comparison the owner read can
+    /// be tested against; it carries no authority of its own.
     ///
     /// # Errors
     ///
@@ -2215,6 +2224,35 @@ impl KernelContextReadClient {
     /// caller: a caller-supplied reading can predate the work it is meant to
     /// bound, so it would restate the pre-selection clock instead of observing
     /// the instant after the selection.
+    ///
+    /// #1869 expiry clock: this composition takes NO clock argument. Both
+    /// clocks it needs are read here, at the point where the work they bound
+    /// happens, out of `crate::unix_ms()` — this crate's one wall-clock source.
+    /// A caller-supplied reading is refused as a parameter for both, for the
+    /// same reason the revalidation clock is:
+    ///
+    /// - the learning expiry clock. `presented.now_unix_secs` is the ONE value
+    ///   every learning expiry is decided against — the per-mark
+    ///   `expires_at_unix_secs` in `screen_learning_subjects`, the overlay's own
+    ///   expiry in `check_governed_carriage`, and the composed entry's use of
+    ///   both. `PresentedLearning` is `Copy` with all-public fields, so a
+    ///   caller could otherwise write `now_unix_secs: 0` and defeat every one of
+    ///   them at once; the value is re-sourced below before it reaches any
+    ///   screen.
+    /// - the headroom staleness clock. `HeadroomContext::now_ms` is what
+    ///   `check_headroom` and `recheck_headroom_handoff` compare an owner-issued
+    ///   reservation's `expires_at_ms` against. It was reachable only because
+    ///   this signature carried it. Nothing this composition admits requires the
+    ///   caller to choose it: the reservation is proved against the permits this
+    ///   compilation holds, so a caller cannot name a reservation the owner did
+    ///   not issue, and a caller-chosen clock could only ever make the staleness
+    ///   comparison read OLDER than the work it is meant to bound. The reading
+    ///   is now taken where each check runs.
+    ///
+    /// Nothing is widened: the live readings are strictly harder to pass than
+    /// any backdated one, and `crate::unix_ms` is the same single source the
+    /// revalidation already used. No new clock, port or global time source is
+    /// introduced.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn compile_context_packet(
         seven: &SevenRoleInputs,
@@ -2230,7 +2268,6 @@ impl KernelContextReadClient {
         headroom_request: &DownstreamHeadroomRequest,
         headroom_result: &DownstreamHeadroomResult,
         headroom_ledger: &HeadroomAllocationLedger,
-        observed_now_ms: u64,
         admission_parts: impl FnOnce(
             &ContextCandidateSetResult,
         ) -> Result<PacketAdmissionParts, PacketCompositionError>,
@@ -2259,12 +2296,6 @@ impl KernelContextReadClient {
                 attempted_recipe_digest: recipe.recipe_sha256.clone(),
                 refusal: Box::new(refusal),
             })?;
-        let headroom = HeadroomContext {
-            request: headroom_request,
-            result: headroom_result,
-            ledger: headroom_ledger,
-            now_ms: observed_now_ms,
-        };
         validate_composition_inputs(request, recipe, policy, floor)?;
         // `measurement::verify` compares the injected measurement's serializer
         // triple against this policy's own, so the policy is bound to the codec
@@ -2340,6 +2371,50 @@ impl KernelContextReadClient {
             recipe,
             &request.binding,
         )?;
+        // The `HeadroomContext` is built HERE, immediately before the admission
+        // that runs `check_headroom` on it, and its staleness clock is read at
+        // that instant rather than taken as an argument. The owner-issued
+        // request/result/ledger are the caller's validated evidence and stay
+        // exactly as they were; only the reading is local. Reading it here,
+        // rather than at the top of this composition, is the same discipline the
+        // revalidation below applies: a clock captured before the candidate stage
+        // cannot observe the instant the reservation is actually checked at.
+        let headroom = HeadroomContext {
+            request: headroom_request,
+            result: headroom_result,
+            ledger: headroom_ledger,
+            now_ms: crate::unix_ms(),
+        };
+        // #1869: the learning expiry clock is RE-SOURCED here, on the owner side,
+        // at the point of use, and whatever `presented.now_unix_secs` the caller
+        // wrote is discarded. This is the same discipline the headroom
+        // revalidation below applies and the same construction the existing
+        // host compositions already use
+        // (`eliot_context_compiler_wasm::compose_governed_compilation` and
+        // `eliot_wasm_host::admit_governed_host` both rebuild
+        // `PresentedLearning { now_unix_secs: <live read>, ..presented }`).
+        //
+        // It has to happen HERE rather than inside the admission crate because
+        // that crate is a declared pure, effect-free, stateless cell
+        // (`eliot-context-admission/module.toml`: `allowed_effects = []`,
+        // `state_class = STATELESS`); a wall-clock read inside it would add an
+        // ambient effect to a cell that declares none, and its module header
+        // states the same. The owner-side read therefore belongs to the host
+        // composition, which is this function.
+        //
+        // Without this, `now_unix_secs` is a caller-written number against which
+        // EVERY expiry in the learning module is decided at once: the per-mark
+        // `expires_at_unix_secs` screen in `screen_learning_subjects`, the
+        // overlay liveness check in `check_governed_carriage`, and the expired
+        // overlay that check derives. `PresentedLearning` is `Copy` with
+        // all-public fields, so `now_unix_secs: 0` defeats all of them.
+        // `crate::unix_ms()` is this crate's one wall-clock source and is
+        // already read below; `MILLIS_PER_SECOND` converts it to the resolution
+        // `now_unix_secs` is expressed in and introduces no second clock.
+        let presented = presented.map(|presented| PresentedLearning {
+            now_unix_secs: crate::unix_ms() / MILLIS_PER_SECOND,
+            ..presented
+        });
         let input = packet_admission_input(request, recipe, &candidates, &admission, presented);
         input
             .validate()
@@ -2455,6 +2530,15 @@ fn require_context_render_codec(
     )
 }
 
+/// Milliseconds in one second, for the two resolutions this composition reads.
+///
+/// #1869. [`crate::unix_ms`] is this crate's ONE wall-clock source and both
+/// clocks here are unit views of the same reading: the headroom staleness clock
+/// is milliseconds, the learning expiry clock `PresentedLearning::now_unix_secs`
+/// is seconds. This constant is the conversion between them and is not a second
+/// time source.
+const MILLIS_PER_SECOND: u64 = 1_000;
+
 /// Rechecks the assembled packet against the reservation it was compiled under.
 ///
 /// #1725: the actual rendered output and handoff are re-proved against the same
@@ -2464,13 +2548,17 @@ fn require_context_render_codec(
 /// here releases a permit, because the non-clone permit handle stays with its
 /// issuer.
 ///
-/// The recheck reads the request, the owner-issued result and the observed clock
-/// out of the same [`HeadroomContext`] this composition handed to admission, so
-/// the handoff can never be proved against evidence other than the evidence the
-/// admission was admitted under. It returns the composition's own existing
-/// error type rather than a new one, so the refusal still crosses as
-/// [`PacketCompositionError::HeadroomHandoff`] carrying the assembly owner's
-/// typed refusal.
+/// The recheck reads the request and the owner-issued result out of the same
+/// [`HeadroomContext`] this composition handed to admission, so the handoff can
+/// never be proved against evidence other than the evidence the admission was
+/// admitted under. It does NOT reuse that context's `now_ms`: the handoff runs
+/// after the render, so its expiry comparison is bounded by work the pre-
+/// selection reading predates, and a backdated reading could only make it read
+/// older than the instant it is checked at. The clock is read HERE instead,
+/// out of the same `crate::unix_ms` source, at the handoff itself. It returns
+/// the composition's own existing error type rather than a new one, so the
+/// refusal still crosses as [`PacketCompositionError::HeadroomHandoff`] carrying
+/// the assembly owner's typed refusal.
 fn recheck_packet_headroom(
     assembled: &ActiveUnderstandingViewResult,
     recipe: &ContextRecipe,
@@ -2481,7 +2569,7 @@ fn recheck_packet_headroom(
         recipe,
         headroom.request,
         headroom.result,
-        headroom.now_ms,
+        crate::unix_ms(),
     )
     .map_err(|refusal| PacketCompositionError::HeadroomHandoff(Box::new(refusal)))?;
     // The release instructions this step returns are DISCARDED here, and that
@@ -2585,6 +2673,19 @@ fn composition_failure(
 ///   refuses an input that carries learning marks or tickets (typed, as
 ///   `learning.governed_path_required`), so a packet that needs governed
 ///   learning cannot slip through this arm by arriving without the authority.
+///
+/// The `None` arm is NOT weaker or broader than the guard that was deleted.
+/// `require_composed_learning_guard` refused exactly the predicate
+/// `eliot_context_admission::refuse_ungoverned_learning` applies, and that
+/// predicate is the SAME one `LearningGovernance::Unpresented` applies — any
+/// learning-marked candidate OR any entry in `learning_tickets`. The two halves
+/// of that predicate cannot be reached around each other on this route, because
+/// `packet_admission_input` derives `learning_tickets` from `presented` alone:
+/// `None` produces an empty ticket list by construction, so the only way a
+/// marked candidate reaches this arm is with the mark itself, and the mark alone
+/// triggers the refusal. Deleting the guard therefore widened nothing; it
+/// removed a refusal that stood in front of the input the `Some` arm exists to
+/// admit.
 ///
 /// No arm falls back to the other. In particular the composed path's refusals
 /// stay refusals on this route: a learning failure keeps the admission owner's
