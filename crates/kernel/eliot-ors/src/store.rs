@@ -7634,12 +7634,12 @@ impl RedbRecoveryStore {
         redemption.validate()?;
         let key = redemption.grant_key()?;
         let write = self.database.begin_write().map_err(storage)?;
-        let Some(staged_bytes) = (write
+        let Some(staged_bytes) = write
             .open_table(BACKUP_VERIFY_SUCCESSION_GRANTS)
             .map_err(storage)?
             .get(key.as_str())
             .map_err(storage)?
-            .map(|value| value.value().to_owned()))
+            .map(|value| value.value().to_owned())
         else {
             return Ok(BackupVerifySuccessionDisposition::NotAuthorized);
         };

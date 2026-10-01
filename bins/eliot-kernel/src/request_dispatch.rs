@@ -3132,13 +3132,10 @@ impl KernelComposition {
         // Spending a grant on a mis-presentation is the intended direction: the
         // owner's decision to allow this reconciliation at all was already made, the
         // grant is one-shot by design, and the failure is the caller's own.
-        let redemption = match verify_succession_redemption(
-            session,
-            successor,
-            report.archive_sha256.as_str(),
-        ) {
-            Ok(redemption) => redemption,
-            Err(_) => return successor_not_observed_reply(idempotency_key),
+        let Ok(redemption) =
+            verify_succession_redemption(session, successor, report.archive_sha256.as_str())
+        else {
+            return successor_not_observed_reply(idempotency_key);
         };
         let Ok(disposition) = self
             .p07_ors
