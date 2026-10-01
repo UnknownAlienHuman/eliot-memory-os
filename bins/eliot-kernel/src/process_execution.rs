@@ -533,7 +533,7 @@ impl KernelGovernedProcessEffectPort {
     /// the caller must continue ingest for the next target).
     ///
     /// Correlation (I10.21 W3): the hint carries the producing lane's
-    /// claimed Session, ActionLease, tool operation, attempt receipt, and
+    /// claimed Session, `ActionLease`, tool operation, attempt receipt, and
     /// State-Fence generation — the claimant's identity for this re-check,
     /// never proof of who wrote the bytes. The fence is the binding's
     /// admission fence, which capture clones as the capture fence.

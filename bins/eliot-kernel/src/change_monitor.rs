@@ -170,7 +170,7 @@ pub(crate) enum HintOrigin {
 /// evidence once the watcher lane attaches.
 ///
 /// Correlation (I10.21 W3): a host-event hint carries the Session,
-/// ActionLease, tool operation, attempt receipt, and State-Fence generation
+/// `ActionLease`, tool operation, attempt receipt, and State-Fence generation
 /// the producing lane claims for it — the claimant's identity, never proof
 /// of who wrote the bytes. A filesystem hint carries none of these: an OS
 /// notification names no governed claimant, so absent correlation is the
@@ -1699,10 +1699,11 @@ pub(crate) struct TransferredResourceTip {
 /// `crates/governor/eliot-governor/src/finish_attempt.rs::GovernorFinishAttempt::prepare_finish_decision`
 /// (acceptance gate) — supplied via
 /// `crates/governor/eliot-governor/src/composition.rs::GovernorComposition::prepare_finish_decision`
-/// — from `export_observation_transfer_json` (live) or the durable
-/// `kernel-change-transfer.v1.json` file [`persist_observation_transfer`]
-/// maintains beside the ledger sidecar (cross-restart) before the gate
-/// consults `has_pending_hints`/`has_unknown_material_change`.
+/// — from the durable `kernel-change-transfer.v1.json` file
+/// [`persist_observation_transfer`] maintains beside the ledger sidecar
+/// (cross-restart; the only out-of-crate vehicle — there is no live-call
+/// seam since a `bins` root never depends on Governor crates and vice versa)
+/// before the gate consults `has_pending_hints`/`has_unknown_material_change`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ObservationTransferDocument {
     pub format_version: u32,
@@ -1806,15 +1807,6 @@ pub(crate) fn export_observation_transfer()
         reconciliations,
         tips,
     })
-}
-
-/// Encodes the single-owner projection export for the Governor seam
-/// (I10.21 W4): the JSON vehicle the out-of-crate hydration lane parses
-/// without depending on this crate's types. Encoding failure is typed,
-/// never a silent empty document.
-pub(crate) fn export_observation_transfer_json() -> Result<String, ChangeMonitorError> {
-    let document = export_observation_transfer()?;
-    serde_json::to_string(&document).map_err(|_| ChangeMonitorError::TransferEncode)
 }
 
 /// Name of the durable observation transfer beside the ledger sidecar.
