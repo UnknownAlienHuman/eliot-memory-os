@@ -12,7 +12,7 @@ use eliot_blob_api::wire::{
     PROCESS_STREAM_READBACK_MAX_CHUNK_BYTES, ProcessStreamSourceReadbackRequest as BlobRequest,
     ProcessStreamSourceReadbackResponse as BlobResponse,
 };
-use eliot_contracts::ClockReading;
+use eliot_contracts::{ClockReading, canonical_json_bytes};
 use eliot_process::{DurableStreamLocatorKind, ProcessStreamKind};
 use eliot_testd_core::{
     AsyncProcessStreamSourceReadbackPort, ProcessStreamSourceReadbackFuture,
@@ -65,7 +65,11 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             return Err(integrity_error(stream));
         }
         let process_binding_json = canonical_json(&request.binding)?;
-        let policy_json = canonical_json(&request.policy)?;
+        let policy_json = serde_json::to_string(&request.policy).map_err(|_| {
+            TestdEvidenceError::BindingMismatch {
+                reason: "the admitted stream policy could not be serialized",
+            }
+        })?;
         let policy: eliot_blob_api::wire::ProcessStreamPolicyBinding =
             serde_json::from_str(&policy_json).map_err(|_| invalid_stream(stream))?;
         let mut offset = 0_u64;
@@ -179,7 +183,7 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
             if owner_generation.is_some_and(|value| value != response_generation)
                 || readback_receipt_id
                     .as_deref()
-                    .is_some_and(|value| value != response_receipt)
+                    .is_some_and(|value| value != response_receipt.as_str())
                 || observed_fence
                     .as_ref()
                     .is_some_and(|value: &eliot_contracts::StateFence| value != &response_fence)
@@ -238,8 +242,11 @@ impl<E: BlobReadbackExchange> KernelBlobReadbackPort<E> {
 }
 
 fn canonical_json(value: &impl Serialize) -> Result<String, TestdEvidenceError> {
-    serde_json::to_string(value).map_err(|_| TestdEvidenceError::BindingMismatch {
+    let bytes = canonical_json_bytes(value).map_err(|_| TestdEvidenceError::BindingMismatch {
         reason: "the admitted source binding could not be canonically serialized",
+    })?;
+    String::from_utf8(bytes).map_err(|_| TestdEvidenceError::BindingMismatch {
+        reason: "the canonical source binding is not UTF-8 JSON",
     })
 }
 
