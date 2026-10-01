@@ -20023,7 +20023,7 @@ impl RedbRecoveryStore {
             owner_incarnation: owner.incarnation,
             retention_policy_revision: owner.revision,
             stream_id: owner.local_stream.clone(),
-            start_sequence: stored.start_sequence,
+            start_sequence,
             end_sequence,
             predecessor_end_sequence: stored.end_sequence,
             predecessor_commitment: stored.segment_commitment.clone(),
