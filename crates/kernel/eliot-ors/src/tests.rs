@@ -683,7 +683,7 @@ fn reconciliation(
     disposition: CanonicalDisposition,
 ) -> Result<CanonicalReconciliation, OrsError> {
     let receipt_id = label(receipt.identity.receipt_id.as_str())?;
-    let receipt_sha = receipt.identity.canonical_sha256.clone();
+    let event_id = eliot_store_api::EventId::new("event-committed-head")?;
     Ok(CanonicalReconciliation {
         reservation_id: token.reservation_id.clone(),
         operation_id: token.operation_id.clone(),
@@ -693,15 +693,32 @@ fn reconciliation(
         scopes: token
             .scopes
             .iter()
-            .map(|reserved| CanonicalScopeObservation {
-                scope: reserved.scope.clone(),
-                prior_head: reserved.expected_head.clone(),
-                committed_sequence: reserved.reserved_sequence,
-                committed_head_sha256: receipt_sha.clone(),
-                committed_revision_head: Some(format!("receipt:{}", receipt_id.as_str())),
-                receipt_id: receipt_id.clone(),
+            .map(|reserved| {
+                // The committed head evidence is the ordering link the canonical
+                // owner commits, minted by the store's single link-hash
+                // algorithm and chained from the reserved expected head.
+                let scope = eliot_store_api::OrderingScopeId::new(reserved.scope.as_str())?;
+                let event_hash = eliot_store_api::ordering_link_hash(
+                    &event_id,
+                    &"cd".repeat(32),
+                    &scope,
+                    reserved.reserved_sequence,
+                    &reserved.expected_head.head_sha256,
+                )?;
+                Ok(CanonicalScopeObservation {
+                    scope: reserved.scope.clone(),
+                    prior_head: reserved.expected_head.clone(),
+                    committed_link: eliot_store_api::OrderingLink {
+                        ordering_scope: scope,
+                        ordering_sequence: reserved.reserved_sequence,
+                        previous_event_hash: reserved.expected_head.head_sha256.clone(),
+                        event_hash,
+                    },
+                    committed_revision_head: Some(format!("receipt:{}", receipt_id.as_str())),
+                    receipt_id: receipt_id.clone(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, OrsError>>()?,
         receipt,
         disposition,
     })
@@ -2395,7 +2412,10 @@ fn crash_restart_enters_reconciliation_and_receipt_unblocks_scope() -> TestResul
     )?;
     next.scopes[0].expected_head = ExpectedOrderingHead {
         sequence: token.scopes[0].reserved_sequence,
-        head_sha256: exact.receipt.identity.canonical_sha256.clone(),
+        // The next reservation extends the committed head, so its expected
+        // digest is the scope's new chain tip, never the receipt envelope's own
+        // identity digest.
+        head_sha256: exact.scopes[0].committed_link.event_hash.clone(),
         revision_head: exact.scopes[0].committed_revision_head.clone(),
     };
     coordinator.reserve(next)?;
@@ -2441,7 +2461,7 @@ fn unknown_outcome_has_no_blind_replay_or_cleanup_expiry() -> TestResult {
         canonical_receipt.clone(),
         CanonicalDisposition::Committed,
     )?;
-    mismatch.scopes[0].committed_sequence += 1;
+    mismatch.scopes[0].committed_link.ordering_sequence += 1;
     assert!(matches!(
         coordinator.reconcile(&mismatch),
         Err(OrsError::ReconciliationMismatch)

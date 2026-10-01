@@ -2690,12 +2690,33 @@ define_recovery_inventory_page!(
 );
 
 /// Canonical head observation supplied alongside a receipt.
+///
+/// `committed_link` is the one ordering link the canonical owner committed for
+/// this scope in this transition (`I5.8` `CanonicalEvent.ordering_links`).
+/// It carries the three objects `I5.7` requires together and keeps them
+/// distinct:
+///
+/// ```text
+/// ordering_scope       the Ordering Scope this observation is about;
+/// ordering_sequence    the last committed sequence of durable semantic history;
+/// previous_event_hash  the prior head digest this link extended, which must be
+///                      the reserved `ExpectedOrderingHead::head_sha256`;
+/// event_hash           the committed head digest, i.e. the scope's chain tip.
+/// ```
+///
+/// `I5.7` makes the Canonical Store `OrderingHead` the owner of "the last
+/// committed sequence/hash of durable semantic history", and the store keeps
+/// that hash as the per-scope chain tip on the same `ordering_head` row it
+/// compare-and-swaps. The receipt envelope's own identity digest is a different
+/// object (`I5.19` receipt envelope) and is never a head digest. ORS never
+/// mints or recomputes a head digest: it validates the link the owner committed
+/// and refuses any link that does not extend the head this reservation
+/// reserved against.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalScopeObservation {
     pub scope: OrderingScope,
     pub prior_head: ExpectedOrderingHead,
-    pub committed_sequence: u64,
-    pub committed_head_sha256: String,
+    pub committed_link: eliot_store_api::OrderingLink,
     pub committed_revision_head: Option<String>,
     pub receipt_id: OpaqueLabel,
 }

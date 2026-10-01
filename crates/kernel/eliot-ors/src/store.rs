@@ -28624,23 +28624,29 @@ impl RedbRecoveryStore {
             let mut head: ScopeReservationHead = decode_named(value.value(), "scope_head")?;
             drop(value);
             if head.canonical_head != observed.prior_head
-                || observed.committed_sequence > head.last_reserved_sequence
-                || observed.committed_sequence <= head.last_terminal_sequence
+                || observed.committed_link.ordering_sequence > head.last_reserved_sequence
+                || observed.committed_link.ordering_sequence <= head.last_terminal_sequence
             {
                 return Err(OrsError::OrderingHeadMismatch);
             }
             let gap = reconciliation.disposition == CanonicalDisposition::Rejected;
             if !gap {
                 head.canonical_head = crate::ExpectedOrderingHead {
-                    sequence: observed.committed_sequence,
-                    head_sha256: observed.committed_head_sha256.clone(),
+                    sequence: observed.committed_link.ordering_sequence,
+                    // The next expected head digest is the scope's new chain
+                    // tip, exactly the value the store transaction
+                    // compare-and-swaps and the value
+                    // `CanonicalEvidenceProvider::verify_ordering_heads`
+                    // checks, so this stored head and the store CAS compare the
+                    // same object.
+                    head_sha256: observed.committed_link.event_hash.clone(),
                     revision_head: observed.committed_revision_head.clone(),
                 };
             }
-            head.last_terminal_sequence = observed.committed_sequence;
+            head.last_terminal_sequence = observed.committed_link.ordering_sequence;
             let terminal = ScopeTerminalReceipt {
                 scope: observed.scope.clone(),
-                reserved_sequence: observed.committed_sequence,
+                reserved_sequence: observed.committed_link.ordering_sequence,
                 disposition: reconciliation.disposition,
                 gap,
                 receipt_id: observed.receipt_id.clone(),
@@ -28653,7 +28659,7 @@ impl RedbRecoveryStore {
             let terminal_key = format!(
                 "{}:{:020}",
                 observed.scope.as_str(),
-                observed.committed_sequence
+                observed.committed_link.ordering_sequence
             );
             let terminal_payload = encode(&terminal)?;
             terminals
@@ -36986,14 +36992,24 @@ fn reconciliation_matches(
     }
     for (reserved, observed) in token.scopes.iter().zip(&reconciliation.scopes) {
         observed.prior_head.validate()?;
-        crate::model::validate_digest(&observed.committed_head_sha256, "committed_head_sha256")?;
+        observed.committed_link.validate()?;
         if let Some(revision) = &observed.committed_revision_head {
             crate::model::validate_text(revision, "committed_revision_head")?;
         }
+        // `I5.7` "Canonical Store `OrderingHead` owns the last committed
+        // sequence/hash of durable semantic history". The head evidence is the
+        // ordering link the owner committed for this scope (`I5.8`), so the
+        // committed head is pinned against the head this reservation actually
+        // reserved against: same scope, the reserved sequence as the committed
+        // sequence, and the reserved head digest as the link's
+        // `previous_event_hash`. The receipt envelope's own identity digest is
+        // a different object (`I5.19`) and is deliberately not compared here.
         if observed.scope != reserved.scope
             || observed.prior_head != reserved.expected_head
-            || observed.committed_sequence != reserved.reserved_sequence
-            || observed.committed_head_sha256 != receipt.identity.canonical_sha256
+            || observed.committed_link.ordering_scope.as_str() != reserved.scope.as_str()
+            || observed.committed_link.ordering_sequence != reserved.reserved_sequence
+            || observed.committed_link.previous_event_hash
+                != reserved.expected_head.head_sha256
             || observed.receipt_id.as_str() != receipt.identity.receipt_id.as_str()
         {
             return Err(OrsError::ReconciliationMismatch);
@@ -37001,7 +37017,7 @@ fn reconciliation_matches(
     }
     // No envelope-causal restatement is demanded here, deliberately. The
     // reserved-order binding is established above on the reconciliation
-    // scopes (prior head, committed sequence, head digest, receipt id),
+    // scopes (prior head, committed ordering link, receipt id),
     // and the receipt operation, fence, disposition and structural
     // validity are checked by the surrounding clauses. A single-scope
     // causal equality against the reserved sequence would require the
