@@ -82,12 +82,14 @@ use eliotd::{
     ActivationClaim, ActivationSubmitError, AgentActivationResolver, DaemonComposition,
     DaemonConfig, DaemonKernelClient, DaemonStatus, FinishSubmitOutcome,
     GovernorAuthorityDriveOutcome, GovernorAuthorityDriver, KernelContextReadClient,
-    LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin, ObserveDeferOutcome,
-    ObserveServeOutcome, ObserveSubmitOutcome, ObserveSuboperation, OutcomeLayer, PROTOCOL_VERSION,
-    SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome, decode_observation_capture,
-    forward_admitted_local_read, observation_base_operation, observation_pending_handle,
-    observation_request_identity, observation_result_body, observation_unavailable_outcome,
-    observe_serve_outcome, serve_admitted_observe, terminal_for_invalid_ticket,
+    LocalReadSubmitOutcome, MaintenanceObservation, MaintenanceTriggerOrigin,
+    OBSERVE_TASK_CONTRACT_REQUIRED, ObserveDeferOutcome, ObserveOperationAuthority, ObserveServeOutcome,
+    ObserveSubmitOutcome, ObserveSuboperation, OutcomeLayer, PROTOCOL_VERSION, SELF_OBSERVED_FAMILY,
+    SERVICE_NAME, TaskControllerSubmitOutcome, decode_observation_capture, forward_admitted_local_read,
+    observation_base_operation, observation_pending_handle, observation_request_identity,
+    observation_result_body, observation_unavailable_outcome, observe_operation_class,
+    observe_serve_outcome, resolve_observe_operation_authority, serve_admitted_observe,
+    terminal_for_invalid_ticket,
 };
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -5142,8 +5144,15 @@ async fn execute_observation_capture(
     // guard the owner borrow below takes.
     let authority = {
         let guard = composition.lock().await;
+        // The daemon's own activation clock owns this reading: it is the one
+        // clock `current_activation_snapshot` is already read with on the
+        // activation-resolution spine, and it fails closed on a pre-epoch or
+        // out-of-range reading instead of clamping a bogus time into the owner
+        // authority decision.
+        let now = unix_ms(SystemTime::now())
+            .map_err(|error| format!("daemon observe authority clock: {error}"))?;
         let activation = guard
-            .current_activation_snapshot(crate::unix_ms())
+            .current_activation_snapshot(now)
             .map_err(|error| format!("daemon observe authority resolution: {error}"))?;
         let live_fence = guard.kernel_snapshot().state_fence().clone();
         resolve_observe_operation_authority(
@@ -5166,18 +5175,13 @@ async fn execute_observation_capture(
     // It is not admitted as an unbound cold capture, and nothing executes.
     if !authority.is_admitting() {
         let (class, code, reason) = match &authority {
-            eliotd::governor_observe_serve::ObserveOperationAuthority::TaskContractRequired {
-                class,
-                code,
-                reason,
-                ..
+            ObserveOperationAuthority::TaskContractRequired { class, code, reason, .. }
+            | ObserveOperationAuthority::ConflictingClaim { class, code, reason, .. } => {
+                // `ObserveOperationClass` and `code` are both `Copy` (the class
+                // is a closed fieldless enum, the code is a `&'static str`), so
+                // neither is cloned; only the owned reason text is moved out.
+                (*class, *code, reason.clone())
             }
-            | eliotd::governor_observe_serve::ObserveOperationAuthority::ConflictingClaim {
-                class,
-                code,
-                reason,
-                ..
-            } => (*class, *code, reason.clone()),
             // `is_admitting()` is exhaustive over the same enum, so this arm is
             // unreachable in practice. It is handled as a typed refusal rather
             // than a panic so the branch can never be the reason the daemon dies.
@@ -5190,7 +5194,7 @@ async fn execute_observation_capture(
                     .to_owned(),
             ),
         };
-        let refused = eliotd::governor_observe_serve::ObserveServeOutcome::AuthorityRefused {
+        let refused = ObserveServeOutcome::AuthorityRefused {
             suboperation,
             class,
             code,
@@ -5202,9 +5206,16 @@ async fn execute_observation_capture(
                 format!("daemon observe authority refusal not retained: {submit_error}")
             });
     }
-    let identity =
-        observation_request_identity(envelope, &capture, &authority, crate::unix_ms_i64())
-            .map_err(|error| format!("daemon observe identity: {error}"))?;
+    // Same daemon activation clock, one reading, so the identity the owner
+    // admits under cannot disagree with the reading the authority resolution
+    // above was taken at. The signed conversion is the one honest projection of
+    // a `u64` millisecond clock into the contract's `i64` clock reading.
+    let observed_unix_ms = i64::try_from(unix_ms(SystemTime::now()).map_err(|error| {
+        format!("daemon observe identity clock: {error}")
+    })?)
+    .map_err(|_| "daemon observe identity clock exceeds the signed millisecond range".to_owned())?;
+    let identity = observation_request_identity(envelope, &capture, &authority, observed_unix_ms)
+        .map_err(|error| format!("daemon observe identity: {error}"))?;
     let base_operation = observation_base_operation(envelope)?;
     // The exact owner operation the commit would carry. It is derived here, not
     // guessed: it is the same identity the owner's own admission mints for this
@@ -5344,8 +5355,9 @@ async fn execute_observation_capture(
 /// The exact owner operation one classified outcome reconciles against.
 ///
 /// Returns `None` for arms that admit no owner operation — a refusal-free
-/// unavailable disposition has nothing to reconcile — so a caller never reads a
-/// missing owner operation as an empty one.
+/// unavailable disposition and an authority refusal have nothing to
+/// reconcile, because neither produced a store operation — so a caller never
+/// reads a missing owner operation as an empty one.
 fn outcome_owner_operation(outcome: &ObserveServeOutcome) -> Option<&str> {
     match outcome {
         ObserveServeOutcome::Committed { operation_id, .. }
@@ -5355,7 +5367,12 @@ fn outcome_owner_operation(outcome: &ObserveServeOutcome) -> Option<&str> {
             Some(operation_id.as_str())
         }
         ObserveServeOutcome::Pending { handle } => Some(handle.operation_id.as_str()),
-        ObserveServeOutcome::Unavailable { .. } => None,
+        // An authority refusal (issue #2565 W2) admits nothing and executes
+        // nothing, so there is no owner operation to reconcile against. It is
+        // named here beside the unavailable arm for exactly that reason, and it
+        // is never folded into an operation identity it never received.
+        ObserveServeOutcome::Unavailable { .. }
+        | ObserveServeOutcome::AuthorityRefused { .. } => None,
     }
 }
 
@@ -5382,6 +5399,14 @@ async fn submit_observe_result_idempotent(
     let retained = match outcome {
         ObserveServeOutcome::Committed { .. } => ObservePollOutcome::Committed,
         ObserveServeOutcome::Refused { .. } => ObservePollOutcome::Refused,
+        // An authority refusal (issue #2565 W2) is terminal for THIS attempt and
+        // nothing executed, so it settles on the owner's own refusal
+        // disposition rather than being deferred (which would claim the owner
+        // never started anything and retry an operation that must never be
+        // admitted as an unbound cold capture). It is NOT `Committed`: the pair
+        // carried no canonical write, and the exact refusal code, operation
+        // class and reason travel in the result body this leg retains.
+        ObserveServeOutcome::AuthorityRefused { .. } => ObservePollOutcome::Refused,
         // A pending handle is NOT a deferred pair: the owner admitted the
         // operation, so the queue pair retires with a live handle whose
         // read/wait/cancel path is the owner's own receipt route. Reporting it

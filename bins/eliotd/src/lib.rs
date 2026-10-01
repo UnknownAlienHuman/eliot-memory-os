@@ -300,8 +300,8 @@ pub use governor_local_read::{
 };
 pub use governor_observe_serve::{
     OBSERVE_CLAIM_CONFLICTS_OWNER_AUTHORITY, OBSERVE_PENDING_RECEIPT_OWNER,
-    OBSERVE_TASK_CONTRACT_REQUIRED, ObserveDeferral, ObserveEffectCeiling, ObserveOperationClass,
-    ObserveOwnerRoute, ObserveServeOutcome, ObserveSuboperation, OutcomeLayer,
+    OBSERVE_TASK_CONTRACT_REQUIRED, ObserveDeferral, ObserveEffectCeiling, ObserveOperationAuthority,
+    ObserveOperationClass, ObserveOwnerRoute, ObserveServeOutcome, ObserveSuboperation, OutcomeLayer,
     PendingObserveHandle, decode_observation_capture, decode_observe_suboperation,
     observation_base_operation, observation_pending_handle, observation_request_identity,
     observation_result_body, observation_unavailable_outcome, observe_effect_ceiling_for,
