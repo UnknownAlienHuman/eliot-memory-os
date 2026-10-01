@@ -20,12 +20,14 @@ use std::path::{Path, PathBuf};
 // updating the oracle (pristine-base proof: 166 sites, 165 blocks, tests.rs 19;
 // same 5 failures on clean 714fb830). #1357 added scm_entry.rs outside the old
 // lib.rs/tests.rs scan. SAFETY-COVERAGE-ALL-SRC (#728) widens discovery to
-// every `.rs` file under `src/` (32 files, 557 sites); the lexer output is
-// authoritative for the per-file rows in EXPECTED_PER_FILE, and EXPECTED_SITES
-// is their sum.
-const EXPECTED_SITES: usize = 557;
-const EXPECTED_FILE_COUNT: usize = 32;
-const EXPECTED_TOTAL_IMPL: usize = 5;
+// every `.rs` file under `src/` (35 files, 575 sites at this source revision).
+// The current additions are 11 lib.rs sites (10 blocks, one impl), five
+// event_log.rs blocks, two terminal_containment.rs blocks, and zero in
+// profile_supervision.rs. The explicit per-file rows below are the audited
+// denominator; EXPECTED_SITES is their sum.
+const EXPECTED_SITES: usize = 575;
+const EXPECTED_FILE_COUNT: usize = 35;
+const EXPECTED_TOTAL_IMPL: usize = 6;
 const EXPECTED_TOTAL_EXTERN: usize = 4;
 const EXPECTED_ALLOWS: usize = 5;
 const MAX_SOURCE_BYTES: usize = 5_000_000;
@@ -175,6 +177,13 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
         externs: 0,
     },
     FileExpectation {
+        rel: "event_log.rs",
+        sites: 5,
+        blocks: 5,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
         rel: "installer_authority_key.rs",
         sites: 7,
         blocks: 7,
@@ -211,9 +220,9 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
     },
     FileExpectation {
         rel: "lib.rs",
-        sites: 166,
-        blocks: 165,
-        impls: 1,
+        sites: 177,
+        blocks: 175,
+        impls: 2,
         externs: 0,
     },
     FileExpectation {
@@ -315,6 +324,13 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
         externs: 0,
     },
     FileExpectation {
+        rel: "profile_supervision.rs",
+        sites: 0,
+        blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
         rel: "protected_path.rs",
         sites: 16,
         blocks: 16,
@@ -367,6 +383,13 @@ const EXPECTED_PER_FILE: &[FileExpectation] = &[
         rel: "tcp_listener_owner_models.rs",
         sites: 0,
         blocks: 0,
+        impls: 0,
+        externs: 0,
+    },
+    FileExpectation {
+        rel: "terminal_containment.rs",
+        sites: 2,
+        blocks: 2,
         impls: 0,
         externs: 0,
     },
@@ -2070,13 +2093,13 @@ fn site_forms_are_block_plus_impl() -> Result<(), String> {
     if blocks + impls + externs != EXPECTED_SITES {
         return Err("form totals do not sum to the denominator".to_string());
     }
-    // lib.rs keeps its exact historical shape: 165 blocks plus one impl.
+    // lib.rs has an exact audited shape: 175 blocks plus two impls.
     let lib = all
         .iter()
         .find(|f| f.rel == "lib.rs")
         .ok_or("lib.rs undiscovered")?;
     let lib_row = expectation_for("lib.rs")?;
-    if lib_row.blocks != 165 || lib_row.impls != 1 || lib.sites.len() != 166 {
+    if lib_row.blocks != 175 || lib_row.impls != 2 || lib.sites.len() != 177 {
         return Err("lib.rs form shape drifted".to_string());
     }
     Ok(())
@@ -2092,7 +2115,7 @@ fn production_cfg_classification_holds() -> Result<(), String> {
         .ok_or("lib.rs undiscovered")?;
     let prod = lib.sites.iter().filter(|s| !s.is_test).count();
     if prod != lib.sites.len() || prod != expectation_for("lib.rs")?.sites {
-        return Err(format!("lib production {prod} != 166"));
+        return Err(format!("lib production {prod} != 177"));
     }
     // Test-classified sites are confined to the two known test modules.
     for file in &all {
