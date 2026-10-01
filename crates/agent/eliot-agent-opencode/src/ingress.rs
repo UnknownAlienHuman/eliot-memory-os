@@ -1730,11 +1730,7 @@ where
 /// longer matches the bound `OpenCode` process. A foreign or stale listener
 /// therefore cannot pass the bootstrap identity check, and a composition with
 /// no live introduction can never mint a proof at all.
-fn handle_bootstrap_contact<I>(
-    challenge: &str,
-    bound_port: u16,
-    introductions: &I,
-) -> HttpOutcome
+fn handle_bootstrap_contact<I>(challenge: &str, bound_port: u16, introductions: &I) -> HttpOutcome
 where
     I: IntroductionStore,
 {
@@ -1767,11 +1763,7 @@ where
         // The introduction names a different bridge incarnation than this
         // listener serves, so this listener must not prove that identity.
         return HttpOutcome::rejected(
-            HostEventReject::new(
-                404,
-                DISPOSITION_INVALID_REQUEST,
-                REASON_ROUTE_UNAVAILABLE,
-            ),
+            HostEventReject::new(404, DISPOSITION_INVALID_REQUEST, REASON_ROUTE_UNAVAILABLE),
             None,
         );
     }
