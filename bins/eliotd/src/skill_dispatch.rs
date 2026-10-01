@@ -1622,7 +1622,7 @@ fn skill_refusal_body(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
+    use eliot_contracts::StateFence;
 
     use eliot_protocol::{
         HOST_REQUEST_WIRE_ID, HostRequestIdentity, HostRequestKind, host_request_operation_id,
