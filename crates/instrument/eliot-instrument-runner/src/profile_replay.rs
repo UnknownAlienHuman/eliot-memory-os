@@ -6,7 +6,7 @@ use eliot_bootstrap::{
     NormativePair,
     normative::{NormativePairReceiptIdentity, parse_normative_pair_receipt_identity},
 };
-use eliot_contracts::{ArtifactId, ClockReading, StateFence, sha256_hex};
+use eliot_contracts::{ArtifactId, ClockReading, StateFence, canonical_json_bytes, sha256_hex};
 use eliot_instrument_api::{EvidenceCoverage, RawEvidence, RawEvidenceSource, VerificationOutcome};
 use eliot_instrument_cargo::{CONTRACT_NAME as CARGO_INSTRUMENT, parse_jsonl as parse_cargo_jsonl};
 use eliot_instrument_nextest::{
@@ -104,6 +104,47 @@ impl VerifiedTestdReplayContext {
         })
     }
 
+    /// Issues a replay context from the exact canonical JSON carried by one
+    /// fresh owner readback. This is the per-stream finish path: callers pass
+    /// the owner response bytes and their wire digests, never a material
+    /// projection or cached launch-time lifecycle.
+    pub fn from_canonical_owner_readback_json(
+        profile_registry: InstrumentRegistry,
+        expected_state_fence: &StateFence,
+        catalog_readback_json: &[u8],
+        catalog_readback_sha256: &str,
+        generation_admission_json: &[u8],
+        generation_admission_sha256: &str,
+        work_scope_binding_json: &[u8],
+        work_scope_binding_sha256: &str,
+    ) -> Result<Self, ProfileReplayError> {
+        let readback: eliot_module_registry::ModuleCatalogOwnerReadback =
+            decode_canonical_owner_json(
+                catalog_readback_json,
+                catalog_readback_sha256,
+                "Module Catalog owner readback",
+            )?;
+        let admission: eliot_module_registry::GenerationAdmission = decode_canonical_owner_json(
+            generation_admission_json,
+            generation_admission_sha256,
+            "Module Catalog generation admission",
+        )?;
+        let work_scope_binding: WorkScopeBindingSnapshot = decode_canonical_owner_json(
+            work_scope_binding_json,
+            work_scope_binding_sha256,
+            "WorkScope owner readback",
+        )?;
+        Self::from_owner_readback(
+            profile_registry,
+            &readback,
+            readback.owner_revision,
+            readback.snapshot.catalog_revision,
+            expected_state_fence,
+            &admission,
+            work_scope_binding,
+        )
+    }
+
     /// Replays bytes already read back from the owner through the context's
     /// exact current registries and independently retained required IDs.
     #[allow(clippy::too_many_arguments)]
@@ -163,6 +204,36 @@ impl VerifiedTestdReplayContext {
             finished_at,
         )
     }
+}
+
+fn decode_canonical_owner_json<T>(
+    bytes: &[u8],
+    expected_sha256: &str,
+    label: &'static str,
+) -> Result<T, ProfileReplayError>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let expected_sha256 = expected_sha256.strip_prefix("sha256:").unwrap_or(expected_sha256);
+    if !valid_sha256_text(expected_sha256) || sha256_hex(bytes) != expected_sha256 {
+        return Err(ProfileReplayError::CurrentnessObservation(format!(
+            "{label} digest does not match its exact owner response bytes"
+        )));
+    }
+    let json: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        ProfileReplayError::CurrentnessObservation(format!("{label} JSON is invalid: {error}"))
+    })?;
+    let canonical = canonical_json_bytes(&json).map_err(|error| {
+        ProfileReplayError::CurrentnessObservation(format!("{label} canonicalization failed: {error}"))
+    })?;
+    if canonical != bytes {
+        return Err(ProfileReplayError::CurrentnessObservation(format!(
+            "{label} bytes are not canonical JSON"
+        )));
+    }
+    serde_json::from_value(json).map_err(|error| {
+        ProfileReplayError::CurrentnessObservation(format!("{label} schema is invalid: {error}"))
+    })
 }
 
 /// Builds the current seven-axis fingerprint set only from live observations
