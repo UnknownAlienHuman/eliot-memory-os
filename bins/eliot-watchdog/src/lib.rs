@@ -63,6 +63,10 @@ mod diagnostics;
 mod health_projection;
 mod heartbeat_transport;
 mod host_identity_observation;
+/// #1757: bounded identity recheck, fenced recovery intent, stop/start
+/// reconciliation, and the correlated dual audit record. Private cell: it
+/// performs no SCM effect and opens no Host journal.
+pub mod host_recovery;
 mod independent_sensor;
 mod observation_attribution;
 mod observation_coverage;
