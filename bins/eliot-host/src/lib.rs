@@ -2271,6 +2271,15 @@ pub(crate) struct HostJobBranches {
     store_restart_attempts: u8,
 }
 
+#[cfg(windows)]
+struct HostSupervisionControlContext {
+    runtime: tokio::runtime::Runtime,
+    transport: NamedPipeTransport,
+    candidate_digest: String,
+    generation: ResourceGeneration,
+    next_sequence: u64,
+}
+
 /// Independent branch disposition after one bounded reconciliation pass.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3136,6 +3145,143 @@ impl HostJobBranches {
             }
         };
         runtime.block_on(self.revoke_host_supervision_evidence_async(generation))
+    }
+
+    /// Opens the exact-fence revocation on the authenticated Kernel connection
+    /// that this fresh heartbeat attempt will use for its report and ProbeReady.
+    /// Kernel anchors its owner-local freshness Instant when it admits this
+    /// revocation; retaining the connection makes its sequence and anchor
+    /// inseparable from the following Host observation.
+    #[cfg(windows)]
+    fn begin_fresh_supervision_control_context(
+        &mut self,
+        generation: &PlatformHandle,
+    ) -> Result<HostSupervisionControlContext, HostError> {
+        let expected_selector = self.current_supervision_observation_digest.clone();
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let cleanup = self.terminate_kernel();
+                return Err(match cleanup {
+                    Ok(()) => HostError::RecoveryRequired(error.to_string()),
+                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                        "could not create the authenticated revocation runtime ({error}); retained Kernel Job containment failed ({cleanup})"
+                    )),
+                });
+            }
+        };
+        let preparation = (|| {
+            let launch = self.launch.as_ref().ok_or_else(|| {
+                HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
+            })?;
+            let candidate = self.kernel_candidate.as_ref().ok_or_else(|| {
+                HostError::ProcessContour(
+                    "retained Kernel candidate binding is missing".to_owned(),
+                )
+            })?;
+            if self.approved_generation.as_ref() != Some(generation) {
+                return Err(HostError::ProcessContour(
+                    "supervision context is not for the approved active generation".to_owned(),
+                ));
+            }
+            let kernel = self
+                .kernel
+                .as_ref()
+                .ok_or_else(|| HostError::ProcessContour("Kernel process is missing".to_owned()))?;
+            let process = kernel.evidence().process().clone();
+            let expected_kernel_image = self
+                .kernel_executable
+                .as_ref()
+                .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?
+                .clone();
+            let candidate = candidate.clone();
+            let candidate_digest = candidate
+                .compute_digest()
+                .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+            Ok::<_, HostError>((
+                candidate,
+                process,
+                expected_kernel_image,
+                candidate_digest,
+                launch.authority_generation,
+            ))
+        })();
+        let (candidate, process, expected_kernel_image, candidate_digest, authority_generation) =
+            match preparation {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    let cleanup = self.terminate_kernel();
+                    return Err(match cleanup {
+                        Ok(()) => error,
+                        Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(
+                            format!(
+                                "supervision preparation failed ({error}); retained Kernel Job containment failed ({cleanup})"
+                            ),
+                        ),
+                    });
+                }
+            };
+        let result = runtime.block_on(async {
+            let mut transport = connect_authenticated_kernel_front_door(&candidate, &process)
+                .await
+                .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            validate_authenticated_kernel_peer(
+                transport.peer_identity(),
+                process.process_id,
+                process.start_time_100ns,
+                &expected_kernel_image,
+            )
+            .map_err(|error| HostError::RecoveryRequired(error.to_string()))?;
+            let disposition = Self::send_bound_host_supervision_revocation(
+                &mut transport,
+                &candidate,
+                authority_generation,
+                expected_selector.clone(),
+                1,
+            )
+            .await?;
+            Ok::<_, HostError>((transport, disposition))
+        });
+        let (transport, disposition) = match result {
+            Ok((transport, disposition)) => (transport, disposition),
+            Err(error) => {
+                let cleanup = self.terminate_kernel();
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => HostError::KernelSupervisionRevocationUncontained(format!(
+                        "uncontained host-supervision revocation: revoke failed ({error}); Kernel Job containment failed ({cleanup})"
+                    )),
+                });
+            }
+        };
+        match disposition {
+            HostSupervisionRevocationDisposition::Revoked
+            | HostSupervisionRevocationDisposition::AlreadyAbsent => {
+                if self.current_supervision_observation_digest == expected_selector {
+                    self.current_supervision_observation_digest = None;
+                }
+            }
+            HostSupervisionRevocationDisposition::Superseded {
+                current_observation_digest,
+            } => {
+                if self.current_supervision_observation_digest == expected_selector {
+                    self.current_supervision_observation_digest = Some(current_observation_digest);
+                }
+                return Err(HostError::KernelSupervisionRevocationSuperseded(
+                    "a newer original heartbeat proof remains current".to_owned(),
+                ));
+            }
+        }
+        Ok(HostSupervisionControlContext {
+            runtime,
+            transport,
+            candidate_digest,
+            generation: authority_generation,
+            next_sequence: 2,
+        })
     }
 
     #[cfg(windows)]
@@ -4779,6 +4925,7 @@ impl HostJobBranches {
         approved_config: &PlatformHandle,
         supervision_evidence: &HostStartupEvidence,
         supervision_heartbeat: Option<&watchdog_heartbeat::AdmittedHostHeartbeat>,
+        mut control: HostSupervisionControlContext,
     ) -> Result<AuthenticatedKernelReadiness, HostError> {
         let reported_observation_digest = supervision_heartbeat
             .map(kernel_heartbeat_observation_digest)
@@ -4846,19 +4993,27 @@ impl HostJobBranches {
             .kernel_executable
             .as_ref()
             .ok_or_else(|| HostError::ProcessContour("Kernel image is missing".to_owned()))?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let candidate_digest = candidate
+            .compute_digest()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
+        if control.generation != launch.authority_generation
+            || control.candidate_digest != candidate_digest
+        {
+            return Err(HostError::ProcessContour(
+                "retained authenticated Kernel context belongs to a different candidate or fence"
+                    .to_owned(),
+            ));
+        }
+        let report_sequence = control.next_sequence;
+        let probe_sequence = report_sequence.checked_add(1).ok_or_else(|| {
+            HostError::ProcessContour("Kernel control sequence is exhausted".to_owned())
+        })?;
+        let runtime = &control.runtime;
+        let transport = &mut control.transport;
         let mut report_attempted = false;
+        self.current_supervision_observation_digest
+            .clone_from(&reported_observation_digest);
         let result = runtime.block_on(async {
-            let mut transport = connect_authenticated_kernel_front_door(candidate, process).await?;
-            validate_authenticated_kernel_peer(
-                transport.peer_identity(),
-                process.process_id,
-                process.start_time_100ns,
-                expected_kernel_image,
-            )?;
             let peer_digest = sha256_json(&(
                 process.process_id,
                 process.start_time_100ns,
@@ -4868,30 +5023,28 @@ impl HostJobBranches {
             let peer_evidence = PlatformHandle::new(format!("kernel-peer:{peer_digest}"))
                 .map_err(|error| HostError::Platform(error.to_string()))?;
             // The combined report carries the original continuous heartbeat
-            // admitted against the exact current owner lease. It occupies the
-            // first command; ProbeReady follows on the strict connection
-            // sequence and cannot bootstrap the heartbeat.
+            // admitted against the exact current owner lease. The exact-fence
+            // revocation already occupied sequence 1 on this retained
+            // connection; the report and ProbeReady continue that sequence.
             // Retain the exact attempted original digest before sending. A
             // lost ACK may follow a committed report, so this is a CAS
             // selector only and does not claim acceptance.
-            self.current_supervision_observation_digest
-                .clone_from(&reported_observation_digest);
             report_attempted = true;
             HostJobBranches::send_bound_host_startup_evidence(
-                &mut transport,
+                transport,
                 supervision_evidence,
                 None,
                 candidate,
                 approved_generation,
                 supervision_heartbeat,
-                1,
+                report_sequence,
             )
             .await?;
             let request = KernelControlRequest {
                 wire_id: eliot_kernel_service::KERNEL_CONTROL_WIRE_ID.to_owned(),
                 wire_version: eliot_kernel_service::KERNEL_CONTROL_WIRE_VERSION,
                 message_id: fresh_identity("kernel-probe")?,
-                sequence: 2,
+                sequence: probe_sequence,
                 peer_process_id: std::process::id(),
                 generation: launch.authority_generation,
                 candidate: candidate.clone(),
@@ -12117,12 +12270,16 @@ impl HostComposition {
     ) -> Result<HostBranchDisposition, HostError> {
         // Invalidate the old exact candidate/fence before even the local
         // contour inspection can fail or decide to skip fresh evidence.
-        if disposition == HostBranchDisposition::LiveAwaitingReadiness
-            && let Err(error) = self.jobs.revoke_host_supervision_evidence(generation)
-        {
-            self.readiness_gate
-                .fail(None, readiness_failure_kind(&error), now);
-            return Err(error);
+        let mut control = None;
+        if disposition == HostBranchDisposition::LiveAwaitingReadiness {
+            match self.jobs.begin_fresh_supervision_control_context(generation) {
+                Ok(context) => control = Some(context),
+                Err(error) => {
+                    self.readiness_gate
+                        .fail(None, readiness_failure_kind(&error), now);
+                    return Err(error);
+                }
+            }
         }
         if disposition != HostBranchDisposition::LiveAwaitingReadiness {
             return Ok(self.reconcile_non_live_branch_readiness_at(generation, disposition, now));
@@ -12153,7 +12310,12 @@ impl HostComposition {
         let mut uncontained_kernel_revocation = None;
         let mut superseded_kernel_revocation = None;
         let outcome = reconcile_authenticated_readiness(&mut readiness_gate, contour, now, || {
-            let result = self.persist_fresh_authenticated_readiness(generation);
+            let result = match control.take() {
+                Some(control) => self.persist_fresh_authenticated_readiness(generation, control),
+                None => Err(HostError::ProcessContour(
+                    "fresh readiness has no authenticated Kernel control context".to_owned(),
+                )),
+            };
             watchdog_failure = matches!(&result, Err(HostError::WatchdogCoverageUnavailable(_)));
             if let Err(HostError::KernelSupervisionRevocationUncontained(reason)) = &result {
                 uncontained_kernel_revocation = Some(reason.clone());
@@ -12348,8 +12510,11 @@ impl HostComposition {
         &mut self,
         generation: &PlatformHandle,
     ) -> Result<(), HostError> {
+        let control = self
+            .jobs
+            .begin_fresh_supervision_control_context(generation)?;
         let now = std::time::Instant::now();
-        let contour = self.persist_fresh_authenticated_readiness(generation)?;
+        let contour = self.persist_fresh_authenticated_readiness(generation, control)?;
         if !self.readiness_gate.grant(contour, now) {
             return Err(HostError::ProcessContour(
                 "journaled readiness contour has no Store proof fence".to_owned(),
@@ -12636,6 +12801,7 @@ impl HostComposition {
     fn persist_fresh_authenticated_readiness(
         &mut self,
         generation: &PlatformHandle,
+        control: HostSupervisionControlContext,
     ) -> Result<ReadinessContourIdentity, HostError> {
         // F-LOG-HOST-1: ready only with actual proof fence; phase only here,
         // outer reconcile owns the terminal. Never claims ready from liveness.
@@ -12755,6 +12921,7 @@ impl HostComposition {
             &materialized_config_digest,
             &supervision_evidence,
             admitted_heartbeat.as_ref(),
+            control,
         )?;
         let post_probe = (|| -> Result<ReadinessContourIdentity, HostError> {
             // ProbeReady may renew the same owner lease. Publish that actual

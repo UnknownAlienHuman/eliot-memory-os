@@ -57,6 +57,8 @@ mod canonical_store_runtime;
 mod composition_bootstrap;
 mod control_plane;
 pub mod coordination_mailbox;
+#[doc(hidden)]
+pub use control_plane::KernelControlSessionContext;
 /// Kernel problem-diagnostic projection (issue #1844; I16.7): the bounded
 /// `LogWindowRef`/`DiagnosticBrief` compiler over the canonical audit chain
 /// and the captured operational log windows. It emits references, gaps, and
@@ -3157,6 +3159,7 @@ impl KernelComposition {
         heartbeat_proof: &eliot_kernel_service::AdmittedWatchdogHeartbeatProof,
         candidate: &eliot_kernel_service::HostKernelCandidateBinding,
         target: &StateFence,
+        admission_context_anchored_at: Instant,
     ) -> Result<(), KernelServiceError> {
         let candidate_digest = candidate.compute_digest().map_err(|_| {
             KernelServiceError::Platform(
@@ -3197,9 +3200,10 @@ impl KernelComposition {
             || heartbeat_proof.freshness_deadline_wall_ms <= now_ms
             || valid_for_ms == 0
             || valid_for_ms > SUPERVISION_LEASE_RENEWAL_POLICY.max_observation_age_ms
+            || admission_context_anchored_at.elapsed() > Duration::from_millis(valid_for_ms)
         {
             return Err(KernelServiceError::Platform(
-                "original Host heartbeat is future-dated, expired, or outside the admitted freshness interval"
+                "original Host heartbeat is future-dated, expired, outside the admitted freshness interval, or outside its authenticated control context"
                     .to_owned(),
             ));
         }
@@ -3212,13 +3216,25 @@ impl KernelComposition {
                         .to_owned(),
                 )
             })?;
-        let local_deadline = admitted_monotonic
+        let wall_deadline = admitted_monotonic
             .checked_add(Duration::from_millis(remaining_ms))
             .ok_or_else(|| {
                 KernelServiceError::Platform(
                     "Kernel-local Watchdog heartbeat deadline is not representable".to_owned(),
                 )
             })?;
+        let context_deadline = admission_context_anchored_at
+            .checked_add(Duration::from_millis(valid_for_ms))
+            .ok_or_else(|| {
+                KernelServiceError::Platform(
+                    "Kernel control-context Watchdog deadline is not representable".to_owned(),
+                )
+            })?;
+        // The revocation anchor predates the Host heartbeat observation on
+        // this same connection. Cap the retained deadline there so a wall
+        // rollback before first report admission cannot restart the original
+        // freshness interval from report reception.
+        let local_deadline = std::cmp::min(wall_deadline, context_deadline);
         let mut scm_parts = evidence.scm_watchdog_observation_digest.as_str().split(':');
         let scm_pid = scm_parts.nth(1).and_then(|value| value.parse::<u32>().ok());
         let scm_start = scm_parts.next().and_then(|value| value.parse::<u64>().ok());
