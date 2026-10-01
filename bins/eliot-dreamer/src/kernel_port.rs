@@ -1286,14 +1286,14 @@ fn checked_response(
 /// revisions may advance after `Start`, so operation-specific revision
 /// binding remains the responsibility of `validate_for` above.
 ///
-/// The opaque owner record the Kernel published is re-proved here through the
-/// existing `OpaqueContentRef::validate` against the ORIGINAL RECORDED value:
-/// its digest, byte length and artifact handle must be exactly the ones the
-/// producing owner recorded, and they are never recomputed on this side. The
-/// record is then recorded, not interpreted — the presence, the digest and the
-/// byte length are what this call observes, and a job whose owner published no
-/// record keeps reading as the typed absence `None`. Nothing here decodes the
-/// record, so it can never stand in for a typed `OrientationSupply` member.
+/// The opaque owner record is bound here against the ORIGINAL value staged for
+/// this job: the Kernel reply must carry exactly the reference the dispatch
+/// material carries, and both sides' digest, byte length and artifact handle are
+/// re-proved through the existing `OpaqueContentRef::validate` rather than
+/// recomputed on this side. A record absent on both sides stays the typed
+/// absence `None`; a record present on one side only is a stale owner record,
+/// not an empty one. Nothing here decodes the record, so it can never stand in
+/// for a typed `OrientationSupply` member.
 fn validate_owner_response_binding(
     material: &ValidatedDreamerMaterial,
     response: &DurableJobResponse,
@@ -1319,14 +1319,31 @@ fn validate_owner_response_binding(
             "Kernel owner reply changed the original semantic input bytes".to_owned(),
         ));
     }
-    // The owner record is opaque. What is recorded here is its presence, the
-    // owner's recorded digest and the owner's recorded byte length — re-proved
-    // against the ORIGINAL recorded value through the existing `validate`, never
-    // recomputed here, and never decoded. A record that is absent stays absent.
+    // The owner record is opaque. What is bound here is its presence, the
+    // owner's recorded digest and the owner's recorded byte length against the
+    // ORIGINAL value staged for this job — re-proved through the existing
+    // `validate` on both sides, never recomputed here, and never decoded. An
+    // absent record stays absent on both sides: a Kernel that published one and
+    // a staged material that carries one must agree exactly.
     if let Some(owner_record) = &response.owner_record {
         owner_record
             .validate("owner_record.sha256")
             .map_err(|error| KernelPortError::OwnerRecordStale(error.to_string()))?;
+        let staged = material.owner_record.as_ref().ok_or(
+            KernelPortError::OwnerRecordStale(
+                "Kernel owner reply carries an owner record this claim was not staged with"
+                    .to_owned(),
+            ),
+        )?;
+        if owner_record != staged {
+            return Err(KernelPortError::OwnerRecordStale(
+                "Kernel owner reply changed the original owner record".to_owned(),
+            ));
+        }
+    } else if material.owner_record.is_some() {
+        return Err(KernelPortError::OwnerRecordStale(
+            "Kernel owner reply dropped the staged owner record".to_owned(),
+        ));
     }
     if response.job_id.as_str() != material.job_id
         || response.attempt_id.as_str() != material.attempt_id
