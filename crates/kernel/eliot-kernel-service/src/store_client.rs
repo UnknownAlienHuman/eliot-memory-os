@@ -28,8 +28,8 @@ use eliot_store_api::{
     SnapshotCursor, SnapshotEndReceipt, SnapshotHandle, SnapshotPage, StoreBackupStatus,
     StoreError, StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
     StoreRequest, StoreResponse, StoreWireError, StoreWorkScopeOwnerRequest,
-    StoreWorkScopeOwnerResponse, WriteReceipt, dreamer_job_capability,
-    map_durable_error, validate_genesis_receipt_envelope, verify_canonical_request_hash,
+    StoreWorkScopeOwnerResponse, WriteReceipt, dreamer_job_capability, map_durable_error,
+    validate_genesis_receipt_envelope, verify_canonical_request_hash,
     verify_ordering_scope_binding,
 };
 use thiserror::Error;

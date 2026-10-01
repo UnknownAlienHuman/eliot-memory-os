@@ -121,16 +121,16 @@ use eliot_testd_core::{
 use eliot_workscope::{
     AuthorityBasis, BootstrapScanEvidence, BootstrapScanOutcome, BootstrapScanner,
     ColdStartController, ColdStartTrigger, DiscoveryLeaseKey, DiscoveryReadLease,
-    GenerationEvidence, GoverningSourceAdmission, GoverningSourceSet, GuardTrigger, GuardVerdict,
-    GoverningSourceCandidate, PrecedenceDeclaration, SourceCandidateOrigin,
-    IdentityEvidence, IdentityLegOutcome, LeaseJoin, LooseScanQuarantine, MaterialAdmission,
-    MaterialReadinessDirective, MaterialReadinessInputs, ObservedScopeResources, OnboardingLease,
-    PrivacyBoundary, PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle,
-    RepositoryLineageIdentity, RequestedEffect, ResolutionAuthentication, ResolutionRequest,
-    ScanDisclosureOwnerBinding, ScanReceiptHandle, ScannerResolverInputs, ScopeBinding,
-    ScopeBindingDisposition, ScopeBindingGuard, ScopeIdentity, ScopeKind,
-    ScopeRelocationOrAttachReceipt, ScopeResolution, SourceAdmissionRequest, TaskBindingInput,
-    TaskBindingState, TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
+    GenerationEvidence, GoverningSourceAdmission, GoverningSourceCandidate, GoverningSourceSet,
+    GuardTrigger, GuardVerdict, IdentityEvidence, IdentityLegOutcome, LeaseJoin,
+    LooseScanQuarantine, MaterialAdmission, MaterialReadinessDirective, MaterialReadinessInputs,
+    ObservedScopeResources, OnboardingLease, PrecedenceDeclaration, PrivacyBoundary,
+    PrivacyProfile, QuarantinedScopeRecord, ReadinessLifecycle, RepositoryLineageIdentity,
+    RequestedEffect, ResolutionAuthentication, ResolutionRequest, ScanDisclosureOwnerBinding,
+    ScanReceiptHandle, ScannerResolverInputs, ScopeBinding, ScopeBindingDisposition,
+    ScopeBindingGuard, ScopeIdentity, ScopeKind, ScopeRelocationOrAttachReceipt, ScopeResolution,
+    SourceAdmissionRequest, SourceCandidateOrigin, TaskBindingInput, TaskBindingState,
+    TaskIntakeCandidate, TaskSelectionRequired, TriggerAdmission, TriggerReport,
     WorkScopeBindingOwner, WorkScopeBindingSnapshot, WorkScopeCandidate, WorkScopeCandidateSet,
     WorkScopeDescriptor, WorkScopeError, WorkScopeResolutionReceipt, WorkScopeResolver,
     WorkspaceInstanceIdentity, admit_at_trigger, admit_initial_binding, check_at_trigger,
@@ -7867,8 +7867,8 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
     /// Admits the initial binding for a newly resolved scope (issue #1787,
     /// bootstrap-constructor entry).
     ///
-/// Used for a new owner or an exact retained-owner replay: the authenticated
-/// explicit binding caller supplies the original descriptor and resolved binding,
+    /// Used for a new owner or an exact retained-owner replay: the authenticated
+    /// explicit binding caller supplies the original descriptor and resolved binding,
     /// the mechanically observed resources from the independent Host probe,
     /// and the original source/privacy closure. The observed binding is
     /// derived here from the Host observation; callers cannot satisfy the
@@ -7946,7 +7946,11 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         for authority in source_candidates
             .iter()
             .filter_map(|candidate| candidate.claim.as_ref())
-            .chain(declared_precedences.iter().map(|declaration| &declaration.authority))
+            .chain(
+                declared_precedences
+                    .iter()
+                    .map(|declaration| &declaration.authority),
+            )
         {
             match authority {
                 AuthorityBasis::HumanOwner { owner_ref } => {
@@ -8018,28 +8022,32 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         }
 
         let mut request = SourceAdmissionRequest {
-                scope_ref: binding.scope.scope_ref.clone(),
-                generation: binding.scope.generation,
-                candidates: source_candidates.to_vec(),
-                precedences: declared_precedences.to_vec(),
-                required_owner_ref: policy_snapshot.policy_owner.owner_ref.clone(),
-                proven_current_bindings: vec![TaskBindingState::CurrentTaskContract {
-                    task_ref,
-                    task_revision,
-                    acceptance_digest,
-                    selection_source_ref,
-                    evidence_ref,
-                }],
-                proven_contracts: Vec::new(),
-                absence_reason_ref: absence_reason_ref.map(str::to_owned),
-                state_fence: fence.clone(),
-                expires_at: admission_deadline,
+            scope_ref: binding.scope.scope_ref.clone(),
+            generation: binding.scope.generation,
+            candidates: source_candidates.to_vec(),
+            precedences: declared_precedences.to_vec(),
+            required_owner_ref: policy_snapshot.policy_owner.owner_ref.clone(),
+            proven_current_bindings: vec![TaskBindingState::CurrentTaskContract {
+                task_ref,
+                task_revision,
+                acceptance_digest,
+                selection_source_ref,
+                evidence_ref,
+            }],
+            proven_contracts: Vec::new(),
+            absence_reason_ref: absence_reason_ref.map(str::to_owned),
+            state_fence: fence.clone(),
+            expires_at: admission_deadline,
         };
         let mut proven_contract_refs = BTreeSet::new();
         for contract_ref in source_candidates
             .iter()
             .filter_map(|candidate| candidate.claim.as_ref())
-            .chain(declared_precedences.iter().map(|declaration| &declaration.authority))
+            .chain(
+                declared_precedences
+                    .iter()
+                    .map(|declaration| &declaration.authority),
+            )
             .filter_map(|basis| match basis {
                 AuthorityBasis::ProjectContract { contract_ref } => Some(contract_ref),
                 AuthorityBasis::HumanOwner { .. } | AuthorityBasis::DelegatedTaskBinding { .. } => {
@@ -8080,11 +8088,9 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
             ));
         }
 
-        if !privacy.admits(binding.privacy_class)
-        {
+        if !privacy.admits(binding.privacy_class) {
             return Err(CompositionError::Recovery(
-                "WorkScope privacy boundary does not admit the binding's source class"
-                    .to_owned(),
+                "WorkScope privacy boundary does not admit the binding's source class".to_owned(),
             ));
         }
 
@@ -8300,7 +8306,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 let mut seen = BTreeSet::new();
                 while let Some(intent) = current {
                     if !seen.insert(intent.grant_id.as_str())
-                        || intent.mechanical_subset.verify_recorded_commitment().is_err()
+                        || intent
+                            .mechanical_subset
+                            .verify_recorded_commitment()
+                            .is_err()
                         || intent.mechanical_subset.binding.state_fence != *fence
                         || intent.mechanical_subset.holder_principal != intent.holder_principal
                         || intent.mechanical_subset.session_id != intent.session_id

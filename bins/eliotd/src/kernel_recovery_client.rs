@@ -333,7 +333,12 @@ fn task_controller_owner_request_identity(
         .map_err(|error| KernelPortError::Contract(error.to_string()))?;
     if request_identity.request.state_fence != client.snapshot.state_fence()
         || request_identity.request.metadata.task_id.as_ref() != Some(&claimed.invocation.task_id)
-        || request_identity.request.metadata.session_id.as_ref().map(SessionId::as_str)
+        || request_identity
+            .request
+            .metadata
+            .session_id
+            .as_ref()
+            .map(SessionId::as_str)
             != Some(attempt.session_id.as_str())
         || request_identity.deadline_unix_ms != identity.deadline_unix_ms
         || identity.session_id.as_deref() != Some(attempt.session_id.as_str())
@@ -361,9 +366,9 @@ impl DaemonKernelClient {
         snapshot
             .validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
-        let next_revision = expected_owner_revision
-            .checked_add(1)
-            .ok_or_else(|| KernelPortError::Contract("WorkScope owner revision overflow".to_owned()))?;
+        let next_revision = expected_owner_revision.checked_add(1).ok_or_else(|| {
+            KernelPortError::Contract("WorkScope owner revision overflow".to_owned())
+        })?;
         if expected_owner_revision == 0
             || snapshot.owner_revision != next_revision
             || snapshot.state_fence != self.snapshot.state_fence()
@@ -429,10 +434,7 @@ impl DaemonKernelClient {
             .validate()
             .map_err(|error| KernelPortError::Contract(error.to_string()))?;
         let value = self
-            .transact_async(
-                "store_recovery",
-                serde_json::json!({ "request": request }),
-            )
+            .transact_async("store_recovery", serde_json::json!({ "request": request }))
             .await
             .map_err(kernel_port_error)?;
         let value = kind_value(&value, "store_recovery")?;
@@ -453,9 +455,7 @@ impl DaemonKernelClient {
         let record = snapshot.owner_records.into_iter().next().ok_or_else(|| {
             KernelPortError::Contract("seeded WorkScope owner row is absent".to_owned())
         })?;
-        if record.record_key() != key
-            || record.state_fence != *state_fence
-            || record.revision == 0
+        if record.record_key() != key || record.state_fence != *state_fence || record.revision == 0
         {
             return Err(KernelPortError::Contract(
                 "WorkScope owner recovery read returned an invalid named row".to_owned(),

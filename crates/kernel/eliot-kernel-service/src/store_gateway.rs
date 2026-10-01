@@ -102,11 +102,10 @@ use eliot_store_api::{
     OrderingHeadReadback, OrderingScopeId, OriginalWriteSubmission, PreparedTransition,
     RecoveryRecord, RecoveryRecordKey, RequestMeta, ReservedWriteRequest, RestoreValidationReceipt,
     RevisionHead, RevisionHeadExpectation, RevisionKey, ScopeId, ScopeRevisionView, StoreError,
-    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot, WriteReceipt,
-    StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse,
-    WriteReceiptStatus, WriteSubmission, admit_write_submission, canonical_request_hash,
-    dreamer_job_queue_key, generated_operation_manifests, operation_manifest_set_digest,
-    verify_canonical_request_hash,
+    StoreGenesisRequest, StoreHealth, StoreRecoveryRequest, StoreRecoverySnapshot,
+    StoreWorkScopeOwnerRequest, StoreWorkScopeOwnerResponse, WriteReceipt, WriteReceiptStatus,
+    WriteSubmission, admit_write_submission, canonical_request_hash, dreamer_job_queue_key,
+    generated_operation_manifests, operation_manifest_set_digest, verify_canonical_request_hash,
 };
 use serde::{Deserialize, Serialize};
 
@@ -8266,22 +8265,15 @@ impl KernelStoreGateway {
             return Err(NamedReadGatewayError::Store(StoreError::FenceMismatch));
         }
         let lease = {
-            let service = self
-                .service
-                .lock()
-                .map_err(|_| {
-                    NamedReadGatewayError::GatewayRefusal(
-                        "Kernel service lock poisoned".to_owned(),
-                    )
-                })?;
+            let service = self.service.lock().map_err(|_| {
+                NamedReadGatewayError::GatewayRefusal("Kernel service lock poisoned".to_owned())
+            })?;
             if service.generation_fenced() {
                 return Err(NamedReadGatewayError::Store(StoreError::FenceMismatch));
             }
             let lease = service
                 .acquire_admission()
-                .map_err(|error| {
-                    NamedReadGatewayError::GatewayRefusal(error.to_string())
-                })?;
+                .map_err(|error| NamedReadGatewayError::GatewayRefusal(error.to_string()))?;
             if lease.authority_epoch() != request.state_fence.authority_epoch {
                 return Err(NamedReadGatewayError::Store(StoreError::FenceMismatch));
             }
@@ -8311,19 +8303,13 @@ impl KernelStoreGateway {
         let expected_record = request.owner_record.clone();
         let next_revision = expected_record.revision;
         match current.owner_records.as_slice() {
-            [record]
-                if record == &expected_record
-                    && record.revision == next_revision =>
-            {
+            [record] if record == &expected_record && record.revision == next_revision => {
                 return Ok(StoreWorkScopeOwnerResponse {
                     record: record.clone(),
                 });
             }
             [record] if record.revision == request.expected_owner_revision => {}
-            [record]
-                if record.revision == next_revision
-                    && record != &expected_record =>
-            {
+            [record] if record.revision == next_revision && record != &expected_record => {
                 return Err(NamedReadGatewayError::Store(StoreError::IdentityConflict));
             }
             _ => return Err(NamedReadGatewayError::Store(StoreError::RevisionConflict)),
@@ -8353,7 +8339,8 @@ impl KernelStoreGateway {
                 include_jobs: false,
             })
             .await?;
-        let same_record = matches!(snapshot.owner_records.as_slice(), [record] if record == &expected_record);
+        let same_record =
+            matches!(snapshot.owner_records.as_slice(), [record] if record == &expected_record);
         drop(lease);
         if snapshot.state_fence != request.state_fence {
             return Err(NamedReadGatewayError::Store(StoreError::FenceMismatch));

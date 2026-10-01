@@ -11,10 +11,9 @@ use eliot_context::campaign_publication::ContextCampaignRecipeBody;
 use eliot_context_contracts::SessionDeliverySnapshot;
 use eliot_contracts::{StateFence, canonical_json_bytes, sha256_hex};
 use eliot_governor::{
-    CampaignOwnerSourceInput, GuardedTaskCommand, KernelPortError, KernelTransitionPort,
-    InitialScopeBindingAdmissionRequest, PreparedTaskTransition, TaskCommand, TaskCommandContext,
-    TaskProposal,
-    TaskSelectionAdmissionBinding, OWNER_SNAPSHOT_SCHEMA,
+    CampaignOwnerSourceInput, GuardedTaskCommand, InitialScopeBindingAdmissionRequest,
+    KernelPortError, KernelTransitionPort, OWNER_SNAPSHOT_SCHEMA, PreparedTaskTransition,
+    TaskCommand, TaskCommandContext, TaskProposal, TaskSelectionAdmissionBinding,
 };
 use eliot_learning_contracts::{
     CampaignSourceBinding, CampaignSourceRevisionRef, CampaignSourceRole, LearningStateViewRecipe,
@@ -443,9 +442,9 @@ pub async fn prepare_task_controller_claim(
 ) -> Result<TaskControllerClaimPreparation, String> {
     let invocation = &claimed.invocation;
     if invocation.action == TaskControllerAction::BindScope {
-        let Ok(request) = serde_json::from_value::<InitialWorkScopeBindingRequest>(
-            invocation.task_input.clone(),
-        ) else {
+        let Ok(request) =
+            serde_json::from_value::<InitialWorkScopeBindingRequest>(invocation.task_input.clone())
+        else {
             return Ok(TaskControllerClaimPreparation::Rejected(Box::new(
                 task_controller_rejection(&claimed, "invalid_scope_binding")?,
             )));
@@ -594,10 +593,11 @@ pub async fn complete_initial_work_scope_binding(
         Ok(record) => record,
         Err(_) => return task_controller_rejection(&claimed, "owner_read_unavailable"),
     };
-    let (expected_owner_revision, retained_snapshot) = match work_scope_owner_revision_state(&current, fence) {
-        Ok(state) => state,
-        Err(()) => return task_controller_rejection(&claimed, "scope_owner_invalid"),
-    };
+    let (expected_owner_revision, retained_snapshot) =
+        match work_scope_owner_revision_state(&current, fence) {
+            Ok(state) => state,
+            Err(()) => return task_controller_rejection(&claimed, "scope_owner_invalid"),
+        };
     let is_empty_owner = retained_snapshot.is_none();
     let owner_revision = if is_empty_owner {
         let Some(revision) = expected_owner_revision.checked_add(1) else {
@@ -633,10 +633,7 @@ pub async fn complete_initial_work_scope_binding(
             .governor
             .admit_initial_scope_binding(InitialScopeBindingAdmissionRequest {
                 now,
-                authenticated_identity: (
-                    claimed.authenticated_principal.as_str(),
-                    session_ref,
-                ),
+                authenticated_identity: (claimed.authenticated_principal.as_str(), session_ref),
                 task_binding: (claimed.invocation.task_id.as_str(), task_revision),
                 work_scope_ref: claimed.invocation.work_scope_id.as_str(),
                 state_fence: fence,
@@ -691,7 +688,9 @@ pub async fn complete_initial_work_scope_binding(
                 } else if reconciled.revision == expected_owner_revision {
                     return task_controller_rejection(&claimed, "scope_owner_write_rejected");
                 } else {
-                    return Err("WorkScope owner write outcome conflicts with retained readback".to_owned());
+                    return Err(
+                        "WorkScope owner write outcome conflicts with retained readback".to_owned(),
+                    );
                 }
             }
         }
@@ -757,10 +756,9 @@ fn work_scope_owner_revision_state(
             .get("revision")
             .and_then(serde_json::Value::as_u64)
             .ok_or(())?;
-        let embedded_fence: StateFence = serde_json::from_value(
-            object.get("state_fence").cloned().ok_or(())?,
-        )
-        .map_err(|_| ())?;
+        let embedded_fence: StateFence =
+            serde_json::from_value(object.get("state_fence").cloned().ok_or(())?)
+                .map_err(|_| ())?;
         if embedded_revision != record.revision || embedded_fence != *expected_fence {
             return Err(());
         }

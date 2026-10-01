@@ -1470,11 +1470,10 @@ fn capture_task_selection_evidence(
         // Missing or ambiguous selection permits only the raw cold capture.
         // Its task association remains absent in the submission even when
         // authenticated request metadata carries a task hint.
-        (Some(_), None) => Ok(None),
+        (_, None) => Ok(None),
         (None, Some(_)) => Err(CompositionError::Kernel(
             KernelPortError::TaskScopeIncompatible,
         )),
-        (None, None) => Ok(None),
     }
 }
 

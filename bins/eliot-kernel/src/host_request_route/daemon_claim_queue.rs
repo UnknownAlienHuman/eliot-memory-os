@@ -815,7 +815,15 @@ impl KernelComposition {
         operation_id: &str,
         request_sha256: &str,
         presented_attempt: &TaskControllerAttempt,
-    ) -> Result<(HostRequestEnvelope, TaskControllerInvocation, serde_json::Value, String), TransportError> {
+    ) -> Result<
+        (
+            HostRequestEnvelope,
+            TaskControllerInvocation,
+            serde_json::Value,
+            String,
+        ),
+        TransportError,
+    > {
         presented_attempt
             .validate()
             .map_err(|_| TransportError::SessionFenced)?;
@@ -860,11 +868,23 @@ impl KernelComposition {
             || presented_attempt.attempt_id != state.attempt_id
             || presented_attempt.fencing_generation != state.generation
             || presented_attempt.task_id.as_str()
-                != envelope.identity.task_id.as_deref().ok_or(TransportError::SessionFenced)?
+                != envelope
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
             || presented_attempt.scope_id
-                != envelope.identity.work_scope_id.as_deref().ok_or(TransportError::SessionFenced)?
+                != envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
             || presented_attempt.session_id
-                != envelope.identity.session_id.as_deref().ok_or(TransportError::SessionFenced)?
+                != envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
             || presented_attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
             || presented_attempt.state_fence != envelope.state_fence
             || !presented_attempt

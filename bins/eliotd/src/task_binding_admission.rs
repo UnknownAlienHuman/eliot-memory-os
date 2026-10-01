@@ -151,11 +151,10 @@ use eliot_security_contracts::PrivacyClass;
 use eliot_store_api::{NamedMutationOperation, PreparedTransition};
 use eliot_workscope::{
     BootstrapDiscoveryInputs, BootstrapScanEvidence, DiscoveryLeaseKey, DiscoveryLeaseRequest,
-    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidate,
-    GoverningSourceCandidateEvidence, GoverningSourceRole, ManifestEvidence,
-    ObservedScopeResources, OnboardingLease, OnboardingReadinessReceipt, PrecedenceDeclaration,
-    ReadinessLifecycle, ScopeBindingDisposition, ScopeResolutionState, TaskBindingState,
-    issue_discovery_lease, task_selection_required,
+    DiscoveryRead, DiscoveryReadLease, GoverningSourceCandidate, GoverningSourceCandidateEvidence,
+    GoverningSourceRole, ManifestEvidence, ObservedScopeResources, OnboardingLease,
+    OnboardingReadinessReceipt, PrecedenceDeclaration, ReadinessLifecycle, ScopeBindingDisposition,
+    ScopeResolutionState, TaskBindingState, issue_discovery_lease, task_selection_required,
 };
 
 /// Authenticated activation's bounded filesystem/VCS observation and its
@@ -219,7 +218,9 @@ impl InitialWorkScopeBindingRequest {
             || self.binding.scope.scope_ref != work_scope_id
             || self.sources.scope_ref != work_scope_id
         {
-            return Err("WorkScope request does not match the admitted invocation scope".to_owned());
+            return Err(
+                "WorkScope request does not match the admitted invocation scope".to_owned(),
+            );
         }
         if self.descriptor.scope_ref != self.binding.scope.scope_ref {
             return Err("WorkScope descriptor and resolved binding disagree".to_owned());

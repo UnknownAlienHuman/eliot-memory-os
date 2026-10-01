@@ -57,8 +57,7 @@ use eliot_process::{
 use eliot_protocol::{
     AgentActivationClaimRequest, HostRequestEnvelope, HostRequestResultBody,
     HostRequestResultLineage, HostRequestResultSourceRevision, LocalReadAttempt,
-    LocalReadExecutionEvidence, RequestIdentity, TaskControllerAttempt,
-    TaskControllerResultBody,
+    LocalReadExecutionEvidence, RequestIdentity, TaskControllerAttempt, TaskControllerResultBody,
     host_request_operation_id,
 };
 #[cfg(windows)]
@@ -77,9 +76,8 @@ use eliot_store_api::{
     OperationIdentity, OrderingHeadExpectation, PreparedTransition, ReadConsistency,
     RecoveryRecord, RecoveryRecordKey, RequestMeta, RevisionHeadExpectation, StoreError,
     StoreFailure, StoreFailureIdentityContext, StoreGenesisRequest, StoreRecoveryRequest,
-    StoreRecoverySnapshot, WriteReceipt,
-    StoreWorkScopeOwnerRequest,
-    WriteReceiptStatus, verify_canonical_request_hash, verify_ordering_scope_binding,
+    StoreRecoverySnapshot, StoreWorkScopeOwnerRequest, WriteReceipt, WriteReceiptStatus,
+    verify_canonical_request_hash, verify_ordering_scope_binding,
 };
 use serde::Deserialize;
 
@@ -813,14 +811,19 @@ fn validate_work_scope_record_against_retained_input(
     if record.namespace != "owner" || record.key != "work_scope" {
         return Err(TransportError::SessionFenced);
     }
-    let owner_snapshot: serde_json::Value = serde_json::from_slice(&record.payload)
-        .map_err(|_| TransportError::SessionFenced)?;
-    let canonical_payload = canonical_json_bytes(&owner_snapshot)
-        .map_err(|_| TransportError::SessionFenced)?;
+    let owner_snapshot: serde_json::Value =
+        serde_json::from_slice(&record.payload).map_err(|_| TransportError::SessionFenced)?;
+    let canonical_payload =
+        canonical_json_bytes(&owner_snapshot).map_err(|_| TransportError::SessionFenced)?;
     if canonical_payload != record.payload
         || owner_snapshot.get("state_fence")
-            != Some(&serde_json::to_value(&record.state_fence).map_err(|_| TransportError::SessionFenced)?)
-        || owner_snapshot.get("owner_revision").and_then(serde_json::Value::as_u64)
+            != Some(
+                &serde_json::to_value(&record.state_fence)
+                    .map_err(|_| TransportError::SessionFenced)?,
+            )
+        || owner_snapshot
+            .get("owner_revision")
+            .and_then(serde_json::Value::as_u64)
             != Some(record.revision)
     {
         return Err(TransportError::SessionFenced);
@@ -846,9 +849,15 @@ fn validate_work_scope_record_against_retained_input(
     {
         return Err(TransportError::SessionFenced);
     }
-    let binding = task_input.get("binding").ok_or(TransportError::SessionFenced)?;
-    let sources = task_input.get("sources").ok_or(TransportError::SessionFenced)?;
-    let privacy = task_input.get("privacy").ok_or(TransportError::SessionFenced)?;
+    let binding = task_input
+        .get("binding")
+        .ok_or(TransportError::SessionFenced)?;
+    let sources = task_input
+        .get("sources")
+        .ok_or(TransportError::SessionFenced)?;
+    let privacy = task_input
+        .get("privacy")
+        .ok_or(TransportError::SessionFenced)?;
     let owner_binding = owner_snapshot
         .get("binding")
         .ok_or(TransportError::SessionFenced)?;
@@ -893,8 +902,7 @@ fn work_scope_owner_store_failure_response(
         || failure.request_id.as_ref() != Some(&context.request_id)
         || failure.operation_id.as_ref() != Some(operation_id)
         || failure.idempotency_key_ref_or_digest.as_deref() != Some(idempotency_key)
-        || failure.state_fence_ref_or_exact_safe_projection.as_ref()
-            != Some(&context.state_fence)
+        || failure.state_fence_ref_or_exact_safe_projection.as_ref() != Some(&context.state_fence)
     {
         return Err(TransportError::SessionFenced);
     }
@@ -3484,11 +3492,7 @@ impl KernelComposition {
                     .await
             }
             "store_work_scope_owner" => {
-                self.store_work_scope_owner_operation(
-                    session,
-                    request_identity,
-                    payload.clone(),
-                )
+                self.store_work_scope_owner_operation(session, request_identity, payload.clone())
                     .await
             }
             "apply_prepared" => {
@@ -9397,14 +9401,12 @@ impl KernelComposition {
                 "kind": "store_work_scope_owner",
                 "value": response.record,
             })),
-            Err(NamedReadGatewayError::Store(error)) => {
-                work_scope_owner_store_failure_response(
-                    error,
-                    context,
-                    &failure_operation_id,
-                    &failure_idempotency_key,
-                )
-            }
+            Err(NamedReadGatewayError::Store(error)) => work_scope_owner_store_failure_response(
+                error,
+                context,
+                &failure_operation_id,
+                &failure_idempotency_key,
+            ),
             Err(NamedReadGatewayError::GatewayRefusal(_)) => Ok(serde_json::json!({
                 "status": "error",
                 "code": "KERNEL_GATEWAY_REFUSAL",
