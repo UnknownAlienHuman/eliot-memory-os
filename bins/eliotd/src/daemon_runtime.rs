@@ -86,6 +86,9 @@ use eliotd::{
     PROTOCOL_VERSION, SELF_OBSERVED_FAMILY, SERVICE_NAME, TaskControllerSubmitOutcome,
     forward_admitted_local_read, serve_admitted_observe, terminal_for_invalid_ticket,
 };
+// `KernelContextReadClient` reaches the head read through this trait impl, so the
+// trait must be in scope for the State poll leg's scope-revision observation.
+use eliot_store_api::CanonicalReadClient as _;
 use serde::Serialize;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 
@@ -5077,7 +5080,7 @@ fn state_pair_selectors(
 /// says so explicitly under `task_selection: "none"` instead of inventing a
 /// task contract or refusing the authenticated request outright.
 async fn serve_local_state_pair(
-    client: crate::KernelContextReadClient,
+    client: KernelContextReadClient,
     kernel: &Arc<DaemonKernelClient>,
     envelope: &eliot_protocol::HostRequestEnvelope,
     tool: &serde_json::Value,
@@ -5358,16 +5361,27 @@ where
         // itself reported as conflicting, is an INCOMPLETE observation the owner
         // named. It is a typed partial outcome, never a healthy empty payload
         // and never a silently dropped fact.
-        Err(eliot_read::ReadError::StaleRevision)
-        | Err(eliot_read::ReadError::RevisionChurn)
-        | Err(eliot_read::ReadError::RevisionConflict)
-        | Err(eliot_read::ReadError::OrderingConflict) => StateFactOutcome::Partial {
-            reason: "the read owner could not complete a coherent closure at the admitted fence"
-                .to_owned(),
-        },
-        // A cross-fence answer is the owner's own fence verdict, never a
-        // mismatch this leg repairs or a payload it re-reads.
-        Err(eliot_read::ReadError::FenceMismatch) => StateFactOutcome::Partial {
+        //
+        // The revision-conflict and ordering-conflict verdicts live on
+        // `ReadError::Store(StoreReadFailure::…)`, which is where the owner maps
+        // every `StoreError` discriminant; `ReadError` itself has no such
+        // variants. Naming the owner's own variants here keeps this match tied
+        // to the real vocabulary instead of a second, weaker one.
+        Err(eliot_read::ReadError::StaleRevision) | Err(eliot_read::ReadError::RevisionChurn) => {
+            StateFactOutcome::Partial {
+                reason:
+                    "the read owner could not complete a coherent closure at the admitted fence"
+                        .to_owned(),
+            }
+        }
+        // A cross-fence answer, a revision conflict and an ordering conflict are
+        // the owner's own verdicts about the admitted closure, never a mismatch
+        // this leg repairs or a payload it re-reads.
+        Err(eliot_read::ReadError::Store(
+            eliot_read::StoreReadFailure::FenceMismatch
+            | eliot_read::StoreReadFailure::RevisionConflict
+            | eliot_read::StoreReadFailure::OrderingConflict,
+        )) => StateFactOutcome::Partial {
             reason: "the read owner refused the admitted state fence".to_owned(),
         },
         Err(error) => StateFactOutcome::Unavailable {
@@ -5626,7 +5640,7 @@ fn state_outcome_name(outcome: StatePollOutcome) -> &'static str {
 /// idempotent by Kernel contract. Any step failure fails the daemon closed, so
 /// a claimed state pair is never silently discarded.
 async fn run_state_poll(
-    kernel: &DaemonKernelClient,
+    kernel: &Arc<DaemonKernelClient>,
     composition: SharedComposition,
 ) -> Result<StatePollOutcome, String> {
     // #740: receipt span over the claim/preview/submit poll step. Pair presence
@@ -5646,12 +5660,7 @@ async fn run_state_poll(
     // read, and holding one for the whole serve would serialise every state poll
     // against all other composition users for the duration of the round trip.
     let body = {
-        let client = {
-            let guard = composition.lock().await;
-            guard
-                .context_read_client(kernel)
-                .map_err(|error| format!("daemon state read composition: {error}"))?
-        };
+        let client = KernelContextReadClient::new(Arc::clone(kernel));
         Box::pin(serve_local_state_pair(
             client, kernel, &envelope, &tool, &attempt,
         ))

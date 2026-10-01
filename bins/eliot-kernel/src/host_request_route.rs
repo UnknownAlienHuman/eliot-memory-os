@@ -266,6 +266,17 @@ const LOCAL_READ_QUERY_CAPABILITY: &str = "eliot.query";
 /// admitted shapes with different serving owners, not two names for one read.
 const LOCAL_READ_STATE_CAPABILITY: &str = "eliot.state";
 
+/// The closed capability of the bounded local-state carrier form.
+///
+/// The serving readback arm in [`crate::daemon_request_dispatch`] must re-prove
+/// that a retained state answer was stored under the STATE capability, so the
+/// comparison reads the one constant through this accessor rather than a second
+/// `"eliot.state"` literal that could drift from the one the admission owner
+/// checks.
+pub(crate) fn local_read_state_capability() -> &'static str {
+    LOCAL_READ_STATE_CAPABILITY
+}
+
 /// Measures the exact retained bytes of one local-read admission.
 ///
 /// I12.14 requires the request-byte bound to be checked *before* expensive

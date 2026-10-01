@@ -10213,16 +10213,44 @@ impl KernelComposition {
         // Rejection-before-reading: linkage plus closed selectors next. This
         // validation is pure, so a changed payload digest, a forged
         // descriptor, or a malformed selector never reaches Gateway IO.
-        let admission = host_request_route::check_local_read_admission(&envelope, &tool)?;
+        let admission = host_request_route::check_local_read_admission(&envelope, &tool);
+        // Issue #2564: the STATE arm of the local-read operation. `eliot.state`
+        // is a first-class admitted carrier form in its own right (never a Query
+        // in disguise) and the query/Skill/packet admission above refuses it by
+        // construction, so its own closed admission owner decides that one
+        // refused pair here. Everything this arm shares with the query arm it
+        // shares BY CALL rather than by duplication: the same admission staging,
+        // the same validating replay (`local_read_replay_response`), the same
+        // current-source-revision rejoin, the same disclosure re-evaluation and
+        // the same shared submit gate. What is specific to this arm is the
+        // carrier-form binding: it reads the STATE claim slot and never a query
+        // slot, so the two lanes cannot complete each other's attempts.
         let selectors = match admission {
-            host_request_route::LocalReadAdmission::Query(selectors) => selectors,
-            host_request_route::LocalReadAdmission::CampaignPacket { .. }
-            | host_request_route::LocalReadAdmission::Skill => {
-                // `local_read` is the query-only Gateway leg. A campaign
-                // packet has its dedicated claim/compile/result flight; Skill
-                // tools are served by the daemon's Skill dispatcher. Neither
-                // may be reinterpreted as `GetEvidencePack` selectors.
-                return Err(TransportError::SessionFenced);
+            Ok(host_request_route::LocalReadAdmission::Query(selectors)) => selectors,
+            // `local_read` is the bounded read Gateway leg. A campaign packet has
+            // its dedicated claim/compile/result flight; Skill tools are served
+            // by the daemon's Skill dispatcher. Neither may be reinterpreted as
+            // `GetEvidencePack` selectors.
+            Ok(
+                host_request_route::LocalReadAdmission::CampaignPacket { .. }
+                | host_request_route::LocalReadAdmission::Skill,
+            ) => return Err(TransportError::SessionFenced),
+            // The query admission refused this pair. That refusal is the ordinary
+            // answer for every tool name that is not a bounded read, so the State
+            // form gets the only other chance: its OWN closed owner, which runs
+            // the same invoke-read linkage gate and then the closed state-selector
+            // derivation. No lane name is trusted here - a pair is answered only
+            // because one of the two existing closed gates proved its own shape.
+            // When neither admits it, the ORIGINAL query refusal is returned
+            // unchanged, so a tool outside both lanes fails exactly as before.
+            Err(query_error) => {
+                return match host_request_route::check_local_state_admission(&envelope, &tool) {
+                    Ok(state_selectors) => {
+                        self.local_state_read_operation(session, &envelope, &state_selectors)
+                            .await
+                    }
+                    Err(_) => Err(query_error),
+                };
             }
         };
         let (receipt, record) = self.admit_host_request_envelope(&envelope)?;
@@ -10438,6 +10466,149 @@ impl KernelComposition {
     ) -> Result<serde_json::Value, TransportError> {
         let _ = payload;
         Err(TransportError::SessionFenced)
+    }
+
+    /// Serves the STATE readback arm of the local-read operation (issue #2564).
+    ///
+    /// Production caller: [`Self::local_read_operation`], for exactly the pairs
+    /// the query/Skill/packet admission refused and
+    /// [`host_request_route::check_local_state_admission`] admitted.
+    ///
+    /// This arm exists because `eliot.state` has a real retained answer - an
+    /// owner-backed bounded preview persisted through the shared ORS result
+    /// owner by the daemon's State poll leg - and until now that answer was
+    /// only reachable through the unvalidated
+    /// [`host_request_route::host_request_admitted_response`] path, because the
+    /// single validating reader, [`host_request_route::local_read_replay_response`],
+    /// was reachable only from the query-only arm. This arm is that reader's
+    /// STATE twin, and it is written as calls to the SAME functions rather than
+    /// as a second, weaker copy:
+    ///
+    /// 1. **Admission** - the same [`Self::admit_host_request_envelope`] staging,
+    ///    the same receipt and the same durable record the query arm reads. The
+    ///    admitted `selectors` are the State's own closed derivation (trusted
+    ///    envelope scope plus the exact `include` list); nothing here re-derives
+    ///    a selector, and the `include` list is never a Store selector.
+    /// 2. **Replay/readback** - [`host_request_route::local_read_replay_response`]
+    ///    is called with the identical `(receipt, record, envelope)` triple the
+    ///    query arm passes, so the join is on the SAME three recorded values:
+    ///    the retained `output_digest` against this row's recorded
+    ///    `result_digest` (never a digest recomputed here), the recorded
+    ///    canonical-class versus `semantic_receipt_ref` consistency, and the
+    ///    digest-bound body through [`HostRequestResultBody::validate`]. That is
+    ///    the whole validation: this arm adds no check and weakens none.
+    /// 3. **Current-source rejoin** - the same bounded
+    ///    [`Self::check_retained_local_read_source_revisions`] head read, against
+    ///    the Store's own current heads, so a moved source revokes the answer
+    ///    rather than serving it as current. An unreachable Store is reported as
+    ///    the same typed unavailable answer with its directive.
+    /// 4. **Current disclosure** - the same
+    ///    [`Self::reevaluate_retained_disclosure_permission`] join at the moment
+    ///    of redelivery, so the permission that admitted the first delivery is
+    ///    re-read from its owners now rather than assumed.
+    ///
+    /// Replay versus refresh is preserved rather than collapsed. An exact replay
+    /// of a prior state operation returns the RETAINED historical result: it
+    /// re-executes nothing, overwrites nothing, and erases no earlier delivery,
+    /// so the original result identity and its recorded binding are what the
+    /// caller sees. A refresh is a NEW admitted operation with its own operation
+    /// handle, its own attempt and its own claim, so it takes the fresh leg below
+    /// and can never recompile or overwrite the old result under its identity.
+    ///
+    /// The fresh leg is bounded on purpose. The preview bytes themselves are the
+    /// daemon's to produce from its owners and are submitted through the shared
+    /// submit gate; this arm never synthesizes a preview, never re-reads the
+    /// Store to answer the request itself, and never returns a stored result as
+    /// a fresh answer. A fresh state read whose result has not yet been retained
+    /// has nothing to read back, so it is the daemon's claim/serve/submit cycle
+    /// that completes it - through the same [`Self::submit_local_state_result`]
+    /// form binding that refuses a result produced for another lane. The arm
+    /// therefore ends at the retained-answer boundary: a live, un-resulted row
+    /// is reported as a typed read-in-progress answer with its operation handle,
+    /// never as an empty preview and never as a fabricated one.
+    #[cfg(windows)]
+    async fn local_state_read_operation(
+        &self,
+        session: &Session,
+        envelope: &HostRequestEnvelope,
+        selectors: &host_request_route::LocalStateSelectors,
+    ) -> Result<serde_json::Value, TransportError> {
+        let (receipt, record) = self.admit_host_request_envelope(envelope)?;
+        // The retained state record IS the readback subject. `local_read_
+        // replay_response` is the single validating reader over it: it compares
+        // the ORIGINALLY RECORDED lineage `output_digest` with the ORIGINALLY
+        // RECORDED `result_digest` (nothing recomputed here - a fresh checksum
+        // would replace the proof instead of checking it), checks the recorded
+        // class against the recorded receipt it admits, and gates the whole pair
+        // through `HostRequestResultBody::validate`. `Ok(None)` means a live or
+        // half-present row, which is never served as a partial answer.
+        let Some(replayed) =
+            host_request_route::local_read_replay_response(&receipt, &record, envelope)?
+        else {
+            // No retained answer to read back yet. This is the honest state of a
+            // state operation the daemon's poll leg has not finished, and it is
+            // reported with its admitted operation handle so the caller retries
+            // THIS read rather than admitting a fresh one. It is not an empty
+            // preview and not a fabricated answer.
+            return Ok(Self::store_read_failure_response(
+                "local_state_read",
+                &envelope.state_fence,
+                Some(&host_request_operation_id(envelope)),
+                &NamedReadGatewayError::Store(StoreError::Unavailable),
+            ));
+        };
+        // Replay preserves the original execution and result identity, but the
+        // retained answer is a dependent branch: it was derived from the source
+        // revisions its own lineage records. Rejoining that branch to the
+        // CURRENT source revisions is what revokes it when a source moved
+        // (I15.7). Nothing is re-executed, overwritten, or narrowed here, and the
+        // observed heads come from the Store's own head read, so this is a causal
+        // join rather than a self-match. When the canonical Store is unreachable
+        // the join is UNESTABLISHED rather than disproved: the retained bytes are
+        // withheld and the caller receives the typed unavailable answer with the
+        // full directive.
+        if let Err(error) = self
+            .check_retained_local_read_source_revisions(&record, envelope)
+            .await?
+        {
+            return Ok(Self::store_read_failure_response(
+                "local_state_read",
+                &envelope.state_fence,
+                Some(&host_request_operation_id(envelope)),
+                &error,
+            ));
+        }
+        // The bytes are about to leave this process, so the CURRENT disclosure
+        // permission is re-evaluated now, at the moment of redelivery, against
+        // the durable row and the live owner reads - never against the value
+        // captured when the result was first produced and never against anything
+        // the presenting caller supplies. A changed permission withholds the
+        // bytes; it does not re-execute, does not overwrite the retained result,
+        // and does not erase an earlier delivery observation.
+        self.reevaluate_retained_disclosure_permission(&record, session, envelope)?;
+        // The State form binding is re-proven on the readback itself, so a stored
+        // state answer cannot be presented as a query answer on the way out: the
+        // row's own recorded capability must be the state capability. This reads
+        // the DURABLE record's capability, not the presenting envelope's.
+        if record.capability_ref.as_str() != host_request_route::local_read_state_capability() {
+            return Err(TransportError::SessionFenced);
+        }
+        // The closed state selectors are proven against the admitted pair one
+        // more time at the answer boundary: the trusted scope the readback
+        // discloses under must be a scope the DURABLE record actually names -
+        // its `scope_ref` or its `session_ref`, never a value the presenting
+        // envelope supplies. Both are `Option<OpaqueLabel>` on
+        // `HostRequestRecord`, so a row that retained neither is refused rather
+        // than matched against an empty string. The `include` list is never
+        // re-derived from the response bytes.
+        let scope_matches = [record.scope_ref.as_ref(), record.session_ref.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|retained| retained.as_str() == selectors.scope_id.as_str());
+        if !scope_matches {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(replayed)
     }
 
     /// Revalidates one retained local-read result against the CURRENT source
