@@ -2609,8 +2609,8 @@ impl KernelStoreGateway {
         .await
     }
 
-    /// Reads and authenticates the current UserAutomation owner material through
-    /// the active generation-routed Store contour. The UserAutomation adapter
+    /// Reads and authenticates the current `UserAutomation` owner material through
+    /// the active generation-routed Store contour. The `UserAutomation` adapter
     /// constructs and projects the closed named reads; this gateway remains the
     /// only production path that performs their Store IO.
     pub async fn read_user_automation_owner(
@@ -2627,11 +2627,11 @@ impl KernelStoreGateway {
         CanonicalUserAutomationStore::<EbpCanonicalStoreClient<NamedPipeTransport>>::project_owner_snapshot(
             lookup,
             &current_request,
-            current_response,
+            &current_response,
             &history_request,
-            history_response,
+            &history_response,
             &current_request,
-            current_after_response,
+            &current_after_response,
         )
         .map_err(|error| error.to_string())
     }
@@ -2659,7 +2659,7 @@ impl KernelStoreGateway {
             automation_id,
             occurrence_id,
             &request,
-            response,
+            &response,
         )
         .map_err(|error| error.to_string())
     }

@@ -422,17 +422,17 @@ fn typed_cross_binding_and_fail_closed_gates() {
     );
     // Exact registration binds; foreign identity/generation/epoch/fence fail.
     request
-        .validate_presented_under_registration("reg-gate-1", 1, test_epoch(1), &live_fence())
+        .validate_presented_under_registration("reg-gate-1", 1, &test_epoch(1), &live_fence())
         .expect("exact registration binds");
     assert!(
         request
-            .validate_presented_under_registration("reg-foreign", 1, test_epoch(1), &live_fence(),)
+            .validate_presented_under_registration("reg-foreign", 1, &test_epoch(1), &live_fence(),)
             .is_err(),
         "foreign registration must not bind"
     );
     assert!(
         request
-            .validate_presented_under_registration("reg-gate-1", 2, test_epoch(1), &live_fence(),)
+            .validate_presented_under_registration("reg-gate-1", 2, &test_epoch(1), &live_fence(),)
             .is_err(),
         "foreign generation must not bind"
     );
