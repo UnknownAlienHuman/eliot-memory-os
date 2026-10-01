@@ -6065,6 +6065,46 @@ impl AgentBridgeCore {
         ))
     }
 
+    /// Records a first truncated delivery on one evaluated tool-exposure
+    /// receipt from the attach-scoped truncation measurement (issue #1945,
+    /// I7.24).
+    ///
+    /// The admission skeleton arrives from its owner and is never minted
+    /// here; the delivery evidence (produced digest recomputed over the
+    /// exact full result bytes bound to the retained handle, exact inline
+    /// preview with its own digest and byte count) is measured by this
+    /// projection's retained-handle seam; see the seam-level function for
+    /// the field-by-field owner account. The recorded receipt
+    /// keeps `transport_completed` as `Some(true)` with `result_delivery`
+    /// as `TRUNCATED`, so it never satisfies complete-evidence or verifier
+    /// requirements. The per-evaluation join that supplies the skeleton and
+    /// retains the receipt is the STITCH caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`BridgeError`] when the bridge is not attached, the
+    /// view is not truncated, the presented bytes do not bind the retained
+    /// handle, or the resulting receipt is inconsistent.
+    pub fn record_truncated_tool_delivery(
+        &self,
+        receipt: eliot_receipts::ToolExposureReceiptV2,
+        view: &HotResourceView,
+        full_result_bytes: &[u8],
+    ) -> Result<eliot_receipts::ToolExposureReceiptV2, BridgeError> {
+        self.require_attached()?;
+        resources::record_truncated_tool_delivery(receipt, view, full_result_bytes).map_err(
+            |error| match error {
+                eliot_receipts::ToolExposureError::InvalidField { field, reason } => {
+                    BridgeError::InvalidContract { field, reason }
+                }
+                _ => BridgeError::InvalidContract {
+                    field: "receipt.result_delivery",
+                    reason: "truncated delivery fact failed its owner validation",
+                },
+            },
+        )
+    }
+
     /// Number of immutable snapshots retained in the attach-scoped resource
     /// projection. The registry is cleared on every new attach, so this
     /// count describes only the live attach.

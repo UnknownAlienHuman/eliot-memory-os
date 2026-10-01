@@ -15,6 +15,10 @@
 
 use std::collections::BTreeMap;
 
+use eliot_receipts::tool_exposure::{DeliveredToolRepresentation, ProducedToolResultIdentity};
+use eliot_receipts::{
+    TokenCountObservation, TokenCountUnavailableReason, ToolExposureError, ToolExposureReceiptV2,
+};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 
@@ -432,6 +436,77 @@ impl ToolResultReceipt {
             delivery => Err(BridgeError::IncompleteDelivery { delivery }),
         }
     }
+}
+
+/// Records a first truncated delivery on one evaluated tool-exposure receipt
+/// from this projection's own truncation measurement (issue #1945, I7.24).
+///
+/// The admission skeleton arrives from its owner
+/// (`ToolExposureReceiptV2::admission_observed`) and is never minted here:
+/// tool definition, route fingerprint, and receipt identity stay
+/// admission-derived. What this seam measures itself is the delivery
+/// evidence: the produced digest is recomputed over the exact full result
+/// bytes and must bind the retained handle's digest, and the delivered
+/// representation is the exact inline preview with its own digest and byte
+/// count. A view that withheld nothing is refused typed — a non-truncated
+/// delivery is never recorded as `TRUNCATED` — as is a byte body the
+/// retained handle does not bind. The route runs no tokenizer on the
+/// hot-view path, so the token observation stays explicitly unavailable
+/// rather than a zero that would read as measured.
+///
+/// The recorded receipt keeps `transport_completed` as `Some(true)` with
+/// `result_delivery` as `TRUNCATED`, so it never satisfies
+/// complete-evidence or verifier requirements. Observable use and the
+/// terminal outcome reference stay unrecorded for their owners; the
+/// per-evaluation join that supplies the skeleton and retains the receipt
+/// is the STITCH caller.
+///
+/// # Errors
+///
+/// Returns [`ToolExposureError`] when the view is not truncated, the
+/// presented bytes do not bind the retained handle, a byte count exceeds
+/// its bound, the skeleton already records a delivery outcome, or the
+/// resulting receipt is inconsistent.
+pub(crate) fn record_truncated_tool_delivery(
+    receipt: ToolExposureReceiptV2,
+    view: &HotResourceView,
+    full_result_bytes: &[u8],
+) -> Result<ToolExposureReceiptV2, ToolExposureError> {
+    if !view.is_truncated() {
+        return Err(ToolExposureError::InvalidField {
+            field: "receipt.result_delivery",
+            reason: "a hot view that withheld nothing is never recorded as a truncated delivery",
+        });
+    }
+    let produced_digest = sha256_hex(full_result_bytes);
+    if produced_digest != view.handle().digest() {
+        return Err(ToolExposureError::InvalidField {
+            field: "receipt.produced_result.result_digest",
+            reason: "retained handle does not bind the presented result bytes",
+        });
+    }
+    let preview = view.preview();
+    let byte_count = u64::try_from(preview.len()).map_err(|_| ToolExposureError::InvalidField {
+        field: "receipt.delivered_representation.byte_count",
+        reason: "delivered byte count exceeds the addressable bound",
+    })?;
+    let handle_uri = view.handle().uri().as_str().to_owned();
+    receipt.record_truncated_delivery(
+        ProducedToolResultIdentity {
+            result_digest: produced_digest,
+            artifact_ref: None,
+            source_handle: Some(handle_uri.clone()),
+        },
+        DeliveredToolRepresentation {
+            representation_digest: sha256_hex(preview),
+            source_handle: handle_uri,
+            byte_count,
+            token_observation: TokenCountObservation::Unavailable {
+                reason: TokenCountUnavailableReason::MeasurementUnavailable,
+            },
+            prior_delivery_receipt_id: None,
+        },
+    )
 }
 
 #[cfg(test)]
