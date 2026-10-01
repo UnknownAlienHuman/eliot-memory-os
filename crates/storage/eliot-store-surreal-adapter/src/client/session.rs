@@ -185,8 +185,7 @@ impl RpcSession {
         })
         .map_err(|error| AdapterError::Serialization(error.to_string()))?;
 
-        self.request_payload(payload, expected_id, true, None)
-            .await
+        self.request_payload(payload, expected_id, true, None).await
     }
 
     /// Sends one payload and reads its response under the accepted transport's
@@ -256,9 +255,8 @@ impl RpcSession {
                         let response = if let Some(ceiling) = ceiling {
                             parse_response_bounded(&bytes, ceiling)?
                         } else {
-                            let text = String::from_utf8(bytes.to_vec()).map_err(|error| {
-                                AdapterError::Serialization(error.to_string())
-                            })?;
+                            let text = String::from_utf8(bytes.to_vec())
+                                .map_err(|error| AdapterError::Serialization(error.to_string()))?;
                             parse_response(&text)?
                         };
                         if response.id.as_ref() == Some(&expected_id) {
