@@ -25,18 +25,19 @@
 //! [`BlobStore`](eliot_store::BlobStore); the returned handles are
 //! content-addressed, so both entries observe the identical bytes.
 //!
-//! Every planned stage is also classified through the single composed
+//! Every planned stage is resolved through the single composed
 //! provider-dispatch closure
 //! ([`compose_provider_dispatch`](eliot_instrument_runner::compose_provider_dispatch)):
 //! exactly-one-entry resolution, generation and fingerprint freshness,
-//! host support, then Testd admission behind the test execution plane, by
-//! admitted identity only. Classification without execution provisions, so
-//! no invocation authority material is ever fabricated here.
+//! host support, then typed Testd stage admission. The exact selected entry
+//! travels through `StageLauncher` into the sealed `ProcessRequest` path; a
+//! missing, unsupported, or stale mapping becomes an explicit missing stage
+//! before any child process exists. Describe-only calls classify with the same
+//! closure but never fabricate invocation authority.
 //!
-//! No process is launched here and no task is declared complete: execution
-//! provisions (executor, request port, evidence sink) and finish authority
-//! belong to the Kernel/testd/Governor composition roots. A non-successful
-//! aggregate fails closed through
+//! Process execution provisions (executor, request port, evidence sink) and
+//! finish authority remain with the Kernel/testd/Governor composition roots.
+//! A non-successful aggregate fails closed through
 //! [`GovernedProfileService::enforce_success`].
 
 use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration, StateFence};
@@ -47,16 +48,18 @@ use eliot_instrument_runner::profile::{
 use eliot_instrument_runner::profile_run::{
     InstrumentRun, ProfileAggregate, StageEvidence, StageOrchestrator, StagePlan,
 };
-use eliot_instrument_runner::registry::{InvalidationSet, ProviderRegistry};
+use eliot_instrument_runner::registry::{InvalidationSet, ProviderRegistry, RegistryEntry};
 use eliot_instrument_runner::{
     AvailabilityInputs, DEV_FAST_PROFILE, InstrumentRunner, ProviderDispatch, ProviderDisposition,
-    StageLauncher, compose_provider_dispatch, dev_fast_registry, host_platform,
+    RunnerError, StageLauncher, compose_provider_dispatch, dev_fast_registry, host_platform,
 };
-use eliot_process::ProcessExecutor;
+use eliot_process::{ProcessEvidenceSink, ProcessExecutor};
 use eliot_store::BlobStore;
 use eliot_types::BlobRef;
 use serde::Serialize;
 use std::num::NonZeroU64;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::rejected;
 use crate::EngineError;
@@ -504,7 +507,8 @@ impl GovernedProfileService {
         blob_store: Option<&BlobStore>,
     ) -> Result<GovernedProfileReport, EngineError> {
         let (resolved, admitted, plan) = Self::resolve_once(name, bindings)?;
-        render_resolved_report(&resolved, &admitted, &plan, runs, blob_store)
+        let selections = select_stage_providers(&plan)?;
+        render_resolved_report(&resolved, &admitted, &plan, runs, &selections, blob_store)
     }
 
     /// Executes one governed profile through the `TestExecutionPlane` owner
@@ -564,8 +568,14 @@ impl GovernedProfileService {
                 )
             })?;
         }
-        let runs = StageOrchestrator::launch_plan(runner, &plan, launcher).await;
-        render_resolved_report(&resolved, &admitted, &plan, runs, blob_store)
+        let selections = select_stage_providers(&plan)?;
+        let bound_launcher = ProviderBoundStageLauncher {
+            inner: launcher,
+            selections: &selections,
+        };
+        let runs =
+            StageOrchestrator::launch_plan(runner, &plan, &bound_launcher).await;
+        render_resolved_report(&resolved, &admitted, &plan, runs, &selections, blob_store)
     }
 
     /// Resolves one profile name to its pinned plan through the single
@@ -669,31 +679,13 @@ fn render_resolved_report(
     admitted: &AdmittedProfile,
     plan: &StagePlan,
     runs: Vec<InstrumentRun>,
+    selections: &StageSelections,
     blob_store: Option<&BlobStore>,
 ) -> Result<GovernedProfileReport, EngineError> {
     let aggregate = ProfileAggregate::assemble(plan, runs);
-    let fingerprints = unattested_fingerprints();
-    let normative_pair_digest = String::new();
-    let providers = ProviderRegistry::ready(
-        BUILTIN_REGISTRY_GENERATION,
-        normative_pair_digest.clone(),
-        &fingerprints,
-    )
-    .map_err(|error| {
-        rejected(
-            "governed-profile",
-            &format!("ready provider registry is unavailable: {error}"),
-        )
-    })?;
-    let dispatch_inputs = AvailabilityInputs {
-        generation: BUILTIN_REGISTRY_GENERATION,
-        normative_pair_digest: &normative_pair_digest,
-        fingerprints: &fingerprints,
-        platform: host_platform(),
-    };
     let mut stages = Vec::with_capacity(plan.stages.len());
     for (planned, run) in plan.stages.iter().zip(aggregate.runs.iter()) {
-        let admission = admit_stage(&providers, planned, &dispatch_inputs);
+        let admission = selected_stage_admission(planned, selections);
         stages.push(persist_stage_report(
             blob_store, resolved, plan, planned, run, &admission,
         )?);
@@ -765,7 +757,107 @@ fn governed_registry_for(name: &str, generation: u64) -> Result<InstrumentRegist
     })
 }
 
-/// Per-stage provider resolution plus testd admission (classification only).
+/// Exact provider selections shared by stage admission and the run report.
+type StageSelections = BTreeMap<String, Result<RegistryEntry, ProviderDisposition>>;
+
+/// Wraps composition-root launch provisions with the exact preselected entry.
+struct ProviderBoundStageLauncher<'a> {
+    inner: &'a dyn StageLauncher,
+    selections: &'a StageSelections,
+}
+
+impl StageLauncher for ProviderBoundStageLauncher<'_> {
+    fn invocation(
+        &self,
+        stage: &eliot_instrument_runner::PlannedStage,
+    ) -> Result<eliot_instrument_api::InstrumentInvocation, RunnerError> {
+        self.inner.invocation(stage)
+    }
+
+    fn provider_entry(
+        &self,
+        stage: &eliot_instrument_runner::PlannedStage,
+    ) -> Result<&RegistryEntry, RunnerError> {
+        let stage_id = stage.route.stage().stage_id.as_str();
+        match self.selections.get(stage_id) {
+            Some(Ok(entry)) => Ok(entry),
+            Some(Err(disposition)) => Err(RunnerError::Binding(format!(
+                "stage '{stage_id}' provider refused: {disposition:?}"
+            ))),
+            None => Err(RunnerError::Binding(format!(
+                "stage '{stage_id}' has no provider selection"
+            ))),
+        }
+    }
+
+    fn port(
+        &self,
+        stage: &eliot_instrument_runner::PlannedStage,
+    ) -> &dyn eliot_instrument_runner::InstrumentRequestPort {
+        self.inner.port(stage)
+    }
+
+    fn sink(
+        &self,
+        stage: &eliot_instrument_runner::PlannedStage,
+    ) -> Arc<dyn ProcessEvidenceSink> {
+        self.inner.sink(stage)
+    }
+
+    fn decode_admitted_stage(
+        &self,
+        stage: &eliot_instrument_runner::PlannedStage,
+        admission: &eliot_instrument_runner::TestdAdmission,
+    ) -> Result<InstrumentRun, RunnerError> {
+        self.inner.decode_admitted_stage(stage, admission)
+    }
+}
+
+/// Resolves each planned stage once through the closed provider registry.
+///
+/// This selection is both the `StageLauncher` binding used before process
+/// request admission and the persisted report disposition, so describe and
+/// execute paths cannot classify the same stage differently.
+fn select_stage_providers(plan: &StagePlan) -> Result<StageSelections, EngineError> {
+    let fingerprints = unattested_fingerprints();
+    let normative_pair_digest = String::new();
+    let providers = ProviderRegistry::ready(
+        BUILTIN_REGISTRY_GENERATION,
+        normative_pair_digest.clone(),
+        &fingerprints,
+    )
+    .map_err(|error| {
+        rejected(
+            "governed-profile",
+            &format!("ready provider registry is unavailable: {error}"),
+        )
+    })?;
+    let inputs = AvailabilityInputs {
+        generation: BUILTIN_REGISTRY_GENERATION,
+        normative_pair_digest: &normative_pair_digest,
+        fingerprints: &fingerprints,
+        platform: host_platform(),
+    };
+    Ok(plan
+        .stages
+        .iter()
+        .map(|planned| {
+            let stage_id = planned.route.stage().stage_id.clone();
+            let selection = match compose_provider_dispatch(
+                &providers,
+                &planned.stage.spec,
+                planned.stage.kind,
+                &inputs,
+            ) {
+                ProviderDispatch::Dispatch { entry } => Ok(*entry),
+                ProviderDispatch::Refused { disposition } => Err(disposition),
+            };
+            (stage_id, selection)
+        })
+        .collect())
+}
+
+/// Per-stage provider resolution plus Testd admission.
 struct StageAdmission {
     /// Registry-selected adapter identity, when the stage spec resolves.
     adapter: Option<String>,
@@ -774,29 +866,17 @@ struct StageAdmission {
     decision: String,
 }
 
-/// Classifies one planned stage through the composed dispatch closure
-/// (issue #1813 W4 describe path).
-///
-/// The stage spec and class run the single
-/// [`compose_provider_dispatch`](eliot_instrument_runner::compose_provider_dispatch)
-/// closure — exactly-one-entry resolution, generation and fingerprint
-/// freshness, host support, then Testd admission — by admitted identity
-/// only, without any invocation authority material: no State Fence,
-/// session, or lease is fabricated, and no stage launches on this decision.
-/// Every refusal keeps the stage inside the declared denominator under its
-/// typed disposition. Callers match on the typed variants, never on message
-/// text.
-fn admit_stage(
-    providers: &ProviderRegistry,
+/// Projects the already selected entry or typed refusal into the run report.
+fn selected_stage_admission(
     planned: &eliot_instrument_runner::PlannedStage,
-    inputs: &AvailabilityInputs<'_>,
+    selections: &StageSelections,
 ) -> StageAdmission {
-    match compose_provider_dispatch(providers, &planned.stage.spec, planned.stage.kind, inputs) {
-        ProviderDispatch::Dispatch { entry } => StageAdmission {
+    match selections.get(planned.route.stage().stage_id.as_str()) {
+        Some(Ok(entry)) => StageAdmission {
             adapter: Some(entry.adapter.clone()),
             decision: "admitted".to_owned(),
         },
-        ProviderDispatch::Refused { disposition } => {
+        Some(Err(disposition)) => {
             let (adapter, reason) = match disposition {
                 // Unreachable through the closure: it never refuses as Ready.
                 ProviderDisposition::Ready => (None, "admitted".to_owned()),
@@ -807,7 +887,7 @@ fn admit_stage(
                     (None, "unresolved:unsupported".to_owned())
                 }
                 ProviderDisposition::UnsupportedByTestd { adapter, .. } => {
-                    (Some(adapter), "refused:unsupported-by-testd".to_owned())
+                    (Some(adapter.clone()), "refused:unsupported-by-testd".to_owned())
                 }
                 ProviderDisposition::UnsupportedPlatform { .. } => {
                     (None, "refused:unsupported-platform".to_owned())
@@ -821,6 +901,10 @@ fn admit_stage(
                 decision: reason,
             }
         }
+        None => StageAdmission {
+            adapter: None,
+            decision: "unresolved:missing-selection".to_owned(),
+        },
     }
 }
 
