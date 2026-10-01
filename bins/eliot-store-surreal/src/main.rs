@@ -17,7 +17,7 @@ use eliot_store_surreal::diagnostics::{
     project_compatibility_health, report_events,
 };
 use eliot_store_surreal::{
-    CompatibilityVerdict, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity,
+    CompatibilityVerdict, ReadinessReceipt, SERVICE_NAME, StoreComposition, StoreHandshakeIdentity,
     admit_authenticated_handshake, dispatch_with_log, install_compatibility_decision,
     load_compatibility_for_config, load_config, load_evidence_snapshot_verification,
     observed_identity_verdict, parse_compatibility_bytes, require_semantic_ready_for_pipe,
@@ -482,6 +482,7 @@ fn bind_observed_identity_inner(
 async fn serve_handshake_loop(
     composition: &StoreComposition,
     config: &eliot_store_surreal::StoreLaunchConfig,
+    readiness: &ReadinessReceipt,
 ) -> Result<(), String> {
     let limits = TransportLimits::default();
     let expectation = match eliot_platform_windows::NamedPipePeerExpectation::new(
@@ -591,6 +592,16 @@ async fn serve_handshake_loop(
             return Err(error);
         }
     };
+    // Issue #1925 (W1 join 2): the concurrent reserved-write execution
+    // generation is installed exactly here, and only here. Two independent
+    // observations already exist at this point and neither is declared by this
+    // process: `readiness` is the receipt this process observed from the live
+    // provider before the pipe was advertised, and the Kernel identity comes
+    // from the peer this handshake just authenticated. Installing before
+    // authentication, or from configuration alone, would let a generation be
+    // owned by a peer that was never proven.
+    let kernel_generation = session.authenticated_kernel_generation()?;
+    composition.install_observed_concurrent_execution(readiness, &kernel_generation)?;
     let mut negotiated_limits = limits;
     negotiated_limits.max_frame_bytes = session.max_frame_bytes();
     let handshake_frame = control_frame(
@@ -857,7 +868,7 @@ async fn run() -> Result<(), String> {
         gated.is_ok(),
     );
     gated?;
-    serve_handshake_loop(&composition, &config).await
+    serve_handshake_loop(&composition, &config, &readiness).await
 }
 
 #[cfg(not(windows))]

@@ -9,6 +9,7 @@
 //! claim identity; it is not a second store or semantic write path.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use eliot_blob::BlobRootOwner;
@@ -51,10 +52,9 @@ use eliot_store_api::{
     StoreFailureDisposition, StoreFailureIdentityContext, StoreGenesisRequest,
     StoreMutationDisposition, StoreRecoveryAction, StoreRetryDirective,
 };
-#[cfg(test)]
-use eliot_store_surreal_adapter::SchemaGeneration;
 use eliot_store_surreal_adapter::{
-    AdapterError, ClientSetLimits, MigrationReceipt, SemanticReadiness, SurrealStoreAdapter,
+    AdapterError, ClientSetLimits, MigrationReceipt, SchemaGeneration, SemanticReadiness,
+    SurrealStoreAdapter,
 };
 #[cfg(test)]
 use secrecy::SecretString;
@@ -334,6 +334,13 @@ pub struct StoreComposition {
     schema_bootstrap_binding: StoreSchemaBootstrapBinding,
     schema_bootstrap_cache: tokio::sync::Mutex<Option<StoreSchemaBootstrapCache>>,
     connections: StoreConnectionManager,
+    /// The one Kernel-configured Store write bound this composition already
+    /// resolved, reused as the concurrent generation's lane count and queue
+    /// depth. It is the same number that bounds the bridge's write set and that
+    /// `ClientSetLimits` validated as the adapter's normal-write session count,
+    /// so the generation can never be wider than the sessions this pool can
+    /// actually open.
+    writer_lanes: NonZeroUsize,
     health_admission: HealthAdminAdmission,
     /// Exact materialization path of the selected Store launch config. It is
     /// the binding that locates the installation-visible I5.9 compatibility
@@ -425,6 +432,13 @@ impl StoreComposition {
         // pre-pool compatibility profile could only ever admit a single-lane
         // generation no matter what write bound this composition configured.
         let client_limits = bounded_client_set_limits(write_limit)?;
+        // The same resolved bound is the concurrent generation's lane count and
+        // queue depth (issue #1925). It is retained here rather than recomputed
+        // at install so the generation, the bridge's write set, and the
+        // adapter's validated session set can never describe three different
+        // capacities.
+        let writer_lanes = NonZeroUsize::new(write_limit)
+            .ok_or_else(|| "configured Store writer lanes must be non-zero".to_owned())?;
         let store = SurrealStoreAdapter::new_with_limits(
             materialize_adapter_config(config, password, provider_bootstrap_password)?,
             provider_process_lease,
@@ -445,6 +459,7 @@ impl StoreComposition {
             schema_bootstrap_binding,
             schema_bootstrap_cache: tokio::sync::Mutex::new(None),
             connections,
+            writer_lanes,
             health_admission: HealthAdminAdmission::bridge_default(),
             store_config_path: PathBuf::from(config.runtime_launch.store_config_path.as_str()),
             _runtime_root_leases: runtime_root_leases,
@@ -579,6 +594,67 @@ impl StoreComposition {
                 ReadinessReceipt::ready(generation.to_string())
             }
         })
+    }
+
+    /// Installs the bounded concurrent reserved-write execution generation
+    /// from an independently observed readiness receipt and the authenticated
+    /// Kernel peer (issue #1925, W1 join 2).
+    ///
+    /// Every member of the install evidence is owner-issued; nothing here is a
+    /// self-declared flag, a process constant, or a value this composition
+    /// invents:
+    ///
+    /// - `observed_generation` is the generation [`Self::readiness`] read back
+    ///   from the live provider. That same observation already took the
+    ///   provider's own validation snapshot and refused
+    ///   [`StoreError::FenceMismatch`] unless the provider's fence equals this
+    ///   composition's.
+    /// - `expected_generation` is the adapter's own validated configuration,
+    ///   materialized from the launch config's digest-bound
+    ///   `schema_generation`; `install_concurrent_execution` refuses unless the
+    ///   observed generation equals it.
+    /// - `state_fence` is this composition's Host-approved
+    ///   `authority_state_fence`, already proved equal to the observed provider
+    ///   fence above and to the authenticated handshake's fence.
+    /// - `kernel_generation` is the authenticated Kernel peer binding this
+    ///   session admitted; see
+    ///   [`StoreEbpSession::authenticated_kernel_generation`].
+    ///
+    /// Lanes and queue depth are both the one already-resolved write bound.
+    /// The adapter revalidates the lanes against its own session set, so this
+    /// can never widen a bound.
+    ///
+    /// Install fails when a generation is already present: a profile change is
+    /// a drained generation transition, never a live overwrite.
+    pub fn install_observed_concurrent_execution(
+        &self,
+        readiness: &ReadinessReceipt,
+        kernel_generation: &str,
+    ) -> Result<(), String> {
+        readiness
+            .validate()
+            .map_err(|error| format!("invalid observed Store readiness receipt: {error}"))?;
+        if readiness.status != ReadinessStatus::Ready {
+            return Err(
+                "concurrent reserved-write execution requires an observed ready Store generation"
+                    .to_owned(),
+            );
+        }
+        let observed = readiness.observed_generation.as_deref().ok_or_else(|| {
+            "ready Store readiness receipt omitted its observed schema generation".to_owned()
+        })?;
+        let observed_generation = SchemaGeneration::new(observed).map_err(|error| {
+            format!("invalid observed Store schema generation: {error}")
+        })?;
+        self.store
+            .install_concurrent_execution(
+                self.writer_lanes,
+                self.writer_lanes,
+                observed_generation,
+                kernel_generation.to_owned(),
+                self.state_fence.clone(),
+            )
+            .map_err(|error| format!("install concurrent Store execution generation: {error}"))
     }
 
     /// Applies exactly the adapter's explicit first-generation schema plan.
@@ -1485,6 +1561,31 @@ impl StoreEbpSession {
     #[must_use]
     pub const fn max_frame_bytes(&self) -> usize {
         self.max_frame_bytes
+    }
+
+    /// The authenticated Kernel identity this session admitted, re-proved at
+    /// read time.
+    ///
+    /// The handshake's `module_generation.generation` is deliberately NOT used
+    /// here: `admit_handshake_inner` refuses any hello whose generation is not
+    /// this Store's own `store_generation()`, so that value identifies the
+    /// Store bridge, never the Kernel. The one Kernel identity this process
+    /// actually holds is the authenticated pipe peer: the platform adapter's
+    /// handle-bound peer proof (SID, logon session, process id, process start
+    /// time) that `AuthenticatedStorePeer::admit` matched against the
+    /// Host-approved SID/session in the launch config. A Kernel generation
+    /// cutover is a new Kernel process, so it is a new peer binding.
+    ///
+    /// This re-runs `validate_session_peer_binding` first, so a session whose
+    /// peer no longer validates refuses instead of yielding a stale identity,
+    /// and an absent authenticated peer is an error in every build rather than
+    /// only outside tests.
+    pub fn authenticated_kernel_generation(&self) -> Result<String, String> {
+        validate_session_peer_binding(self)?;
+        self.authenticated_peer
+            .as_ref()
+            .map(|peer| peer.principal_binding.clone())
+            .ok_or_else(|| "Store EBP session has no authenticated Kernel peer".to_owned())
     }
 }
 
