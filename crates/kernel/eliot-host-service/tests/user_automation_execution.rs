@@ -12,12 +12,14 @@ use eliot_host_state::{
     MemoryBackend, ReadinessEvidence, RecordFence, ServiceSafetyClass, WakeRecord,
 };
 use eliot_kernel_service::{
-    UserAutomationRuntimeError, UserAutomationWakeCancellation,
-    UserAutomationWakeCancellationTarget, UserAutomationWakePort,
+    wake_occurrence_denominator_digest, UserAutomationRuntimeError,
+    UserAutomationWakeCancellation, UserAutomationWakeCancellationTarget,
+    UserAutomationWakeEnumerationRequest, UserAutomationWakePort,
 };
 use eliot_platform::PlatformHandle;
 use eliot_runtime_contracts::{WakeIntent, WakeIntentState};
 use eliot_store_api::OperationIdentity;
+use sha2::{Digest, Sha256};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -65,6 +67,31 @@ fn operation(name: &str) -> IdempotencyIdentity {
     IdempotencyIdentity {
         operation_id: handle(name),
         idempotency_key: handle(&format!("key-{name}")),
+    }
+}
+
+fn occurrence_id() -> String {
+    let automation_id = "automation-1";
+    let revision = "revision-7";
+    let trigger = serde_json::json!({"kind": "manual", "nonce": "remove-wake"});
+    let identity = eliot_contracts::canonical_json_bytes(&(
+        "ELIOT/I11.12/USER-AUTOMATION-OCCURRENCE/V1",
+        automation_id,
+        revision,
+        &trigger,
+    ))
+    .unwrap_or_else(|_| unreachable!());
+    format!(
+        "user-automation-occurrence:{:x}",
+        Sha256::digest(identity)
+    )
+}
+
+fn cancellation_identity() -> OperationIdentity {
+    OperationIdentity {
+        operation_id: OperationId::new("automation-remove").unwrap_or_else(|_| unreachable!()),
+        idempotency_key: "automation-remove-key".to_owned(),
+        canonical_request_hash: "b".repeat(64),
     }
 }
 
@@ -118,13 +145,13 @@ fn activation_record(
 }
 
 fn wake_record(host: &HostInstallationEpoch, state_fence: StateFence) -> HostStateRecord {
-    let wake_id = "wake-automation-1";
+    let wake_id = occurrence_id();
     HostStateRecord::Wake(WakeRecord {
         fence: record_fence(host),
         operation: operation("wake-create"),
-        wake_id: handle(wake_id),
+        wake_id: handle(&wake_id),
         intent: WakeIntent {
-            wake_id: wake_id.to_owned(),
+            wake_id: wake_id.clone(),
             reason: "user automation schedule".to_owned(),
             state_fence,
             state: WakeIntentState::Pending,
@@ -161,21 +188,18 @@ fn request_metadata(state_fence: StateFence) -> RequestMetadata {
 fn cancellation(
     context: RequestMetadata,
     target: UserAutomationWakeCancellationTarget,
+    enumeration_receipt: eliot_kernel_service::UserAutomationWakeEnumerationReceipt,
 ) -> UserAutomationWakeCancellation {
     UserAutomationWakeCancellation {
         state_fence: context.state_fence.clone(),
         context,
         authenticated_principal: "human-1".to_owned(),
-        identity: OperationIdentity {
-            operation_id: OperationId::new("automation-remove").unwrap_or_else(|_| unreachable!()),
-            idempotency_key: "automation-remove-key".to_owned(),
-            canonical_request_hash: "b".repeat(64),
-        },
+        identity: cancellation_identity(),
         automation_id: "automation-1".to_owned(),
         automation_revision: "revision-7".to_owned(),
         only_unadmitted: true,
         targets: vec![target],
-        enumeration_receipt: None,
+        enumeration_receipt: Some(Box::new(enumeration_receipt)),
     }
 }
 
@@ -209,6 +233,33 @@ async fn host_wake_adapter_cancels_real_pending_record_and_refuses_wrong_target(
         state_fence: state_fence.clone(),
     };
     let adapter = HostWakeIntentAdapter::new(&journal);
+    // I5.16 / #2808: cancellation carries the complete owner snapshot receipt,
+    // which binds the denominator and selected target to one State Fence.
+    let mut enumeration_request = UserAutomationWakeEnumerationRequest {
+        context: request_metadata(state_fence.clone()),
+        authenticated_principal: "human-1".to_owned(),
+        identity: cancellation_identity(),
+        automation_id: "automation-1".to_owned(),
+        automation_revision: "revision-7".to_owned(),
+        revision_digest: format!("{:x}", Sha256::digest(b"automation-1@revision-7")),
+        denominator: serde_json::from_value(serde_json::json!([{
+            "automation_id": "automation-1",
+            "revision": "revision-7",
+            "trigger": {"kind": "manual", "nonce": "remove-wake"},
+            "occurrence_id": occurrence_id(),
+        }]))
+        .unwrap_or_else(|_| unreachable!()),
+        denominator_digest: String::new(),
+    };
+    enumeration_request.denominator_digest =
+        wake_occurrence_denominator_digest(&enumeration_request.denominator)?;
+    let enumeration_receipt = adapter
+        .enumerate_pending_wakes_authenticated(
+            enumeration_request,
+            format!("{:x}", Sha256::digest(b"authenticated-test-channel")),
+        )
+        .await?;
+    assert_eq!(enumeration_receipt.cancellation_targets()?, [target.clone()]);
 
     let mut foreign_target = target.clone();
     foreign_target.wake_id = "foreign-wake".to_owned();
@@ -216,6 +267,7 @@ async fn host_wake_adapter_cancels_real_pending_record_and_refuses_wrong_target(
         .cancel_pending_wakes(cancellation(
             request_metadata(state_fence.clone()),
             foreign_target,
+            enumeration_receipt.clone(),
         ))
         .await
         .expect_err("foreign wake identity must be refused");
@@ -228,9 +280,10 @@ async fn host_wake_adapter_cancels_real_pending_record_and_refuses_wrong_target(
         .cancel_pending_wakes(cancellation(
             request_metadata(state_fence.clone()),
             target.clone(),
+            enumeration_receipt.clone(),
         ))
         .await?;
-    assert_eq!(cancelled, ["wake-automation-1"]);
+    assert_eq!(cancelled, [occurrence_id()]);
 
     let snapshot = journal.snapshot()?;
     let wake_after = snapshot
@@ -270,7 +323,11 @@ async fn host_wake_adapter_cancels_real_pending_record_and_refuses_wrong_target(
     assert_eq!(wake_after.budget_ref, wake_before.budget_ref);
 
     let stale_error = adapter
-        .cancel_pending_wakes(cancellation(request_metadata(state_fence), target))
+        .cancel_pending_wakes(cancellation(
+            request_metadata(state_fence),
+            target,
+            enumeration_receipt,
+        ))
         .await
         .expect_err("a target bound to the pre-cancellation record is stale");
     assert_eq!(stale_error, UserAutomationRuntimeError::IdentityConflict);

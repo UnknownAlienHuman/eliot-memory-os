@@ -2702,7 +2702,11 @@ mod tests {
                     pending_ref: pending_ref.clone(),
                 };
                 unknown.validate().unwrap();
-                assert!(response_matches_request(&request, &unknown));
+                // The unknown reference reconciles the operation/request identity
+                // after a lost response. This fixture intentionally has no typed
+                // carrier, so full response matching must still refuse it.
+                assert!(pending_ref_matches_request(&pending_ref, &request));
+                assert!(!response_matches_request(&request, &unknown));
                 let frame =
                     runtime_control_response_frame("ua-reconcile-connection", &unknown).unwrap();
                 let decoded = decode_runtime_control_response_frame(&frame).unwrap();
