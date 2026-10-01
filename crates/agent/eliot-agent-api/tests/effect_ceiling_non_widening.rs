@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use eliot_agent_api::{
-    AttemptId, AuthorizedEffect, ContractError, EffectCeiling, EffectKind, ProposedEffect,
+    AttemptId, AuthorizedEffect, CONTRACT_VERSION, ContractError, EffectCeiling, EffectKind,
+    ProposedEffect,
 };
 
 fn ceiling(scope_ref: &str, allowed: &[EffectKind], max_external_effects: u32) -> EffectCeiling {
@@ -13,9 +14,8 @@ fn ceiling(scope_ref: &str, allowed: &[EffectKind], max_external_effects: u32) -
 }
 
 fn canonical_digest() -> Result<eliot_agent_api::LowercaseSha256, serde_json::Error> {
-    serde_json::from_value(serde_json::json!(
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    ))
+    let produced = eliot_contracts::sha256_hex(b"effect payload");
+    serde_json::from_value(serde_json::json!(produced))
 }
 
 #[test]
@@ -162,8 +162,12 @@ fn authorized_effect_rejects_string_and_unzoned_times() {
 }
 
 #[test]
-fn v6_legacy_effect_wire_is_rejected_by_current_schema_and_ceiling()
+fn v6_legacy_effect_wire_is_rejected_after_version_bump_and_ceiling()
 -> Result<(), Box<dyn std::error::Error>> {
+    // Keep the historical v6 version as an independent floor. Do not pin the
+    // implementation's current version here; later revisions may advance it.
+    assert_ne!(CONTRACT_VERSION, "eliot-agent-api/v6");
+
     // Preserve the v6 effect member shape: its digest was an untyped string.
     let v6 = serde_json::json!({
         "effect_id": "effect-1",
@@ -181,7 +185,7 @@ fn v6_legacy_effect_wire_is_rejected_by_current_schema_and_ceiling()
         "attempt_id": "attempt-1",
         "kind": "observe",
         "scope_ref": "scope:root",
-        "payload_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "payload_digest": eliot_contracts::sha256_hex(b"effect payload"),
         "rationale_ref": null,
     }))?;
     assert_eq!(current.validate_against(&parent), Ok(()));
