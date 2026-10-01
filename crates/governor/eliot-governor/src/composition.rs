@@ -4849,12 +4849,12 @@ pub enum CompositionReadiness {
 /// restart recovery still belongs to the `WorkScope` owner path.
 const MAX_RETAINED_SCOPE_QUARANTINE_RECORDS: usize = 8;
 
-/// Exact owner-bound inputs for initial WorkScope admission.
+/// Exact owner-bound inputs for initial `WorkScope` admission.
 ///
 /// The request groups the original source/privacy tuple and authenticated
 /// invocation coordinates without converting or reconstructing them. A
 /// retained snapshot is present only when the caller independently read the
-/// exact canonical WorkScope owner row; `None` identifies the seeded-empty
+/// exact canonical `WorkScope` owner row; `None` identifies the seeded-empty
 /// first-write path.
 pub struct InitialScopeBindingAdmissionRequest<'a> {
     pub now: u64,
@@ -8418,10 +8418,6 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         let mut seen = BTreeSet::new();
         while let Some(intent) = current {
             if !seen.insert(intent.grant_id.as_str())
-                || intent
-                    .mechanical_subset
-                    .verify_recorded_commitment()
-                    .is_err()
                 || intent.mechanical_subset.binding.state_fence != *validation.fence
                 || intent.mechanical_subset.holder_principal != intent.holder_principal
                 || intent.mechanical_subset.session_id != intent.session_id
@@ -8455,6 +8451,10 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                 || intent.expires_at_ms != Some(expires_at_ms)
                 || intent.mechanical_subset.issued_at_ms != issued_at_ms
                 || intent.mechanical_subset.expires_at_ms != Some(expires_at_ms)
+                || crate::owner_closure_provider::verify_mechanical_subset_against_current_grant_record(
+                    intent, grant,
+                )
+                .is_err()
             {
                 return false;
             }
