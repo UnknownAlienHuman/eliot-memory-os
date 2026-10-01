@@ -52,7 +52,10 @@ fn kernel_activation_note_event_log_unavailable() {
 #[cfg(windows)]
 fn kernel_activation_observe_bound(
     detail: &str,
-    fields: &[(&'static str, super::host_job_launch::LaunchIdentityField<'_>)],
+    fields: &[(
+        &'static str,
+        super::host_job_launch::LaunchIdentityField<'_>,
+    )],
 ) {
     kernel_activation_note_event_log_unavailable();
     super::host_diagnostics::observe_entrypoint_with_detail(
@@ -73,33 +76,59 @@ fn kernel_activation_observe_bound(
 /// or on a resumed activation whose candidate binding is absent) reports those
 /// slots as explicitly unavailable rather than defaulting them.
 #[cfg(windows)]
-type ActivationIdentityFields<'a> = Vec<(&'static str, super::host_job_launch::LaunchIdentityField<'a>)>;
+type ActivationIdentityFields<'a> = Vec<(
+    &'static str,
+    super::host_job_launch::LaunchIdentityField<'a>,
+)>;
 
 #[cfg(windows)]
 struct ActivationRecordIdentity<'a> {
     record: &'a KernelRecord,
+    /// The candidate root process start identity, rendered once as
+    /// `pid/creation-time` from the retained candidate Job binding.
+    ///
+    /// This is owned rather than borrowed because it is composed here from two
+    /// numeric bindings rather than read out of an existing handle. Owning it
+    /// lets the projected identity slots below borrow the rendering for exactly
+    /// as long as the projection lives, instead of borrowing a temporary that
+    /// would be dropped before the record is emitted. It is still a pure
+    /// rendering of the retained binding: no process is opened or queried.
+    candidate_process: Option<String>,
 }
 
 #[cfg(windows)]
 impl<'a> ActivationRecordIdentity<'a> {
+    /// Projects one retained record into its identity slots.
+    ///
+    /// The candidate root process start identity is rendered here, once, from
+    /// the binding this record holds; a record with no candidate binding has
+    /// none to render and the slot reads explicitly unavailable.
+    fn new(record: &'a KernelRecord) -> Self {
+        let candidate_process = record
+            .candidate_job_binding
+            .as_ref()
+            .map(|binding| format!("{}/{}", binding.root_pid, binding.root_start_time_100ns));
+        Self {
+            record,
+            candidate_process,
+        }
+    }
+
     /// Appends one more already-held slot to a rendered field list.
     ///
     /// A static helper rather than a builder method so each emission site reads
     /// as one flat list of the identities it holds.
-    fn with(
-        fields: ActivationIdentityFields<'a>,
+    fn with<'b>(
+        fields: ActivationIdentityFields<'b>,
         key: &'static str,
-        value: super::host_job_launch::LaunchIdentityField<'a>,
-    ) -> ActivationIdentityFields<'a> {
+        value: super::host_job_launch::LaunchIdentityField<'b>,
+    ) -> ActivationIdentityFields<'b> {
         let mut fields = fields;
         fields.push((key, value));
         fields
     }
-}
 
-#[cfg(windows)]
-impl<'a> ActivationRecordIdentity<'a> {
-    fn base(&self) -> ActivationIdentityFields<'a> {
+    fn base(&self) -> ActivationIdentityFields<'_> {
         vec![
             (
                 "installation",
@@ -122,7 +151,12 @@ impl<'a> ActivationRecordIdentity<'a> {
             (
                 "activation_generation",
                 super::host_job_launch::LaunchIdentityField::Number(
-                    self.record.fence.activation_generation.current.sequence.get(),
+                    self.record
+                        .fence
+                        .activation_generation
+                        .current
+                        .sequence
+                        .get(),
                 ),
             ),
             (
@@ -158,13 +192,11 @@ impl<'a> ActivationRecordIdentity<'a> {
     /// produced, so the record names the transaction identity and sequence the
     /// journal actually assigned. The driver does not read the journal to
     /// obtain them.
-    fn with_journal(&self, receipt: &'a AppendReceipt) -> ActivationIdentityFields<'a> {
+    fn with_journal<'b>(&'b self, receipt: &'b AppendReceipt) -> ActivationIdentityFields<'b> {
         let mut fields = self.base();
         fields.push((
             "journal_transaction",
-            super::host_job_launch::LaunchIdentityField::Text(
-                receipt.transaction_id().as_str(),
-            ),
+            super::host_job_launch::LaunchIdentityField::Text(receipt.transaction_id().as_str()),
         ));
         fields.push((
             "journal_sequence",
@@ -179,10 +211,10 @@ impl<'a> ActivationRecordIdentity<'a> {
     /// This is the full identity of one committed activation transition: what
     /// the fence and operation are, where the journal put it, and which
     /// candidate process incarnation it is about.
-    fn with_journal_and_candidate(
-        &self,
-        receipt: &'a AppendReceipt,
-    ) -> ActivationIdentityFields<'a> {
+    fn with_journal_and_candidate<'b>(
+        &'b self,
+        receipt: &'b AppendReceipt,
+    ) -> ActivationIdentityFields<'b> {
         let mut fields = self.with_candidate();
         fields.push((
             "journal_transaction",
@@ -201,7 +233,7 @@ impl<'a> ActivationRecordIdentity<'a> {
     /// candidate binding the driver bound; the root image path inside that
     /// binding is a path and is never recorded. A record with no candidate
     /// binding reports both slots as unavailable.
-    fn with_candidate(&self) -> ActivationIdentityFields<'a> {
+    fn with_candidate(&self) -> ActivationIdentityFields<'_> {
         let mut fields = self.base();
         let Some(binding) = self.record.candidate_job_binding.as_ref() else {
             fields.push((
@@ -220,14 +252,14 @@ impl<'a> ActivationRecordIdentity<'a> {
         ));
         // The root process start identity is the pair that distinguishes this
         // candidate process incarnation from a later process reusing its PID.
-        // It is read from the retained binding; no process is opened or queried
-        // to obtain it.
+        // It was rendered from the retained binding by [`Self::new`]; no process
+        // is opened or queried to obtain it.
         fields.push((
             "candidate_process",
-            super::host_job_launch::LaunchIdentityField::Text(&format!(
-                "{}/{}",
-                binding.root_pid, binding.root_start_time_100ns
-            )),
+            match self.candidate_process.as_deref() {
+                Some(process) => super::host_job_launch::LaunchIdentityField::Text(process),
+                None => super::host_job_launch::LaunchIdentityField::Unavailable,
+            },
         ));
         fields
     }
@@ -279,7 +311,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // no terminal here, the outermost #891 contour owns it.
         kernel_activation_observe_bound(
             "host.kernel-activation resume requested",
-            &ActivationRecordIdentity { record: &current }.with_candidate(),
+            &ActivationRecordIdentity::new(&current).with_candidate(),
         );
         Self {
             journal,
@@ -311,7 +343,14 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // candidate being bound. The activation operation id is not yet issued
         // (it is created by the record below), so that slot is explicitly
         // unavailable rather than predicted. The candidate pipe identity and
-        // the Host process nonce are never recorded.
+        // the Host process nonce are never recorded. The candidate root process
+        // start identity is rendered into a named local first, so the slot below
+        // borrows that binding rather than a temporary that would be dropped at
+        // the end of the array expression.
+        let candidate_process = format!(
+            "{}/{}",
+            candidate_job_binding.root_pid, candidate_job_binding.root_start_time_100ns
+        );
         let requested = [
             (
                 "installation",
@@ -345,9 +384,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             ),
             (
                 "artifact_digest",
-                super::host_job_launch::LaunchIdentityField::Text(
-                    approved_artifact_hash.as_str(),
-                ),
+                super::host_job_launch::LaunchIdentityField::Text(approved_artifact_hash.as_str()),
             ),
             (
                 "candidate_job",
@@ -357,10 +394,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             ),
             (
                 "candidate_process",
-                super::host_job_launch::LaunchIdentityField::Text(&format!(
-                    "{}/{}",
-                    candidate_job_binding.root_pid, candidate_job_binding.root_start_time_100ns
-                )),
+                super::host_job_launch::LaunchIdentityField::Text(candidate_process.as_str()),
             ),
         ];
         // WORK_UNIT_CASE: 978/7 — candidate bind requested; handshake/auth
@@ -408,8 +442,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // nonce issuance and activation below.
         kernel_activation_observe_bound(
             "host.kernel-activation candidate observed",
-            &ActivationRecordIdentity { record: &current }
-                .with_journal_and_candidate(&bound_receipt),
+            &ActivationRecordIdentity::new(&current).with_journal_and_candidate(&bound_receipt),
         );
         Ok(Self {
             journal,
@@ -489,8 +522,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         kernel_activation_observe_bound(
             "host.kernel-activation handoff prepared observed",
             &ActivationRecordIdentity::with(
-                ActivationRecordIdentity { record: &self.current }
-                    .with_journal_and_candidate(&receipt),
+                ActivationRecordIdentity::new(&self.current).with_journal_and_candidate(&receipt),
                 "disposition_evidence",
                 super::host_job_launch::LaunchIdentityField::Number(
                     self.current.disposition_evidence.len() as u64,
@@ -540,8 +572,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         kernel_activation_observe_bound(
             "host.kernel-activation prior disposition committed observed",
             &ActivationRecordIdentity::with(
-                ActivationRecordIdentity { record: &self.current }
-                    .with_journal_and_candidate(&receipt),
+                ActivationRecordIdentity::new(&self.current).with_journal_and_candidate(&receipt),
                 "prior_kernel",
                 super::host_job_launch::LaunchIdentityField::Text(
                     if matches!(
@@ -572,7 +603,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         kernel_activation_observe_bound(
             "host.kernel-activation nonce requested",
             &ActivationRecordIdentity::with(
-                ActivationRecordIdentity { record: &self.current }.with_candidate(),
+                ActivationRecordIdentity::new(&self.current).with_candidate(),
                 "authority_epoch",
                 super::host_job_launch::LaunchIdentityField::Number(
                     candidate.kernel_epoch.sequence.get(),
@@ -622,7 +653,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         kernel_activation_observe_bound(
             "host.kernel-activation nonce issued",
             &[
-                ActivationRecordIdentity { record: &self.current }
+                ActivationRecordIdentity::new(&self.current)
                     .with_journal(&receipt)
                     .as_slice(),
                 [
@@ -666,25 +697,25 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // slot says so rather than naming a default.
         // WORK_UNIT_CASE: 978/7 — activating requested; forbidden before the
         // committed NonceIssued receipt, distinct from nonce issuance.
-        let permit_operation =
-            self.issued_permit
-                .as_ref()
-                .map_or(super::host_job_launch::LaunchIdentityField::Unavailable, |permit| {
-                    super::host_job_launch::LaunchIdentityField::Text(permit.operation_id.as_str())
-                });
-        let permit_authority_epoch =
-            self.issued_permit
-                .as_ref()
-                .map_or(super::host_job_launch::LaunchIdentityField::Unavailable, |permit| {
-                    super::host_job_launch::LaunchIdentityField::Number(
-                        permit.authority_epoch.sequence.get(),
-                    )
-                });
+        let permit_operation = self.issued_permit.as_ref().map_or(
+            super::host_job_launch::LaunchIdentityField::Unavailable,
+            |permit| {
+                super::host_job_launch::LaunchIdentityField::Text(permit.operation_id.as_str())
+            },
+        );
+        let permit_authority_epoch = self.issued_permit.as_ref().map_or(
+            super::host_job_launch::LaunchIdentityField::Unavailable,
+            |permit| {
+                super::host_job_launch::LaunchIdentityField::Number(
+                    permit.authority_epoch.sequence.get(),
+                )
+            },
+        );
         kernel_activation_observe_bound(
             "host.kernel-activation activating requested",
             &ActivationRecordIdentity::with(
                 ActivationRecordIdentity::with(
-                    ActivationRecordIdentity { record: &self.current }.with_candidate(),
+                    ActivationRecordIdentity::new(&self.current).with_candidate(),
                     "permit_operation",
                     permit_operation,
                 ),
@@ -704,8 +735,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         )?;
         kernel_activation_observe_bound(
             "host.kernel-activation activating observed",
-            &ActivationRecordIdentity { record: &self.current }
-                .with_journal_and_candidate(&receipt),
+            &ActivationRecordIdentity::new(&self.current).with_journal_and_candidate(&receipt),
         );
         Ok(())
     }
@@ -729,7 +759,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         kernel_activation_observe_bound(
             "host.kernel-activation readiness requested",
             &[
-                ActivationRecordIdentity { record: &self.current }
+                ActivationRecordIdentity::new(&self.current)
                     .with_candidate()
                     .as_slice(),
                 [
@@ -776,10 +806,8 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         ready
             .validate(candidate, activation_receipt)
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let active_receipt = self.transition(
-            KernelActivationState::Active,
-            "kernel-active",
-            |next| {
+        let active_receipt =
+            self.transition(KernelActivationState::Active, "kernel-active", |next| {
                 next.active_pipe_identity = next.candidate_pipe_identity.clone();
                 next.one_time_nonce = next.one_time_nonce.consume()?;
                 let process = next.process.as_mut().ok_or_else(|| {
@@ -796,8 +824,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
                     .map_err(|error| HostError::Platform(error.to_string()))?,
                 );
                 Ok(())
-            },
-        )?;
+            })?;
         // Everything below is held: the committed `Active` append's journal
         // transaction identity and sequence, the permit's operation id and
         // authority epoch, the activation receipt's operation id and journal
@@ -806,14 +833,12 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // activation nonce digest and the evidence reference handles
         // themselves stay with the journal record.
         let evidence_fields = [
-            ActivationRecordIdentity { record: &self.current }
+            ActivationRecordIdentity::new(&self.current)
                 .with_journal_and_candidate(&active_receipt),
             vec![
                 (
                     "permit_operation",
-                    super::host_job_launch::LaunchIdentityField::Text(
-                        permit.operation_id.as_str(),
-                    ),
+                    super::host_job_launch::LaunchIdentityField::Text(permit.operation_id.as_str()),
                 ),
                 (
                     "authority_epoch",
@@ -862,7 +887,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
                 (
                     "ready_evidence_count",
                     super::host_job_launch::LaunchIdentityField::Number(
-                        ready.evidence_refs.len() as u64,
+                        ready.evidence_refs.len() as u64
                     ),
                 ),
             ],
@@ -875,7 +900,10 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
             "host.kernel-activation activation observed",
             &evidence_fields,
         );
-        kernel_activation_observe_bound("host.kernel-activation readiness observed", &evidence_fields);
+        kernel_activation_observe_bound(
+            "host.kernel-activation readiness observed",
+            &evidence_fields,
+        );
         Ok(())
     }
 
@@ -893,7 +921,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // the outermost #891 contour emits the single terminal.
         kernel_activation_observe_bound(
             "host.kernel-activation fail observed",
-            &ActivationRecordIdentity { record: &self.current }.with_candidate(),
+            &ActivationRecordIdentity::new(&self.current).with_candidate(),
         );
         if self.current.state == KernelActivationState::Failed {
             return Ok(());
@@ -923,8 +951,7 @@ impl<'a, B: JournalBackend> DurableKernelActivationDriver<'a, B> {
         // same phase of activation B.
         kernel_activation_observe_bound(
             "host.kernel-activation failure committed observed",
-            &ActivationRecordIdentity { record: &self.current }
-                .with_journal_and_candidate(&receipt),
+            &ActivationRecordIdentity::new(&self.current).with_journal_and_candidate(&receipt),
         );
         Ok(())
     }
