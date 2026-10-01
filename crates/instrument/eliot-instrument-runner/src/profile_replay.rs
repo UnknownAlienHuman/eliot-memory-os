@@ -315,6 +315,9 @@ fn replay_profile_stream_inner(
         return list_receipt(source, verified, bytes, entry, parser_revision, finished_at);
     }
     match entry.instrument.as_str() {
+        CARGO_INSTRUMENT if stage.stage_id == "cargo-metadata" => {
+            cargo_metadata_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at)
+        }
         CARGO_INSTRUMENT => cargo_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
         RUSTC_INSTRUMENT => rustc_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
         RUSTFMT_INSTRUMENT => rustfmt_receipt(source, verified, bytes, entry, parser_revision, terminal, finished_at),
@@ -572,6 +575,29 @@ fn cargo_receipt(
         parser_revision,
         outcome,
         "cargo-json-message-outcome",
+        finished_at,
+    )
+}
+
+fn cargo_metadata_receipt(
+    source: &TestdStreamEvidenceBinding,
+    verified: VerifiedSource<'_>,
+    bytes: &EphemeralSourceBytes,
+    entry: &RegistryEntry,
+    parser_revision: String,
+    terminal: Option<&ExitStatus>,
+    finished_at: ClockReading,
+) -> Result<ProfileReplayReceipt, ProfileReplayError> {
+    if let Err(error) = eliot_instrument_cargo::parse_metadata_json(bytes.bytes()) {
+        return parse_failed_receipt(source, verified, entry, parser_revision, error.to_string(), finished_at);
+    }
+    evaluated_report_receipt(
+        source,
+        verified,
+        entry,
+        parser_revision,
+        terminal_outcome(VerificationOutcome::Pass, terminal),
+        "cargo-metadata-workspace-denominator-and-terminal-outcome",
         finished_at,
     )
 }

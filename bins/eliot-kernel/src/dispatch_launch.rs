@@ -126,11 +126,11 @@ use eliot_testd_core::{
     JobState as TestdJobState, JobSubmissionMetadata, KernelProcessAdmissionEvidence,
     KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, LaneIdentity, ProcessAdmission,
     ResourceWeight, RetryPolicy, TARGET_LAYOUT_REVISION, TESTD_OWNER_SUBMIT_OPERATION,
-    TESTD_OWNER_SUBMIT_WIRE_VERSION, TESTD_PRODUCTIVE_PROFILE, TargetLayoutBinding, TargetRoots,
+    TESTD_OWNER_SUBMIT_WIRE_VERSION, TargetLayoutBinding, TargetRoots,
     StageExecutionKind, TestResourceProfile, TestdBlobProcessStreamGrant,
     TestdBlobProcessStreamTokenRef, TestdOwnerSubmitDirective, TestdOwnerSubmitRequest,
     TestdOwnerSubmitResponse, TestdStore, TestdVerifierDispatchBinding, TestdVerifierJobSubmission,
-    issue_process_admission, testd_profile_binding, verification_receipt_sha256,
+    issue_process_admission, testd_productive_stage_resource_limits, verification_receipt_sha256,
     verify_envelope_layout_binding,
 };
 use serde::{Deserialize, Serialize};
@@ -1338,10 +1338,12 @@ pub(crate) async fn submit_testd_owner_job(
     if stage_request.invocation != request.submission.invocation
         || stage_request.execution != StageExecutionKind::Process
         || stage_request.kind != request.submission.invocation.kind
-        || stage_request.adapter != "eliot.instrument.nextest"
+        || stage_request.profile_name != request.submission.invocation.profile
+        || !eliot_testd_core::is_testd_executor_profile(&stage_request.profile_name)
+        || stage_request.validate().is_err()
     {
         return Err(DispatchLaunchError::Gate(
-            "productive TestD owner currently admits only the selected Nextest process stage"
+            "productive TestD owner requires the exact admitted process stage and command"
                 .to_owned(),
         ));
     }
@@ -1616,11 +1618,26 @@ pub(crate) async fn submit_testd_owner_job(
         .validate_for_roots(&lane_envelope)
         .map_err(|error| DispatchLaunchError::InvalidMaterial(error.to_string()))?;
 
-    let profile = testd_profile_binding(
-        TESTD_PRODUCTIVE_PROFILE,
-        &request.process_tool.observation.nextest_sha256,
-    )
-    .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
+    let stage_command = stage_request.stage_command.as_ref().ok_or_else(|| {
+        DispatchLaunchError::Gate("productive TestD stage has no sealed registered command".to_owned())
+    })?;
+    let (executable_path, executable_sha256) = match stage_command.executable.as_str() {
+        "cargo" => (
+            request.process_tool.observation.cargo_path.clone(),
+            request.process_tool.observation.cargo_sha256.clone(),
+        ),
+        "cargo-nextest" => (
+            request.process_tool.observation.nextest_path.clone(),
+            request.process_tool.observation.nextest_sha256.clone(),
+        ),
+        _ => {
+            return Err(DispatchLaunchError::Gate(
+                "productive TestD stage command has an unknown executable selector".to_owned(),
+            ));
+        }
+    };
+    let limits = testd_productive_stage_resource_limits()
+        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let process_tree_id = ProcessTreeId::new(format!("testd-tree-{}", &job_digest[..32]))
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let process_session_id = SessionId::new(format!("testd-session-{}", &job_digest[..32]))
@@ -1630,24 +1647,16 @@ pub(crate) async fn submit_testd_owner_job(
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
         process_tree_id,
         JobId::new(job_id.clone()).map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
-        ImageId::new("testd-profile-cargo-nextest")
+        ImageId::new(format!("testd-profile-{}", stage_request.profile_name))
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
         process_session_id,
         generation,
-        request.process_tool.observation.nextest_path.clone(),
-        request.process_tool.observation.nextest_sha256.clone(),
-        profile.fixed_argv.clone(),
+        executable_path,
+        executable_sha256,
+        stage_command.argv.clone(),
         source_root.to_string_lossy().into_owned(),
-        environment,
-        ResourceLimits::new(
-            profile.wall_timeout_ms,
-            profile.cpu_time_ms,
-            profile.memory_bytes,
-            profile.stdout_bytes,
-            profile.stderr_bytes,
-            profile.max_descendants,
-        )
-        .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
+        environment.clone(),
+        limits.clone(),
     )
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let fence = FencingToken::new(
@@ -1662,7 +1671,7 @@ pub(crate) async fn submit_testd_owner_job(
         ActionLeaseRef::new(format!("testd-owner-lease-{}", &job_digest[..32]))
             .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?,
         fence,
-        now_unix_ms.saturating_add(profile.wall_timeout_ms),
+        now_unix_ms.saturating_add(limits.wall_timeout_ms()),
     )
     .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let process_owner = launch_owner_binding(
@@ -1743,12 +1752,10 @@ pub(crate) async fn submit_testd_owner_job(
     Ok(response)
 }
 
-/// Environment class the productive `TestD` profile runs under.
+/// Environment class the productive runner stage runs under.
 ///
-/// A declaration, not a measurement: the productive profile is the closed
-/// non-inheriting `cargo nextest run` binding
-/// ([`TESTD_PRODUCTIVE_PROFILE_ARGV`](eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_ARGV)),
-/// so its build environment is the lane-local one
+/// A declaration, not a measurement: each admitted stage uses its runner-sealed
+/// executable and argv under the non-inheriting environment, so its build environment is the lane-local one
 /// ([`TestdProcessToolIntent::validate_for_roots`](eliot_testd_core::TestdProcessToolIntent))
 /// and never the caller's ambient environment. It is named here so the
 /// fingerprint records the class it actually ran in.
@@ -1969,7 +1976,7 @@ fn capture_testd_launch_owner_binding(
     let verifier_dispatch = job.verifier_dispatch.clone();
     let stage_request = job.stage_request.clone();
     let blob_process_stream_grant = job.blob_process_stream_grant.clone();
-    if admission.profile == TESTD_PRODUCTIVE_PROFILE {
+    if eliot_testd_core::is_testd_executor_profile(&admission.profile) {
         let stage = stage_request.as_ref().ok_or_else(|| {
             DispatchLaunchError::Gate(
                 "productive TestD owner row is missing its admitted stage identity".to_owned(),
@@ -1979,7 +1986,8 @@ fn capture_testd_launch_owner_binding(
             || stage.invocation.request.request_id.as_str() != admission.operation_id
             || stage.execution != StageExecutionKind::Process
             || stage.kind != job.invocation.kind
-            || stage.adapter != "eliot.instrument.nextest"
+            || stage.profile_name != job.invocation.profile
+            || stage.stage_command.is_none()
         {
             return Err(DispatchLaunchError::Gate(
                 "durable TestD stage identity does not bind the admitted process invocation"
@@ -2110,7 +2118,7 @@ pub(crate) fn read_testd_terminal_completion(
             "retained TestD launch is outside the live Kernel fence".to_owned(),
         ));
     }
-    if admission.profile != TESTD_PRODUCTIVE_PROFILE {
+    if !eliot_testd_core::is_testd_executor_profile(&admission.profile) {
         return Err(DispatchLaunchError::Gate(
             "terminal verifier completion requires the admitted productive profile".to_owned(),
         ));
@@ -2145,7 +2153,7 @@ pub(crate) fn read_testd_terminal_completion(
     let invocation_bytes = canonical_json_bytes(&job.invocation)
         .map_err(|error| DispatchLaunchError::Gate(error.to_string()))?;
     let invocation_digest = sha256_hex(&invocation_bytes);
-    if job.invocation.profile != TESTD_PRODUCTIVE_PROFILE
+    if !eliot_testd_core::is_testd_executor_profile(&job.invocation.profile)
         || binding.operation_id != job.process.operation_id.as_str()
         || owner_binding.verifier_dispatch.as_ref() != Some(binding)
         || owner_binding.stage_request.as_ref() != job.stage_request.as_ref()
@@ -4677,7 +4685,7 @@ pub fn prepare_testd_launch(
         &authority_epoch,
         generation,
     )?;
-    if admission.profile == TESTD_PRODUCTIVE_PROFILE {
+    if eliot_testd_core::is_testd_executor_profile(&admission.profile) {
         let stored_stage = owner_binding.stage_request.as_ref().ok_or_else(|| {
             DispatchLaunchError::Gate(
                 "productive TestD owner row is missing its admitted stage identity".to_owned(),

@@ -1752,6 +1752,14 @@ pub fn compose_provider_dispatch(
                 kind,
             },
         },
+        Err(TestdPortError::UnsupportedAdapterStage { adapter, kind, .. }) => {
+            ProviderDispatch::Refused {
+                disposition: crate::ProviderDisposition::UnsupportedByTestd { adapter, kind },
+            }
+        }
+        Err(TestdPortError::StageBinding { detail }) => ProviderDispatch::Refused {
+            disposition: crate::ProviderDisposition::StageBindingRejected { detail },
+        },
         Err(TestdPortError::Registry(error)) => ProviderDispatch::Refused {
             disposition: crate::disposition_for_parts(instrument.as_str(), kind, &error),
         },
