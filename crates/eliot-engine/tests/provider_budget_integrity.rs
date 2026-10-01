@@ -309,3 +309,91 @@ fn immutable_campaign_max_rejects_late_budget_expansion() -> TestResult {
     assert_eq!(owner.snapshot()?.budgets[0].max_calls, 1);
     Ok(())
 }
+
+#[test]
+fn absent_ledger_is_empty_and_admits_the_first_campaign() -> TestResult {
+    let root = TempRoot::new("absent-ledger")?;
+    let owner = ProviderCallReservationOwner::new(root.path());
+    let runtime = root.path().join("runtime");
+    for candidate in [
+        "provider-call-ledger.json",
+        "provider-call-ledger.json.next",
+        "provider-call-ledger.json.bak",
+    ] {
+        assert!(!runtime.join(candidate).exists());
+    }
+
+    // No candidate file exists at all, so the ledger has genuinely never been
+    // written: this is absence, not corruption, and both readers return the
+    // empty ledger instead of refusing.
+    assert_eq!(owner.snapshot()?.budgets.len(), 0);
+    assert_eq!(owner.snapshot_read_only()?.budgets.len(), 0);
+
+    open_campaign(&owner, "campaign:first", 1)?;
+    let reservation_id = reserved(owner.reserve(request("campaign:first", "first"))?)?;
+    assert!(!reservation_id.is_empty());
+
+    // The admitted campaign is durable, and the atomic write path leaves no
+    // `.next` or `.bak` candidate behind for the loader to fall back to.
+    assert!(runtime.join("provider-call-ledger.json").is_file());
+    assert!(!runtime.join("provider-call-ledger.json.next").exists());
+    assert!(!runtime.join("provider-call-ledger.json.bak").exists());
+    let ledger = owner.snapshot()?;
+    assert_eq!(ledger.budgets.len(), 1);
+    assert_eq!(ledger.reservations.len(), 1);
+    assert_eq!(ledger.budgets[0].remaining_calls, 0);
+    Ok(())
+}
+
+#[test]
+fn an_undecodable_ledger_never_becomes_a_fresh_budget() -> TestResult {
+    let root = TempRoot::new("corrupt-ledger")?;
+    let owner = ProviderCallReservationOwner::new(root.path());
+    open_campaign(&owner, "campaign:corrupt", 1)?;
+    let reservation_id = reserved(owner.reserve(request("campaign:corrupt", "first"))?)?;
+    // A nonterminal reservation whose provider outcome is still unresolved. Its
+    // budget is already consumed, so reading the ledger as empty would
+    // undercount the call and admit a replacement provider effect.
+    owner.mark_dispatching(&reservation_id)?;
+    let ledger_path = root.path().join("runtime/provider-call-ledger.json");
+    let intact = fs::read(&ledger_path)?;
+    assert_eq!(owner.snapshot()?.reservations.len(), 1);
+
+    // Truncated bytes, with no valid `.next` and no valid `.bak` to fall back
+    // to: the only candidate that exists cannot decode.
+    let truncated = intact[..intact.len() / 2].to_vec();
+    fs::write(&ledger_path, &truncated)?;
+    assert_undecodable_ledger_refuses(&owner)?;
+    assert_eq!(fs::read(&ledger_path)?, truncated);
+
+    // One unknown member inside the stored protected budget record.
+    let unknown_member = String::from_utf8(intact)?
+        .replacen("\"campaign_id\"", "\"unknown_member\": 0, \"campaign_id\"", 1);
+    fs::write(&ledger_path, &unknown_member)?;
+    assert_undecodable_ledger_refuses(&owner)?;
+    assert_eq!(fs::read(&ledger_path)?, unknown_member.as_bytes());
+    Ok(())
+}
+
+/// Every production entry into the ledger must refuse the same way: the
+/// corruption disposition reaches the readers, and neither `open_campaign` nor
+/// `reserve` may admit a fresh budget or reservation over it.
+fn assert_undecodable_ledger_refuses(owner: &ProviderCallReservationOwner) -> TestResult {
+    for error in [
+        owner.snapshot().err(),
+        owner.snapshot_read_only().err(),
+    ] {
+        assert!(matches!(error, Some(EngineError::ServiceNotReady { .. })));
+    }
+    assert!(
+        owner
+            .open_campaign(ProviderCallCampaignRequest {
+                campaign_id: "campaign:corrupt".to_owned(),
+                max_calls: 1,
+                closed: false,
+            })
+            .is_err()
+    );
+    assert!(owner.reserve(request("campaign:corrupt", "second")).is_err());
+    Ok(())
+}
