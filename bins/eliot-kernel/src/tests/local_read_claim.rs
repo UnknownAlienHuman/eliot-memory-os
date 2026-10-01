@@ -22,7 +22,9 @@ use eliot_protocol::{
     HOST_REQUEST_RESULT_BODY_WIRE_ID, HOST_REQUEST_WIRE_ID, HostRequestEnvelope,
     HostRequestIdentity, HostRequestKind, HostRequestResultBody, LocalReadAttempt,
 };
-use host_request_route::{LocalReadSubmitDisposition, StaleLocalReadReason};
+use host_request_route::{
+    LocalReadPairKind, LocalReadSubmitDisposition, StaleLocalReadReason,
+};
 
 fn tool_digest(tool: &serde_json::Value) -> String {
     let bytes = eliot_contracts::canonical_json_bytes(tool).expect("tool must canonicalize");
@@ -45,6 +47,21 @@ fn query_envelope(
     request_id: &str,
     tool_digest: &str,
 ) -> HostRequestEnvelope {
+    read_envelope(fence, deadline_unix_ms, request_id, tool_digest, "eliot.query")
+}
+
+/// The one bounded-read envelope builder, shared by both carrier forms.
+///
+/// `capability` is the closed capability the admitted tool name must match, so
+/// the query and `eliot.state` forms are the same admitted shape with the two
+/// different admission owners rather than two hand-rolled envelopes.
+fn read_envelope(
+    fence: &StateFence,
+    deadline_unix_ms: u64,
+    request_id: &str,
+    tool_digest: &str,
+    capability: &str,
+) -> HostRequestEnvelope {
     HostRequestEnvelope {
         wire_id: HOST_REQUEST_WIRE_ID.to_owned(),
         wire_version: HostRequestEnvelope::CONTRACT_VERSION,
@@ -57,7 +74,7 @@ fn query_envelope(
             cancellation_id: format!("{request_id}:invoke:cancel"),
             parent_operation_id: None,
             deadline_unix_ms,
-            capability: "eliot.query".to_owned(),
+            capability: capability.to_owned(),
             session_id: Some("kernel-session-1".to_owned()),
             task_id: None,
             work_scope_id: None,
@@ -216,10 +233,13 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         .enqueue_local_read_pair(&envelope, &tool)
         .expect("replay enqueue must stay idempotent");
 
-    let (claimed_envelope, claimed_tool, attempt) = kernel
+    let claimed = kernel
         .claim_local_read_pair(&daemon_session)
         .expect("claim must not fail")
         .expect("queued pair must claim");
+    let claimed_envelope = claimed.envelope;
+    let claimed_tool = claimed.tool;
+    let attempt = claimed.attempt;
     assert_eq!(
         claimed_envelope.envelope_sha256, envelope.envelope_sha256,
         "the claim returns the exact admitted envelope"
@@ -234,10 +254,11 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
         .expect("the minted capability must validate");
     // A re-claim by the same owner session returns the identical current
     // capability: lost-answer retry without a new identity.
-    let (_, _, reattempt) = kernel
+    let reattempt = kernel
         .claim_local_read_pair(&daemon_session)
         .expect("re-claim must not fail")
-        .expect("the owned pair must re-claim");
+        .expect("the owned pair must re-claim")
+        .attempt;
     assert_eq!(
         reattempt.attempt_id, attempt.attempt_id,
         "same-owner re-claim returns the identical attempt"
@@ -331,10 +352,11 @@ fn local_read_claim_submit_roundtrip_with_exact_replay_conflict_and_expiry() {
     kernel
         .enqueue_local_read_pair(&envelope, &tool)
         .expect("re-enqueue after retire must succeed");
-    let (_, _, fresh) = kernel
+    let fresh = kernel
         .claim_local_read_pair(&daemon_session)
         .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
+        .expect("re-enqueued pair must claim")
+        .attempt;
     assert_ne!(
         fresh.attempt_id, attempt.attempt_id,
         "a new claim mints a fresh attempt identity"
@@ -438,15 +460,17 @@ fn governed_claim_replacement(
     kernel
         .enqueue_local_read_pair(&envelope, &tool)
         .expect("enqueue must succeed");
-    let (_, _, first) = kernel
+    let first = kernel
         .claim_local_read_pair(owner)
         .expect("owner claim must not fail")
-        .expect("pair must claim");
+        .expect("pair must claim")
+        .attempt;
     assert_eq!(first.fencing_generation, 1);
-    let (_, _, second) = kernel
+    let second = kernel
         .claim_local_read_pair(rival)
         .expect("rival claim must not fail")
-        .expect("pair must re-claim");
+        .expect("pair must re-claim")
+        .attempt;
     assert_eq!(
         second.fencing_generation, 2,
         "reassignment bumps the fencing generation"
@@ -532,10 +556,11 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
     kernel
         .enqueue_local_read_pair(&revoked, &revoked_tool)
         .expect("enqueue must succeed");
-    let (_, _, revoked_attempt) = kernel
+    let revoked_attempt = kernel
         .claim_local_read_pair(owner)
         .expect("claim must not fail")
-        .expect("pair must claim");
+        .expect("pair must claim")
+        .attempt;
     kernel.fence_host_requests_for_connection("conn-test-1");
     let revoked_body = body_with_revision(&revoked, revoked_attempt, 5);
     match kernel
@@ -562,10 +587,11 @@ fn governed_revocation_roundtrip(kernel: &KernelComposition, fence: &StateFence,
     kernel
         .enqueue_local_read_pair(&revoked, &revoked_tool)
         .expect("re-enqueue after revoke must succeed");
-    let (_, _, fresh) = kernel
+    let fresh = kernel
         .claim_local_read_pair(owner)
         .expect("fresh claim must not fail")
-        .expect("re-enqueued pair must claim");
+        .expect("re-enqueued pair must claim")
+        .attempt;
     let fresh_body = body_with_revision(&revoked, fresh, 6);
     assert!(
         matches!(
@@ -667,6 +693,203 @@ async fn local_read_claim_daemon_poll_returns_null_when_empty() {
             .await
             .is_err(),
         "a result without a body must fence"
+    );
+
+    drop(kernel);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Acceptance (issue #2564): one carrier, two distinct claims, no
+/// cross-completion.
+///
+/// The bounded local-read carrier is shared, but the carrier FORM is an
+/// admission-derived discriminator: an admitted `eliot.state` pair is retained
+/// under [`LocalReadPairKind::State`] and an admitted `eliot.query` pair under
+/// [`LocalReadPairKind::Query`]. Each form has its own claim entry, and the
+/// proof here is that they never overlap: the State claim refuses a queue that
+/// holds only the query pair, and the Query claim refuses a queue that holds
+/// only the state pair. `None` from a claim is a null poll, not an error, so a
+/// refutation here is the absence of the other lane's work — never a fence.
+///
+/// Both pairs ride the same connection and the same bounded ledger, so the
+/// refusal can only come from the form gate itself.
+#[test]
+fn state_and_query_claims_never_hand_each_other_the_same_carrier_pair() {
+    let root = std::env::temp_dir().join(format!(
+        "eliot-kernel-state-query-form-separation-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("test work root");
+    let kernel = KernelComposition::new(KernelConfig::new(&root)).expect("kernel composition");
+    let policy = kernel
+        .front_door_policy
+        .lock()
+        .expect("front-door policy")
+        .clone();
+    let fence = policy.module_generation.state_fence.clone();
+    let daemon_session = daemon_session_for(&policy);
+
+    // ---- Half one: an admitted `eliot.state` pair is a State pair. ----
+    let state_tool = serde_json::json!({"name":"eliot.state","arguments":{
+        "include": ["task", "scope", "attention", "health"]
+    }});
+    let state_envelope = read_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-state-form-1",
+        &tool_digest(&state_tool),
+        "eliot.state",
+    );
+    // The state form passes its own closed admission, which re-runs the exact
+    // invoke-read linkage gate before any store IO.
+    host_request_route::check_local_state_admission(&state_envelope, &state_tool)
+        .expect("the state pair must pass the state admission gate");
+    // ...and is refused by the query gate: it is not a bounded evidence query,
+    // so the two forms are decided by different admission owners.
+    assert!(
+        host_request_route::check_local_read_admission(&state_envelope, &state_tool).is_err(),
+        "an eliot.state pair must not be admitted as a bounded evidence query"
+    );
+    stage_admitted(&kernel, &state_envelope);
+
+    // The retention leg resolves the form from the admission itself, not from
+    // the lane the caller happens to be routing for.
+    assert_eq!(
+        kernel
+            .enqueue_local_read_pair(&state_envelope, &state_tool)
+            .expect("the state pair must be retained on the shared carrier"),
+        LocalReadPairKind::State,
+        "an admitted eliot.state pair is retained under the State carrier form"
+    );
+
+    // The Query lane polls the same carrier and must not find it.
+    assert!(
+        kernel
+            .claim_local_read_pair(&daemon_session)
+            .expect("the query claim must not fail")
+            .is_none(),
+        "the query lane must not claim an admitted state pair"
+    );
+    // The State lane claims it, and the claim carries the State form.
+    let state_claim = kernel
+        .claim_local_state_pair(&daemon_session)
+        .expect("the state claim must not fail")
+        .expect("the queued state pair must claim on the State lane");
+    assert_eq!(
+        state_claim.form,
+        LocalReadPairKind::State,
+        "the State lane returns the pair tagged as the State form"
+    );
+    assert_eq!(
+        state_claim.envelope.envelope_sha256, state_envelope.envelope_sha256,
+        "the State lane returns the exact admitted state envelope"
+    );
+    assert_eq!(
+        state_claim.tool, state_tool,
+        "the State lane returns the exact retained state tool bytes"
+    );
+    state_claim
+        .attempt
+        .validate()
+        .expect("the minted state capability must validate");
+
+    // A query result can never complete the State claim: the submit gate reads
+    // the STORED capability, so the wrong lane is a typed refusal rather than a
+    // second completion.
+    let state_body = result_body_for(&state_envelope, Some(state_claim.attempt.clone()));
+    assert!(
+        matches!(
+            kernel.submit_local_read_result(&daemon_session, &state_body),
+            Err(TransportError::SessionFenced)
+        ),
+        "a query-lane result must not complete an eliot.state claim"
+    );
+    // The State lane completes its own claim.
+    match kernel
+        .submit_local_state_result(&daemon_session, &state_body)
+        .expect("the state submit must not fail")
+    {
+        LocalReadSubmitDisposition::Persisted(record) => {
+            assert_eq!(record.state, HostRequestState::ResultReceived);
+            assert_eq!(
+                record.result_response.as_ref(),
+                Some(&state_body.response),
+                "the State lane persists the state answer under its own operation"
+            );
+        }
+        LocalReadSubmitDisposition::StaleAttempt(observation) => {
+            panic!("the current state attempt must persist, got stale: {observation:?}")
+        }
+    }
+    kernel.retire_local_read_pair(
+        &eliot_protocol::host_request_operation_id(&state_envelope),
+        &state_envelope.envelope_sha256,
+    );
+
+    // ---- Half two: an admitted `eliot.query` pair is a Query pair, and the
+    // State lane must not answer it. ----
+    let query = query_tool();
+    let query_enveloped = query_envelope(
+        &fence,
+        unix_ms().saturating_add(60_000),
+        "host-request-query-form-1",
+        &tool_digest(&query),
+    );
+    assert!(
+        matches!(
+            host_request_route::check_local_read_admission(&query_enveloped, &query)
+                .expect("the admitted query must validate"),
+            host_request_route::LocalReadAdmission::Query(_)
+        ),
+        "the admitted query carries selectors and is queue-eligible"
+    );
+    // The state gate is closed to the query form.
+    assert!(
+        host_request_route::check_local_state_admission(&query_enveloped, &query).is_err(),
+        "an eliot.query pair must not be admitted as an owner-backed state read"
+    );
+    stage_admitted(&kernel, &query_enveloped);
+
+    assert_eq!(
+        kernel
+            .enqueue_local_read_pair(&query_enveloped, &query)
+            .expect("the query pair must be retained on the shared carrier"),
+        LocalReadPairKind::Query,
+        "an admitted eliot.query pair is retained under the Query carrier form"
+    );
+
+    // The State lane polls the same carrier and must not find it.
+    assert!(
+        kernel
+            .claim_local_state_pair(&daemon_session)
+            .expect("the state claim must not fail")
+            .is_none(),
+        "the state lane must not claim an admitted query pair"
+    );
+    // The Query lane claims it, under the Query form.
+    let query_claim = kernel
+        .claim_local_read_pair(&daemon_session)
+        .expect("the query claim must not fail")
+        .expect("the queued query pair must claim on the Query lane");
+    assert_eq!(
+        query_claim.form,
+        LocalReadPairKind::Query,
+        "the Query lane returns the pair tagged as the Query form"
+    );
+    assert_eq!(
+        query_claim.envelope.envelope_sha256, query_enveloped.envelope_sha256,
+        "the Query lane returns the exact admitted query envelope"
+    );
+
+    // And the reverse cross-completion: a state result can never complete the
+    // Query claim.
+    let query_body = result_body_for(&query_enveloped, Some(query_claim.attempt.clone()));
+    assert!(
+        matches!(
+            kernel.submit_local_state_result(&daemon_session, &query_body),
+            Err(TransportError::SessionFenced)
+        ),
+        "a state-lane result must not complete an eliot.query claim"
     );
 
     drop(kernel);
