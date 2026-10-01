@@ -3905,6 +3905,7 @@ mod tests {
             "eliot-testd.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
+            "eliot-user-broker.exe",
             "eliotd-governor.json",
         ];
         let facts = roles
@@ -3917,7 +3918,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let digest = GenerationPackagePlanner::phase_a_template_content_digest(&facts)
-            .expect("exact eleven typed template facts must be accepted");
+            .expect("exact twelve typed template facts must be accepted");
         let mut reordered = facts.clone();
         reordered.swap(0, 6);
         assert_eq!(
@@ -3964,6 +3965,7 @@ mod tests {
             "eliot-testd.exe",
             "eliot-native-worker.exe",
             "eliot-wasm-host.exe",
+            "eliot-user-broker.exe",
             "eliotd-governor.json",
         ];
         let facts = roles

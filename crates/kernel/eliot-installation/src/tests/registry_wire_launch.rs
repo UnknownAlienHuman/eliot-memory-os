@@ -141,9 +141,20 @@ fn legacy_registry_table_requires_explicit_migration() {
     let _ = std::fs::remove_file(path);
 }
 
+/// The current registry seed carries an abort-receipt history introduced after
+/// the legacy wire shapes exercised below. Remove it when projecting a prior
+/// shape so the decoder reaches the intended migration discriminator.
+fn remove_post_legacy_registry_members(value: &mut serde_json::Value) {
+    value
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("legacy registry fixture object"))
+        .remove("aborted_activation_receipts");
+}
+
 #[test]
 fn v2_registry_wire_requires_explicit_restage_without_defaults() {
     let mut legacy = must(serde_json::to_value(ApprovedGenerationRegistry::new()));
+    remove_post_legacy_registry_members(&mut legacy);
     let object = legacy.as_object_mut().unwrap_or_else(|| unreachable!());
     object.remove("registry_wire_version");
     object.remove("revision");
@@ -880,6 +891,7 @@ fn pre_split_registry_value() -> serde_json::Value {
         ..ApprovedGenerationRegistry::new()
     };
     let mut value = must(serde_json::to_value(registry));
+    remove_post_legacy_registry_members(&mut value);
     let Some(object) = value.as_object_mut() else {
         panic!("pre-split registry object");
     };
@@ -942,6 +954,7 @@ fn pre_credential_binding_registry_value() -> serde_json::Value {
         ..ApprovedGenerationRegistry::new()
     };
     let mut value = must(serde_json::to_value(registry));
+    remove_post_legacy_registry_members(&mut value);
     value
         .as_object_mut()
         .unwrap_or_else(|| panic!("pre-credential-binding registry object"))
@@ -1005,6 +1018,7 @@ fn pre_eliotd_config_registry_value() -> serde_json::Value {
         ..ApprovedGenerationRegistry::new()
     };
     let mut value = must(serde_json::to_value(registry));
+    remove_post_legacy_registry_members(&mut value);
     value
         .as_object_mut()
         .unwrap_or_else(|| panic!("pre-eliotd-config registry object"))
@@ -1050,6 +1064,7 @@ fn pre_host_artifact_binding_registry_value() -> serde_json::Value {
         ..ApprovedGenerationRegistry::new()
     };
     let mut value = must(serde_json::to_value(registry));
+    remove_post_legacy_registry_members(&mut value);
     value
         .as_object_mut()
         .unwrap_or_else(|| panic!("pre-host-artifact-binding registry object"))
@@ -1096,6 +1111,7 @@ fn pre_service_registration_approval_registry_requires_explicit_restage() {
         test_handle("approval:pre-service-registration"),
     ));
     let mut value = must(serde_json::to_value(registry));
+    remove_post_legacy_registry_members(&mut value);
     value
         .as_object_mut()
         .unwrap_or_else(|| panic!("pre-service-registration registry object"))
