@@ -6952,6 +6952,13 @@ impl KernelComposition {
     ///   privacy class, source/recipient class, or provider-retention field,
     ///   so no disclosure class is proven for these exact bytes and no grant
     ///   membership can hold for them. No grant is invented to fill the gap.
+    /// - the Governor-owned provider-restriction and retention-terms legs:
+    ///   undecided — no caller on this route presents either leg (the
+    ///   envelope carries no provider-retention field and the retained
+    ///   `Session` negotiates no provider terms), so the owner withholds on
+    ///   the provider leg before any grant membership can admit. The legs
+    ///   enter the owner query as deny-only gates and travel in the recorded
+    ///   verdict, never as an invented admission.
     ///
     /// Absent evidence is UNRESOLVED, never permission: the owner withholds
     /// raw persistence and names the side the evaluated evidence determined,
@@ -6986,15 +6993,18 @@ impl KernelComposition {
         )
         .map_err(|_| TransportError::SessionFenced)?;
         // The verdict is the owner's evaluation over the evidence for THIS
-        // event: the retained session's recipient grant and the (unproven)
-        // source class of these exact bytes inside the Governor-resolved
-        // scope. The policy revision recorded alongside it is the owner's own
-        // rule revision — never the fencing generation, which measures
-        // liveness rather than policy.
+        // event: the retained session's recipient grant, the (unproven)
+        // source class of these exact bytes, and the (undecided)
+        // provider-restriction and retention-terms legs, inside the
+        // Governor-resolved scope. The policy revision recorded alongside it
+        // is the owner's own rule revision — never the fencing generation,
+        // which measures liveness rather than policy.
         let disclosure = eliot_workscope::resolve_bridge_ingest_disclosure(
             work_scope_id,
             None,
             &session.privacy_classes,
+            eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
+            eliot_workscope::BridgeIngestPolicyLeg::Unavailable,
         )
         .map_err(|_| TransportError::SessionFenced)?;
         Ok(serde_json::json!({
@@ -7006,6 +7016,8 @@ impl KernelComposition {
             "scope_ref": work_scope_id,
             "source_class": serde_json::Value::Null,
             "recipient_grant": &session.privacy_classes,
+            "provider_restriction": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
+            "retention_terms": eliot_workscope::BridgeIngestPolicyLeg::Unavailable.as_str(),
         }))
     }
 
