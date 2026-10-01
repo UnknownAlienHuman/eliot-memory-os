@@ -84,18 +84,24 @@ pub use implementation_deviation_status::{
 
 mod controlboard_projection;
 pub use controlboard_projection::{
-    CONTROLBOARD_CONTOUR_CONTRACT, ControlBoardContour, ControlBoardEntryKind,
-    ControlBoardProjectionBindings, ControlBoardProjectionError, ControlBoardStatusRow,
-    project_controlboard_contour, read_controlboard_contour,
+    CONTROLBOARD_CONTOUR_CONTRACT, CONTROLBOARD_REVIEW_DETAIL_CONTRACT, ControlBoardCodeProvenance,
+    ControlBoardContour, ControlBoardEntryKind, ControlBoardProjectionBindings,
+    ControlBoardProjectionError, ControlBoardReviewBatchStatus, ControlBoardReviewDetail,
+    ControlBoardReviewDetailError, ControlBoardReviewItemStatus, ControlBoardReviewProvenanceRef,
+    ControlBoardStatusRow, ReviewCorrectionAction, ReviewProvenanceDirection,
+    project_controlboard_contour, read_code_provenance, read_controlboard_contour,
+    read_review_batch_status, read_review_detail,
 };
 
 mod controlboard_consumer;
 pub use controlboard_consumer::{
-    CONTROLBOARD_CONSUMER_CONTRACT, ControlBoardCapability, ControlBoardConsumerError,
-    ControlBoardEvidenceHandle, ControlBoardExpectedSet, ControlBoardGeneration,
-    ControlBoardInstallation, ControlBoardObservationContext, ControlBoardObservationTime,
-    ControlBoardOwner, ControlBoardRecoveryOwner, ControlBoardRowDisposition,
-    ControlBoardSourceDigest, RenderedControlBoard, RenderedControlBoardRow,
+    CONTROLBOARD_CONSUMER_CONTRACT, CONTROLBOARD_REVIEW_RENDER_CONTRACT, ControlBoardCapability,
+    ControlBoardConsumerError, ControlBoardEvidenceHandle, ControlBoardExpectedSet,
+    ControlBoardGeneration, ControlBoardInstallation, ControlBoardObservationContext,
+    ControlBoardObservationTime, ControlBoardOwner, ControlBoardRecoveryOwner,
+    ControlBoardRowDisposition, ControlBoardSourceDigest, RenderedCodeProvenance,
+    RenderedControlBoard, RenderedControlBoardRow, RenderedCorrectionAction, RenderedProvenanceRef,
+    RenderedReviewBatchSummary, RenderedReviewDetail, RenderedReviewMapping,
     read_controlboard_status, render_controlboard_status,
 };
 

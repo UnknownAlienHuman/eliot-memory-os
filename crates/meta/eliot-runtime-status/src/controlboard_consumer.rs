@@ -1098,7 +1098,7 @@ fn render_provenance_ref(
     counterparty: &str,
     direction: &str,
     attribution: Attribution,
-    receipt_ref: &Option<String>,
+    receipt_ref: Option<&String>,
 ) -> RenderedProvenanceRef {
     RenderedProvenanceRef {
         edge_id: edge_id.to_owned(),
@@ -1245,7 +1245,7 @@ impl RenderedCodeProvenance {
                         &edge.counterparty,
                         direction,
                         edge.attribution,
-                        &edge.receipt_ref,
+                        edge.receipt_ref.as_ref(),
                     )
                 })
                 .collect(),
