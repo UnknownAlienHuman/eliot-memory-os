@@ -27,11 +27,12 @@ use eliot_process::{
 };
 use eliot_process_executor::{DispatchValidationPort, WindowsProcessExecutor};
 use eliot_testd_core::{
-    KernelProcessAdmissionEvidence, KernelProcessAdmissionProvider, KernelProcessAdmissionRequest,
-    Lease, ProcessAdmissionPermit, RetryPolicy, SchedulingDecision, SourceObservationGitPort,
-    TargetRoots, TestJob, TestdError, TestdSourceObservation, TestdStore,
-    is_admitted_testd_profile, issue_process_admission, testd_profile_resource_limits,
-    validate_running_lease, verify_envelope_layout_binding, verify_layout_binding,
+    FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV, KernelProcessAdmissionEvidence,
+    KernelProcessAdmissionProvider, KernelProcessAdmissionRequest, Lease, ProcessAdmissionPermit,
+    RetryPolicy, SchedulingDecision, SourceObservationGitPort, TargetRoots, TestJob, TestdError,
+    TestdSourceObservation, TestdStore, is_admitted_testd_profile, issue_process_admission,
+    testd_profile_resource_limits, validate_running_lease, verify_envelope_layout_binding,
+    verify_layout_binding,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -529,22 +530,15 @@ pub(crate) async fn start_claimed_from_store<E: ProcessExecutor + 'static>(
     if grant.contour_root() != current.target_roots.allowed_contour_root {
         return Err(TestdError::InvalidBinding);
     }
-    // Issue #1897 (AUD2): the fixture bindings the child was composed with are
-    // read back here and compared, by content, against the namespace and root
-    // the RETAINED envelope derives. The child runs the fixture tree this job
-    // was admitted with, not one the presented request names; a mismatch refuses
-    // before the executor is reached.
-    if let Some(envelope) = current.work_envelope.as_ref() {
-        let non_secret = request.environment().non_secret();
-        for (name, expected) in envelope
-            .fixture_environment()
-            .map_err(|_| TestdError::InvalidBinding)?
-        {
-            if non_secret.get(&name) != Some(&expected) {
-                return Err(TestdError::InvalidBinding);
-            }
-        }
-    }
+    // Issue #1897 (AUD2/AUD8): the fixture bindings the child was composed with
+    // are read back here and compared, by content, against the namespace and
+    // the physical root the RETAINED envelope derives. The child runs the
+    // fixture tree this job was admitted with, not one the presented request
+    // names; a mismatch refuses before the executor is reached. A row admitted
+    // WITHOUT a lane is refused when its child names a fixture root at all: it
+    // holds no namespace to isolate one with, so a fixture root on such a row is
+    // an unallocated namespace rather than an isolated one.
+    verify_governed_fixture_bindings(current.work_envelope.as_ref(), request.environment())?;
     let operation_id = request.operation_id().clone();
     let request_job_id = request.job_id().as_str().to_owned();
     let process_tree_id = request.process_tree_id().as_str().to_owned();
@@ -1781,8 +1775,26 @@ fn validate_productive_tool_environment(
         TESTD_ENV_PATH,
         "CARGO_TARGET_DIR",
     ];
-    if values.len() != environment.len()
-        || values.len() != expected_keys.len()
+    // Issue #1897 (AUD8): the governed fixture pair is the only extension of the
+    // registered set, it is admitted as a pair or not at all, and the pair must
+    // be internally consistent — the physical root the child is handed must BE
+    // the directory its own carried namespace owns. That is a content check on
+    // this operation's own bindings, not presence: a namespace with no root, a
+    // root with no namespace, or a root that is some other namespace's
+    // directory all refuse. The Kernel's single environment authority
+    // (`TestdProcessToolIntent::validate_for_roots`) emits both values from the
+    // one retained envelope and sealed them into this job's invocation digest,
+    // and `bind_tool_environment_to_roots` puts exactly those two into this
+    // map, so the store re-derives them from that same envelope again before
+    // the start.
+    let fixture_keys = [FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV];
+    let bound_fixture_keys = fixture_keys
+        .iter()
+        .filter(|key| values.contains_key(**key))
+        .count();
+    if (bound_fixture_keys != 0 && bound_fixture_keys != fixture_keys.len())
+        || values.len() != environment.len()
+        || values.len() != expected_keys.len() + bound_fixture_keys
         || expected_keys.iter().any(|key| !values.contains_key(*key))
         || values.get(TESTD_ENV_NEXTEST_GATE).map(String::as_str) != Some("1")
     {
@@ -1790,6 +1802,39 @@ fn validate_productive_tool_environment(
             field: "tool_environment",
             reason: "productive environment is not the owner-registered set",
         });
+    }
+    if bound_fixture_keys == fixture_keys.len() {
+        // Both keys are proven present by the count and membership checks above,
+        // but they are read as an INSEPARABLE PAIR or not at all: binding one
+        // without the other would leave a lane naming a namespace it does not
+        // own a root for, which is the inert-namespace defect this closes.
+        let (Some(namespace), Some(root)) = (
+            values.get(FIXTURE_NAMESPACE_ENV),
+            values.get(FIXTURE_ROOT_ENV),
+        ) else {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "governed fixture bindings must carry the namespace and its root together",
+            });
+        };
+        if namespace.trim().is_empty() || namespace.chars().any(char::is_control) {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "governed fixture namespace is not a usable directory name",
+            });
+        }
+        let root = Path::new(root);
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+            || root.file_name().and_then(|name| name.to_str()) != Some(namespace.as_str())
+        {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "governed fixture root is not the carried namespace's own directory",
+            });
+        }
     }
     for key in [TESTD_ENV_CARGO, TESTD_ENV_RUSTC] {
         let path = values.get(key).ok_or(TestdError::Invalid {
@@ -2046,11 +2091,38 @@ fn derive_dispatch_process_intent(
         eliot_testd_core::TESTD_PRODUCTIVE_PROFILE_PROGRAM
     };
     let tool = resolve_testd_tool_at(program_path, canonical_job_source)?;
+    // Issue #1897 (AUD8): the retained lane is the ONLY source, and the pair is
+    // the same two bindings the Kernel's single environment authority
+    // (`TestdProcessToolIntent::validate_for_roots`) composed from this same
+    // retained tuple and sealed into this job's invocation digest. This owner
+    // re-derives them from that envelope rather than composing them again, so
+    // both maps carry the identical pair and the two invocation digests this
+    // lane is gated on can still be equal. Nothing here is re-derived from
+    // ambient state and no key is added to this map beside the authority's own
+    // composition. A job admitted without a lane receives nothing: an
+    // unallocated lane has no namespace to isolate one with.
+    let fixture_environment = retained_fixture_environment(job)?;
+    // The Kernel created this lane's fixture directory when it sealed the
+    // intent. Re-reading it here is the owner's own observation of the same
+    // physical directory immediately before the launch: a directory that
+    // vanished, or that was replaced by something that does not canonicalize
+    // back to itself, refuses the launch rather than handing the child a
+    // namespace that no longer names an exclusively-owned directory.
+    for (key, value) in &fixture_environment {
+        if key == FIXTURE_ROOT_ENV
+            && std::fs::canonicalize(value).ok().as_deref() != Some(Path::new(value))
+        {
+            return Err(TestdError::Contract(
+                "governed fixture root is not canonical".to_owned(),
+            ));
+        }
+    }
     let tool_environment = bind_tool_environment_to_roots(
         &job.invocation.profile,
         tool.environment,
         &job.target_roots.target_root,
         &job.target_roots.cache_root,
+        fixture_environment,
     )?;
     // The Kernel-admitted slot suffix and the durable job arguments proved
     // equal at the dispatch agreement gate; the sealed argv derives from
@@ -2235,11 +2307,73 @@ pub async fn drive_validated_dispatch_material_with_terminal_publisher(
     Ok(outcome)
 }
 
+/// Refuses a start whose child environment disagrees with the lane's own
+/// retained fixture namespace.
+///
+/// The namespace is not a recorded label: it is the last path segment of the
+/// physical fixture root this work item owns, so two lanes holding different
+/// namespaces cannot touch one directory. Both values are compared BY CONTENT
+/// against the retained envelope, never by presence and never against a rebuild
+/// of the tuple from the current ambient environment. A row with no envelope is
+/// refused when it names either key, because an unallocated lane has no
+/// namespace and a fixture root on such a row is exactly the un-isolated case.
+fn verify_governed_fixture_bindings(
+    envelope: Option<&eliot_testd_core::GovernedWorkEnvelope>,
+    environment: &eliot_process::EnvironmentProjection,
+) -> Result<(), TestdError> {
+    let environment = environment.non_secret();
+    let Some(envelope) = envelope else {
+        return match [FIXTURE_NAMESPACE_ENV, FIXTURE_ROOT_ENV]
+            .iter()
+            .any(|variable| environment.contains_key(*variable))
+        {
+            true => Err(TestdError::InvalidBinding),
+            false => Ok(()),
+        };
+    };
+    for (variable, expected) in envelope
+        .fixture_environment()
+        .map_err(|error| TestdError::Contract(error.to_string()))?
+    {
+        if environment.get(&variable).map(String::as_str) != Some(expected.as_str()) {
+            return Err(TestdError::InvalidBinding);
+        }
+    }
+    Ok(())
+}
+
+/// The fixture bindings this durable job's child process is launched with.
+///
+/// Issue #1897 (AUD8): the retained lane is the ONLY source. The pair is
+/// composed by the one
+/// [`GovernedWorkEnvelope::fixture_environment`](eliot_testd_core::GovernedWorkEnvelope)
+/// derivation — the same retained tuple the Kernel's single environment
+/// authority
+/// ([`TestdProcessToolIntent::validate_for_roots`](eliot_testd_core::TestdProcessToolIntent))
+/// read when it sealed this job's intent — so this owner does not compose the
+/// namespace or the root a second time and the re-derived map and the
+/// Kernel-issued map carry the identical pair. That equality is what keeps the
+/// two invocation digests this lane is gated on satisfiable at all, because
+/// `ProcessIntent::effect_digest` covers `environment`. A job admitted without
+/// a lane receives nothing at all: an unallocated lane has no namespace, and
+/// inventing one here would restore exactly the inert label the envelope exists
+/// to replace. Nothing is derived from the current ambient environment; the row
+/// just read is the authority.
+fn retained_fixture_environment(job: &TestJob) -> Result<Vec<(String, String)>, TestdError> {
+    let Some(envelope) = job.work_envelope.as_ref() else {
+        return Ok(Vec::new());
+    };
+    envelope
+        .fixture_environment()
+        .map_err(|error| TestdError::Contract(error.to_string()))
+}
+
 fn bind_tool_environment_to_roots(
     profile: &str,
     environment: Vec<(String, String)>,
     target_root: &str,
     cache_root: &str,
+    fixture_environment: Vec<(String, String)>,
 ) -> Result<Vec<(String, String)>, TestdError> {
     let mut values = BTreeMap::new();
     for (key, value) in environment {
@@ -2258,6 +2392,22 @@ fn bind_tool_environment_to_roots(
     }
     values.insert("CARGO_TARGET_DIR".to_owned(), target_root.to_owned());
     values.insert("CARGO_HOME".to_owned(), cache_root.to_owned());
+    // Issue #1897 (AUD8): the fixture bindings join the same closed map as the
+    // governed Cargo roots, so the child cannot receive a fixture namespace
+    // that some other lane's process also carries. These are the SAME two
+    // bindings the Kernel's single environment authority sealed into this
+    // job's invocation digest — read from the one retained envelope rather
+    // than composed here — which is what keeps that gate satisfiable. An
+    // owner-resolved key of the same name is refused rather than overwritten: a
+    // collision would mean two independent fixture authorities for one process.
+    for (key, value) in fixture_environment {
+        if values.insert(key, value).is_some() {
+            return Err(TestdError::Invalid {
+                field: "tool_environment",
+                reason: "owner environment already binds a governed fixture key",
+            });
+        }
+    }
     Ok(values.into_iter().collect())
 }
 
