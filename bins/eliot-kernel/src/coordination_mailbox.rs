@@ -131,7 +131,10 @@ impl std::fmt::Display for CoordinationMailboxError {
                 write!(f, "mailbox message not found: {message_id}")
             }
             Self::AcknowledgementNotRequired { message_id } => {
-                write!(f, "mailbox message requires no acknowledgement: {message_id}")
+                write!(
+                    f,
+                    "mailbox message requires no acknowledgement: {message_id}"
+                )
             }
             Self::Foundation(error) => {
                 write!(f, "mailbox message foundation contract: {error}")
@@ -416,7 +419,7 @@ pub fn acknowledge_mailbox_message(
             message_id: record.message_id.clone(),
         });
     }
-    require_text(acknowledged_by, "acknowledged_by", MAX_IDENTITY_LEN)?;;
+    require_text(acknowledged_by, "acknowledged_by", MAX_IDENTITY_LEN)?;
     if let Some(known) = existing.iter().find(|acknowledgement| {
         acknowledgement.message_id == record.message_id
             && acknowledgement.acknowledged_by == acknowledged_by
@@ -440,8 +443,16 @@ pub fn acknowledge_mailbox_message(
 fn validate_mailbox_draft(draft: &MailboxMessageDraft) -> Result<(), CoordinationMailboxError> {
     require_text(&draft.message_id, "message_id", MAX_IDENTITY_LEN)?;
     require_text(&draft.recipient_id, "recipient_id", MAX_IDENTITY_LEN)?;
-    require_text(&draft.sender_principal, "sender_principal", MAX_IDENTITY_LEN)?;
-    require_text(&draft.submitter_principal, "submitter_principal", MAX_IDENTITY_LEN)?;;
+    require_text(
+        &draft.sender_principal,
+        "sender_principal",
+        MAX_IDENTITY_LEN,
+    )?;
+    require_text(
+        &draft.submitter_principal,
+        "submitter_principal",
+        MAX_IDENTITY_LEN,
+    )?;
     require_text(&draft.provenance, "provenance", MAX_PROVENANCE_LEN)?;
     require_text(&draft.privacy_class, "privacy_class", MAX_PRIVACY_LEN)?;
     require_text(&draft.disclosure, "disclosure", MAX_DISCLOSURE_LEN)?;
@@ -469,10 +480,7 @@ fn validate_mailbox_draft(draft: &MailboxMessageDraft) -> Result<(), Coordinatio
 /// known record. A reused identity with a different recipient, task, sender,
 /// provenance, privacy, body, acknowledgement duty, timestamp, or fence is an
 /// identity conflict, never a silent replay.
-fn draft_matches_record(
-    draft: &MailboxMessageDraft,
-    record: &CoordinationMailboxRecord,
-) -> bool {
+fn draft_matches_record(draft: &MailboxMessageDraft, record: &CoordinationMailboxRecord) -> bool {
     draft.recipient_id == record.recipient_id
         && draft.task_id == record.task_id
         && draft.sender_principal == record.sender_principal
@@ -500,10 +508,12 @@ fn next_sequence(
         .max();
     match highest {
         None => Ok(1),
-        Some(sequence) => sequence.checked_add(1).ok_or(CoordinationMailboxError::InvalidField {
-            field: "sequence",
-            reason: "sequence overflow",
-        }),
+        Some(sequence) => sequence
+            .checked_add(1)
+            .ok_or(CoordinationMailboxError::InvalidField {
+                field: "sequence",
+                reason: "sequence overflow",
+            }),
     }
 }
 
