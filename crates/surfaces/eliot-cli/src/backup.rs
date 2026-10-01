@@ -2827,14 +2827,8 @@ pub fn backup_restore_test(
         BACKUP_WIRE_OK => BACKUP_STATE_UNKNOWN,
         other => other,
     };
-    let mut outcome = undecided_restore_outcome(
-        &params,
-        state,
-        &operation_id,
-        effect,
-        proof_ceiling,
-        &claim,
-    );
+    let mut outcome =
+        undecided_restore_outcome(&params, state, &operation_id, effect, proof_ceiling, &claim);
     // The COMPLETE relation between the graded answer and the catalogue row is
     // checked here, before a single owner field is echoed: the refused branch
     // reports this operation's typed refusal with the exact relation that
@@ -3023,7 +3017,7 @@ impl RestoreAuthorityClaim {
     /// unconditionally. The posture check is separate and stated here: a receipt
     /// that is not a rehearsal is refused because A13.7 keeps cutover a separate
     /// authority, and this command is rehearsal-only by definition.
-    fn refusal(&self, receipt_id: &str) -> Option<UnprovenClaim> {
+    fn refusal(self, receipt_id: &str) -> Option<UnprovenClaim> {
         match self.beyond_rehearsal {
             AuthorityBeyondRehearsal::ClaimsReadiness => Some(UnprovenClaim {
                 obligation: "a restore receipt that does not report operational readiness"
@@ -3335,7 +3329,8 @@ fn apply_restore_receipt(
         evidence.journal_owner,
         evidence.phase_log.join(", "),
         evidence.authority.rehearsal
-    );}
+    );
+}
 
 /// The bounded classification ONE returned restore-test answer makes.
 ///
