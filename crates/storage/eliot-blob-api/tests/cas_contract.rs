@@ -1518,6 +1518,158 @@ fn backend_and_caller_fixtures_use_the_public_owner_exhaustively() {
     }
 }
 
+/// Removes Rust comments while preserving literals and executable source.
+/// The CAS contract scan must distinguish implementation from documentation:
+/// I5.12 defines durable flush/publication stages, and #3343/#864 added the
+/// provider-observation variants; #1494/#946 still forbids implementation in
+/// this contract crate.
+fn rust_code_without_comments(source: &str) -> String {
+    fn starts_with(bytes: &[u8], start: usize, prefix: &[u8]) -> bool {
+        bytes.get(start..start.saturating_add(prefix.len())) == Some(prefix)
+    }
+
+    fn raw_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+        if start > 0 {
+            let previous = bytes[start - 1];
+            if previous.is_ascii_alphanumeric() || previous == b'_' || !previous.is_ascii() {
+                return None;
+            }
+        }
+
+        let prefix_len = if starts_with(bytes, start, b"br") || starts_with(bytes, start, b"cr") {
+            2
+        } else if bytes.get(start) == Some(&b'r') {
+            1
+        } else {
+            return None;
+        };
+        let hashes_start = start + prefix_len;
+        let mut quote = hashes_start;
+        while bytes.get(quote) == Some(&b'#') {
+            quote += 1;
+        }
+        if bytes.get(quote) != Some(&b'"') {
+            return None;
+        }
+
+        let hashes = quote - hashes_start;
+        let mut cursor = quote + 1;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'"' {
+                let terminator_end = cursor + 1 + hashes;
+                if terminator_end <= bytes.len()
+                    && bytes[cursor + 1..terminator_end]
+                        .iter()
+                        .all(|byte| *byte == b'#')
+                {
+                    return Some(terminator_end);
+                }
+            }
+            cursor += 1;
+        }
+        None
+    }
+
+    fn quoted_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut cursor = start + 1;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                b'"' => return Some(cursor + 1),
+                _ => cursor += 1,
+            }
+        }
+        None
+    }
+
+    fn char_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut cursor = start + 1;
+        if bytes.get(cursor) == Some(&b'\\') {
+            cursor = (cursor + 2).min(bytes.len());
+            while cursor < bytes.len() {
+                match bytes[cursor] {
+                    b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                    b'\'' => return Some(cursor + 1),
+                    b'\n' | b'\r' => return None,
+                    _ => cursor += 1,
+                }
+            }
+            return None;
+        }
+
+        let tail = std::str::from_utf8(bytes.get(cursor..)?).ok()?;
+        let character = tail.chars().next()?;
+        if character == '\n' || character == '\r' || character == '\'' {
+            return None;
+        }
+        cursor += character.len_utf8();
+        (bytes.get(cursor) == Some(&b'\'')).then_some(cursor + 1)
+    }
+
+    let bytes = source.as_bytes();
+    let mut code = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if let Some(end) = raw_string_end(bytes, cursor) {
+            code.extend_from_slice(&bytes[cursor..end]);
+            cursor = end;
+            continue;
+        }
+
+        if bytes[cursor] == b'"' {
+            let end = quoted_literal_end(bytes, cursor).unwrap_or(bytes.len());
+            code.extend_from_slice(&bytes[cursor..end]);
+            cursor = end;
+            continue;
+        }
+        if bytes[cursor] == b'\'' {
+            if let Some(end) = char_literal_end(bytes, cursor) {
+                code.extend_from_slice(&bytes[cursor..end]);
+                cursor = end;
+                continue;
+            }
+        }
+
+        if starts_with(bytes, cursor, b"//") {
+            while cursor < bytes.len() && bytes[cursor] != b'\n' && bytes[cursor] != b'\r' {
+                cursor += 1;
+            }
+            continue;
+        }
+        if starts_with(bytes, cursor, b"/*") {
+            cursor += 2;
+            let mut depth = 1usize;
+            while cursor < bytes.len() && depth > 0 {
+                if starts_with(bytes, cursor, b"/*") {
+                    depth += 1;
+                    cursor += 2;
+                } else if starts_with(bytes, cursor, b"*/") {
+                    depth -= 1;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+            }
+            continue;
+        }
+
+        code.push(bytes[cursor]);
+        cursor += 1;
+    }
+
+    match String::from_utf8(code) {
+        Ok(code) => code,
+        Err(_) => panic!("removing Rust comments preserves UTF-8"),
+    }
+}
+
+fn first_forbidden_marker<'a>(source: &str, forbidden: &'a [String]) -> Option<&'a str> {
+    forbidden
+        .iter()
+        .find(|marker| source.contains(marker.as_str()))
+        .map(String::as_str)
+}
+
 /// Source: `crates/storage/eliot-blob-api/src/lib.rs` and its manifest,
 /// embedded at compile time.
 /// Discovery: `tests/data/cas-contract/source-proof.json`.
@@ -1540,11 +1692,36 @@ fn contract_source_carries_no_implementation_authority() {
     let forbidden: Vec<String> = ok(serde_json::from_value(fixture["forbidden_markers"].clone()));
     assert!(forbidden.contains(&"std::fs".to_owned()));
     assert!(forbidden.contains(&"tokio".to_owned()));
-    for marker in &forbidden {
-        assert!(
-            !LIB_RS.contains(marker.as_str()),
-            "forbidden implementation marker in contract source: {marker}"
-        );
+    assert!(forbidden.contains(&"fsync".to_owned()));
+
+    let comment_probe = concat!(
+        "/// provider fsync observation belongs in contract documentation\n",
+        "/* outer comment /* nested fsync text */ remains documentation */\n",
+        "const EXAMPLE: &str = r#\"// slash text inside a raw string\"#;\n",
+    );
+    let comment_probe_code = rust_code_without_comments(comment_probe);
+    assert!(!comment_probe_code.contains("provider fsync"));
+    assert!(!comment_probe_code.contains("nested fsync"));
+    assert!(comment_probe_code.contains("r#\"// slash text inside a raw string\"#"));
+    assert_eq!(first_forbidden_marker(&comment_probe_code, &forbidden), None);
+
+    let fsync_code_probe = rust_code_without_comments("fn flush() { fsync(); }\n");
+    assert_eq!(
+        first_forbidden_marker(&fsync_code_probe, &forbidden),
+        Some("fsync"),
+        "an implementation call must still fail the same forbidden-marker check"
+    );
+    let filesystem_code_probe =
+        rust_code_without_comments("fn read() { std::fs::read(\"payload\"); }\n");
+    assert_eq!(
+        first_forbidden_marker(&filesystem_code_probe, &forbidden),
+        Some("std::fs"),
+        "a filesystem implementation must remain forbidden"
+    );
+
+    let contract_code = rust_code_without_comments(LIB_RS);
+    if let Some(marker) = first_forbidden_marker(&contract_code, &forbidden) {
+        panic!("forbidden implementation marker in contract source: {marker}");
     }
 
     assert!(LIB_RS.contains("#![forbid(unsafe_code)]"));
