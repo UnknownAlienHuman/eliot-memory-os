@@ -9096,6 +9096,23 @@ fn decode_retained_wake_enumeration_receipt(
     Ok(*receipt)
 }
 
+/// Expected cancelled wake ids of one retained enumeration receipt, or the
+/// shared unretained-answer refusal when its targets cannot be read.
+fn expected_cancellation_wake_ids(
+    receipt: &UserAutomationWakeEnumerationReceipt,
+    automation_revision: &str,
+    owner_operation_id: &str,
+) -> Result<Vec<String>, String> {
+    Ok(receipt
+        .cancellation_targets()
+        .map_err(|_| {
+            unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
+        })?
+        .into_iter()
+        .map(|target| target.wake_id)
+        .collect::<Vec<_>>())
+}
+
 /// Decodes the retained wake-cancellation answer of one durable obligation, or
 /// names why the retained body is not this operation's answer.
 ///
@@ -9133,14 +9150,11 @@ fn decode_retained_cancellation_answer(
                 owner_operation_id,
             ));
         }
-        let expected_wake_ids = enumeration_receipt
-            .cancellation_targets()
-            .map_err(|_| {
-                unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-            })?
-            .into_iter()
-            .map(|target| target.wake_id)
-            .collect::<Vec<_>>();
+        let expected_wake_ids = expected_cancellation_wake_ids(
+            enumeration_receipt.as_ref(),
+            automation_revision,
+            owner_operation_id,
+        )?;
         if expected_wake_ids.is_empty() || cancelled_wake_ids != expected_wake_ids {
             return Err(unretained_cancellation_answer_reason(
                 automation_revision,
@@ -9173,14 +9187,11 @@ fn decode_retained_cancellation_answer(
         expected_receipt.validate_integrity().map_err(|_| {
             unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
         })?;
-        let expected_wake_ids = expected_receipt
-            .cancellation_targets()
-            .map_err(|_| {
-                unretained_cancellation_answer_reason(automation_revision, owner_operation_id)
-            })?
-            .into_iter()
-            .map(|target| target.wake_id)
-            .collect::<Vec<_>>();
+        let expected_wake_ids = expected_cancellation_wake_ids(
+            expected_receipt,
+            automation_revision,
+            owner_operation_id,
+        )?;
         if expected_transport_request_sha256 == Some(request_sha256.as_str())
             && state_fence == expected_receipt.state_fence
             && wake_ids == expected_wake_ids
