@@ -50,9 +50,9 @@ const PHASE_B_QUEUE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration:
 //
 // Through the #889 facade only
 // (`crate::host_diagnostics::observe_entrypoint_with_detail`,
-// `observe_terminal_error`); the Event Log seam stays typed-Unavailable
-// (`crate::windows_event_log::event_log_sink_status`), never implemented here
-// (#984 still open).
+// `observe_terminal_error_with_correlation`); the Event Log seam stays
+// typed-Unavailable (`crate::windows_event_log::event_log_sink_status`),
+// never implemented here (#984 still open).
 //
 // Observation-only contract: every helper projects facts already produced by
 // the semantic owner. The boundary label is a frozen literal; request-bound
@@ -61,20 +61,25 @@ const PHASE_B_QUEUE_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration:
 // idempotency pair, installation plan digest, source and request digests,
 // generation, owner epoch, binding fence, root-lease subject digest, and the
 // credential target reference (I15.4: diagnostics may record which reference
-// was used, never the value). Still never carried: credential values,
-// ownership keys, envelope or marker bytes, digests over secret-bearing
-// bytes, raw paths (roots enter as path-identity digests only), or arbitrary
-// `Debug`/error text — so bounding limits size, not sensitivity (I15.4).
+// was used, never the value). The single terminal for a failed operation
+// shares the exact operation token its subordinate records carry
+// (transaction, effect, request), so interleaved operations ending in one
+// frozen code stay distinguishable without order inference (I13.11:
+// timeline and correlation, not adjacency). Still never carried: credential
+// values, ownership keys, envelope or marker bytes, digests over
+// secret-bearing bytes, raw paths (roots enter as path-identity digests
+// only), or arbitrary `Debug`/error text — so bounding limits size, not
+// sensitivity (I15.4).
 // Stale/foreign/conflict reasons stay in the frozen labels. Sink outcome
 // never alters result/order/status/cleanup. There is no mutable global dedup
 // cache: one terminal emission per failed credential-owned operation is
 // enforced by the single outermost observer per operation (the `handle`
 // outcome check for request outcomes, the guard for `serve_one` transport),
 // while relayed Phase-B outcomes keep the terminal owned by their Phase-B
-// handler and inner phases correlate by stage order only. The three
-// pre-request marks (`acquire requested`, `acquired owner-epoch`, `serve
-// requested`) keep frozen labels only: no operation identity exists yet at
-// those boundaries.
+// handler. The three pre-request marks (`acquire requested`, `acquired
+// owner-epoch`, `serve requested`) keep frozen labels only: no operation
+// identity exists yet at those boundaries, and a pre-subject terminal says
+// correlation is unavailable instead of relying on order.
 fn credential_control_note_event_log_unavailable() {
     let _ = crate::windows_event_log::event_log_sink_status();
 }
@@ -87,9 +92,31 @@ fn credential_control_observe(detail: &str) {
     );
 }
 
-fn credential_control_observe_terminal(code: &str) {
+fn credential_control_observe_terminal_with_correlation(
+    code: &str,
+    correlation: &crate::host_diagnostics::HostTerminalCorrelation,
+) {
     credential_control_note_event_log_unavailable();
-    crate::host_diagnostics::observe_terminal_error(code);
+    crate::host_diagnostics::observe_terminal_error_with_correlation(code, correlation);
+}
+
+/// Projects the owner-issued operation identity of one live credential
+/// request into the immutable terminal correlation (F-LOG-HOST-2, #893).
+///
+/// The exact same three handles the subordinate records of this operation
+/// already carry (`CredentialObservation::for_request` renders them as the
+/// shared `tx`/`effect`/`req` fields): transaction, effect, and request
+/// digest. Nonsecret handles only, never credential values, paths, payloads,
+/// or error text (I15.4). Pure projection of owner-produced facts: nothing
+/// is probed, synthesized, or cached here.
+fn credential_terminal_correlation(
+    request: &HostCredentialControlRequest,
+) -> crate::host_diagnostics::HostTerminalCorrelation {
+    crate::host_diagnostics::HostTerminalCorrelation::bound(
+        request.intent.transaction_id.as_str(),
+        request.intent.effect_id.as_str(),
+        request.intent.request_digest.as_str(),
+    )
 }
 
 /// Stable diagnostic label for one credential operation (F-LOG-HOST-2 W3).
@@ -182,21 +209,39 @@ fn credential_control_observe_bound(observation: &CredentialObservation) {
 
 /// Single-terminal guard for one credential transport operation.
 ///
-/// Armed on entry; the single outermost boundary disarms on success. Any
-/// `Err` return (explicit or via `?`) drops armed and emits exactly one
-/// terminal record with the operation's frozen code. Emitting here never
+/// Armed on entry with explicitly unavailable correlation: no operation
+/// identity exists yet at the transport boundary. Once the request subject is
+/// decoded, the owner binds its identity via `bind_request`; a pre-subject
+/// failure then still says correlation is unavailable instead of relying on
+/// record order (I13.11: timeline and correlation, not adjacency). The single
+/// outermost boundary disarms on success. Any `Err` return (explicit or via
+/// `?`) drops armed and emits exactly one terminal record with the
+/// operation's frozen code and the retained correlation. Emitting here never
 /// changes the `Result`: the guard only observes the already-produced
-/// outcome. No dedup cache, no lock, no second evaluation. This mirrors the
-/// `HostTerminalGuard` model in `lib.rs` (F-LOG-HOST-1, #891) without touching
-/// it.
+/// outcome. No dedup cache, no lock, no second evaluation, no second
+/// terminal. This mirrors the `HostTerminalGuard` model in `lib.rs`
+/// (F-LOG-HOST-1, #891) without touching it.
 struct CredentialTerminalGuard<'a> {
     code: &'a str,
+    correlation: crate::host_diagnostics::HostTerminalCorrelation,
     armed: bool,
 }
 
 impl<'a> CredentialTerminalGuard<'a> {
     fn armed(code: &'a str) -> Self {
-        Self { code, armed: true }
+        Self {
+            code,
+            correlation: crate::host_diagnostics::HostTerminalCorrelation::unavailable(),
+            armed: true,
+        }
+    }
+
+    /// Retains the immutable owner-issued operation correlation once the
+    /// request subject exists. Called at most once per arming, never
+    /// re-armed, never cleared: the projection is fixed for the rest of the
+    /// guarded operation.
+    fn bind_request(&mut self, request: &HostCredentialControlRequest) {
+        self.correlation = credential_terminal_correlation(request);
     }
 
     fn disarm(&mut self) {
@@ -207,7 +252,7 @@ impl<'a> CredentialTerminalGuard<'a> {
 impl Drop for CredentialTerminalGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            credential_control_observe_terminal(self.code);
+            credential_control_observe_terminal_with_correlation(self.code, &self.correlation);
         }
     }
 }
@@ -370,7 +415,8 @@ impl HostCredentialControl {
         // outcome. Relayed Phase-B responses keep the terminal owned by their
         // Phase-B handler (observed here as relay-only); credential-owned
         // inspect/provision/revoke Unknown outcomes own the single terminal
-        // emitted below. Inner phases correlate by stage order only.
+        // emitted below, sharing the exact operation token the subordinate
+        // records of this request carry.
         credential_control_observe_bound(&CredentialObservation::for_request(
             "host.credential requested",
             request,
@@ -399,7 +445,10 @@ impl HostCredentialControl {
                 request,
                 &self.core.host_epoch_digest,
             ));
-            credential_control_observe_terminal("host-credential-unknown");
+            credential_control_observe_terminal_with_correlation(
+                "host-credential-unknown",
+                &credential_terminal_correlation(request),
+            );
         }
         response
     }
@@ -498,8 +547,10 @@ impl HostCredentialControl {
     /// request cannot be established.
     pub async fn serve_one(&self, timeout: std::time::Duration) -> Result<(), String> {
         // F-LOG-HOST-2 (#893): credential transport boundary. Single terminal
-        // via guard; relayed request Unknowns are `Ok` responses here and own
-        // no second terminal.
+        // via guard; the owner identity binds once the request decodes, so a
+        // later transport failure carries the same operation token while a
+        // pre-subject failure stays explicitly uncorrelated. Relayed request
+        // Unknowns are `Ok` responses here and own no second terminal.
         credential_control_observe("host.credential serve requested");
         let mut serve_terminal = CredentialTerminalGuard::armed("host-credential-serve-failed");
         let installer =
@@ -519,6 +570,7 @@ impl HostCredentialControl {
         let connection_id = frame.connection_id.clone();
         let request =
             decode_credential_control_request_frame(&frame).map_err(|error| error.to_string())?;
+        serve_terminal.bind_request(&request);
         let response = self.handle(&request).await;
         let response = credential_control_response_frame(connection_id, &response)
             .map_err(|error| error.to_string())?;
