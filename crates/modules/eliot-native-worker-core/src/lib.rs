@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod action_envelope;
+mod execute_port;
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/native_worker_facets_v1.rs"));
 }
@@ -25,6 +26,7 @@ pub use action_envelope::{
     ActionEnvelopeCarrier, ActionEnvelopeCarrierError, MAX_ACTION_ENVELOPE_BYTES,
     MAX_ACTION_ENVELOPE_OP_LEN,
 };
+pub use execute_port::NativeWorkerExecutePort;
 pub use eliot_agent_api::{
     AttemptId, AuthorityEnvelope, BudgetEnvelope, EffectCeiling, EffectKind,
 };
@@ -237,6 +239,7 @@ pub struct WorkerCore<E, A, R, C> {
     replay: Option<R>,
     checkpoint: Option<C>,
     evidence_sink: Option<Arc<dyn ProcessEvidenceSink>>,
+    execute_port: Option<Arc<dyn NativeWorkerExecutePort>>,
     lifecycle: WorkerLifecycle,
     grant: Option<CapabilityGrant>,
     process_binding: Option<ProcessBindingSnapshot>,
@@ -267,6 +270,7 @@ where
             replay,
             checkpoint,
             evidence_sink,
+            execute_port: None,
             lifecycle: WorkerLifecycle::Created,
             grant: None,
             process_binding: None,
@@ -290,6 +294,16 @@ where
     #[must_use]
     pub const fn process_start_receipt(&self) -> Option<&ProcessStartReceipt> {
         self.process_start_receipt.as_ref()
+    }
+
+    /// Injects the provider-neutral Execute hook used only after the core has
+    /// validated and durably admitted one EBP Execute request. Provider inputs
+    /// remain the hook owner's responsibility; the generic request payload
+    /// never becomes a provider material source.
+    #[must_use]
+    pub fn with_execute_port(mut self, execute_port: Arc<dyn NativeWorkerExecutePort>) -> Self {
+        self.execute_port = Some(execute_port);
+        self
     }
 
     /// Admits an exact route/capability envelope, invokes P-03, and becomes
@@ -830,7 +844,9 @@ where
         }
 
         match frame.body.clone() {
-            WorkerFrameBody::Execute(call) => self.execute(&frame, call.input, prepared_effect),
+            WorkerFrameBody::Execute(call) => {
+                self.execute(&frame, call.input, prepared_effect).await
+            }
             WorkerFrameBody::Cancel(request) => self.cancel(&frame, request).await,
             WorkerFrameBody::Heartbeat => self.heartbeat(&frame),
             WorkerFrameBody::Health => self.health(&frame),
@@ -843,7 +859,7 @@ where
         }
     }
 
-    fn execute(
+    async fn execute(
         &mut self,
         frame: &WorkerFrame,
         request: WorkerRequest,
@@ -864,7 +880,9 @@ where
             DeliveryClass::DurableObservation,
             true,
         )?];
-        if let (Some(proposal), Some(authorized_effect)) = (request.proposed_effect, authorized) {
+        if let (Some(proposal), Some(authorized_effect)) =
+            (request.proposed_effect.clone(), authorized)
+        {
             events.push(self.append_from_frame(
                 frame,
                 "worker.candidate_effect",
@@ -878,6 +896,9 @@ where
                 DeliveryClass::DurableObservation,
                 true,
             )?);
+        }
+        if let Some(execute_port) = self.execute_port.as_ref() {
+            execute_port.execute(frame, &request).await?;
         }
         Ok(events)
     }

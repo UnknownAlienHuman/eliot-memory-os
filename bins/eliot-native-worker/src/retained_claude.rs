@@ -90,7 +90,6 @@ pub struct RetainedClaudeAttempt {
     route_receipt: AdmittedRouteReceipt,
     effect_ceiling: EffectCeiling,
     usage: UsageReceipt,
-    gate: UnknownOutcomeGate,
     running: Option<ClaudeRunningSidecar>,
 }
 
@@ -110,7 +109,7 @@ impl RetainedClaudeAttempt {
         self.require_same_identity(identity)?;
         let view = self
             .factory
-            .inspect_same_operation(&self.process_operation_id, &self.identity.attempt_id)
+            .inspect_same_operation(&self.process_operation_id, self.identity.attempt_id())
             .await
             .map_err(map_claude_error)?;
         Ok(RetainedClaudeInspection {
@@ -139,7 +138,7 @@ impl RetainedClaudeAttempt {
             .factory
             .cancel_same_operation(
                 &self.process_operation_id,
-                &self.identity.attempt_id,
+                self.identity.attempt_id(),
                 envelope,
             )
             .await
@@ -151,7 +150,7 @@ impl RetainedClaudeAttempt {
         }
         let evidence_ref = self
             .factory
-            .inspect_same_operation(&self.process_operation_id, &self.identity.attempt_id)
+            .inspect_same_operation(&self.process_operation_id, self.identity.attempt_id())
             .await
             .ok()
             .and_then(|view| view.descendants().and_then(|item| item.evidence_ref()))
@@ -176,8 +175,10 @@ impl RetainedClaudeAttempt {
         &mut self,
         identity: &NativeWorkerRetainedOperationIdentity,
         observed_at_unix_ms: u64,
+        gate: &mut UnknownOutcomeGate,
     ) -> Result<RetainedClaudeResult, RegistryError> {
         self.require_same_identity(identity)?;
+        require_owner_reconcile_gate(identity.attempt_id(), gate)?;
         if observed_at_unix_ms == 0 {
             return Err(RegistryError::BadInput {
                 field: "reconcile_time",
@@ -188,11 +189,11 @@ impl RetainedClaudeAttempt {
             .factory
             .reconcile_same_operation_bound_with_evidence(
                 &self.process_operation_id,
-                &self.identity.attempt_id,
+                self.identity.attempt_id(),
                 &self.process_request_digest,
                 &self.process_fence,
                 self.process_generation,
-                &mut self.gate,
+                gate,
             )
             .await
             .map_err(map_claude_error)?;
@@ -410,10 +411,6 @@ pub async fn launch_retained_claude_attempt(
     let process_generation = input.process_request.generation();
     let provider_binding = input.binding.clone();
     let provider_request = input.request.clone();
-    let gate = input
-        .gate
-        .clone()
-        .unwrap_or_else(|| UnknownOutcomeGate::new(identity.attempt_id.clone()));
     let mut prepared = match eliot_agent_claude::execution::prepare(input)
         .map_err(map_claude_error)?
     {
@@ -449,7 +446,6 @@ pub async fn launch_retained_claude_attempt(
         route_receipt,
         effect_ceiling,
         usage,
-        gate,
         running: None,
     };
     match attempt
@@ -465,6 +461,43 @@ pub async fn launch_retained_claude_attempt(
     }
 }
 
+fn require_owner_reconcile_gate(
+    attempt_id: &str,
+    gate: &UnknownOutcomeGate,
+) -> Result<(), RegistryError> {
+    gate.validate().map_err(map_claude_error)?;
+    if gate.attempt_id != attempt_id {
+        return Err(RegistryError::BadInput {
+            field: "unknown_outcome_gate",
+            detail: "reconcile gate does not name the retained provider attempt".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use eliot_agent_claude::UnknownOutcomeGate;
+
+    use super::require_owner_reconcile_gate;
+
+    /// #22 Work/Acceptance positive: reconciliation accepts the original
+    /// owner gate for the exact retained attempt.
+    #[test]
+    fn reconcile_gate_accepts_exact_owner_attempt() {
+        let gate = UnknownOutcomeGate::new("attempt-1".to_owned());
+        assert!(require_owner_reconcile_gate("attempt-1", &gate).is_ok());
+    }
+
+    /// #22 Work/Acceptance refusal: a gate for another provider attempt
+    /// cannot release or reconcile the retained operation.
+    #[test]
+    fn reconcile_gate_refuses_foreign_attempt() {
+        let gate = UnknownOutcomeGate::new("attempt-2".to_owned());
+        assert!(require_owner_reconcile_gate("attempt-1", &gate).is_err());
+    }
+}
+
 fn require_owner_binding(
     identity: &NativeWorkerRetainedOperationIdentity,
     validated: &ValidatedDispatch,
@@ -474,22 +507,26 @@ fn require_owner_binding(
 ) -> Result<(), RegistryError> {
     let claim = admission.claim();
     if identity.task_id != validated.task_id()
-        || identity.claim_id != validated.claim_id()
-        || identity.attempt_id != validated.attempt_id()
-        || identity.operation_id != validated.operation_id()
+        || identity.claim_id() != validated.claim_id()
+        || identity.attempt_id() != validated.attempt_id()
+        || identity.dispatch_operation_id() != validated.operation_id()
         || identity.worker_generation != validated.worker_generation()
-        || identity.binding_digest != validated.binding_digest()
+        || identity.binding_digest() != validated.binding_digest()
         || identity.task_id != claim.task_id.as_str()
         || identity.route_ref != hello.route_ref
         || identity.route_class != eliot_agent_claude::CLAUDE_SIDECAR_ROUTE_CLASS
-        || input.binding.attempt_id.as_str() != identity.attempt_id
-        || input.admitted.id.as_str() != identity.attempt_id
+        || input.binding.attempt_id.as_str() != identity.attempt_id()
+        || input.admitted.id.as_str() != identity.attempt_id()
         || input.admitted.task_id.as_str() != identity.task_id
         || input.binding.runtime_generation.get() != identity.worker_generation
         || input.binding.state_fence != identity.state_fence
         || input.current_fence != identity.state_fence
-        || input.process_request.operation_id().as_str() != identity.operation_id
+        || input.process_request.operation_id().as_str() != identity.provider_operation_id()
         || input.process_request.generation().get() != identity.worker_generation
+        || input.process_request.executable_sha256()
+            != identity.provider_process.provider_executable_digest
+        || input.process_request.invocation_digest()
+            != identity.provider_process.provider_process_invocation_digest
         || input.request.kind != eliot_agent_claude::ClaudeRequestKind::Query
     {
         return Err(RegistryError::BadClaim(WorkerError::AdmissionMismatch(

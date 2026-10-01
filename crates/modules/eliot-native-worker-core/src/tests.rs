@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -837,6 +838,77 @@ fn fixture_with_executor(
         Some(Arc::new(sink.clone())),
     );
     (core, executor, admission, replay, sink)
+}
+
+struct RecordingExecutePort {
+    expected_attempt: String,
+    calls: Mutex<Vec<String>>,
+}
+
+impl RecordingExecutePort {
+    fn new(expected_attempt: &str) -> Self {
+        Self {
+            expected_attempt: expected_attempt.to_owned(),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl NativeWorkerExecutePort for RecordingExecutePort {
+    fn execute<'a>(
+        &'a self,
+        _frame: &'a WorkerFrame,
+        request: &'a WorkerRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WorkerError>> + Send + 'a>> {
+        Box::pin(async move {
+            if request.attempt_id.as_str() != self.expected_attempt {
+                return Err(WorkerError::AdmissionMismatch("execute_port_attempt"));
+            }
+            self.calls
+                .lock()
+                .map_err(|_| WorkerError::Provider("execute port lock failed".to_owned()))?
+                .push(request.attempt_id.as_str().to_owned());
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn admitted_execute_port_runs_after_core_acceptance() {
+    let (core, _, _, _, _) = fixture();
+    let port = Arc::new(RecordingExecutePort::new("attempt-1"));
+    let mut core = core.with_execute_port(port.clone());
+    start(&mut core);
+
+    let events = block_on(core.handle(frame(
+        "execute-owner-port-positive",
+        WorkerFrameBody::Execute(execute_call(None)),
+    )))
+    .expect("owner execute port accepts the exact attempt");
+
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0].payload, WorkerEventPayload::Accepted { .. }));
+    assert_eq!(
+        *port.calls.lock().expect("execute port calls"),
+        ["attempt-1"]
+    );
+}
+
+#[test]
+fn admitted_execute_port_refuses_a_foreign_attempt_before_provider_use() {
+    let (core, _, _, _, _) = fixture();
+    let port = Arc::new(RecordingExecutePort::new("attempt-foreign"));
+    let mut core = core.with_execute_port(port.clone());
+    start(&mut core);
+
+    assert_eq!(
+        block_on(core.handle(frame(
+            "execute-owner-port-foreign",
+            WorkerFrameBody::Execute(execute_call(None)),
+        ))),
+        Err(WorkerError::AdmissionMismatch("execute_port_attempt"))
+    );
+    assert!(port.calls.lock().expect("execute port calls").is_empty());
 }
 
 fn start(core: &mut TestCore) -> ProcessBindingSnapshot {
@@ -1945,6 +2017,88 @@ fn claim_hello(connection: &str, request: &str) -> WorkerHello {
     let mut created = hello(connection, request);
     created.launch_nonce = "launch-nonce-claim-1".to_owned();
     created
+}
+
+fn retained_identity_for_provider_attempt(
+    claim: &NativeWorkerClaim,
+    hello_value: &WorkerHello,
+    process: &ProcessRequest,
+) -> NativeWorkerRetainedOperationIdentity {
+    NativeWorkerRetainedOperationIdentity {
+        dispatch_id: "dispatch-claim-1".to_owned(),
+        task_id: claim.task_id.as_str().to_owned(),
+        material_reference: eliot_protocol::native_worker_material::NativeWorkerRetainedProviderMaterialRefV1 {
+            claim_id: claim.claim_id.as_str().to_owned(),
+            dispatch_operation_id: claim.operation_id.as_str().to_owned(),
+            attempt_id: claim.attempt_id.as_str().to_owned(),
+            binding_digest: claim.binding_digest.clone(),
+            material_ref: "material:claim-1".to_owned(),
+            material_sha256: "a".repeat(64),
+        },
+        provider_process: eliot_protocol::native_worker_material::NativeWorkerProviderProcessIdentityV1 {
+            provider_operation_id: process.operation_id().as_str().to_owned(),
+            provider_process_invocation_digest: process.invocation_digest().to_owned(),
+            provider_executable_digest: process.executable_sha256().to_owned(),
+            process_ref: "provider-process:claim-1".to_owned(),
+        },
+        route_class: claim.route_class.clone(),
+        route_ref: hello_value.route_ref.clone(),
+        worker_generation: claim.worker_generation,
+        executable_digest: "b".repeat(64),
+        expected_result_schema: claim.expected_result_schema.clone(),
+        deadline_unix_ms: claim.deadline_unix_ms,
+        cancellation_id: "provider-cancel-1".to_owned(),
+        state_fence: claim.state_fence.clone(),
+        authority_epoch: claim.authority_epoch.clone(),
+    }
+}
+
+#[test]
+fn retained_provider_process_joins_distinct_owner_operation_and_exact_digests() {
+    let (_, _, _, _, admission, _) = claimed_setup();
+    let hello_value = claim_hello("connection-claim-1", "start-claim-1");
+    let provider_process = process_request_with("operation-provider-1", "tree-provider-1", 1);
+    let identity = retained_identity_for_provider_attempt(
+        admission.claim(),
+        &hello_value,
+        &provider_process,
+    );
+
+    identity
+        .validate_against(&admission, &hello_value, &provider_process)
+        .expect("separate provider process joins the exact retained claim");
+}
+
+#[test]
+fn retained_provider_process_refuses_supervisor_reuse_and_foreign_digest() {
+    let (_, _, _, _, admission, _) = claimed_setup();
+    let hello_value = claim_hello("connection-claim-1", "start-claim-1");
+    let supervisor_process = process_request();
+    let reused = retained_identity_for_provider_attempt(
+        admission.claim(),
+        &hello_value,
+        &supervisor_process,
+    );
+    assert_eq!(
+        reused.validate_against(&admission, &hello_value, &supervisor_process),
+        Err(WorkerError::AdmissionMismatch(
+            "retained_provider_operation_reuses_dispatch"
+        ))
+    );
+
+    let provider_process = process_request_with("operation-provider-1", "tree-provider-1", 1);
+    let mut foreign_digest = retained_identity_for_provider_attempt(
+        admission.claim(),
+        &hello_value,
+        &provider_process,
+    );
+    foreign_digest.provider_process.provider_process_invocation_digest = "e".repeat(64);
+    assert_eq!(
+        foreign_digest.validate_against(&admission, &hello_value, &provider_process),
+        Err(WorkerError::AdmissionMismatch(
+            "retained_provider_process_identity"
+        ))
+    );
 }
 
 fn claimed_setup() -> (

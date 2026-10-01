@@ -8,6 +8,9 @@
 //! request before using it.
 
 use eliot_contracts::{EpochId, StateFence, sha256_hex};
+use eliot_protocol::native_worker_material::{
+    NativeWorkerProviderProcessIdentityV1, NativeWorkerRetainedProviderMaterialRefV1,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -24,12 +27,12 @@ pub struct NativeWorkerRetainedOperationIdentity {
     pub dispatch_id: String,
     /// Governed task identity.
     pub task_id: String,
-    /// Exact external-effect operation identity.
-    pub operation_id: String,
-    /// Admitted attempt identity.
-    pub attempt_id: String,
-    /// Admitted claim identity.
-    pub claim_id: String,
+    /// Exact owner-issued claim-scoped retained-material reference. Its
+    /// dispatch operation is the native claim operation and is not reused as
+    /// the provider child's operation.
+    pub material_reference: NativeWorkerRetainedProviderMaterialRefV1,
+    /// Separate Kernel-issued identity for the provider child process.
+    pub provider_process: NativeWorkerProviderProcessIdentityV1,
     /// Admitted provider route class.
     pub route_class: String,
     /// Full admitted provider route reference.
@@ -50,19 +53,44 @@ pub struct NativeWorkerRetainedOperationIdentity {
     pub state_fence: StateFence,
     /// Exact admitted authority epoch.
     pub authority_epoch: EpochId,
-    /// Opaque reference to the retained, owner-resolved admitted material.
-    pub retained_material_ref: String,
 }
 
 impl NativeWorkerRetainedOperationIdentity {
+    /// Exact dispatch operation named by the shared claim-scoped reference.
+    #[must_use]
+    pub fn dispatch_operation_id(&self) -> &str {
+        &self.material_reference.dispatch_operation_id
+    }
+
+    /// Exact claim id named by the shared claim-scoped reference.
+    #[must_use]
+    pub fn claim_id(&self) -> &str {
+        &self.material_reference.claim_id
+    }
+
+    /// Exact admitted attempt named by the shared claim-scoped reference.
+    #[must_use]
+    pub fn attempt_id(&self) -> &str {
+        &self.material_reference.attempt_id
+    }
+
+    /// Exact binding digest named by the shared claim-scoped reference.
+    #[must_use]
+    pub fn binding_digest(&self) -> &str {
+        &self.material_reference.binding_digest
+    }
+
+    /// Exact provider child operation named by the separate process identity.
+    #[must_use]
+    pub fn provider_operation_id(&self) -> &str {
+        &self.provider_process.provider_operation_id
+    }
+
     /// Validates bounded shape without granting authority.
     pub fn validate(&self) -> Result<(), WorkerError> {
         for (value, field) in [
             (&self.dispatch_id, "retained.dispatch_id"),
             (&self.task_id, "retained.task_id"),
-            (&self.operation_id, "retained.operation_id"),
-            (&self.attempt_id, "retained.attempt_id"),
-            (&self.claim_id, "retained.claim_id"),
             (&self.route_class, "retained.route_class"),
             (&self.route_ref, "retained.route_ref"),
             (
@@ -70,18 +98,26 @@ impl NativeWorkerRetainedOperationIdentity {
                 "retained.expected_result_schema",
             ),
             (&self.cancellation_id, "retained.cancellation_id"),
-            (
-                &self.retained_material_ref,
-                "retained.retained_material_ref",
-            ),
         ] {
             validate_identity_text(value, field)?;
         }
         if self.worker_generation == 0 || self.deadline_unix_ms == 0 {
             return Err(WorkerError::InvalidRequest("retained.deadline_generation"));
         }
+        self.material_reference
+            .validate()
+            .map_err(|_| WorkerError::InvalidRequest("retained.material_reference"))?;
+        self.provider_process
+            .validate()
+            .map_err(|_| WorkerError::InvalidRequest("retained.provider_process"))?;
+        if self.material_reference.dispatch_operation_id
+            == self.provider_process.provider_operation_id
+        {
+            return Err(WorkerError::AdmissionMismatch(
+                "retained_provider_operation_reuses_dispatch",
+            ));
+        }
         for (digest, field) in [
-            (&self.binding_digest, "retained.binding_digest"),
             (&self.executable_digest, "retained.executable_digest"),
         ] {
             if !is_lowercase_sha256(digest) {
@@ -96,6 +132,22 @@ impl NativeWorkerRetainedOperationIdentity {
             .is_same_authority(&self.state_fence.authority_epoch)
         {
             return Err(WorkerError::StaleEpoch);
+        }
+        Ok(())
+    }
+
+    /// Requires the exact worker executable digest from the independently
+    /// authenticated admitted-material owner. The provider child's digest is
+    /// checked separately against its sealed `ProcessRequest`.
+    pub fn validate_dispatch_executable_digest(
+        &self,
+        owner_executable_digest: &str,
+    ) -> Result<(), WorkerError> {
+        self.validate()?;
+        if owner_executable_digest != self.executable_digest {
+            return Err(WorkerError::AdmissionMismatch(
+                "retained_dispatch_executable_digest",
+            ));
         }
         Ok(())
     }
@@ -115,11 +167,11 @@ impl NativeWorkerRetainedOperationIdentity {
         process.validate()?;
         let claim = admission.claim();
         if self.task_id != claim.task_id.as_str()
-            || self.operation_id != claim.operation_id.as_str()
-            || self.attempt_id != claim.attempt_id.as_str()
-            || self.claim_id != claim.claim_id.as_str()
+            || self.material_reference.dispatch_operation_id != claim.operation_id.as_str()
+            || self.material_reference.attempt_id != claim.attempt_id.as_str()
+            || self.material_reference.claim_id != claim.claim_id.as_str()
             || self.worker_generation != claim.worker_generation
-            || self.binding_digest != claim.binding_digest
+            || self.material_reference.binding_digest != claim.binding_digest
             || self.route_class != claim.route_class
             || self.expected_result_schema != claim.expected_result_schema
             || self.deadline_unix_ms != claim.deadline_unix_ms
@@ -135,13 +187,17 @@ impl NativeWorkerRetainedOperationIdentity {
             return Err(WorkerError::StaleFence);
         }
         if self.route_ref != hello.route_ref
-            || self.operation_id != process.operation_id().as_str()
+            || self.provider_process.provider_operation_id != process.operation_id().as_str()
             || self.worker_generation != process.generation().get()
-            || self.executable_digest != process.executable_sha256()
+            || self.provider_process.provider_executable_digest != process.executable_sha256()
+            || self.provider_process.provider_process_invocation_digest
+                != process.invocation_digest()
         {
-            return Err(WorkerError::AdmissionMismatch("retained_process_identity"));
+            return Err(WorkerError::AdmissionMismatch(
+                "retained_provider_process_identity",
+            ));
         }
-        if self.binding_digest != claim.compute_binding_digest()? {
+        if self.material_reference.binding_digest != claim.compute_binding_digest()? {
             return Err(WorkerError::AdmissionMismatch("retained_binding_digest"));
         }
         Ok(())
@@ -280,20 +336,29 @@ mod tests {
         NativeWorkerRetainedOperationIdentity {
             dispatch_id: "dispatch-1".to_owned(),
             task_id: "task-1".to_owned(),
-            operation_id: "operation-1".to_owned(),
-            attempt_id: "attempt-1".to_owned(),
-            claim_id: "claim-1".to_owned(),
+            material_reference: NativeWorkerRetainedProviderMaterialRefV1 {
+                claim_id: "claim-1".to_owned(),
+                dispatch_operation_id: "operation-dispatch-1".to_owned(),
+                attempt_id: "attempt-1".to_owned(),
+                binding_digest: "a".repeat(64),
+                material_ref: "material:operation-1".to_owned(),
+                material_sha256: "e".repeat(64),
+            },
+            provider_process: NativeWorkerProviderProcessIdentityV1 {
+                provider_operation_id: "operation-provider-1".to_owned(),
+                provider_process_invocation_digest: "d".repeat(64),
+                provider_executable_digest: "c".repeat(64),
+                process_ref: "process:provider-1".to_owned(),
+            },
             route_class: "claude.agent-sdk.local-sidecar".to_owned(),
             route_ref: "claude.local".to_owned(),
             worker_generation: 3,
-            binding_digest: "a".repeat(64),
             executable_digest: "b".repeat(64),
             expected_result_schema: "claude.candidate/v1".to_owned(),
             deadline_unix_ms: 50_000,
             cancellation_id: "cancel-1".to_owned(),
             state_fence: StateFence::new(epoch.clone(), ResourceGeneration::new(3).expect("generation")),
             authority_epoch: epoch,
-            retained_material_ref: "material:operation-1".to_owned(),
         }
     }
 
@@ -318,7 +383,7 @@ mod tests {
     #[test]
     fn retained_identity_refuses_changed_digest_and_uncommitted_candidate() {
         let mut bad = identity();
-        bad.binding_digest = "A".repeat(64);
+        bad.material_reference.binding_digest = "A".repeat(64);
         assert!(bad.validate().is_err());
 
         let mut outcome = NativeWorkerRetainedOperationOutcome {
