@@ -1296,7 +1296,8 @@ impl<R: ProcessRunner> GitBridge<R> {
             return Err(BridgeError::RemovalFenced);
         }
         let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
-        let identity = format!("{} #{sequence}", invocation.describe());
+        let describe = invocation.describe();
+        let identity = format!("{describe} #{sequence}");
         stitch.ledger.note_dispatched(&identity);
         Ok(identity)
     }
