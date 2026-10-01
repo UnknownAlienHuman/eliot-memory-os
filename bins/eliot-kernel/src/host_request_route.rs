@@ -6594,6 +6594,7 @@ impl KernelComposition {
         let value = match operation {
             AGENT_BRIDGE_EVENT_FORWARD_OPERATION => {
                 let event = bridge_event_envelope_from_payload(&payload)?;
+                let restricted_source = bridge_restricted_source_bytes_from_payload(&payload)?;
                 if event.delivery_class == DeliveryClass::BestEffortTelemetry {
                     let _transition = self.agent_bridge_transition_read()?;
                     self.admit_bridge_event_envelope(
@@ -6602,6 +6603,7 @@ impl KernelComposition {
                         &identity.request.state_fence,
                         identity.deadline_unix_ms,
                         None,
+                        restricted_source.as_deref(),
                     )?
                 } else {
                     self.with_live_bridge_application_binding(
@@ -6614,6 +6616,7 @@ impl KernelComposition {
                                 &identity.request.state_fence,
                                 identity.deadline_unix_ms,
                                 Some(binding.work_scope_id.as_str()),
+                                restricted_source.as_deref(),
                             )
                         },
                     )?
@@ -6827,6 +6830,7 @@ impl KernelComposition {
         frame_fence: &eliot_contracts::StateFence,
         deadline_unix_ms: u64,
         work_scope_id: Option<&str>,
+        restricted_source_bytes: Option<&[u8]>,
     ) -> Result<serde_json::Value, TransportError> {
         // Authority check against the retained Session, never caller text:
         // the event must cohere with the presenting live fence (same
@@ -6891,6 +6895,7 @@ impl KernelComposition {
                     event,
                     &envelope_bytes,
                     work_scope_id,
+                    restricted_source_bytes,
                 )?;
                 let privacy = RedbRecoveryStore::bridge_event_privacy_decision(
                     &envelope_bytes,
@@ -6976,6 +6981,7 @@ impl KernelComposition {
         event: &EventEnvelope,
         envelope_bytes: &[u8],
         work_scope_id: &str,
+        _restricted_source_bytes: Option<&[u8]>,
     ) -> Result<serde_json::Value, TransportError> {
         let source_sha256 = eliot_contracts::sha256_hex(envelope_bytes);
         // The scope commits to the Governor-resolved scope as well as the
@@ -8962,6 +8968,76 @@ pub(crate) fn bridge_event_envelope_from_payload(
         .require_known_payload_type()
         .map_err(|_| TransportError::SessionFenced)?;
     Ok(envelope)
+}
+
+/// Decodes a restricted OpenCode callback sidecar without adding it to the
+/// normalized public event envelope. The array representation preserves the
+/// exact canonical bytes across the existing typed frame and is bounded by
+/// the same event-size ceiling as the durable envelope.
+pub(crate) fn bridge_restricted_source_bytes_from_payload(
+    payload: &serde_json::Value,
+) -> Result<Option<Vec<u8>>, TransportError> {
+    let Some(value) = payload.get("restricted_source_bytes") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let values = value.as_array().ok_or(TransportError::SessionFenced)?;
+    if values.is_empty() || values.len() > 256 * 1024 {
+        return Err(TransportError::SessionFenced);
+    }
+    let bytes = values
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or(TransportError::SessionFenced)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let source: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| TransportError::SessionFenced)?;
+    if !source.is_object()
+        || eliot_contracts::canonical_json_bytes(&source)
+            .map_err(|_| TransportError::SessionFenced)?
+            != bytes
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(test)]
+mod issue_1935_restricted_source_tests {
+    use super::bridge_restricted_source_bytes_from_payload;
+    use eliot_contracts::canonical_json_bytes;
+
+    #[test]
+    fn issue_1935_restricted_source_round_trips_exact_canonical_callback_bytes() {
+        let source = serde_json::json!({"event":"session.idle","sequence":7});
+        let bytes = canonical_json_bytes(&source).expect("canonical callback source");
+        let payload = serde_json::json!({
+            "restricted_source_bytes": bytes,
+        });
+        assert_eq!(
+            bridge_restricted_source_bytes_from_payload(&payload)
+                .expect("valid sidecar")
+                .as_deref(),
+            Some(bytes.as_slice())
+        );
+    }
+
+    #[test]
+    fn issue_1935_restricted_source_refuses_noncanonical_or_malformed_sidecar() {
+        let malformed = serde_json::json!({"restricted_source_bytes":[123,125,32]});
+        assert!(bridge_restricted_source_bytes_from_payload(&malformed).is_err());
+        let missing = serde_json::json!({});
+        assert_eq!(
+            bridge_restricted_source_bytes_from_payload(&missing).expect("missing source"),
+            None
+        );
+    }
 }
 
 /// One digest-bound hook observation: the hook identity plus the exact digest

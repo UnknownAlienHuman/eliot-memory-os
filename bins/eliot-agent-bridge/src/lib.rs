@@ -4261,6 +4261,54 @@ impl McpForwardingPort for KernelMcpForwardingPort {
         let value = decode_bridge_event_reply(&reply, &frame)?;
         decode_event_port_outcome(event, &value, &envelope_sha, self)
     }
+    fn forward_event_with_restricted_source(
+        &mut self,
+        binding: &AttachBinding,
+        event: &EventEnvelope,
+        source_bytes: &[u8],
+    ) -> Result<EventPortOutcome, ProviderFailure> {
+        if source_bytes.is_empty() || event.validate().is_err() {
+            return Err(event_shape_failure(
+                "restricted event refused: original source is empty or normalized envelope is invalid; nothing staged",
+            ));
+        }
+        self.check_continuity(binding)?;
+        self.check_event_binding(binding, event)?;
+        let facts = self.transport_facts()?;
+        if facts.session.is_none() {
+            return Err(event_shape_failure(
+                "restricted event forwarding refused: no admitted Kernel session; attach and activate before event delivery",
+            ));
+        }
+        if !matches!(
+            event.delivery_class,
+            DeliveryClass::DurableControl | DeliveryClass::DurableObservation
+        ) {
+            return Err(event_shape_failure(
+                "restricted source requires durable host-event admission",
+            ));
+        }
+        let now_ms = bridge_event_unix_ms()?;
+        let envelope_bytes = canonical_json_bytes(event).map_err(|_| event_transport_failure())?;
+        let envelope_sha = sha256_hex(&envelope_bytes);
+        let envelope_value = serde_json::to_value(event).map_err(|_| event_transport_failure())?;
+        let source_octets: Vec<u8> = source_bytes.to_vec();
+        let correlation = format!("bridge-event:{}:{}", event.stream_id, event.event_id);
+        let frame = bridge_event_frame_for_operation(
+            &correlation,
+            &facts,
+            serde_json::json!({
+                "operation": BridgeEventMethod::Event.kernel_operation(),
+                "envelope": envelope_value,
+                "envelope_sha256": envelope_sha,
+                "restricted_source_bytes": source_octets,
+            }),
+            now_ms,
+        )?;
+        let reply = self.exchange(&frame)?;
+        let value = decode_bridge_event_reply(&reply, &frame)?;
+        decode_event_port_outcome(event, &value, &envelope_sha, self)
+    }
     fn forward_gap(
         &mut self,
         binding: &AttachBinding,

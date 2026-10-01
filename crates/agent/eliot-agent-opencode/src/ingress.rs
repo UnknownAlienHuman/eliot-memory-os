@@ -632,6 +632,10 @@ pub struct HostEventSubmission {
     pub argument_keys: Vec<String>,
     /// Exact SHA-256 hex transport hash of the raw request body (I7.23).
     pub transport_hash: String,
+    /// Original callback object, isolated from the normalized envelope.
+    /// Only the Kernel privacy owner may decide whether a separate
+    /// restricted record can be retained. `None` means source unavailable.
+    pub restricted_source_bytes: Option<Vec<u8>>,
     /// Normalized envelope payload: descriptor, digests, bounded metadata.
     pub envelope_json: serde_json::Value,
 }
@@ -1641,7 +1645,10 @@ where
 
 #[cfg(test)]
 mod issue_1935_native_peer_tests {
-    use super::{HostEventPeerProcessIdentity, peer_matches_process_binding};
+    use super::{
+        HostEventPeerProcessIdentity, base_submission, normalized_request_without_restricted_source,
+        peer_matches_process_binding,
+    };
     use eliot_user_broker_core::OpenCodeProcessBinding;
 
     fn binding() -> OpenCodeProcessBinding {
@@ -1679,6 +1686,48 @@ mod issue_1935_native_peer_tests {
         };
         assert!(!peer_matches_process_binding(&peer, &binding));
     }
+
+    #[test]
+    fn issue_1935_native_callback_keeps_exact_source_private_from_projection() {
+        let source = serde_json::json!({"event":"session.idle","private":"callback bytes"});
+        let request = serde_json::json!({
+            "event_id":"opencode:session.idle:1",
+            "sequence":1,
+            "native_source":source,
+            "event_kind":"session.idle"
+        });
+        let submission = base_submission(
+            "opencode:session.idle:1",
+            br#"{"native_source":{"event":"session.idle","private":"callback bytes"}}"#,
+            &request,
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                submission.restricted_source_bytes.as_deref().expect("source sidecar"),
+            )
+            .expect("canonical source"),
+            source
+        );
+        let normalized = normalized_request_without_restricted_source(&request);
+        assert!(normalized.get("native_source").is_none());
+        assert_eq!(normalized["event_kind"], "session.idle");
+    }
+
+    #[test]
+    fn issue_1935_native_callback_refuses_missing_original_source_as_unavailable() {
+        let request = serde_json::json!({"event_id":"opencode:session.idle:1"});
+        let submission = base_submission("opencode:session.idle:1", b"{}", &request);
+        assert!(submission.restricted_source_bytes.is_none());
+        assert!(normalized_request_without_restricted_source(&request).get("native_source").is_none());
+    }
+}
+
+fn normalized_request_without_restricted_source(value: &serde_json::Value) -> serde_json::Value {
+    let mut normalized = value.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        object.remove("native_source");
+    }
+    normalized
 }
 
 fn transport_hash(body: &[u8]) -> String {
@@ -1727,6 +1776,9 @@ fn base_submission(event_id: &str, body: &[u8], value: &serde_json::Value) -> Ho
         effect_digest: None,
         argument_keys: Vec::new(),
         transport_hash: transport_hash(body),
+        restricted_source_bytes: value
+            .get("native_source")
+            .and_then(|source| canonical_json_bytes(source).ok()),
         envelope_json: serde_json::Value::Null,
     }
 }
@@ -1798,7 +1850,8 @@ where
             Some(event_id),
         );
     }
-    let validated: ValidatedMutationGate = match validate_mutation_gate_payload(value) {
+    let normalized_request = normalized_request_without_restricted_source(value);
+    let validated: ValidatedMutationGate = match validate_mutation_gate_payload(&normalized_request) {
         Ok(validated) => validated,
         Err(_) => {
             return HttpOutcome::rejected(
@@ -1807,7 +1860,7 @@ where
             );
         }
     };
-    let mut envelope = value.clone();
+    let mut envelope = normalized_request;
     if let Some(object) = envelope.as_object_mut() {
         object.insert(
             "transport_hash".to_owned(),
@@ -2106,7 +2159,8 @@ where
             Some(event_id),
         );
     }
-    let validated: ValidatedSkippedReceipt = match validate_skipped_tool_receipt(value) {
+    let normalized_request = normalized_request_without_restricted_source(value);
+    let validated: ValidatedSkippedReceipt = match validate_skipped_tool_receipt(&normalized_request) {
         Ok(validated) => validated,
         Err(_) => {
             return HttpOutcome::rejected(
@@ -2115,7 +2169,7 @@ where
             );
         }
     };
-    let mut envelope = value.clone();
+    let mut envelope = normalized_request;
     if let Some(object) = envelope.as_object_mut() {
         object.insert(
             "transport_hash".to_owned(),

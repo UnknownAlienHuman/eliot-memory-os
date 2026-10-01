@@ -80,6 +80,7 @@ impl HostActivationPort for SequencedHost {
 struct ForwardState {
     hooks: usize,
     events: usize,
+    restricted_sources: Vec<Vec<u8>>,
     gaps: Vec<CoverageGap>,
     outcomes: VecDeque<EventPortOutcome>,
     reconciliations: VecDeque<ReconciliationPortOutcome>,
@@ -116,6 +117,20 @@ impl McpForwardingPort for FakeForwarder {
             .outcomes
             .pop_front()
             .ok_or_else(|| ProviderFailure::new("mcp", "missing test outcome"))
+    }
+
+    fn forward_event_with_restricted_source(
+        &mut self,
+        binding: &AttachBinding,
+        event: &EventEnvelope,
+        source_bytes: &[u8],
+    ) -> Result<EventPortOutcome, ProviderFailure> {
+        self.state
+            .lock()
+            .map_err(|_| ProviderFailure::new("mcp", "test lock poisoned"))?
+            .restricted_sources
+            .push(source_bytes.to_vec());
+        self.forward_event(binding, event)
     }
 
     fn forward_gap(
@@ -565,6 +580,43 @@ fn durable_duplicate_replay_is_idempotent_and_ack_phase_controls_cursor()
         bridge.forward_event(&conflicting),
         Err(BridgeError::ProviderContract(_))
     ));
+    Ok(())
+}
+
+#[test]
+fn issue_1935_restricted_source_uses_separate_forwarding_path_and_empty_refuses()
+-> Result<(), Box<dyn std::error::Error>> {
+    let forward_state = Arc::new(Mutex::new(ForwardState::default()));
+    forward_state
+        .lock()
+        .map_err(|_| "forward state lock poisoned")?
+        .outcomes
+        .push_back(EventPortOutcome::Acknowledged(EventForwardAck::new(
+            "stream-1",
+            "event-1935",
+            AckPhase::Durable,
+            EventDisposition::Accepted,
+        )?));
+    let mut bridge = bridge(
+        Arc::new(Mutex::new(HostState::default())),
+        Arc::clone(&forward_state),
+    )?;
+    bridge.attach(managed_request("connection-1")?)?;
+    let durable = event("durable_observation", "event-1935", 1)?;
+    let source = br#"{"event":"session.idle"}"#;
+    assert!(bridge
+        .forward_event_with_restricted_source(&durable, source)
+        .is_ok());
+    assert_eq!(
+        forward_state
+            .lock()
+            .map_err(|_| "forward state lock poisoned")?
+            .restricted_sources,
+        vec![source.to_vec()]
+    );
+    assert!(bridge
+        .forward_event_with_restricted_source(&durable, b"")
+        .is_err());
     Ok(())
 }
 

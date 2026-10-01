@@ -929,6 +929,22 @@ pub trait McpForwardingPort {
         event: &EventEnvelope,
     ) -> Result<EventPortOutcome, ProviderFailure>;
 
+    /// Forwards a normalized event with an independently retained original
+    /// source sidecar. Implementations that do not own a restricted-source
+    /// path fail closed instead of silently dropping or normalizing the bytes.
+    fn forward_event_with_restricted_source(
+        &mut self,
+        binding: &AttachBinding,
+        event: &EventEnvelope,
+        source_bytes: &[u8],
+    ) -> Result<EventPortOutcome, ProviderFailure> {
+        let _ = (binding, event, source_bytes);
+        Err(ProviderFailure::new(
+            "eliot-kernel-front-door",
+            "restricted source forwarding is not configured",
+        ))
+    }
+
     fn forward_gap(
         &mut self,
         binding: &AttachBinding,
@@ -5128,6 +5144,30 @@ impl AgentBridgeCore {
         &mut self,
         event: &EventEnvelope,
     ) -> Result<EventForwardStatus, BridgeError> {
+        self.forward_event_inner(event, None)
+    }
+
+    /// Forwards the normalized event and exact canonical original callback
+    /// bytes on a separate restricted channel. The bytes never enter the
+    /// `EventEnvelope` or its public projection.
+    pub fn forward_event_with_restricted_source(
+        &mut self,
+        event: &EventEnvelope,
+        source_bytes: &[u8],
+    ) -> Result<EventForwardStatus, BridgeError> {
+        if source_bytes.is_empty() {
+            return Err(BridgeError::InvalidTransition(
+                "restricted source bytes are unavailable",
+            ));
+        }
+        self.forward_event_inner(event, Some(source_bytes))
+    }
+
+    fn forward_event_inner(
+        &mut self,
+        event: &EventEnvelope,
+        restricted_source: Option<&[u8]>,
+    ) -> Result<EventForwardStatus, BridgeError> {
         self.ensure_forwardable()?;
         event
             .validate()
@@ -5137,9 +5177,14 @@ impl AgentBridgeCore {
 
         match event.delivery_class {
             DeliveryClass::DurableControl | DeliveryClass::DurableObservation => {
-                self.forward_durable(&binding, event)
+                self.forward_durable(&binding, event, restricted_source)
             }
-            DeliveryClass::BestEffortTelemetry => self.forward_best_effort(&binding, event),
+            DeliveryClass::BestEffortTelemetry if restricted_source.is_none() => {
+                self.forward_best_effort(&binding, event)
+            }
+            DeliveryClass::BestEffortTelemetry => Err(BridgeError::InvalidTransition(
+                "restricted source requires durable host-event admission",
+            )),
         }
     }
 
@@ -5370,6 +5415,7 @@ impl AgentBridgeCore {
         &mut self,
         binding: &AttachBinding,
         event: &EventEnvelope,
+        restricted_source: Option<&[u8]>,
     ) -> Result<EventForwardStatus, BridgeError> {
         if !event.ack_required {
             return Err(BridgeError::InvalidContract {
@@ -5411,10 +5457,13 @@ impl AgentBridgeCore {
             }
         }
 
-        let outcome = self
-            .forwarder()?
-            .forward_event(binding, event)
-            .map_err(BridgeError::from_forwarding_failure)?;
+        let forwarder = self.forwarder()?;
+        let outcome = match restricted_source {
+            Some(source_bytes) => forwarder
+                .forward_event_with_restricted_source(binding, event, source_bytes),
+            None => forwarder.forward_event(binding, event),
+        }
+        .map_err(BridgeError::from_forwarding_failure)?;
         let EventPortOutcome::Acknowledged(ack) = outcome else {
             return Err(BridgeError::MissingDurableAck);
         };

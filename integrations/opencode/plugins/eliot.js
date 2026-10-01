@@ -417,6 +417,10 @@ async function compactEvent(kind, input = {}, output = {}, effectBinding = null)
 
   const payload = {
     event_id: eventId,
+    // Keep the unprojected OpenCode callback object as the restricted source
+    // sidecar. Rust removes it before constructing the normalized envelope;
+    // it is neither a public projection field nor an adapter authority claim.
+    native_source: input,
     sequence,
     native_sequence: nativeSequence,
     native_event_id: nativeEventId,

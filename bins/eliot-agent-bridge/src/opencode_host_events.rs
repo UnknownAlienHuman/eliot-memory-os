@@ -447,9 +447,12 @@ impl HostEventAdmission for BridgeHostEventAdmission<'_> {
         let envelope_digest = canonical_json_bytes(&envelope)
             .map(|canonical| sha256_hex(&canonical))
             .map_err(|_| HostEventAdmissionError::of(HostEventAdmissionFailure::Unavailable))?;
-        let status = self
-            .runner
-            .forward_event(&envelope)
+        let status = match submission.restricted_source_bytes.as_deref() {
+            Some(source_bytes) => self
+                .runner
+                .forward_event_with_restricted_source(&envelope, source_bytes),
+            None => self.runner.forward_event(&envelope),
+        }
             .map_err(|error| HostEventAdmissionError::of(bridge_failure(&error)))?;
         match status {
             EventForwardStatus::Durable {
