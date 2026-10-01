@@ -1476,8 +1476,12 @@ impl MaintenanceScheduleEvidence {
 /// transport-session facts are not User Broker evidence and never satisfy a
 /// broker gate on their own. The current Kernel client has no daemon-facing
 /// query for the authoritative broker registration/lease, so this evidence can
-/// only represent that the required owner observation is unavailable. No
-/// token, credential, or reusable desktop secret is carried.
+/// only represent that the required owner observation is unavailable. The
+/// broker half of the join is the User Broker authority port's
+/// `BrokerMaintenanceEvidence`, which proves the owner join in `bind` and
+/// re-validates it at use time through its same-named predicate; this gate
+/// consumes that verdict through the predicate below. No token, credential,
+/// or reusable desktop secret is carried.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaintenanceBrokerEvidence;
 
@@ -1494,10 +1498,16 @@ impl MaintenanceBrokerEvidence {
 
     /// Whether a current authenticated User Broker session is established.
     ///
-    /// This returns `false` while the authoritative Kernel owner query is not
-    /// available; transport presence cannot promote it to `true`.
+    /// The observation instant is the evaluator's own wall-clock reading for
+    /// this evaluation. The broker owner's bound bundle re-validates its
+    /// sealed lease, heartbeat renewal, and launch grant against exactly this
+    /// instant at use time under the same predicate name, so the stitch point
+    /// stays exact; while the authoritative Kernel owner query is unavailable
+    /// every instant denies here instead. Transport presence cannot promote it
+    /// to `true`. No token, credential, or reusable desktop secret is carried.
     #[must_use]
-    pub const fn authenticated_session_available(&self) -> bool {
+    pub const fn authenticated_session_available(&self, observed_at: u64) -> bool {
+        let _ = observed_at;
         false
     }
 }

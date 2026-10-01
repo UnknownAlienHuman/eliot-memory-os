@@ -280,6 +280,13 @@ impl DaemonComposition {
                 &observation.evidence_refs,
                 policy.revision,
             )?;
+            // The single wall-clock observation for this evaluation: it fills
+            // the input's expiry comparison instant and the broker predicate's
+            // freshness instant together, so the gate never mixes two readings.
+            // A non-positive reading maps to the invalid instant, which the
+            // broker predicate denies like any absent broker observation.
+            let now_ms = crate::unix_ms_i64();
+            let broker_observed_at = u64::try_from(now_ms).unwrap_or_default();
             let input = MaintenanceTriggerInput {
                 trigger_id,
                 evidence_refs: observation.evidence_refs,
@@ -294,11 +301,15 @@ impl DaemonComposition {
                 route_available: route.is_service_safe(),
                 budget_available: budget.has_budget(),
                 // Fail closed until the Kernel owner supplies a current
-                // authenticated broker registration/lease observation.
-                user_session_available: broker.authenticated_session_available(),
+                // authenticated broker registration/lease observation: the
+                // evaluation instant travels into the broker predicate, whose
+                // same-named bundle check plugs in here with no signature
+                // change once that query exists.
+                user_session_available: broker
+                    .authenticated_session_available(broker_observed_at),
                 user_session_required: policy.requires_interactive_session(),
                 safety_required: safety.is_required(),
-                now_ms: crate::unix_ms_i64(),
+                now_ms,
                 expires_at_ms: None,
                 active_job_id: None,
             };
