@@ -57,7 +57,7 @@ use eliot_protocol::{
     MAINTENANCE_TRIGGER_DECISION_RECEIPT_WIRE_VERSION, MaintenanceTriggerClaim,
     MaintenanceTriggerDecisionReceipt, MaintenanceTriggerRecord, ProtocolError, RequestIdentity,
 };
-use eliot_receipts::{GrantClosureReceipt, GrantClosureState, ReceiptIdentity, RequestBinding};
+use eliot_receipts::{GrantClosureReceipt, GrantClosureState, RequestBinding};
 use eliot_store_api::{StoreError, WriteReceiptStatus};
 use thiserror::Error;
 
