@@ -407,16 +407,13 @@ impl NativeWorkerExecutableBinding {
 /// process invocation value.
 ///
 /// Pure projection helper for the T9-01 production caller
-/// (`GovernorComposition::publish_native_worker_binding`): canonicalizes the
+/// (`GovernorComposition::publish_native_worker_binding_for_invocation`,
+/// which forwards into `publish_native_worker_binding`): canonicalizes the
 /// exact invocation JSON with the same `canonical_json_bytes` + `sha256_hex`
 /// the wire uses, so the published binding carries the real invocation
 /// digest, never a placeholder. This changes no signing, no authority, and
 /// no digest scheme; it only gives production callers the one correct way to
 /// derive the field.
-#[allow(
-    dead_code,
-    reason = "R1 derivation helper: the composition publish caller wires in the Governor integration wave; unit-proofed here"
-)]
 pub fn process_invocation_digest_for(invocation: &serde_json::Value) -> Result<String, String> {
     let bytes = canonical_json_bytes(invocation)
         .map_err(|error| format!("cannot canonicalize process invocation: {error}"))?;
