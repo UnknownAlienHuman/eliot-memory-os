@@ -1108,15 +1108,23 @@ impl KernelComposition {
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
+        // Issue #77 W2: Kernel-owned bind/dispatch leg runs BEFORE the
+        // route's own admit staging. The binder's `admit_and_stage` advances
+        // `Requested -> Admitted` itself, and only the call that stages first
+        // reaches `Fresh` and therefore `build_application` — the single
+        // product construction of the Kernel-owned `RequestIdentity`
+        // (authority epoch, admitted operation identity, absolute deadline)
+        // and `EffectCeiling::CandidateOnly`. A route-first staging would
+        // reduce every fresh envelope to a replay inside `invoke_admitted`,
+        // so the Kernel-owned identity would never be minted. The leg is
+        // fail-closed: any non-dispatched disposition falls through to the
+        // existing admit-and-queue path below unchanged.
+        let binder_dispatched = self.invoke_admitted_binder_leg(envelope, tool);
         let (receipt, mut record) = self.admit_host_request_envelope_under_transition(envelope)?;
-        // Issue #77 W2: Kernel-owned bind/dispatch leg over the admitted
-        // envelope. The binder mints and validates the Kernel-owned
-        // RequestIdentity, authority epoch, admitted operation identity,
-        // deadline, and effect ceiling through `invoke_admitted`; a dispatched
-        // leg reloads the owner-stored record so an answered operation is
-        // never queued twice. Any other disposition keeps the existing lane
-        // queueing below unchanged.
-        if record.result_digest.is_none() && self.invoke_admitted_binder_leg(envelope, tool) {
+        // A dispatched leg stored its bounded answer through the single ORS
+        // durability owner, so reload the owner-stored record: an answered
+        // operation is never queued twice.
+        if binder_dispatched {
             let operation_id = OperationIdentity::new(host_request_operation_id(envelope))
                 .map_err(|_| TransportError::SessionFenced)?;
             record = self
@@ -1245,6 +1253,10 @@ impl KernelComposition {
     /// Never narrows admission: a non-dispatched leg (fail-closed owner gap
     /// or pre-dispatch rejection) leaves the existing queue path unchanged
     /// until a real Governor port is injected.
+    ///
+    /// Must run before the route's own admit staging: only the first stager
+    /// reaches `Fresh` inside `invoke_admitted` and therefore mints the
+    /// Kernel-owned `RequestIdentity` and effect ceiling.
     fn invoke_admitted_binder_leg(
         &self,
         envelope: &HostRequestEnvelope,
