@@ -6994,7 +6994,7 @@ mod tests {
     #[test]
     fn exact_replay_binds_recomputed_digest_and_is_byte_identical() -> Result<(), StoreError> {
         // Proves cross-crate stability: the store recompute uses the same
-// shared helper as Slice A. The golden vector that
+        // shared helper as Slice A. The golden vector that
         // `canonical_request_hash` produces in `eliot-store-api` is pinned in
         // `request_hash.rs::golden_request_hash_is_stable_across_crates`.
         //
