@@ -168,9 +168,9 @@ pub(crate) fn validate_schema_meta_record(record: &SchemaMetaRecord) -> Result<(
 /// The returned string is the ORIGINAL RECORDED value, borrowed from the row, so
 /// a caller that reports it reports what the store wrote rather than
 /// `crate::ADAPTER_NAME` out of the running binary.
-pub(crate) fn validate_recorded_bridge_range<'a>(
-    record: &'a SchemaMetaRecord,
-) -> Result<&'a str, AdapterError> {
+pub(crate) fn validate_recorded_bridge_range(
+    record: &SchemaMetaRecord,
+) -> Result<&str, AdapterError> {
     let range = record.compatible_bridge_range.as_str();
     if range.trim().is_empty() || range.chars().any(char::is_control) {
         return Err(AdapterError::PartialOutcome);

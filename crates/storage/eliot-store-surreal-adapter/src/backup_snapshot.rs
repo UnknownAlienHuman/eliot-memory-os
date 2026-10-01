@@ -234,8 +234,8 @@ pub enum EcxfCaptureGap {
 /// Requested-scope membership of one captured class, decided from its rows.
 ///
 /// I4.5 keeps `ScopeId` out of [`StateFence`](eliot_store_api::StateFence) and
-/// names its owner: "WorkScope mints and revisions the scope identity, and each
-/// Context Compiler operation carries it on its own ContextBinding". So a scope
+/// names its owner: "`WorkScope` mints and revisions the scope identity, and each
+/// `Context Compiler` operation carries it on its own `ContextBinding`". So a scope
 /// id in the request is a CLAIM, and membership is a property of each row. This
 /// is that property, read per class out of the rows the census already returned,
 /// never out of the request and never out of the DDL: these tables are
@@ -968,18 +968,14 @@ fn captures_purge_ledger() -> bool {
 fn observed_blob_reachability(
     class_rows: &[Vec<Map<String, Value>>],
 ) -> Result<Option<Vec<String>>, StoreError> {
-    let Some(class) = captured_member_classes()
-        .find(|class| class.member_type == SnapshotMemberType::Blob)
+    let Some(class) =
+        captured_member_classes().find(|class| class.member_type == SnapshotMemberType::Blob)
     else {
         return Ok(None);
     };
     let mut keys = Vec::new();
     for row in observed_class_rows(class_rows, class.table) {
-        keys.push(row_residency_digest(
-            class,
-            row,
-            &row_content_digest(row)?,
-        )?);
+        keys.push(row_residency_digest(class, row, &row_content_digest(row)?)?);
     }
     Ok(Some(keys))
 }
@@ -1046,13 +1042,19 @@ fn observed_capture_gaps(
     // no blob class was captured at all, so no residency evidence was read) is a
     // DIFFERENT record and refuses here too, rather than being reported as zero
     // reachable blobs.
-    if observed_blob_reachability(class_rows)?.is_none_or(Vec::is_empty) {
+    if !matches!(
+        observed_blob_reachability(class_rows)?,
+        Some(ref keys) if !keys.is_empty()
+    ) {
         gaps.push(EcxfCaptureGap::BlobStoreEvidenceUnavailable);
     }
     for (gap, columns) in [
         (
             EcxfCaptureGap::ExternalSourceIdentityEvidenceUnavailable,
-            &["architecture_source_digest", "normative_pair_identity_receipt_digest"][..],
+            &[
+                "architecture_source_digest",
+                "normative_pair_identity_receipt_digest",
+            ][..],
         ),
         (
             EcxfCaptureGap::SourceExportReceiptUnavailable,
