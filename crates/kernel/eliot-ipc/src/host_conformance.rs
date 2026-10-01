@@ -765,15 +765,6 @@ impl FingerprintQuarantine {
         self.entries.contains_key(fingerprint_canonical)
     }
 
-    /// Reconciles one fingerprint, clearing its quarantine entry.
-    /// Returns true when an entry was present.
-    ///
-    /// Production release must present exact current revalidation evidence
-    /// instead; see [`FingerprintQuarantine::reconcile_with_revalidation`].
-    pub fn reconcile(&mut self, fingerprint_canonical: &str) -> bool {
-        self.entries.remove(fingerprint_canonical).is_some()
-    }
-
     /// Reconciles one fingerprint only against exact current revalidation
     /// evidence: live probe plus production-observation evidence naming the
     /// quarantined fingerprint in scope. Returns true when the entry was

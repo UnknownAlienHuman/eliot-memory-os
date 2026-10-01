@@ -203,9 +203,18 @@ fn route_mismatch_marks_candidate_only_invalidates_and_quarantines() {
     };
     let next = ok(gate.next_attempt_after_effect("attempt-2", handoff, bundle));
     assert_eq!(next.causal_parent(), Some(&"attempt-1".to_owned()));
-    // Reconciliation clears the quarantine; fresh evidence re-verifies.
-    assert!(quarantine.reconcile(&active.canonical()));
+    // Identity-only release and empty revalidation cannot clear quarantine.
+    assert_eq!(
+        quarantine.reconcile_with_revalidation(&active, &[], SCOPE, NOW),
+        Err(ConformanceError::CandidateOnlyWhereVerifiedRequired)
+    );
+    assert!(quarantine.is_quarantined(&active.canonical()));
+
+    // A matched production attempt plus its live probe releases quarantine.
     let fresh = full_evidence();
+    assert!(ok(quarantine.reconcile_with_revalidation(
+        &active, &fresh, SCOPE, NOW
+    )));
     assert_eq!(
         ok(admit_coverage(&fresh, &active, SCOPE, NOW, &quarantine)),
         AdmissionCoverage::Verified
