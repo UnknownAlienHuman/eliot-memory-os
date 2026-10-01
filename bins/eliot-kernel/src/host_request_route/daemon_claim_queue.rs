@@ -804,7 +804,7 @@ impl KernelComposition {
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
 
-    /// Revalidates the live, original BIND_SCOPE claim before its owner snapshot
+    /// Revalidates the live, original `BIND_SCOPE` claim before its owner snapshot
     /// is written to canonical recovery. The caller supplies only the exact
     /// operation/request digest and Kernel-issued attempt returned by the
     /// existing claim; the retained envelope, tool bytes, activation principal,

@@ -9130,6 +9130,23 @@ impl KernelComposition {
     }
 
     #[cfg(windows)]
+    fn validate_owner_protected_snapshot(&self, expected: &str) -> Result<(), TransportError> {
+        let policy = self
+            .front_door_policy
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let current = policy
+            .config_snapshot
+            .get("protected_snapshot_digest")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        if current != expected {
+            return Err(TransportError::SessionFenced);
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     async fn store_work_scope_owner_operation(
         &self,
         session: &Session,
@@ -9146,7 +9163,10 @@ impl KernelComposition {
         let context = &identity.request.metadata;
         if context.product_id.as_str() != ACTIVE_DAEMON_CALLER
             || context.source_id.as_str() != ACTIVE_DAEMON_CALLER
-            || context.session_id.as_ref().map(|session| session.as_str())
+            || context
+                .session_id
+                .as_ref()
+                .map(eliot_contracts::SessionId::as_str)
                 != Some(operation.attempt.session_id.as_str())
             || context.task_id.as_ref() != Some(&operation.attempt.task_id)
             || identity.request.state_fence != operation.attempt.state_fence
@@ -9179,7 +9199,10 @@ impl KernelComposition {
             || context.task_id.as_ref() != Some(&invocation.task_id)
             || context.state_fence != envelope.state_fence
             || context.request_id != envelope.identity.request_id
-            || context.session_id.as_ref().map(|id| id.as_str())
+            || context
+                .session_id
+                .as_ref()
+                .map(eliot_contracts::SessionId::as_str)
                 != envelope.identity.session_id.as_deref()
             || operation.request.operation_id.as_str() != operation.operation_id
             || operation.request.idempotency_key != envelope.identity.idempotency_key
@@ -9202,21 +9225,7 @@ impl KernelComposition {
             &invocation.task_input,
             &invocation.work_scope_id,
         )?;
-        let protected_snapshot_digest = {
-            let policy = self
-                .front_door_policy
-                .lock()
-                .map_err(|_| TransportError::SessionFenced)?;
-            policy
-                .config_snapshot
-                .get("protected_snapshot_digest")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(TransportError::SessionFenced)?
-                .to_owned()
-        };
-        if operation.request.protected_snapshot_digest != protected_snapshot_digest {
-            return Err(TransportError::SessionFenced);
-        }
+        self.validate_owner_protected_snapshot(&operation.request.protected_snapshot_digest)?;
         let failure_operation_id = operation.request.operation_id.clone();
         let failure_idempotency_key = operation.request.idempotency_key.clone();
         let gateway = self.retained_store_gateway()?;
@@ -10746,10 +10755,8 @@ impl KernelComposition {
             .map_err(|_| TransportError::SessionFenced)?;
         let resulted = match self.submit_local_read_result(session, &submission)? {
             host_request_route::LocalReadSubmitDisposition::Persisted(record) => record,
-            host_request_route::LocalReadSubmitDisposition::StagedWrite(_) => {
-                return Err(TransportError::SessionFenced);
-            }
-            host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
+            host_request_route::LocalReadSubmitDisposition::StagedWrite(_)
+            | host_request_route::LocalReadSubmitDisposition::StaleAttempt(_) => {
                 return Err(TransportError::SessionFenced);
             }
         };

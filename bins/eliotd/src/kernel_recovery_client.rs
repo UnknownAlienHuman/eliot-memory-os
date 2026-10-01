@@ -72,7 +72,7 @@ fn work_scope_owner_wire_value(
                     error: KernelPortError::Contract(
                         "Kernel Store failure has an invalid operation value envelope".to_owned(),
                     ),
-                    expected: Some(expected.clone()),
+                    expected: Some(Box::new(expected.clone())),
                 });
             }
             let Some(failure) = failure else {
@@ -80,14 +80,14 @@ fn work_scope_owner_wire_value(
                     error: KernelPortError::Contract(
                         "Kernel Store failure omitted its typed failure contract".to_owned(),
                     ),
-                    expected: Some(expected.clone()),
+                    expected: Some(Box::new(expected.clone())),
                 });
             };
             failure
                 .validate()
                 .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
                     error: KernelPortError::Contract(error.to_string()),
-                    expected: Some(expected.clone()),
+                    expected: Some(Box::new(expected.clone())),
                 })?;
             if failure.request_id.as_ref() != Some(&claimed.envelope.identity.request_id)
                 || failure.operation_id.as_ref() != Some(&claimed.operation_id)
@@ -101,13 +101,13 @@ fn work_scope_owner_wire_value(
                         "Kernel Store failure does not preserve the exact original request identity"
                             .to_owned(),
                     ),
-                    expected: Some(expected.clone()),
+                    expected: Some(Box::new(expected.clone())),
                 });
             }
             let _ = reason;
             Err(WorkScopeOwnerWriteFailure::Store {
                 failure,
-                expected: expected.clone(),
+                expected: Box::new(expected.clone()),
             })
         }
         WireOutcome::Error {
@@ -119,7 +119,7 @@ fn work_scope_owner_wire_value(
             error: KernelPortError::Contract(format!(
                 "Kernel attached a typed Store failure to non-Store error {code}: {reason}"
             )),
-            expected: Some(expected.clone()),
+            expected: Some(Box::new(expected.clone())),
         }),
         WireOutcome::Error { code, reason, .. } => {
             let error = if code == "KERNEL_GATEWAY_REFUSAL" {
@@ -129,46 +129,46 @@ fn work_scope_owner_wire_value(
             };
             Err(WorkScopeOwnerWriteFailure::Kernel {
                 error,
-                expected: Some(expected.clone()),
+                expected: Some(Box::new(expected.clone())),
             })
         }
         WireOutcome::Partial { reason, .. } | WireOutcome::Unknown { reason } => {
             Err(WorkScopeOwnerWriteFailure::Kernel {
                 error: KernelPortError::Unknown(reason),
-                expected: Some(expected.clone()),
+                expected: Some(Box::new(expected.clone())),
             })
         }
         WireOutcome::AcceptedPending { .. } => Err(WorkScopeOwnerWriteFailure::Kernel {
             error: KernelPortError::Unknown(
                 "Kernel returned ACCEPTED_PENDING to an exact owner publisher".to_owned(),
             ),
-            expected: Some(expected.clone()),
+            expected: Some(Box::new(expected.clone())),
         }),
     }
 }
 
 fn work_scope_owner_record(
-    value: serde_json::Value,
+    value: &serde_json::Value,
     request: &StoreWorkScopeOwnerRequest,
     expected: &RecoveryRecord,
     state_fence: &StateFence,
 ) -> Result<RecoveryRecord, WorkScopeOwnerWriteFailure> {
-    let value = kind_value(&value, "store_work_scope_owner").map_err(|error| {
+    let value = kind_value(value, "store_work_scope_owner").map_err(|error| {
         WorkScopeOwnerWriteFailure::Kernel {
             error,
-            expected: Some(expected.clone()),
+            expected: Some(Box::new(expected.clone())),
         }
     })?;
     let record: RecoveryRecord =
         serde_json::from_value(value).map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
             error: KernelPortError::Contract(error.to_string()),
-            expected: Some(expected.clone()),
+            expected: Some(Box::new(expected.clone())),
         })?;
     record
         .validate_for_fence(state_fence)
         .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
             error: KernelPortError::Contract(error.to_string()),
-            expected: Some(expected.clone()),
+            expected: Some(Box::new(expected.clone())),
         })?;
     if record != *expected
         || record.namespace != OWNER_RECOVERY_NAMESPACE
@@ -179,7 +179,7 @@ fn work_scope_owner_record(
             error: KernelPortError::Contract(
                 "Kernel WorkScope owner write did not return the exact durable readback".to_owned(),
             ),
-            expected: Some(expected.clone()),
+            expected: Some(Box::new(expected.clone())),
         });
     }
     StoreWorkScopeOwnerResponse {
@@ -188,7 +188,7 @@ fn work_scope_owner_record(
     .validate_for_request(request)
     .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
         error: KernelPortError::Contract(error.to_string()),
-        expected: Some(expected.clone()),
+        expected: Some(Box::new(expected.clone())),
     })?;
     Ok(record)
 }
@@ -200,11 +200,11 @@ fn work_scope_owner_record(
 pub(super) enum WorkScopeOwnerWriteFailure {
     Store {
         failure: Box<StoreFailure>,
-        expected: RecoveryRecord,
+        expected: Box<RecoveryRecord>,
     },
     Kernel {
         error: KernelPortError,
-        expected: Option<RecoveryRecord>,
+        expected: Option<Box<RecoveryRecord>>,
     },
 }
 
@@ -696,10 +696,10 @@ impl DaemonKernelClient {
             .map_err(kernel_port_error)
             .map_err(|error| WorkScopeOwnerWriteFailure::Kernel {
                 error,
-                expected: Some(expected.clone()),
+                expected: Some(Box::new(expected.clone())),
             })?;
         let value = work_scope_owner_wire_value(outcome, claimed, &expected)?;
-        work_scope_owner_record(value, &request, &expected, &self.snapshot.state_fence())
+        work_scope_owner_record(&value, &request, &expected, &self.snapshot.state_fence())
     }
 
     fn recovery_snapshot(
