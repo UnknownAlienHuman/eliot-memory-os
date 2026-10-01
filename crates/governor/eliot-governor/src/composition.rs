@@ -483,6 +483,17 @@ pub trait KernelRecoveryPort: Send + Sync {
         request: KernelNamedReadRequest,
     ) -> Result<Option<KernelNamedReadReply>, KernelPortError>;
 
+    /// Executes one closed Store named read through the same authenticated
+    /// Kernel route used by canonical Store consumers.
+    fn store_named_read(
+        &self,
+        _request: eliot_store_api::NamedReadRequest,
+    ) -> Result<eliot_store_api::NamedReadResponse, KernelPortError> {
+        Err(KernelPortError::NotAdmitted(
+            "Kernel Store named-read route is not admitted".to_owned(),
+        ))
+    }
+
     /// Atomically seeds the complete Governor genesis owner set through the
     /// Canonical→Kernel→Store path.  Implementations must return success only
     /// for an idempotent all-absent genesis state; partial/unknown state must
@@ -814,6 +825,18 @@ pub struct KernelNamedReadReply {
     pub payload: Vec<u8>,
     /// Digest of the exact canonical owner payload bytes.
     pub value_digest: String,
+}
+
+/// Exact fresh WorkScope row envelope retained alongside its decoded binding.
+/// The value digest is the original Store owner digest over the exact payload
+/// bytes returned by the authenticated named read.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkScopeOwnerReadback {
+    pub state_fence: StateFence,
+    pub owner_revision: u64,
+    pub value_digest: String,
+    pub snapshot: WorkScopeBindingSnapshot,
 }
 
 /// One service observation recovered from the Kernel-owned state/control
@@ -5588,6 +5611,16 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
         &self,
         expected_state_fence: &StateFence,
     ) -> Result<Option<WorkScopeBindingSnapshot>, CompositionError> {
+        self.read_current_work_scope_owner_readback_with_provenance(expected_state_fence)
+            .map(|readback| readback.map(|owner| owner.snapshot))
+    }
+
+    /// Same fresh WorkScope named read with the Store-issued revision and
+    /// original payload digest preserved for downstream admission records.
+    pub fn read_current_work_scope_owner_readback_with_provenance(
+        &self,
+        expected_state_fence: &StateFence,
+    ) -> Result<Option<WorkScopeOwnerReadback>, CompositionError> {
         if self.readiness != CompositionReadiness::Ready {
             return Err(CompositionError::NotReady);
         }
@@ -5685,13 +5718,72 @@ impl<P: KernelGenerationPort + ?Sized> GovernorComposition<P> {
                             .to_owned(),
                     ));
                 }
-                Ok(Some(snapshot.clone()))
+                Ok(Some(WorkScopeOwnerReadback {
+                    state_fence: reply.state_fence,
+                    owner_revision: reply.revision,
+                    value_digest: reply.value_digest,
+                    snapshot: snapshot.clone(),
+                }))
             }
             _ => Err(CompositionError::Recovery(
                 "fresh Store WorkScope owner presence differs from the canonical Governor owner"
                     .to_owned(),
             )),
         }
+    }
+
+    /// Reads one independently persisted process-source admission through the
+    /// authenticated generic Store named-read route and joins it to the fresh
+    /// WorkScope row's original Store revision/digest. A source admission is
+    /// never selected from the WorkScope governing-document closure.
+    pub fn read_current_blob_process_source_admission(
+        &self,
+        identity: &eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionIdentity,
+        expected_state_fence: &StateFence,
+    ) -> Result<
+        Option<eliot_store_api::blob_process_source_admission::BlobProcessSourceAdmissionReadback>,
+        CompositionError,
+    > {
+        identity
+            .validate()
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let scope = self
+            .read_current_work_scope_owner_readback_with_provenance(expected_state_fence)?
+            .ok_or_else(|| {
+                CompositionError::Recovery(
+                    "process-source admission requires a current WorkScope owner".to_owned(),
+                )
+            })?;
+        if scope.snapshot.binding.scope.scope_ref != identity.work_scope_ref {
+            return Err(CompositionError::Recovery(
+                "process-source admission WorkScope differs from the current owner".to_owned(),
+            ));
+        }
+        let request = eliot_store_api::blob_process_source_admission::
+            blob_process_source_admission_read_request(identity, expected_state_fence)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        let response = self
+            .kernel
+            .store_named_read(request)
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if response.payload.is_null() {
+            return Ok(None);
+        }
+        let readback = eliot_store_api::blob_process_source_admission::
+            decode_blob_process_source_admission_readback(
+                &response,
+                identity,
+                expected_state_fence,
+            )
+            .map_err(|error| CompositionError::Recovery(error.to_string()))?;
+        if readback.admission.work_scope_owner_revision != scope.owner_revision
+            || readback.admission.work_scope_owner_digest != scope.value_digest
+        {
+            return Err(CompositionError::Recovery(
+                "process-source admission is not bound to current WorkScope owner facts".to_owned(),
+            ));
+        }
+        Ok(Some(readback))
     }
 
     /// Retains one execution-evidence page in the existing Skill lifecycle

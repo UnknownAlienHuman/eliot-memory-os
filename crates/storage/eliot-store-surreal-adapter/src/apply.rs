@@ -36,12 +36,14 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
 mod atomic_write;
+mod blob_process_source_admission;
 mod empty_migration;
 mod genesis;
 #[path = "health_probe.rs"]
 mod health_probe;
 mod read_boundary;
 mod receipt_reconciliation;
+mod recovery_owner_update;
 mod recovery;
 mod schema_contract;
 pub(crate) mod surreal_automation;

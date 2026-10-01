@@ -286,7 +286,7 @@ struct ActivatedReadDescriptor {
 /// against (issue #325 P1, I7.9: the obligation set belongs to the task's own
 /// contract rather than to a caller's scope, and it must be read at one exact
 /// contract revision rather than at whatever happens to be current).
-const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
+const ACTIVATED_READS: [ActivatedReadDescriptor; 24] = [
     ActivatedReadDescriptor {
         operation: NamedReadOperation::GetCurrentEpistemicPosition,
         requires_scope_id: true,
@@ -402,11 +402,16 @@ const ACTIVATED_READS: [ActivatedReadDescriptor; 23] = [
         requires_scope_id: false,
         scope_kind: SCOPE_KIND_NONE,
     },
+    ActivatedReadDescriptor {
+        operation: NamedReadOperation::GetBlobProcessSourceAdmission,
+        requires_scope_id: false,
+        scope_kind: SCOPE_KIND_NONE,
+    },
 ];
 
 /// Returns the activated read operations in canonical declaration order.
 #[must_use]
-pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
+pub const fn activated_read_operations() -> [NamedReadOperation; 24] {
     [
         ACTIVATED_READS[0].operation,
         ACTIVATED_READS[1].operation,
@@ -431,6 +436,7 @@ pub const fn activated_read_operations() -> [NamedReadOperation; 23] {
         ACTIVATED_READS[20].operation,
         ACTIVATED_READS[21].operation,
         ACTIVATED_READS[22].operation,
+        ACTIVATED_READS[23].operation,
     ]
 }
 
@@ -545,6 +551,18 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
         // Owner snapshots are bounded at 512 KiB. The existing 2 MiB bulk
         // parameter bound covers canonical JSON string escaping and the
         // remaining fixed parameters without broadening the payload bound.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordWorkScopeSnapshot,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::RecordBlobProcessSourceAdmission,
+        transition_classes: &[TransitionClass::RecoverySchema],
+        maximum_effect: EffectClass::ReversibleMutation,
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
     ActivatedMutationDescriptor {
