@@ -1659,6 +1659,21 @@ mod issue_1935_native_peer_tests {
             adapter_artifact_digest: "a".repeat(64),
             adapter_descriptor_digest: "b".repeat(64),
             installation_profile_digest: "c".repeat(64),
+            native_event_classes: [
+                "session.created",
+                "session.compacted",
+                "session.error",
+                "session.idle",
+                "permission.asked",
+                "permission.replied",
+                "file.edited",
+                "todo.updated",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            native_hook_classes: ["tool.execute.before", "tool.execute.after"]
+                .map(str::to_owned)
+                .to_vec(),
             executable_digest: "d".repeat(64),
             launch_nonce: "broker-launch-42".to_owned(),
             parent_broker_process_id: "4000".to_owned(),
@@ -1720,6 +1735,22 @@ mod issue_1935_native_peer_tests {
         assert!(submission.restricted_source_bytes.is_none());
         assert!(normalized_request_without_restricted_source(&request).get("native_source").is_none());
     }
+
+    #[test]
+    fn issue_1935_native_fingerprint_uses_broker_admitted_artifact_and_runtime_join() {
+        let binding = binding();
+        let projected = broker_process_binding_projection(&binding, "intro-digest");
+        assert_eq!(projected["process_id"], binding.process_id);
+        assert_eq!(projected["process_start_time_100ns"], binding.process_start_time_100ns);
+        assert_eq!(projected["adapter_artifact_sha256"], binding.adapter_artifact_digest);
+        assert_eq!(projected["adapter_descriptor_sha256"], binding.adapter_descriptor_digest);
+        assert_eq!(projected["installation_profile_sha256"], binding.installation_profile_digest);
+        assert_eq!(projected["native_event_classes"], serde_json::json!(binding.native_event_classes));
+        assert_eq!(projected["native_hook_classes"], serde_json::json!(binding.native_hook_classes));
+        assert_eq!(projected["executable_sha256"], binding.executable_digest);
+        assert!(broker_admitted_native_class(&binding, "session.idle"));
+        assert!(!broker_admitted_native_class(&binding, "caller.submitted"));
+    }
 }
 
 fn normalized_request_without_restricted_source(value: &serde_json::Value) -> serde_json::Value {
@@ -1728,6 +1759,32 @@ fn normalized_request_without_restricted_source(value: &serde_json::Value) -> se
         object.remove("native_source");
     }
     normalized
+}
+
+fn broker_process_binding_projection(
+    binding: &eliot_user_broker_core::OpenCodeProcessBinding,
+    introduction_digest: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "process_id": binding.process_id,
+        "process_start_time_100ns": binding.process_start_time_100ns,
+        "image_path": binding.image_path,
+        "adapter_artifact_sha256": binding.adapter_artifact_digest,
+        "adapter_descriptor_sha256": binding.adapter_descriptor_digest,
+        "installation_profile_sha256": binding.installation_profile_digest,
+        "native_event_classes": binding.native_event_classes,
+        "native_hook_classes": binding.native_hook_classes,
+        "executable_sha256": binding.executable_digest,
+        "launch_nonce": binding.launch_nonce,
+        "introduction_digest": introduction_digest,
+    })
+}
+
+fn broker_admitted_native_class(
+    binding: &eliot_user_broker_core::OpenCodeProcessBinding,
+    kind: &str,
+) -> bool {
+    binding.native_event_classes.iter().any(|expected| expected == kind)
 }
 
 fn transport_hash(body: &[u8]) -> String {
@@ -2208,18 +2265,16 @@ fn passive_envelope(
         "sequence".to_owned(),
         serde_json::Value::Number(sequence.into()),
     );
-    // These bindings come from the authenticated User Broker introduction,
-    // not from the plugin payload. They identify the actual OpenCode process
-    // that submitted this source frame; they do not identify an adapter
-    // artifact, so the downstream native-adapter fingerprint remains
-    // unavailable until its installation owner admits one.
+    // Every field comes from the authenticated User Broker introduction, not
+    // from plugin payload claims. The Broker joined the OS-observed process
+    // identity and executable digest to the exact installation-admitted
+    // adapter artifact, descriptor and profile before issuing this binding.
     envelope.insert(
         "opencode_process_binding".to_owned(),
-        serde_json::json!({
-            "executable_sha256": introduction.process_binding.executable_digest.as_str(),
-            "launch_nonce": introduction.process_binding.launch_nonce.as_str(),
-            "introduction_digest": introduction.introduction_digest.as_str(),
-        }),
+        broker_process_binding_projection(
+            &introduction.process_binding,
+            introduction.introduction_digest.as_str(),
+        ),
     );
     for field in [
         "native_emitted_at",
@@ -2299,6 +2354,12 @@ where
         );
     }
     if kind.is_empty() || kind.len() > MAX_EVENT_ID_BYTES {
+        return HttpOutcome::rejected(
+            HostEventReject::new(400, DISPOSITION_INVALID_REQUEST, REASON_INVALID_ARGUMENT),
+            Some(event_id),
+        );
+    }
+    if !broker_admitted_native_class(&introduction.process_binding, kind) {
         return HttpOutcome::rejected(
             HostEventReject::new(400, DISPOSITION_INVALID_REQUEST, REASON_INVALID_ARGUMENT),
             Some(event_id),

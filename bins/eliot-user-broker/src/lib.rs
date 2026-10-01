@@ -1709,6 +1709,8 @@ impl BrokerComposition {
             adapter_artifact_digest: adapter.artifact_digest.as_str().to_owned(),
             adapter_descriptor_digest: adapter.descriptor_digest.as_str().to_owned(),
             installation_profile_digest: profile.profile.profile_sha256.as_str().to_owned(),
+            native_event_classes: adapter.native_event_classes.clone(),
+            native_hook_classes: adapter.native_hook_classes.clone(),
             executable_digest: row.executable_sha256.clone(),
             launch_nonce,
             parent_broker_process_id: broker_process_id.to_string(),

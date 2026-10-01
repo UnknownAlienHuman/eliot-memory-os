@@ -5081,6 +5081,13 @@ pub struct OpenCodeProcessBinding {
     pub adapter_descriptor_digest: String,
     /// Exact protected User Broker installation profile digest.
     pub installation_profile_digest: String,
+    /// Independent lifecycle-event denominator parsed from the exact
+    /// installation-admitted adapter descriptor. It is a static owner
+    /// specification; runtime coverage remains unavailable without separate
+    /// native observation evidence.
+    pub native_event_classes: Vec<String>,
+    /// Independent hook denominator parsed from the same admitted descriptor.
+    pub native_hook_classes: Vec<String>,
     /// Lowercase SHA-256 hex of the exact approved `OpenCode` executable.
     pub executable_digest: String,
     /// Broker-minted launch nonce binding this introduction to one launch.
@@ -5107,6 +5114,34 @@ impl OpenCodeProcessBinding {
             &self.installation_profile_digest,
             "introduction.process_binding.installation_profile_digest",
         )?;
+        const EXPECTED_EVENTS: [&str; 8] = [
+            "session.created",
+            "session.compacted",
+            "session.error",
+            "session.idle",
+            "permission.asked",
+            "permission.replied",
+            "file.edited",
+            "todo.updated",
+        ];
+        const EXPECTED_HOOKS: [&str; 2] = ["tool.execute.before", "tool.execute.after"];
+        if self.native_event_classes.len() != EXPECTED_EVENTS.len()
+            || self
+                .native_event_classes
+                .iter()
+                .zip(EXPECTED_EVENTS)
+                .any(|(actual, expected)| actual != expected)
+            || self.native_hook_classes.len() != EXPECTED_HOOKS.len()
+            || self
+                .native_hook_classes
+                .iter()
+                .zip(EXPECTED_HOOKS)
+                .any(|(actual, expected)| actual != expected)
+        {
+            return Err(BrokerError::InvalidField(
+                "introduction.process_binding.native_event_manifest",
+            ));
+        }
         hex_digest(
             &self.executable_digest,
             "introduction.process_binding.executable_digest",
@@ -6996,10 +7031,38 @@ mod tests {
             adapter_artifact_digest: "a".repeat(64),
             adapter_descriptor_digest: "b".repeat(64),
             installation_profile_digest: "c".repeat(64),
+            native_event_classes: [
+                "session.created",
+                "session.compacted",
+                "session.error",
+                "session.idle",
+                "permission.asked",
+                "permission.replied",
+                "file.edited",
+                "todo.updated",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            native_hook_classes: ["tool.execute.before", "tool.execute.after"]
+                .map(str::to_owned)
+                .to_vec(),
             executable_digest: "d".repeat(64),
             launch_nonce: "broker-launch-42".to_owned(),
             parent_broker_process_id: "4000".to_owned(),
         }
+    }
+
+    #[test]
+    fn issue_1935_native_manifest_is_independent_and_closed() {
+        let mut admitted = issue_1935_opencode_process_binding();
+        assert!(admitted.validate().is_ok());
+        admitted.native_event_classes[0] = "caller.submitted".to_owned();
+        assert_eq!(
+            admitted.validate(),
+            Err(BrokerError::InvalidField(
+                "introduction.process_binding.native_event_manifest"
+            ))
+        );
     }
 
     #[test]
