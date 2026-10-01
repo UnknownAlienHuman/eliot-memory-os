@@ -1475,11 +1475,86 @@ impl KernelProcessStreamSinkClient {
         outcome.validate_against_session(&session)?;
         let response = self.calls.reconcile_current_call()
             .map_err(map_sink_ipc_error)?;
-        let (owner, original_terminal) = completed_sink_response_with_terminal(response)?;
-        let ProcessStreamSinkWireResponse::Readback { body } = owner else {
-            return Err(ProcessStreamSinkError::ProviderUnavailable);
-        };
-        readback_from_projection(&session, original_terminal.as_ref(), *body)
+        match response.outcome {
+            BlobProcessStreamKernelOutcome::Unknown { .. }
+            | BlobProcessStreamKernelOutcome::NotStarted { .. }
+            | BlobProcessStreamKernelOutcome::Unavailable { .. } => {
+                Ok(ProcessStreamSinkReadback::UnknownOutcome { outcome })
+            }
+            BlobProcessStreamKernelOutcome::Completed {
+                response,
+                original_terminal_request,
+                ..
+            } => {
+                let original_terminal =
+                    original_terminal_request.map(|request| *request);
+                let owner = match response.operation {
+                    BlobProcessStreamOperationResponse::SourceReadback { .. } => {
+                        return Err(ProcessStreamSinkError::BindingMismatch);
+                    }
+                    BlobProcessStreamOperationResponse::Sink { response } => response,
+                };
+                match owner {
+                    ProcessStreamSinkWireResponse::Finalized { body } => {
+                        let operation = original_terminal
+                            .as_ref()
+                            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                        if !matches!(
+                            operation,
+                            BlobProcessStreamKernelOperationRequest::SinkFinalize { .. }
+                        ) {
+                            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                        }
+                        let terminal = terminal_from_retained_operation(
+                            &session,
+                            operation,
+                            *body,
+                        )?;
+                        Ok(ProcessStreamSinkReadback::Terminal { terminal })
+                    }
+                    ProcessStreamSinkWireResponse::Aborted { body } => {
+                        let operation = original_terminal
+                            .as_ref()
+                            .ok_or(ProcessStreamSinkError::ProviderUnavailable)?;
+                        if !matches!(
+                            operation,
+                            BlobProcessStreamKernelOperationRequest::SinkAbort { .. }
+                        ) {
+                            return Err(ProcessStreamSinkError::TerminalIdentityConflict);
+                        }
+                        let terminal = terminal_from_retained_operation(
+                            &session,
+                            operation,
+                            *body,
+                        )?;
+                        Ok(ProcessStreamSinkReadback::Terminal { terminal })
+                    }
+                    ProcessStreamSinkWireResponse::Readback { body } => {
+                        readback_from_projection(
+                            &session,
+                            original_terminal.as_ref(),
+                            *body,
+                        )
+                    }
+                    ProcessStreamSinkWireResponse::AppendDisposition { body } => {
+                        // The exact completed append response is retained by
+                        // Kernel, but it is not a full session observation.
+                        // Use the distinct successor token for a read-only
+                        // sink readback before returning reconciled state.
+                        let _: ProcessStreamSinkAppendDisposition =
+                            serde_json::from_value(*body).map_err(|_| sink_invalid())?;
+                        self.readback_sync(session)
+                    }
+                    ProcessStreamSinkWireResponse::Opened { binding } => {
+                        ensure_binding_ref(&binding, &session)?;
+                        self.readback_sync(session)
+                    }
+                    ProcessStreamSinkWireResponse::Unavailable { .. } => {
+                        Ok(ProcessStreamSinkReadback::UnknownOutcome { outcome })
+                    }
+                }
+            }
+        }
     }
 
     fn binding_for_session(
