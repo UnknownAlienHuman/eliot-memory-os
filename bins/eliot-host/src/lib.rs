@@ -3317,7 +3317,7 @@ impl HostJobBranches {
         kernel_authority_epoch: EpochId,
         active_manifest: &CandidateManifest,
     ) -> Result<(KernelActivationReceipt, KernelReadyReceipt), HostError> {
-        let launch = self.launch.as_ref().ok_or_else(|| {
+        let launch = self.launch.clone().ok_or_else(|| {
             HostError::ProcessContour("runtime launch descriptor is missing".to_owned())
         })?;
         let kernel_artifact = self.kernel_artifact_digest.as_ref().ok_or_else(|| {
@@ -12637,7 +12637,7 @@ impl HostComposition {
             .manifest
             .host_child_artifact_digests()
             .map_err(|error| HostError::ProcessContour(error.to_string()))?;
-        let materialized_config_digest = self.jobs.config_digest.as_ref().ok_or_else(|| {
+        let materialized_config_digest = self.jobs.config_digest.clone().ok_or_else(|| {
             HostError::ProcessContour(
                 "readiness probe has no materialized Store config digest".to_owned(),
             )
@@ -12651,7 +12651,7 @@ impl HostComposition {
             generation,
             kernel_artifact,
             store_artifact,
-            materialized_config_digest,
+            &materialized_config_digest,
         )?;
         let registry_authority = self
             .registry
@@ -12730,7 +12730,7 @@ impl HostComposition {
             generation,
             kernel_artifact,
             store_artifact,
-            materialized_config_digest,
+            &materialized_config_digest,
             &supervision_evidence,
             admitted_heartbeat
                 .as_ref()
@@ -12769,7 +12769,7 @@ impl HostComposition {
                 &self.journal,
                 &proof,
                 kernel_artifact,
-                materialized_config_digest,
+                &materialized_config_digest,
                 &watchdog_template,
                 &heartbeat_refs,
             )?;
@@ -12781,7 +12781,7 @@ impl HostComposition {
                 generation,
                 kernel_artifact,
                 store_artifact,
-                materialized_config_digest,
+                &materialized_config_digest,
             )?;
             if !confirmed.same_probe_input_contour(&contour)
                 || confirmed.store_proof_fence.as_ref() != Some(&proof.store_fence)
