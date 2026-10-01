@@ -1108,11 +1108,22 @@ where
     )
     .await
     .map_err(restriction_commit_refused)?;
-    // `insert` cannot refuse here and the reason is structural, not empirical:
-    // the key was located by `apply_scope_change` and is therefore already
-    // retained, and the revision presented now is exactly one greater than the
-    // revision retained for it, which is the only ordering `insert` accepts.
-    admission.insert(restricted.clone(), revision);
+    // The install is checked, not assumed: `insert` accepts only a strictly
+    // newer owner-issued revision, and the successor installed here is the
+    // store contract `expected + 1` re-derived locally rather than read back
+    // from the receipt (see `capability_evidence_commit`). A provider that
+    // issued anything else would make this refuse; surfacing that as a
+    // commit-leg refusal keeps the held revision from silently disagreeing
+    // with the store. The in-process restriction REMAINS either way —
+    // `apply_scope_change` already limited the retained record — so the
+    // failure direction is closed and the next startup drain re-reads the
+    // store revision and converges.
+    if !admission.insert(restricted.clone(), revision) {
+        return Err(EvidenceBridgeError::RestrictionCommit(format!(
+            "store-issued revision for {} was not installed into the held view",
+            restricted.skill_id
+        )));
+    }
     Ok(())
 }
 
