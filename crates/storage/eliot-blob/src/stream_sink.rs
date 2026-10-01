@@ -19,7 +19,17 @@
 //!   returns the same session; a different digest is `OpenDigestMismatch`.
 //! * `append` admits exact sequence/offset chunks into a staging buffer
 //!   bounded by the session ceilings, with exact-replay acknowledgement and
-//!   an explicit backpressure contract. Appends never touch storage.
+//!   an explicit backpressure contract. Appends never touch storage, never
+//!   wait and never retry.
+//! * Backpressure isolation (issue #267 W5): the RETAINED bytes this session
+//!   will keep and the QUEUED / IN-FLIGHT bytes it is holding right now are
+//!   two separate accountings against two separate declared ceilings, and both
+//!   are enforced. See [`PersistenceQueueBound`].
+//! * The declared overflow disposition is `Backpressured`: a full persistence
+//!   queue REFUSES the append, stages nothing and charges nothing, and the
+//!   caller applies backpressure at its own end. This adapter holds no wait
+//!   on the append path, so persistence pressure can never stall the pipe
+//!   drain.
 //! * `finalize` publishes only a gap-free, transport-complete source through
 //!   one durable stage call, verifies the ready receipt, reads the object
 //!   back, and only then mints the `COMPLETE_SOURCE` terminal. Anything else
@@ -73,6 +83,16 @@
 //! duration of one in-flight publication, and a dropped publication stays
 //! recoverable. The append-only temporary object that removes this window
 //! entirely is the #297 path named below.
+//!
+//! Shed bytes are never coverage (issue #267 W5). An append refused by the
+//! persistence-queue ceiling is refused BEFORE anything is charged: it does
+//! not reach `staged`, does not feed the transport digest or the preview, and
+//! advances neither `next_sequence` nor `next_offset`. So a shed byte cannot
+//! appear in the admitted digest, the admitted count, the published object or
+//! any measure, and a session that shed is only ever publishable if its own
+//! caller declared the matching gap. Bytes that are dropped are recorded by
+//! the caller as `StreamEvidenceGap::PersistenceBackpressure`; this adapter
+//! never mints a terminal that calls them covered.
 //!
 //! Publication coverage (audit `5881613195`): a terminal is always the one
 //! [`BlobStreamPublication`] the session actually proved. A gapped,
@@ -265,6 +285,15 @@ pub enum BlobStreamUnavailableReason {
 /// contract; the ready receipt reference resolves and verifies the object.
 const BLOB_SOURCE_LOCATOR_SCHEME: &str = "blob";
 
+/// Serialized size of one `u64` field in a queue record.
+///
+/// A canonical serialization carries the value's decimal text, but the byte
+/// width of the slot is used here as the FIXED per-record overhead, so the
+/// charge is a floor: it can only understate a real digest string, and a real
+/// digest string is added on top of it exactly. This is not a new limit — it
+/// is the width of a field the record already has.
+const U64_SERIALIZED_BYTES: u64 = 8;
+
 /// Store-side identities bound once for one sink session.
 ///
 /// The composition owner supplies the one root lease, one stage context
@@ -360,6 +389,11 @@ struct SinkState {
     /// the admitted stream itself.
     admissible_source: Option<BlobStreamAdmissibleSourceMeasure>,
     admitted_chunks: Vec<AdmittedChunk>,
+    /// The QUEUED / IN-FLIGHT half of the accounting, independent of the
+    /// RETAINED half (`next_offset` against `max_total_admitted_bytes`).
+    /// See [`PersistenceQueueBound`] for what each side bounds and why the
+    /// overflow disposition is a refusal rather than a block.
+    persistence_queue: PersistenceQueueBound,
     next_sequence: u64,
     next_offset: u64,
     terminal: Option<ProcessStreamSinkTerminal>,
@@ -423,11 +457,80 @@ pub struct BlobStreamAdmissibleSourceMeasure {
     pub sha256: String,
 }
 
+/// One admitted chunk's queue metadata — no plaintext.
+///
+/// A record is what the persistence queue holds *beside* the plaintext: a
+/// sequence, an offset, the exact byte length and the caller's per-chunk
+/// digest string. It is why `max_in_flight_chunks` bounds records rather than
+/// a claim, and it is why the in-flight byte charge is a serialization size
+/// and not a `Vec::len()`: `Vec::len()` counts one chunk's payload only, and
+/// is blind to this record and to the same bytes already copied into
+/// [`SinkState::staged`].
 struct AdmittedChunk {
     sequence: u64,
     offset: u64,
     length: u64,
     sha256: String,
+}
+
+/// The two INDEPENDENT accountings this adapter now keeps for one session.
+///
+/// They are deliberately separate quantities and neither is derived from the
+/// other, because "bytes the sink will KEEP" and "bytes the sink is HOLDING
+/// right now on behalf of persistence" have different ceilings and different
+/// failure modes:
+///
+/// * **RETAINED** is the caller-supplied `max_total_admitted_bytes`. It is
+///   what the terminal's coverage claim rests on, and it is charged against
+///   `next_offset` — a monotone cursor that never runs back down, so a
+///   released byte is never re-spendable and the total over a session's life
+///   is bounded by the session, not by instantaneous occupancy.
+/// * **QUEUED / IN-FLIGHT** is the declared `max_in_flight_chunks` and
+///   `max_in_flight_bytes`. It is charged when an append is admitted and
+///   released when the session's terminal is recorded. Until then the charge
+///   is real memory this adapter is holding, so a full queue refuses the
+///   *next* append immediately instead of waiting for room to appear.
+///
+/// The overflow disposition is `ProcessStreamSinkAppendDisposition::
+/// Backpressured`: the append is REFUSED, nothing is staged, and the caller
+/// applies backpressure at its own end and records the shed byte range as a
+/// `StreamEvidenceGap`. This adapter never blocks, never sleeps, never retries
+/// and never queues behind a provider call, so a full persistence queue
+/// cannot stall the pipe drain.
+///
+/// Every dimension here is a ceiling this crate already READS from the
+/// session (`ProcessStreamSinkLimits::max_in_flight_chunks` and
+/// `::max_in_flight_bytes`), both of which the #296 constructor already
+/// rejects at zero. No numeric limit is invented by this adapter.
+struct PersistenceQueueBound {
+    /// Queued/in-flight chunk records currently charged.
+    queued_chunks: u32,
+    /// Queued/in-flight bytes currently charged, measured as a serialization
+    /// size (see [`PersistenceQueueBound::record_bytes`]).
+    queued_bytes: u64,
+    /// Latched once a queued/in-flight ceiling refused an append. It is never
+    /// cleared, so once the persistence queue has overflowed every later
+    /// append sheds too and the pipe keeps draining at full speed. Latching
+    /// is what makes "cannot stall indefinitely" structural rather than a
+    /// property of the caller noticing to stop retrying.
+    overflowed: bool,
+}
+
+impl PersistenceQueueBound {
+    /// Serialization size of one chunk's queue metadata plus its payload.
+    ///
+    /// The four `u64` slots are charged at their byte width (see
+    /// [`U64_SERIALIZED_BYTES`]) and the digest at its exact hex length, so
+    /// the fixed part is a floor rather than an over-count. A longer digest
+    /// only ever RAISES the charge, so this can never under-count what the
+    /// record really costs.
+    fn record_bytes(length: u64, sha256_hex_len: usize) -> u64 {
+        // The fixed fields are the sequence, the offset, the length and the
+        // retained digest's own length — four `u64` slots.
+        let fixed = 4 * U64_SERIALIZED_BYTES;
+        let digest = u64::try_from(sha256_hex_len).unwrap_or(u64::MAX);
+        fixed.saturating_add(digest).saturating_add(length)
+    }
 }
 
 /// Bounded phase record for the one terminal command of one session.
@@ -634,6 +737,11 @@ impl SinkState {
             preview: BoundedPreviewDigest::new(),
             admissible_source: None,
             admitted_chunks: Vec::new(),
+            persistence_queue: PersistenceQueueBound {
+                queued_chunks: 0,
+                queued_bytes: 0,
+                overflowed: false,
+            },
             next_sequence: 0,
             next_offset: 0,
             terminal: None,
@@ -987,6 +1095,19 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         Ok(ProcessStreamSinkReadback::Session { view })
     }
 
+    /// Exact bytes one arriving append charges the persistence queue.
+    ///
+    /// The charge is a SERIALIZATION size and not `request.byte_length()`: this
+    /// adapter produces two live copies of every arriving byte — the caller's
+    /// `ProcessStreamSinkAppend` and the copy this adapter extends into
+    /// [`SinkState::staged`] — plus one queue record per chunk. Accounting only
+    /// the payload would leave every record and the staged copy invisible to
+    /// the byte ceiling, which is the finding the audit names: "not only
+    /// `Vec::len()`".
+    fn queue_charge_bytes(request: &ProcessStreamSinkAppend) -> u64 {
+        PersistenceQueueBound::record_bytes(request.byte_length(), request.sha256().len())
+    }
+
     fn append_locked(
         state: &mut SinkState,
         session: &ProcessStreamSinkSession,
@@ -1045,11 +1166,49 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         {
             return Err(ProcessStreamSinkError::TotalLimitExceeded);
         }
-        // This synchronous adapter has no append queue: each request is
-        // admitted as one bounded chunk. The total byte and chunk ceilings
-        // bound staged memory and reject overflow explicitly above. Since
-        // each admitted sequence adds one record, max_chunks also bounds
-        // this metadata without retaining another plaintext copy.
+        // PERSISTENCE QUEUE BOUND (issue #267 W5). This is the half of the
+        // accounting the RETAINED ceiling above cannot express. `next_offset`
+        // answers "how much will this session keep"; the ledger below answers
+        // "how much is this adapter holding right now for persistence", and
+        // the two have separate ceilings because a caller can be refused long
+        // before its retained total is reached.
+        //
+        // The check is BEFORE any charge and before `staged` is extended, so a
+        // refused append stages nothing, digests nothing and advances no
+        // cursor: a shed byte can never reach the staged plaintext, the
+        // transport digest or the admitted count, and therefore can never be
+        // counted as covered.
+        //
+        // `retry_after_ms` is a hint, never a promise. This adapter holds no
+        // wait on the append path — it never sleeps, never retries, never
+        // queues behind a provider call — so `0` states the truth that room
+        // only appears as a terminal or abort releases it. A caller that
+        // retries immediately still gets an immediate, identical refusal
+        // instead of a block, and the drain therefore cannot stall here.
+        let charged_bytes = Self::queue_charge_bytes(request);
+        if state.persistence_queue.overflowed
+            || u64::from(state.persistence_queue.queued_chunks).saturating_add(1)
+                > u64::from(limits.max_in_flight_chunks())
+            || state
+                .persistence_queue
+                .queued_bytes
+                .saturating_add(charged_bytes)
+                > limits.max_in_flight_bytes()
+        {
+            // Latched, never cleared: once persistence has overflowed, every
+            // later append sheds too. That is what makes the drain immune to
+            // a stalled provider — a caller cannot grind through a full queue
+            // by retrying, and a caller's failure to stop retrying costs it a
+            // refusal per chunk, never the pipe.
+            state.persistence_queue.overflowed = true;
+            return Ok(ProcessStreamSinkAppendDisposition::Backpressured { retry_after_ms: 0 });
+        }
+        state.persistence_queue.queued_chunks =
+            state.persistence_queue.queued_chunks.saturating_add(1);
+        state.persistence_queue.queued_bytes = state
+            .persistence_queue
+            .queued_bytes
+            .saturating_add(charged_bytes);
         state.admitted_chunks.push(AdmittedChunk {
             sequence: request.sequence(),
             offset: request.offset(),
@@ -1623,6 +1782,14 @@ impl<C: BlobStoreClient> BlobStoreStreamSink<C> {
         }
         state.terminal_command = Some(identity);
         state.finalization = None;
+        // The whole persistence-queue charge is released with the terminal,
+        // because this is the last moment anything is retained: the staged
+        // plaintext, the queue records and the queued byte count all go at
+        // once. Releasing it here is also what bounds the charge's LIFETIME —
+        // an adapter whose session never terminates keeps its charge, and that
+        // is precisely the pressure the ceiling above is there to refuse.
+        state.persistence_queue.queued_chunks = 0;
+        state.persistence_queue.queued_bytes = 0;
         state.staged = Vec::new();
         state.publication = Some(publication);
         state.terminal = Some(terminal.clone());
