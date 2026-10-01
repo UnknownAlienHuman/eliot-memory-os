@@ -3659,34 +3659,31 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         if is_idempotency_conflict_reply(&reply, &envelope) {
             return Err(PortFailure::IdempotencyConflict);
         }
-        match decode_admitted_reply(&reply, &envelope) {
-            Some((receipt, record)) => {
-                // Unresolved durable states are re-read from the Kernel-owned
-                // record instead of assumed: the admitted pair is presented
-                // unchanged to the rehydrate entry and the refreshed state is
-                // mapped. A failed re-read keeps the admitted record the owner
-                // already returned; its handle stays the typed reconcile path.
-                let record = match record.state {
-                    HostRequestRecordState::PossiblyEffected
-                    | HostRequestRecordState::Unknown
-                    | HostRequestRecordState::Reconciling => {
-                        match self.rehydrate_operation(&envelope, &receipt) {
-                            Ok(refreshed) => refreshed,
-                            Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
-                            Err(_) => record,
-                        }
+        if let Some((receipt, record)) = decode_admitted_reply(&reply, &envelope) {
+            // Unresolved durable states are re-read from the Kernel-owned
+            // record instead of assumed: the admitted pair is presented
+            // unchanged to the rehydrate entry and the refreshed state is
+            // mapped. A failed re-read keeps the admitted record the owner
+            // already returned; its handle stays the typed reconcile path.
+            let record = match record.state {
+                HostRequestRecordState::PossiblyEffected
+                | HostRequestRecordState::Unknown
+                | HostRequestRecordState::Reconciling => {
+                    match self.rehydrate_operation(&envelope, &receipt) {
+                        Ok(refreshed) => refreshed,
+                        Err(error @ PortFailure::AgentResponse { .. }) => return Err(error),
+                        Err(_) => record,
                     }
-                    _ => record,
-                };
-                self.record_settled(
-                    correlation.as_str(),
-                    submit_outcome(&receipt, &record, request, &envelope),
-                )
-            }
-            None => {
-                let outcome = self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
-                self.record_settled(correlation.as_str(), outcome)
-            }
+                }
+                _ => record,
+            };
+            self.record_settled(
+                correlation.as_str(),
+                submit_outcome(&receipt, &record, request, &envelope),
+            )
+        } else {
+            let outcome = self.probe_settles_invocation(&facts, &session, &envelope, now_ms);
+            self.record_settled(correlation.as_str(), outcome)
         }
     }
 
@@ -3745,23 +3742,20 @@ impl KernelHostRequestPort for KernelHostRequestClient {
         if is_idempotency_conflict_reply(&reply, &envelope) {
             return Err(PortFailure::IdempotencyConflict);
         }
-        match decode_admitted_reply(&reply, &envelope) {
-            Some((_, _intent_record)) => {
-                let outcome =
-                    self.resolve_cancellation_parent_disposition(&parent, &facts, &session);
-                self.record_settled(parent.request_base.as_str(), outcome)
-            }
-            None => {
-                let outcome = self.resolve_retained_cancellation(
-                    &parent,
-                    cancel_correlation.as_str(),
-                    &envelope,
-                    &facts,
-                    &session,
-                    now_ms,
-                );
-                self.record_settled(parent.request_base.as_str(), outcome)
-            }
+        if let Some((_, _intent_record)) = decode_admitted_reply(&reply, &envelope) {
+            let outcome =
+                self.resolve_cancellation_parent_disposition(&parent, &facts, &session);
+            self.record_settled(parent.request_base.as_str(), outcome)
+        } else {
+            let outcome = self.resolve_retained_cancellation(
+                &parent,
+                cancel_correlation.as_str(),
+                &envelope,
+                &facts,
+                &session,
+                now_ms,
+            );
+            self.record_settled(parent.request_base.as_str(), outcome)
         }
     }
 
