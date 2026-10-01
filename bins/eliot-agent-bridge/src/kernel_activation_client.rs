@@ -87,9 +87,7 @@ pub(super) fn agent_reason_for_denial(
 /// so its honest recovery is a new ticket. The directive is read from the
 /// generated `BRIDGE_DENIAL_PROJECTION` table; a missing row fails closed at
 /// the caller.
-pub(super) fn denial_directive_kind(
-    code: AgentBridgeActivationDenialCode,
-) -> Option<&'static str> {
+pub(super) fn denial_directive_kind(code: AgentBridgeActivationDenialCode) -> Option<&'static str> {
     eliot_protocol::bridge_denial_projection(code.as_str()).map(|row| row.directive)
 }
 
