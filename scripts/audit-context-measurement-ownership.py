@@ -275,6 +275,46 @@ CONSUMER_DEPENDENCY_MARKERS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# Who owns a stale inventory row.
+#
+# A row whose recorded ``source_sha256`` no longer matches the live file is an
+# unfinished migration owned by the issue that row is allocated to, not by #787.
+# #787 may not edit ``scripts/context_measurement_inventory.py`` (#866's
+# single-writer producer) and may not edit the consumer implementations, so it
+# can only *name* the owner that has to re-derive the row. Naming it is what
+# turns a bare digest mismatch into actionable unfinished work.
+#
+# The owner is read from the artifact row's OWN ``owner`` field -- the
+# allocation #866 itself recorded -- so the attribution cannot drift from the
+# artifact the way a list written here could. This closed table maps that
+# recorded owner string to the issue that must act, and is closed in both
+# directions: an owner outside the table is reported as UNATTRIBUTED rather
+# than being guessed into one of the entries below.
+# ---------------------------------------------------------------------------
+ROW_INVALIDATION_OWNERS: dict[str, str] = {
+    CANONICAL_MEASUREMENT_OWNER: (
+        f"#{MEASUREMENT_OWNER_ISSUE} must re-derive this row through "
+        f"`python scripts/context_measurement_inventory.py sync --root .`"
+    ),
+    "#783": (
+        "#783 must finish migrating this consumer and then #787 re-derives the row "
+        f"through `python scripts/context_measurement_inventory.py sync --root .`"
+    ),
+    "#878": (
+        "#878 must finish migrating this consumer and then #787 re-derives the row "
+        f"through `python scripts/context_measurement_inventory.py sync --root .`"
+    ),
+    "#880": (
+        "#880 must finish migrating this consumer and then #787 re-derives the row "
+        f"through `python scripts/context_measurement_inventory.py sync --root .`"
+    ),
+    "unresolved": (
+        "the candidate has no exact-scope owner, so no issue may re-derive it until "
+        "the coverage gap is closed by the integration; #787 never invents an owner"
+    ),
+}
+
 
 class OracleError(RuntimeError):
     """Typed fail-closed error carrying a machine-readable reason code."""
@@ -895,6 +935,72 @@ def _producer_check(
     return "stale", "producer re-emission differs from the stored artifact"
 
 
+def _stale_row_attribution(
+    rows: list[dict[str, Any]],
+    stale_paths: Mapping[str, set[str]],
+    rel: str,
+    measured_sha: str,
+) -> str:
+    """Name the unfinished work behind every stale row in one changed file.
+
+    A file whose bytes moved invalidates *every* row anchored to it, whether or
+    not that row's own span drifted: the producer's per-row ``invalidation``
+    contract says so in the artifact itself -- "row invalid when the source span
+    digest, **file sha**, rule revision, owner map, or owner allocation
+    changes; rerun sync". So this function never decides which rows are stale.
+    It is handed the rows the producer already measured as stale for ``rel`` and
+    only reports what has to happen to them.
+
+    The expected set is the artifact's OWN rows grouped by the file they point
+    at -- read from the artifact, never from the caller list the digest check
+    iterated -- so the comparison answers "does this changed file invalidate
+    rows nobody reported?", which is the failure mode a per-row loop silently
+    shares between the two ``SOURCE_DIGEST_CHANGED`` sites.
+
+    Returns one sentence naming each stale row's recorded owner, its status,
+    and the issue that must re-derive it. An owner outside
+    ``ROW_INVALIDATION_OWNERS`` is named verbatim as unattributed rather than
+    being folded into a known owner.
+    """
+    affected = sorted(
+        (str(row["id"]), str(row["case_ref"]), str(row["owner"]), str(row["status"]))
+        for row in rows
+        if str(row["path"]) == rel and str(row["source_sha256"]) != measured_sha
+    )
+    reported = stale_paths.get(rel, set())
+    parts: list[str] = []
+    for row_id, case_ref, owner, status in affected:
+        if case_ref not in reported:
+            # Defensive: the digest check and this attribution read the same
+            # artifact, so this cannot normally fire. It is kept so a future
+            # refactor that narrows one of the two digest sites is reported as
+            # a stale row rather than silently dropped from this sentence.
+            parts.append(
+                f"row {row_id} ({case_ref}, owner {owner}, status {status}) is stale but "
+                f"was not reported by the digest comparison"
+            )
+            continue
+        owed = ROW_INVALIDATION_OWNERS.get(owner)
+        if owed is None:
+            parts.append(
+                f"row {row_id} ({case_ref}) is allocated to owner {owner!r}, which is outside "
+                f"the closed re-derivation set, so this oracle cannot name who must act"
+            )
+        else:
+            parts.append(
+                f"row {row_id} ({case_ref}, owner {owner}, status {status}) is stale: {owed}"
+            )
+    if not parts:
+        return ""
+    return (
+        f"{rel} now measures {measured_sha[:16]}, which invalidates "
+        f"{len(affected)} recorded row(s) in it -- "
+        + "; ".join(parts)
+        + f"; this is unfinished work owned outside #{ISSUE}, which may not edit the "
+        f"#{PRODUCER_ISSUE} producer or the consumer sources"
+    )
+
+
 def _unaccounted_candidates(
     root: Path,
     producer: Any,
@@ -1368,6 +1474,14 @@ def evaluate(root: Path) -> OwnershipResult:
             seen_row_identity[identity] = str(row["id"])
 
     # Match measured candidates (from the producer) to stored rows by case_ref.
+    #
+    # ``stale_cases`` records, per declared scan root, which case_refs the
+    # producer measured as carrying a stale file digest. It is filled by this
+    # loop and read by the per-row ``row-digest`` pass below, so both digest
+    # sites agree on one measured verdict instead of each deciding staleness
+    # for itself from a different source (the producer's candidate record here,
+    # the producer's file record there).
+    stale_cases: dict[str, set[str]] = {}
     for cand in candidates:
         case_ref = str(cand["case_ref"])
         row = by_case.get(case_ref)
@@ -1406,13 +1520,21 @@ def evaluate(root: Path) -> OwnershipResult:
                 rule="row-coverage",
             )
         if str(row["source_sha256"]) != str(cand["source_sha256"]):
+            stale_cases.setdefault(str(cand["path"]), set()).add(case_ref)
             add(
                 "SOURCE_DIGEST_CHANGED",
                 f"candidate {case_ref} source file digest changed: stored "
-                f"{row['source_sha256'][:16]}, measured {cand['source_sha256'][:16]}",
+                f"{row['source_sha256'][:16]}, measured {cand['source_sha256'][:16]}; "
+                f"the row's own recorded span is still "
+                f"{row['span_start']}-{row['span_end']} while the #{PRODUCER_ISSUE} "
+                f"producer now locates this signal at "
+                f"{cand['span_start']}-{cand['span_end']}, so the file moved under an "
+                f"unchanged measurement line",
                 row_id=str(row["id"]),
                 case_ref=case_ref,
                 path=str(cand["path"]),
+                span_start=int(cand["span_start"]),
+                span_end=int(cand["span_end"]),
                 rule="row-coverage",
             )
         if str(row["classification"]) != str(cand["classification"]):
@@ -1492,6 +1614,7 @@ def evaluate(root: Path) -> OwnershipResult:
     # of the candidate-by-candidate comparison above: it needs no signal to still
     # be present, so it also covers rows whose measurement site was migrated.
     measured_file_sha = {str(rec["path"]): str(rec["sha256"]) for rec in file_records}
+    attributed: set[str] = set()
     for row in rows:
         rel = str(row["path"])
         measured_sha = measured_file_sha.get(rel)
@@ -1501,11 +1624,21 @@ def evaluate(root: Path) -> OwnershipResult:
             # source digest claim instead, which is checked in _producer_check.
             continue
         if str(row["source_sha256"]) != measured_sha:
+            # One measured verdict per changed file, carried by the first row
+            # that reaches this pass. The attribution sentence names EVERY stale
+            # row in the file, so repeating it on each of the file's rows would
+            # restate one defect N times in the detail without adding a row to
+            # it. The findings themselves stay one-per-stale-row.
+            attribution = ""
+            if rel not in attributed:
+                attributed.add(rel)
+                attribution = _stale_row_attribution(rows, stale_cases, rel, measured_sha)
             add(
                 "SOURCE_DIGEST_CHANGED",
                 f"row {row['id']} ({row['case_ref']}) records source digest "
                 f"{str(row['source_sha256'])[:16]} for {rel} but the live file measures "
-                f"{measured_sha[:16]}; the stored row was measured against different source",
+                f"{measured_sha[:16]}; the stored row was measured against different "
+                f"source.{' ' + attribution if attribution else ''}",
                 row_id=str(row["id"]),
                 case_ref=str(row["case_ref"]),
                 path=rel,
