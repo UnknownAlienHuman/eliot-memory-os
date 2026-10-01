@@ -884,6 +884,7 @@ impl KernelComposition {
             receipt: serde_json::to_value(receipt).map_err(|_| TransportError::SessionFenced)?,
             receipt_operation_order: receipt.operation_order(),
             row_operation_id: record.operation_id.as_str().to_owned(),
+            stage_operation_id: record.stage_operation_id.as_str().to_owned(),
             state_fence: serde_json::to_value(&record.state_fence)
                 .map_err(|_| TransportError::SessionFenced)?,
             authority_epoch: serde_json::to_value(&record.authority_epoch)
@@ -1079,6 +1080,7 @@ impl KernelComposition {
             receipt: serde_json::to_value(receipt).map_err(|_| TransportError::SessionFenced)?,
             receipt_operation_order: receipt.operation_order(),
             row_operation_id: record.operation_id.as_str().to_owned(),
+            stage_operation_id: record.stage_operation_id.as_str().to_owned(),
             state_fence: serde_json::to_value(&record.state_fence)
                 .map_err(|_| TransportError::SessionFenced)?,
             authority_epoch: serde_json::to_value(&record.authority_epoch)
