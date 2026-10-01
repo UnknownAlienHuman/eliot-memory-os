@@ -1571,10 +1571,27 @@ public static class UserAutomationOutcomeClassifier
             return false;
         }
 
-        var committed = TryReadCommittedRevisionBinding(configuration);
+        // Absence of a committed revision is NOT fatal, and must not be read as
+        // one. The owner permits exactly two shapes that carry none: a read-only
+        // phase and a `run_now`. Both are legitimate answers (`list`, `status`,
+        // `history`, `inspect_last_failure`, `run_now`), so refusing every
+        // transition without a committed revision would over-refuse most of the
+        // catalogue to fix nothing.
+        //
+        // What the owner does forbid is either of those two shapes carrying a
+        // horizon or an orchestration record — a read is refused as "carries
+        // mutation phases" and a `run_now` as "phases are not bound to the
+        // committed occurrence". A horizon or orchestration record therefore may
+        // only be admitted beside a committed-revision configuration phase,
+        // which is the sole shape the owner lets carry one. Gating on that here
+        // means the revision join below can never be silently skipped by a body
+        // whose configuration phase does not justify one, which is exactly the
+        // spliced shape a parent join exists to refuse.
+        var hasCommittedRevision = TryReadCommittedRevisionBinding(configuration, out var committed);
 
         if (transition.TryGetProperty("horizon", out var horizon)
             && (!OptionalRecordIsAbsentOrObject(transition, "horizon")
+                || !hasCommittedRevision
                 || !HasCurrentHorizonPhase(horizon, committed)))
         {
             return false;
@@ -1582,6 +1599,7 @@ public static class UserAutomationOutcomeClassifier
 
         return !transition.TryGetProperty(OptionalOrchestrationMember, out var orchestration)
             || (OptionalRecordIsAbsentOrObject(transition, OptionalOrchestrationMember)
+                && hasCommittedRevision
                 && HasCurrentOrchestrationRecord(orchestration, parent, committed));
     }
 
