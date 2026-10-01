@@ -413,6 +413,17 @@ pub struct InstrumentSpecParams {
     /// Fixed command template; empty when the manifest declares none, in
     /// which case only the empty argument vector is admitted.
     pub argument_template: Vec<String>,
+    /// Explicitly permitted toolchain environment variable names.
+    ///
+    /// This is the closed set of ambient variable NAMES this instrument's
+    /// command is allowed to receive. It is a name allowlist, not a value
+    /// assignment: the values are supplied by the composing owner from roots
+    /// it already admitted (the target layout), never inherited wholesale from
+    /// the host. A name absent here is not placed in the child's projection,
+    /// so I18.21's "environment differences are declared profile dependencies"
+    /// is satisfied by the spec itself rather than by whatever the machine
+    /// happened to export.
+    pub environment_variables: Vec<String>,
     /// Admitted credential policy identity.
     pub credential_policy: ContractId,
     /// Admitted network policy identity.
@@ -456,6 +467,13 @@ pub struct InstrumentSpec {
     pub schema: ContractId,
     /// Fixed command template; empty admits only the empty argument vector.
     pub argument_template: Vec<String>,
+    /// Explicitly permitted toolchain environment variable names.
+    ///
+    /// Bound into [`Self::digest`], so a change to what a stage's command may
+    /// read changes the spec identity the admission and the receipt carry. The
+    /// composing owner resolves each name against roots it admitted; no value
+    /// is ever taken from the host wholesale.
+    pub environment_variables: Vec<String>,
     /// Admitted credential policy identity.
     pub credential_policy: ContractId,
     /// Admitted network policy identity.
@@ -472,8 +490,8 @@ impl InstrumentSpec {
     /// # Errors
     ///
     /// Returns [`ProfileError::InvalidText`] when the executable name, the
-    /// environment class, a pinned version, or a template argument is blank
-    /// or carries control characters.
+    /// environment class, a pinned version, a template argument, or a declared
+    /// environment variable name is blank or carries control characters.
     pub fn new(params: InstrumentSpecParams) -> Result<Self, ProfileError> {
         validate_text(&params.executable, "executable")?;
         validate_text(&params.environment_profile, "environment_profile")?;
@@ -482,6 +500,9 @@ impl InstrumentSpec {
         }
         for argument in &params.argument_template {
             validate_text(argument, "argument_template")?;
+        }
+        for name in &params.environment_variables {
+            validate_text(name, "environment_variables")?;
         }
         Ok(Self {
             kind: params.kind,
@@ -494,6 +515,7 @@ impl InstrumentSpec {
             environment_profile: params.environment_profile,
             schema: params.schema,
             argument_template: params.argument_template,
+            environment_variables: params.environment_variables,
             credential_policy: params.credential_policy,
             network_policy: params.network_policy,
             limits: params.limits,
@@ -509,7 +531,7 @@ impl InstrumentSpec {
     /// Deterministic identity over every spec field.
     pub fn digest(&self) -> String {
         let material = format!(
-            "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.kind.digest(),
             self.class,
             self.revision,
@@ -520,6 +542,7 @@ impl InstrumentSpec {
             self.environment_profile,
             self.schema.as_str(),
             self.argument_template.join("\0"),
+            self.environment_variables.join("\0"),
             self.credential_policy.as_str(),
             self.network_policy.as_str(),
             self.limits.digest(),
@@ -883,21 +906,111 @@ impl InstrumentProfile {
     }
 }
 
+/// The workspace package-compilation command a `Build` stage performs.
+///
+/// This is the command the repository already accepts as its compile proof:
+/// `scripts/verify.ps1`'s `cargo-check-workspace` gate
+/// (`cargo check --locked --workspace --all-targets`), which is the same
+/// compile-only ceiling CI's automatic gate runs. It is declared HERE, on the
+/// spec, because the spec is the registry-owned admission record — the argv a
+/// stage runs is read back out of the admitted spec by the composing owner,
+/// never restated by it. No second command list exists anywhere else.
+///
+/// The `Build` stage of a verification route therefore names the CARGO
+/// instrument, not a bare `rustc`: `rustc` drives a single crate from an
+/// explicit source path and cannot verify a workspace package, so a stage that
+/// ran `rustc` with no arguments would not be package verification at all.
+const PACKAGE_COMPILE_ARGUMENTS: &[&str] = &["check", "--locked", "--workspace", "--all-targets"];
+
+/// The fixed part of the nextest adapter's `run` command (`nextest run --profile
+/// <profile> --message-format libtest-json-plus --message-format-version <n>`).
+///
+/// `NextestCommand::run` supplies the profile name and the message-format
+/// version from the admitted profile and the adapter's own format constant.
+/// This template carries the stable subcommand-and-flags projection of the same
+/// command so a `Test` stage's argv is admitted spec text rather than an empty
+/// invocation. It is `cargo nextest run --profile <profile>` with the admitted
+/// profile revision substituted for `<profile>` — the owner of the profile
+/// name is the same registry that owns the template.
+const NEXTEST_RUN_ARGUMENTS: &[&str] = &[
+    "nextest",
+    "run",
+    "--profile",
+    "default",
+    "--message-format",
+    "libtest-json-plus",
+];
+
+/// The exact `cargo fmt --all -- --check` projection built by
+/// `RustfmtCommand::check`, which the owning rustfmt adapter declares as its
+/// canonical format check.
+const RUSTFMT_CHECK_ARGUMENTS: &[&str] = &["fmt", "--all", "--", "--check"];
+
+/// The toolchain environment names every Rust verification command is
+/// explicitly permitted to read.
+///
+/// `PATH` locates the tool; `CARGO_HOME`, `RUSTUP_HOME`, `CARGO_TARGET_DIR`,
+/// `CARGO_TERM_COLOR` and `RUST_BACKTRACE` are the toolchain roots and
+/// diagnostic settings a `cargo`/`rustc`/`nextest` process needs to behave as
+/// the admitted tool rather than as a reconfigured copy of it. These are NAMES:
+/// the composing owner fills them from roots it already admitted, so nothing
+/// else the host exports reaches the child. An undeclared name is not passed,
+/// which is what keeps I18.21's declared-environment-difference requirement a
+/// property of the profile instead of a property of the machine.
+const TOOLCHAIN_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_TERM_COLOR",
+    "RUST_BACKTRACE",
+];
+
+/// Owns an `&[&str]` command projection from the same text the admitted
+/// registry entry and the owning adapter's command builder use.
+///
+/// This is a projection, not a second declaration: the `rustfmt` arguments are
+/// `RustfmtCommand::check`'s and the `nextest` arguments are
+/// `NextestCommand::run`'s, both owned by the adapter that launches those
+/// instruments. Keeping them as spec text is what makes the argv admission-
+/// checkable — `AdmittedStage::admit` refuses any invocation whose arguments
+/// differ from this template.
+fn fixed_arguments(arguments: &[&str]) -> Vec<String> {
+    arguments.iter().map(|value| (*value).to_owned()).collect()
+}
+
+/// Owns the permitted toolchain environment projection for one admitted spec.
+fn toolchain_environment() -> Vec<String> {
+    TOOLCHAIN_ENVIRONMENT
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
 /// Builds the builtin spec set backing the `compiler`, `test`, and `dev-fast` profiles.
 ///
 /// Builtin specs pin the exact executable file, the owning adapter's schema
 /// authority, the isolated-process environment/credential/network classes,
 /// and the adapter's real capture bound where the adapter defines one (the
 /// cargo adapter defines none, so its ceiling stays with the
-/// composition-root port). No fixed command template is declared, so the
-/// shared gate admits only the empty invocation argument vector for
-/// builtins; a manifest that needs further arguments admits them as an
-/// exact fixed template. No machine observation exists at registry
-/// construction, so builtins ship no supply-chain receipt and pin no tool
-/// version.
+/// composition-root port).
+///
+/// Every builtin spec now declares the REAL command its kind performs — the
+/// fixed argv that driver is the stage's whole verification work, and an empty
+/// template would launch the executable with no arguments, which is a tool
+/// printing its own usage rather than verifying anything. The `rustfmt` and
+/// `nextest` templates are the owning adapters' own command projections; the
+/// `Build` template is the repository's accepted workspace-compile command.
+/// Each spec also declares the toolchain environment NAMES its command is
+/// permitted to read, so the environment a stage runs under is admitted text
+/// rather than whatever the host happened to export.
+///
+/// No machine observation exists at registry construction, so builtins ship no
+/// supply-chain receipt and pin no tool version.
 pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
     let credential = ContractId::new(ISOLATED_CREDENTIAL_POLICY)?;
     let network = ContractId::new(ISOLATED_NETWORK_POLICY)?;
+    let toolchain_environment = toolchain_environment();
     Ok(vec![
         InstrumentSpec::new(InstrumentSpecParams {
             kind: InstrumentKindId::new(
@@ -912,7 +1025,8 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(CARGO_CONTRACT_NAME)?,
-            argument_template: Vec::new(),
+            argument_template: fixed_arguments(PACKAGE_COMPILE_ARGUMENTS),
+            environment_variables: toolchain_environment.clone(),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, None),
@@ -928,7 +1042,16 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(RUSTC_INSTRUMENT)?,
+            // `rustc` is a single-crate driver: `RustcCommand::new` requires an
+            // explicit source path, which no fixed template can carry, so this
+            // driver spec declares none and admits only the empty argument
+            // vector. No admitted verification ROUTE uses it — a `Build` route
+            // stage compiles its package through the cargo spec above, whose
+            // template is the real workspace-compile command. This spec stays
+            // available to a caller that builds a per-crate driver request
+            // through `RustcCommand`, which is where its arguments come from.
             argument_template: Vec::new(),
+            environment_variables: toolchain_environment.clone(),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_RUSTC_OUTPUT_BYTES as u64)),
@@ -947,7 +1070,12 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(NEXTEST_INSTRUMENT)?,
-            argument_template: Vec::new(),
+            // The test stage's real command is the owning nextest adapter's own
+            // `run` projection (`cargo nextest run --profile <profile>`), bound
+            // here so the argv admission is checkable rather than synthesized
+            // at launch.
+            argument_template: fixed_arguments(NEXTEST_RUN_ARGUMENTS),
+            environment_variables: toolchain_environment.clone(),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_NEXTEST_OUTPUT_BYTES as u64)),
@@ -966,7 +1094,10 @@ pub fn builtin_specs() -> Result<Vec<InstrumentSpec>, ProfileError> {
             parser_generation: BUILTIN_PARSER_GENERATION,
             environment_profile: ISOLATED_PROCESS_CLASS.to_owned(),
             schema: ContractId::new(RUSTFMT_INSTRUMENT)?,
-            argument_template: Vec::new(),
+            // The format stage's real command is the owning rustfmt adapter's
+            // own `check` projection (`cargo fmt --all -- --check`).
+            argument_template: fixed_arguments(RUSTFMT_CHECK_ARGUMENTS),
+            environment_variables: toolchain_environment.clone(),
             credential_policy: credential.clone(),
             network_policy: network.clone(),
             limits: ResourceLimits::new(None, Some(MAX_RUSTFMT_OUTPUT_BYTES as u64)),
@@ -1085,7 +1216,13 @@ pub fn package_verification_profile() -> Result<InstrumentProfile, ProfileError>
         vec![
             StageDecl::new(
                 "package-compile".to_owned(),
-                ContractId::new(RUSTC_INSTRUMENT)?,
+                // The compilation stage binds the CARGO instrument: the real
+                // package-compilation command is `cargo check --locked
+                // --workspace --all-targets`, which this spec declares as its
+                // fixed template. A bare `rustc` cannot compile a workspace
+                // package, so binding the driver here would leave the route's
+                // compilation stage with no command to run.
+                ContractId::new(CARGO_CONTRACT_NAME)?,
                 InstrumentKind::Build,
                 Vec::new(),
                 true,
@@ -1153,7 +1290,9 @@ pub fn bundle_verification_profile() -> Result<InstrumentProfile, ProfileError> 
         vec![
             StageDecl::new(
                 "bundle-compile".to_owned(),
-                ContractId::new(RUSTC_INSTRUMENT)?,
+                // Same binding as the package route's compilation stage: the
+                // real compile command is the cargo spec's fixed template.
+                ContractId::new(CARGO_CONTRACT_NAME)?,
                 InstrumentKind::Build,
                 Vec::new(),
                 true,
@@ -1636,6 +1775,7 @@ fn rebuild_spec(spec: InstrumentSpec) -> Result<InstrumentSpec, ProfileError> {
         environment_profile: spec.environment_profile,
         schema: spec.schema,
         argument_template: spec.argument_template,
+        environment_variables: spec.environment_variables,
         credential_policy: spec.credential_policy,
         network_policy: spec.network_policy,
         limits: spec.limits,
@@ -2019,6 +2159,11 @@ pub struct AdmittedStage {
     pub supply_receipt: Option<SupplyChainReceipt>,
     /// Fixed command template; empty admits only the empty argument vector.
     pub argument_template: Vec<String>,
+    /// Explicitly permitted toolchain environment variable names for this stage.
+    ///
+    /// Copied verbatim from the admitted spec, so the composing owner reads the
+    /// permitted environment from the registry rather than restating it.
+    pub environment_variables: Vec<String>,
     /// Invocation schema authority.
     pub schema: ContractId,
     /// Admitted environment class.
@@ -2590,6 +2735,7 @@ impl<'a> ProfileCompiler<'a> {
                 executable_version: spec.executable_version.clone(),
                 supply_receipt,
                 argument_template: spec.argument_template.clone(),
+                environment_variables: spec.environment_variables.clone(),
                 schema: spec.schema.clone(),
                 environment_class: spec.environment_profile.clone(),
                 credential_policy: spec.credential_policy.clone(),

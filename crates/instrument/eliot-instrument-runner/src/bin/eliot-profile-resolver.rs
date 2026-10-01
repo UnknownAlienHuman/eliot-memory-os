@@ -918,20 +918,26 @@ fn observed_tool_version(executable: &Path, epoch: &EpochId) -> Result<String, C
 /// Seals the one-shot permit-bound request for the `--version` observation read.
 ///
 /// This is deliberately the same P-07 composition [`seal_stage_request`] uses —
-/// the same [`ProcessIntent`] fields, the same isolated [`isolated_projection`],
-/// the same fenced epoch and registry generation, and the same
-/// [`DispatchCell::issue`] one-shot issuance — so the read is a governed launch
-/// of the same kind the stage is, and the I10.8.2 single-executor rule covers it
-/// without exception. It differs only in what is being launched: the tool's own
-/// `--version` argv against the pinned executable, observed in the directory
-/// [`resolve_tool`] resolved it in, so a stage's working directory cannot change
-/// which bytes answer.
+/// the same [`ProcessIntent`] fields, the same fenced epoch and registry
+/// generation, and the same [`DispatchCell::issue`] one-shot issuance — so the
+/// read is a governed launch of the same kind the stage is, and the I10.8.2
+/// single-executor rule covers it without exception. It differs only in what is
+/// being launched: the tool's own `--version` argv against the pinned
+/// executable, observed in the directory [`resolve_tool`] resolved it in, so a
+/// stage's working directory cannot change which bytes answer.
+///
+/// Its environment is [`version_projection`] rather than the stage toolchain
+/// projection: the probe runs before any stage is admitted, so it has no
+/// admitted spec to read a permitted-name list from, and it needs none — the
+/// executable is already resolved and digest-pinned to an absolute path by
+/// [`resolve_tool`] before this point, so a child that reads `PATH` could only
+/// reach a different tool than the one whose bytes were pinned.
 fn seal_version_request(
     cell: &DispatchCell,
     epoch: &EpochId,
     executable: &Path,
 ) -> Result<ProcessRequest, CliError> {
-    let projection = isolated_projection()?;
+    let projection = version_projection()?;
     let argv = vec!["--version".to_owned()];
     // The operation identity is derived from the same real tool bytes the stage
     // launch pins, so the read and the stage it precedes are bound to one
@@ -1456,7 +1462,7 @@ impl StagePort {
         let mut sealed = BTreeMap::new();
         for planned in &plan.stages {
             let stage_id = planned.route.stage().stage_id.as_str();
-            let argv = stage_argv(planned);
+            let argv = stage_argv(planned)?;
             let operation = operation_identity(stage_id, &argv);
             let request = seal_stage_request(
                 cell,
@@ -1465,6 +1471,7 @@ impl StagePort {
                 stage_id,
                 &planned.stage.executable,
                 &argv,
+                &planned.stage.environment_variables,
             )?;
             sealed.insert(operation, request);
         }
@@ -1477,14 +1484,30 @@ impl StagePort {
 
 /// The exact process argv one admitted stage runs.
 ///
-/// It is built from the admitted spec's own argument template and nothing else.
-/// An admitted template is empty for every builtin verification spec, so a stage
-/// runs its executable with no arguments at all rather than with a command this
-/// entry invented; a spec that declares a template contributes exactly those
-/// arguments. Either way the argv is profile text read from the admitted
-/// registry, not a command list restated here.
-fn stage_argv(stage: &PlannedStage) -> Vec<String> {
-    stage.stage.argument_template.clone()
+/// It is read from the admitted spec's own argument template and nothing else.
+/// The template is the registry-owned declaration of what that instrument's
+/// command actually IS — the compiling owner declares it once, in
+/// `builtin_specs`, and this entry contributes no command text of its own, so
+/// there is no second command list here to drift from the admitted profile.
+/// `AdmittedStage::admit` compares the invocation and the sealed grant's
+/// arguments against this same template, so the argv a stage runs is the argv
+/// the admission checked.
+///
+/// A stage whose admitted spec declares no template is REFUSED here rather than
+/// launched bare: an executable with no arguments prints its own usage or
+/// version, which is not package verification, and reporting that as a stage
+/// outcome would relabel empty work as completion.
+fn stage_argv(stage: &PlannedStage) -> Result<Vec<String>, CliError> {
+    let stage_id = stage.route.stage().stage_id.as_str();
+    let admitted = &stage.stage.argument_template;
+    if admitted.is_empty() {
+        return Err(CliError::Contract(format!(
+            "stage '{stage_id}' has no admitted verification command: its spec '{}' declares no argument template, so launching {} with no arguments would run the tool's default output rather than the route's verification",
+            stage.stage.spec.as_str(),
+            stage.stage.executable
+        )));
+    }
+    Ok(admitted.clone())
 }
 
 /// Seals the one permit-bound process request for one admitted stage.
@@ -1511,9 +1534,10 @@ fn seal_stage_request(
     stage_id: &str,
     executable_name: &str,
     argv: &[String],
+    environment_variables: &[String],
 ) -> Result<ProcessRequest, CliError> {
     let executable = resolve_tool(executable_name)?;
-    let projection = isolated_projection()?;
+    let projection = toolchain_projection(layout, environment_variables)?;
     let observed = ExecutableObservation::observe_at_path(
         &executable,
         argv.to_vec(),
@@ -1570,15 +1594,81 @@ fn seal_stage_request(
     )
 }
 
-/// The isolated environment projection every admitted stage child runs under.
+/// The environment the permit-bound `--version` probe runs under.
 ///
-/// An empty projection with `EnvironmentInheritance::None` is the same isolated
-/// class the admitted specs declare: the child receives no ambient variable and
-/// no inherited secret, and the digest of that projection is what the executor
-/// binds as the stage's environment identity.
-fn isolated_projection() -> Result<EnvironmentProjection, CliError> {
+/// `PATH` is the single name it declares. That is what the probe genuinely
+/// needs, and it is declared explicitly here with
+/// [`EnvironmentInheritance::None`], so the probe is not a process that
+/// inherited an arbitrary ambient environment either. As above, the executable
+/// it runs is already digest-pinned to an absolute path, so nothing the probe
+/// could reach through `PATH` substitutes for the bytes that were hashed.
+fn version_projection() -> Result<EnvironmentProjection, CliError> {
+    let path = std::env::var("PATH")
+        .map_err(|_| CliError::Contract("tool version probe cannot locate PATH".to_owned()))?;
     Ok(EnvironmentProjection::new(
-        BTreeMap::new(),
+        BTreeMap::from([("PATH".to_owned(), path)]),
+        Vec::new(),
+        EnvironmentInheritance::None,
+    )?)
+}
+
+/// The explicitly permitted toolchain environment one admitted stage runs under.
+///
+/// The admitted spec names exactly which variable NAMES its command may read
+/// (its `environment_variables` allowlist, which the registry digests), and this
+/// projection fills only those names. Inheritance stays
+/// [`EnvironmentInheritance::None`]: nothing else the host exports reaches the
+/// child, so a stage cannot be moved by an ambient variable the profile never
+/// declared.
+///
+/// The VALUES come from roots this run already admitted, not from the ambient
+/// environment wholesale: `CARGO_TARGET_DIR` is the admitted target root and
+/// `CARGO_HOME` is the admitted cache root, both of which
+/// [`resolve_verification_route`] already requires to be absolute and
+/// traversal-free. `PATH` is the one genuinely ambient input — it is what names
+/// the tool at all — so it is passed as an explicit value and the file the name
+/// resolved to is separately digest-pinned by the sealed intent, which is what
+/// makes a `PATH`-mediated location a recorded identity rather than a trust.
+///
+/// The digest of THIS projection is the stage's environment identity:
+/// `seal_stage_request` feeds it to `ExecutableObservation::observe_at_path` and
+/// puts the projection in the sealed `ProcessIntent`, so
+/// `ExecutableObservation::observe_from_intent` re-derives the same digest at
+/// launch. Declaring the environment therefore cannot weaken that binding —
+/// it strengthens it, because the values are now part of what the executor
+/// checks rather than an empty projection that happened to match.
+fn toolchain_projection(
+    layout: &TargetLayout,
+    environment_variables: &[String],
+) -> Result<EnvironmentProjection, CliError> {
+    let mut non_secret = BTreeMap::new();
+    for name in environment_variables {
+        let value = match name.as_str() {
+            "CARGO_TARGET_DIR" => Some(layout.target_root.clone()),
+            "CARGO_HOME" => Some(layout.cache_root.clone()),
+            "PATH" => std::env::var("PATH").ok(),
+            "RUSTUP_HOME" | "CARGO_TERM_COLOR" | "RUST_BACKTRACE" => {
+                std::env::var(name.as_str()).ok()
+            }
+            // A name outside the closed set is refused rather than skipped, so a
+            // spec that declares a variable this owner cannot resolve fails
+            // closed instead of launching a child with less environment than the
+            // profile declared.
+            other => {
+                return Err(CliError::Contract(format!(
+                    "admitted stage environment declares variable '{other}', which this entry does not resolve; an unresolved declaration is refused, not silently dropped"
+                )));
+            }
+        };
+        let Some(value) = value else {
+            return Err(CliError::Contract(format!(
+                "admitted stage environment declares variable '{name}', which is unset on this machine; a declared toolchain variable with no value is refused rather than replaced"
+            )));
+        };
+        non_secret.insert(name.clone(), value);
+    }
+    Ok(EnvironmentProjection::new(
+        non_secret,
         Vec::new(),
         EnvironmentInheritance::None,
     )?)
@@ -1619,7 +1709,20 @@ impl StageLauncher for StageRoute {
             "worktree:{}",
             &sha256_hex(self.layout.source_root.as_bytes())[..16]
         );
-        let request_id = operation_identity(stage_id, &stage.stage.argument_template);
+        // The request id and the declared arguments are BOTH the admitted argv
+        // read through the same [`stage_argv`], so the identity the request port
+        // hands this stage matches the one it was sealed under, and the
+        // invocation's declared arguments equal the admitted template that
+        // `invocation_skew_reason` checks. Neither is text this entry wrote.
+        let argv = stage_argv(stage).map_err(|error| match error {
+            CliError::Contract(detail) => RunnerError::Binding(format!(
+                "stage '{stage_id}' has no admitted verification command: {detail}"
+            )),
+            CliError::Usage(detail) => RunnerError::Binding(format!(
+                "stage '{stage_id}' invocation refused: {detail}"
+            )),
+        })?;
+        let request_id = operation_identity(stage_id, &argv);
         let invocation = InstrumentInvocation {
             request: RequestMetadata {
                 request_id: RequestId::new(request_id).map_err(|error| {
@@ -1645,10 +1748,12 @@ impl StageLauncher for StageRoute {
             kind: stage.stage.kind,
             profile: stage.route.stage().profile.clone(),
             target,
-            // Instrument-level arguments are never argv: the process argv comes
-            // from the admitted argument template in `seal`, so a stage cannot
-            // smuggle a command through this field.
-            arguments: Vec::new(),
+            // The invocation declares exactly the admitted argument template. This is
+            // the field the admission's skew check compares against that same
+            // template, so it is bound from the spec rather than chosen here:
+            // a stage cannot smuggle a command through it, and it cannot
+            // under-report one either.
+            arguments: argv,
             input_artifacts: Vec::new(),
             declared_scope: ADMITTED_SCOPE_CLASS.to_owned(),
             requested_at: self.clock,
