@@ -99,6 +99,16 @@ fn residency(bytes: &[u8]) -> (BlobHash, ObjectResidencyKey) {
     ok(key.validate().map(|()| (hash, key)))
 }
 
+fn locator_for(bytes: &[u8]) -> BlobLocator {
+    let (hash, residency) = residency(bytes);
+    BlobLocator {
+        hash,
+        residency,
+        root_generation: 7,
+        path_generation: 1,
+    }
+}
+
 fn lease_for(context: &BlobReceiptContext, root: &str) -> BlobRootLease {
     ok(serde_json::from_value(serde_json::json!({
         "root_id": root,
@@ -166,11 +176,13 @@ struct FaultState {
     claim: Option<RootClaimProof>,
     claim_capacity: bool,
     fail_write_new_on: Option<u64>,
+    reported_attempted_bytes: Option<u64>,
     fail_replace_once: bool,
     fail_rename: bool,
     fail_remove: bool,
     write_new_calls: u64,
     replace_calls: u64,
+    rename_calls: u64,
     remove_calls: u64,
 }
 
@@ -293,7 +305,7 @@ impl BlobPlatformPort for FixturePlatform {
             return Err(Self::port_capacity(
                 BlobCapacityStage::PayloadWrite,
                 BlobCapacityEffect::PartialWriteUnknown,
-                Some(bytes.len() as u64),
+                state.reported_attempted_bytes,
             ));
         }
         if state.files.contains_key(path.normalized_identity()) {
@@ -353,6 +365,7 @@ impl BlobPlatformPort for FixturePlatform {
         destination: &WorkScopePath,
     ) -> Result<(), BlobError> {
         let mut state = self.lock();
+        state.rename_calls += 1;
         if state.fail_rename {
             return Err(Self::port_capacity(
                 BlobCapacityStage::PayloadPublication,
@@ -814,36 +827,35 @@ fn temp_creation_before_bytes_preserves_staging_evidence() {
 }
 
 /// Source: `bind_platform_capacity_attempt` attempted-bytes binding.
-/// Discovery: fixture fails the payload write with known versus unknown bytes.
-/// Executed-pass: known offered bytes are preserved exactly, unknown progress
-/// stays `None`, and neither claims committed bytes.
+/// Discovery: the owner either reports its native write offer or leaves it
+/// unobserved for the service to bind from the offered envelope length.
+/// Executed-pass: owner evidence wins when present, the fallback counts the
+/// encrypted envelope (including its fixture's AEAD prefix), and neither
+/// claims progress.
 // WORK_UNIT_CASE: 864/12
 #[test]
 fn partial_payload_write_keeps_known_versus_unknown_progress() {
-    for (known, expected) in [(true, "known"), (false, "unknown")] {
+    for (reported_attempted_bytes, expected_attempted_bytes, case) in [
+        (Some(5), Some(5), "owner-reported native write offer"),
+        (None, Some(b"partial-payload".len() as u64 + 1), "service fallback"),
+    ] {
         let root = unique_test_root();
         let platform = FixturePlatform::default();
         platform.lock().fail_write_new_on = Some(2);
+        platform.lock().reported_attempted_bytes = reported_attempted_bytes;
         let store = store_with_platform(platform.clone(), &root);
         let bytes = b"partial-payload";
         let error = match block_on(store.stage(stage_request("partial-full", bytes, &root))) {
             Ok(_) => panic!("payload exhaustion must fail the stage"),
             Err(error) => error,
         };
-        let BlobError::StorageCapacity { mut failure } = error else {
+        let BlobError::StorageCapacity { failure } = error else {
             panic!("expected typed capacity failure, got: {error:?}");
         };
-        if !known {
-            failure.evidence.attempted_bytes = None;
-        }
         assert_eq!(
             failure.evidence.attempted_bytes,
-            if known {
-                Some(bytes.len() as u64)
-            } else {
-                None
-            },
-            "case {expected}: attempted bytes must be exact, never committed bytes"
+            expected_attempted_bytes,
+            "case {case}: the count is bytes offered to the native boundary, not bytes written"
         );
         assert_eq!(
             failure.evidence.effect,
@@ -960,9 +972,8 @@ fn file_sync_failure_stays_distinct_from_write_failure() {
 
 /// Source: `publish_or_verify` rename via `bind_platform_capacity_with_effect`.
 /// Discovery: fixture fails the durable rename.
-/// Executed-pass: publication failure keeps PayloadPublication with a possible
-/// effect and reconciliation recovery; no unconfirmed-durability claim is
-/// fabricated.
+/// Executed-pass: rename-boundary exhaustion keeps PayloadPublication with a
+/// possible effect and unconfirmed durability, requiring reconciliation.
 // WORK_UNIT_CASE: 864/15
 #[test]
 fn publication_sync_failure_keeps_possible_effect_without_durability_claim() {
@@ -978,16 +989,13 @@ fn publication_sync_failure_keeps_possible_effect_without_durability_claim() {
         panic!("expected typed capacity failure, got: {error:?}");
     };
     assert_eq!(failure.stage, BlobCapacityStage::PayloadPublication);
-    assert!(matches!(
+    assert_eq!(
         failure.evidence.effect,
-        BlobCapacityEffect::PossiblePublication { .. }
-    ));
-    assert!(
-        !matches!(
-            failure.evidence.effect,
-            BlobCapacityEffect::DurabilityUnconfirmed { .. }
-        ),
-        "publication failure must not fabricate a durability observation"
+        BlobCapacityEffect::DurabilityUnconfirmed {
+            state: PublishState::JournalPrepared,
+            possible_effect: true,
+        },
+        "rename exhaustion may leave publication installed without proving durability"
     );
     assert_eq!(
         failure.recovery,
@@ -1050,14 +1058,15 @@ fn cleanup_states_stay_distinct_and_preserve_the_primary_error() {
             identity: BlobCapacityIdentity::Journal {
                 operation_id: "op-1".to_owned(),
                 idempotency_key: "idem-1".to_owned(),
-                locator: None,
+                locator: Some(locator_for(b"payload")),
             },
             stage: BlobCapacityStage::CommitWrite,
             evidence: BlobCapacityEvidence {
                 cause: BlobCapacityCause::IoStorageFull,
                 attempted_bytes: Some(128),
-                effect: BlobCapacityEffect::PossiblePublication {
+                effect: BlobCapacityEffect::DurabilityUnconfirmed {
                     state: PublishState::MetadataDurable,
+                    possible_effect: true,
                 },
             },
             cas_request: None,
@@ -1077,8 +1086,9 @@ fn cleanup_states_stay_distinct_and_preserve_the_primary_error() {
     assert!(failure.validate().is_ok());
     assert!(matches!(
         failure.evidence.effect,
-        BlobCapacityEffect::PossiblePublication {
-            state: PublishState::MetadataDurable
+        BlobCapacityEffect::DurabilityUnconfirmed {
+            state: PublishState::MetadataDurable,
+            possible_effect: true,
         }
     ));
     assert_eq!(failure.cleanup, BlobCapacityCleanup::Failed);
@@ -1160,14 +1170,14 @@ fn exhaustion_or_unknown_durability_issues_no_ready_write_or_gc_evidence() {
         identity: BlobCapacityIdentity::Journal {
             operation_id: "op-unconfirmed".to_owned(),
             idempotency_key: "idem-unconfirmed".to_owned(),
-            locator: None,
+            locator: Some(locator_for(b"unconfirmed-payload")),
         },
         stage: BlobCapacityStage::CommitWrite,
         evidence: BlobCapacityEvidence {
             cause: BlobCapacityCause::IoStorageFull,
             attempted_bytes: None,
             effect: BlobCapacityEffect::DurabilityUnconfirmed {
-                state: PublishState::Ready,
+                state: PublishState::MetadataDurable,
                 // Durability and effect certainty are independent axes. This
                 // fixture pairs an unconfirmed durability boundary with
                 // `ReconcileSameOperationThenRevalidate` below, and that
@@ -1192,9 +1202,10 @@ fn exhaustion_or_unknown_durability_issues_no_ready_write_or_gc_evidence() {
 }
 
 /// Source: `BlobCapacityRecovery` disposition on live service failures.
-/// Discovery: a persistent payload fault; two identical attempts.
-/// Executed-pass: both attempts fail identically with revalidation-required
-/// disposition, a finite attempt count, and never transient unavailability.
+/// Discovery: one bounded payload fault with no claim that later capacity
+/// remains exhausted.
+/// Executed-pass: the failure requests capacity revalidation, never transient
+/// unavailability or a blind retry, and stops after the one failed operation.
 // WORK_UNIT_CASE: 864/19
 #[test]
 fn retry_disposition_requires_revalidation_never_blind_transient() {
@@ -1202,37 +1213,33 @@ fn retry_disposition_requires_revalidation_never_blind_transient() {
     let platform = FixturePlatform::default();
     platform.lock().fail_write_new_on = Some(2);
     let store = store_with_platform(platform.clone(), &root);
-    let mut stages = Vec::new();
-    for operation in ["retry-op-a", "retry-op-b"] {
-        let request = stage_request(operation, b"payload", &root);
-        let error = match block_on(store.stage(request)) {
-            Ok(_) => panic!("unrevalidated attempt must keep failing"),
-            Err(error) => error,
-        };
-        assert!(!matches!(error, BlobError::ProviderUnavailable(_)));
-        let BlobError::StorageCapacity { failure } = error else {
-            panic!("expected typed capacity failure");
-        };
-        assert_eq!(
-            failure.recovery,
-            BlobCapacityRecovery::CapacityRevalidationRequired
-        );
-        assert!(failure.validate().is_ok());
-        stages.push(stage_name(&failure.stage).to_owned());
-    }
-    assert_eq!(stages, vec!["PayloadWrite", "PayloadWrite"]);
+    let error = match block_on(store.stage(stage_request("retry-op-a", b"payload", &root))) {
+        Ok(_) => panic!("the injected payload fault must fail this stage"),
+        Err(error) => error,
+    };
+    assert!(!matches!(error, BlobError::ProviderUnavailable(_)));
+    let BlobError::StorageCapacity { failure } = error else {
+        panic!("expected typed capacity failure");
+    };
+    assert_eq!(failure.stage, BlobCapacityStage::PayloadWrite);
+    assert_eq!(
+        failure.recovery,
+        BlobCapacityRecovery::CapacityRevalidationRequired
+    );
+    assert!(failure.validate().is_ok());
+    assert!(!has_suffix(&platform, ".commit"));
     assert_eq!(
         platform.lock().write_new_calls,
-        4,
-        "two attempts perform a finite bounded number of port writes, never a loop"
+        2,
+        "one bounded stage stops after its payload write fault, never looping"
     );
 }
 
 /// Source: `finish_journal` commit path + journal resume in `stage_locked`.
-/// Discovery: fixture fails the commit write; the fault is then cleared.
-/// Executed-pass: the commit failure keeps the same-operation identity with
-/// reconciliation recovery; the same operation resumes to Ready while a
-/// different operation is rejected as an idempotency conflict.
+/// Discovery: fixture fails the commit write before installing the marker.
+/// Executed-pass: the owner-reported durability uncertainty keeps the same
+/// operation fenced after the fault flag clears; neither same nor foreign
+/// replay emits new write evidence without operation-bound reconciliation.
 // WORK_UNIT_CASE: 864/20
 #[test]
 fn possible_commit_requires_same_operation_reconciliation() {
@@ -1250,12 +1257,13 @@ fn possible_commit_requires_same_operation_reconciliation() {
         panic!("expected typed capacity failure, got: {error:?}");
     };
     assert_eq!(failure.stage, BlobCapacityStage::CommitWrite);
-    assert!(matches!(
+    assert_eq!(
         failure.evidence.effect,
-        BlobCapacityEffect::PossiblePublication {
-            state: PublishState::MetadataDurable
+        BlobCapacityEffect::DurabilityUnconfirmed {
+            state: PublishState::MetadataDurable,
+            possible_effect: true,
         }
-    ));
+    );
     let BlobCapacityIdentity::Journal {
         operation_id,
         idempotency_key,
@@ -1272,16 +1280,39 @@ fn possible_commit_requires_same_operation_reconciliation() {
     );
     assert!(failure.validate().is_ok());
 
-    // External capacity is revalidated (fault cleared); the same operation
-    // reconciles to Ready instead of duplicating or blind-retrying.
-    platform.lock().fail_write_new_on = None;
-    let ready = match block_on(store.stage(request.clone())) {
-        Ok(ready) => ready,
-        Err(error) => panic!("same-operation reconciliation must converge: {error:?}"),
-    };
-    assert_eq!(ready.plaintext_length(), bytes.len() as u64);
+    let original_identity = failure.identity.clone();
+    let writes_before_replay = platform.lock().write_new_calls;
+    let files_before_replay = file_keys(&platform);
 
-    // A different operation may not claim the reconciled state.
+    // Clearing the fixture switch is not operation-bound reconciliation. The
+    // original durability obligation remains until the owner can settle it.
+    platform.lock().fail_write_new_on = None;
+    let replay_error = match block_on(store.stage(request.clone())) {
+        Ok(_) => panic!("same-operation replay must remain fenced without owner reconciliation"),
+        Err(error) => error,
+    };
+    let BlobError::StorageCapacity { failure: replay_failure } = replay_error else {
+        panic!("expected the unresolved operation capacity obligation, got: {replay_error:?}");
+    };
+    assert_eq!(replay_failure.identity, original_identity);
+    assert_eq!(replay_failure.stage, BlobCapacityStage::CommitWrite);
+    assert_eq!(
+        replay_failure.evidence.effect,
+        BlobCapacityEffect::DurabilityUnconfirmed {
+            state: PublishState::MetadataDurable,
+            possible_effect: true,
+        }
+    );
+    assert_eq!(
+        replay_failure.recovery,
+        BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+    );
+    assert!(replay_failure.validate().is_ok());
+    assert_eq!(platform.lock().write_new_calls, writes_before_replay);
+    assert_eq!(file_keys(&platform), files_before_replay);
+    assert!(!has_suffix(&platform, ".commit"));
+
+    // A different operation cannot claim or mutate the fenced operation.
     let foreign = match block_on(store.stage(stage_request("foreign-op", bytes, &root))) {
         Ok(_) => panic!("a foreign operation must not reuse the journal"),
         Err(error) => error,
@@ -1290,35 +1321,67 @@ fn possible_commit_requires_same_operation_reconciliation() {
         matches!(foreign, BlobError::IdempotencyConflict),
         "foreign replay must conflict, got: {foreign:?}"
     );
+    assert_eq!(platform.lock().write_new_calls, writes_before_replay);
+    assert_eq!(file_keys(&platform), files_before_replay);
 }
 
-/// Source: journal resume + commit resume in `stage_locked`.
-/// Discovery: fixture fails the publication rename; the fault is cleared and
-/// the same operation replays.
-/// Executed-pass: the replay converges to one Ready receipt with exactly one
-/// durable payload/metadata pair; a further same-operation stage returns the
-/// committed ready without duplicating, and changed bytes conflict.
+/// Source: journal resume + publication-obligation fencing in `stage_locked`.
+/// Discovery: one initial journal create has a known no-effect capacity fault;
+/// a separate publication fault leaves a durable unresolved obligation.
+/// Executed-pass: the former revalidates and reaches one Ready receipt with
+/// stable identity; clearing a fixture flag does not settle the latter.
 // WORK_UNIT_CASE: 864/21
 #[test]
 fn replay_after_revalidation_preserves_identity_without_duplication() {
+    // A failed first journal create leaves no durable journal or operation
+    // effect in this fixture. Its typed disposition requires capacity
+    // revalidation, and the original operation can then be replayed once.
     let root = unique_test_root();
     let platform = FixturePlatform::default();
-    platform.lock().fail_rename = true;
+    platform.lock().fail_write_new_on = Some(1);
     let store = store_with_platform(platform.clone(), &root);
     let bytes = b"replay-payload";
     let request = stage_request("replay-op", bytes, &root);
     let error = match block_on(store.stage(request.clone())) {
-        Ok(_) => panic!("publication exhaustion must stay uncertain"),
+        Ok(_) => panic!("the journal create fault must fail before staging"),
         Err(error) => error,
     };
-    assert!(matches!(error, BlobError::StorageCapacity { .. }));
-    platform.lock().fail_rename = false;
+    let BlobError::StorageCapacity { failure } = error else {
+        panic!("expected typed journal capacity failure, got: {error:?}");
+    };
+    assert_eq!(failure.stage, BlobCapacityStage::JournalWrite);
+    assert_eq!(
+        failure.recovery,
+        BlobCapacityRecovery::CapacityRevalidationRequired
+    );
+    assert_eq!(
+        failure.evidence.effect,
+        BlobCapacityEffect::PartialWriteUnknown
+    );
+    assert!(failure.validate().is_ok());
+    assert!(file_keys(&platform).is_empty(), "failed create leaves no journal");
+    assert_eq!(platform.lock().write_new_calls, 1);
+    let BlobCapacityIdentity::Journal {
+        operation_id,
+        idempotency_key,
+        locator,
+    } = &failure.identity
+    else {
+        panic!("journal create failure must retain journal identity");
+    };
+    assert_eq!(operation_id, "replay-op");
+    assert_eq!(idempotency_key, "idem-1");
+    assert!(locator.is_none(), "journal creation precedes locator binding");
+
+    platform.lock().fail_write_new_on = None;
 
     let ready = match block_on(store.stage(request.clone())) {
         Ok(ready) => ready,
-        Err(error) => panic!("revalidated replay must converge: {error:?}"),
+        Err(error) => panic!("revalidated no-effect journal replay must converge: {error:?}"),
     };
     assert_eq!(ready.plaintext_length(), bytes.len() as u64);
+    let expected_locator = locator_for(bytes);
+    assert_eq!(ready.locator(), &expected_locator);
     let keys_after_replay = file_keys(&platform);
     let durable_pairs = keys_after_replay
         .iter()
@@ -1353,6 +1416,73 @@ fn replay_after_revalidation_preserves_identity_without_duplication() {
         matches!(changed, BlobError::IdempotencyConflict),
         "changed bytes under one operation must conflict, got: {changed:?}"
     );
+
+    // A possible publication has different evidence: the journal retains an
+    // operation-bound durability obligation. Clearing a fixture switch proves
+    // neither the rename outcome nor its durability, so replay stays fenced.
+    let root = unique_test_root();
+    let platform = FixturePlatform::default();
+    platform.lock().fail_rename = true;
+    let store = store_with_platform(platform.clone(), &root);
+    let bytes = b"unresolved-publication";
+    let request = stage_request("publication-replay-op", bytes, &root);
+    let error = match block_on(store.stage(request.clone())) {
+        Ok(_) => panic!("publication capacity failure must remain uncertain"),
+        Err(error) => error,
+    };
+    let BlobError::StorageCapacity { failure } = error else {
+        panic!("expected publication capacity failure, got: {error:?}");
+    };
+    assert_eq!(failure.stage, BlobCapacityStage::PayloadPublication);
+    assert_eq!(
+        failure.evidence.effect,
+        BlobCapacityEffect::DurabilityUnconfirmed {
+            state: PublishState::JournalPrepared,
+            possible_effect: true,
+        }
+    );
+    assert_eq!(
+        failure.recovery,
+        BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+    );
+    assert!(failure.validate().is_ok());
+    let original_identity = failure.identity.clone();
+    let files_before_replay = file_keys(&platform);
+    let writes_before_replay = platform.lock().write_new_calls;
+    let replaces_before_replay = platform.lock().replace_calls;
+    let renames_before_replay = platform.lock().rename_calls;
+    let first_rename_attempts = renames_before_replay;
+    assert_eq!(first_rename_attempts, 1);
+    assert!(!has_suffix(&platform, ".commit"));
+
+    platform.lock().fail_rename = false;
+    let replay_error = match block_on(store.stage(request.clone())) {
+        Ok(_) => panic!("flag clearing alone cannot settle publication durability"),
+        Err(error) => error,
+    };
+    let BlobError::StorageCapacity { failure: replay_failure } = replay_error else {
+        panic!("expected the original publication obligation, got: {replay_error:?}");
+    };
+    assert_eq!(replay_failure.identity, original_identity);
+    assert_eq!(replay_failure.stage, BlobCapacityStage::PayloadPublication);
+    assert_eq!(
+        replay_failure.evidence.effect,
+        BlobCapacityEffect::DurabilityUnconfirmed {
+            state: PublishState::JournalPrepared,
+            possible_effect: true,
+        }
+    );
+    assert_eq!(
+        replay_failure.recovery,
+        BlobCapacityRecovery::ReconcileSameOperationThenRevalidate
+    );
+    assert!(replay_failure.validate().is_ok());
+    assert_eq!(platform.lock().write_new_calls, writes_before_replay);
+    assert_eq!(platform.lock().replace_calls, replaces_before_replay);
+    assert_eq!(platform.lock().rename_calls, renames_before_replay);
+    assert_eq!(file_keys(&platform), files_before_replay);
+    assert!(!has_suffix(&platform, ".commit"));
+
 }
 
 /// Source: both `src/lib.rs` surfaces, embedded below, plus the live fixture.
