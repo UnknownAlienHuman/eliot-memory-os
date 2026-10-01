@@ -1057,9 +1057,11 @@ impl KernelBackupCapture {
     /// - `not_before_unix_ms` and `expires_at_unix_ms` are this owner's own
     ///   clock readings around the grant, so the authorization has a bounded
     ///   lifetime that no caller can widen or move.
-    /// - `principal` is the ADMITTED caller principal this owner was called
-    ///   under (`CaptureCallerAuth`), not a value re-read from the payload, so
-    ///   a grant is bound to the authenticated identity that earned it.
+    /// - `principal` is the BARE authenticated principal the row identity and
+    ///   the per-principal key use, threaded in from the live session rather
+    ///   than read off `CaptureCallerAuth` (which carries a composite
+    ///   `user@session`). A grant is therefore bound to exactly the identity the
+    ///   successor path compares it against.
     /// - `scope_id` is the live verifying scope. It is threaded in rather than
     ///   read off `CaptureCallerAuth` because that struct carries the
     ///   authenticated principal and the admitted capability and deliberately
@@ -1089,8 +1091,8 @@ impl KernelBackupCapture {
     /// by a value this owner could not actually draw.
     pub fn issue_succession_grant(
         &self,
+        principal: &str,
         scope_id: &str,
-        caller: &CaptureCallerAuth,
         kernel_fence: &StateFence,
     ) -> Result<eliot_ors::BackupVerifySuccessionGrant, KernelCaptureError> {
         // The grant is issued BY this owner, so the owner's own work root is
@@ -1117,7 +1119,7 @@ impl KernelBackupCapture {
         let expires_at_unix_ms = not_before_unix_ms.saturating_add(SUCCESSION_GRANT_HORIZON_MS);
         Ok(eliot_ors::BackupVerifySuccessionGrant {
             grant_id,
-            principal: caller.principal.clone(),
+            principal: principal.to_owned(),
             scope_id: scope_id.to_owned(),
             authority_lineage_id: kernel_fence.authority_epoch.lineage_id.to_string(),
             issued_at_unix_ms,

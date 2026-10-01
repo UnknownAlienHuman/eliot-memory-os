@@ -3347,7 +3347,7 @@ impl KernelComposition {
         else {
             return Ok(verification_not_recorded_reply(idempotency_key));
         };
-        Ok(self.answer_backup_verify(session, &caller, prior, &identity, &fresh, idempotency_key))
+        Ok(self.answer_backup_verify(session, prior, &identity, &fresh, idempotency_key))
     }
 
     /// Answers the I5.27 identity conflict for presented bytes that are NOT the archive
@@ -3764,7 +3764,6 @@ impl KernelComposition {
     fn answer_backup_verify(
         &self,
         session: &Session,
-        caller: &CaptureCallerAuth,
         prior: PriorVerification,
         identity: &BackupVerifyRequestIdentity,
         fresh: &VerifiedProjection,
@@ -3801,7 +3800,7 @@ impl KernelComposition {
             // only honest answer is no verification result at all.
             PriorVerification::Unreadable => verification_not_recorded_reply(idempotency_key),
             PriorVerification::Absent => {
-                self.stage_backup_verification(session, caller, identity, fresh, idempotency_key)
+                self.stage_backup_verification(session, identity, fresh, idempotency_key)
             }
         }
     }
@@ -3820,7 +3819,6 @@ impl KernelComposition {
     fn stage_backup_verification(
         &self,
         session: &Session,
-        caller: &CaptureCallerAuth,
         identity: &BackupVerifyRequestIdentity,
         fresh: &VerifiedProjection,
         idempotency_key: &str,
@@ -3838,14 +3836,23 @@ impl KernelComposition {
         // cannot draw its entropy the row is still committed, carrying no grant,
         // and every reconciliation of it is refused: the operation itself must
         // not fail because its recovery contract could not be issued.
-        let succession_grant = self
-            .backup_capture()
-            .issue_succession_grant(
-                session.module_generation.module_id.as_str(),
-                caller,
-                &session.module_generation.state_fence,
-            )
+        // The grant's principal is the SAME bare authenticated principal the
+        // stored row identity and the per-principal key use, NOT the composite
+        // `user@session` on `CaptureCallerAuth`. The successor path compares
+        // the grant against `authenticated_backup_principal`, so a composite
+        // value here could never match and every reconciliation would refuse.
+        let grant_principal = authenticated_backup_principal(session)
+            .map(|(principal, _)| principal)
             .ok();
+        let succession_grant = grant_principal.and_then(|principal| {
+            self.backup_capture()
+                .issue_succession_grant(
+                    principal,
+                    session.module_generation.module_id.as_str(),
+                    &session.module_generation.state_fence,
+                )
+                .ok()
+        });
         let record = record_from_projection(identity, fresh, reply_digest, succession_grant);
         match self.p07_ors.stage_backup_verification_result(&record) {
             Ok(BackupVerificationDisposition::Stored) => body,

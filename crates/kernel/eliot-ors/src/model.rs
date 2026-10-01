@@ -5507,7 +5507,14 @@ pub struct BackupVerifySuccessionGrant {
     /// projected onto the wire and never derivable from any value the
     /// predecessor's `ok` reply already carried.
     pub grant_id: String,
-    /// Authenticated principal this grant was issued to.
+    /// Bare authenticated principal this grant was issued to.
+    ///
+    /// This is the SAME principal value the stored row's
+    /// `BackupVerifyRequestIdentity::principal` and the per-principal key use
+    /// (the authenticated user identity alone, NOT the composite
+    /// `user@session` carried on `CaptureCallerAuth`). The successor path
+    /// compares the grant against the live authenticated principal, so the two
+    /// definitions must be identical or no reconciliation could ever match.
     pub principal: String,
     /// `WorkScope` owner value this grant was issued under.
     pub scope_id: String,
@@ -5557,13 +5564,21 @@ impl BackupVerifySuccessionGrant {
                 reason: "grant expiry must be strictly after its due time",
             });
         }
-        if let Some(consumed_at_unix_ms) = self.consumed_at_unix_ms
-            && consumed_at_unix_ms < self.not_before_unix_ms
-        {
-            return Err(OrsError::InvalidField {
-                field: "backup_verify_succession_grant_consumed_at_unix_ms",
-                reason: "grant consumption must fall inside its own authorization window",
-            });
+        // A consumption marker must fall INSIDE the grant's own window: not
+        // before it opens, and not at or after it expires. A marker outside the
+        // window would otherwise pass validation and make a spent grant look
+        // live, so both bounds are checked here rather than trusting the writer.
+        match self.consumed_at_unix_ms {
+            Some(consumed_at_unix_ms)
+                if consumed_at_unix_ms < self.not_before_unix_ms
+                    || consumed_at_unix_ms >= self.expires_at_unix_ms =>
+            {
+                return Err(OrsError::InvalidField {
+                    field: "backup_verify_succession_grant_consumed_at_unix_ms",
+                    reason: "grant consumption must fall inside its own authorization window",
+                });
+            }
+            _ => {}
         }
         Ok(())
     }
