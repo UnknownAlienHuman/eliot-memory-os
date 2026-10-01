@@ -561,7 +561,8 @@ async fn serve_handshake_loop(
             "process_id": composition.blob_owner().process_id(),
             "claim_id": composition.blob_owner().claim_id(),
         }),
-    );
+    )
+    .with_blob_process_stream_available(composition.blob_process_stream_supported());
     let authenticated_peer = server.peer_identity().clone();
     let (mut session, server_hello) = match admit_authenticated_handshake(
         hello_frame,
