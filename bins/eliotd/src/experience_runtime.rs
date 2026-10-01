@@ -62,8 +62,8 @@ use eliot_observation::{
     },
 };
 use eliot_observation_contracts::{
-    AgentFeedbackRecord, ExperienceBankRecord, ObservationScope, ProjectionCoverage,
-    ProjectionOmission, RetentionHold, RetentionSchedule,
+    AgentFeedbackRecord, CoverageDisposition, ExperienceBankRecord, ObservationScope,
+    ProjectionCoverage, ProjectionOmission, RetentionHold, RetentionSchedule,
 };
 use eliot_protocol::RequestIdentity;
 use eliot_read::{
@@ -72,9 +72,9 @@ use eliot_read::{
 };
 use eliot_receipts::{RequestBinding, WorkScopeId};
 use eliot_store_api::{
-    CanonicalReadClient, EXPERIENCE_PAGE_NEXT_CURSOR, NamedReadOperation, OrderingHeadExpectation,
-    ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId, StoreError, WriteReceipt,
-    epistemic_revision::EpistemicPositionReadback,
+    CanonicalReadClient, EXPERIENCE_PAGE_NEXT_CURSOR, ExperienceRangePage, NamedReadOperation,
+    OrderingHeadExpectation, ReadConsistency, RevisionHeadExpectation, RevisionKey, ScopeId,
+    StoreError, WriteReceipt, epistemic_revision::EpistemicPositionReadback,
 };
 use eliot_understanding_assessment::{
     AssessmentClosure, AssessmentScope, CommonGroundAssessment, CommonGroundInput, EvidenceCite,
@@ -111,6 +111,20 @@ pub enum ExperienceDriverError {
     /// The position readback holds no usable current position.
     #[error("position field {field}: {reason}")]
     Position {
+        field: &'static str,
+        reason: &'static str,
+    },
+    /// The caller-supplied retention schedule is not the owner schedule in
+    /// force at this invocation's fence.
+    #[error("retention schedule {field}: {reason}")]
+    Retention {
+        field: &'static str,
+        reason: &'static str,
+    },
+    /// The caller-supplied coverage binding claims a completeness posture the
+    /// owner page does not support.
+    #[error("projection coverage {field}: {reason}")]
+    Coverage {
         field: &'static str,
         reason: &'static str,
     },
@@ -392,6 +406,107 @@ fn select_applicable_current_position(
     })
 }
 
+/// Gates the caller-supplied retention schedule against this invocation.
+///
+/// `RetentionSchedule` carries the fence it is "in force at" precisely so the
+/// calling edge can gate on it (`eliot-observation-contracts`
+/// `RetentionSchedule::fence`: "Fence this schedule is in force at, carried
+/// for edge gating"). Nothing in the repository did that gate before this
+/// call: `resolve_retention_read` compares the schedule against each RECORD's
+/// own fence and answers `UnknownPolicy` on disagreement, so a schedule
+/// minted at another authority epoch or another resource generation was never
+/// compared to the fence this run publishes under — it simply withheld every
+/// record under a substituted schedule.
+///
+/// That is the missing retention join of audit item 2, and it is closed with
+/// the OWNER's own relation in the OWNER's own direction:
+/// `schedule.fence.is_compatible_with(invocation_fence)` is verbatim
+/// `resolve_retention_read`'s `schedule.fence.is_compatible_with(record_fence)`
+/// at the invocation instead of per record. It requires the exact
+/// `(lineage_id, sequence)` authority tuple and an equal resource generation,
+/// so a foreign epoch — including an equal sequence under a different lineage
+/// — and a stale generation are both refused, while a `None` revision
+/// dimension on the schedule stays the wildcard the owner already treats it
+/// as.
+///
+/// Exact equality (`fences_match_exact`) would be stronger and is rejected on
+/// purpose: this daemon's retained kernel fence is
+/// `StateFence::new(epoch, generation)` and therefore carries no task
+/// revision, so requiring two-way agreement would refuse every schedule any
+/// owner issues under a task-bound fence. That is the unreachable-route
+/// failure `context_reconstruction_route.rs` documents at its own fence
+/// comparison, and a gate that can never be satisfied proves nothing.
+fn prove_schedule_in_force_at(
+    schedule: &RetentionSchedule,
+    invocation_fence: &StateFence,
+) -> Result<(), ExperienceDriverError> {
+    if !schedule.fence.is_compatible_with(invocation_fence) {
+        return Err(ExperienceDriverError::Retention {
+            field: "event.schedule",
+            reason: "owner-issued retention schedule is not in force at the invocation fence",
+        });
+    }
+    Ok(())
+}
+
+/// Gates a caller-supplied coverage binding against the owner page it covers.
+///
+/// `ExperienceBankEventInputs::coverage` / `ExperienceFeedbackEventInputs::
+/// coverage` are owner EVIDENCE the caller supplies, and the projection
+/// envelope reconciles counts against them
+/// (`EnvelopeHeader::validate`: carried must not exceed
+/// `coverage.evidence.observed_count`). That reconciliation is only sound
+/// while the evidence itself is the owner's: it compares the caller's records
+/// against the caller's own `observed_count`, which is exactly the
+/// self-referential check this package's completeness rule forbids.
+///
+/// The independent expected set already exists in the payload and is
+/// owner-minted: [`ExperienceRangePage`] publishes `matched_total` (records
+/// actually returned) and `truncated` (rows exist past the bound). The read
+/// owner's own `classify_payload_coverage` refuses a page whose `matched_total`
+/// disagrees with its record set as `Unknown` and a truncated page as
+/// `Partial`, for the same reason. This applies that ONE rule to the
+/// completeness claim: a `Complete` posture is only admissible over a page
+/// that is neither truncated nor partially matched.
+///
+/// A `Partial` posture is left alone deliberately. Partial is the honest
+/// posture for a truncated page and for retention-withheld material, so
+/// refusing it would refuse the documented gap-reporting path rather than
+/// close a guarantee. What is refused is the stronger claim: completeness
+/// asserted over a page the owner says does not contain the whole
+/// enumeration. That is the "never relabel old values current" clause of
+/// audit item 4 applied to coverage instead of to the fence.
+///
+/// The page is decoded through the owner's own exported
+/// [`ExperienceRangePage`] type, not through restated key names, and
+/// [`prove_page_state_fence`] has already run on this payload before any
+/// coverage member is read here — the fence-before-coverage order the read
+/// owner states as its guarantee.
+///
+/// [`ExperienceRangePage`]: eliot_store_api::ExperienceRangePage
+fn prove_owner_coverage_complete(
+    field: &'static str,
+    payload: &serde_json::Value,
+    coverage: &ProjectionCoverage,
+) -> Result<(), ExperienceDriverError> {
+    if coverage.evidence.disposition != CoverageDisposition::Complete {
+        return Ok(());
+    }
+    let page: ExperienceRangePage = serde_json::from_value(payload.clone()).map_err(|_| {
+        ExperienceDriverError::Coverage {
+            field,
+            reason: "complete coverage is claimed over a page that is not the owner page shape",
+        }
+    })?;
+    if page.truncated || page.matched_total != page.records.len() {
+        return Err(ExperienceDriverError::Coverage {
+            field,
+            reason: "complete coverage is claimed over a page the owner reports truncated or partially matched",
+        });
+    }
+    Ok(())
+}
+
 /// Journal-leg driver inputs: projection context plus live binding.
 pub struct ExperienceJournalDriverInputs<'a> {
     /// Stable identity minted by the caller for the projection envelope.
@@ -669,6 +784,19 @@ fn range_next_cursor(payload: &serde_json::Value) -> Option<String> {
 /// state). Any drift, malformation, withheld-but-uncited material, or
 /// missing family fails closed; nothing partial is emitted as complete
 /// and nothing is persisted or submitted by this entry.
+///
+/// #223 C2 — owner inputs are gated, not trusted. Two of the owner inputs this
+/// entry consumes had no join at all: the retention schedule (whose own
+/// `fence` field exists "for edge gating" and was compared against nothing)
+/// and the two coverage bindings (whose `observed_count` the projection
+/// envelope reconciles against, which is the caller's own count). Both are
+/// now joined to owner values this entry already holds — the invocation fence
+/// and the owner-minted page — by [`prove_schedule_in_force_at`] and
+/// [`prove_owner_coverage_complete`], after the two page fence proofs and
+/// before any projection is assembled. A `Complete` coverage posture is only
+/// admissible over a page the owner reports whole; a `Partial` one, which is
+/// the honest posture for a truncated page and for retention-withheld
+/// material, is untouched so the gap-reporting path stays open.
 #[allow(clippy::too_many_lines)]
 pub async fn run_experience_quality_event(
     composition: &DaemonComposition,
@@ -720,6 +848,23 @@ pub async fn run_experience_quality_event(
     // every projection below is assembled at.
     prove_page_state_fence(&event.bank.payload, &ctx.state_fence)?;
     prove_page_state_fence(&event.feedback.payload, &ctx.state_fence)?;
+    // #223 C2 (audit item 2, "close its missing input/retention joins"): the
+    // retention schedule and the two coverage bindings are the owner inputs
+    // this entry consumes but never gated. Both joins run HERE, after the two
+    // page fence proofs above and before any projection is assembled, so a
+    // substituted schedule or an unsupported completeness claim is refused
+    // before it can shape a candidate.
+    prove_schedule_in_force_at(event.schedule, &ctx.state_fence)?;
+    prove_owner_coverage_complete(
+        "event.bank.coverage",
+        &event.bank.payload,
+        &event.bank.coverage,
+    )?;
+    prove_owner_coverage_complete(
+        "event.feedback.coverage",
+        &event.feedback.payload,
+        &event.feedback.coverage,
+    )?;
     let bank_records = bank_records_from_range_payload(&event.bank.payload)?;
     let bank_live = supply_bank_projection_from_store(
         &mut ledger,
@@ -1386,5 +1531,290 @@ mod position_binding_tests {
             }
         }
         assert_eq!(described.len(), 3, "the three refusals must stay distinct");
+    }
+}
+
+#[cfg(test)]
+mod owner_input_join_tests {
+    #![allow(clippy::expect_used)] // test-only panic-acceptable (#838).
+    use super::*;
+    use eliot_contracts::{EpochId, EpochLineageId, ResourceGeneration};
+    use eliot_observation_contracts::CoverageEvidence;
+    use std::num::NonZeroU64;
+
+    type ProofResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    const TEST_LINEAGE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn fence(sequence: u64, generation: u64) -> StateFence {
+        StateFence::new(
+            EpochId::new(
+                EpochLineageId::new(TEST_LINEAGE).expect("valid test lineage"),
+                NonZeroU64::new(sequence).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            ResourceGeneration::new(generation).expect("nonzero resource generation"),
+        )
+    }
+
+    /// One owner-issued schedule, built through the owner's own `issue`
+    /// constructor so its identity, revision and frozen digest are the
+    /// owner's and not a hand-written literal.
+    fn schedule_in_force_at(target: &StateFence) -> RetentionSchedule {
+        RetentionSchedule::issue(
+            "schedule-223".to_owned(),
+            4,
+            target.clone(),
+            vec!["policy-223".to_owned()],
+        )
+        .expect("valid owner retention schedule")
+    }
+
+    /// One owner-minted range page, built through the owner's own `payload`
+    /// method so the member names and the fence are the owner's.
+    fn owner_page(
+        bound: &StateFence,
+        record_count: usize,
+        matched_total: usize,
+        truncated: bool,
+    ) -> serde_json::Value {
+        ExperienceRangePage {
+            records: vec![serde_json::json!({ "handle": "record-223" }); record_count],
+            matched_total,
+            truncated,
+            next_cursor: None,
+            state_fence: bound.clone(),
+        }
+        .payload()
+    }
+
+    fn coverage(disposition: CoverageDisposition, observed_count: u64) -> ProjectionCoverage {
+        let evidence = CoverageEvidence {
+            disposition,
+            denominator_source_ref: "store-experience:GetExperienceBankRange:223".to_owned(),
+            interval: None,
+            blind_intervals: Vec::new(),
+            observed_count,
+        };
+        let coverage_digest = eliot_contracts::sha256_hex(
+            &eliot_contracts::canonical_json_bytes(&evidence).expect("encodable coverage evidence"),
+        );
+        ProjectionCoverage {
+            evidence,
+            coverage_digest,
+        }
+    }
+
+    // --- retention schedule join -----------------------------------------
+
+    /// POSITIVE: the schedule the owner issued at exactly this invocation
+    /// fence is admitted.
+    #[test]
+    fn schedule_in_force_at_the_invocation_fence_is_admitted() -> ProofResult {
+        let invocation = fence(1, 1);
+        prove_schedule_in_force_at(&schedule_in_force_at(&invocation), &invocation)?;
+        Ok(())
+    }
+
+    /// REFUSAL: a schedule minted at an older resource generation is a
+    /// substituted owner input. It used to pass unnoticed and withhold every
+    /// record as `UnknownPolicy`; it is refused at the invocation instead.
+    #[test]
+    fn schedule_from_another_resource_generation_is_refused() {
+        let invocation = fence(1, 2);
+        let foreign = schedule_in_force_at(&fence(1, 1));
+
+        let error = prove_schedule_in_force_at(&foreign, &invocation)
+            .expect_err("a schedule from another generation was never in force here");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Retention {
+                field: "event.schedule",
+                reason: "owner-issued retention schedule is not in force at the invocation fence",
+            }
+        ));
+    }
+
+    /// REFUSAL: an equal sequence under a DIFFERENT authority lineage is
+    /// unrelated authority, not the same authority one generation along.
+    /// `EpochId::is_same_authority` compares the exact
+    /// `(lineage_id, sequence)` tuple, so this is refused at the invocation
+    /// rather than silently withheld per record.
+    #[test]
+    fn schedule_from_another_authority_lineage_is_refused() {
+        let invocation = fence(1, 1);
+        let foreign = RetentionSchedule::issue(
+            "schedule-223".to_owned(),
+            4,
+            StateFence::new(
+                EpochId::new(
+                    EpochLineageId::new("00000000-0000-4000-8000-000000000001")
+                        .expect("valid foreign lineage"),
+                    NonZeroU64::new(1).expect("nonzero sequence"),
+                )
+                .expect("valid foreign epoch"),
+                ResourceGeneration::new(1).expect("nonzero resource generation"),
+            ),
+            vec!["policy-223".to_owned()],
+        )
+        .expect("valid foreign schedule");
+
+        let error = prove_schedule_in_force_at(&foreign, &invocation)
+            .expect_err("another authority lineage is unrelated authority");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Retention {
+                field: "event.schedule",
+                reason: "owner-issued retention schedule is not in force at the invocation fence",
+            }
+        ));
+    }
+
+    // --- owner coverage completeness join --------------------------------
+
+    /// POSITIVE: a `Complete` posture over a whole page is admissible.
+    #[test]
+    fn complete_coverage_over_a_whole_page_is_admitted() -> ProofResult {
+        let bound = fence(1, 1);
+        let page = owner_page(&bound, 2, 2, false);
+        prove_owner_coverage_complete(
+            "event.bank.coverage",
+            &page,
+            &coverage(CoverageDisposition::Complete, 2),
+        )?;
+        Ok(())
+    }
+
+    /// POSITIVE: `Partial` is the honest posture over a truncated page and
+    /// over retention-withheld material, so the gap-reporting path stays open.
+    /// Refusing it would refuse a documented posture, not close a guarantee.
+    #[test]
+    fn partial_coverage_over_a_truncated_page_stays_admitted() -> ProofResult {
+        let bound = fence(1, 1);
+        let page = owner_page(&bound, 2, 9, true);
+        prove_owner_coverage_complete(
+            "event.bank.coverage",
+            &page,
+            &coverage(CoverageDisposition::Partial, 9),
+        )?;
+        Ok(())
+    }
+
+    /// REFUSAL: completeness asserted over a page the owner says has rows
+    /// past the bound. The projection would otherwise reconcile the caller's
+    /// records against the caller's own count and report a whole enumeration
+    /// that the owner contradicts.
+    #[test]
+    fn complete_coverage_over_a_truncated_page_is_refused() {
+        let bound = fence(1, 1);
+        let page = owner_page(&bound, 2, 9, true);
+
+        let error = prove_owner_coverage_complete(
+            "event.bank.coverage",
+            &page,
+            &coverage(CoverageDisposition::Complete, 9),
+        )
+        .expect_err("a truncated page cannot be a complete enumeration");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Coverage {
+                field: "event.bank.coverage",
+                reason: "complete coverage is claimed over a page the owner reports truncated or partially matched",
+            }
+        ));
+    }
+
+    /// REFUSAL: the same claim over a page whose own count contradicts its
+    /// record set — the read owner's `Unknown` case, which proves the
+    /// completeness claim rests on nothing observable.
+    #[test]
+    fn complete_coverage_over_a_partially_matched_page_is_refused() {
+        let bound = fence(1, 1);
+        let page = owner_page(&bound, 2, 9, false);
+
+        let error = prove_owner_coverage_complete(
+            "event.feedback.coverage",
+            &page,
+            &coverage(CoverageDisposition::Complete, 2),
+        )
+        .expect_err("a partially matched page is not a whole enumeration");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Coverage {
+                field: "event.feedback.coverage",
+                reason: "complete coverage is claimed over a page the owner reports truncated or partially matched",
+            }
+        ));
+    }
+
+    /// REFUSAL: completeness over a payload that is not the owner page shape
+    /// at all. Distinct from the two above — the evidence itself is
+    /// unobservable, not merely incomplete.
+    #[test]
+    fn complete_coverage_over_a_foreign_payload_is_refused() {
+        let error = prove_owner_coverage_complete(
+            "event.bank.coverage",
+            &serde_json::json!({ "records": [] }),
+            &coverage(CoverageDisposition::Complete, 0),
+        )
+        .expect_err("a payload with no owner page shape proves nothing");
+
+        assert!(matches!(
+            error,
+            ExperienceDriverError::Coverage {
+                field: "event.bank.coverage",
+                reason: "complete coverage is claimed over a page that is not the owner page shape",
+            }
+        ));
+    }
+
+    /// The three coverage refusals and the retention refusal stay four
+    /// distinguishable outcomes, and the admitted whole-page case stays
+    /// reachable as success. A consumer can tell an unobservable evidence
+    /// shape from an incomplete enumeration, and a substituted schedule from
+    /// either; none collapses into another and none is reachable as success.
+    #[test]
+    fn the_owner_input_refusals_stay_distinguishable() -> ProofResult {
+        let bound = fence(1, 1);
+        let invocation = fence(1, 2);
+        let whole = owner_page(&bound, 2, 2, false);
+        let truncated = owner_page(&bound, 2, 9, true);
+        let mismatched = owner_page(&bound, 2, 9, false);
+        let complete = coverage(CoverageDisposition::Complete, 2);
+
+        // The admitted case is admitted: a whole page under a Complete posture
+        // is the one owner input set this entry accepts for completeness, and
+        // it must not be swept up by any of the refusals below.
+        prove_owner_coverage_complete("event.bank.coverage", &whole, &complete)?;
+        prove_schedule_in_force_at(&schedule_in_force_at(&bound), &bound)?;
+
+        let refusals = [
+            prove_schedule_in_force_at(&schedule_in_force_at(&bound), &invocation),
+            prove_owner_coverage_complete("event.bank.coverage", &truncated, &complete),
+            prove_owner_coverage_complete("event.bank.coverage", &mismatched, &complete),
+            prove_owner_coverage_complete(
+                "event.bank.coverage",
+                &serde_json::json!({ "records": [] }),
+                &complete,
+            ),
+        ];
+
+        let mut described = BTreeSet::new();
+        for outcome in &refusals {
+            let refusal = match outcome {
+                Ok(()) => panic!("a refusal collapsed into success"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                described.insert(refusal.clone()),
+                "duplicate refusal: {refusal}"
+            );
+        }
+        assert_eq!(described.len(), 4, "the four refusals must stay distinct");
+        Ok(())
     }
 }
