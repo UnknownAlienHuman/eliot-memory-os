@@ -1529,6 +1529,14 @@ impl KernelComposition {
         .validate()
         .map_err(|_| TransportError::SessionFenced)?;
         let _transition = self.agent_bridge_transition_read()?;
+        if envelope.identity.capability == "eliot.finish" {
+            check_finish_admission(envelope, tool)?;
+            let pending = self
+                .agent_activation_pending
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            self.finish_owner_binding_for_pair(envelope, tool, &pending)?;
+        }
         // Issue #77 W2: Kernel-owned bind/dispatch leg runs BEFORE the
         // route's own admit staging. The binder's `admit_and_stage` advances
         // `Requested -> Admitted` itself, and only the call that stages first
@@ -2495,7 +2503,22 @@ impl KernelComposition {
         let task_relative = task_relative_tool.unwrap_or_else(|| {
             host_request_capability_is_task_relative(envelope.identity.capability.as_str())
         });
-        if envelope.kind == HostRequestKind::Invocation && task_relative {
+        if envelope.kind == HostRequestKind::Invocation
+            && task_relative
+            && envelope.identity.capability == "eliot.finish"
+        {
+            // Finish's task revision is semantic data held in the strict
+            // candidate and checked against this activation owner by
+            // `finish_owner_binding_for_pair`. It cannot be copied into the
+            // transport Session fence, which remains epoch+generation only.
+            let task_named =
+                envelope.identity.task_id.as_deref() == Some(retained.task_id.as_str());
+            let scope_named = envelope.identity.work_scope_id.as_deref()
+                == Some(retained.work_scope_id.as_str());
+            if !task_named || !scope_named || envelope.state_fence.task_revision.is_some() {
+                return Err(TransportError::SessionFenced);
+            }
+        } else if envelope.kind == HostRequestKind::Invocation && task_relative {
             let task_named =
                 envelope.identity.task_id.as_deref() == Some(retained.task_id.as_str());
             let scope_named =
@@ -2506,6 +2529,61 @@ impl KernelComposition {
             }
         }
         Ok(())
+    }
+
+    /// Returns the activation-issued application owner after joining it to a
+    /// strict Finish draft. The draft's task/revision remain selectors; the
+    /// returned record is always the Kernel-retained principal/session/task/
+    /// scope/revision tuple.
+    pub(super) fn finish_owner_binding_for_pair(
+        &self,
+        envelope: &HostRequestEnvelope,
+        tool: &serde_json::Value,
+        pending: &super::AgentActivationPendingState,
+    ) -> Result<super::ActivatedApplicationBinding, TransportError> {
+        if envelope.kind != HostRequestKind::Invocation
+            || envelope.identity.capability != "eliot.finish"
+            || envelope.identity.session_id.is_none()
+            || envelope.state_fence.task_revision.is_some()
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let retained = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(&envelope.connection_id)
+            .and_then(|state| state.activated_binding.clone())
+            .ok_or(TransportError::SessionFenced)?;
+        if !self.activation_result_still_retained(pending, &retained, &envelope.connection_id)
+            || retained.principal_id.trim().is_empty()
+            || !retained
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+            || retained.activation_generation != envelope.state_fence.resource_generation
+            || envelope.identity.session_id.as_deref() != Some(retained.session_id.as_str())
+            || envelope.identity.task_id.as_deref() != Some(retained.task_id.as_str())
+            || envelope.identity.work_scope_id.as_deref()
+                != Some(retained.work_scope_id.as_str())
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        let arguments = tool
+            .get("arguments")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(TransportError::SessionFenced)?;
+        let task_id = arguments
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(TransportError::SessionFenced)?;
+        let task_revision = arguments
+            .get("expected_task_revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(TransportError::SessionFenced)?;
+        if task_id != retained.task_id || task_revision != retained.task_revision.value() {
+            return Err(TransportError::IdentityConflict);
+        }
+        Ok(retained)
     }
 
     fn validate_host_request_application_session(
@@ -3321,13 +3399,22 @@ impl KernelComposition {
             {
                 return Ok(false);
             }
-            if task_relative
-                && (envelope.identity.task_id.as_deref() != Some(retained.task_id.as_str())
-                    || envelope.identity.work_scope_id.as_deref()
-                        != Some(retained.work_scope_id.as_str())
-                    || envelope.state_fence.task_revision != Some(retained.task_revision))
-            {
-                return Ok(false);
+            if task_relative {
+                let finish = envelope.identity.capability == "eliot.finish";
+                let task_scope_match =
+                    envelope.identity.task_id.as_deref() == Some(retained.task_id.as_str())
+                        && envelope.identity.work_scope_id.as_deref()
+                            == Some(retained.work_scope_id.as_str());
+                let revision_match = if finish {
+                    // Finish compares expected_task_revision from its retained
+                    // strict draft to the owner tuple when issuing the attempt.
+                    envelope.state_fence.task_revision.is_none()
+                } else {
+                    envelope.state_fence.task_revision == Some(retained.task_revision)
+                };
+                if !task_scope_match || !revision_match {
+                    return Ok(false);
+                }
             }
             Some(retained.session_id.as_str())
         } else {

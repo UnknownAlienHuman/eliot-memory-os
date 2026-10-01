@@ -717,9 +717,12 @@ pub struct FinishClaimedInvocation {
 
 /// Derives the Governor request identity for one admitted finish candidate.
 ///
-/// The task binding comes exclusively from the digest-bound admitted draft
-/// plus the admitted envelope fence: the task id from the draft and the
-/// envelope's live fence unchanged.
+/// The task binding comes from the Kernel-issued FinishAttempt, which carries
+/// the authenticated activation owner tuple. The strict draft's task and
+/// revision are compared to that tuple before this identity is constructed;
+/// the RequestIdentity retains the live transport fence unchanged, while the
+/// separate attempt retains the complete semantic task fence for this exact
+/// operation and its result reconciliation.
 ///
 /// The fence deliberately carries no `task_revision`. It is the Kernel
 /// generation fence (`KernelGenerationSnapshot::state_fence` is
@@ -734,10 +737,44 @@ pub struct FinishClaimedInvocation {
 fn derive_finish_request_identity(
     draft: &eliot_governor::FinishAttemptDraft,
     envelope: &HostRequestEnvelope,
+    attempt: &eliot_protocol::FinishAttempt,
 ) -> Result<RequestIdentity, String> {
     draft
         .validate()
         .map_err(|error| format!("claimed finish draft is invalid: {error}"))?;
+    let session_id_text = envelope
+        .identity
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "claimed finish envelope omits its authenticated session".to_owned())?;
+    let task_id = envelope
+        .identity
+        .task_id
+        .as_deref()
+        .ok_or_else(|| "claimed finish envelope omits its owner-bound task".to_owned())?;
+    let work_scope_id = envelope
+        .identity
+        .work_scope_id
+        .as_deref()
+        .ok_or_else(|| "claimed finish envelope omits its owner-bound WorkScope".to_owned())?;
+    let mut semantic_fence = envelope.state_fence.clone();
+    semantic_fence.task_revision = Some(
+        eliot_contracts::TaskRevision::new(attempt.task_revision)
+            .map_err(|error| format!("Kernel finish revision is invalid: {error}"))?,
+    );
+    if attempt.session_id != session_id_text
+        || attempt.principal_id.trim().is_empty()
+        || attempt.task_id != task_id
+        || attempt.task_id != draft.task_id
+        || attempt.work_scope_id != work_scope_id
+        || attempt.task_revision != draft.expected_task_revision
+        || attempt.semantic_state_fence != semantic_fence
+        || !attempt
+            .authority_epoch
+            .is_same_authority(&envelope.state_fence.authority_epoch)
+    {
+        return Err("Kernel finish attempt does not retain the admitted owner binding".to_owned());
+    }
     let fence = envelope.state_fence.clone();
     let session_id = envelope
         .identity
@@ -748,10 +785,8 @@ fn derive_finish_request_identity(
     let metadata = RequestMetadata {
         request_id: envelope.identity.request_id.clone(),
         session_id,
-        task_id: Some(
-            eliot_contracts::TaskId::new(draft.task_id.clone())
-                .map_err(|error| format!("claimed finish task id is invalid: {error}"))?,
-        ),
+        task_id: Some(eliot_contracts::TaskId::new(attempt.task_id.clone())
+            .map_err(|error| format!("Kernel-bound finish task id is invalid: {error}"))?),
         product_id: ProductId::new("eliotd").map_err(|error| error.to_string())?,
         source_id: SourceId::new("eliotd-finish-lane").map_err(|error| error.to_string())?,
         state_fence: fence.clone(),
@@ -775,6 +810,7 @@ fn derive_finish_request_identity(
 fn validate_finish_claim_request_identity(
     envelope: &HostRequestEnvelope,
     draft: &eliot_governor::FinishAttemptDraft,
+    attempt: &eliot_protocol::FinishAttempt,
     request_identity: &RequestIdentity,
     expected_identity: &RequestIdentity,
 ) -> Result<(), String> {
@@ -790,12 +826,12 @@ fn validate_finish_claim_request_identity(
             .metadata
             .task_id
             .as_ref()
-            .is_none_or(|task| task.as_str() != draft.task_id.as_str())
-        || envelope
-            .identity
-            .task_id
-            .as_deref()
-            .is_some_and(|task| task != draft.task_id)
+            .is_none_or(|task| task.as_str() != attempt.task_id.as_str())
+        || envelope.identity.task_id.as_deref() != Some(attempt.task_id.as_str())
+        || envelope.identity.work_scope_id.as_deref() != Some(attempt.work_scope_id.as_str())
+        || attempt.task_id != draft.task_id
+        || attempt.task_revision != draft.expected_task_revision
+        || attempt.session_id != envelope.identity.session_id.as_deref().unwrap_or_default()
         || request_identity.idempotency_key != envelope.identity.idempotency_key
         || request_identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
         || request_identity.cancellation_id != envelope.identity.cancellation_id
@@ -868,7 +904,7 @@ pub fn parse_finish_claimed_pair(
     let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
         .map_err(|error| format!("Kernel finish operation id does not decode: {error}"))?;
     let expected_operation = host_request_operation_id(&envelope);
-    let expected_identity = derive_finish_request_identity(&draft, &envelope)?;
+    let expected_identity = derive_finish_request_identity(&draft, &envelope, &attempt)?;
     let request_identity = match pair.get("identity") {
         Some(value) => serde_json::from_value(value.clone())
             .map_err(|error| format!("Kernel finish identity does not decode: {error}"))?,
@@ -880,6 +916,7 @@ pub fn parse_finish_claimed_pair(
     validate_finish_claim_request_identity(
         &envelope,
         &draft,
+        &attempt,
         &request_identity,
         &expected_identity,
     )?;

@@ -1522,6 +1522,23 @@ fn build_invocation_envelope(
         .correlation_projection
         .clone()
         .ok_or_else(request_failure)?;
+    if let ToolRequest::Finish(draft) = &request.tool {
+        let binding = facts.task_binding.as_ref().ok_or_else(request_failure)?;
+        if binding.principal_id.trim().is_empty()
+            || binding.principal_id.chars().any(char::is_control)
+            || binding.session_id != session_id
+            || facts.session.as_deref() != Some(session_id)
+            || binding.task_id != draft.task_id
+            || binding.task_revision != draft.expected_task_revision
+            || !binding
+                .state_fence
+                .authority_epoch
+                .is_same_authority(&facts.state_fence.authority_epoch)
+            || binding.state_fence.resource_generation != facts.state_fence.resource_generation
+        {
+            return Err(request_failure());
+        }
+    }
     let (task_id, work_scope_id) = match facts.task_binding.as_ref() {
         Some(binding) => (
             Some(binding.task_id.clone()),

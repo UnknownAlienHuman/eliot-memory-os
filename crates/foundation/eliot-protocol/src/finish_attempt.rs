@@ -9,7 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-use eliot_contracts::{EpochId, canonical_json_bytes};
+use eliot_contracts::{EpochId, StateFence, canonical_json_bytes};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,7 +22,7 @@ pub const FINISH_INVOKE_PAYLOAD_SCHEMA_ID: &str = "eliot.finish.invoke.v1";
 /// Stable wire identity for one Kernel-issued finish attempt capability.
 pub const FINISH_ATTEMPT_WIRE_ID: &str = "eliot.protocol.finish-attempt";
 /// Current finish attempt capability wire version.
-pub const FINISH_ATTEMPT_WIRE_VERSION: u16 = 1;
+pub const FINISH_ATTEMPT_WIRE_VERSION: u16 = 2;
 /// Stable wire identity for one finish result body.
 pub const FINISH_RESULT_BODY_WIRE_ID: &str = "eliot.protocol.finish-result-body";
 /// Current finish result body wire version.
@@ -31,11 +31,10 @@ pub const FINISH_RESULT_BODY_WIRE_VERSION: u16 = 1;
 /// Kernel-issued fenced attempt bound to one admitted `eliot.finish`
 /// operation.
 ///
-/// The capability binds the exact operation handle, the presenting session
-/// and the admitted envelope fence. The owner-native task binding is not
-/// carried here: it lives only in the digest-bound admitted tool bytes, and
-/// the Governor finish owner re-derives it from those exact bytes when it
-/// builds the owner request identity.
+/// The capability binds the exact operation handle and presenting session to
+/// the Kernel-retained authenticated task owner tuple. The semantic task fence
+/// is carried separately from the admitted envelope's transport Session
+/// fence, so task revision never mutates the daemon's live transport identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FinishAttempt {
@@ -51,6 +50,18 @@ pub struct FinishAttempt {
     pub fencing_generation: u64,
     /// Authenticated session bound to this attempt.
     pub session_id: String,
+    /// Authenticated application principal retained by Kernel activation.
+    pub principal_id: String,
+    /// Owner-selected task retained by Kernel activation.
+    pub task_id: String,
+    /// Owner-selected WorkScope retained by Kernel activation.
+    pub work_scope_id: String,
+    /// Current TaskContract revision retained by Kernel activation.
+    pub task_revision: u64,
+    /// Semantic task fence, retained separately from the transport Session
+    /// fence. Its epoch and generation must agree with the admitted envelope;
+    /// its task revision is the activation owner's current revision.
+    pub semantic_state_fence: StateFence,
     /// Authority epoch observed when the Kernel issued the attempt.
     pub authority_epoch: EpochId,
     /// Absolute attempt expiry in Unix milliseconds.
@@ -63,6 +74,9 @@ impl FinishAttempt {
     /// Validates the bounded capability shape. Currency is still enforced by
     /// the Kernel's retained attempt record.
     pub fn validate(&self) -> Result<(), ProtocolError> {
+        self.semantic_state_fence
+            .validate()
+            .map_err(ProtocolError::Foundation)?;
         if self.wire_id != FINISH_ATTEMPT_WIRE_ID
             || self.wire_version != FINISH_ATTEMPT_WIRE_VERSION
         {
@@ -86,6 +100,38 @@ impl FinishAttempt {
             });
         }
         bounded_text(&self.session_id, "finish_attempt.session_id")?;
+        bounded_text(&self.principal_id, "finish_attempt.principal_id")?;
+        bounded_text(&self.task_id, "finish_attempt.task_id")?;
+        bounded_text(&self.work_scope_id, "finish_attempt.work_scope_id")?;
+        if self.task_revision == 0
+            || self
+                .semantic_state_fence
+                .task_revision
+                .map(|revision| revision.value())
+                != Some(self.task_revision)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "finish_attempt.semantic_state_fence",
+                reason: "semantic fence must carry the retained positive task revision",
+            });
+        }
+        eliot_contracts::epoch_identity_digest(&self.semantic_state_fence.authority_epoch)
+            .map_err(|_| ProtocolError::InvalidField {
+                field: "finish_attempt.semantic_state_fence.authority_epoch",
+                reason: "semantic authority epoch is not valid",
+            })?;
+        if self.semantic_state_fence.authority_epoch != self.authority_epoch {
+            return Err(ProtocolError::InvalidField {
+                field: "finish_attempt.semantic_state_fence.authority_epoch",
+                reason: "semantic fence authority epoch must match the attempt epoch",
+            });
+        }
+        if self.semantic_state_fence.resource_generation.value() == 0 {
+            return Err(ProtocolError::InvalidField {
+                field: "finish_attempt.semantic_state_fence.resource_generation",
+                reason: "semantic resource generation must be positive",
+            });
+        }
         eliot_contracts::epoch_identity_digest(&self.authority_epoch).map_err(|_| {
             ProtocolError::InvalidField {
                 field: "finish_attempt.authority_epoch",

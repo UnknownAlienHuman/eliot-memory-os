@@ -474,6 +474,7 @@ impl KernelComposition {
             .agent_activation_pending
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
+        self.finish_owner_binding_for_pair(envelope, tool, &_admission_owner)?;
         self.host_request_connection_gate_under_transition(envelope)?;
         let mut index = self
             .host_request_connection_index
@@ -598,6 +599,8 @@ impl KernelComposition {
                 if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
                     continue;
                 }
+                let owner_binding =
+                    self.finish_owner_binding_for_pair(envelope, tool, &admission_owner)?;
                 if !candidate.finish_attempt.is_owned_by(session) {
                     let generation = candidate
                         .finish_attempt
@@ -629,6 +632,15 @@ impl KernelComposition {
                     attempt_id: candidate.finish_attempt.attempt_id.clone(),
                     fencing_generation: candidate.finish_attempt.generation,
                     session_id: session_id.to_owned(),
+                    principal_id: owner_binding.principal_id.clone(),
+                    task_id: owner_binding.task_id.clone(),
+                    work_scope_id: owner_binding.work_scope_id.clone(),
+                    task_revision: owner_binding.task_revision.value(),
+                    semantic_state_fence: {
+                        let mut fence = envelope.state_fence.clone();
+                        fence.task_revision = Some(owner_binding.task_revision);
+                        fence
+                    },
                     authority_epoch: envelope.state_fence.authority_epoch.clone(),
                     expires_at_unix_ms: envelope.identity.deadline_unix_ms,
                     use_budget: 1,
@@ -831,6 +843,39 @@ impl KernelComposition {
             });
         }
         let (envelope, state, tool) = self.finish_queued_pair(body)?;
+        if !self.application_binding_live_for_claim(&envelope, &_admission_owner, true)? {
+            return Ok(LocalReadSubmitDisposition::StaleAttempt(StaleLocalReadObservation {
+                operation_id: body.operation_id.clone(),
+                request_digest: body.request_sha256.clone(),
+                presented_attempt_id: Some(body.attempt.attempt_id.clone()),
+                presented_generation: Some(body.attempt.fencing_generation),
+                current_generation: Some(state.generation),
+                reason: StaleLocalReadReason::Superseded,
+            }));
+        }
+        let owner_binding = self.finish_owner_binding_for_pair(
+            &envelope,
+            tool.as_ref().ok_or(TransportError::SessionFenced)?,
+            &_admission_owner,
+        )?;
+        let mut semantic_fence = envelope.state_fence.clone();
+        semantic_fence.task_revision = Some(owner_binding.task_revision);
+        if body.attempt.principal_id != owner_binding.principal_id
+            || body.attempt.session_id != owner_binding.session_id
+            || body.attempt.task_id != owner_binding.task_id
+            || body.attempt.work_scope_id != owner_binding.work_scope_id
+            || body.attempt.task_revision != owner_binding.task_revision.value()
+            || body.attempt.semantic_state_fence != semantic_fence
+        {
+            return Ok(LocalReadSubmitDisposition::StaleAttempt(StaleLocalReadObservation {
+                operation_id: body.operation_id.clone(),
+                request_digest: body.request_sha256.clone(),
+                presented_attempt_id: Some(body.attempt.attempt_id.clone()),
+                presented_generation: Some(body.attempt.fencing_generation),
+                current_generation: Some(state.generation),
+                reason: StaleLocalReadReason::Superseded,
+            }));
+        }
         if let Some(observation) = finish_stale_attempt(body, &state, session, &envelope) {
             return Ok(LocalReadSubmitDisposition::StaleAttempt(observation));
         }
@@ -1167,15 +1212,14 @@ fn finish_admission(
     if task_id.len() > MAX_FINISH_REF_BYTES {
         return Err(TransportError::SessionFenced);
     }
-    // #1861 hard boundary 1 (strict canonical finish only): a finish draft
-    // that names a different task than the envelope's bound task is a weak
-    // legacy finish survivor. The envelope's task binding is the Kernel-owned
-    // authority for which task this finish may complete, so the draft's
-    // `task_id` must equal it whenever the envelope binds one. An envelope
-    // without a task binding leaves the draft's task standing alone, exactly
-    // as before; the join never widens what the draft may name.
-    if let Some(bound_task) = envelope.identity.task_id.as_deref()
-        && bound_task != task_id
+    // Draft task/revision are selectors only. Both must join to an activation
+    // owner before staging, and the task/scope fields are mandatory here so a
+    // caller draft can never supply its own missing binding.
+    if envelope.identity.task_id.as_deref() != Some(task_id)
+        || envelope.identity.work_scope_id.as_deref().is_none_or(|scope| {
+            scope.trim().is_empty() || scope.chars().any(char::is_control)
+        })
+        || envelope.state_fence.task_revision.is_some()
     {
         return Err(TransportError::SessionFenced);
     }
@@ -1302,6 +1346,9 @@ fn finish_stale_attempt(
     session: &Session,
     envelope: &HostRequestEnvelope,
 ) -> Option<StaleLocalReadObservation> {
+    let mut semantic_fence = envelope.state_fence.clone();
+    semantic_fence.task_revision =
+        eliot_contracts::TaskRevision::new(body.attempt.task_revision).ok();
     let observation = |reason| StaleLocalReadObservation {
         operation_id: body.operation_id.clone(),
         request_digest: body.request_sha256.clone(),
@@ -1316,6 +1363,7 @@ fn finish_stale_attempt(
     if body.attempt.operation_id != body.operation_id
         || body.attempt.attempt_id != state.attempt_id
         || body.attempt.fencing_generation != state.generation
+        || body.attempt.principal_id.trim().is_empty()
         || body.attempt.session_id
             != envelope
                 .identity
@@ -1323,6 +1371,21 @@ fn finish_stale_attempt(
                 .as_deref()
                 .ok_or(TransportError::SessionFenced)
                 .ok()?
+        || body.attempt.task_id
+            != envelope
+                .identity
+                .task_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)
+                .ok()?
+        || body.attempt.work_scope_id
+            != envelope
+                .identity
+                .work_scope_id
+                .as_deref()
+                .ok_or(TransportError::SessionFenced)
+                .ok()?
+        || body.attempt.semantic_state_fence != semantic_fence
         || body.attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
         || !body
             .attempt
