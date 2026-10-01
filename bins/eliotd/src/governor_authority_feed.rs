@@ -193,9 +193,9 @@ async fn read_governor_authority_observation(
     };
     let wire: GovernorAuthorityObservationResponseWire =
         match serde_json::from_value::<GovernorAuthorityObservationResponseWire>(value) {
-        Ok(wire) if wire.schema_version == 1 => wire,
-        _ => return unavailable(None, "Kernel observation response schema was invalid"),
-    };
+            Ok(wire) if wire.schema_version == 1 => wire,
+            _ => return unavailable(None, "Kernel observation response schema was invalid"),
+        };
     let reason = wire
         .source_reason
         .clone()

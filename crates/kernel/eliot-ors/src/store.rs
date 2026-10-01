@@ -18057,11 +18057,7 @@ impl RedbRecoveryStore {
                 });
             }
             let owner = Self::checked_bridge_observation_owner_index(
-                &owners,
-                &scope,
-                lineage,
-                principal,
-                &namespace,
+                &owners, &scope, lineage, principal, &namespace,
             )?;
             if sequence <= query.after_owner_sequence {
                 continue;
@@ -18110,8 +18106,7 @@ impl RedbRecoveryStore {
                 &owner.producer,
                 &owner.local_stream,
             )? != namespace
-            || Self::bridge_owner_scope_digest(&owner.authority_lineage, &owner.principal)?
-                != scope
+            || Self::bridge_owner_scope_digest(&owner.authority_lineage, &owner.principal)? != scope
         {
             return Err(OrsError::RecoveryOwnerMismatch);
         }
@@ -18154,11 +18149,8 @@ impl RedbRecoveryStore {
             &records,
             &projections,
         )?;
-        let (gaps, gap_total) = Self::read_bridge_observation_gaps(
-            &read,
-            namespace,
-            &stored_owner.local_stream,
-        )?;
+        let (gaps, gap_total) =
+            Self::read_bridge_observation_gaps(&read, namespace, &stored_owner.local_stream)?;
         let result = BridgeEventObservationPage {
             owner: requested.clone(),
             after_event_sequence: query.after_event_sequence,

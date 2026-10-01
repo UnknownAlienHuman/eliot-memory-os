@@ -449,7 +449,9 @@ fn summarize_available_source_readback(
         ));
     }
     if next.is_some() {
-        gaps.push("Kernel source snapshot has a bounded continuation beyond this readback.".to_owned());
+        gaps.push(
+            "Kernel source snapshot has a bounded continuation beyond this readback.".to_owned(),
+        );
     }
     if streams.is_empty() || record_count == 0 {
         gaps.push(
@@ -881,8 +883,10 @@ impl GovernorCoverageDerivation {
         observation: &mut GovernorAuthorityObservation,
         fingerprint: String,
     ) -> Result<IntegrationCoverageProfile, CoverageError> {
-        match IntegrationCoverageProfile::from_authority_observation(observation, fingerprint.clone())
-        {
+        match IntegrationCoverageProfile::from_authority_observation(
+            observation,
+            fingerprint.clone(),
+        ) {
             Ok(coverage) => Ok(coverage),
             Err(error) => {
                 observation.source = SourceReadback::Unavailable {
@@ -925,8 +929,7 @@ impl GovernorCoverageDerivation {
         let Some(fingerprint) = fingerprint else {
             return Ok(None);
         };
-        let mut validated_observation =
-            Self::validated_observation(observation, admitted_adapter);
+        let mut validated_observation = Self::validated_observation(observation, admitted_adapter);
         let coverage = Self::observation_coverage(&mut validated_observation, fingerprint)?;
         let binding = ObservationDerivationBinding {
             observation: observation.clone(),
