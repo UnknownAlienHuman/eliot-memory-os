@@ -61,15 +61,15 @@ pub use admission_reservation_stage::{
     stage_operation_identity, verify_launch_outbox_intent, verify_staged_claim_completeness,
 };
 pub use backup_snapshot::{
-    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, MAX_BACKUP_BYTES,
-    MAX_BACKUP_ID_LEN, MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES, ORS_FAMILY_CURSOR_VERSION,
-    ORS_OPERATIONAL_CURSOR_VERSION, OrsAxisState, OrsBackupDestination, OrsBackupEntry,
-    OrsBackupFence, OrsBackupImportReceipt, OrsBackupImportRequest, OrsBackupPage,
-    OrsBackupRequest, OrsBackupSnapshot, OrsBackupSourceIdentity, OrsFamilyContinuation,
-    OrsFamilyCursor, OrsFamilyRowChain, OrsFamilySnapshotIdentity, OrsOperationalContinuation,
-    OrsOperationalCursor, OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition,
-    RowFamilyDisposition, RowFamilyKind, RowPayloadState, StoredEffectClass,
-    check_outcome_identities,
+    BACKUP_SNAPSHOT_SCHEMA_VERSION, BackupCompleteness, BackupPartialReason, KnownZeroVerdict,
+    MAX_BACKUP_BYTES, MAX_BACKUP_ID_LEN, MAX_BACKUP_PAGE_ENTRIES, MAX_BACKUP_PAGES,
+    ORS_FAMILY_CURSOR_VERSION, ORS_OPERATIONAL_CURSOR_VERSION, OrsAxisState,
+    OrsBackupDestination, OrsBackupEntry, OrsBackupFence, OrsBackupImportReceipt,
+    OrsBackupImportRequest, OrsBackupPage, OrsBackupRequest, OrsBackupSnapshot,
+    OrsBackupSourceIdentity, OrsFamilyContinuation, OrsFamilyCursor, OrsFamilyRowChain,
+    OrsFamilySnapshotIdentity, OrsOperationalContinuation, OrsOperationalCursor,
+    OrsOperationalSnapshotIdentity, PerEntryOutcome, RowDisposition, RowFamilyDisposition,
+    RowFamilyKind, RowPayloadState, StoredEffectClass, check_outcome_identities,
 };
 pub use control_reserve::{
     ORS_DURABLE_BYTES_BOTTLENECK, ORS_TRANSACTION_BOTTLENECK, OrsDimension,
