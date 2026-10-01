@@ -474,6 +474,12 @@ impl StoreRequest {
                             .to_owned(),
                     ));
                 }
+                if request.idempotency_key != identity.idempotency_key {
+                    return Err(StoreWireError::Identity(
+                        "WorkScope owner idempotency key does not match request identity"
+                            .to_owned(),
+                    ));
+                }
                 if request.state_fence != identity.request.state_fence {
                     return Err(StoreWireError::Identity(
                         "WorkScope owner fence does not match request identity".to_owned(),
