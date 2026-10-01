@@ -3794,6 +3794,43 @@ fn handle_mcp_initialize(
     };
     if let Err(error) = runner.attach(AttachRequest::managed(demand, connection)) {
         *provider_failure |= matches!(error, BridgeError::PlanGap(_));
+        // Issue #66 W5/A8: a typed activation denial must reach the MCP
+        // surface with its I7.20 legs intact (disposition, exact reason_code,
+        // directive, operation identity, and the owner-issued
+        // candidate/recovery detail). `bridge_error` already projects
+        // `ActivationDenied` onto the existing `Response::ActivationDenied`
+        // shape that the private `op` loop serializes losslessly; the MCP
+        // envelope carries that same content in `data` instead of collapsing
+        // it to the generic BRIDGE_REQUEST_REJECTED pair below. No new
+        // mapping is computed here: code, reason, disposition, directive, and
+        // detail come straight from that existing projection, and the
+        // operation identity from the denial report it was built from.
+        if let Response::ActivationDenied {
+            code,
+            reason_code,
+            disposition,
+            directive_kind,
+            detail,
+        } = bridge_error(&error)
+        {
+            let operation = match &error {
+                BridgeError::ActivationDenied(report) => Some(report.operation().to_owned()),
+                _ => None,
+            };
+            return render_error(
+                Some(id),
+                WIRE_INTERNAL_ERROR,
+                "attach was refused",
+                serde_json::json!({
+                    "code": code,
+                    "reason_code": reason_code,
+                    "disposition": disposition,
+                    "directive_kind": directive_kind,
+                    "operation": operation,
+                    "detail": detail,
+                }),
+            );
+        }
         let (code, message) = bridge_error_code(&error);
         return render_error(
             Some(id),
