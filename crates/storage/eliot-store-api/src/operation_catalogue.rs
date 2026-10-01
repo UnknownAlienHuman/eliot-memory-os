@@ -495,7 +495,7 @@ struct ActivatedMutationDescriptor {
 /// activated mutation rows address no store scope, mirroring the scope-free read
 /// descriptors. Every
 /// other mutation stays known-but-unsupported.
-const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
+const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 23] = [
     ActivatedMutationDescriptor {
         operation: NamedMutationOperation::ApplyEpistemicRevision,
         transition_classes: &[TransitionClass::Epistemic],
@@ -659,6 +659,17 @@ const ACTIVATED_MUTATIONS: [ActivatedMutationDescriptor; 22] = [
         // JSON inside the parameters object, so the bulk bound covers escaping
         // and the enclosing structure without loosening the record's own
         // closed validator.
+        max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
+    },
+    ActivatedMutationDescriptor {
+        operation: NamedMutationOperation::ApplyInstrumentRegistryState,
+        transition_classes: &[TransitionClass::InstrumentRegistry],
+        maximum_effect: TransitionClass::InstrumentRegistry.maximum_effect(),
+        // The admitted snapshot is one owner snapshot plus its bounded
+        // supply-chain receipts, carried as a JSON string: the 2 MiB bulk
+        // parameter bound covers canonical-JSON escaping and the enclosing
+        // structure without broadening the snapshot's own closed validator,
+        // exactly as the other owner-snapshot rows above.
         max_input_bytes: BULK_MUTATION_MAX_INPUT_BYTES,
     },
 ];
