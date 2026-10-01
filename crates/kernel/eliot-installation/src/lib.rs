@@ -11119,7 +11119,8 @@ where
                 service_runtime_lineage: Some(runtime_lineage),
                 ..
             } if external_identity == durable_identity && runtime_lineage == durable_lineage => {}
-            InstallationEffectObservation::Matching { .. } => {
+            InstallationEffectObservation::Matching { .. }
+            | InstallationEffectObservation::Mismatch { .. } => {
                 return Err(InstallationError::IdentityConflict);
             }
             InstallationEffectObservation::Absent {
@@ -11131,9 +11132,6 @@ where
                     "watchdog start reconciliation observed a runtime lineage for effect {}",
                     transaction.effect_progress[index].effect_id.as_str(),
                 )));
-            }
-            InstallationEffectObservation::Mismatch { .. } => {
-                return Err(InstallationError::IdentityConflict);
             }
         }
         Ok(())
