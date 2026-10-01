@@ -65,6 +65,7 @@ pub use handoff_resume::{HandoffResumeOutcome, resume_handoff};
 pub use learning_gate::assemble_active_view_with_learning;
 pub use measurement::assemble_active_view_with_measurement;
 pub use readback::{ReopenedSource, gate_citation};
+pub use render::EXECUTED_CONTEXT_ROLE_ORDER;
 
 pub use eliot_context_contracts::{
     ActiveUnderstandingView, AdmittedContextSet, BoundaryMetadataSet, ContextError, ContextOutcome,

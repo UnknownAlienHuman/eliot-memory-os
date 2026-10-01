@@ -46,6 +46,7 @@ fn context_execution_support() -> Result<RecipeExecutionSupport, ContextPublicat
     let support = RecipeExecutionSupport {
         executed_stage: stage,
         ordering_revision,
+        role_order: eliot_context_assembly::EXECUTED_CONTEXT_ROLE_ORDER.to_vec(),
         repetition: EXECUTED_REPETITION_POLICY,
         section_degradation: EXECUTED_SECTION_DEGRADATION,
         supports_feature_disable: false,
