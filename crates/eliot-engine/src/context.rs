@@ -376,6 +376,7 @@ impl ContextCompiler {
         ));
         enforce_budget(&mut packet, request.max_tokens, &request.candidate_handles)?;
         PacketQualityService::finalize(&mut packet, frame)?;
+        adjudicate_post_quality_packet_budget(&packet, request.max_tokens, 0, 0)?;
         Ok(packet)
     }
 
@@ -2860,6 +2861,67 @@ fn canonical_measurement_for_payload(
     ))
 }
 
+fn total_surface_estimate(
+    packet_estimate: usize,
+    supplement_tokens: usize,
+    budget_metadata_tokens: usize,
+) -> Result<usize, EngineError> {
+    packet_estimate
+        .checked_add(supplement_tokens)
+        .and_then(|estimate| estimate.checked_add(budget_metadata_tokens))
+        .ok_or_else(|| EngineError::from(ContextError::Overflow))
+}
+
+fn adjudicate_post_quality_packet_budget(
+    packet: &ContextPacketL3,
+    max_tokens: usize,
+    supplement_tokens: usize,
+    budget_metadata_tokens: usize,
+) -> Result<(), EngineError> {
+    let serialized_packet = serde_json::to_vec(packet)?;
+    let (_, stu_estimate, _) = canonical_measurement_for_payload(&serialized_packet)?;
+    adjudicate_post_quality_packet_stu(
+        packet,
+        stu_estimate,
+        max_tokens,
+        supplement_tokens,
+        budget_metadata_tokens,
+    )
+}
+
+fn adjudicate_post_quality_packet_stu(
+    packet: &ContextPacketL3,
+    stu_estimate: StuEstimate,
+    max_tokens: usize,
+    supplement_tokens: usize,
+    budget_metadata_tokens: usize,
+) -> Result<(), EngineError> {
+    // This is planning-budget evidence from the exact final packet bytes and
+    // existing named allowances. It is not tokenizer qualification or proof
+    // that a Decision Safety Floor fits, and it never changes membership.
+    let packet_stu = usize::try_from(stu_estimate.value)
+        .map_err(|_| EngineError::from(ContextError::Overflow))?;
+    let estimated_tokens = total_surface_estimate(
+        packet_stu,
+        supplement_tokens,
+        budget_metadata_tokens,
+    )?;
+    if estimated_tokens > max_tokens {
+        let mut section_tokens = packet_section_accounting(packet)?;
+        section_tokens.insert("returned_supplements".to_owned(), supplement_tokens);
+        section_tokens.insert(
+            "packet_budget_decision_and_compile_audit".to_owned(),
+            budget_metadata_tokens,
+        );
+        return Err(EngineError::PacketFloorExceedsBudget {
+            max_tokens,
+            estimated_tokens,
+            section_tokens,
+        });
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize)]
 struct PacketReturnMetadataView<'a> {
     packet_budget_decision: &'a PacketBudgetDecision,
@@ -3007,8 +3069,15 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
             serde_json::to_vec(&rendered_packet).map_err(EngineError::from)?;
         let (rendered_utf8_bytes, stu_estimate, content_digest) =
             canonical_measurement_for_payload(&final_serialized_packet)?;
-        budget.estimated_tokens = usize::try_from(stu_estimate.value)
-            .map_err(|_| EngineError::from(ContextError::Overflow))?;
+        // Keep `estimated_tokens` as the original packet projection plus its
+        // named allowances for planning-budget evidence. The exact post-quality
+        // whole-packet STU is bound separately below; neither proves
+        // tokenizer-specific Decision Safety Floor fit.
+        budget.estimated_tokens = total_surface_estimate(
+            rendered_packet.token_budget_report.estimated_tokens,
+            budget.supplement_tokens,
+            budget_metadata_tokens,
+        )?;
         budget.rendered_utf8_bytes = rendered_utf8_bytes;
         budget.stu_estimate = stu_estimate;
         let (
@@ -3038,6 +3107,13 @@ fn finalize_precompiled_packet_with_policy_and_audit_context(
             budget
                 .validate_packet_envelope(&final_serialized_packet)
                 .map_err(EngineError::from)?;
+            adjudicate_post_quality_packet_stu(
+                &rendered_packet,
+                stu_estimate,
+                budget.effective_tokens,
+                budget.supplement_tokens,
+                budget_metadata_tokens,
+            )?;
             let project_understanding =
                 rendered_packet
                     .project_understanding
@@ -3475,7 +3551,8 @@ pub fn refinalize_compiled_packet(
     required_handles: &[String],
 ) -> Result<(), EngineError> {
     enforce_budget(packet, max_tokens, required_handles)?;
-    PacketQualityService::finalize(packet, frame)
+    PacketQualityService::finalize(packet, frame)?;
+    adjudicate_post_quality_packet_budget(packet, max_tokens, 0, 0)
 }
 
 pub fn packet_section_accounting(
