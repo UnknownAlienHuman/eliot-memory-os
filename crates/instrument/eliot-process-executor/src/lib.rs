@@ -6443,10 +6443,7 @@ mod tests {
                     // join window) is an honest typed outcome for B itself,
                     // but B must still be retained — never promoted — and A
                     // must still read unknown.
-                    assert_quarantined_unknown(
-                        &executor,
-                        OperationId::new("op-82-b-healthy")?,
-                    )?;
+                    assert_quarantined_unknown(&executor, OperationId::new("op-82-b-healthy")?)?;
                 }
                 Err(other) => {
                     return Err(format!(
@@ -6489,10 +6486,9 @@ mod tests {
             .iter()
             .find(|record| record.operation_id() == &operation_id)
         else {
-            return Err(format!(
-                "quarantine projection lost original operation {operation_id}"
-            )
-            .into());
+            return Err(
+                format!("quarantine projection lost original operation {operation_id}").into(),
+            );
         };
         assert_eq!(record.lifecycle(), ProcessLifecycle::UnknownOutcome);
         Ok(())
