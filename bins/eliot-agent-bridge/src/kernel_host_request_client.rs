@@ -4429,6 +4429,11 @@ mod tests {
         // the payload and revision verbatim.
         let (request, _, envelope) = test_envelope();
         let (body, digest) = stored_test_response(&envelope);
+        let result_lineage: HostRequestResultLineage = serde_json::from_value(serde_json::json!({
+            "output_digest": digest,
+            "result_class": "EXISTING_EVIDENCE_READ",
+        }))
+        .expect("retained result lineage must decode");
         let received = AdmittedReplyView {
             operation_id: receipt.operation_id.clone(),
             state: HostRequestRecordState::ResultReceived,
@@ -4444,7 +4449,7 @@ mod tests {
             scope_ref: None,
             capability_ref: None,
             payload_digest: None,
-            result_lineage: None,
+            result_lineage: Some(result_lineage),
         };
         match submit_outcome(&receipt, &received, &request, &envelope) {
             Ok(HostInvocationPortOutcome::Responded {
