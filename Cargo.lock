@@ -1103,6 +1103,7 @@ name = "eliot-config"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "eliot-blob-api",
  "eliot-contracts",
  "eliot-runtime-contracts",
  "eliot-security-contracts",
@@ -2319,6 +2320,7 @@ dependencies = [
  "eliot-blob-api",
  "eliot-contracts",
  "eliot-installation",
+ "eliot-instrument-runner",
  "eliot-ipc",
  "eliot-kernel-core",
  "eliot-kernel-service",
@@ -3364,6 +3366,7 @@ name = "eliot-testd"
 version = "0.1.0"
 dependencies = [
  "eliot-blob-api",
+ "eliot-bootstrap",
  "eliot-cli",
  "eliot-contracts",
  "eliot-instrument-api",
