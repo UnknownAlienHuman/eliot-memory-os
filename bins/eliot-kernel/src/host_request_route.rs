@@ -1513,6 +1513,7 @@ impl KernelComposition {
     /// the dispatch-then-store leg wherever a Governor is injected.
     pub fn invoke_read_host_request(
         &self,
+        session: &Session,
         envelope: &HostRequestEnvelope,
         tool: &serde_json::Value,
         request_identity: &RequestIdentity,
@@ -1543,7 +1544,8 @@ impl KernelComposition {
                 envelope,
                 task_relative_tool,
             )?;
-        let identity = host_request_kernel_identity_binding(envelope, request_identity)?;
+        let identity =
+            host_request_kernel_identity_binding(session, envelope, request_identity)?;
         self.generation_gateway
             .ors
             .bind_host_request_kernel_identity(
@@ -6073,6 +6075,7 @@ pub(crate) fn requested_host_request_record(
 }
 
 fn host_request_kernel_identity_binding(
+    session: &Session,
     envelope: &HostRequestEnvelope,
     identity: &RequestIdentity,
 ) -> Result<HostRequestKernelRequestIdentity, TransportError> {
@@ -6092,15 +6095,94 @@ fn host_request_kernel_identity_binding(
     {
         return Err(TransportError::SessionFenced);
     }
+    if session.connection_id != envelope.connection_id
+        || session.session_epoch == 0
+        || session.launch_nonce.trim().is_empty()
+        || !session
+            .module_generation
+            .state_fence
+            .is_compatible_with(&envelope.state_fence)
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let authenticated_peer = match &session.peer {
+        PeerIdentity::Authenticated {
+            process_id,
+            user_identity,
+            session_identity,
+            ..
+        } if *process_id != 0
+            && !user_identity.trim().is_empty()
+            && !session_identity.trim().is_empty() =>
+        {
+            eliot_ors::HostRequestKernelAuthenticatedPeer {
+                connection_id: session.connection_id.clone(),
+                process_id: *process_id,
+                user_identity: user_identity.clone(),
+                session_identity: session_identity.clone(),
+                transport_session_epoch: session.session_epoch,
+                launch_nonce_sha256: eliot_contracts::sha256_hex(
+                    session.launch_nonce.as_bytes(),
+                ),
+            }
+        }
+        _ => return Err(TransportError::PeerIdentityUnavailable),
+    };
+    authenticated_peer
+        .validate()
+        .map_err(|_| TransportError::PeerIdentityUnavailable)?;
     let value = serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?;
     let bytes = eliot_contracts::canonical_json_bytes(&value)
         .map_err(|_| TransportError::SessionFenced)?;
     let canonical_json = String::from_utf8(bytes).map_err(|_| TransportError::SessionFenced)?;
     let sha256 = eliot_contracts::sha256_hex(canonical_json.as_bytes());
+    let authenticated_peer_sha256 = eliot_contracts::sha256_hex(
+        &eliot_contracts::canonical_json_bytes(&authenticated_peer)
+            .map_err(|_| TransportError::SessionFenced)?,
+    );
     Ok(HostRequestKernelRequestIdentity {
         canonical_json,
         sha256,
+        authenticated_peer: Some(authenticated_peer),
+        authenticated_peer_sha256: Some(authenticated_peer_sha256),
     })
+}
+
+fn host_request_kernel_identity_matches(
+    envelope: &HostRequestEnvelope,
+    identity: &RequestIdentity,
+    retained: &HostRequestKernelRequestIdentity,
+) -> Result<bool, TransportError> {
+    identity
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    retained
+        .validate()
+        .map_err(|_| TransportError::SessionFenced)?;
+    let peer = retained
+        .authenticated_peer
+        .as_ref()
+        .ok_or(TransportError::PeerIdentityUnavailable)?;
+    if peer.connection_id != envelope.connection_id
+        || identity.request.metadata.request_id.as_str() != envelope.identity.request_id
+        || identity.request.metadata.session_id.as_ref().map(|id| id.as_str())
+            != envelope.identity.session_id.as_deref()
+        || identity.request.metadata.task_id.as_ref().map(|id| id.as_str())
+            != envelope.identity.task_id.as_deref()
+        || identity.request.state_fence != envelope.state_fence
+        || identity.request.metadata.state_fence != envelope.state_fence
+        || identity.idempotency_key != envelope.identity.idempotency_key
+        || identity.cancellation_id != envelope.identity.cancellation_id
+        || identity.deadline_unix_ms != envelope.identity.deadline_unix_ms
+    {
+        return Err(TransportError::SessionFenced);
+    }
+    let value = serde_json::to_value(identity).map_err(|_| TransportError::SessionFenced)?;
+    let bytes = eliot_contracts::canonical_json_bytes(&value)
+        .map_err(|_| TransportError::SessionFenced)?;
+    let canonical_json = String::from_utf8(bytes).map_err(|_| TransportError::SessionFenced)?;
+    Ok(canonical_json == retained.canonical_json
+        && eliot_contracts::sha256_hex(canonical_json.as_bytes()) == retained.sha256)
 }
 
 /// Derives the exact ORS key of the parent operation targeted by a
@@ -6346,8 +6428,12 @@ impl KernelComposition {
                 }
                 AGENT_HOST_REQUEST_INVOKE_READ_OPERATION => {
                     let tool = host_request_tool_from_payload(payload)?;
-                    let (receipt, record) =
-                        self.invoke_read_host_request(envelope, &tool, request_identity)?;
+                    let (receipt, record) = self.invoke_read_host_request(
+                        session,
+                        envelope,
+                        &tool,
+                        request_identity,
+                    )?;
                     // The durable record carries the result pair when the
                     // operation already received its bounded answer, so the
                     // admitted shape is the result-bearing response: no second

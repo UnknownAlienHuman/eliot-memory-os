@@ -426,6 +426,12 @@ pub struct TaskControllerClaimedInvocation {
     pub envelope: HostRequestEnvelope,
     pub tool: serde_json::Value,
     pub request_identity: RequestIdentity,
+    /// Original Kernel-authenticated transport peer persisted with the Host
+    /// request. This is distinct from caller payload identity and remains
+    /// available after Kernel restart/claim rehydration.
+    pub authenticated_peer: eliot_ors::HostRequestKernelAuthenticatedPeer,
+    /// Digest carried by the Kernel's durable Host owner row.
+    pub authenticated_peer_sha256: String,
     pub operation_id: OperationId,
     pub attempt: TaskControllerAttempt,
 }
@@ -544,6 +550,22 @@ pub fn parse_task_controller_claimed_pair(
     request_identity
         .validate()
         .map_err(|error| format!("Kernel Task Controller identity is invalid: {error}"))?;
+    let authenticated_peer: eliot_ors::HostRequestKernelAuthenticatedPeer =
+        serde_json::from_value(decode("authenticated_peer")?).map_err(|error| {
+            format!("Kernel Task Controller authenticated peer does not decode: {error}")
+        })?;
+    authenticated_peer
+        .validate()
+        .map_err(|error| format!("Kernel Task Controller authenticated peer is invalid: {error}"))?;
+    let authenticated_peer_sha256 = decode("authenticated_peer_sha256")?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "Kernel Task Controller authenticated peer digest is not text".to_owned())?;
+    if sha256_hex(&canonical_json_bytes(&authenticated_peer).map_err(|error| error.to_string())?)
+        != authenticated_peer_sha256
+    {
+        return Err("Kernel Task Controller authenticated peer digest mismatch".to_owned());
+    }
     let operation_id: OperationId = serde_json::from_value(decode("operation_id")?)
         .map_err(|error| format!("Kernel Task Controller operation id does not decode: {error}"))?;
     let attempt: TaskControllerAttempt = serde_json::from_value(decode("attempt")?)
@@ -580,6 +602,7 @@ pub fn parse_task_controller_claimed_pair(
         || tool_invocation.as_ref() != Some(&invocation)
         || !identity_task_matches
         || !identity_scope_matches
+        || authenticated_peer.connection_id != envelope.connection_id
         || request_identity.request.metadata.request_id.as_str()
             != envelope.identity.request_id.as_str()
         || request_identity.request.metadata.session_id.as_ref().map(|id| id.as_str())
@@ -604,6 +627,8 @@ pub fn parse_task_controller_claimed_pair(
         envelope,
         tool,
         request_identity,
+        authenticated_peer,
+        authenticated_peer_sha256,
         operation_id,
         attempt,
     }))
