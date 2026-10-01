@@ -992,6 +992,12 @@ pub struct PreparedDestination {
 /// nothing here grants authority: the handle states what this Host admitted and
 /// created, and cutover authority is a separate owner question A13.7 keeps out
 /// of it entirely.
+///
+/// What the handle **publishes** is only [`Self::operation_id`] and
+/// [`Self::manifest_binding`]. The other members above are still carried and
+/// still owner-issued, but they are private and are consumed by [`Self::proves`]
+/// as one field-by-field comparison against the retained record rather than
+/// through accessors: see [`Self::manifest_binding`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedDestinationHandle {
     operation_id: String,
@@ -1085,41 +1091,29 @@ impl PreparedDestinationHandle {
         &self.operation_id
     }
 
-    /// The owner-derived destination identity, never a caller- or
-    /// archive-selected value.
-    #[must_use]
-    pub fn destination_id(&self) -> &str {
-        &self.destination_id
-    }
-
-    /// The preparation-scope lineage marker. **Not** an Authority Epoch: no
-    /// Authority Epoch is issued here, and nothing may read it as one.
-    #[must_use]
-    pub const fn destination_epoch(&self) -> u64 {
-        self.destination_epoch
-    }
-
-    /// The protected-root owner's pinned OS identity for the created directory.
-    #[must_use]
-    pub const fn root_identity(&self) -> &RootIdentity {
-        &self.root_identity
-    }
-
-    /// The owner's admission digest over every admitted input.
-    #[must_use]
-    pub fn admission_digest(&self) -> &str {
-        &self.admission_digest
-    }
-
-    /// The owner-issued configuration projection digest this destination was
-    /// admitted under.
-    #[must_use]
-    pub fn config_projection_digest(&self) -> &str {
-        &self.config_projection_digest
-    }
-
     /// The owner-issued active-manifest binding this destination was admitted
     /// under, which is what the Kernel resolves into its destination admission.
+    ///
+    /// This is the whole of the handle's published read surface, and it is
+    /// published for a named consumer rather than for symmetry: the Kernel-side
+    /// `DestinationManifestEvidence::issue_from_owner_manifest` takes exactly
+    /// these three owner-read members - the active manifest's configuration
+    /// digest, the manifest-bound runtime roots' digest and the observed
+    /// registry revision - and nothing else.
+    ///
+    /// The other owner-issued members this handle carries are deliberately NOT
+    /// published one at a time. `destination_id`, `destination_epoch`,
+    /// `root_identity`, `admission_digest` and `config_projection_digest` are
+    /// the Host's own proof over the directory it created, and [`Self::proves`]
+    /// is how they are consumed: field by field against the retained
+    /// [`BackupPreparationRecord`], in one comparison, so a reader cannot pick
+    /// the subset that happens to agree and ignore the rest. No Kernel-side
+    /// destination admission carries any of them - `destination_epoch` in
+    /// particular is a preparation-scope marker that no Authority Epoch may be
+    /// read from, and `root_identity` is a pinned OS identity that means nothing
+    /// to a consumer that cannot open the directory. Publishing them as
+    /// accessors would be an interface nobody reads, so they stay private and
+    /// stay proved.
     #[must_use]
     pub const fn manifest_binding(&self) -> &HostManifestBinding {
         &self.manifest
@@ -5333,7 +5327,7 @@ impl OwnerEvidence {
                 target_profile: binding.approved_profile.clone(),
                 approved_generation: self.authority_generation(),
                 authority_generation: self.authority_generation(),
-                owner_lease_ref: owner_lease_ref,
+                owner_lease_ref,
                 // No purge-ledger claim: the revision is owner-issued by the ORS
                 // owner and is bound into the projection digest whether or not a
                 // claim was made, so an explicit absence is the honest value.
@@ -5351,12 +5345,10 @@ impl OwnerEvidence {
                 state_fence_digest: fence_digest.clone(),
             };
             Ok(OwnerPreparationCredential {
-                operation_id: presentation.operation_id.clone(),
                 caller: caller.clone(),
                 source_installation_id: presentation.source_installation_id.clone(),
                 lease_digest,
                 fence_digest,
-                manifest,
                 presentation,
             })
         })();
@@ -5509,13 +5501,24 @@ impl AdmittedBackupCaller {
     }
 
     /// The authenticated principal identity the transport reported.
+    ///
+    /// The projection is `String::as_str`, not a deref of the owned field,
+    /// because a const fn cannot perform the `&String` to `&str` coercion at
+    /// all. That is the const-accessor shape this workspace already uses over an
+    /// owned `String`
+    /// (`crates/kernel/eliot-ors/src/effect_operation_lease.rs`,
+    /// `EffectOperationLease::manifest_module_id`), so the identity stays
+    /// readable in const context rather than losing its constness.
     pub(crate) const fn principal(&self) -> &str {
-        &self.principal
+        self.principal.as_str()
     }
 
     /// The authenticated session the transport reported.
+    ///
+    /// [`Self::principal`]'s rule, for the same reason: `as_str` is what a const
+    /// fn may call on an owned `String`.
     pub(crate) const fn session_id(&self) -> &str {
-        &self.session_id
+        self.session_id.as_str()
     }
 
     /// The separately authenticated role projection.
@@ -5594,13 +5597,24 @@ pub fn admitted_preparation_operation_id(
 ///   carries is compared against owner evidence rather than against a second
 ///   value the same caller chose;
 /// - the owner-issued manifest binding
-///   ([`OwnerEvidence::owner_manifest_binding`]) that the published
-///   [`PreparedDestinationHandle`] carries to the Kernel;
+///   ([`OwnerEvidence::owner_manifest_binding`]), which the published
+///   [`PreparedDestinationHandle`] carries to the Kernel and which the fence
+///   digest below is computed over. It is deliberately NOT carried on the
+///   credential as a readable member: this credential never leaves the Host, the
+///   published handle is what crosses the seam, and a second readable copy of
+///   the same binding here would be one more value a caller could read without
+///   the handle that is the thing actually published;
 /// - the two digests [`BackupCallerAuth`] compares against: one over the
 ///   retained protected-root lease reference this owner still proves, one over
 ///   the committed activation generation and the manifest binding. Both are
 ///   derived from owner records this bundle validated, so neither is a caller
 ///   string, and neither is an epoch a caller can increment.
+///
+/// The admitted operation identity is likewise not carried twice: it is the
+/// `operation_identity` of the [`AdmittedBackupCaller`] this credential binds,
+/// and it is the `operation_id` of the owner-built presentation below, which is
+/// the same value. The published [`PreparedDestinationHandle::operation_id`] is
+/// the readable name for it once the effect has happened.
 ///
 /// The presentation it carries is **built here**, not presented: every field
 /// [`DelegatedPreparation::prepare`] needs is owner-issued or is an explicit
@@ -5611,21 +5625,13 @@ pub fn admitted_preparation_operation_id(
 /// string or an epoch of its own, which is the whole point of the credential.
 pub struct OwnerPreparationCredential {
     caller: AdmittedBackupCaller,
-    operation_id: String,
     source_installation_id: String,
     lease_digest: String,
     fence_digest: String,
-    manifest: HostManifestBinding,
     presentation: PresentedPreparationRequest,
 }
 
 impl OwnerPreparationCredential {
-    /// The preparation operation identity this credential was issued for.
-    #[must_use]
-    pub fn operation_id(&self) -> &str {
-        &self.operation_id
-    }
-
     /// The owner-issued source installation this credential admitted.
     #[must_use]
     pub fn source_installation_id(&self) -> &str {
@@ -5643,13 +5649,6 @@ impl OwnerPreparationCredential {
     #[must_use]
     pub fn fence_digest(&self) -> &str {
         &self.fence_digest
-    }
-
-    /// The owner-issued active-manifest binding this preparation was admitted
-    /// under, which is what the Kernel resolves into its destination admission.
-    #[must_use]
-    pub const fn manifest_binding(&self) -> &HostManifestBinding {
-        &self.manifest
     }
 
     /// The authenticated caller this credential is bound to.
