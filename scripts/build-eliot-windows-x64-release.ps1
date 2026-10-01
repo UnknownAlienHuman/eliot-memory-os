@@ -2069,7 +2069,10 @@ function Select-ReleaseIsolationFallback(
     #   * it must name the phase it measured and the 40-hex pinned HEAD it
     #     observed;
     #   * every assertion the measurement is responsible for must be recorded
-    #     as exactly $true.
+    #     as a real boolean whose value is exactly $true.  `-ne` coerces the
+    #     right operand to the left operand's type, so without an explicit type
+    #     test a recorded 'true' or 1 compares equal to $true and a
+    #     wrong-shaped record would be stamped as local proof.
     # `Assert-IsolatedSourceTree` throws on any divergence, so a boundary whose
     # proof comes from it can only reach this call at all once the measurement
     # actually ran; and a boundary with no measured record can never be
@@ -2091,7 +2094,19 @@ function Select-ReleaseIsolationFallback(
             $defects.Add("measured phase '$phase' carries no 40-hex pinned HEAD")
         }
         foreach ($assertion in @('tracked_clean', 'untracked_rejected', 'cargo_config_absent')) {
-            if (-not $proof.Contains($assertion) -or $proof[$assertion] -ne $true) {
+            # The three ways a measurement can fail to prove an assertion stay
+            # distinguishable in the recorded reason: the key can be absent, it
+            # can be present in the wrong shape, or it can be a boolean that is
+            # not $true.  Naming the shape is what lets an operator tell a
+            # wrong-shaped record from an unsatisfied assertion.
+            if (-not $proof.Contains($assertion)) {
+                $defects.Add("measured phase '$phase' recorded no $assertion")
+            }
+            elseif ($proof[$assertion] -isnot [bool]) {
+                $recordedShape = if ($null -eq $proof[$assertion]) { 'null' } else { $proof[$assertion].GetType().Name }
+                $defects.Add("measured phase '$phase' recorded $assertion as $recordedShape, not as a boolean")
+            }
+            elseif ($proof[$assertion] -ne $true) {
                 $defects.Add("measured phase '$phase' did not record $assertion as true")
             }
         }
