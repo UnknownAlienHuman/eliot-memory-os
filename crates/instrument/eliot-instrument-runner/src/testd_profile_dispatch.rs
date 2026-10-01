@@ -111,16 +111,7 @@ pub const TESTD_DISPATCH_BINDINGS: [TestdDispatchBinding; 12] = [
 /// stage DAGs are compiled by this registry.
 #[must_use]
 pub fn dispatched_testd_profiles() -> Vec<&'static str> {
-    let candidates = [
-        TESTD_PRODUCTIVE_PROFILE,
-        TESTD_LIST_PROFILE,
-        TESTD_SCOPED_PROFILE,
-        COMPILER_PROFILE,
-        TEST_PROFILE,
-        PACKAGE_VERIFICATION_ROUTE,
-        BUNDLE_VERIFICATION_ROUTE,
-    ];
-    candidates
+    eliot_testd_core::PRODUCTIVE_TESTD_PROFILE_NAMES
         .into_iter()
         .filter(|profile| is_productive_testd_profile(profile))
         .collect()
@@ -168,10 +159,7 @@ pub enum TestdDispatchError {
     },
     /// A productive profile or one of its compiled stages has no binding.
     #[error("testd profile '{profile}' has no dispatch binding for stage '{stage_id}'")]
-    UnboundStage {
-        profile: &'static str,
-        stage_id: String,
-    },
+    UnboundStage { profile: String, stage_id: String },
     /// A declared binding does not correspond to the compiled runner DAG.
     #[error("testd dispatch binding for '{profile}'/'{stage_id}' differs from the compiled profile")]
     StageBindingMismatch {
@@ -211,7 +199,7 @@ pub fn verify_testd_dispatch(registry: &ProviderRegistry) -> Result<(), TestdDis
         Vec::new(),
     )
     .map_err(|_| TestdDispatchError::UnboundStage {
-        profile: COMPILER_PROFILE,
+        profile: COMPILER_PROFILE.to_owned(),
         stage_id: "<builtin-registry>".to_owned(),
     })?;
     verify_compiled_stages(registry, &profiles)?;
@@ -259,6 +247,37 @@ fn verify_compiled_stages(
     providers: &ProviderRegistry,
     profiles: &InstrumentRegistry,
 ) -> Result<(), TestdDispatchError> {
+    for profile in profiles
+        .iter()
+        .filter(|profile| is_productive_testd_profile(&profile.name))
+    {
+        let compiled = ProfileCompiler::new(profiles)
+            .compile_exact(&profile.name, profile.revision)
+            .map_err(|_| TestdDispatchError::UnboundStage {
+                profile: profile.name.clone(),
+                stage_id: profile.name.clone(),
+            })?;
+        for stage in compiled.stages {
+            let binding = TESTD_DISPATCH_BINDINGS
+                .iter()
+                .find(|binding| {
+                    binding.testd_profile == profile.name
+                        && binding.stage_id.as_deref() == Some(stage.stage_id.as_str())
+                });
+            let Some(binding) = binding else {
+                return Err(TestdDispatchError::UnboundStage {
+                    profile: profile.name.clone(),
+                    stage_id: stage.stage_id,
+                });
+            };
+            if binding.instrument_contract != stage.spec.as_str() {
+                return Err(TestdDispatchError::StageBindingMismatch {
+                    profile: binding.testd_profile,
+                    stage_id: binding.stage_id.unwrap_or("<legacy>"),
+                });
+            }
+        }
+    }
     for binding in TESTD_DISPATCH_BINDINGS {
         let Some(stage_id) = binding.stage_id else {
             let supported = providers.iter().any(|entry| {
