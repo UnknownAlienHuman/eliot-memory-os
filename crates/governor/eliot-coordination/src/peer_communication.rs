@@ -4291,6 +4291,9 @@ impl CoordinationOwner {
     /// Submits one revision-anchored review through the existing owner.
     /// The review binds the exact artifact digest at its revision; a stale
     /// revision is retained as stale and never satisfies a requirement.
+    /// An ambiguous anchor is retained as an explicitly ambiguous unattached
+    /// item: the `Ambiguous` status and anchor evidence stay on the record,
+    /// it joins no conflict set, and it never satisfies a requirement.
     /// Conflicting recommendations on one revision retain a conflict set.
     /// The retained record binds the reviewer's authenticated principal at
     /// submit and its admission sequence on commit.
@@ -4378,14 +4381,18 @@ impl CoordinationOwner {
             .cloned()
             .ok_or(CoordinationError::InvalidState)?;
         let stale = draft.artifact_revision < head.revision;
+        // I10.18/I10.21: an ambiguous anchor is retained as an explicitly
+        // ambiguous unattached item, never refused and never attached to a
+        // similar fragment. Every other unresolvable anchor stays typed.
+        let ambiguous = matches!(draft.anchor_resolution, AnchorResolution::Ambiguous);
+        if !stale && !ambiguous && !draft.anchor_resolution.satisfies_required_review() {
+            return Err(CoordinationError::PeerReviewAnchorInvalid(
+                draft.review_id.clone(),
+            ));
+        }
         let lifecycle = if stale {
             PeerReviewLifecycle::Stale
         } else {
-            if !draft.anchor_resolution.satisfies_required_review() {
-                return Err(CoordinationError::PeerReviewAnchorInvalid(
-                    draft.review_id.clone(),
-                ));
-            }
             PeerReviewLifecycle::PendingDelivery
         };
         let standing = if draft.expires_at.is_some_and(|expiry| now >= expiry) {
@@ -4436,13 +4443,20 @@ impl CoordinationOwner {
             created_at: now,
             durability: recorded.clone(),
         };
-        if !stale {
+        // An ambiguous anchor stays unattached: it neither joins a conflict
+        // set itself nor lends an ambiguous record as a conflict rival, so no
+        // retained item is ever attached to a similar fragment (I10.21).
+        if !stale && !ambiguous {
             let rivals: Vec<AnchoredReview> = self
                 .peer_reviews
                 .values()
                 .filter(|existing| {
                     existing.artifact_id == draft.artifact_id
                         && existing.artifact_revision == draft.artifact_revision
+                        && !matches!(
+                            existing.anchor_resolution,
+                            AnchorResolution::Ambiguous
+                        )
                         && !matches!(
                             existing.lifecycle,
                             PeerReviewLifecycle::Stale | PeerReviewLifecycle::Superseded
