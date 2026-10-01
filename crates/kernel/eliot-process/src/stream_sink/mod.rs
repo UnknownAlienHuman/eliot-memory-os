@@ -248,17 +248,25 @@ pub enum ProcessStreamSinkError {
     TerminalCommandStateMismatch,
     #[error("terminal/evidence invariant failed: {reason}")]
     EvidenceInvariant { reason: String },
+    /// Typed capacity failure, including provider cause and mutation certainty.
     #[error("storage capacity exhausted at {stage} ({cause:?}); possible_effect={possible_effect}")]
     StorageCapacity {
+        /// Storage boundary that reported exhaustion.
         stage: &'static str,
+        /// Target-qualified native cause.
         cause: ProcessStreamSinkCapacityCause,
+        /// Bytes offered to the native boundary, when known.
         attempted_bytes: Option<u64>,
+        /// Whether this storage operation may already have changed durable state.
         possible_effect: bool,
     },
+    /// The owner rejected a stale or conflicting authority fence.
     #[error("storage authority was fenced: {reason}")]
     AdmissionFenced { reason: ProcessStreamSinkFenceReason },
+    /// Storage verification rejected source bytes or their metadata binding.
     #[error("stored source integrity failed: {reason}")]
     IntegrityFailure { reason: ProcessStreamSinkIntegrityReason },
+    /// The owner could not establish whether the original operation took effect.
     #[error("storage effect remains possible and unresolved at {operation}")]
     PossibleEffectUnknown { operation: &'static str },
     #[error("provider unavailable before an exact session result")]
@@ -271,23 +279,31 @@ pub enum ProcessStreamSinkError {
 /// storage crate's provider vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessStreamSinkCapacityCause {
+    /// Generic platform storage-full observation.
     StorageFull,
+    /// POSIX `ENOSPC` with its native code.
     PosixEnospc { code: i32 },
+    /// Windows disk-full code.
     WindowsDiskFull { code: u32 },
+    /// Windows handle-disk-full code.
     WindowsHandleDiskFull { code: u32 },
 }
 
 /// Why the exact sink authority was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessStreamSinkFenceReason {
+    /// The state fence is stale, mismatched, or revoked.
     StaleOrRevoked,
+    /// A different root owner holds the storage lease.
     OwnerConflict,
 }
 
 /// Integrity category preserved from the storage owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessStreamSinkIntegrityReason {
+    /// Authentication, plaintext digest, or content digest verification failed.
     AuthenticationOrDigest,
+    /// Ready metadata and payload identity did not match.
     MetadataPayloadBinding,
 }
 
