@@ -148,7 +148,10 @@ impl<'a, P: ?Sized> GovernorFinishAttempt<'a, P> {
         kernel_attempt: &eliot_protocol::FinishAttempt,
     ) -> Result<Option<FinishDecisionReceipt>, FinishAttemptError> {
         validate_identity(identity)?;
-        draft.validate().map_err(FinishError::from)?;
+        draft
+            .validate()
+            .map_err(eliot_canonical::CanonicalError::from)
+            .map_err(FinishError::from)?;
         kernel_attempt
             .validate()
             .map_err(|error| FinishAttemptError::Serialization(error.to_string()))?;
@@ -1474,7 +1477,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         contract_acceptance_set: &RehydratedContractAcceptanceSet,
     ) -> Result<Option<PreparedKernelExchange>, FinishAttemptError> {
         validate_identity(identity)?;
-        draft.validate().map_err(FinishError::from)?;
+        draft
+            .validate()
+            .map_err(eliot_canonical::CanonicalError::from)
+            .map_err(FinishError::from)?;
         let fence = identity.request.metadata.state_fence.clone();
         if self.canonical.state_fence() != &fence {
             return Err(FinishError::FenceMismatch.into());
@@ -1563,7 +1569,10 @@ impl<P: KernelTransitionPort + ?Sized> GovernorFinishAttempt<'_, P> {
         draft: FinishAttemptDraft,
     ) -> Result<PreparedFinishDecision, FinishAttemptError> {
         validate_identity(identity)?;
-        draft.validate().map_err(FinishError::from)?;
+        draft
+            .validate()
+            .map_err(eliot_canonical::CanonicalError::from)
+            .map_err(FinishError::from)?;
         let fence = identity.request.metadata.state_fence.clone();
         if self.canonical.state_fence() != &fence {
             return Err(FinishError::FenceMismatch.into());
