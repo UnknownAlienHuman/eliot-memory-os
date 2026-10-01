@@ -2498,6 +2498,24 @@ impl UserAutomationRevision {
         Ok(())
     }
 
+    /// Validates an owner-normalized replacement of an immutable legacy revision.
+    /// Draft validation belongs to the preceding migration request; Edit must
+    /// retain the owner's generated occurrence and receipt projection.
+    pub fn validate_normalized_migration_supersedes(
+        &self,
+        old: &UserAutomationRevision,
+    ) -> Result<(), UserAutomationError> {
+        self.validate()?;
+        old.validate_legacy_for_schedule_migration()?;
+        if self.automation_id != old.automation_id
+            || self.revision == old.revision
+            || self.supersedes.as_deref() != Some(old.revision.as_str())
+        {
+            return Err(UserAutomationError::InvalidSupersession);
+        }
+        Ok(())
+    }
+
     /// Compiles an inert existing-contract wake intent for one occurrence.
     pub fn compile_wake_intent(
         &self,
@@ -4142,7 +4160,7 @@ impl UserAutomationOperation {
                         .validate_legacy_for_schedule_migration()
                         .is_ok();
                 if legacy_predecessor {
-                    revision.validate_migration_supersedes(previous_revision)?;
+                    revision.validate_normalized_migration_supersedes(previous_revision)?;
                     if normalization_receipt_envelope.core.operation.operation_kind
                         != USER_AUTOMATION_LEGACY_MIGRATION_OPERATION_KIND
                     {
