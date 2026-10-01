@@ -3830,6 +3830,9 @@ pub enum NamedReadOperation {
     GetTaskContractAcceptanceSet,
     /// Exact fenced lookup of one process-stream admission / Ready commitment.
     GetBlobProcessSourceAdmission,
+    /// Exact fenced lookup of the fixed `owner/policy` recovery record,
+    /// preserving physical row absence as distinct from an unavailable read.
+    GetPolicyOwnerSnapshot,
 }
 
 /// Schema identifier of the neutral `TaskContract` acceptance-set payload.
@@ -4284,6 +4287,45 @@ pub struct NamedReadResponse {
     pub state_fence: StateFence,
     pub revision_heads: Vec<RevisionHead>,
     pub payload: Value,
+}
+
+/// Closed result of the fixed `owner/policy` recovery-owner lookup.
+///
+/// `Absent` is returned only after a successful Store query under the
+/// enclosing `NamedReadResponse::state_fence`; query/provider errors are
+/// errors and never become this value. The key is included so a consumer can
+/// validate that the owner did not answer for a different recovery record.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PolicyOwnerSnapshotReadResult {
+    /// Store confirmed that no physical `owner/policy` recovery row exists.
+    Absent { record_key: RecoveryRecordKey },
+    /// Store returned the one exact, current `owner/policy` recovery row.
+    Bound { record: RecoveryRecord },
+}
+
+impl PolicyOwnerSnapshotReadResult {
+    /// Validates the closed key/schema/fence and content-addressed owner row.
+    pub fn validate(&self, expected_fence: &StateFence) -> Result<(), StoreError> {
+        expected_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        let expected_key = RecoveryRecordKey::new("owner", "policy")?;
+        match self {
+            Self::Absent { record_key } if record_key == &expected_key => Ok(()),
+            Self::Absent { .. } => Err(StoreError::IdentityConflict),
+            Self::Bound { record } => {
+                record.validate()?;
+                if record.record_key() != expected_key
+                    || record.schema != OWNER_SNAPSHOT_SCHEMA
+                    || record.state_fence != *expected_fence
+                {
+                    return Err(StoreError::IdentityConflict);
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl NamedReadResponse {
