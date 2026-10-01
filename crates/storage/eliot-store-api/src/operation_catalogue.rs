@@ -1032,6 +1032,25 @@ fn validate_proposed_attempt_transition(
             reason: "must match the prepared transition task",
         });
     }
+    if record.operation == crate::SOURCE_SNAPSHOT_STAGE_OPERATION {
+        let identity: eliot_protocol::RequestIdentity =
+            serde_json::from_value(record.request_identity.clone()).map_err(|_| {
+                StoreError::InvalidField {
+                    field: "proposed_attempt.request_identity",
+                    reason: "SourceSnapshotStage requires the original E child identity",
+                }
+            })?;
+        if transition.transition_class != TransitionClass::TaskControl
+            || transition.requested_effect_ceiling != EffectClass::ReversibleMutation
+            || transition.scope_id.as_str() != record.work_scope_id
+            || identity.idempotency_key != transition.identity.idempotency_key
+        {
+            return Err(StoreError::InvalidField {
+                field: "proposed_attempt.source_snapshot_admission",
+                reason: "SourceSnapshotStage must use its exact E child identity, scope, and reversible TaskControl transition",
+            });
+        }
+    }
     Ok(())
 }
 

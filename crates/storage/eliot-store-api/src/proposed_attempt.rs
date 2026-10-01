@@ -20,6 +20,62 @@ use crate::{
 pub const PROPOSED_ATTEMPT_RECORD_NAMESPACE: &str = "source-capture-proposed-attempt-v1";
 /// Schema carried by one canonical ProposedAttempt record.
 pub const PROPOSED_ATTEMPT_RECORD_SCHEMA_V1: &str = "eliot.source-capture.proposed-attempt.v1";
+/// Closed operation name for the distinct source-tree archive publication E
+/// action. The parent HostRequest remains recorded separately.
+pub const SOURCE_SNAPSHOT_STAGE_OPERATION: &str = "SourceSnapshotStage";
+
+/// Exact target and byte commitment for a source-snapshot ProposedAttempt.
+/// These values are inert data: authority still comes from the original
+/// ActionContract, active ORS reservation, canonical receipt and use-time
+/// owner validation.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSnapshotAdmissionBinding {
+    /// SHA-256 of the exact captured source-tree archive bytes.
+    pub archive_sha256: String,
+    /// Identity of the original BlobRootOwner selecting this target.
+    pub blob_root_owner_id: String,
+    /// Canonical locator/resource reference returned by the Blob owner.
+    pub canonical_locator: String,
+}
+
+impl SourceSnapshotAdmissionBinding {
+    fn validate(&self) -> Result<(), StoreError> {
+        crate::validate_digest(
+            &self.archive_sha256,
+            "proposed_attempt.source_snapshot.archive_sha256",
+        )?;
+        for (value, field) in [
+            (
+                &self.blob_root_owner_id,
+                "proposed_attempt.source_snapshot.blob_root_owner_id",
+            ),
+            (
+                &self.canonical_locator,
+                "proposed_attempt.source_snapshot.canonical_locator",
+            ),
+        ] {
+            validate_text(value, field)?;
+        }
+        let locator: Value = serde_json::from_str(&self.canonical_locator).map_err(|error| {
+            StoreError::Serialization(format!(
+                "source snapshot canonical locator is invalid JSON: {error}"
+            ))
+        })?;
+        if !locator.is_object()
+            || canonical_json_bytes(&locator)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?
+                .as_slice()
+                != self.canonical_locator.as_bytes()
+        {
+            return Err(StoreError::InvalidField {
+                field: "proposed_attempt.source_snapshot.canonical_locator",
+                reason: "must be the canonical JSON object returned by the Blob owner",
+            });
+        }
+        Ok(())
+    }
+}
 
 /// One admitted and durably retained source-capture attempt.
 ///
@@ -68,6 +124,11 @@ pub struct ProposedAttemptRecord {
     pub authority_epoch: Value,
     /// Exact closed ORS claims used for the reservation.
     pub reservation_claims: Value,
+    /// Present only for the distinct source-tree snapshot publication action.
+    /// `skip_serializing_if` preserves the exact v1 encoding for original
+    /// Diagnostics/ProbeVersion records that predate this extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_snapshot_admission: Option<SourceSnapshotAdmissionBinding>,
     /// Original current Store fence.
     pub state_fence: StateFence,
     /// Admission disposition committed by this record.
@@ -111,13 +172,35 @@ impl ProposedAttemptRecord {
                 reason: "work item, attempt, and reservation identities must remain distinct",
             });
         }
-        if !matches!(self.operation.as_str(), "Diagnostics" | "ProbeVersion")
-            || self.disposition != "ADMITTED"
-            || self.created_at_ms <= 0
-        {
+        let source_snapshot_stage = self.operation == SOURCE_SNAPSHOT_STAGE_OPERATION;
+        let known_operation = matches!(self.operation.as_str(), "Diagnostics" | "ProbeVersion")
+            || source_snapshot_stage;
+        if !known_operation || self.disposition != "ADMITTED" || self.created_at_ms <= 0 {
             return Err(StoreError::InvalidField {
                 field: "proposed_attempt.lifecycle",
                 reason: "operation, ADMITTED disposition, or creation time is invalid",
+            });
+        }
+        match (&self.source_snapshot_admission, source_snapshot_stage) {
+            (Some(binding), true) => binding.validate()?,
+            (None, false) => {}
+            (None, true) => {
+                return Err(StoreError::InvalidField {
+                    field: "proposed_attempt.source_snapshot_admission",
+                    reason: "is required for SourceSnapshotStage",
+                });
+            }
+            (Some(_), false) => {
+                return Err(StoreError::InvalidField {
+                    field: "proposed_attempt.source_snapshot_admission",
+                    reason: "is permitted only for SourceSnapshotStage",
+                });
+            }
+        }
+        if source_snapshot_stage && self.selector.is_some() {
+            return Err(StoreError::InvalidField {
+                field: "proposed_attempt.selector",
+                reason: "SourceSnapshotStage does not carry a selector or use it as a payload slot",
             });
         }
         self.state_fence
@@ -131,6 +214,43 @@ impl ProposedAttemptRecord {
                 field: "proposed_attempt.owner_projection",
                 reason: "request, authority epoch, and reservation claims must be objects",
             });
+        }
+        if source_snapshot_stage {
+            let identity: eliot_protocol::RequestIdentity =
+                serde_json::from_value(self.request_identity.clone()).map_err(|error| {
+                    StoreError::Serialization(format!(
+                        "source snapshot child RequestIdentity is invalid: {error}"
+                    ))
+                })?;
+            identity.validate().map_err(|error| {
+                StoreError::Serialization(format!(
+                    "source snapshot child RequestIdentity is invalid: {error}"
+                ))
+            })?;
+            if identity.request.state_fence != self.state_fence
+                || identity.request.metadata.state_fence != self.state_fence
+                || identity
+                    .request
+                    .metadata
+                    .task_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref()
+                    != Some(self.task_id.as_str())
+                || identity
+                    .request
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref()
+                    != Some(self.session_id.as_str())
+            {
+                return Err(StoreError::InvalidField {
+                    field: "proposed_attempt.request_identity",
+                    reason: "SourceSnapshotStage child identity must match the exact task, session, and fence",
+                });
+            }
         }
         for (digest, field) in [
             (&self.source_digest, "proposed_attempt.source_digest"),
@@ -240,4 +360,178 @@ pub fn decode_proposed_attempt_record(
         serde_json::from_value(value).map_err(|error| StoreError::Serialization(error.to_string()))?;
     record.validate()?;
     Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_contracts::{
+        ClockReading, EpochId, EpochLineageId, ProductId, RequestId, ResourceGeneration,
+        SessionId, SourceId, StateFence, TaskId,
+    };
+    use eliot_receipts::RequestBinding;
+    use std::num::NonZeroU64;
+
+    fn fence() -> StateFence {
+        let lineage = EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+            .expect("test lineage");
+        let epoch = EpochId::new(lineage, NonZeroU64::new(1).expect("non-zero"))
+            .expect("test epoch");
+        StateFence::new(epoch, ResourceGeneration::genesis())
+    }
+
+    fn record(
+        operation: &str,
+        selector: Option<&str>,
+        source_snapshot_admission: Option<SourceSnapshotAdmissionBinding>,
+    ) -> ProposedAttemptRecord {
+        let state_fence = fence();
+        let metadata = eliot_contracts::RequestMetadata {
+            request_id: RequestId::new("source-snapshot-e-child").expect("request ID"),
+            session_id: Some(SessionId::new("session-source-snapshot").expect("session ID")),
+            task_id: Some(TaskId::new("task-source-snapshot").expect("task ID")),
+            product_id: ProductId::new("product-source-snapshot").expect("product ID"),
+            source_id: SourceId::new("source-source-snapshot").expect("source ID"),
+            state_fence: state_fence.clone(),
+            clock: ClockReading::default(),
+        };
+        let identity = eliot_protocol::RequestIdentity {
+            request: RequestBinding {
+                metadata,
+                state_fence: state_fence.clone(),
+            },
+            idempotency_key: "source-snapshot-e-idempotency".to_owned(),
+            deadline_unix_ms: 1,
+            cancellation_id: "source-snapshot-e-cancel".to_owned(),
+        };
+        ProposedAttemptRecord {
+            work_item_id: "work-item-source-snapshot".to_owned(),
+            proposed_attempt_id: "attempt-source-snapshot".to_owned(),
+            reservation_id: "reservation-source-snapshot".to_owned(),
+            reservation_stage_receipt_id: "receipt-source-snapshot-stage".to_owned(),
+            request_identity: serde_json::to_value(identity).expect("RequestIdentity JSON"),
+            parent_operation_id: "hostreq:source-snapshot-parent-digest".to_owned(),
+            task_id: "task-source-snapshot".to_owned(),
+            session_id: "session-source-snapshot".to_owned(),
+            work_scope_id: "scope-source-snapshot".to_owned(),
+            work_lease_id: "lease-source-snapshot".to_owned(),
+            principal_id: "principal-source-snapshot".to_owned(),
+            operation: operation.to_owned(),
+            selected_relative_path: "src/lib.rs".to_owned(),
+            selector: selector.map(str::to_owned),
+            source_digest: "b".repeat(64),
+            configuration_digest: "c".repeat(64),
+            action_contract_digest: "d".repeat(64),
+            authority_epoch: serde_json::json!({"lineage": "epoch-1", "sequence": 1}),
+            reservation_claims: serde_json::json!({
+                "resources": {"reference": "owner:resources", "sha256": "e".repeat(64)},
+                "lane": {"reference": "owner:lane", "sha256": "f".repeat(64)},
+                "environment": {"reference": "owner:environment", "sha256": "a".repeat(64)},
+                "effects": {"reference": "owner:effects", "sha256": "b".repeat(64)},
+                "quota_view": {"reference": "owner:quota", "sha256": "c".repeat(64)}
+            }),
+            source_snapshot_admission,
+            state_fence,
+            disposition: "ADMITTED".to_owned(),
+            created_at_ms: 1,
+        }
+    }
+
+    fn binding() -> SourceSnapshotAdmissionBinding {
+        SourceSnapshotAdmissionBinding {
+            archive_sha256: "a".repeat(64),
+            blob_root_owner_id: "blob-root-owner-current".to_owned(),
+            canonical_locator: "{\"domain\":\"source-tree\",\"key\":\"archive-1\"}".to_owned(),
+        }
+    }
+
+    #[test]
+    fn source_snapshot_stage_requires_exact_archive_and_owner_target_binding() {
+        let valid = record(SOURCE_SNAPSHOT_STAGE_OPERATION, None, Some(binding()));
+        assert!(valid.validate().is_ok());
+        assert!(record(SOURCE_SNAPSHOT_STAGE_OPERATION, None, None)
+            .validate()
+            .is_err());
+
+        let mut changed_archive = binding();
+        changed_archive.archive_sha256 = "A".repeat(64);
+        assert!(record(
+            SOURCE_SNAPSHOT_STAGE_OPERATION,
+            None,
+            Some(changed_archive)
+        )
+        .validate()
+        .is_err());
+
+        let mut missing_owner = binding();
+        missing_owner.blob_root_owner_id.clear();
+        assert!(record(
+            SOURCE_SNAPSHOT_STAGE_OPERATION,
+            None,
+            Some(missing_owner)
+        )
+        .validate()
+        .is_err());
+
+        let mut missing_locator = binding();
+        missing_locator.canonical_locator.clear();
+        assert!(record(
+            SOURCE_SNAPSHOT_STAGE_OPERATION,
+            None,
+            Some(missing_locator)
+        )
+        .validate()
+        .is_err());
+
+        let mut noncanonical_locator = binding();
+        noncanonical_locator.canonical_locator =
+            "{ \"domain\": \"source-tree\", \"key\": \"archive-1\" }".to_owned();
+        assert!(record(
+            SOURCE_SNAPSHOT_STAGE_OPERATION,
+            None,
+            Some(noncanonical_locator)
+        )
+        .validate()
+        .is_err());
+
+        let mut wrong_task = record(SOURCE_SNAPSHOT_STAGE_OPERATION, None, Some(binding()));
+        wrong_task.request_identity["request"]["metadata"]["task_id"] =
+            serde_json::json!("different-task");
+        assert!(wrong_task.validate().is_err());
+
+        let mut wrong_session = record(SOURCE_SNAPSHOT_STAGE_OPERATION, None, Some(binding()));
+        wrong_session.request_identity["request"]["metadata"]["session_id"] =
+            serde_json::json!("different-session");
+        assert!(wrong_session.validate().is_err());
+
+        let mut wrong_fence = record(SOURCE_SNAPSHOT_STAGE_OPERATION, None, Some(binding()));
+        wrong_fence.request_identity["request"]["metadata"]["state_fence"]["resource_generation"] =
+            serde_json::json!(2);
+        assert!(wrong_fence.validate().is_err());
+    }
+
+    #[test]
+    fn source_snapshot_stage_does_not_reuse_selector_slot_and_old_ops_keep_v1_shape() {
+        assert!(record(
+            SOURCE_SNAPSHOT_STAGE_OPERATION,
+            Some("archive payload"),
+            Some(binding())
+        )
+        .validate()
+        .is_err());
+
+        for operation in ["Diagnostics", "ProbeVersion"] {
+            let original = record(operation, None, None);
+            assert!(original.validate().is_ok());
+            let encoded = serde_json::to_value(&original).expect("old record JSON");
+            assert!(encoded.get("source_snapshot_admission").is_none());
+            let decoded: ProposedAttemptRecord =
+                serde_json::from_value(encoded).expect("old record remains readable");
+            assert_eq!(decoded, original);
+        }
+
+        assert!(record("Diagnostics", None, Some(binding()))
+            .validate()
+            .is_err());
+    }
 }

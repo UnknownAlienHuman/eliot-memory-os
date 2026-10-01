@@ -242,9 +242,10 @@ pub use task_contract_acceptance::{
     validate_acceptance_record_identity,
 };
 pub use proposed_attempt::{
-    ProposedAttemptRecord, PROPOSED_ATTEMPT_RECORD_NAMESPACE,
+    ProposedAttemptRecord, SourceSnapshotAdmissionBinding, PROPOSED_ATTEMPT_RECORD_NAMESPACE,
     PROPOSED_ATTEMPT_RECORD_SCHEMA_V1, decode_proposed_attempt_record,
     proposed_attempt_record_key, proposed_attempt_record_request,
+    SOURCE_SNAPSHOT_STAGE_OPERATION,
 };
 
 pub use wire::{
