@@ -35,6 +35,17 @@ use crate::{
     unix_ms,
 };
 
+/// The exact authority and execution materials returned with a claimed Task
+/// Controller pair. Kept as one narrow alias so the claim endpoint's contract
+/// stays readable without changing the wire tuple consumed by its caller.
+type TaskControllerClaimedPair = (
+    HostRequestEnvelope,
+    serde_json::Value,
+    TaskControllerInvocation,
+    TaskControllerAttempt,
+    String,
+);
+
 use super::{
     DaemonReadQueue, ExpiredClaimObservation, ExpiryRetireLane, HostRequestOperationRef,
     LOCAL_READ_ENQUEUE_SALT, LocalReadAdmission, LocalReadAttemptState, LocalReadSubmitDisposition,
@@ -372,15 +383,7 @@ impl KernelComposition {
     pub(crate) fn claim_task_controller_pair(
         &self,
         session: &Session,
-    ) -> Result<
-        Option<(
-            HostRequestEnvelope,
-            serde_json::Value,
-            TaskControllerInvocation,
-            TaskControllerAttempt,
-        )>,
-        TransportError,
-    > {
+    ) -> Result<Option<TaskControllerClaimedPair>, TransportError> {
         let _transition = self.agent_bridge_transition_read()?;
         let admission_owner = self
             .agent_activation_pending
@@ -406,6 +409,23 @@ impl KernelComposition {
                 if !self.application_binding_live_for_claim(envelope, &admission_owner, true)? {
                     continue;
                 }
+                // The requester principal belongs to the retained application
+                // activation, independently of the daemon transport peer.
+                // The transition guard keeps this verified binding unchanged
+                // through claim publication.
+                let authenticated_principal = self
+                    .agent_bridge_connections
+                    .lock()
+                    .map_err(|_| TransportError::SessionFenced)?
+                    .get(&envelope.connection_id)
+                    .and_then(|connection| connection.activated_binding.as_ref())
+                    .map(|binding| binding.principal_id.clone())
+                    .filter(|principal| {
+                        !principal.trim().is_empty()
+                            && principal.trim() == principal
+                            && !principal.chars().any(char::is_control)
+                    })
+                    .ok_or(TransportError::SessionFenced)?;
                 if !candidate.task_controller_attempt.is_owned_by(session) {
                     let generation = candidate
                         .task_controller_attempt
@@ -458,7 +478,13 @@ impl KernelComposition {
                 attempt
                     .validate()
                     .map_err(|_| TransportError::SessionFenced)?;
-                return Ok(Some((envelope.clone(), tool.clone(), invocation, attempt)));
+                return Ok(Some((
+                    envelope.clone(),
+                    tool.clone(),
+                    invocation,
+                    attempt,
+                    authenticated_principal,
+                )));
             }
         }
         Ok(None)
@@ -779,6 +805,120 @@ impl KernelComposition {
         Ok(LocalReadSubmitDisposition::Persisted(Box::new(persisted)))
     }
 
+    /// Revalidates the live, original `BIND_SCOPE` claim before its owner snapshot
+    /// is written to canonical recovery. The caller supplies only the exact
+    /// operation/request digest and Kernel-issued attempt returned by the
+    /// existing claim; the retained envelope, tool bytes, activation principal,
+    /// and current P-07 binding remain the authority.
+    pub(crate) fn admit_task_controller_work_scope_owner_write(
+        &self,
+        session: &Session,
+        operation_id: &str,
+        request_sha256: &str,
+        presented_attempt: &TaskControllerAttempt,
+    ) -> Result<
+        (
+            HostRequestEnvelope,
+            TaskControllerInvocation,
+            serde_json::Value,
+            String,
+        ),
+        TransportError,
+    > {
+        presented_attempt
+            .validate()
+            .map_err(|_| TransportError::SessionFenced)?;
+        if presented_attempt.operation_id != operation_id {
+            return Err(TransportError::SessionFenced);
+        }
+        let _transition = self.agent_bridge_transition_read()?;
+        let admission_owner = self
+            .agent_activation_pending
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let index = self
+            .host_request_connection_index
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?;
+        let candidate = index
+            .values()
+            .flatten()
+            .find(|candidate| {
+                candidate.operation_id == operation_id
+                    && candidate.request_digest == request_sha256
+                    && candidate.task_controller_envelope.is_some()
+                    && candidate.task_controller_tool.is_some()
+            })
+            .ok_or(TransportError::UnknownRequest)?;
+        let envelope = candidate
+            .task_controller_envelope
+            .clone()
+            .ok_or(TransportError::UnknownRequest)?;
+        let tool = candidate
+            .task_controller_tool
+            .clone()
+            .ok_or(TransportError::UnknownRequest)?;
+        let state = &candidate.task_controller_attempt;
+        let invocation = task_controller_admission(&envelope, &tool)?;
+        if invocation.action != eliot_protocol::TaskControllerAction::BindScope
+            || host_request_operation_id(&envelope) != operation_id
+            || envelope.envelope_sha256 != request_sha256
+            || activation_deadline_expired(unix_ms(), envelope.identity.deadline_unix_ms)
+            || !state.is_owned_by(session)
+            || !state.is_live()
+            || presented_attempt.attempt_id != state.attempt_id
+            || presented_attempt.fencing_generation != state.generation
+            || presented_attempt.task_id.as_str()
+                != envelope
+                    .identity
+                    .task_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
+            || presented_attempt.scope_id
+                != envelope
+                    .identity
+                    .work_scope_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
+            || presented_attempt.session_id
+                != envelope
+                    .identity
+                    .session_id
+                    .as_deref()
+                    .ok_or(TransportError::SessionFenced)?
+            || presented_attempt.expires_at_unix_ms != envelope.identity.deadline_unix_ms
+            || presented_attempt.state_fence != envelope.state_fence
+            || !presented_attempt
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+            || session.module_generation.state_fence != envelope.state_fence
+            || !session
+                .authority_epoch
+                .is_same_authority(&envelope.state_fence.authority_epoch)
+        {
+            return Err(TransportError::SessionFenced);
+        }
+        if !self.application_binding_live_for_claim(&envelope, &admission_owner, true)? {
+            return Err(TransportError::SessionFenced);
+        }
+        // The authenticated principal belongs to the retained activation, not
+        // the daemon's transport peer or the submitted owner snapshot.
+        let principal = self
+            .agent_bridge_connections
+            .lock()
+            .map_err(|_| TransportError::SessionFenced)?
+            .get(&envelope.connection_id)
+            .and_then(|connection| connection.activated_binding.as_ref())
+            .map(|binding| binding.principal_id.clone())
+            .filter(|principal| {
+                !principal.trim().is_empty()
+                    && principal.trim() == principal
+                    && !principal.chars().any(char::is_control)
+            })
+            .ok_or(TransportError::SessionFenced)?;
+        Ok((envelope, invocation, tool, principal))
+    }
+
     /// Submits the result of one claimed `eliot.finish` candidate. The
     /// attempt, operation, authority and State Fence joins are checked
     /// against the same live queue record before the result reaches ORS.
@@ -1051,7 +1191,7 @@ fn task_controller_stale_attempt(
                 .as_deref()
                 .ok_or(TransportError::SessionFenced)
                 .ok()?
-        || body.attempt.session_id
+        || body.attempt.session_id.as_str()
             != envelope
                 .identity
                 .session_id

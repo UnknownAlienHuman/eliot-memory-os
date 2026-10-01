@@ -201,6 +201,7 @@ fn request_scopes(op: &str, scopes: &[(&str, u64, u64)], order: u64) -> Reserved
             state_fence: fence(),
         }],
         expected_ordering_heads,
+        original_write_submission: None,
     }
 }
 
@@ -215,12 +216,13 @@ fn request(
 }
 
 fn evidence() -> ConcurrentEvidence {
+    let state_fence = fence();
     ConcurrentEvidence {
         capability: CAPABILITY_RESERVED_WRITE,
         observed_generation: SchemaGeneration::v2(),
         expected_generation: SchemaGeneration::v2(),
-        state_fence: fence(),
-        kernel_generation: "kernel-993".to_owned(),
+        kernel_generation: state_fence.resource_generation.clone(),
+        state_fence,
     }
 }
 

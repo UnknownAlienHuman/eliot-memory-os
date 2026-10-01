@@ -267,6 +267,7 @@ fn config() -> StoreLaunchConfig {
         connect_timeout_ms: 1_000,
         query_timeout_ms: 1_000,
         store_transaction_limit: None,
+        store_write_max_pending: None,
         schema_generation: "1.0.0".to_owned(),
         blob_root: r"C:\ProgramData\Eliot\blob".to_owned(),
         instance_id: "store-test".to_owned(),
@@ -446,6 +447,7 @@ fn valid_request() -> ReservedWriteRequest {
             expected_sequence: 6,
             state_fence: fence(),
         }],
+        original_write_submission: None,
     }
 }
 

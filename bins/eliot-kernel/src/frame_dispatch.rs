@@ -1540,6 +1540,7 @@ fn is_daemon_operation(operation: &str) -> bool {
             | super::daemon_request_dispatch::MAINTENANCE_TRIGGER_INTAKE_OPERATION
             | "store_recovery"
             | "store_initialize_genesis"
+            | "store_work_scope_owner"
             | "apply_prepared"
             | "receipt"
             | "store_named"

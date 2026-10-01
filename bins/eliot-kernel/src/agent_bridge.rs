@@ -346,6 +346,10 @@ impl KernelComposition {
                 session.fence();
             }
             state.accepted_transport = None;
+            state.peer_admission_receipt = None;
+            state.observation_host_policy_readback = None;
+            state.observation_host_activation_result = None;
+            state.observation_host_activation_ticket = None;
         }
         // The index is drained while the same admission owner is held.  Its
         // detached store fencing may continue after the map ownership is gone,
@@ -544,6 +548,10 @@ impl KernelComposition {
                 declaration,
                 peer,
                 accepted_transport: None,
+                peer_admission_receipt: None,
+                observation_host_policy_readback: None,
+                observation_host_activation_result: None,
+                observation_host_activation_ticket: None,
                 session: None,
                 activation_completed: false,
                 activated_binding: None,
@@ -607,6 +615,7 @@ impl KernelComposition {
                 .map(|accepted| {
                     let receipt = accepted.admission_receipt().clone();
                     state.accepted_transport = Some(accepted);
+                    state.peer_admission_receipt = Some(receipt.clone());
                     receipt
                 })
         };
@@ -615,6 +624,10 @@ impl KernelComposition {
         {
             state.exchange.fence();
             state.accepted_transport = None;
+            state.peer_admission_receipt = None;
+            state.observation_host_policy_readback = None;
+            state.observation_host_activation_result = None;
+            state.observation_host_activation_ticket = None;
         }
         result
     }
@@ -786,6 +799,7 @@ impl KernelComposition {
             demand_id: request.demand_id.clone(),
             activation_request_sha256: request.request_sha256.clone(),
             peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+            peer_admission_receipt: Some(receipt.clone()),
             connection_id: connection_id.to_owned(),
             workspace_selector: request.workspace_selector.clone(),
             cancellation_id: request.request_identity.cancellation_id.clone(),
@@ -1670,6 +1684,31 @@ impl KernelComposition {
         {
             return Err(TransportError::SessionFenced);
         }
+        if let Some(readback) = &result.observation_host_policy_readback {
+            readback
+                .validate_against(&pending.ticket)
+                .map_err(|_| TransportError::SessionFenced)?;
+            let exact_receipt: eliot_protocol::AgentBridgePeerAdmissionReceipt =
+                serde_json::from_value(
+                    readback
+                        .owner_projection_value
+                        .get("origin")
+                        .and_then(|origin| origin.get("peer_admission_receipt"))
+                        .cloned()
+                        .ok_or(TransportError::SessionFenced)?,
+                )
+                .map_err(|_| TransportError::SessionFenced)?;
+            let connections = self
+                .agent_bridge_connections
+                .lock()
+                .map_err(|_| TransportError::SessionFenced)?;
+            let state = connections
+                .get(connection_id)
+                .ok_or(TransportError::SessionFenced)?;
+            if state.peer_admission_receipt.as_ref() != Some(&exact_receipt) {
+                return Err(TransportError::IdentityConflict);
+            }
+        }
         self.validate_result_bridge_leg(&pending.ticket)?;
         // The match stays exhaustive with no wildcard arm, so adding a
         // future disposition breaks compilation instead of silently
@@ -1705,6 +1744,7 @@ impl KernelComposition {
                     pending,
                     reason_code,
                     Some(result.disposition.clone()),
+                    result,
                 )
             }
         }
@@ -1805,12 +1845,17 @@ impl KernelComposition {
             authority_epoch: pending.ticket.state_fence.authority_epoch.clone(),
             activation_generation: pending.ticket.state_fence.resource_generation,
             activation_ticket_id: pending.ticket.ticket_id.clone(),
+            activation_ticket: pending.ticket.clone(),
             activation_ticket_sha256: pending.ticket.ticket_sha256.clone(),
             activation_request_id: pending.ticket.activation_request_id.as_str().to_owned(),
             activation_request_sha256: pending.ticket.activation_request_sha256.clone(),
             peer_admission_receipt_sha256: pending.ticket.peer_admission_receipt_sha256.clone(),
             resolution_result_sha256: result.result_sha256.clone(),
+            activation_result: result.clone(),
             resolved_binding: binding.clone(),
+            activation_state_fence: pending.ticket.state_fence.clone(),
+            activation_owner_evidence: owner_evidence.clone(),
+            activation_owner_readback: owner_readback.clone(),
             kernel_owner_revision: kernel_owner.revision,
             kernel_owner_bundle_sha256: kernel_owner.bundle_sha256.clone(),
         })
@@ -1940,6 +1985,7 @@ impl KernelComposition {
         pending: &AgentActivationPending,
         reason_code: AgentBridgeActivationDenialCode,
         detail: Option<AgentActivationResolutionDisposition>,
+        result: &AgentActivationResolutionResult,
     ) -> Result<Frame, TransportError> {
         let response = if let Some(detail) = detail {
             let (code, disposition, directive) =
@@ -2003,6 +2049,11 @@ impl KernelComposition {
         if state.activation_completed || state.session.is_some() {
             return Err(TransportError::IdentityConflict);
         }
+        state
+            .observation_host_policy_readback
+            .clone_from(&result.observation_host_policy_readback);
+        state.observation_host_activation_result = Some(result.clone());
+        state.observation_host_activation_ticket = Some(pending.ticket.clone());
         state.activation_completed = true;
         Ok(reply)
     }
@@ -2444,6 +2495,10 @@ impl KernelComposition {
                 session.fence();
             }
             state.accepted_transport = None;
+            state.peer_admission_receipt = None;
+            state.observation_host_policy_readback = None;
+            state.observation_host_activation_result = None;
+            state.observation_host_activation_ticket = None;
         }
         self.fence_host_requests_for_connection(connection_id);
         self.note_agent_bridge_peer_set_change();
@@ -2626,6 +2681,10 @@ impl KernelComposition {
                 session.fence();
             }
             state.accepted_transport = None;
+            state.peer_admission_receipt = None;
+            state.observation_host_policy_readback = None;
+            state.observation_host_activation_result = None;
+            state.observation_host_activation_ticket = None;
         }
         self.fence_host_requests_for_connection(connection_id);
         self.note_agent_bridge_peer_set_change();

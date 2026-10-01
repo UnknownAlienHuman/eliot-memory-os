@@ -185,8 +185,8 @@ pub fn is_controlboard_read_tool(tool: &serde_json::Value) -> bool {
 /// Every field is a Kernel-issued owner value, never a default, a derived
 /// constant, or anything read from a file, PID, or port:
 ///
-/// * `session_id` and `generation` come from the Kernel-issued
-///   [`LocalReadAttempt`] — the admitted session binding and the monotonic
+/// * the `Some(session_id)` and generation come from the Kernel-issued
+///   [`LocalReadAttempt`] — the admitted session binding and monotonic
 ///   fencing generation that only the current generation may complete;
 /// * `connection_id` and `request_id` come from the admitted
 ///   [`HostRequestEnvelope`], the Kernel-created transport correlation and the
@@ -197,10 +197,11 @@ pub fn is_controlboard_read_tool(tool: &serde_json::Value) -> bool {
 ///   for this very request, carried as opaque references and never as secret
 ///   material.
 ///
-/// The attempt's session must be the session the envelope admitted; a mismatch
-/// is refused as an exact typed board error rather than resolved toward
-/// either side. Nothing is pinned to an expected revision or fence: the caller
-/// declared no view, so the read serves the one snapshot taken here.
+/// The attempt's session must be present and match the session the envelope
+/// admitted; a missing `HostPeer` session or mismatch is refused as an exact
+/// typed board error, never resolved toward either side. Nothing is pinned to
+/// an expected revision or fence: the caller declared no view, so the read
+/// serves the one snapshot taken here.
 pub(crate) fn controlboard_read_intent(
     envelope: &HostRequestEnvelope,
     attempt: &LocalReadAttempt,
@@ -208,11 +209,14 @@ pub(crate) fn controlboard_read_intent(
     if attempt.fencing_generation == 0 {
         return Err(ControlBoardError::InvalidField("generation"));
     }
-    if envelope.identity.session_id.as_deref() != Some(attempt.session_id.as_str()) {
+    let Some(session_id) = attempt.session_id.as_deref() else {
+        return Err(ControlBoardError::Unauthorized);
+    };
+    if envelope.identity.session_id.as_deref() != Some(session_id) {
         return Err(ControlBoardError::Unauthorized);
     }
     ReadRequest::new(
-        attempt.session_id.clone(),
+        session_id.to_owned(),
         envelope.connection_id.clone(),
         envelope.descriptor_sha256.clone(),
         envelope.peer_admission_receipt_sha256.clone(),

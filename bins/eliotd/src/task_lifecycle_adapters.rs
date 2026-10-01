@@ -139,6 +139,29 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingTaskLifecycle<'_, P> {
             )
     }
 
+    /// Builds the exact Task Controller selection-bound transition before
+    /// `PreparedTransition` hashing. The Governor owner validates and embeds
+    /// the original evidence plus its source/evidence refs; this forwarding
+    /// layer does not reconstruct or transform those values.
+    pub fn prepare_apply_task_with_selection(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        operation_id: eliot_contracts::OperationId,
+        guarded: GuardedTaskCommand,
+        recipe: LearningStateViewRecipe,
+        source_heads: eliot_governor::TaskControllerCampaignSourceHeads,
+        input: eliot_governor::TaskSelectionTransitionInput<'_>,
+    ) -> Result<PreparedTaskTransition, TaskLifecycleError> {
+        self.inner.prepare_apply_task_with_selection(
+            identity,
+            operation_id,
+            guarded,
+            recipe,
+            source_heads,
+            input,
+        )
+    }
+
     /// Forwards one authenticated task record read to the Governor owner.
     pub fn view(
         &self,

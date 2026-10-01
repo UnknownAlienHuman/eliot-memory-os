@@ -10,12 +10,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use eliot_contracts::{
-    ArtifactId, ContractId, ResourceGeneration, SourceId, TaskId, TransactionSequence,
-};
+use eliot_contracts::{ArtifactId, ContractId, SourceId, TaskId, TransactionSequence};
 pub use eliot_contracts::{
     ContractError, ContractVersion, ErrorCode, OperationId, PolicyRevision, RequestMetadata,
-    StateFence, canonical_json_bytes, sha256_hex,
+    ResourceGeneration, StateFence, canonical_json_bytes, sha256_hex,
 };
 pub use eliot_learning_contracts::{CampaignLearningStateView, LearningStateViewRecipe, OwnerId};
 pub use eliot_learning_contracts::{
@@ -321,13 +319,14 @@ pub use learning_store::{
 
 pub use write_admission::{
     MAX_WRITE_ADMISSION_LABEL_BYTES, MAX_WRITE_ADMISSION_SCOPES, MAX_WRITE_SUBMISSION_REASON_CODES,
-    NOT_ACCEPTED_RETRY_IDENTITY_RULE, RESOLVED_EXISTING_NEXT_ALLOWED_ACTION,
-    RESOLVED_EXISTING_RETRY_IDENTITY_RULE, ReservationEnvelopeState, ReservedScopeBinding,
-    ReservedWriteOutcome, ReservedWriteReconciliation, ReservedWriteRequest,
-    ReservedWriteUnsupported, STAGED_NEXT_ALLOWED_ACTION, STAGED_RETRY_IDENTITY_RULE,
-    SplitDimension, SplitDirective, WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams,
-    WriteAdmissionProjection, WriteSubmission, WriteSubmissionState, WriterEpochBinding,
-    admit_write_submission, derive_ors_stage_ref, derive_submission_id, prepared_transition_digest,
+    NOT_ACCEPTED_RETRY_IDENTITY_RULE, OriginalWriteSubmission, PreparedWriteOutcome,
+    RESOLVED_EXISTING_NEXT_ALLOWED_ACTION, RESOLVED_EXISTING_RETRY_IDENTITY_RULE,
+    ReservationEnvelopeState, ReservedScopeBinding, ReservedWriteOutcome,
+    ReservedWriteReconciliation, ReservedWriteRequest, ReservedWriteUnsupported,
+    STAGED_NEXT_ALLOWED_ACTION, STAGED_RETRY_IDENTITY_RULE, SplitDimension, SplitDirective,
+    WRITE_ADMISSION_CONTRACT_VERSION, WriteAdmissionParams, WriteAdmissionProjection,
+    WriteSubmission, WriteSubmissionState, WriterEpochBinding, admit_write_submission,
+    derive_ors_stage_ref, derive_submission_id, prepared_transition_digest,
 };
 
 pub use operation_catalogue::{
@@ -505,7 +504,9 @@ impl RecoveryRecord {
         Ok(())
     }
 
-    fn validate_for_fence(&self, expected: &StateFence) -> Result<(), StoreError> {
+    /// Validates this existing durable record and its exact independently
+    /// supplied fence without replacing or recomputing its recorded digest.
+    pub fn validate_for_fence(&self, expected: &StateFence) -> Result<(), StoreError> {
         self.validate()?;
         ensure_same_fence(expected, &self.state_fence)
     }
@@ -704,6 +705,152 @@ impl StoreGenesisRequest {
             });
         }
         ensure_same_fence(&context.state_fence, &self.state_fence)
+    }
+}
+
+/// Compare-and-set of the already-retained `WorkScope` owner row.
+///
+/// This is the narrow post-genesis owner transition used to replace the
+/// installed empty `WorkScope` snapshot with Governor's admitted initial
+/// binding. The record remains opaque to Store; the caller validates the
+/// typed owner snapshot before constructing this request. Store enforces the
+/// fixed owner address/schema, canonical payload bytes, exact fence and
+/// independent current owner revision.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreWorkScopeOwnerRequest {
+    pub contract_version: ContractVersion,
+    /// Exact original Task Controller operation identity retained by Kernel.
+    /// This is distinct from the daemon publisher's `RequestMeta.request_id`.
+    pub operation_id: OperationId,
+    /// Exact original Host idempotency key, independently rechecked by Kernel.
+    pub idempotency_key: String,
+    pub state_fence: StateFence,
+    /// Protected Kernel launch digest carried by the authenticated owner
+    /// admission. Kernel verifies it against the active protected handoff;
+    /// Store binds the presented digest into the request hash and validates
+    /// its shape.
+    pub protected_snapshot_digest: String,
+    /// Current durable `WorkScope` owner row revision observed by Kernel.
+    pub expected_owner_revision: u64,
+    /// Exact canonical `WorkScope` owner record to install at the next revision.
+    pub owner_record: RecoveryRecord,
+    /// Digest over every request field except this digest itself.
+    pub canonical_request_hash: String,
+}
+
+impl StoreWorkScopeOwnerRequest {
+    /// Returns deterministic bytes covered by `canonical_request_hash`.
+    pub fn canonical_unsigned_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        let mut unsigned = self.clone();
+        unsigned.canonical_request_hash.clear();
+        canonical_json_bytes(&unsigned)
+            .map_err(|error| StoreError::Serialization(error.to_string()))
+    }
+
+    /// Computes the canonical request hash over every owner-CAS field,
+    /// including the original operation and idempotency identities.
+    pub fn compute_digest(&self) -> Result<String, StoreError> {
+        Ok(sha256_hex(&self.canonical_unsigned_bytes()?))
+    }
+
+    /// Fills the canonical request digest for an explicitly constructed CAS.
+    pub fn with_computed_digest(mut self) -> Result<Self, StoreError> {
+        self.canonical_request_hash = self.compute_digest()?;
+        Ok(self)
+    }
+
+    /// Validates the closed initial `WorkScope` owner CAS against its authenticated
+    /// request context. The existing empty owner row must have a non-zero
+    /// revision; this path never recreates genesis or accepts a guessed row.
+    pub fn validate_for_context(&self, context: &RequestMeta) -> Result<(), StoreError> {
+        validate_recovery_contract_version(self.contract_version)?;
+        context.validate().map_err(StoreError::Foundation)?;
+        self.state_fence
+            .validate()
+            .map_err(StoreError::Foundation)?;
+        validate_text(self.operation_id.as_str(), "operation_id")?;
+        validate_text(&self.idempotency_key, "idempotency_key")?;
+        if self.state_fence != context.state_fence {
+            return Err(StoreError::FenceMismatch);
+        }
+        validate_digest(&self.protected_snapshot_digest, "protected_snapshot_digest")?;
+        validate_digest(&self.canonical_request_hash, "canonical_request_hash")?;
+        if self.expected_owner_revision == 0 {
+            return Err(StoreError::InvalidField {
+                field: "expected_owner_revision",
+                reason: "must match the retained non-zero WorkScope owner revision",
+            });
+        }
+        let next_revision =
+            self.expected_owner_revision
+                .checked_add(1)
+                .ok_or(StoreError::InvalidField {
+                    field: "expected_owner_revision",
+                    reason: "revision overflow",
+                })?;
+        self.owner_record.validate_for_fence(&self.state_fence)?;
+        if self.owner_record.namespace != "owner"
+            || self.owner_record.key != "work_scope"
+            || self.owner_record.schema != OWNER_SNAPSHOT_SCHEMA
+            || self.owner_record.revision != next_revision
+        {
+            return Err(StoreError::InvalidField {
+                field: "owner_record",
+                reason: "must be the next canonical WorkScope owner record",
+            });
+        }
+        let payload: Value = serde_json::from_slice(&self.owner_record.payload)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let canonical_payload = canonical_json_bytes(&payload)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let payload_fence = payload.get("state_fence");
+        let payload_revision = payload.get("owner_revision").and_then(Value::as_u64);
+        let canonical_fence = canonical_json_bytes(&self.state_fence)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        let payload_fence_bytes = payload_fence
+            .map(canonical_json_bytes)
+            .transpose()
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if canonical_payload != self.owner_record.payload
+            || payload_revision != Some(next_revision)
+            || payload_fence_bytes.as_deref() != Some(canonical_fence.as_slice())
+        {
+            return Err(StoreError::InvalidField {
+                field: "owner_record.payload",
+                reason: "must be canonical and carry the exact next owner revision and fence",
+            });
+        }
+        let observed = self.compute_digest()?;
+        if observed != self.canonical_request_hash {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: self.canonical_request_hash.clone(),
+                observed,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Exact same-fence provider readback after a `WorkScope` owner CAS.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoreWorkScopeOwnerResponse {
+    pub record: RecoveryRecord,
+}
+
+impl StoreWorkScopeOwnerResponse {
+    /// Confirms the provider returned the exact record requested at the exact
+    /// fence. A successful transport alone is not a successful owner write.
+    pub fn validate_for_request(
+        &self,
+        request: &StoreWorkScopeOwnerRequest,
+    ) -> Result<(), StoreError> {
+        self.record.validate_for_fence(&request.state_fence)?;
+        if self.record != request.owner_record {
+            return Err(StoreError::IdentityConflict);
+        }
+        Ok(())
     }
 }
 
@@ -4396,6 +4543,46 @@ impl OrderingHead {
     }
 }
 
+/// Store-owned readback of one canonical ordering-head body.
+///
+/// `canonical_bytes` are the deterministic bytes of the persisted canonical
+/// body as returned by the storage owner. `canonical_sha256` is computed by
+/// that owner over those bytes; consumers can validate the binding without
+/// inventing a digest from caller expectations or a lossy projection.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderingHeadReadback {
+    /// Fully typed canonical head body.
+    pub head: OrderingHead,
+    /// Canonical bytes of the exact persisted head body.
+    pub canonical_bytes: Vec<u8>,
+    /// Lowercase SHA-256 of `canonical_bytes`, produced by the store owner.
+    pub canonical_sha256: String,
+}
+
+impl OrderingHeadReadback {
+    /// Validates the typed head, exact canonical body bytes, and their digest.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        self.head.validate()?;
+        let canonical_head_bytes = canonical_json_bytes(&self.head)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if self.canonical_bytes != canonical_head_bytes {
+            return Err(StoreError::InvalidField {
+                field: "ordering_head.canonical_bytes",
+                reason: "must encode the complete canonical ordering head",
+            });
+        }
+        validate_digest(&self.canonical_sha256, "ordering_head.canonical_sha256")?;
+        if sha256_hex(&self.canonical_bytes) != self.canonical_sha256 {
+            return Err(StoreError::TransitionDigestMismatch {
+                expected: self.canonical_sha256.clone(),
+                observed: sha256_hex(&self.canonical_bytes),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Compare-and-swap expectation for one ordering head.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6576,6 +6763,18 @@ pub trait CanonicalStoreClient: Send + Sync {
         Err(StoreError::Unavailable)
     }
 
+    /// Atomically replaces only the retained `WorkScope` owner row under its
+    /// observed revision and returns the exact same-fence durable readback.
+    /// Backends without this concrete owner CAS fail closed.
+    async fn write_work_scope_owner(
+        &self,
+        context: &RequestMeta,
+        request: StoreWorkScopeOwnerRequest,
+    ) -> Result<StoreWorkScopeOwnerResponse, StoreError> {
+        request.validate_for_context(context)?;
+        Err(StoreError::Unavailable)
+    }
+
     /// Resolves a final receipt by operation identity.
     async fn receipt(&self, operation_id: OperationId) -> Result<Option<WriteReceipt>, StoreError>;
     /// Reads revision heads by stable key.
@@ -6591,6 +6790,17 @@ pub trait CanonicalStoreClient: Send + Sync {
         &self,
         scopes: Vec<OrderingScopeId>,
     ) -> Result<Vec<OrderingHead>, StoreError>;
+    /// Reads store-owned canonical ordering-head bodies and their exact
+    /// canonical bytes/digests for reservation seeding.
+    ///
+    /// Implementations without a source-byte owner fail closed. They must not
+    /// synthesize this proof from `ordering_heads` or caller expectations.
+    async fn ordering_head_readbacks(
+        &self,
+        _scopes: Vec<OrderingScopeId>,
+    ) -> Result<Vec<OrderingHeadReadback>, StoreError> {
+        Err(StoreError::Unavailable)
+    }
     /// Executes one closed named read; raw query strings are impossible here.
     async fn execute_named(&self, query: NamedReadRequest)
     -> Result<NamedReadResponse, StoreError>;

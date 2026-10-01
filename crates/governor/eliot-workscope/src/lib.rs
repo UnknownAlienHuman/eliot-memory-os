@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 
 use eliot_contracts::StateFence;
+use eliot_observation::TaskSelectionEvidence;
 use eliot_security_contracts::{
     FreshnessStatus, IntegrityStatus, ObservationDomainRef, PrivacyClass, QuarantineState,
     SourceAssurance,
@@ -466,6 +467,8 @@ pub struct WorkScopeBindingSnapshot {
     pub owner_revision: u64,
     pub binding: ScopeBinding,
     pub guard_receipt: ScopeBindingGuardReceipt,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_closure: Option<(GoverningSourceSet, PrivacyProfile)>,
 }
 
 /// The canonical owner for one current `WorkScope` binding.
@@ -501,10 +504,14 @@ pub enum WorkScopeError {
     SourceIdentityMismatch,
     #[error("source set is not admitted for this scope generation")]
     SourceSetMismatch,
+    #[error("the retained WorkScope owner has no admitted governing-source closure")]
+    SourceClosureUnavailable,
     #[error("governing sources are conflicted with no admitted winner")]
     UnresolvedSourceConflict,
     #[error("task promotion requires the decision owner or a delegated binding")]
     TaskAuthorityDenied,
+    #[error("task selection evidence is invalid")]
+    InvalidTaskSelectionEvidence,
     #[error("source privacy class is outside the admitted boundary")]
     PrivacyDenied,
     #[error("state fence is invalid")]
@@ -1119,6 +1126,104 @@ pub enum TaskBindingState {
     },
 }
 
+/// Data projection of one current task selection from a readiness receipt.
+///
+/// This value is not owner evidence or an admission capability. The receipt
+/// has public fields and can be caller-constructed, so a consumer must obtain
+/// the receipt from the retained owner and join this projection to the current
+/// activation and `WorkScope` before using it in a write admission path. The
+/// exact readiness receipt and onboarding lease references are retained as
+/// join inputs; they are not proof by themselves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CurrentTaskSelectionProjection {
+    receipt_ref: String,
+    lease_ref: String,
+    principal_ref: String,
+    session_ref: String,
+    work_scope_ref: String,
+    scope_descriptor_revision: u64,
+    instance_ref: String,
+    governing_source_generation: u64,
+    task_ref: String,
+    task_revision: u64,
+    acceptance_digest: String,
+    state_fence: StateFence,
+}
+
+impl CurrentTaskSelectionProjection {
+    /// Exact owner readiness receipt that contains this task selection.
+    #[must_use]
+    pub fn receipt_ref(&self) -> &str {
+        &self.receipt_ref
+    }
+
+    /// Exact onboarding lease that admitted the readiness receipt.
+    #[must_use]
+    pub fn lease_ref(&self) -> &str {
+        &self.lease_ref
+    }
+
+    /// Principal bound by the owner readiness receipt.
+    #[must_use]
+    pub fn principal_ref(&self) -> &str {
+        &self.principal_ref
+    }
+
+    /// Session bound by the owner readiness receipt.
+    #[must_use]
+    pub fn session_ref(&self) -> &str {
+        &self.session_ref
+    }
+
+    /// `WorkScope` identity bound by the owner readiness receipt.
+    #[must_use]
+    pub fn work_scope_ref(&self) -> &str {
+        &self.work_scope_ref
+    }
+
+    /// Expected descriptor revision recorded by the owner readiness receipt.
+    #[must_use]
+    pub const fn scope_descriptor_revision(&self) -> u64 {
+        self.scope_descriptor_revision
+    }
+
+    /// Workspace instance bound by the owner readiness receipt.
+    #[must_use]
+    pub fn instance_ref(&self) -> &str {
+        &self.instance_ref
+    }
+
+    /// Governing-source generation bound by the owner readiness receipt.
+    #[must_use]
+    pub const fn governing_source_generation(&self) -> u64 {
+        self.governing_source_generation
+    }
+
+    /// Exact task identity selected by the owner receipt.
+    #[must_use]
+    pub fn task_ref(&self) -> &str {
+        &self.task_ref
+    }
+
+    /// Current task-contract revision selected by the owner receipt.
+    #[must_use]
+    pub const fn task_revision(&self) -> u64 {
+        self.task_revision
+    }
+
+    /// Acceptance digest selected by the owner receipt.
+    #[must_use]
+    pub fn acceptance_digest(&self) -> &str {
+        &self.acceptance_digest
+    }
+
+    /// State Fence at which the owner receipt was compiled.
+    #[must_use]
+    pub const fn state_fence(&self) -> &StateFence {
+        &self.state_fence
+    }
+}
+
 /// Cold-start lifecycle position of one compiled readiness receipt.
 ///
 /// `compile` emits a narrow subset: `NeedsTask` for a missing, ambiguous or
@@ -1190,6 +1295,10 @@ pub struct OnboardingReadinessReceipt {
     pub lineage: Option<RepositoryLineageIdentity>,
     pub scope_resolution: ScopeResolutionState,
     pub task_binding: TaskBindingState,
+    /// Original owner-issued evidence used for an exact selected task.
+    /// Legacy `Current` inputs remain structurally known and carry no evidence.
+    #[serde(default)]
+    pub task_selection_evidence: Option<TaskSelectionEvidence>,
     pub state_fence: StateFence,
     pub governing_source_set_ref: String,
     pub governing_source_generation: u64,
@@ -1243,6 +1352,48 @@ pub struct OnboardingReadinessReceipt {
 }
 
 impl OnboardingReadinessReceipt {
+    /// Returns the task selection data carried by this validated readiness
+    /// receipt, when it is material-ready and scope-authenticated.
+    ///
+    /// The returned projection is not evidence and is insufficient for a
+    /// write. Its caller must first obtain this receipt from the retained owner,
+    /// then join it to the current activation, current `WorkScope` observation
+    /// and write fence. Non-current, exploratory, stale, ambiguous and
+    /// task-free receipts remain typed non-selections.
+    pub fn current_task_selection_projection(
+        &self,
+    ) -> Result<Option<CurrentTaskSelectionProjection>, WorkScopeError> {
+        self.validate()?;
+        if self.scope_resolution != ScopeResolutionState::Authenticated
+            || self.readiness != ReadinessLifecycle::ReadyMaterial
+        {
+            return Ok(None);
+        }
+        let TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+            ..
+        } = &self.task_binding
+        else {
+            return Ok(None);
+        };
+        Ok(Some(CurrentTaskSelectionProjection {
+            receipt_ref: self.receipt_ref.clone(),
+            lease_ref: self.lease_ref.clone(),
+            principal_ref: self.principal_ref.clone(),
+            session_ref: self.session_ref.clone(),
+            work_scope_ref: self.scope.scope_ref.clone(),
+            scope_descriptor_revision: self.scope_descriptor_revision,
+            instance_ref: self.instance.instance_ref.clone(),
+            governing_source_generation: self.governing_source_generation,
+            task_ref: task_ref.clone(),
+            task_revision: *task_revision,
+            acceptance_digest: acceptance_digest.clone(),
+            state_fence: self.state_fence.clone(),
+        }))
+    }
+
     /// Validates every bound reference without re-resolving any authority.
     ///
     /// # Errors
@@ -1291,6 +1442,18 @@ impl OnboardingReadinessReceipt {
             .validate()
             .map_err(|_| WorkScopeError::InvalidStateFence)?;
         self.validate_task_binding()?;
+        self.validate_task_selection_evidence()?;
+        self.validate_readiness_inputs()?;
+        Self::check_refs(&self.discovered_source_refs, "discovered_source_refs", 32)?;
+        Self::check_refs(&self.admitted_source_refs, "admitted_source_refs", 32)?;
+        Self::check_refs(&self.conflicting_source_refs, "conflicting_source_refs", 32)?;
+        Self::check_refs(&self.unavailable_source_refs, "unavailable_source_refs", 32)?;
+        Self::check_store_seed_maintenance(self)?;
+        counter(self.expiry_tick, "expiry_tick")?;
+        Ok(())
+    }
+
+    fn validate_readiness_inputs(&self) -> Result<(), WorkScopeError> {
         if self.limiting_integration_evidence.is_empty()
             || self.limiting_integration_evidence.len() > 8
         {
@@ -1309,12 +1472,48 @@ impl OnboardingReadinessReceipt {
         for missing in &self.missing_inputs {
             text(missing, "missing_inputs")?;
         }
-        Self::check_refs(&self.discovered_source_refs, "discovered_source_refs", 32)?;
-        Self::check_refs(&self.admitted_source_refs, "admitted_source_refs", 32)?;
-        Self::check_refs(&self.conflicting_source_refs, "conflicting_source_refs", 32)?;
-        Self::check_refs(&self.unavailable_source_refs, "unavailable_source_refs", 32)?;
-        Self::check_store_seed_maintenance(self)?;
-        counter(self.expiry_tick, "expiry_tick")?;
+        Ok(())
+    }
+
+    fn validate_task_selection_evidence(&self) -> Result<(), WorkScopeError> {
+        let Some(evidence) = &self.task_selection_evidence else {
+            return Ok(());
+        };
+        Self::validate_selected_evidence(evidence)?;
+        let TaskBindingState::CurrentTaskContract {
+            task_ref,
+            task_revision,
+            acceptance_digest,
+            selection_source_ref,
+            evidence_ref,
+        } = &self.task_binding
+        else {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        };
+        if evidence.task_ref != *task_ref
+            || evidence.task_revision != *task_revision
+            || evidence.acceptance_digest != *acceptance_digest
+            || evidence.selection_source_ref != *selection_source_ref
+            || evidence.evidence_ref != *evidence_ref
+            || evidence.work_scope_ref != self.scope.scope_ref
+            || self
+                .state_fence
+                .task_revision
+                .map(eliot_contracts::TaskRevision::value)
+                != Some(evidence.task_revision)
+        {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_selected_evidence(evidence: &TaskSelectionEvidence) -> Result<(), WorkScopeError> {
+        evidence
+            .validate()
+            .map_err(|_| WorkScopeError::InvalidTaskSelectionEvidence)?;
+        if evidence.is_contaminated() {
+            return Err(WorkScopeError::InvalidTaskSelectionEvidence);
+        }
         Ok(())
     }
 
@@ -1515,6 +1714,8 @@ pub enum TaskBindingInput {
         /// Exact intake evidence that produced the selection.
         evidence_ref: String,
     },
+    /// Exact owner-issued evidence retained unchanged in the readiness receipt.
+    Selected(TaskSelectionEvidence),
     AmbiguousCandidates(Vec<String>),
     Stale {
         task_ref: String,
@@ -1642,6 +1843,10 @@ impl ColdStartController {
         let projection_source_ref = projection_source_ref.into();
         Self::check_lease_and_identities(lease, scope, instance, lineage, candidate, sources, now)?;
         Self::check_fence_sources_privacy(state_fence, sources, scope, candidate, privacy, lease)?;
+        let task_selection_evidence = match &task {
+            TaskBindingInput::Selected(evidence) => Some(evidence.clone()),
+            _ => None,
+        };
         let (task_binding, scope_resolution, readiness, missing_inputs, next_safe_action) =
             Self::resolve_task_binding(task)?;
         let scan_receipt_ref = scan_receipt
@@ -1672,6 +1877,7 @@ impl ColdStartController {
             lineage: lineage.cloned(),
             scope_resolution,
             task_binding: task_binding.clone(),
+            task_selection_evidence,
             state_fence: state_fence.clone(),
             governing_source_set_ref: governing_source_set_ref.clone(),
             governing_source_generation: sources.generation,
@@ -1764,6 +1970,26 @@ impl ColdStartController {
         {
             return Err(WorkScopeError::InvalidCounter { field: "lease" });
         }
+        let task = match (&task, &previous.task_selection_evidence) {
+            (
+                TaskBindingInput::Current {
+                    task_ref,
+                    task_revision,
+                    acceptance_digest,
+                    selection_source_ref,
+                    evidence_ref,
+                },
+                Some(evidence),
+            ) if task_ref == &evidence.task_ref
+                && task_revision == &evidence.task_revision
+                && acceptance_digest == &evidence.acceptance_digest
+                && selection_source_ref == &evidence.selection_source_ref
+                && evidence_ref == &evidence.evidence_ref =>
+            {
+                TaskBindingInput::Selected(evidence.clone())
+            }
+            _ => task,
+        };
         let mut receipt = self.compile(
             receipt_ref,
             lease,
@@ -2026,6 +2252,16 @@ impl ColdStartController {
                 selection_source_ref,
                 evidence_ref,
             ),
+            TaskBindingInput::Selected(evidence) => {
+                OnboardingReadinessReceipt::validate_selected_evidence(&evidence)?;
+                Self::check_current_task_ref(
+                    evidence.task_ref,
+                    evidence.task_revision,
+                    evidence.acceptance_digest,
+                    evidence.selection_source_ref,
+                    evidence.evidence_ref,
+                )
+            }
             TaskBindingInput::AmbiguousCandidates(handles) => {
                 Self::check_ambiguous_handles(handles)
             }
@@ -3143,7 +3379,25 @@ impl WorkScopeBindingSnapshot {
             owner_revision,
             binding,
             guard_receipt,
+            source_closure: None,
         };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Constructs and retains the exact source/privacy closure accepted with
+    /// this binding. The closure is part of the serializable owner snapshot so
+    /// a canonical-owner restore can revalidate the original values.
+    pub fn new_with_source_closure(
+        state_fence: StateFence,
+        owner_revision: u64,
+        binding: ScopeBinding,
+        guard_receipt: ScopeBindingGuardReceipt,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+    ) -> Result<Self, WorkScopeError> {
+        let mut snapshot = Self::new(state_fence, owner_revision, binding, guard_receipt)?;
+        snapshot.source_closure = Some((sources.clone(), privacy.clone()));
         snapshot.validate()?;
         Ok(snapshot)
     }
@@ -3181,6 +3435,18 @@ impl WorkScopeBindingSnapshot {
         {
             return Err(WorkScopeError::BindingReceiptMismatch);
         }
+        if let Some((sources, privacy)) = &self.source_closure {
+            if sources.generation != self.binding.governing_source_generation {
+                return Err(WorkScopeError::SourceSetMismatch);
+            }
+            let current = ScopeBindingGuard.check(&self.binding, &self.binding, sources, privacy);
+            if current.disposition != ScopeBindingDisposition::Matched {
+                return Err(WorkScopeError::BindingReceiptNotMatched);
+            }
+            if current != self.guard_receipt {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
+        }
         Ok(())
     }
 }
@@ -3192,6 +3458,8 @@ struct WorkScopeBindingSnapshotWire {
     owner_revision: u64,
     binding: ScopeBinding,
     guard_receipt: ScopeBindingGuardReceipt,
+    #[serde(default)]
+    source_closure: Option<(GoverningSourceSet, PrivacyProfile)>,
 }
 
 impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
@@ -3200,13 +3468,16 @@ impl<'de> Deserialize<'de> for WorkScopeBindingSnapshot {
         D: serde::Deserializer<'de>,
     {
         let wire = WorkScopeBindingSnapshotWire::deserialize(deserializer)?;
-        Self::new(
+        let mut snapshot = Self::new(
             wire.state_fence,
             wire.owner_revision,
             wire.binding,
             wire.guard_receipt,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        snapshot.source_closure = wire.source_closure;
+        snapshot.validate().map_err(serde::de::Error::custom)?;
+        Ok(snapshot)
     }
 }
 
@@ -3215,6 +3486,38 @@ impl WorkScopeBindingOwner {
     pub fn new(snapshot: WorkScopeBindingSnapshot) -> Result<Self, WorkScopeError> {
         snapshot.validate()?;
         Ok(Self { snapshot })
+    }
+
+    /// Creates an owner that retains the exact source/privacy values used by
+    /// the successful binding admission.
+    ///
+    /// The supplied closure is revalidated against the admitted snapshot
+    /// before it is retained in the serializable owner snapshot.
+    pub fn new_with_source_closure(
+        mut snapshot: WorkScopeBindingSnapshot,
+        sources: &GoverningSourceSet,
+        privacy: &PrivacyProfile,
+    ) -> Result<Self, WorkScopeError> {
+        snapshot.validate()?;
+        if sources.generation != snapshot.binding.governing_source_generation {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
+        let receipt =
+            ScopeBindingGuard.check(&snapshot.binding, &snapshot.binding, sources, privacy);
+        if receipt.disposition != ScopeBindingDisposition::Matched {
+            return Err(WorkScopeError::BindingReceiptNotMatched);
+        }
+        if receipt != snapshot.guard_receipt {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        if let Some((retained_sources, retained_privacy)) = &snapshot.source_closure {
+            if retained_sources != sources || retained_privacy != privacy {
+                return Err(WorkScopeError::BindingReceiptMismatch);
+            }
+        } else {
+            snapshot.source_closure = Some((sources.clone(), privacy.clone()));
+        }
+        Self::new(snapshot)
     }
 
     /// Recovers the owner through the same fail-closed validation path.
@@ -3235,6 +3538,39 @@ impl WorkScopeBindingOwner {
             return Err(WorkScopeError::StateFenceMismatch);
         }
         Ok(self.snapshot.clone())
+    }
+
+    /// Reads the exact admitted source/privacy closure at its current fence.
+    ///
+    /// Legacy owners reconstructed from snapshots remain readable through
+    /// [`Self::read_current`], but cannot authorize a source-dependent write
+    /// because their original closure values were not retained.
+    pub fn read_current_source_closure(
+        &self,
+        state_fence: &StateFence,
+    ) -> Result<(GoverningSourceSet, PrivacyProfile), WorkScopeError> {
+        self.read_current(state_fence)?;
+        let (sources, privacy) = self
+            .snapshot
+            .source_closure
+            .as_ref()
+            .ok_or(WorkScopeError::SourceClosureUnavailable)?;
+        if sources.generation != self.snapshot.binding.governing_source_generation {
+            return Err(WorkScopeError::SourceSetMismatch);
+        }
+        let receipt = ScopeBindingGuard.check(
+            &self.snapshot.binding,
+            &self.snapshot.binding,
+            sources,
+            privacy,
+        );
+        if receipt.disposition != ScopeBindingDisposition::Matched {
+            return Err(WorkScopeError::BindingReceiptNotMatched);
+        }
+        if receipt != self.snapshot.guard_receipt {
+            return Err(WorkScopeError::BindingReceiptMismatch);
+        }
+        Ok((sources.clone(), privacy.clone()))
     }
 }
 

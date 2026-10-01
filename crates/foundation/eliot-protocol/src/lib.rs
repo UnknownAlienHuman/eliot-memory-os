@@ -168,7 +168,7 @@ pub const AGENT_BRIDGE_FAILED_INTERNAL: &str = "FAILED_INTERNAL";
 pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID: &str =
     "eliot.protocol.agent-activation-resolution-ticket";
 /// Current semantic-resolution ticket wire version.
-pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION: u16 = 2;
+pub const AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION: u16 = 3;
 const FRAME_PREFIX_BYTES: usize = 4;
 
 /// A protocol contract validation or compatibility failure.
@@ -2673,6 +2673,10 @@ pub struct AgentActivationResolutionTicket {
     pub activation_request_sha256: String,
     /// Digest of the exact Kernel peer-admission receipt.
     pub peer_admission_receipt_sha256: String,
+    /// Exact original Kernel peer-admission receipt. Older v2 tickets may
+    /// omit it; every newly issued v3 Kernel ticket retains it verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_admission_receipt: Option<AgentBridgePeerAdmissionReceipt>,
     /// Kernel-created transport connection identity.
     pub connection_id: String,
     /// Exact inert workspace selector carried by the authenticated activation
@@ -2722,7 +2726,10 @@ impl AgentActivationResolutionTicket {
     /// Validates the closed correlation-only ticket shape.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.wire_id != AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_ID
-            || self.wire_version != Self::CONTRACT_VERSION
+            || !matches!(
+                self.wire_version,
+                2 | AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION
+            )
         {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_ticket.wire",
@@ -2754,6 +2761,27 @@ impl AgentActivationResolutionTicket {
             &self.peer_admission_receipt_sha256,
             "agent_activation_resolution_ticket.peer_admission_receipt_sha256",
         )?;
+        match (self.wire_version, self.peer_admission_receipt.as_ref()) {
+            (2, None) | (AGENT_ACTIVATION_RESOLUTION_TICKET_WIRE_VERSION, _) => {}
+            _ => {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_ticket.peer_admission_receipt",
+                    reason: "v2 legacy tickets omit the receipt; current tickets retain it exactly",
+                });
+            }
+        }
+        if let Some(receipt) = &self.peer_admission_receipt {
+            receipt.validate()?;
+            if receipt.receipt_sha256 != self.peer_admission_receipt_sha256
+                || receipt.state_fence != self.state_fence
+                || receipt.connection_id != self.connection_id
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "agent_activation_resolution_ticket.peer_admission_receipt",
+                    reason: "must equal the ticket's exact digest, fence, and connection",
+                });
+            }
+        }
         bounded_text(
             &self.connection_id,
             "agent_activation_resolution_ticket.connection_id",
@@ -2824,6 +2852,16 @@ impl AgentActivationResolutionTicket {
             return Err(ProtocolError::InvalidField {
                 field: "agent_activation_resolution_ticket.binding",
                 reason: "must bind the exact activation request and peer receipt",
+            });
+        }
+        if self
+            .peer_admission_receipt
+            .as_ref()
+            .is_some_and(|retained| retained != receipt)
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "agent_activation_resolution_ticket.peer_admission_receipt",
+                reason: "must preserve the exact original peer receipt",
             });
         }
         Ok(())
@@ -4566,6 +4604,12 @@ const HOST_REQUEST_RESULT_BODY_V4_READBACK_WIRE_VERSION: u16 = 4;
 pub const LOCAL_READ_ATTEMPT_WIRE_ID: &str = "eliot.protocol.local-read-attempt";
 /// Current local-read attempt capability wire version.
 pub const LOCAL_READ_ATTEMPT_WIRE_VERSION: u16 = 1;
+/// Host-origin Observe attempt wire version. It records the absence of an
+/// application Session explicitly while retaining the owner-resolved scope.
+pub const LOCAL_READ_ATTEMPT_HOST_ORIGIN_CONTRACT_VERSION: u16 = 2;
+/// Backward-friendly alias for the host-origin version constant.
+pub const LOCAL_READ_ATTEMPT_HOST_ORIGIN_WIRE_VERSION: u16 =
+    LOCAL_READ_ATTEMPT_HOST_ORIGIN_CONTRACT_VERSION;
 
 /// Versioned P-04 invoke-read payload: one exact envelope plus the exact
 /// canonical tool bytes it admits (Implements #18: local read result).
@@ -5239,8 +5283,11 @@ pub struct LocalReadAttempt {
     /// Monotonic fencing generation for this operation, starting at 1. Only
     /// the current generation may complete or extend the attempt.
     pub fencing_generation: u64,
-    /// Admitted envelope session binding (I15.2 principal/session binding).
-    pub session_id: String,
+    /// Admitted application Session binding, when the request has an
+    /// application-session origin. Host-origin Observe uses `None`; its
+    /// physical peer identity remains in the separate retained receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     /// Authority epoch observed at claim; rotation invalidates the attempt.
     pub authority_epoch: EpochId,
     /// Trusted Kernel-issued scope the read is admitted for.
@@ -5256,14 +5303,23 @@ pub struct LocalReadAttempt {
 }
 
 impl LocalReadAttempt {
-    /// Current attempt capability contract version.
+    /// Legacy application-session capability version. Existing routes keep
+    /// this version and preserve the original serialized string value.
     pub const CONTRACT_VERSION: u16 = LOCAL_READ_ATTEMPT_WIRE_VERSION;
+    /// Host-origin Observe capability version with an explicitly absent app
+    /// Session.
+    pub const HOST_ORIGIN_CONTRACT_VERSION: u16 = LOCAL_READ_ATTEMPT_HOST_ORIGIN_WIRE_VERSION;
 
     /// Validates the closed capability shape. Currency (current generation,
     /// live owner, live epoch) is owned by the Kernel claim record, never by
     /// shape validation alone.
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.wire_id != LOCAL_READ_ATTEMPT_WIRE_ID || self.wire_version != Self::CONTRACT_VERSION
+        if self.wire_id != LOCAL_READ_ATTEMPT_WIRE_ID
+            || !matches!(
+                self.wire_version,
+                Self::CONTRACT_VERSION | Self::HOST_ORIGIN_CONTRACT_VERSION
+            )
+            || (self.wire_version == Self::CONTRACT_VERSION && self.session_id.is_none())
         {
             return Err(ProtocolError::InvalidField {
                 field: "local_read_attempt.wire",
@@ -5307,11 +5363,13 @@ impl LocalReadAttempt {
                 reason: "fencing generation must be positive",
             });
         }
-        bounded_text(
-            &self.session_id,
-            "local_read_attempt.session_id",
-            MAX_HOST_REQUEST_TEXT_BYTES,
-        )?;
+        if let Some(session_id) = self.session_id.as_deref() {
+            bounded_text(
+                session_id,
+                "local_read_attempt.session_id",
+                MAX_HOST_REQUEST_TEXT_BYTES,
+            )?;
+        }
         eliot_contracts::epoch_identity_digest(&self.authority_epoch).map_err(|_| {
             ProtocolError::InvalidField {
                 field: "local_read_attempt.authority_epoch",
@@ -6987,6 +7045,7 @@ mod tests {
             demand_id: request.demand_id.clone(),
             activation_request_sha256: request.request_sha256.clone(),
             peer_admission_receipt_sha256: receipt.receipt_sha256.clone(),
+            peer_admission_receipt: Some(receipt.clone()),
             connection_id: receipt.connection_id.clone(),
             workspace_selector: request.workspace_selector.clone(),
             cancellation_id: request.request_identity.cancellation_id.clone(),

@@ -18,6 +18,7 @@ use eliot_protocol::dreamer_job::DurableJobResponse;
 use eliot_store_api::CanonicalStoreClient;
 use eliot_store_api::MAX_STORE_FAILURE_REFERENCE_LEN;
 use eliot_store_api::NamedReadRequest;
+use eliot_store_api::OrderingScopeId;
 use eliot_store_api::ReadinessReceipt;
 use eliot_store_api::RequestMeta;
 use eliot_store_api::StoreBackupOperation;
@@ -30,6 +31,7 @@ use eliot_store_api::StoreHealth;
 use eliot_store_api::StoreHealthStatus;
 use eliot_store_api::StoreRecoveryRequest;
 use eliot_store_api::StoreRecoverySnapshot;
+use eliot_store_api::StoreWorkScopeOwnerRequest;
 use eliot_store_api::WriteReceipt;
 use eliot_store_api::{canonical_json_bytes, sha256_hex};
 
@@ -394,6 +396,43 @@ async fn dispatch_named_request(store: &StoreComposition, request: NamedReadRequ
     }
 }
 
+async fn dispatch_genesis_request(
+    composition: &StoreComposition,
+    context: RequestMeta,
+    request: StoreGenesisRequest,
+) -> Response {
+    let result =
+        CanonicalStoreClient::initialize_genesis(&composition.store, &context, request.clone())
+            .await;
+    map_genesis_dispatch_result(&context, &request, result)
+}
+
+async fn dispatch_work_scope_owner_request(
+    composition: &StoreComposition,
+    context: RequestMeta,
+    request: StoreWorkScopeOwnerRequest,
+) -> Response {
+    let failure_context = StoreFailureIdentityContext {
+        request_id: Some(context.request_id.clone()),
+        idempotency_key_ref_or_digest: Some(request.canonical_request_hash.clone()),
+        state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
+        ..StoreFailureIdentityContext::default()
+    };
+    match CanonicalStoreClient::write_work_scope_owner(
+        &composition.store,
+        &context,
+        request.clone(),
+    )
+    .await
+    {
+        Ok(response) => match response.validate_for_request(&request) {
+            Ok(()) => Response::WorkScopeOwner { response },
+            Err(error) => map_store_error(error, failure_context),
+        },
+        Err(error) => map_store_error(error, failure_context),
+    }
+}
+
 /// Classifies one closed request as a canonical mutation and returns its typed
 /// failure identity context, or `None` for the health/readiness/read surfaces.
 ///
@@ -425,6 +464,12 @@ fn mutation_failure_context(request: &Request) -> Option<StoreFailureIdentityCon
             request.operation_id.clone(),
             request.idempotency_key.clone(),
         )),
+        Request::WriteWorkScopeOwner { context, request } => Some(StoreFailureIdentityContext {
+            request_id: Some(context.request_id.clone()),
+            idempotency_key_ref_or_digest: Some(request.canonical_request_hash.clone()),
+            state_fence_ref_or_exact_safe_projection: Some(request.state_fence.clone()),
+            ..StoreFailureIdentityContext::default()
+        }),
         Request::DreamerJob { context, request } => Some(failure_context_for_operation(
             context,
             request.request_identity.operation.operation_id.clone(),
@@ -436,6 +481,7 @@ fn mutation_failure_context(request: &Request) -> Option<StoreFailureIdentityCon
         | Request::Receipt { .. }
         | Request::RevisionHeads { .. }
         | Request::OrderingHeads { .. }
+        | Request::OrderingHeadReadbacks { .. }
         | Request::ValidationSnapshot
         | Request::Recovery { .. } => None,
     }
@@ -459,6 +505,16 @@ fn compatibility_verdict_for(
         Some(composition.compatibility_verdict())
     } else {
         None
+    }
+}
+
+async fn dispatch_ordering_head_readbacks(
+    composition: &StoreComposition,
+    scopes: Vec<OrderingScopeId>,
+) -> Response {
+    match composition.ordering_head_readbacks(scopes).await {
+        Ok(heads) => Response::OrderingHeadReadbacks { heads },
+        Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
     }
 }
 
@@ -693,6 +749,9 @@ impl StoreDispatchBackend for StoreComposition {
                 Ok(heads) => Response::OrderingHeads { heads },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
             },
+            Request::OrderingHeadReadbacks { scopes } => {
+                dispatch_ordering_head_readbacks(self, scopes).await
+            }
             Request::ValidationSnapshot => match self.validation_snapshot().await {
                 Ok(snapshot) => Response::ValidationSnapshot { snapshot },
                 Err(error) => map_store_error(error, StoreFailureIdentityContext::default()),
@@ -702,13 +761,10 @@ impl StoreDispatchBackend for StoreComposition {
                 map_recovery_dispatch_result(&request, result)
             }
             Request::InitializeGenesis { context, request } => {
-                let result = CanonicalStoreClient::initialize_genesis(
-                    &self.store,
-                    &context,
-                    request.clone(),
-                )
-                .await;
-                map_genesis_dispatch_result(&context, &request, result)
+                dispatch_genesis_request(self, context, request).await
+            }
+            Request::WriteWorkScopeOwner { context, request } => {
+                dispatch_work_scope_owner_request(self, context, request).await
             }
             Request::DreamerJob { context, request } => {
                 // Boxed: the ledger request/response futures hold

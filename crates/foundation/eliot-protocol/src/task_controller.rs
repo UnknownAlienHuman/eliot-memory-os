@@ -21,8 +21,12 @@ pub const TASK_CONTROLLER_INVOCATION_WIRE_ID: &str = "eliot.protocol.task-contro
 /// configuration that recipe is resolved from (#1724 W1/W2). A `1` payload
 /// cannot decode into this shape, so the missing member is refused by version
 /// and by field rather than defaulted into an instance that was compiled under
-/// no approved recipe.
-pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 2;
+/// no approved recipe. Version 2 remains accepted for the original `PROPOSE`
+/// and `APPLY` actions. Version 3 adds the closed `BIND_SCOPE` ingress. Its
+/// `task_input` carries the explicit Governor-native binding request; all
+/// required recipe-bearing fields must be JSON null for this action and are
+/// never decoded as authority.
+pub const TASK_CONTROLLER_INVOCATION_WIRE_VERSION: u16 = 3;
 /// Stable wire identity for the Kernel-issued Task Controller attempt.
 pub const TASK_CONTROLLER_ATTEMPT_WIRE_ID: &str = "eliot.protocol.task-controller-attempt";
 /// Current Task Controller attempt wire version.
@@ -97,6 +101,8 @@ pub enum TaskControllerAction {
     Propose,
     /// Apply an exact command to an existing task.
     Apply,
+    /// Bind the exact admitted task to a caller-declared WorkScope.
+    BindScope,
 }
 
 /// Owner-native material bundle used only for a complete campaign-owner
@@ -172,9 +178,16 @@ impl TaskControllerInvocation {
     /// Validates the transport envelope and bounded JSON object fields.
     /// Semantic field/identity validation remains with the daemon owners.
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID
-            || self.wire_version != TASK_CONTROLLER_INVOCATION_WIRE_VERSION
-        {
+        let supported_version = match self.action {
+            TaskControllerAction::BindScope => {
+                self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
+            }
+            TaskControllerAction::Propose | TaskControllerAction::Apply => {
+                self.wire_version == 2
+                    || self.wire_version == TASK_CONTROLLER_INVOCATION_WIRE_VERSION
+            }
+        };
+        if self.wire_id != TASK_CONTROLLER_INVOCATION_WIRE_ID || !supported_version {
             return Err(ProtocolError::InvalidField {
                 field: "task_controller_invocation.wire",
                 reason: "unsupported Task Controller invocation",
@@ -185,8 +198,23 @@ impl TaskControllerInvocation {
             &self.work_scope_id,
             "task_controller_invocation.work_scope_id",
         )?;
+        structured_object(&self.task_input, "task_controller_invocation.task_input")?;
+        if self.action == TaskControllerAction::BindScope {
+            if !self.learning_state_view_recipe.is_null()
+                || !self.context_campaign_recipe_catalogue.is_null()
+                || !self.context_campaign_recipe.is_null()
+                || !self.context_input.is_null()
+                || self.prior_delivery_selector.is_some()
+                || self.campaign_owner_materials.is_some()
+            {
+                return Err(ProtocolError::InvalidField {
+                    field: "task_controller_invocation",
+                    reason: "BIND_SCOPE cannot carry recipe or campaign inputs",
+                });
+            }
+            return Ok(());
+        }
         for (value, field) in [
-            (&self.task_input, "task_controller_invocation.task_input"),
             (
                 &self.learning_state_view_recipe,
                 "task_controller_invocation.learning_state_view_recipe",

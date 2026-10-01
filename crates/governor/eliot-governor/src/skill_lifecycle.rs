@@ -209,6 +209,24 @@ fn map_kernel_error(error: KernelPortError, ctx: &StoreFailureIdentityContext) -
         )
         .map(SkillError::Store)
         .unwrap_or(SkillError::IdentityMismatch),
+        KernelPortError::TaskSelectionRequired => store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "TASK_SELECTION_REQUIRED",
+            StoreMutationDisposition::NotAttempted,
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
+        )
+        .map_or(SkillError::IdentityMismatch, SkillError::Store),
+        KernelPortError::TaskScopeIncompatible => store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "TASK_SCOPE_INCOMPATIBLE",
+            StoreMutationDisposition::NotAttempted,
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
+        )
+        .map_or(SkillError::IdentityMismatch, SkillError::Store),
     }
 }
 
@@ -237,6 +255,14 @@ fn map_composition_store_failure(
 fn map_composition_error(error: CompositionError, ctx: &StoreFailureIdentityContext) -> SkillError {
     match error {
         CompositionError::Kernel(inner) => map_kernel_error(inner, ctx),
+        CompositionError::TaskContractAcceptance(error) => map_store_error(*error, ctx),
+        CompositionError::TaskSelectionEvidence(_) => map_composition_store_failure(
+            StoreFailureDisposition::DeterministicRejection,
+            "TASK_SELECTION_REQUIRED",
+            StoreRetryDirective::DoNotRetry,
+            StoreRecoveryAction::None,
+            ctx,
+        ),
         CompositionError::Canonical(_) => map_composition_store_failure(
             StoreFailureDisposition::DeterministicRejection,
             "CANONICAL_REJECTED",

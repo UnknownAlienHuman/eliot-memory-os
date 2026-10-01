@@ -22,8 +22,10 @@ use eliot_governor::{
 use eliot_kernel_core::Notification;
 use eliot_platform_windows::{ProtectedPathError, ProtectedRuntimePathLease};
 use eliot_protocol::{
-    AgentActivationOwnerEvidence, AgentActivationOwnerReadback, AgentActivationResolutionResult,
-    AgentActivationResolutionTicket, AgentActivationResolvedBinding, RequestIdentity,
+    AgentActivationObservationPolicyReadback, AgentActivationOwnerEvidence,
+    AgentActivationOwnerReadback, AgentActivationResolutionDisposition,
+    AgentActivationResolutionResult, AgentActivationResolutionTicket,
+    AgentActivationResolvedBinding, RequestIdentity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -120,6 +122,7 @@ mod kernel_authority_client;
 mod kernel_context_read_client;
 mod kernel_recovery_client;
 mod kernel_transition_client;
+pub use kernel_transition_client::OwnerSelectionKernelPort;
 pub mod maintenance_dispatch;
 pub mod maintenance_family_catalog;
 // Public because `daemon_runtime` lives in the `eliotd` binary crate and
@@ -226,8 +229,8 @@ pub use cue_activation_route::{
 pub use daemon_config::{DaemonConfig, admit_daemon_module_manifest};
 pub(crate) use daemon_kernel_client::kernel_port_error;
 pub use daemon_kernel_client::{
-    ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveDeferOutcome,
-    ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
+    ActivationSubmitError, DaemonKernelClient, LocalReadSubmitOutcome, ObserveClaimedPair,
+    ObserveDeferOutcome, ObserveSubmitOutcome, OwnerSessionFacts, TaskControllerSubmitOutcome,
 };
 #[cfg(test)]
 pub(crate) use daemon_kernel_client::{KernelClientError, WireOutcome, operation_payload};
@@ -667,6 +670,13 @@ pub struct DaemonComposition {
     /// [`DaemonComposition::controlboard`]. An empty supply reads as an
     /// empty inbox, never as resolved or suppressed state.
     notification_snapshot: Vec<Notification>,
+    /// Explicit workspace locator retained from the last accepted
+    /// authenticated activation. It is only a locator for a fresh Host-side
+    /// resource observation; identity and authority always come from the
+    /// current `WorkScope` owner and the current Task Controller selection.
+    /// The locator is keyed by the complete semantic activation binding so a
+    /// later request cannot borrow another task's workspace path.
+    activation_workspace_locator: Option<RetainedActivationWorkspaceLocator>,
     /// Shared Governor Skill catalogue handle for catalogue-guarded skill
     /// promotion. Empty until catalogue installation wiring lands; absent
     /// entries forward open-world.
@@ -761,6 +771,31 @@ pub struct DaemonComposition {
     /// of the store image itself follows the canonical-write envelope wiring
     /// (remainder, #1699); this field never claims it.
     swarm_attachment: eliot_governor::SwarmAttachmentComposition,
+}
+
+/// An accepted ticket's explicit Host workspace selector retained only to
+/// repeat the mechanical observation at a later ingress. Its typed origin is
+/// either an authenticated application selection or the exact Host peer
+/// receipt. This path never supplies authority; every consumer re-observes it
+/// and compares the result with the current owner-issued `WorkScope` binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedActivationWorkspaceLocator {
+    origin: RetainedWorkspaceLocatorOrigin,
+    work_scope_ref: String,
+    root: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RetainedWorkspaceLocatorOrigin {
+    ApplicationSelection {
+        principal_ref: String,
+        session_ref: String,
+        task_ref: String,
+    },
+    HostPeer {
+        peer_admission_receipt: Box<eliot_protocol::AgentBridgePeerAdmissionReceipt>,
+        activation_request_id: String,
+    },
 }
 
 /// Production B-MOD model registry port (issue #1108 W4/A2).
@@ -1061,6 +1096,7 @@ impl DaemonComposition {
             operator_replay: SharedOperatorReplay::new(),
             owner_session: None,
             notification_snapshot: Vec::new(),
+            activation_workspace_locator: None,
             skill_catalogue: Arc::new(
                 std::sync::Mutex::new(eliot_skill::SkillCatalogue::default()),
             ),
@@ -2061,6 +2097,10 @@ impl DaemonComposition {
             .governor
             .read_unique_agent_activation(now)
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let observation = self
+            .governor
+            .try_observation_capture_owner_binding_for_activation(&snapshot)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
         let binding = AgentActivationResolvedBinding {
             principal_id: snapshot.principal_id,
             session_id: snapshot.session_id,
@@ -2074,10 +2114,92 @@ impl DaemonComposition {
         let evidence = AgentActivationOwnerEvidence::for_binding(
             &binding,
             snapshot.owner_revision,
-            snapshot.state_fence,
+            snapshot.state_fence.clone(),
         )
         .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
-        AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
+        let readback = AgentActivationOwnerReadback::from_evidence(evidence, now.max(1))
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let Some(observation) = observation else {
+            return Ok(readback);
+        };
+        let observation = Self::activation_observation_policy_readback(&observation)?;
+        readback
+            .with_observation_policy_readback(observation)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Re-reads the current activation's exact Session, `WorkScope`, and
+    /// Observation Policy owners. The activation task remains context only;
+    /// this projection always has no task-selection applicability.
+    pub fn current_activation_observation_owner_binding(
+        &self,
+        now: u64,
+    ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, DaemonError> {
+        let snapshot = self
+            .governor
+            .read_unique_agent_activation(now)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        self.governor
+            .observation_capture_owner_binding_for_activation(&snapshot)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Re-reads the current Policy and `WorkScope` owners for an authenticated
+    /// cold Observe capture. This owner read is tied to the retained Session
+    /// and State Fence and does not require a unique active task selection.
+    pub fn current_cold_observation_owner_binding(
+        &self,
+        authenticated_principal_ref: &str,
+        authenticated_session_ref: &str,
+        state_fence: &eliot_contracts::StateFence,
+    ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, DaemonError> {
+        let session_id = eliot_contracts::SessionId::new(authenticated_session_ref.to_owned())
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        self.governor
+            .observation_capture_owner_binding_for_principal_session(
+                authenticated_principal_ref,
+                &session_id,
+                state_fence,
+            )
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Reads the current Policy and `WorkScope` owners for the exact Host peer
+    /// admission origin. This path deliberately has no semantic application
+    /// principal, session, or task applicability.
+    pub fn host_origin_observation_owner_binding(
+        &self,
+        receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, DaemonError> {
+        self.governor
+            .observation_capture_owner_binding_for_host_origin(receipt)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    /// Attempts the supplemental Host-origin observation-policy projection.
+    /// Missing explicit capture policy is ordinary activation state and does
+    /// not suppress the independent negative activation owner result; other
+    /// owner errors remain errors. Capture preparation continues to use the
+    /// strict projection method above.
+    pub fn try_host_origin_observation_owner_binding(
+        &self,
+        receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+    ) -> Result<Option<eliot_governor::ObservationCaptureOwnerBinding>, DaemonError> {
+        self.governor
+            .try_observation_capture_owner_binding_for_host_origin(receipt)
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))
+    }
+
+    fn activation_observation_policy_readback(
+        binding: &eliot_governor::ObservationCaptureOwnerBinding,
+    ) -> Result<AgentActivationObservationPolicyReadback, DaemonError> {
+        let value = binding
+            .canonical_value()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        let digest = binding
+            .canonical_digest()
+            .map_err(|error| DaemonError::Lifecycle(error.to_string()))?;
+        AgentActivationObservationPolicyReadback::from_owner_projection(value, digest)
             .map_err(|error| DaemonError::Lifecycle(error.to_string()))
     }
 
@@ -2365,6 +2487,343 @@ impl DaemonComposition {
     /// only, never the client; no new thread, no new handshake.
     pub fn note_owner_session_binding(&mut self, facts: OwnerSessionFacts) {
         self.owner_session = Some(facts);
+    }
+
+    /// Retains the explicit Host workspace selector from an accepted,
+    /// owner-authenticated activation. The path is only a locator: callers
+    /// must observe it again and compare the result with the live `WorkScope`
+    /// owner before admitting any task-bound transition.
+    pub fn note_activation_workspace_locator(
+        &mut self,
+        ticket: &AgentActivationResolutionTicket,
+        result: &AgentActivationResolutionResult,
+        owner_readback: Option<&AgentActivationOwnerReadback>,
+    ) -> Result<(), crate::task_binding_admission::TaskBindingError> {
+        let (AgentActivationResolutionDisposition::Resolved { binding }, Some(owner_evidence)) =
+            (&result.disposition, result.owner_evidence.as_ref())
+        else {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::selection_required(
+                    "accepted activation did not retain a resolved semantic owner binding",
+                ),
+            );
+        };
+        let readback = owner_readback.ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::selection_required(
+                "accepted activation has no retained authenticated owner readback",
+            )
+        })?;
+        readback.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "retained activation owner readback is invalid: {error}"
+            ))
+        })?;
+        if readback.evidence != *owner_evidence
+            || readback.evidence.binding.as_ref() != binding.as_ref()
+            || result.ticket_id != ticket.ticket_id
+            || result.ticket_state_fence != readback.evidence.state_fence
+        {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "activation workspace locator is not bound to the accepted owner result",
+                ),
+            );
+        }
+        let root = ticket.workspace_selector.as_deref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::selection_required(
+                "accepted activation has no explicit Host workspace locator",
+            )
+        })?;
+        let root = Path::new(root);
+        if !root.is_absolute() {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained activation workspace locator is not absolute",
+                ),
+            );
+        }
+        self.activation_workspace_locator = Some(RetainedActivationWorkspaceLocator {
+            origin: RetainedWorkspaceLocatorOrigin::ApplicationSelection {
+                principal_ref: binding.principal_id.clone(),
+                session_ref: binding.session_id.clone(),
+                task_ref: binding.task_id.clone(),
+            },
+            work_scope_ref: binding.work_scope_id.clone(),
+            root: root.to_path_buf(),
+        });
+        Ok(())
+    }
+
+    /// Retains the exact activation ticket's Host selector for task-free raw
+    /// capture. The peer receipt and current owner projection are the identity
+    /// joins; the path remains only a candidate for fresh Host observation.
+    pub fn note_host_origin_workspace_locator(
+        &mut self,
+        ticket: &AgentActivationResolutionTicket,
+        result: &AgentActivationResolutionResult,
+        owner_binding: &eliot_governor::ObservationCaptureOwnerBinding,
+    ) -> Result<(), crate::task_binding_admission::TaskBindingError> {
+        let receipt = ticket.peer_admission_receipt.as_ref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "activation ticket has no exact Host peer admission receipt",
+            )
+        })?;
+        receipt.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "retained Host peer receipt is invalid: {error}"
+            ))
+        })?;
+        let readback = result
+            .observation_host_policy_readback
+            .as_ref()
+            .ok_or_else(|| {
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "accepted cold result has no Host-origin owner policy readback",
+                )
+            })?;
+        let owner_value = owner_binding.canonical_value().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "current Host-origin owner projection is invalid: {error}"
+            ))
+        })?;
+        let owner_digest = owner_binding.canonical_digest().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "current Host-origin owner projection digest is invalid: {error}"
+            ))
+        })?;
+        readback.kernel_owner.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "Host-origin P-07 owner readback is invalid: {error}"
+            ))
+        })?;
+        let expected_origin = serde_json::json!({
+            "kind": "HOST_PEER",
+            "domain": "AGENT_BRIDGE",
+            "peer_admission_receipt": receipt,
+        });
+        let actual_origin = owner_value.get("origin");
+        if result.ticket_id != ticket.ticket_id
+            || result.ticket_state_fence != ticket.state_fence
+            || !matches!(
+                &result.disposition,
+                AgentActivationResolutionDisposition::TaskSelectionRequired { .. }
+                    | AgentActivationResolutionDisposition::ScopeSelectionRequired { .. }
+                    | AgentActivationResolutionDisposition::ScopeAmbiguous { .. }
+            )
+            || receipt.receipt_sha256 != ticket.peer_admission_receipt_sha256
+            || owner_binding.state_fence != ticket.state_fence
+            || actual_origin != Some(&expected_origin)
+            || readback.owner_projection_value != owner_value
+            || readback.owner_projection_sha256 != owner_digest
+        {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "Host-origin workspace locator is not bound to the accepted ticket and current owner projection",
+                ),
+            );
+        }
+        let root = ticket.workspace_selector.as_deref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "cold activation ticket has no explicit Host workspace locator",
+            )
+        })?;
+        let root = Path::new(root);
+        if !root.is_absolute() {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained Host-origin workspace locator is not absolute",
+                ),
+            );
+        }
+        owner_binding
+            .work_scope_binding
+            .validate()
+            .map_err(|error| {
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                    "current Host-origin WorkScope is invalid: {error}"
+                ))
+            })?;
+        self.activation_workspace_locator = Some(RetainedActivationWorkspaceLocator {
+            origin: RetainedWorkspaceLocatorOrigin::HostPeer {
+                peer_admission_receipt: Box::new(receipt.clone()),
+                activation_request_id: ticket.activation_request_id.as_str().to_owned(),
+            },
+            work_scope_ref: owner_binding
+                .work_scope_binding
+                .binding
+                .scope
+                .scope_ref
+                .clone(),
+            root: root.to_path_buf(),
+        });
+        Ok(())
+    }
+
+    /// Returns the exact activation locator for one owner selection. It does
+    /// not search by scope, task recency, or path proximity.
+    pub fn activation_workspace_locator_for_selection(
+        &self,
+        selection: &eliot_governor::TaskSelectionAdmissionBinding,
+    ) -> Result<PathBuf, crate::task_binding_admission::TaskBindingError> {
+        let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::selection_required(
+                "no accepted activation retained an explicit workspace locator",
+            )
+        })?;
+        let origin_matches = matches!(
+            &locator.origin,
+            RetainedWorkspaceLocatorOrigin::ApplicationSelection {
+                principal_ref,
+                session_ref,
+                task_ref,
+            } if principal_ref == selection.principal_ref()
+                && session_ref == selection.session_ref()
+                && task_ref == selection.task_ref()
+        );
+        if !origin_matches
+            || locator.work_scope_ref != selection.work_scope().binding.scope.scope_ref
+        {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::selection_required(
+                    "no retained activation locator matches the exact current task selection",
+                ),
+            );
+        }
+        Ok(locator.root.clone())
+    }
+
+    /// Returns the retained Host workspace locator for a task-free request
+    /// whose authenticated principal/session and exact current `WorkScope`
+    /// snapshot match the accepted activation. The locator supplies only a
+    /// candidate root for fresh Host observation; the snapshot and that
+    /// observation remain the independent admission authorities.
+    pub fn activation_workspace_locator_for_scope(
+        &self,
+        principal_ref: &str,
+        session_ref: &str,
+        work_scope: &eliot_workscope::WorkScopeBindingSnapshot,
+    ) -> Result<PathBuf, crate::task_binding_admission::TaskBindingError> {
+        work_scope.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "current WorkScope snapshot is invalid: {error}"
+            ))
+        })?;
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        if !eliot_contracts::fences_match_exact(&work_scope.state_fence, &live_fence) {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "current WorkScope snapshot fence is no longer live",
+                ),
+            );
+        }
+        let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "no accepted activation retained a Host workspace locator",
+            )
+        })?;
+        let origin_matches = matches!(
+            &locator.origin,
+            RetainedWorkspaceLocatorOrigin::ApplicationSelection {
+                principal_ref: retained_principal,
+                session_ref: retained_session,
+                ..
+            } if retained_principal == principal_ref && retained_session == session_ref
+        );
+        if !origin_matches || locator.work_scope_ref != work_scope.binding.scope.scope_ref {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained activation locator does not match the authenticated request and current WorkScope",
+                ),
+            );
+        }
+        Ok(locator.root.clone())
+    }
+
+    /// Returns a Host-origin locator only for the exact retained peer receipt
+    /// and current owner `WorkScope` snapshot. The path itself has no authority.
+    pub fn host_origin_workspace_locator_for_scope(
+        &self,
+        receipt: &eliot_protocol::AgentBridgePeerAdmissionReceipt,
+        activation_request_id: &str,
+        work_scope: &eliot_workscope::WorkScopeBindingSnapshot,
+    ) -> Result<PathBuf, crate::task_binding_admission::TaskBindingError> {
+        receipt.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "Host peer receipt is invalid: {error}"
+            ))
+        })?;
+        work_scope.validate().map_err(|error| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(format!(
+                "current WorkScope snapshot is invalid: {error}"
+            ))
+        })?;
+        let live_fence = self.governor.kernel_snapshot().state_fence();
+        if !eliot_contracts::fences_match_exact(&work_scope.state_fence, &live_fence) {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "current WorkScope snapshot fence is no longer live",
+                ),
+            );
+        }
+        let locator = self.activation_workspace_locator.as_ref().ok_or_else(|| {
+            crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                "no accepted Host-origin ticket retained a workspace locator",
+            )
+        })?;
+        let origin_matches = matches!(
+            &locator.origin,
+            RetainedWorkspaceLocatorOrigin::HostPeer {
+                peer_admission_receipt,
+                activation_request_id: retained_request_id,
+            } if peer_admission_receipt.as_ref() == receipt && retained_request_id == activation_request_id
+        );
+        if !origin_matches || locator.work_scope_ref != work_scope.binding.scope.scope_ref {
+            return Err(
+                crate::task_binding_admission::TaskBindingError::scope_incompatible(
+                    "retained Host-origin locator does not match the peer receipt and current WorkScope",
+                ),
+            );
+        }
+        Ok(locator.root.clone())
+    }
+
+    /// Starts an owner-retained Task Controller selection read. The returned
+    /// Governor token is passed across the exact Kernel acceptance-set read;
+    /// callers release the shared composition lock before performing that I/O.
+    pub fn prepare_task_selection_for_request(
+        &self,
+        now: u64,
+        authenticated_principal_ref: &str,
+        request_session_ref: &str,
+        request_task_ref: &str,
+        request_scope_ref: &str,
+        request_fence: &eliot_contracts::StateFence,
+    ) -> Result<eliot_governor::PendingTaskSelectionRequest, eliot_governor::CompositionError> {
+        self.governor.prepare_task_selection_for_request(
+            now,
+            authenticated_principal_ref,
+            request_session_ref,
+            request_task_ref,
+            request_scope_ref,
+            request_fence,
+        )
+    }
+
+    /// Completes the split owner selection read after Kernel I/O. Governor
+    /// re-reads the active selection, `WorkScope`, and live fence before it
+    /// accepts the unchanged canonical `TaskContract` response.
+    pub fn finish_task_selection_for_request(
+        &self,
+        pending: eliot_governor::PendingTaskSelectionRequest,
+        now_after_kernel_read: u64,
+        acceptance_set: eliot_store_api::TaskContractAcceptanceSet,
+    ) -> Result<eliot_governor::TaskSelectionAdmissionBinding, eliot_governor::CompositionError>
+    {
+        self.governor.finish_task_selection_for_request(
+            pending,
+            now_after_kernel_read,
+            acceptance_set,
+        )
     }
 
     /// Notes verified canonical notification records into this composition.
@@ -3099,6 +3558,19 @@ impl DaemonComposition {
                 self.governor.observation_reconciliation(),
             ),
         )
+    }
+
+    /// Reads exact current Session, Policy, and `WorkScope` owners for one
+    /// authenticated Observe request before the protected request content is
+    /// prepared for capture.
+    pub fn observation_capture_owner_binding(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        authenticated_principal_ref: &str,
+    ) -> Result<eliot_governor::ObservationCaptureOwnerBinding, eliot_governor::CompositionError>
+    {
+        self.governor
+            .observation_capture_owner_binding(identity, authenticated_principal_ref)
     }
 
     /// Borrows the Kernel-backed read-only context client over the retained
@@ -4330,15 +4802,19 @@ impl DaemonComposition {
     /// accepted input and its `receipt_ref` is a reference the Governor binds,
     /// not an authority the daemon asserts.
     ///
-    /// # Not yet reached (issue #1929)
+    /// # Attach-transport boundary (issue #1929)
     ///
-    /// This method currently has zero call sites, and it cannot acquire one
-    /// without inventing authority, so it is reported here rather than wired to
-    /// a synthetic caller. Three measured reasons:
+    /// This rebind/attach method currently has zero call sites, and it cannot
+    /// acquire one without inventing authority. Initial `WorkScope` binding is
+    /// admitted through the separate authenticated Task Controller
+    /// `BIND_SCOPE` action; that path checks the current task and policy owners,
+    /// independently observes the explicit root, and durably installs the
+    /// admitted initial snapshot before acknowledging it. Three measured
+    /// reasons this attach method remains unwired:
     ///
     /// - it is **circular** — `GovernorComposition::admit_observed_scope_attach`
-    ///   fails closed unless a `WorkScope` owner is already retained, and this
-    ///   method is the only daemon path that installs one;
+    ///   fails closed unless a `WorkScope` owner is already retained; the
+    ///   separate initial binding route does not create an attach receipt;
     /// - the daemon holds no `WorkScopeDescriptor`, no `GoverningSourceSet`, and
     ///   no authenticated authorization reference, so three of the nine
     ///   `ScopeAttachIngress` fields would have to be fabricated;

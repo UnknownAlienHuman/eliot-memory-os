@@ -35,6 +35,7 @@ eliot-protocol.workspace = true
 eliot-reactive-context-plan = { path = "../../crates/smart/eliot-reactive-context-plan", version = "0.1.0" }
 eliot-receipts.workspace = true
 eliot-runtime.workspace = true
+eliot-store-api.workspace = true
 eliot-types.workspace = true
 eliot-user-broker-core.workspace = true
 eliot-workscope.workspace = true

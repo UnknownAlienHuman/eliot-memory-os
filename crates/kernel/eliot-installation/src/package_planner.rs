@@ -259,6 +259,10 @@ struct PlannerStoreLaunchConfig {
     /// identically to the bridge `OperationalConfig` or approvals split.
     #[serde(default)]
     store_transaction_limit: Option<usize>,
+    /// Explicit queue bound for the reserved-write generation. Legacy launch
+    /// bytes omit this field and therefore do not enable that capability.
+    #[serde(default)]
+    store_write_max_pending: Option<usize>,
     schema_generation: String,
     blob_root: String,
     instance_id: String,
@@ -295,6 +299,8 @@ struct PlannerOperationalConfig<'a> {
     // part of the approval either way.
     #[serde(skip_serializing_if = "Option::is_none")]
     store_transaction_limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_write_max_pending: Option<usize>,
     schema_generation: &'a str,
     blob_root: &'a str,
     instance_id: &'a str,
@@ -335,6 +341,7 @@ fn validate_source_store_config(
         || config.connect_timeout_ms == 0
         || config.query_timeout_ms == 0
         || config.store_transaction_limit == Some(0)
+        || config.store_write_max_pending == Some(0)
     {
         return Err(InstallationError::IdentityConflict);
     }
@@ -360,6 +367,7 @@ fn validate_source_store_config(
         connect_timeout_ms: config.connect_timeout_ms,
         query_timeout_ms: config.query_timeout_ms,
         store_transaction_limit: config.store_transaction_limit,
+        store_write_max_pending: config.store_write_max_pending,
         schema_generation: &config.schema_generation,
         blob_root: &config.blob_root,
         instance_id: &config.instance_id,
@@ -4206,6 +4214,7 @@ mod tests {
             connect_timeout_ms: config.connect_timeout_ms,
             query_timeout_ms: config.query_timeout_ms,
             store_transaction_limit: config.store_transaction_limit,
+            store_write_max_pending: config.store_write_max_pending,
             schema_generation: &config.schema_generation,
             blob_root: &config.blob_root,
             instance_id: &config.instance_id,
@@ -4245,6 +4254,9 @@ mod tests {
         if let Some(limit) = config.store_transaction_limit {
             value["store_transaction_limit"] = serde_json::json!(limit);
         }
+        if let Some(limit) = config.store_write_max_pending {
+            value["store_write_max_pending"] = serde_json::json!(limit);
+        }
         value
     }
 
@@ -4276,6 +4288,7 @@ mod tests {
             connect_timeout_ms: 10_000,
             query_timeout_ms: 10_000,
             store_transaction_limit: None,
+            store_write_max_pending: None,
             schema_generation: "1.0.0".to_owned(),
             blob_root: Path::new(launch.runtime_state_roots.store_data_root.as_str())
                 .join("blob")
@@ -4357,6 +4370,7 @@ mod tests {
             connect_timeout_ms: 10_000,
             query_timeout_ms: 10_000,
             store_transaction_limit: None,
+            store_write_max_pending: None,
             schema_generation: "1.0.0".to_owned(),
             blob_root: Path::new(launch.runtime_state_roots.store_data_root.as_str())
                 .join("blob")
