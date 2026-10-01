@@ -180,7 +180,7 @@ pub fn parse_build_output(bytes: &[u8]) -> Result<DotnetBuildReport, DotnetOutpu
     let mut test_summary = None;
     for line in output.lines() {
         let line = line.trim();
-        if line.starts_with("Passed! - ") || line.starts_with("Failed! - ") {
+        if is_test_summary_line(line) {
             if test_summary.replace(parse_test_summary(line)?).is_some() {
                 return Err(DotnetOutputError::DuplicateTestSummary);
             }
@@ -238,7 +238,7 @@ pub fn parse_test_output(bytes: &[u8]) -> Result<DotnetTestSummary, DotnetOutput
     let output = std::str::from_utf8(bytes).map_err(|_| DotnetOutputError::InvalidUtf8)?;
     let mut summary = None;
     for line in output.lines().map(str::trim) {
-        if line.starts_with("Passed! - ") || line.starts_with("Failed! - ") {
+        if is_test_summary_line(line) {
             if summary.replace(parse_test_summary(line)?).is_some() {
                 return Err(DotnetOutputError::DuplicateTestSummary);
             }
@@ -248,10 +248,17 @@ pub fn parse_test_output(bytes: &[u8]) -> Result<DotnetTestSummary, DotnetOutput
 }
 
 fn parse_test_summary(line: &str) -> Result<DotnetTestSummary, DotnetOutputError> {
-    let succeeded = line.starts_with("Passed! - ");
-    let totals = line
-        .split_once(" - ")
-        .map(|(_, values)| values)
+    let (succeeded, remainder) = if let Some(remainder) = line.strip_prefix("Passed!") {
+        (true, remainder)
+    } else if let Some(remainder) = line.strip_prefix("Failed!") {
+        (false, remainder)
+    } else {
+        return Err(DotnetOutputError::MalformedTestSummary);
+    };
+    let totals = remainder
+        .trim_start()
+        .strip_prefix('-')
+        .map(str::trim_start)
         .ok_or(DotnetOutputError::MalformedTestSummary)?;
     let mut fields = totals.split(", ");
     let failed = parse_test_total(fields.next(), "Failed:")?;
@@ -259,9 +266,7 @@ fn parse_test_summary(line: &str) -> Result<DotnetTestSummary, DotnetOutputError
     let skipped = parse_test_total(fields.next(), "Skipped:")?;
     let total = parse_test_total(fields.next(), "Total:")?;
     if let Some(duration) = fields.next() {
-        if !duration
-            .strip_prefix("Duration:")
-            .is_some_and(|value| !value.trim().is_empty())
+        if !duration.strip_prefix("Duration:").is_some_and(|value| !value.trim().is_empty())
             || fields.next().is_some()
         {
             return Err(DotnetOutputError::MalformedTestSummary);
@@ -274,6 +279,10 @@ fn parse_test_summary(line: &str) -> Result<DotnetTestSummary, DotnetOutputError
         skipped,
         total,
     })
+}
+
+fn is_test_summary_line(line: &str) -> bool {
+    line.starts_with("Passed!") || line.starts_with("Failed!")
 }
 
 fn parse_test_total(field: Option<&str>, label: &str) -> Result<u64, DotnetOutputError> {
