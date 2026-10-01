@@ -1242,8 +1242,7 @@ pub fn watchdog_export_result_for_acknowledgement(
     // records.
     if acknowledgement.batch_id != batch.batch_id
         || acknowledgement.batch_digest != batch.batch_digest
-        || acknowledgement.predecessor_sequence
-            != batch.predecessor_cursor.acknowledged_sequence
+        || acknowledgement.predecessor_sequence != batch.predecessor_cursor.acknowledged_sequence
         || acknowledgement.first_sequence != batch.first_sequence
         || acknowledgement.last_sequence != batch.last_sequence
         || acknowledgement.installation_id != batch.installation_id
@@ -1267,7 +1266,9 @@ pub fn watchdog_export_result_for_acknowledgement(
                 WatchdogSpoolEntryOutcome::Applied
             }
             eliot_watchdog_core::WatchdogSpoolSinkDisposition::Rejected { reason } => {
-                WatchdogSpoolEntryOutcome::Rejected { reason: reason.clone() }
+                WatchdogSpoolEntryOutcome::Rejected {
+                    reason: reason.clone(),
+                }
             }
             eliot_watchdog_core::WatchdogSpoolSinkDisposition::GapRequiresRecovery => {
                 WatchdogSpoolEntryOutcome::GapRequiresRecovery

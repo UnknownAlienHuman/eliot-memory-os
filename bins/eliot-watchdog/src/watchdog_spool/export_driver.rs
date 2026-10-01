@@ -23,10 +23,11 @@ use eliot_contracts::{
 };
 use eliot_protocol::{
     ClientHello, EliotPipeName, EncodingProfile, Frame, FrameKind, MessageType, ProtocolPayload,
-    ProtocolRange, ProtocolVersion, WATCHDOG_SPOOL_BATCH_ROUTE, WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID,
-    WATCHDOG_SPOOL_EXPORT_ROUTE, WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID, WatchdogIntentKind,
-    WatchdogSpoolEntryKind, WatchdogSpoolEntryOutcome, WatchdogSpoolExportBatchPayload,
-    WatchdogSpoolExportSubmission, WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
+    ProtocolRange, ProtocolVersion, WATCHDOG_SPOOL_BATCH_ROUTE,
+    WATCHDOG_SPOOL_EXPORT_BATCH_WIRE_ID, WATCHDOG_SPOOL_EXPORT_ROUTE,
+    WATCHDOG_SPOOL_INTENT_BATCH_WIRE_ID, WatchdogIntentKind, WatchdogSpoolEntryKind,
+    WatchdogSpoolEntryOutcome, WatchdogSpoolExportBatchPayload, WatchdogSpoolExportSubmission,
+    WatchdogSpoolIntentBatchPayload, WatchdogSpoolIntentSubmission,
     watchdog_export_reconciliation_idempotency_key, watchdog_intent_reconciliation_idempotency_key,
 };
 use eliot_runtime_contracts::{
@@ -526,7 +527,8 @@ async fn transact_intent_batch(
     let signed = lease.lease();
     let connection_id = format!("{}:{}", SERVICE_NAME, signed.lease_id);
     let (mut transport, protocol_version) =
-        connect_watchdog_front_door(lease, &connection_id, WATCHDOG_INTENT_SUBMIT_OPERATION).await?;
+        connect_watchdog_front_door(lease, &connection_id, WATCHDOG_INTENT_SUBMIT_OPERATION)
+            .await?;
     let limits = TransportLimits::default();
     let body = serde_json::to_value(payload)
         .map_err(|error| SpoolError::Serialization(error.to_string()))?;
@@ -1059,8 +1061,7 @@ impl WatchdogExportSink for KernelFrontDoorWatchdogExportSink {
     ) -> Result<WatchdogSpoolAcknowledgement, SpoolError> {
         let lease_id = self.lease.lease().lease_id.clone();
         if batch.installation_id != self.lease.lease().installation_id
-            || batch.watchdog_generation
-                != self.lease.lease().activation_generation.value()
+            || batch.watchdog_generation != self.lease.lease().activation_generation.value()
             || batch.watchdog_epoch != self.lease.lease().watchdog_epoch.value()
         {
             return Err(SpoolError::LeaseFenced(

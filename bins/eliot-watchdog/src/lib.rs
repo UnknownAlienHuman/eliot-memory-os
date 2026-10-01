@@ -1443,8 +1443,7 @@ impl KernelWatchdogPort for IndependentKernelSensor {
     ) -> Pin<Box<dyn Future<Output = Result<u64, SpoolError>> + Send>> {
         Box::pin(async move {
             let lease_id = lease.lease().lease_id.clone();
-            let sink =
-                KernelFrontDoorWatchdogExportSink::new(lease, self.epoch_lineage.as_str());
+            let sink = KernelFrontDoorWatchdogExportSink::new(lease, self.epoch_lineage.as_str());
             tokio::task::spawn_blocking(move || {
                 // The export contour is bound to the lease this tick actually
                 // verified, never to a lease a caller could present: a sensor

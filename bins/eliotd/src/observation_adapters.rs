@@ -282,11 +282,10 @@ impl super::DaemonComposition {
     ) -> Result<WatchdogExportDrainStep, String> {
         let entries = batch.entries.len();
         let acknowledgement = admit_claimed_watchdog_export(self, batch).await?;
-        let Some(result) =
-            crate::daemon_kernel_client::watchdog_export_result_for_acknowledgement(
-                batch,
-                &acknowledgement,
-            )?
+        let Some(result) = crate::daemon_kernel_client::watchdog_export_result_for_acknowledgement(
+            batch,
+            &acknowledgement,
+        )?
         else {
             // The Governor admitted the window but decided no entry terminally.
             // Nothing is submitted, so the durable rows stay pending and the
@@ -339,11 +338,7 @@ async fn admit_claimed_watchdog_export(
     composition: &super::DaemonComposition,
     batch: &eliot_watchdog_core::WatchdogSpoolExportBatch,
 ) -> Result<eliot_watchdog_core::WatchdogSpoolAcknowledgement, String> {
-    let live_fence = composition
-        .governor
-        .kernel_snapshot()
-        .state_fence()
-        .clone();
+    let live_fence = composition.governor.kernel_snapshot().state_fence().clone();
     let now_ms = crate::unix_ms();
     let operation_text = format!(
         "watchdog-spool-drain:{}:{}",

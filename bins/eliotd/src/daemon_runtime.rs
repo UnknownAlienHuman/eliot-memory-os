@@ -3641,7 +3641,10 @@ async fn drain_flights_on_shutdown(
             && matches!(local_read_flight, LocalReadFlight::Idle)
             && matches!(observe_flight, ObserveFlight::Idle)
             && matches!(testd_owner_flight, TestdOwnerFlight::Idle)
-            && matches!(watchdog_export_drain_flight, WatchdogExportDrainFlight::Idle)
+            && matches!(
+                watchdog_export_drain_flight,
+                WatchdogExportDrainFlight::Idle
+            )
             && matches!(owner_feed_flight, OwnerFeedFlight::Idle)
             && matches!(governor_authority_flight, GovernorAuthorityFlight::Idle)
             && matches!(maintenance_flight, MaintenanceFlight::Idle)
@@ -6696,7 +6699,9 @@ fn start_testd_owner_drain(
     composition: SharedComposition,
 ) -> Pin<Box<dyn std::future::Future<Output = TestdOwnerCompletion>>> {
     let kernel_clone = Arc::clone(kernel);
-    Box::pin(async move { TestdOwnerCompletion::Settled(run_testd_owner_drain(&kernel_clone, composition).await) })
+    Box::pin(async move {
+        TestdOwnerCompletion::Settled(run_testd_owner_drain(&kernel_clone, composition).await)
+    })
 }
 
 /// Completion of one in-flight Watchdog spool-drain step.
@@ -6740,9 +6745,7 @@ fn decide_watchdog_export_drain_tick(
 ) -> WatchdogExportDrainTickDecision {
     match flight {
         WatchdogExportDrainFlight::Idle => WatchdogExportDrainTickDecision::StartDrain,
-        WatchdogExportDrainFlight::InFlight(_) => {
-            WatchdogExportDrainTickDecision::SkipInFlight
-        }
+        WatchdogExportDrainFlight::InFlight(_) => WatchdogExportDrainTickDecision::SkipInFlight,
     }
 }
 

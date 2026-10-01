@@ -1191,10 +1191,7 @@ impl KernelComposition {
         // result that already exists was written by the Governor's own outcome
         // leg through `record_watchdog_export_outcomes`, so it is read back here
         // and reported as what it is — never reinterpreted by this route.
-        let outcome = match (
-            admitted.state,
-            admitted.result_response.as_ref(),
-        ) {
+        let outcome = match (admitted.state, admitted.result_response.as_ref()) {
             (HostRequestState::ResultReceived, Some(body)) => {
                 Some(decode_watchdog_export_outcome(body)?)
             }
@@ -1299,7 +1296,9 @@ impl KernelComposition {
         };
         if retained.get("batch_id").and_then(serde_json::Value::as_str)
             != Some(payload.batch_id.as_str())
-            || retained.get("batch_digest").and_then(serde_json::Value::as_str)
+            || retained
+                .get("batch_digest")
+                .and_then(serde_json::Value::as_str)
                 != Some(payload.batch_digest.as_str())
             || retained
                 .get("installation_id")
@@ -1327,10 +1326,8 @@ impl KernelComposition {
         if now_ms >= stored.deadline_unix_ms {
             return Err(TransportError::Timeout);
         }
-        let recorded = serde_json::to_value(outcome)
-            .map_err(|_| TransportError::SessionFenced)?;
-        let result_digest =
-            sha256_json(&recorded).map_err(|_| TransportError::SessionFenced)?;
+        let recorded = serde_json::to_value(outcome).map_err(|_| TransportError::SessionFenced)?;
+        let result_digest = sha256_json(&recorded).map_err(|_| TransportError::SessionFenced)?;
         let admitted_now = stored.state != HostRequestState::ResultReceived;
         let persisted = self
             .generation_gateway
@@ -1379,13 +1376,9 @@ impl KernelComposition {
             .watchdog_export_drain
             .lock()
             .map_err(|_| TransportError::SessionFenced)?;
-        if queue
-            .iter()
-            .any(|pending| {
-                pending.batch_id == payload.batch_id
-                    && pending.batch_digest == payload.batch_digest
-            })
-        {
+        if queue.iter().any(|pending| {
+            pending.batch_id == payload.batch_id && pending.batch_digest == payload.batch_digest
+        }) {
             return Ok(());
         }
         if queue.len() >= MAX_WATCHDOG_EXPORT_DRAIN_WINDOWS {
