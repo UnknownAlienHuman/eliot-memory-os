@@ -207,6 +207,19 @@ pub struct GovernorObservationReconciliation<'a, P: ?Sized> {
 }
 
 impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
+    /// The live canonical fence this owner admits under.
+    ///
+    /// A caller reads this to refuse a pair whose admitted fence is no longer
+    /// current before it lets the owner begin any work. Admission itself
+    /// re-proves the same agreement; this read only avoids starting work that
+    /// the owner would refuse anyway.
+    #[must_use]
+    pub fn state_fence(&self) -> StateFence {
+        self.canonical.state_fence().clone()
+    }
+}
+
+impl<'a, P: ?Sized> GovernorObservationReconciliation<'a, P> {
     /// Borrows the single Governor owner triple. No per-caller journal,
     /// problem map, or canonical owner is created; scratch clones in
     /// [`Self::admit_doctor_verification`] never publish authority. The
@@ -2291,6 +2304,210 @@ impl<P: KernelTransitionPort + ?Sized> GovernorObservationReconciliation<'_, P> 
             .await?;
         Ok(receipt)
     }
+
+    /// Admits one caller-prepared observation into the canonical capture path
+    /// (issue #2565, `eliot.observe` `Observation`).
+    ///
+    /// This is the same gateway every other capture on this owner uses, with no
+    /// new preparation path and no second journal: the caller supplies the
+    /// typed [`ObservationSubmission`] (its provenance, scope, privacy/retention
+    /// disclosure and evidence handles are the caller's real owner reads),
+    /// the submission is admitted to a scratch clone of the recovered
+    /// [`ObservationJournal`] to prove domain legality without publishing
+    /// authority, and the canonical `CaptureObservation` /
+    /// `CaptureCandidate` write goes through [`CanonicalAdmissionOwner::commit`]
+    /// with the store's own receipt returned unchanged.
+    ///
+    /// The publication identity is derived from the caller-supplied observation
+    /// operation, never from retry time, so an identical replay reconciles the
+    /// existing receipt while changed content under the same operation
+    /// conflicts. A lost acknowledgement reads the original receipt back
+    /// through the neutral port instead of committing a second observation.
+    ///
+    /// The envelope's required proof carries the submission's own evidence
+    /// handles and the retained operation identity; a submission with no
+    /// evidence publishes with empty proof rather than an invented reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompositionError`] when readiness or fence agreement fails, the
+    /// journal refuses the submission (including an identity conflict), or the
+    /// canonical commit cannot be completed or reconciled.
+    pub async fn admit_capture_submission(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        observation_operation: &OperationId,
+        submission: &ObservationSubmission,
+    ) -> Result<WriteReceipt, CompositionError> {
+        self.validate_capture_identity_fence(identity)?;
+        // The submission's own operation and idempotency identity are the ones
+        // the store will arbitrate; they are compared against the identity the
+        // caller presents, never taken from the envelope's base operation. A
+        // mismatch is refused rather than silently rewritten.
+        if submission.operation_id != observation_operation.as_str()
+            || submission.idempotency_key != identity.idempotency_key
+            || submission.state_fence != identity.request.metadata.state_fence
+        {
+            return Err(identity_refused(
+                "observation submission identity does not match the admitted capture identity"
+                    .to_owned(),
+            ));
+        }
+        let mut scratch = self.observation.clone();
+        match scratch
+            .admit(submission.clone())
+            .map_err(|error| owner_refused(error.to_string()))?
+        {
+            ObservationAdmissionResult::Accepted { .. }
+            | ObservationAdmissionResult::Replayed { .. } => {}
+            ObservationAdmissionResult::Rejected { rejection } => {
+                if rejection.disposition == RejectionDisposition::Conflict {
+                    return Err(owner_refused(format!(
+                        "observation identity conflict: {}",
+                        rejection.all_contract_errors.join("; ")
+                    )));
+                }
+                return Err(owner_refused(format!(
+                    "observation is not admissible: {}",
+                    rejection.all_contract_errors.join("; ")
+                )));
+            }
+        }
+        let manifest_digest = production_manifest_digest()?;
+        let proof_refs = submission_proof_refs(submission);
+        let envelope = capture_submission_envelope(
+            identity,
+            observation_operation,
+            submission,
+            &proof_refs,
+            &manifest_digest,
+        )?;
+        let expected_hash = envelope
+            .canonical_request_hash()
+            .map_err(CompositionError::Canonical)?;
+        if let Some(receipt) = self
+            .reconcile_capture_observation_receipt(
+                identity,
+                observation_operation,
+                &expected_hash,
+                &manifest_digest,
+            )
+            .await?
+        {
+            return Ok(receipt);
+        }
+        self.commit_observation_leg(
+            identity,
+            observation_operation,
+            envelope,
+            &expected_hash,
+            &manifest_digest,
+        )
+        .await
+    }
+}
+
+/// The evidence handles the submission's own event core carries, deduplicated.
+///
+/// A submission whose record has no event (a control record) carries no
+/// handles, so the canonical proof set is empty rather than invented.
+fn submission_proof_refs(submission: &ObservationSubmission) -> Vec<String> {
+    submission
+        .record
+        .event
+        .as_ref()
+        .map(|core| {
+            core.evidence_and_raw_handles
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Builds the canonical `CaptureObservation` envelope for one prepared
+/// submission.
+///
+/// The envelope binds the record identity, the submission's canonical request
+/// digest, the operation and idempotency identity, and the retained scope, all
+/// from the admitted identity and the prepared submission. Required proof is
+/// exactly the submission's own evidence handles, deduplicated, so a mutated
+/// evidence set under the same operation changes the canonical hash and
+/// conflicts instead of overwriting.
+fn capture_submission_envelope(
+    identity: &eliot_protocol::RequestIdentity,
+    observation_operation: &OperationId,
+    submission: &ObservationSubmission,
+    proof_refs: &[String],
+    manifest_digest: &OperationManifestDigest,
+) -> Result<CanonicalWriteEnvelope, CompositionError> {
+    let fence = &identity.request.metadata.state_fence;
+    let request_digest = submission
+        .request_digest()
+        .map_err(|error| owner_refused(error.to_string()))?;
+    let work_scope = submission.record.event.as_ref().map(|core| {
+        core.affected_scope
+            .work_scope
+            .as_str()
+            .to_owned()
+    });
+    let mut parameters = BTreeMap::new();
+    for (name, value) in [
+        ("record_id", submission.record.record_id.clone()),
+        ("request_digest", request_digest),
+        ("operation_id", submission.operation_id.clone()),
+        ("idempotency_key", submission.idempotency_key.clone()),
+    ] {
+        parameters.insert(name.to_owned(), serde_json::Value::String(value));
+    }
+    if let Some(scope) = work_scope.as_ref() {
+        parameters.insert(
+            "work_scope".to_owned(),
+            serde_json::Value::String(scope.clone()),
+        );
+    }
+    let envelope = CanonicalWriteEnvelope {
+        operation_id: observation_operation.clone(),
+        request: identity.request.metadata.clone(),
+        idempotency_key: submission.idempotency_key.clone(),
+        scope_id: ScopeId::new(work_scope.as_deref().unwrap_or(GOVERNOR_SCOPE_ID))
+            .map_err(|error| owner_refused(error.to_string()))?,
+        task_id: identity
+            .request
+            .metadata
+            .task_id
+            .as_ref()
+            .map(|task| task.as_str().to_owned()),
+        transition_class: TransitionClass::CaptureCandidate,
+        requested_effect_ceiling: EffectClass::Candidate,
+        admission_contract_set_digest: eliot_canonical::supported_admission_contract_set_digest()?,
+        operation_manifest_digest: manifest_digest.clone(),
+        semantic_commands: vec![NamedMutationRequest {
+            operation: NamedMutationOperation::CaptureObservation,
+            parameters,
+        }],
+        event_projection_relation_intents: EventProjectionRelationIntents {
+            event_ids: Vec::new(),
+            projection_kinds: Vec::new(),
+            relation_kinds: Vec::new(),
+        },
+        security: SecurityContext::default(),
+        required_proof_and_approval_refs: proof_refs.to_vec(),
+        expected_revision_heads: Vec::new(),
+        expected_ordering_heads: vec![OrderingHeadExpectation {
+            scope: OrderingScopeId::new(format!(
+                "scope:{}",
+                work_scope.as_deref().unwrap_or(GOVERNOR_SCOPE_ID)
+            ))
+            .map_err(|error| owner_refused(error.to_string()))?,
+            expected_sequence: 1,
+            state_fence: fence.clone(),
+        }],
+    };
+    envelope.validate()?;
+    Ok(envelope)
 }
 
 #[cfg(test)]

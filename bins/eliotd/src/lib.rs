@@ -298,7 +298,9 @@ pub use governor_local_read::{
     serve_admitted_local_read,
 };
 pub use governor_observe_serve::{
-    ObserveDeferral, ObserveOwnerRoute, ObserveSuboperation, decode_observe_suboperation,
+    ObserveAdmittedSubmission, ObserveDeferral, ObserveObservationCapture,
+    ObserveObservationProvenance, ObserveOwnerRoute, ObserveSuboperation,
+    capture_admitted_observation, decode_observe_suboperation, observe_suboperation_executes,
     observe_suboperation_owner, serve_admitted_observe,
 };
 pub use improvement_candidate_dispatch::{

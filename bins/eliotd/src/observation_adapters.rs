@@ -96,6 +96,40 @@ impl<P: KernelTransitionPort + ?Sized> ForwardingObservationReconciliation<'_, P
             .await
     }
 
+    /// Forwards one caller-prepared observation to the Governor canonical
+    /// capture path and returns only the exact issued store receipt.
+    ///
+    /// This is the narrow admission the admitted `eliot.observe`
+    /// `Observation` suboperation reaches (issue #2565). The adapter adds no
+    /// admission rule of its own: fence agreement, scratch journal legality,
+    /// the proactive same-operation receipt check, the canonical commit and the
+    /// receipt binding checks all stay with the Governor owner. An identical
+    /// replay of the same observation operation reconciles the existing
+    /// receipt; a lost acknowledgement is read back through the same operation
+    /// rather than committing a second observation, and no result is reported as
+    /// captured without an exact store receipt.
+    pub async fn admit_capture_submission(
+        &self,
+        identity: &eliot_protocol::RequestIdentity,
+        observation_operation: &eliot_contracts::OperationId,
+        submission: &eliot_observation::ObservationSubmission,
+    ) -> Result<eliot_store_api::WriteReceipt, CompositionError> {
+        self.inner
+            .admit_capture_submission(identity, observation_operation, submission)
+            .await
+    }
+
+    /// The single live canonical fence the observation owner is admitted under.
+    ///
+    /// A caller reads this to compare the fence it holds against the fence the
+    /// owner is actually committed to, before it lets an effect be adopted. The
+    /// owner checks the same value again inside admission; this read exists so
+    /// the caller can refuse a stale pair without beginning the work.
+    #[must_use]
+    pub fn state_fence(&self) -> eliot_contracts::StateFence {
+        self.inner.state_fence()
+    }
+
     /// Forwards one Watchdog spool export batch through Governor admission
     /// and returns the exact sink-owned acknowledgement.
     ///
@@ -968,6 +1002,242 @@ mod tests {
         assert_eq!(
             ack.dispositions[1].disposition,
             eliot_watchdog_core::WatchdogSpoolSinkDisposition::GapRequiresRecovery
+        );
+    }
+
+    /// Builds one Kernel-admitted `eliot.observe` envelope whose payload digest
+    /// binds the exact tool bytes, so the serve path's linkage proof holds.
+    fn observe_envelope(
+        fence: &eliot_contracts::StateFence,
+        tool: &serde_json::Value,
+        task_id: Option<&str>,
+    ) -> eliot_protocol::HostRequestEnvelope {
+        let bytes = eliot_contracts::canonical_json_bytes(tool)
+            .expect("observe tool canonicalizes for the test");
+        let mut envelope = eliot_protocol::HostRequestEnvelope {
+            wire_id: eliot_protocol::HOST_REQUEST_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::HostRequestEnvelope::CONTRACT_VERSION,
+            kind: eliot_protocol::HostRequestKind::Invocation,
+            connection_id: "conn-observe-2565".to_owned(),
+            identity: eliot_protocol::HostRequestIdentity {
+                request_id: eliot_contracts::RequestId::new("host-request-observe-2565")
+                    .expect("observe request id"),
+                correlation_projection: None,
+                idempotency_key: "host-request-observe-2565:invoke".to_owned(),
+                cancellation_id: "host-request-observe-2565:invoke:cancel".to_owned(),
+                parent_operation_id: None,
+                deadline_unix_ms: 2_000_000_000_000,
+                capability: "eliot.observe".to_owned(),
+                session_id: Some("kernel-session-observe-2565".to_owned()),
+                task_id: task_id.map(str::to_owned),
+                work_scope_id: None,
+                payload_schema_id: "eliot.mcp.tool-request.v1".to_owned(),
+                payload_sha256: eliot_contracts::sha256_hex(&bytes),
+            },
+            state_fence: fence.clone(),
+            descriptor_sha256: "d".repeat(64),
+            peer_admission_receipt_sha256: "e".repeat(64),
+            activation_binding: None,
+            envelope_sha256: String::new(),
+        };
+        envelope.envelope_sha256 = envelope.compute_digest().expect("observe envelope digest");
+        envelope
+    }
+
+    /// Builds the Kernel-minted attempt the claim would mint for that envelope.
+    fn observe_attempt(
+        envelope: &eliot_protocol::HostRequestEnvelope,
+    ) -> eliot_protocol::LocalReadAttempt {
+        eliot_protocol::LocalReadAttempt {
+            wire_id: eliot_protocol::LOCAL_READ_ATTEMPT_WIRE_ID.to_owned(),
+            wire_version: eliot_protocol::LocalReadAttempt::CONTRACT_VERSION,
+            operation_id: eliot_protocol::host_request_operation_id(envelope),
+            attempt_id: "attempt-observe-2565-1".to_owned(),
+            fencing_generation: 1,
+            session_id: envelope.identity.session_id.clone().expect("admitted session"),
+            authority_epoch: envelope.state_fence.authority_epoch.clone(),
+            scope_id: "governor".to_owned(),
+            facet_method: "eliot.observe".to_owned(),
+            expires_at_unix_ms: envelope.identity.deadline_unix_ms,
+            use_budget: 1,
+        }
+    }
+
+    /// Builds a ready Governor composition over the neutral genesis kernel,
+    /// returning the composition and the shared neutral port handle so the test
+    /// can count the canonical transitions that actually executed.
+    fn observe_governor(
+        kernel: Arc<GenesisKernel>,
+    ) -> (
+        eliot_governor::GovernorComposition<
+            'static,
+            Arc<GenesisKernel>,
+            eliot_governor::KernelServiceRecovery,
+            eliot_governor::RecoveryOwner,
+            eliot_governor::KernelGenerationExpectation,
+            eliot_governor::GenesisOwnerRecordSet,
+        >,
+        Arc<GenesisKernel>,
+    ) {
+        let expected = KernelGenerationExpectation::from_snapshot(&kernel.snapshot)
+            .expect("observe expectation");
+        let handle = Arc::clone(&kernel);
+        let composition = GovernorComposition::new(kernel, None, &expected, QueueLimits::default())
+            .expect("observe genesis composition is ready");
+        (composition, handle)
+    }
+
+    fn observe_snapshot() -> KernelGenerationSnapshot {
+        KernelGenerationSnapshot {
+            service: "eliot-kernel".to_owned(),
+            protocol: "eliot.kernel.v1".to_owned(),
+            generation: ResourceGeneration::genesis(),
+            authority_epoch: EpochId::new(
+                EpochLineageId::new("550e8400-e29b-41d4-a716-446655440000")
+                    .expect("valid test lineage"),
+                std::num::NonZeroU64::new(1).expect("nonzero test sequence"),
+            )
+            .expect("valid test epoch"),
+            artifact_digest: "a".repeat(64),
+            protected_snapshot_digest: "b".repeat(64),
+            principal: "S-1-5-18".to_owned(),
+        }
+    }
+
+    /// The connected `Observation` suboperation really captures through the
+    /// observation owner, and a no-task observation stays a cold candidate.
+    ///
+    /// The positive leg drives the production edge
+    /// [`crate::capture_admitted_observation`] over a real Governor
+    /// composition: the store issues a real `Committed` `CaptureCandidate`
+    /// receipt, exactly one canonical transition executes, and an exact replay
+    /// of the same retained pair reconciles that SAME receipt instead of
+    /// producing a second effect. The refusal leg is the same production edge
+    /// on a non-`Observation` suboperation, which still has no connected owner
+    /// admission: it refuses and the neutral port records zero transitions.
+    #[tokio::test]
+    async fn captures_an_observation_and_refuses_an_unconnected_suboperation() {
+        let kernel = Arc::new(GenesisKernel {
+            snapshot: observe_snapshot(),
+            genesis: Mutex::new(None),
+            committed: Mutex::new(BTreeMap::new()),
+            apply_calls: Mutex::new(0),
+        });
+        let fence = kernel.snapshot.state_fence();
+        let (composition, handle) = observe_governor(kernel);
+        let forwarder =
+            ForwardingObservationReconciliation::new(composition.observation_reconciliation());
+
+        // (a) A task-bound observation: captured through the owner.
+        let observation_tool = serde_json::json!({
+            "name": "eliot.observe",
+            "arguments": {
+                "kind": "observation",
+                "text_or_structured_payload": "the queue drained without a task",
+                "task_id": "task-observe-2565",
+                "affected_resources": ["crates/governor/eliot-governor"],
+                "source_handles": ["daemon-observe-2565"],
+            }
+        });
+        let envelope = observe_envelope(&fence, &observation_tool, Some("task-observe-2565"));
+        let attempt = observe_attempt(&envelope);
+        let capture = crate::capture_admitted_observation(&forwarder, &envelope, &observation_tool, &attempt)
+            .await
+            .expect("the observation suboperation captures through the owner");
+        assert_eq!(
+            capture.receipt.status,
+            WriteReceiptStatus::Committed,
+            "a captured observation carries the store's own committed receipt"
+        );
+        assert_eq!(
+            capture.receipt.transition_class,
+            eliot_store_api::TransitionClass::CaptureCandidate,
+            "an observation is a cold candidate, never a stronger transition"
+        );
+        assert!(capture.task_bound, "the envelope named a task");
+        assert_eq!(handle.apply_count(), 1, "one capture is one transition");
+
+        // The lost-result recovery path: an exact replay of the same retained
+        // pair reconciles the SAME receipt rather than capturing a second time.
+        let replayed = crate::capture_admitted_observation(&forwarder, &envelope, &observation_tool, &attempt)
+            .await
+            .expect("an exact replay reconciles the original receipt");
+        assert_eq!(
+            replayed.receipt, capture.receipt,
+            "a lost host result must recover the SAME receipt"
+        );
+        assert_eq!(
+            handle.apply_count(),
+            1,
+            "an exact replay must never produce a second observation"
+        );
+
+        // (b) A no-task observation: still a capture, still a cold candidate.
+        let cold_tool = serde_json::json!({
+            "name": "eliot.observe",
+            "arguments": {
+                "kind": "observation",
+                "text_or_structured_payload": "an untethered observation",
+                "affected_resources": [],
+                "source_handles": [],
+            }
+        });
+        let cold_envelope = observe_envelope(&fence, &cold_tool, None);
+        let cold_attempt = observe_attempt(&cold_envelope);
+        let cold = crate::capture_admitted_observation(
+            &forwarder,
+            &cold_envelope,
+            &cold_tool,
+            &cold_attempt,
+        )
+        .await
+        .expect("a no-task observation captures as a cold candidate");
+        assert_eq!(cold.receipt.status, WriteReceiptStatus::Committed);
+        assert!(!cold.task_bound, "no admitted task means a cold candidate");
+        let stored = handle
+            .committed
+            .lock()
+            .expect("committed lock")
+            .get(cold.receipt.operation_id.as_str())
+            .expect("the cold observation is retained under its own operation")
+            .2
+            .clone();
+        assert_eq!(stored, cold.receipt);
+
+        // The refusal leg: an unconnected suboperation still defers, so the
+        // capture edge refuses it and the neutral port records no transition.
+        let decision_tool = serde_json::json!({
+            "name": "eliot.observe",
+            "arguments": {
+                "kind": "decision",
+                "text_or_structured_payload": "chose the narrow slice",
+                "affected_resources": [],
+                "source_handles": [],
+            }
+        });
+        let decision_envelope = observe_envelope(&fence, &decision_tool, None);
+        let decision_attempt = observe_attempt(&decision_envelope);
+        assert!(
+            !crate::observe_suboperation_executes(crate::ObserveSuboperation::Decision),
+            "the decision suboperation still has no connected owner admission"
+        );
+        let before = handle.apply_count();
+        let refused = crate::capture_admitted_observation(
+            &forwarder,
+            &decision_envelope,
+            &decision_tool,
+            &decision_attempt,
+        )
+        .await
+        .expect_err("an unconnected suboperation must not reach the capture path");
+        assert!(
+            refused.contains("only the observation suboperation captures"),
+            "the refusal names the exact connected suboperation: {refused}"
+        );
+        assert_eq!(
+            handle.apply_count(),
+            before,
+            "a refused suboperation must not commit anything"
         );
     }
 }
